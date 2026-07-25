@@ -17,7 +17,7 @@ use crate::flacenc::FlacStreamWriter;
 use crate::metadata;
 #[cfg(feature = "mp3-encoding")]
 use crate::mp3enc;
-use crate::wav::{AudioBuffer, PcmKind, WavStreamWriter, WavWriter};
+use crate::wav::{AudioBuffer, ChannelRole, PcmKind, WavStreamWriter, WavWriter};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,11 +273,43 @@ pub fn write<P: AsRef<Path>>(
 
 /// Analyze a file on disk (buffer is dropped after measurement).
 pub fn analyze_file<P: AsRef<Path>>(path: P) -> Result<Analysis, String> {
+    analyze_file_with_roles(path, None)
+}
+
+/// Analyze a file with an optional explicit channel layout.
+pub fn analyze_file_with_roles<P: AsRef<Path>>(
+    path: P,
+    channel_roles: Option<&[ChannelRole]>,
+) -> Result<Analysis, String> {
     let mut analyzer: Option<lufs::StreamingAnalyzer> = None;
     let info = decoder::decode_stream(path.as_ref(), |info, chunk| {
-        let meter = analyzer.get_or_insert_with(|| {
-            lufs::StreamingAnalyzer::new(info.sample_rate, info.channel_roles.clone())
-        });
+        if channel_roles.is_none()
+            && info.channels > 6
+            && info
+                .channel_roles
+                .iter()
+                .all(|role| matches!(role, ChannelRole::Main))
+        {
+            return Err(format!(
+                "{}: ambiguous {}-channel layout; provide --channel-layout",
+                path.as_ref().display(),
+                info.channels
+            ));
+        }
+        let roles = if let Some(roles) = channel_roles {
+            if roles.len() != info.channels as usize {
+                return Err(format!(
+                    "channel layout has {} channels but input has {}",
+                    roles.len(),
+                    info.channels
+                ));
+            }
+            roles.to_vec()
+        } else {
+            info.channel_roles.clone()
+        };
+        let meter =
+            analyzer.get_or_insert_with(|| lufs::StreamingAnalyzer::new(info.sample_rate, roles));
         meter.process(chunk)
     })?;
     let measured = analyzer
@@ -328,7 +360,17 @@ pub fn verify_file_at_level<P: AsRef<Path>>(
     if !tolerance.is_finite() || tolerance < 0.0 {
         return Err("verification tolerance must be a finite non-negative number".into());
     }
-    let output = analyze_file(output)?;
+    verify_file_at_level_with_roles(output.as_ref(), expected_level, plan, tolerance, None)
+}
+
+fn verify_file_at_level_with_roles(
+    output: &Path,
+    expected_level: f64,
+    plan: &Plan,
+    tolerance: f64,
+    channel_roles: Option<&[ChannelRole]>,
+) -> Result<Verification, String> {
+    let output = analyze_file_with_roles(output, channel_roles)?;
     Ok(verify_analysis_at_level(
         &output,
         expected_level,
@@ -393,7 +435,17 @@ pub fn normalize_one<P: AsRef<Path>>(
     plan: &Plan,
     format: OutputFormat,
 ) -> Result<(Analysis, f32), String> {
-    let an = analyze_file(&input)?;
+    normalize_one_with_roles(input, output, plan, format, None)
+}
+
+pub fn normalize_one_with_roles<P: AsRef<Path>>(
+    input: P,
+    output: P,
+    plan: &Plan,
+    format: OutputFormat,
+    channel_roles: Option<&[ChannelRole]>,
+) -> Result<(Analysis, f32), String> {
+    let an = analyze_file_with_roles(input.as_ref(), channel_roles)?;
     let gain = compute_gain(&an, plan);
     let staged = AtomicOutput::new(output.as_ref())?;
     normalize_stream(input.as_ref(), staged.path(), &an, gain, plan, format, None)?;
@@ -419,19 +471,37 @@ pub fn normalize_one_corrected<P: AsRef<Path>>(
     tolerance: f64,
     max_retries: usize,
 ) -> Result<CorrectedNormalization, String> {
+    normalize_one_corrected_with_roles(input, output, plan, format, tolerance, max_retries, None)
+}
+
+pub fn normalize_one_corrected_with_roles<P: AsRef<Path>>(
+    input: P,
+    output: P,
+    plan: &Plan,
+    format: OutputFormat,
+    tolerance: f64,
+    max_retries: usize,
+    channel_roles: Option<&[ChannelRole]>,
+) -> Result<CorrectedNormalization, String> {
     if !tolerance.is_finite() || tolerance < 0.0 {
         return Err("verification tolerance must be a finite non-negative number".into());
     }
     let input = input.as_ref();
     let output = output.as_ref();
-    let source = analyze_file(input)?;
+    let source = analyze_file_with_roles(input, channel_roles)?;
     let mut gain = compute_gain(&source, plan);
     let expected_level = analysis_level(&source, plan.mode) + gain_db(gain);
     let staged = AtomicOutput::new(output)?;
 
     for attempt in 0..=max_retries {
         normalize_stream(input, staged.path(), &source, gain, plan, format, None)?;
-        let verification = verify_file_at_level(staged.path(), expected_level, plan, tolerance)?;
+        let verification = verify_file_at_level_with_roles(
+            staged.path(),
+            expected_level,
+            plan,
+            tolerance,
+            channel_roles,
+        )?;
         if verification.passed() {
             finalize_metadata(input, staged.path(), format, verification.output.lufs, None)?;
             staged.commit()?;
@@ -481,7 +551,20 @@ pub fn normalize_album(
     plan: &Plan,
     formats: &[OutputFormat],
 ) -> Result<Vec<(Analysis, f32)>, String> {
-    let analyses: Vec<Analysis> = inputs.iter().map(analyze_file).collect::<Result<_, _>>()?;
+    normalize_album_with_roles(inputs, outputs, plan, formats, None)
+}
+
+pub fn normalize_album_with_roles(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    channel_roles: Option<&[ChannelRole]>,
+) -> Result<Vec<(Analysis, f32)>, String> {
+    let analyses: Vec<Analysis> = inputs
+        .iter()
+        .map(|path| analyze_file_with_roles(path, channel_roles))
+        .collect::<Result<_, _>>()?;
     let gain = album_gain(&analyses, plan);
     let album_output_lufs = album_lufs(&analyses) + gain_db(gain);
     let staged: Vec<AtomicOutput> = outputs
@@ -526,6 +609,26 @@ pub fn normalize_album_corrected(
     tolerance: f64,
     max_retries: usize,
 ) -> Result<CorrectedAlbumNormalization, String> {
+    normalize_album_corrected_with_roles(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        tolerance,
+        max_retries,
+        None,
+    )
+}
+
+pub fn normalize_album_corrected_with_roles(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    tolerance: f64,
+    max_retries: usize,
+    channel_roles: Option<&[ChannelRole]>,
+) -> Result<CorrectedAlbumNormalization, String> {
     if inputs.is_empty() {
         return Err("cannot correct an empty album".into());
     }
@@ -535,7 +638,10 @@ pub fn normalize_album_corrected(
     if !tolerance.is_finite() || tolerance < 0.0 {
         return Err("verification tolerance must be a finite non-negative number".into());
     }
-    let sources: Vec<Analysis> = inputs.iter().map(analyze_file).collect::<Result<_, _>>()?;
+    let sources: Vec<Analysis> = inputs
+        .iter()
+        .map(|path| analyze_file_with_roles(path, channel_roles))
+        .collect::<Result<_, _>>()?;
     let mut gain = album_gain(&sources, plan);
     let expected_album_lufs = album_lufs(&sources) + gain_db(gain);
     let expected_track_levels: Vec<f64> = sources
@@ -566,7 +672,7 @@ pub fn normalize_album_corrected(
         }
         let decoded: Vec<Analysis> = staged_paths
             .iter()
-            .map(analyze_file)
+            .map(|path| analyze_file_with_roles(path, channel_roles))
             .collect::<Result<_, _>>()?;
         let actual_album_lufs = album_lufs(&decoded);
         let verifications: Vec<Verification> = decoded

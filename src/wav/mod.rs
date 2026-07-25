@@ -10,9 +10,28 @@ pub use writer::{WavStreamWriter, WavWriter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelRole {
+    /// A conventional front or centre channel with unity loudness weighting.
     Main,
+    /// A conventional surround channel in a mono/stereo/5.1 programme.
     Surround,
+    /// Mono content intended to be reproduced identically by two speakers.
+    DualMono,
+    /// A channel with a known loudspeaker position. BS.1770-5 Annex 3 derives
+    /// its weight from azimuth and elevation instead of a generic name.
+    Positioned {
+        azimuth_degrees: i16,
+        elevation_degrees: i16,
+    },
     Lfe,
+}
+
+impl ChannelRole {
+    pub const fn positioned(azimuth_degrees: i16, elevation_degrees: i16) -> Self {
+        Self::Positioned {
+            azimuth_degrees,
+            elevation_degrees,
+        }
+    }
 }
 
 pub fn default_channel_roles(channels: u16) -> Vec<ChannelRole> {
@@ -25,6 +44,57 @@ pub fn default_channel_roles(channels: u16) -> Vec<ChannelRole> {
         6 => vec![Main, Main, Main, Lfe, Surround, Surround],
         _ => vec![Main; channels as usize],
     }
+}
+
+/// A named, ordered channel layout accepted by the CLI.
+///
+/// Orders follow WAVE_FORMAT_EXTENSIBLE: FL, FR, FC, LFE, back L/R, side L/R,
+/// then top-front L/R and top-back L/R where present.
+pub fn named_channel_layout(name: &str) -> Option<Vec<ChannelRole>> {
+    use ChannelRole::{Lfe, Main, Surround};
+    let p = ChannelRole::positioned;
+    Some(match name {
+        "mono" => vec![Main],
+        "stereo" => vec![Main, Main],
+        "5.1" => vec![Main, Main, Main, Lfe, Surround, Surround],
+        "7.1" => vec![
+            Main,
+            Main,
+            Main,
+            Lfe,
+            p(-135, 0),
+            p(135, 0),
+            p(-90, 0),
+            p(90, 0),
+        ],
+        "5.1.4" => vec![
+            Main,
+            Main,
+            Main,
+            Lfe,
+            Surround,
+            Surround,
+            p(-30, 45),
+            p(30, 45),
+            p(-135, 45),
+            p(135, 45),
+        ],
+        "7.1.4" => vec![
+            Main,
+            Main,
+            Main,
+            Lfe,
+            p(-135, 0),
+            p(135, 0),
+            p(-90, 0),
+            p(90, 0),
+            p(-30, 45),
+            p(30, 45),
+            p(-135, 45),
+            p(135, 45),
+        ],
+        _ => return None,
+    })
 }
 
 /// A fully-decoded, **planar** audio buffer (one `Vec<f32>` per channel).

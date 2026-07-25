@@ -99,6 +99,19 @@ pub struct Cli {
     #[arg(long = "album")]
     pub album: bool,
 
+    /// Override the input channel order when container metadata is absent or
+    /// wrong. Orders follow WAVE_FORMAT_EXTENSIBLE.
+    #[arg(
+        long = "channel-layout",
+        value_parser = ["mono", "stereo", "5.1", "7.1", "5.1.4", "7.1.4"]
+    )]
+    pub channel_layout: Option<String>,
+
+    /// Treat a one-channel input as identical signals reproduced by two
+    /// speakers, applying the conventional -3.01 dB pan-law correction.
+    #[arg(long = "dual-mono", conflicts_with = "channel_layout")]
+    pub dual_mono: bool,
+
     /// Only measure and print stats; do not write files.
     #[arg(long = "analyze")]
     pub analyze_only: bool,
