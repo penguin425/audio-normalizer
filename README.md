@@ -140,6 +140,13 @@ forge track.wav -o out.wav --mode=peak --target-peak=-1
 # Album mode: one shared gain across all tracks (mixed formats allowed)
 forge --album a.wav b.mp3 c.flac -o ./normalized/
 
+# Recursively normalize a library while preserving subdirectories
+forge ./library --recursive -o ./normalized
+
+# Preview outputs without writing, and explicitly allow replacement when ready
+forge ./library --recursive -o ./normalized --dry-run
+forge ./library --recursive -o ./normalized --overwrite
+
 # Just measure any file, don't write
 forge --analyze song.mp3
 
@@ -159,6 +166,9 @@ forge in.wav -o out.wav --bits=24 --dither
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-m, --mode` | `lufs` | `lufs`, `peak`, or `rms` |
+| `--recursive` | off | Recursively process input directories |
+| `--dry-run` | off | Analyze and show output paths without writing |
+| `--overwrite` | off | Replace output files that already exist |
 | `--target` | `-16` | Target LUFS (`--mode lufs`) |
 | `--target-peak` | `-0.1` | Target sample peak dBFS (`--mode peak`) |
 | `--target-rms` | `-18` | Target RMS dBFS (`--mode rms`) |
