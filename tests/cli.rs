@@ -42,3 +42,14 @@ fn recursive_dry_run_preserves_relative_directories() {
 
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn preset_is_accepted_but_explicit_target_conflicts() {
+    let cli = Cli::try_parse_from(["forge", "track.wav", "--preset", "ebu-r128"]).unwrap();
+    assert_eq!(cli.preset.as_deref(), Some("ebu-r128"));
+    assert!(
+        Cli::try_parse_from(["forge", "track.wav", "--preset", "spotify", "--target=-12"]).is_err()
+    );
+}
+use clap::Parser;
+use forge_normalizer::cli::Cli;

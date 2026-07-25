@@ -4,6 +4,7 @@ use clap::Parser;
 use forge_normalizer::cli;
 use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::normalize::{self, Mode, OutputFormat, Plan};
+use forge_normalizer::preset::Preset;
 use forge_normalizer::report::{self, AnalysisReport};
 use forge_normalizer::wav::PcmKind;
 use rayon::ThreadPoolBuilder;
@@ -52,12 +53,20 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
     let (expanded, relative_paths) = expand_inputs(&cli.inputs, cli.recursive)?;
     cli.inputs = expanded;
 
+    let preset = cli
+        .preset
+        .as_deref()
+        .map(|name| Preset::named(name).expect("clap validates preset names"));
     let plan = Plan {
-        mode: parse_mode(&cli.mode),
-        target_lufs: cli.target_lufs,
+        mode: if preset.is_some() {
+            Mode::Lufs
+        } else {
+            parse_mode(&cli.mode)
+        },
+        target_lufs: preset.map_or(cli.target_lufs, |value| value.target_lufs),
         target_peak_db: cli.target_peak_db,
         target_rms_db: cli.target_rms_db,
-        ceiling_db: cli.ceiling_db,
+        ceiling_db: preset.map_or(cli.ceiling_db, |value| value.ceiling_db),
         max_gain_db: cli.max_gain_db,
         dither: cli.dither,
         output_kind: cli.bits.as_deref().map(parse_bits),
@@ -68,6 +77,12 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
             release_ms: cli.limiter_release,
         }),
     };
+    if let Some(preset) = preset {
+        eprintln!(
+            "preset {}: {:.1} LUFS, {:.1} dBTP ({})",
+            preset.name, preset.target_lufs, preset.ceiling_db, preset.description
+        );
+    }
 
     if cli.album && plan.mode != Mode::Lufs {
         return Err("--album is only valid with --mode lufs".into());
