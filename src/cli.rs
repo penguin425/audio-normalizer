@@ -133,6 +133,16 @@ pub struct Cli {
     #[arg(long, default_value_t = 0.5, requires = "verify")]
     pub verify_tolerance: f64,
 
+    /// Re-encode up to N times with an automatically corrected gain when
+    /// post-encode verification misses the intended level or true-peak ceiling.
+    #[arg(
+        long,
+        default_value_t = 0,
+        value_parser = clap::value_parser!(u8).range(0..=10),
+        requires = "verify"
+    )]
+    pub verify_retries: u8,
+
     /// Use a streaming look-ahead true-peak limiter instead of reducing global gain.
     #[arg(long)]
     pub limiter: bool,

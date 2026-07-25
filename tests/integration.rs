@@ -335,6 +335,48 @@ fn album_mode_applies_shared_gain() {
 }
 
 #[test]
+fn corrected_album_verifies_a_shared_gain() {
+    let quiet = synth_sine(48_000, 5.0, 0.04, 997.0, 2);
+    let loud = synth_sine(48_000, 5.0, 0.20, 997.0, 2);
+    let input_a = tmp_path("forge_it_corrected_album_a.wav");
+    let input_b = tmp_path("forge_it_corrected_album_b.wav");
+    let output_a = tmp_path("forge_it_corrected_album_a.flac");
+    let output_b = tmp_path("forge_it_corrected_album_b.flac");
+    WavWriter::write(&input_a, &quiet, PcmKind::F32, false).unwrap();
+    WavWriter::write(&input_b, &loud, PcmKind::F32, false).unwrap();
+    let plan = Plan {
+        mode: Mode::Lufs,
+        target_lufs: -18.0,
+        target_peak_db: -1.0,
+        target_rms_db: -18.0,
+        ceiling_db: -1.0,
+        max_gain_db: None,
+        dither: false,
+        output_kind: Some(PcmKind::S24),
+        mp3_bitrate: 192,
+        mp3_quality: 2,
+        limiter: None,
+    };
+
+    let result = normalize::normalize_album_corrected(
+        &[input_a.clone(), input_b.clone()],
+        &[output_a.clone(), output_b.clone()],
+        &plan,
+        &[OutputFormat::Flac, OutputFormat::Flac],
+        0.05,
+        2,
+    )
+    .unwrap();
+
+    assert_eq!(result.attempts, 1);
+    assert!(result.verifications.iter().all(|item| item.passed()));
+    assert!((result.actual_album_lufs - result.expected_album_lufs).abs() <= 0.05);
+    for path in [input_a, input_b, output_a, output_b] {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
 fn album_loudness_uses_the_combined_block_population() {
     let short_quiet = normalize::analyze(&synth_sine(48_000, 1.0, 0.01, 1000.0, 1));
     let long_loud = normalize::analyze(&synth_sine(48_000, 10.0, 0.10, 1000.0, 1));
@@ -436,4 +478,36 @@ fn mp3_encode_and_decode_roundtrip() {
 
     let _ = std::fs::remove_file(&wav_in);
     let _ = std::fs::remove_file(&mp3_out);
+}
+
+#[test]
+#[cfg(feature = "mp3-encoding")]
+fn mp3_post_encode_correction_converges_from_the_original_source() {
+    let buf = synth_sine(48_000, 6.0, 0.10, 997.0, 2);
+    let input = tmp_path("forge_it_mp3_correction_in.wav");
+    let output = tmp_path("forge_it_mp3_correction_out.mp3");
+    WavWriter::write(&input, &buf, PcmKind::F32, false).unwrap();
+    let plan = Plan {
+        mode: Mode::Lufs,
+        target_lufs: -16.0,
+        target_peak_db: -1.0,
+        target_rms_db: -18.0,
+        ceiling_db: -1.0,
+        max_gain_db: None,
+        dither: false,
+        output_kind: None,
+        mp3_bitrate: 128,
+        mp3_quality: 2,
+        limiter: None,
+    };
+
+    let result =
+        normalize::normalize_one_corrected(&input, &output, &plan, OutputFormat::Mp3, 0.01, 3)
+            .unwrap();
+
+    assert!(result.attempts > 1, "MP3 drift did not exercise a retry");
+    assert!(result.verification.passed(), "{result:?}");
+    assert!(result.verification.deviation <= 0.01, "{result:?}");
+    let _ = std::fs::remove_file(input);
+    let _ = std::fs::remove_file(output);
 }
