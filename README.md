@@ -404,6 +404,13 @@ BS.1770 absolute/relative gating and enforces a Loudness-to-Dialogue Ratio
 can come from the mix, the centre channel, or a separate stem via
 `--dialogue-source mix|center|stem` and `--dialogue-stem`.
 
+Codec delivery QC accepts a reviewable JSON/TOML sidecar with `--codec-metadata`.
+Fields include `codec`, `dialnorm_lkfs`, `encoded_loudness_lufs`,
+`downmix_mode`, and `tolerance_lu`. Dialnorm is checked against measured
+dialogue loudness when available, otherwise programme loudness. Use
+`--downmix-qc` to also render and measure the conventional WAVE-order Lo/Ro
+presentation (centre/surround at -3.01 dB, LFE omitted).
+
 Loudness Range (LRA) is reported for every analysis, together with
 `loudness_range_stable`. EBU Tech 3341 notes that LRA is not stable during the
 first 60 seconds, so shorter measurements are marked provisional instead of

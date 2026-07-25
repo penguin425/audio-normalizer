@@ -96,6 +96,25 @@ fn dialogue_loudness_uses_duration_weighted_ungated_energy() {
     let _ = std::fs::remove_file(input);
 }
 
+#[test]
+fn stereo_downmix_uses_center_coefficient_and_omits_lfe() {
+    let input = tmp_path("forge_it_downmix.wav");
+    let mut buffer = synth_sine(48_000, 1.0, 0.0, 997.0, 6);
+    for frame in 0..buffer.frames {
+        buffer.data[2][frame] = 0.2 * (2.0 * PI * 997.0 * frame as f64 / 48_000.0).sin() as f32;
+        buffer.data[3][frame] = 0.9;
+    }
+    WavWriter::write(&input, &buffer, PcmKind::F32, false).unwrap();
+
+    let measured = normalize::analyze_stereo_downmix(&input).unwrap();
+    assert_eq!(measured.analysis.channels, 2);
+    assert!(measured.analysis.lufs.is_finite());
+    assert!(measured.analysis.true_peak < 0.16);
+    assert!(measured.method.contains("LFE omitted"));
+
+    let _ = std::fs::remove_file(input);
+}
+
 #[cfg(feature = "aac-encoding")]
 #[test]
 fn aac_m4a_roundtrips_gaplessly_and_writes_loudness_tags() {
