@@ -104,23 +104,28 @@ impl TruePeakMeter {
     }
 
     pub fn process(&mut self, samples: &[f32]) {
-        let Some(&first) = samples.first() else {
+        if samples.is_empty() {
             return;
-        };
-        let history = self.history.get_or_insert([first as f64; TAPS_PER_PHASE]);
-        let phases = phases();
-        for &sample in samples {
-            history.copy_within(0..TAPS_PER_PHASE - 1, 1);
-            history[0] = sample as f64;
-            self.peak = self.peak.max(sample.abs());
-            for phase in phases {
-                let mut acc = 0.0f64;
-                for k in 0..TAPS_PER_PHASE {
-                    acc += phase[k] as f64 * history[k];
-                }
-                self.peak = self.peak.max(acc.abs() as f32);
-            }
         }
+        for &sample in samples {
+            self.process_sample(sample);
+        }
+    }
+
+    pub(crate) fn process_sample(&mut self, sample: f32) -> f32 {
+        let history = self.history.get_or_insert([sample as f64; TAPS_PER_PHASE]);
+        history.copy_within(0..TAPS_PER_PHASE - 1, 1);
+        history[0] = sample as f64;
+        let mut frame_peak = sample.abs();
+        for phase in phases() {
+            let mut acc = 0.0f64;
+            for k in 0..TAPS_PER_PHASE {
+                acc += phase[k] as f64 * history[k];
+            }
+            frame_peak = frame_peak.max(acc.abs() as f32);
+        }
+        self.peak = self.peak.max(frame_peak);
+        frame_peak
     }
 
     pub const fn peak(&self) -> f32 {

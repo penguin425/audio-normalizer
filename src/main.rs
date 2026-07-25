@@ -2,6 +2,7 @@
 
 use clap::Parser;
 use forge_normalizer::cli;
+use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::normalize::{self, Mode, OutputFormat, Plan};
 use forge_normalizer::report::{self, AnalysisReport};
 use forge_normalizer::wav::PcmKind;
@@ -62,6 +63,10 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
         output_kind: cli.bits.as_deref().map(parse_bits),
         mp3_bitrate: cli.bitrate,
         mp3_quality: cli.quality,
+        limiter: cli.limiter.then_some(LimiterConfig {
+            lookahead_ms: cli.limiter_lookahead,
+            release_ms: cli.limiter_release,
+        }),
     };
 
     if cli.album && plan.mode != Mode::Lufs {
@@ -69,6 +74,16 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
     }
     if !cli.verify_tolerance.is_finite() || cli.verify_tolerance < 0.0 {
         return Err("--verify-tolerance must be a finite non-negative number".into());
+    }
+    if cli.limiter
+        && (!cli.limiter_lookahead.is_finite()
+            || cli.limiter_lookahead < 1.0
+            || !cli.limiter_release.is_finite()
+            || cli.limiter_release <= 0.0)
+    {
+        return Err(
+            "--limiter-lookahead must be >= 1 ms and --limiter-release must be > 0 ms".into(),
+        );
     }
 
     if cli.write_tags {

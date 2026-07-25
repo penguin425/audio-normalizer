@@ -10,6 +10,7 @@
 //! professional loudness normalizers avoid clipping without a dynamic limiter.
 
 use crate::decoder;
+use crate::dsp::limiter::{LimiterConfig, TruePeakLimiter};
 use crate::dsp::{lufs, simd, truepeak};
 use crate::flacenc::FlacStreamWriter;
 use crate::metadata;
@@ -44,14 +45,16 @@ pub struct Plan {
     pub ceiling_db: f64,
     /// Optional safety cap on the applied gain (dB).
     pub max_gain_db: Option<f64>,
-    /// Apply TPDF dither when writing integer PCM (WAV only).
+    /// Apply TPDF dither when writing integer PCM (WAV/FLAC).
     pub dither: bool,
-    /// WAV output sample format; otherwise keep the input's format (WAV only).
+    /// PCM output sample format; FLAC maps this to 16 or 24 bits.
     pub output_kind: Option<PcmKind>,
     /// MP3 CBR bitrate in kbps (MP3 only).
     pub mp3_bitrate: i32,
     /// MP3 encoder quality 0..=9, 0 = best/slowest (MP3 only).
     pub mp3_quality: i32,
+    /// Optional streaming look-ahead true-peak limiter.
+    pub limiter: Option<LimiterConfig>,
 }
 
 /// Loudness/peak analysis of a single file.
@@ -142,11 +145,13 @@ pub fn compute_gain(an: &Analysis, plan: &Plan) -> f32 {
 }
 
 fn clamp_gain(mut lin: f64, true_peak: f64, plan: &Plan) -> f32 {
-    let ceil_lin = 10.0_f64.powf(plan.ceiling_db / 20.0);
-    if true_peak > 0.0 {
-        let max_for_ceil = ceil_lin / true_peak;
-        if lin > max_for_ceil {
-            lin = max_for_ceil;
+    if plan.limiter.is_none() {
+        let ceil_lin = 10.0_f64.powf(plan.ceiling_db / 20.0);
+        if true_peak > 0.0 {
+            let max_for_ceil = ceil_lin / true_peak;
+            if lin > max_for_ceil {
+                lin = max_for_ceil;
+            }
         }
     }
     if let Some(maxg) = plan.max_gain_db {
@@ -160,6 +165,21 @@ fn clamp_gain(mut lin: f64, true_peak: f64, plan: &Plan) -> f32 {
 
 /// Apply `gain` to every channel, then a safety brick-wall clip to the ceiling.
 pub fn apply_gain_and_protect(buf: &mut AudioBuffer, gain: f32, plan: &Plan) {
+    if let Some(config) = plan.limiter {
+        apply_gain(&mut buf.data, gain);
+        let mut limiter =
+            TruePeakLimiter::new(buf.sample_rate, buf.channels, plan.ceiling_db, config)
+                .expect("validated limiter configuration");
+        let mut output = limiter
+            .process(&buf.data)
+            .expect("AudioBuffer channel layout is internally consistent");
+        let tail = limiter.finish();
+        for (channel, tail) in output.iter_mut().zip(tail) {
+            channel.extend(tail);
+        }
+        buf.data = output;
+        return;
+    }
     let ceil_lin = 10.0_f64.powf(plan.ceiling_db / 20.0) as f32;
     for ch in buf.data.iter_mut() {
         simd::apply_gain(ch, gain);
@@ -359,8 +379,7 @@ fn normalize_stream(
                 plan.dither,
             )
             .map_err(|error| format!("write {}: {error}", output.display()))?;
-            decoder::decode_stream(input, |_, planar| {
-                gain_chunk(planar, gain, ceiling);
+            process_normalized_stream(input, analysis, gain, ceiling, plan, |planar| {
                 writer
                     .write_chunk(planar)
                     .map_err(|error| format!("write {}: {error}", output.display()))
@@ -378,8 +397,7 @@ fn normalize_stream(
                 bits,
                 plan.dither,
             )?;
-            decoder::decode_stream(input, |_, planar| {
-                gain_chunk(planar, gain, ceiling);
+            process_normalized_stream(input, analysis, gain, ceiling, plan, |planar| {
                 writer.write_chunk(planar)
             })?;
             writer.finish()
@@ -394,8 +412,7 @@ fn normalize_stream(
                     plan.mp3_bitrate,
                     plan.mp3_quality,
                 )?;
-                decoder::decode_stream(input, |_, planar| {
-                    gain_chunk(planar, gain, ceiling);
+                process_normalized_stream(input, analysis, gain, ceiling, plan, |planar| {
                     writer.write_chunk(planar)
                 })?;
                 writer.finish()
@@ -409,10 +426,57 @@ fn normalize_stream(
     }
 }
 
+fn process_normalized_stream(
+    input: &Path,
+    analysis: &Analysis,
+    gain: f32,
+    ceiling: f32,
+    plan: &Plan,
+    mut write: impl FnMut(&[Vec<f32>]) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut limiter = plan
+        .limiter
+        .map(|config| {
+            TruePeakLimiter::new(
+                analysis.sample_rate,
+                analysis.channels,
+                plan.ceiling_db,
+                config,
+            )
+        })
+        .transpose()?;
+    decoder::decode_stream(input, |_, planar| {
+        if let Some(limiter) = limiter.as_mut() {
+            apply_gain(planar, gain);
+            let output = limiter.process(planar)?;
+            if output.first().is_some_and(|channel| !channel.is_empty()) {
+                write(&output)?;
+            }
+        } else {
+            gain_chunk(planar, gain, ceiling);
+            write(planar)?;
+        }
+        Ok(())
+    })?;
+    if let Some(limiter) = limiter {
+        let tail = limiter.finish();
+        if tail.first().is_some_and(|channel| !channel.is_empty()) {
+            write(&tail)?;
+        }
+    }
+    Ok(())
+}
+
 fn flac_bits(kind: PcmKind) -> Result<u16, String> {
     match kind {
         PcmKind::U8 | PcmKind::S16 => Ok(16),
         PcmKind::S24 | PcmKind::S32 | PcmKind::F32 | PcmKind::F64 => Ok(24),
+    }
+}
+
+fn apply_gain(planar: &mut [Vec<f32>], gain: f32) {
+    for channel in planar {
+        simd::apply_gain(channel, gain);
     }
 }
 

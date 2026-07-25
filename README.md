@@ -171,6 +171,9 @@ forge album/*.flac --album --write-tags
 # Re-decode the completed file and fail if level/true-peak verification misses
 forge track.wav -o track.flac --verify
 
+# Reach the loudness target through isolated peaks with a true-peak limiter
+forge track.wav -o track.flac --limiter --verify
+
 # Print the gain that would be applied, write nothing
 forge --gain-only track.wav --target=-14
 
@@ -202,6 +205,9 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--write-tags` | off | Write ReplayGain 2.0 metadata without changing audio |
 | `--verify` | off | Re-decode output and verify achieved level and true peak |
 | `--verify-tolerance` | `0.5` | Allowed post-encode deviation in LU/dB |
+| `--limiter` | off | Look-ahead 4× oversampled true-peak limiter |
+| `--limiter-lookahead` | `5` | Limiter look-ahead in milliseconds |
+| `--limiter-release` | `100` | Limiter release time in milliseconds |
 | `--dither` | off | TPDF dither for integer PCM output |
 | `--bits` | input's | `8`/`16`/`24`/`32`/`32f`/`64f` output format |
 | `-j, --jobs` | all cores | Worker thread count |
@@ -228,6 +234,7 @@ src/
     simd.rs         AVX2+FMA / scalar gain, sum-of-squares, abs-max
     kwfilter.rs     BS.1770 K-weighting (two biquads, sample-rate independent)
     lufs.rs         gated integrated loudness + RMS/peak
+    limiter.rs      streaming look-ahead true-peak limiter
     truepeak.rs     4x polyphase FIR true-peak meter
   normalize.rs      analyze -> gain (ceiling-protected) -> apply -> write; album mode
 build.rs            optionally links libmp3lame for MP3 encoding
@@ -242,8 +249,8 @@ tests/
   formats need only the Rust crates (symphonia).
 * AAC/ALAC/Vorbis can be read but are written as WAV/FLAC (or MP3 with its
   optional feature); Forge does not encode those source containers directly.
-* Linear normalization (no dynamic/look-ahead limiter). The
-  true-peak ceiling is enforced by reducing the global gain, which is the
-  transparent, artifact-free approach used for loudness normalization.
+* By default, the true-peak ceiling is enforced transparently by reducing
+  global gain. `--limiter` opts into dynamic look-ahead limiting when reaching
+  the loudness target matters more than preserving dynamics unchanged.
 * MP3 is lossy: re-encoding shifts loudness by ~0.2–0.4 LU per pass. For
   production work, normalize to WAV/FLAC and encode to MP3 once at the end.

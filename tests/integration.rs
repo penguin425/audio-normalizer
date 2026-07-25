@@ -6,6 +6,7 @@
 //! the entire read -> measure -> gain -> write -> read round trip.
 
 use forge_normalizer::decoder;
+use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::normalize::{self, Mode, OutputFormat, Plan};
 use forge_normalizer::wav::{default_channel_roles, AudioBuffer, PcmKind, WavReader, WavWriter};
 use lofty::config::WriteOptions;
@@ -58,6 +59,7 @@ fn flac_output_roundtrips_at_16_and_24_bits() {
             output_kind: Some(kind),
             mp3_bitrate: 192,
             mp3_quality: 2,
+            limiter: None,
         };
         normalize::normalize_one(&input, &output, &plan, OutputFormat::Flac).unwrap();
         let decoded = decoder::decode(&output).unwrap();
@@ -86,6 +88,7 @@ fn replaygain_tags_leave_decoded_audio_unchanged() {
         output_kind: Some(PcmKind::S24),
         mp3_bitrate: 192,
         mp3_quality: 2,
+        limiter: None,
     };
     normalize::write(&buf, &input, &plan, OutputFormat::Flac).unwrap();
     let before = decoder::decode(&input).unwrap();
@@ -129,6 +132,7 @@ fn post_encode_verification_detects_level_mismatch() {
         output_kind: Some(PcmKind::S24),
         mp3_bitrate: 192,
         mp3_quality: 2,
+        limiter: None,
     };
     let (source, gain) =
         normalize::normalize_one(&input, &output, &plan, OutputFormat::Flac).unwrap();
@@ -141,6 +145,42 @@ fn post_encode_verification_detects_level_mismatch() {
     let invalid = normalize::verify_file(&output, &source, wrong_gain, &plan, 0.5).unwrap();
     assert!(!invalid.level_ok);
     assert!(!invalid.passed());
+    let _ = std::fs::remove_file(input);
+    let _ = std::fs::remove_file(output);
+}
+
+#[test]
+fn true_peak_limiter_reaches_loudness_despite_isolated_transient() {
+    let input = tmp_path("forge_it_limiter_in.wav");
+    let output = tmp_path("forge_it_limiter_out.flac");
+    let mut buf = synth_sine(48_000, 6.0, 0.02, 1000.0, 2);
+    for channel in &mut buf.data {
+        channel[48_000] = 0.95;
+    }
+    WavWriter::write(&input, &buf, PcmKind::F32, false).unwrap();
+    let plan = Plan {
+        mode: Mode::Lufs,
+        target_lufs: -16.0,
+        target_peak_db: -1.0,
+        target_rms_db: -18.0,
+        ceiling_db: -1.0,
+        max_gain_db: None,
+        dither: false,
+        output_kind: Some(PcmKind::S24),
+        mp3_bitrate: 192,
+        mp3_quality: 2,
+        limiter: Some(LimiterConfig::default()),
+    };
+    let (source, gain) =
+        normalize::normalize_one(&input, &output, &plan, OutputFormat::Flac).unwrap();
+    assert!(20.0 * (gain as f64).log10() > 10.0);
+    let result = normalize::analyze_file(&output).unwrap();
+    assert!((result.lufs - plan.target_lufs).abs() < 0.3, "{result:?}");
+    assert!(
+        result.true_peak_db() <= plan.ceiling_db + 0.05,
+        "{result:?}"
+    );
+    assert!(source.true_peak_db() > -1.0);
     let _ = std::fs::remove_file(input);
     let _ = std::fs::remove_file(output);
 }
@@ -170,6 +210,7 @@ fn roundtrip_lufs_hits_target() {
         output_kind: Some(PcmKind::F32),
         mp3_bitrate: 192,
         mp3_quality: 2,
+        limiter: None,
     };
     let (an, _gain) = normalize::normalize_one(&inp, &outp, &plan, OutputFormat::Wav).unwrap();
     assert!(an.lufs < -19.0 && an.lufs > -21.0, "input LUFS {}", an.lufs);
@@ -217,6 +258,7 @@ fn roundtrip_peak_mode_hits_target() {
         output_kind: None,
         mp3_bitrate: 192,
         mp3_quality: 2,
+        limiter: None,
     };
     let (an, _gain) = normalize::normalize_one(&inp, &outp, &plan, OutputFormat::Wav).unwrap();
     let in_peak_db = an.sample_peak_db();
@@ -260,6 +302,7 @@ fn album_mode_applies_shared_gain() {
         output_kind: None,
         mp3_bitrate: 192,
         mp3_quality: 2,
+        limiter: None,
     };
     let results = normalize::normalize_album(
         &[i1.clone(), i2.clone()],
@@ -364,6 +407,7 @@ fn mp3_encode_and_decode_roundtrip() {
         output_kind: None,
         mp3_bitrate: 192,
         mp3_quality: 2,
+        limiter: None,
     };
 
     // WAV -> MP3 (encode via LAME).
