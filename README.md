@@ -13,7 +13,7 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
 
 | | Read (decode) | Write (encode) |
 |---|---|---|
-| **WAV** (PCM 8/16/24/32-bit, float 32/64-bit) | Forge's own fast parallel demuxer | Forge's own muxer |
+| **WAV / RF64 / BW64** (PCM 8/16/24/32-bit, float 32/64-bit) | Forge's own fast parallel demuxer | Forge's own muxer |
 | **MP3** | symphonia (pure Rust) | LAME via FFI |
 | **FLAC** (16/24-bit, up to 8 channels) | symphonia (pure Rust) | flacenc (pure Rust) |
 | **Ogg Opus** (mono/stereo) | libopus + pure-Rust Ogg | libopus + pure-Rust Ogg |
@@ -35,6 +35,8 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
   engine consumes.
 * Common metadata fields and embedded artwork are preserved across
   normalization and remapped to the destination container's primary tag type.
+* Broadcast Wave output can preserve `bext`, ADM `axml`/`chna`, and iXML chunks.
+  BWF v2 measured loudness fields are updated from the normalized output.
 
 By default the output container follows the input where Forge can encode it
 (FLAC → FLAC, MP3 → MP3), and otherwise falls back to lossless WAV.
@@ -87,9 +89,9 @@ Decoded MP3 output lands within ~0.3 LU of the target (lossy round-trip).
   channels; `--channel-layout` can override missing or incorrect metadata.
 * **EBU Mode analysis** reports Integrated, maximum Momentary (400 ms), maximum
   Short-term (3 s), and Loudness Range (LRA) measurements.
-* **EBU R128 compliance reports** evaluate programme loudness against
-  −23.0 ±0.2 LU and maximum true peak against −1.0 dBTP, with separate and
-  aggregate PASS/FAIL fields in JSON and CSV.
+* **Delivery compliance reports** include EBU R 128, ATSC A/85 short-form, and
+  AES77 presets plus custom JSON/TOML profiles. Every evaluated rule and the
+  aggregate PASS/FAIL result are available in machine-readable reports.
 * **True peak** is measured by 4× polyphase FIR oversampling (Kaiser-windowed
   lowpass, unity DC gain), so inter-sample peaks that exceed sample peaks are
   caught — and the gain is reduced so the output never clips after DAC
@@ -102,8 +104,9 @@ Decoded MP3 output lands within ~0.3 LU of the target (lossy round-trip).
 
 ## Formats
 
-Reads and writes PCM 8/16/24/32-bit and IEEE float 32/64-bit WAV, including
-`WAVE_FORMAT_EXTENSIBLE` files. Output format can be kept or overridden.
+Reads and writes PCM 8/16/24/32-bit and IEEE float 32/64-bit RIFF/WAVE, RF64,
+and BW64, including `WAVE_FORMAT_EXTENSIBLE` files. `auto` switches from RIFF
+to RF64 when the output would exceed 4 GiB.
 
 ## Build
 
@@ -204,6 +207,13 @@ forge --analyze album/*.flac --csv report.csv
 # Machine-readable EBU R128 delivery checks
 forge --analyze programme.wav --compliance ebu-r128 --json
 
+# Short-form broadcast QC and a station-specific JSON/TOML profile
+forge --analyze commercial.wav --compliance ebu-r128-short --json
+forge --analyze programme.wav --compliance station-qc.toml --csv qc.csv
+
+# Produce a BW64 Broadcast Wave master while preserving ADM/iXML metadata
+forge programme.wav -o delivery.wav --format wav --bwf --wav-container bw64
+
 # Write ReplayGain 2.0 track tags without changing encoded audio
 forge song.flac --write-tags
 
@@ -254,7 +264,7 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--analyze` | off | Measure only; do not write files |
 | `--json` | off | Write analyze results as JSON to stdout |
 | `--csv` | none | Write analyze results as CSV to a file or `-` |
-| `--compliance` | none | Evaluate analysis against `ebu-r128` delivery limits |
+| `--compliance` | none | Built-in delivery profile name or custom `.json`/`.toml` profile |
 | `--gain-only` | off | Print the gain; write nothing |
 | `--write-tags` | off | Write ReplayGain 2.0 metadata without changing audio |
 | `--verify` | off | Re-decode output and verify achieved level and true peak |
@@ -265,6 +275,8 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--limiter-release` | `100` | Limiter release time in milliseconds |
 | `--dither` | off | TPDF dither for integer PCM output |
 | `--bits` | input's | `8`/`16`/`24`/`32`/`32f`/`64f` output format |
+| `--wav-container` | `auto` | `auto`, `riff`, `rf64`, or `bw64` WAV container |
+| `--bwf` | off | Preserve/write BWF v2 metadata and measured loudness fields |
 | `-j, --jobs` | all cores | Worker thread count |
 
 > Negative values need `=`: `--target=-16` (clap parses `-16` as a flag otherwise).
@@ -289,6 +301,38 @@ Service playback behavior can change and is not a substitute for a distributor's
 delivery specification; Apple Music, YouTube, and podcast entries are practical
 playback references rather than acceptance guarantees.
 
+### Delivery compliance profiles
+
+| Name | Integrated loudness | Additional limits |
+|------|---------------------|-------------------|
+| `ebu-r128` | −23.0 ±0.2 LUFS | true peak ≤ −1 dBTP |
+| `ebu-r128-short` | −23.0 ±0.2 LUFS | true peak ≤ −1 dBTP; max short-term ≤ −18 LUFS |
+| `atsc-a85-short` | −24 ±2 LUFS | true peak ≤ −2 dBTP |
+| `aes77-assorted` | ≤ −16 LUFS (target −18, upper tolerance +2) | true peak ≤ −1 dBTP |
+| `aes77-music-track` | −16.0 ±0.2 LUFS | true peak ≤ −1 dBTP |
+| `aes77-interstitial` | −18.0 ±0.2 LUFS | true peak ≤ −1 dBTP |
+
+ATSC long-form programme compliance requires dialogue-gated measurement and is
+therefore deliberately not implied by `atsc-a85-short`.
+
+Custom profiles use JSON or TOML. All fields except `name` are optional; a
+profile must define at least one rule:
+
+```toml
+name = "station-qc"
+target_lufs = -23.0
+lower_tolerance_lu = 1.0
+upper_tolerance_lu = 0.5
+max_true_peak_dbtp = -1.0
+max_short_term_lufs = -18.0
+max_momentary_lufs = -15.0
+min_loudness_range_lu = 3.0
+max_loudness_range_lu = 18.0
+```
+
+ADM chunks are carried through unchanged; Forge normalizes the rendered PCM
+bed and does not currently render or modify individual ADM objects.
+
 ## Architecture
 
 ```
@@ -301,8 +345,8 @@ src/
   mp3enc.rs         MP3 encoder via LAME FFI (interleaved f32 -> MP3 bytes)
   wav/
     format.rs       PcmKind / WaveFormat
-    reader.rs       RIFF/WAVE demuxer
-    writer.rs       RIFF/WAVE muxer
+    reader.rs       RIFF/WAVE, RF64, and BW64 demuxer
+    writer.rs       RIFF/WAVE, RF64, and BW64 muxer
     mod.rs          AudioBuffer (planar f32)
   dsp/
     convert.rs      PCM <-> f32, parallel decode, TPDF-dithered encode

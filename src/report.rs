@@ -1,64 +1,245 @@
 //! Stable machine-readable analysis reports.
 
 use crate::normalize::Analysis;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy)]
-pub enum ComplianceProfile {
-    EbuR128,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComplianceProfile {
+    pub name: String,
+    pub target_lufs: Option<f64>,
+    pub loudness_tolerance_lu: Option<f64>,
+    pub lower_tolerance_lu: Option<f64>,
+    pub upper_tolerance_lu: Option<f64>,
+    pub max_true_peak_dbtp: Option<f64>,
+    pub max_short_term_lufs: Option<f64>,
+    pub max_momentary_lufs: Option<f64>,
+    pub min_loudness_range_lu: Option<f64>,
+    pub max_loudness_range_lu: Option<f64>,
 }
 
 impl ComplianceProfile {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::EbuR128 => "ebu-r128",
+    pub fn builtin(name: &str) -> Option<Self> {
+        let profile = match name {
+            "ebu-r128" => Self::symmetric("ebu-r128", -23.0, 0.2, -1.0),
+            "ebu-r128-short" => Self {
+                max_short_term_lufs: Some(-18.0),
+                ..Self::symmetric("ebu-r128-short", -23.0, 0.2, -1.0)
+            },
+            "atsc-a85-short" => Self::symmetric("atsc-a85-short", -24.0, 2.0, -2.0),
+            "aes77-assorted" => Self {
+                name: "aes77-assorted".into(),
+                target_lufs: Some(-18.0),
+                loudness_tolerance_lu: None,
+                lower_tolerance_lu: None,
+                upper_tolerance_lu: Some(2.0),
+                max_true_peak_dbtp: Some(-1.0),
+                max_short_term_lufs: None,
+                max_momentary_lufs: None,
+                min_loudness_range_lu: None,
+                max_loudness_range_lu: None,
+            },
+            "aes77-music-track" => Self::symmetric("aes77-music-track", -16.0, 0.2, -1.0),
+            "aes77-interstitial" => Self::symmetric("aes77-interstitial", -18.0, 0.2, -1.0),
+            _ => return None,
+        };
+        Some(profile)
+    }
+
+    fn symmetric(name: &str, target: f64, tolerance: f64, true_peak: f64) -> Self {
+        Self {
+            name: name.into(),
+            target_lufs: Some(target),
+            loudness_tolerance_lu: Some(tolerance),
+            lower_tolerance_lu: None,
+            upper_tolerance_lu: None,
+            max_true_peak_dbtp: Some(true_peak),
+            max_short_term_lufs: None,
+            max_momentary_lufs: None,
+            min_loudness_range_lu: None,
+            max_loudness_range_lu: None,
         }
     }
 
-    pub fn target_lufs(self) -> f64 {
-        match self {
-            Self::EbuR128 => -23.0,
+    pub fn load(name_or_path: &str) -> Result<Self, String> {
+        if let Some(profile) = Self::builtin(name_or_path) {
+            return Ok(profile);
         }
+        let path = Path::new(name_or_path);
+        let text = fs::read_to_string(path)
+            .map_err(|error| format!("read compliance profile {}: {error}", path.display()))?;
+        let profile: Self = match path.extension().and_then(|value| value.to_str()) {
+            Some("json") => serde_json::from_str(&text)
+                .map_err(|error| format!("parse JSON profile {}: {error}", path.display()))?,
+            Some("toml") => toml::from_str(&text)
+                .map_err(|error| format!("parse TOML profile {}: {error}", path.display()))?,
+            _ => {
+                return Err("custom compliance profiles must use a .json or .toml extension".into())
+            }
+        };
+        profile.validate()?;
+        Ok(profile)
     }
 
-    pub fn loudness_tolerance_lu(self) -> f64 {
-        match self {
-            Self::EbuR128 => 0.2,
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() {
+            return Err("compliance profile name cannot be empty".into());
         }
+        if self.loudness_tolerance_lu.is_some()
+            && (self.lower_tolerance_lu.is_some() || self.upper_tolerance_lu.is_some())
+        {
+            return Err(
+                "use either loudness_tolerance_lu or asymmetric lower/upper tolerances".into(),
+            );
+        }
+        if self.target_lufs.is_some()
+            && self.loudness_tolerance_lu.is_none()
+            && self.lower_tolerance_lu.is_none()
+            && self.upper_tolerance_lu.is_none()
+        {
+            return Err("target_lufs requires at least one loudness tolerance".into());
+        }
+        let values = [
+            self.target_lufs,
+            self.loudness_tolerance_lu,
+            self.lower_tolerance_lu,
+            self.upper_tolerance_lu,
+            self.max_true_peak_dbtp,
+            self.max_short_term_lufs,
+            self.max_momentary_lufs,
+            self.min_loudness_range_lu,
+            self.max_loudness_range_lu,
+        ];
+        if values.into_iter().flatten().any(|value| !value.is_finite()) {
+            return Err("compliance profile values must be finite".into());
+        }
+        if [
+            self.loudness_tolerance_lu,
+            self.lower_tolerance_lu,
+            self.upper_tolerance_lu,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| value < 0.0)
+        {
+            return Err("loudness tolerances must be non-negative".into());
+        }
+        if self.target_lufs.is_none()
+            && self.max_true_peak_dbtp.is_none()
+            && self.max_short_term_lufs.is_none()
+            && self.max_momentary_lufs.is_none()
+            && self.min_loudness_range_lu.is_none()
+            && self.max_loudness_range_lu.is_none()
+        {
+            return Err("compliance profile must define at least one rule".into());
+        }
+        if self
+            .min_loudness_range_lu
+            .zip(self.max_loudness_range_lu)
+            .is_some_and(|(minimum, maximum)| minimum > maximum)
+        {
+            return Err("minimum loudness range exceeds maximum".into());
+        }
+        Ok(())
     }
 
-    pub fn max_true_peak_dbtp(self) -> f64 {
-        match self {
-            Self::EbuR128 => -1.0,
+    pub fn evaluate(&self, analysis: &Analysis) -> ComplianceResult {
+        let mut rules = Vec::new();
+        if let Some(target) = self.target_lufs {
+            let lower = target
+                - self
+                    .loudness_tolerance_lu
+                    .or(self.lower_tolerance_lu)
+                    .unwrap_or(f64::INFINITY);
+            let upper = target
+                + self
+                    .loudness_tolerance_lu
+                    .or(self.upper_tolerance_lu)
+                    .unwrap_or(f64::INFINITY);
+            rules.push(ComplianceRuleResult::range(
+                "integrated_lufs",
+                analysis.lufs,
+                lower,
+                upper,
+            ));
         }
-    }
-
-    pub fn evaluate(self, analysis: &Analysis) -> ComplianceResult {
-        let loudness_pass =
-            (analysis.lufs - self.target_lufs()).abs() <= self.loudness_tolerance_lu();
-        let true_peak_pass = analysis.true_peak_db() <= self.max_true_peak_dbtp();
+        add_max_rule(
+            &mut rules,
+            "true_peak_dbtp",
+            analysis.true_peak_db(),
+            self.max_true_peak_dbtp,
+        );
+        add_max_rule(
+            &mut rules,
+            "max_short_term_lufs",
+            analysis.max_short_term_lufs,
+            self.max_short_term_lufs,
+        );
+        add_max_rule(
+            &mut rules,
+            "max_momentary_lufs",
+            analysis.max_momentary_lufs,
+            self.max_momentary_lufs,
+        );
+        if self.min_loudness_range_lu.is_some() || self.max_loudness_range_lu.is_some() {
+            rules.push(ComplianceRuleResult::range(
+                "loudness_range_lu",
+                analysis.loudness_range_lu,
+                self.min_loudness_range_lu.unwrap_or(f64::NEG_INFINITY),
+                self.max_loudness_range_lu.unwrap_or(f64::INFINITY),
+            ));
+        }
         ComplianceResult {
-            profile: self.name(),
-            target_lufs: self.target_lufs(),
-            loudness_tolerance_lu: self.loudness_tolerance_lu(),
-            max_true_peak_dbtp: self.max_true_peak_dbtp(),
-            loudness_pass,
-            true_peak_pass,
-            passed: loudness_pass && true_peak_pass,
+            profile: self.name.clone(),
+            passed: rules.iter().all(|rule| rule.passed),
+            rules,
         }
+    }
+}
+
+fn add_max_rule(
+    rules: &mut Vec<ComplianceRuleResult>,
+    metric: &'static str,
+    measured: f64,
+    maximum: Option<f64>,
+) {
+    if let Some(maximum) = maximum {
+        rules.push(ComplianceRuleResult::maximum(metric, measured, maximum));
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ComplianceRuleResult {
+    pub metric: &'static str,
+    pub measured: f64,
+    pub minimum: Option<f64>,
+    pub maximum: Option<f64>,
+    pub passed: bool,
+}
+
+impl ComplianceRuleResult {
+    fn range(metric: &'static str, measured: f64, minimum: f64, maximum: f64) -> Self {
+        Self {
+            metric,
+            measured,
+            minimum: minimum.is_finite().then_some(minimum),
+            maximum: maximum.is_finite().then_some(maximum),
+            passed: measured >= minimum && measured <= maximum,
+        }
+    }
+
+    fn maximum(metric: &'static str, measured: f64, maximum: f64) -> Self {
+        Self::range(metric, measured, f64::NEG_INFINITY, maximum)
     }
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ComplianceResult {
-    pub profile: &'static str,
-    pub target_lufs: f64,
-    pub loudness_tolerance_lu: f64,
-    pub max_true_peak_dbtp: f64,
-    pub loudness_pass: bool,
-    pub true_peak_pass: bool,
+    pub profile: String,
+    pub rules: Vec<ComplianceRuleResult>,
     pub passed: bool,
 }
 
@@ -76,12 +257,23 @@ pub struct AnalysisReport {
     pub rms_dbfs: f64,
     pub sample_peak_dbfs: f64,
     pub true_peak_dbtp: f64,
-    pub compliance_profile: Option<&'static str>,
+    pub compliance_profile: Option<String>,
     pub compliance_target_lufs: Option<f64>,
     pub compliance_loudness_tolerance_lu: Option<f64>,
+    pub compliance_lower_tolerance_lu: Option<f64>,
+    pub compliance_upper_tolerance_lu: Option<f64>,
     pub compliance_max_true_peak_dbtp: Option<f64>,
     pub compliance_loudness_pass: Option<bool>,
     pub compliance_true_peak_pass: Option<bool>,
+    pub compliance_max_short_term_lufs: Option<f64>,
+    pub compliance_short_term_pass: Option<bool>,
+    pub compliance_max_momentary_lufs: Option<f64>,
+    pub compliance_momentary_pass: Option<bool>,
+    pub compliance_min_loudness_range_lu: Option<f64>,
+    pub compliance_max_loudness_range_lu: Option<f64>,
+    pub compliance_loudness_range_pass: Option<bool>,
+    /// Complete evaluated rule set, encoded as JSON so CSV remains flat.
+    pub compliance_rules_json: Option<String>,
     pub compliance_passed: Option<bool>,
 }
 
@@ -93,7 +285,7 @@ impl AnalysisReport {
     pub fn with_compliance(
         path: &Path,
         analysis: &Analysis,
-        profile: Option<ComplianceProfile>,
+        profile: Option<&ComplianceProfile>,
     ) -> Self {
         let compliance = profile.map(|profile| profile.evaluate(analysis));
         Self {
@@ -116,19 +308,37 @@ impl AnalysisReport {
             rms_dbfs: analysis.rms_db,
             sample_peak_dbfs: analysis.sample_peak_db(),
             true_peak_dbtp: analysis.true_peak_db(),
-            compliance_profile: compliance.as_ref().map(|result| result.profile),
-            compliance_target_lufs: compliance.as_ref().map(|result| result.target_lufs),
-            compliance_loudness_tolerance_lu: compliance
-                .as_ref()
-                .map(|result| result.loudness_tolerance_lu),
-            compliance_max_true_peak_dbtp: compliance
-                .as_ref()
-                .map(|result| result.max_true_peak_dbtp),
-            compliance_loudness_pass: compliance.as_ref().map(|result| result.loudness_pass),
-            compliance_true_peak_pass: compliance.as_ref().map(|result| result.true_peak_pass),
+            compliance_profile: compliance.as_ref().map(|result| result.profile.clone()),
+            compliance_target_lufs: profile.and_then(|value| value.target_lufs),
+            compliance_loudness_tolerance_lu: profile.and_then(|value| value.loudness_tolerance_lu),
+            compliance_lower_tolerance_lu: profile.and_then(|value| value.lower_tolerance_lu),
+            compliance_upper_tolerance_lu: profile.and_then(|value| value.upper_tolerance_lu),
+            compliance_max_true_peak_dbtp: profile.and_then(|value| value.max_true_peak_dbtp),
+            compliance_loudness_pass: rule_pass(&compliance, "integrated_lufs"),
+            compliance_true_peak_pass: rule_pass(&compliance, "true_peak_dbtp"),
+            compliance_max_short_term_lufs: profile.and_then(|value| value.max_short_term_lufs),
+            compliance_short_term_pass: rule_pass(&compliance, "max_short_term_lufs"),
+            compliance_max_momentary_lufs: profile.and_then(|value| value.max_momentary_lufs),
+            compliance_momentary_pass: rule_pass(&compliance, "max_momentary_lufs"),
+            compliance_min_loudness_range_lu: profile.and_then(|value| value.min_loudness_range_lu),
+            compliance_max_loudness_range_lu: profile.and_then(|value| value.max_loudness_range_lu),
+            compliance_loudness_range_pass: rule_pass(&compliance, "loudness_range_lu"),
+            compliance_rules_json: compliance.as_ref().map(|result| {
+                serde_json::to_string(&result.rules).expect("compliance rules are serializable")
+            }),
             compliance_passed: compliance.as_ref().map(|result| result.passed),
         }
     }
+}
+
+fn rule_pass(compliance: &Option<ComplianceResult>, metric: &str) -> Option<bool> {
+    compliance.as_ref().and_then(|result| {
+        result
+            .rules
+            .iter()
+            .find(|rule| rule.metric == metric)
+            .map(|rule| rule.passed)
+    })
 }
 
 pub fn write_json<W: Write>(writer: W, reports: &[AnalysisReport]) -> Result<(), String> {
@@ -165,9 +375,19 @@ mod tests {
             compliance_profile: None,
             compliance_target_lufs: None,
             compliance_loudness_tolerance_lu: None,
+            compliance_lower_tolerance_lu: None,
+            compliance_upper_tolerance_lu: None,
             compliance_max_true_peak_dbtp: None,
             compliance_loudness_pass: None,
             compliance_true_peak_pass: None,
+            compliance_max_short_term_lufs: None,
+            compliance_short_term_pass: None,
+            compliance_max_momentary_lufs: None,
+            compliance_momentary_pass: None,
+            compliance_min_loudness_range_lu: None,
+            compliance_max_loudness_range_lu: None,
+            compliance_loudness_range_pass: None,
+            compliance_rules_json: None,
             compliance_passed: None,
         }
     }
@@ -195,6 +415,7 @@ mod tests {
         let mut analysis = crate::normalize::Analysis {
             sample_rate: 48_000,
             channels: 2,
+            channel_roles: crate::wav::default_channel_roles(2),
             frames: 48_000,
             kind: crate::wav::PcmKind::S24,
             lufs: -23.1,
@@ -206,11 +427,114 @@ mod tests {
             true_peak: 0.8,
             loudness_blocks: Vec::new(),
         };
-        assert!(ComplianceProfile::EbuR128.evaluate(&analysis).passed);
+        let profile = ComplianceProfile::builtin("ebu-r128").unwrap();
+        assert!(profile.evaluate(&analysis).passed);
         analysis.true_peak = 1.0;
-        let result = ComplianceProfile::EbuR128.evaluate(&analysis);
-        assert!(result.loudness_pass);
-        assert!(!result.true_peak_pass);
+        let result = profile.evaluate(&analysis);
+        assert!(
+            result
+                .rules
+                .iter()
+                .find(|rule| rule.metric == "integrated_lufs")
+                .unwrap()
+                .passed
+        );
+        assert!(
+            !result
+                .rules
+                .iter()
+                .find(|rule| rule.metric == "true_peak_dbtp")
+                .unwrap()
+                .passed
+        );
         assert!(!result.passed);
+    }
+
+    #[test]
+    fn short_form_profile_checks_short_term_loudness() {
+        let mut report = sample_report();
+        let analysis = crate::normalize::Analysis {
+            sample_rate: report.sample_rate_hz,
+            channels: report.channels,
+            channel_roles: crate::wav::default_channel_roles(report.channels),
+            frames: 48_000,
+            kind: crate::wav::PcmKind::S24,
+            lufs: -23.0,
+            max_momentary_lufs: report.max_momentary_lufs,
+            max_short_term_lufs: -17.9,
+            loudness_range_lu: report.loudness_range_lu,
+            rms_db: report.rms_dbfs,
+            sample_peak: 0.5,
+            true_peak: 0.5,
+            loudness_blocks: Vec::new(),
+        };
+        let profile = ComplianceProfile::builtin("ebu-r128-short").unwrap();
+        let result = profile.evaluate(&analysis);
+        assert!(!result.passed);
+        report.compliance_passed = Some(result.passed);
+        assert_eq!(report.compliance_passed, Some(false));
+    }
+
+    #[test]
+    fn custom_profile_validation_rejects_conflicting_tolerances() {
+        let profile = ComplianceProfile {
+            name: "custom".into(),
+            target_lufs: Some(-20.0),
+            loudness_tolerance_lu: Some(1.0),
+            lower_tolerance_lu: None,
+            upper_tolerance_lu: Some(2.0),
+            max_true_peak_dbtp: None,
+            max_short_term_lufs: None,
+            max_momentary_lufs: None,
+            min_loudness_range_lu: None,
+            max_loudness_range_lu: None,
+        };
+        assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn custom_json_and_toml_profiles_load() {
+        let json_path = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        std::fs::write(
+            json_path.path(),
+            r#"{
+                "name": "station-json",
+                "target_lufs": -20.0,
+                "loudness_tolerance_lu": 1.0,
+                "lower_tolerance_lu": null,
+                "upper_tolerance_lu": null,
+                "max_true_peak_dbtp": -1.0,
+                "max_short_term_lufs": null,
+                "max_momentary_lufs": null,
+                "min_loudness_range_lu": null,
+                "max_loudness_range_lu": null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ComplianceProfile::load(json_path.path().to_str().unwrap())
+                .unwrap()
+                .name,
+            "station-json"
+        );
+
+        let toml_path = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        std::fs::write(
+            toml_path.path(),
+            r#"
+                name = "station-toml"
+                target_lufs = -18.0
+                lower_tolerance_lu = 1.0
+                upper_tolerance_lu = 2.0
+                max_true_peak_dbtp = -1.0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            ComplianceProfile::load(toml_path.path().to_str().unwrap())
+                .unwrap()
+                .upper_tolerance_lu,
+            Some(2.0)
+        );
     }
 }

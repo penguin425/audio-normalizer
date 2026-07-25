@@ -125,11 +125,9 @@ pub struct Cli {
     pub csv: Option<PathBuf>,
 
     /// Evaluate analysis against a delivery specification.
-    #[arg(
-        long,
-        value_parser = ["ebu-r128"],
-        requires = "analyze_only"
-    )]
+    ///
+    /// Accepts a built-in name or a custom .json/.toml profile path.
+    #[arg(long, requires = "analyze_only")]
     pub compliance: Option<String>,
 
     /// Print the gain that would be applied; write nothing.
@@ -184,6 +182,18 @@ pub struct Cli {
     /// Default: keep the input's format.
     #[arg(long = "bits", value_parser = ["8", "16", "24", "32", "32f", "64f"])]
     pub bits: Option<String>,
+
+    /// WAV container: auto selects RIFF below 4 GiB and RF64 above it.
+    #[arg(
+        long = "wav-container",
+        value_parser = ["auto", "riff", "rf64", "bw64"],
+        default_value = "auto"
+    )]
+    pub wav_container: String,
+
+    /// Write/preserve a Broadcast Wave bext chunk and measured R128 fields.
+    #[arg(long)]
+    pub bwf: bool,
 
     /// Number of worker threads (default: all logical cores).
     #[arg(short = 'j', long = "jobs")]
