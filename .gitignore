@@ -1,0 +1,13 @@
+/target/
+
+# Local editor and OS metadata
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local environment and logs
+.env
+.env.*
+*.log

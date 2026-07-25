@@ -1,0 +1,6 @@
+# Build configuration for Forge.
+# Compile for the host CPU so LLVM can emit AVX2/AVX-512/FMA and auto-vectorize
+# the DSP hot loops. The SIMD module still does runtime feature detection, so the
+# binary remains portable (it falls back to scalar on older CPUs).
+[build]
+rustflags = ["-C", "target-cpu=native"]
