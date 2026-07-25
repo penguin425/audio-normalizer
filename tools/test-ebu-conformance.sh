@@ -3,7 +3,13 @@ set -euo pipefail
 
 readonly ARCHIVE_NAME="ebu-loudness-test-setv05.zip"
 readonly ARCHIVE_SHA256="9cc500b4df83f7c21855c74dce795ef5209a752bf884253ae57d0ce512efb062"
-readonly MIRROR_URL="https://mirrors.mit.edu/gentoo-distfiles/distfiles/de/${ARCHIVE_NAME}"
+readonly SOURCE_URLS=(
+    "https://mirror.iro.umontreal.ca/gentoo/gentoo/distfiles/de/${ARCHIVE_NAME}"
+    "https://mirrors.nju.edu.cn/gentoo/distfiles/de/${ARCHIVE_NAME}"
+    "https://ftp.jaist.ac.jp/pub/Linux/Gentoo/distfiles/de/${ARCHIVE_NAME}"
+    "https://ftp.lysator.liu.se/pub/gentoo/distfiles/de/${ARCHIVE_NAME}"
+    "https://mirrors.mit.edu/gentoo-distfiles/distfiles/de/${ARCHIVE_NAME}"
+)
 readonly CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/forge-normalizer"
 readonly ARCHIVE_PATH="${CACHE_DIR}/${ARCHIVE_NAME}"
 readonly FIXTURE_DIR="${CACHE_DIR}/ebu-loudness-test-setv05"
@@ -11,9 +17,16 @@ readonly FIXTURE_DIR="${CACHE_DIR}/ebu-loudness-test-setv05"
 mkdir -p "${CACHE_DIR}" "${FIXTURE_DIR}"
 
 if [[ ! -f "${ARCHIVE_PATH}" ]]; then
-    curl --fail --location "${MIRROR_URL}" --output "${ARCHIVE_PATH}"
+    for source_url in "${SOURCE_URLS[@]}"; do
+        if curl --fail --location --retry 3 --retry-all-errors \
+            --connect-timeout 15 "${source_url}" --output "${ARCHIVE_PATH}"; then
+            break
+        fi
+        rm -f "${ARCHIVE_PATH}"
+    done
 fi
 
+test -f "${ARCHIVE_PATH}"
 printf '%s  %s\n' "${ARCHIVE_SHA256}" "${ARCHIVE_PATH}" | sha256sum --check -
 
 unzip -joq "${ARCHIVE_PATH}" \
