@@ -84,6 +84,12 @@ pub struct Analysis {
 }
 
 #[derive(Debug, Clone)]
+pub struct TimedAnalysis {
+    pub analysis: Analysis,
+    pub timeline: Vec<lufs::LoudnessTimelinePoint>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Verification {
     pub output: Analysis,
     pub expected_level: f64,
@@ -300,8 +306,34 @@ pub fn analyze_file_with_roles<P: AsRef<Path>>(
     path: P,
     channel_roles: Option<&[ChannelRole]>,
 ) -> Result<Analysis, String> {
+    Ok(analyze_file_range_with_roles(path, channel_roles, 0.0, None, None)?.analysis)
+}
+
+/// Analyze an optional source-time range and optionally capture a loudness
+/// timeline at the requested interval.
+pub fn analyze_file_range_with_roles<P: AsRef<Path>>(
+    path: P,
+    channel_roles: Option<&[ChannelRole]>,
+    start_seconds: f64,
+    duration_seconds: Option<f64>,
+    timeline_interval_ms: Option<f64>,
+) -> Result<TimedAnalysis, String> {
+    if !start_seconds.is_finite() || start_seconds < 0.0 {
+        return Err("analysis start must be a finite non-negative number".into());
+    }
+    if duration_seconds.is_some_and(|value| !value.is_finite() || value <= 0.0) {
+        return Err("analysis duration must be a finite positive number".into());
+    }
+    if timeline_interval_ms.is_some_and(|value| !value.is_finite() || value <= 0.0) {
+        return Err("timeline interval must be a finite positive number".into());
+    }
+
+    const RANGE_COMPLETE: &str = "__forge_analysis_range_complete__";
     let mut analyzer: Option<lufs::StreamingAnalyzer> = None;
-    let info = decoder::decode_stream(path.as_ref(), |info, chunk| {
+    let mut captured_info = None;
+    let mut source_frames = 0usize;
+    let decoded = decoder::decode_stream(path.as_ref(), |info, chunk| {
+        captured_info.get_or_insert_with(|| info.clone());
         if channel_roles.is_none()
             && info.channels > 6
             && info
@@ -327,29 +359,84 @@ pub fn analyze_file_with_roles<P: AsRef<Path>>(
         } else {
             info.channel_roles.clone()
         };
-        let meter =
-            analyzer.get_or_insert_with(|| lufs::StreamingAnalyzer::new(info.sample_rate, roles));
-        meter.process(chunk)
-    })?;
+        let range_start = (start_seconds * info.sample_rate as f64).round() as usize;
+        let range_end = duration_seconds.map(|duration| {
+            range_start.saturating_add((duration * info.sample_rate as f64).round() as usize)
+        });
+        let chunk_start = source_frames;
+        let chunk_end = source_frames + chunk.first().map_or(0, Vec::len);
+        source_frames = chunk_end;
+        if range_end.is_some_and(|end| chunk_start >= end) {
+            return Err(RANGE_COMPLETE.into());
+        }
+        let selected_start = range_start.saturating_sub(chunk_start);
+        let selected_end = range_end
+            .map_or(chunk_end, |end| end.min(chunk_end))
+            .saturating_sub(chunk_start);
+        if selected_start < selected_end {
+            let selected = chunk
+                .iter()
+                .map(|channel| channel[selected_start..selected_end].to_vec())
+                .collect::<Vec<_>>();
+            let interval_frames = timeline_interval_ms.map(|milliseconds| {
+                ((info.sample_rate as f64 * milliseconds / 1_000.0).round() as usize).max(1)
+            });
+            let meter = analyzer.get_or_insert_with(|| {
+                lufs::StreamingAnalyzer::with_timeline_interval(
+                    info.sample_rate,
+                    roles,
+                    interval_frames,
+                )
+            });
+            meter.process(&selected)?;
+        }
+        if range_end.is_some_and(|end| chunk_end >= end) {
+            Err(RANGE_COMPLETE.into())
+        } else {
+            Ok(())
+        }
+    });
+    let info = match decoded {
+        Ok(info) => info,
+        Err(error) if error == RANGE_COMPLETE => {
+            captured_info.ok_or_else(|| format!("{}: no audio decoded", path.as_ref().display()))?
+        }
+        Err(error) => return Err(error),
+    };
     let measured = analyzer
-        .ok_or_else(|| format!("{}: no audio decoded", path.as_ref().display()))?
+        .ok_or_else(|| {
+            format!(
+                "{}: requested analysis range contains no audio",
+                path.as_ref().display()
+            )
+        })?
         .finish();
-    Ok(Analysis {
-        sample_rate: info.sample_rate,
-        channels: info.channels,
-        channel_roles: channel_roles
-            .map(ToOwned::to_owned)
-            .unwrap_or(info.channel_roles),
-        frames: measured.frames,
-        kind: info.source_kind,
-        lufs: measured.ebu.integrated_lufs,
-        max_momentary_lufs: measured.ebu.max_momentary_lufs,
-        max_short_term_lufs: measured.ebu.max_short_term_lufs,
-        loudness_range_lu: measured.ebu.loudness_range_lu,
-        rms_db: measured.rms_db,
-        sample_peak: measured.sample_peak,
-        true_peak: measured.true_peak,
-        loudness_blocks: measured.ebu.gating_blocks,
+    let mut timeline = measured.timeline;
+    let actual_start_seconds = ((start_seconds * info.sample_rate as f64).round() as usize) as f64
+        / info.sample_rate as f64;
+    for point in &mut timeline {
+        point.start_seconds += actual_start_seconds;
+        point.end_seconds += actual_start_seconds;
+    }
+    Ok(TimedAnalysis {
+        analysis: Analysis {
+            sample_rate: info.sample_rate,
+            channels: info.channels,
+            channel_roles: channel_roles
+                .map(ToOwned::to_owned)
+                .unwrap_or(info.channel_roles),
+            frames: measured.frames,
+            kind: info.source_kind,
+            lufs: measured.ebu.integrated_lufs,
+            max_momentary_lufs: measured.ebu.max_momentary_lufs,
+            max_short_term_lufs: measured.ebu.max_short_term_lufs,
+            loudness_range_lu: measured.ebu.loudness_range_lu,
+            rms_db: measured.rms_db,
+            sample_peak: measured.sample_peak,
+            true_peak: measured.true_peak,
+            loudness_blocks: measured.ebu.gating_blocks,
+        },
+        timeline,
     })
 }
 

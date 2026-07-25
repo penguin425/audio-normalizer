@@ -1,6 +1,10 @@
 //! Command-line interface definition (clap derive).
 
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser};
+use serde::Deserialize;
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -11,6 +15,10 @@ use std::path::PathBuf;
     long_about = None
 )]
 pub struct Cli {
+    /// Load repeatable job settings from a TOML file. Explicit CLI options win.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
     /// Input WAV file(s). With multiple files and --album, all files are
     /// normalized with one shared gain (album mode).
     #[arg(required = true)]
@@ -154,6 +162,27 @@ pub struct Cli {
     #[arg(long, requires = "analyze_only")]
     pub compliance: Option<String>,
 
+    /// Start analysis at this source time in seconds.
+    #[arg(long = "start", value_name = "SECONDS", requires = "analyze_only")]
+    pub start_seconds: Option<f64>,
+
+    /// Analyze at most this many seconds from --start (or the beginning).
+    #[arg(long = "duration", value_name = "SECONDS", requires = "analyze_only")]
+    pub duration_seconds: Option<f64>,
+
+    /// Write a time-resolved QC report (.json, .ndjson, or .csv; `-` is NDJSON).
+    #[arg(long, value_name = "PATH", requires = "analyze_only")]
+    pub timeline: Option<PathBuf>,
+
+    /// Timeline sampling interval in milliseconds.
+    #[arg(
+        long = "timeline-interval",
+        value_name = "MILLISECONDS",
+        default_value_t = 100.0,
+        requires = "timeline"
+    )]
+    pub timeline_interval_ms: f64,
+
     /// Print the gain that would be applied; write nothing.
     #[arg(long = "gain-only")]
     pub gain_only: bool,
@@ -222,4 +251,307 @@ pub struct Cli {
     /// Number of worker threads (default: all logical cores).
     #[arg(short = 'j', long = "jobs")]
     pub jobs: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ForgeConfig {
+    normalization: NormalizationConfig,
+    analysis: AnalysisConfig,
+    output: OutputConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct NormalizationConfig {
+    preset: Option<String>,
+    mode: Option<String>,
+    target_lufs: Option<f64>,
+    target_peak_db: Option<f64>,
+    target_rms_db: Option<f64>,
+    ceiling_dbtp: Option<f64>,
+    max_gain_db: Option<f64>,
+    limiter: Option<bool>,
+    limiter_lookahead_ms: Option<f64>,
+    limiter_release_ms: Option<f64>,
+    dither: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AnalysisConfig {
+    enabled: Option<bool>,
+    compliance: Option<String>,
+    start_seconds: Option<f64>,
+    duration_seconds: Option<f64>,
+    timeline: Option<PathBuf>,
+    timeline_interval_ms: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct OutputConfig {
+    format: Option<String>,
+    bits: Option<String>,
+    bitrate_kbps: Option<i32>,
+    quality: Option<i32>,
+    verify: Option<bool>,
+    verify_tolerance: Option<f64>,
+    verify_retries: Option<u8>,
+    wav_container: Option<String>,
+    bwf: Option<bool>,
+}
+
+impl Cli {
+    pub fn parse_with_config() -> Result<Self, String> {
+        let matches = Self::command().get_matches();
+        let mut cli = Self::from_arg_matches(&matches)
+            .map_err(|error| format!("parse command line: {error}"))?;
+        let Some(path) = cli.config.clone() else {
+            return Ok(cli);
+        };
+        let text = fs::read_to_string(&path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        let config: ForgeConfig =
+            toml::from_str(&text).map_err(|error| format!("parse {}: {error}", path.display()))?;
+        cli.apply_config(config, &matches, &path)?;
+        Ok(cli)
+    }
+
+    fn apply_config(
+        &mut self,
+        config: ForgeConfig,
+        matches: &clap::ArgMatches,
+        config_path: &Path,
+    ) -> Result<(), String> {
+        let normalization = config.normalization;
+        let explicit_preset = is_explicit(matches, "preset");
+        let explicit_target = [
+            "mode",
+            "target_lufs",
+            "target_peak_db",
+            "target_rms_db",
+            "ceiling_db",
+        ]
+        .iter()
+        .any(|id| is_explicit(matches, id));
+        if !explicit_preset && !explicit_target {
+            set_option_if_implicit(matches, "preset", &mut self.preset, normalization.preset);
+        }
+        if self.preset.is_none() {
+            set_if_implicit(matches, "mode", &mut self.mode, normalization.mode);
+            set_if_implicit(
+                matches,
+                "target_lufs",
+                &mut self.target_lufs,
+                normalization.target_lufs,
+            );
+            set_if_implicit(
+                matches,
+                "target_peak_db",
+                &mut self.target_peak_db,
+                normalization.target_peak_db,
+            );
+            set_if_implicit(
+                matches,
+                "target_rms_db",
+                &mut self.target_rms_db,
+                normalization.target_rms_db,
+            );
+            set_if_implicit(
+                matches,
+                "ceiling_db",
+                &mut self.ceiling_db,
+                normalization.ceiling_dbtp,
+            );
+        }
+        set_option_if_implicit(
+            matches,
+            "max_gain_db",
+            &mut self.max_gain_db,
+            normalization.max_gain_db,
+        );
+        set_if_implicit(matches, "limiter", &mut self.limiter, normalization.limiter);
+        set_if_implicit(
+            matches,
+            "limiter_lookahead",
+            &mut self.limiter_lookahead,
+            normalization.limiter_lookahead_ms,
+        );
+        set_if_implicit(
+            matches,
+            "limiter_release",
+            &mut self.limiter_release,
+            normalization.limiter_release_ms,
+        );
+        set_if_implicit(matches, "dither", &mut self.dither, normalization.dither);
+
+        let analysis = config.analysis;
+        set_if_implicit(
+            matches,
+            "analyze_only",
+            &mut self.analyze_only,
+            analysis.enabled,
+        );
+        let configured_compliance = analysis.compliance.map(|value| {
+            if value.ends_with(".json") || value.ends_with(".toml") {
+                resolve_path(config_path, PathBuf::from(value))
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                value
+            }
+        });
+        set_option_if_implicit(
+            matches,
+            "compliance",
+            &mut self.compliance,
+            configured_compliance,
+        );
+        set_option_if_implicit(
+            matches,
+            "start_seconds",
+            &mut self.start_seconds,
+            analysis.start_seconds,
+        );
+        set_option_if_implicit(
+            matches,
+            "duration_seconds",
+            &mut self.duration_seconds,
+            analysis.duration_seconds,
+        );
+        set_option_if_implicit(
+            matches,
+            "timeline",
+            &mut self.timeline,
+            analysis
+                .timeline
+                .map(|path| resolve_path(config_path, path)),
+        );
+        set_if_implicit(
+            matches,
+            "timeline_interval_ms",
+            &mut self.timeline_interval_ms,
+            analysis.timeline_interval_ms,
+        );
+
+        let output = config.output;
+        set_option_if_implicit(matches, "format", &mut self.format, output.format);
+        set_option_if_implicit(matches, "bits", &mut self.bits, output.bits);
+        set_if_implicit(matches, "bitrate", &mut self.bitrate, output.bitrate_kbps);
+        set_if_implicit(matches, "quality", &mut self.quality, output.quality);
+        set_if_implicit(matches, "verify", &mut self.verify, output.verify);
+        set_if_implicit(
+            matches,
+            "verify_tolerance",
+            &mut self.verify_tolerance,
+            output.verify_tolerance,
+        );
+        set_if_implicit(
+            matches,
+            "verify_retries",
+            &mut self.verify_retries,
+            output.verify_retries,
+        );
+        set_if_implicit(
+            matches,
+            "wav_container",
+            &mut self.wav_container,
+            output.wav_container,
+        );
+        set_if_implicit(matches, "bwf", &mut self.bwf, output.bwf);
+        if !self.analyze_only
+            && (self.compliance.is_some()
+                || self.start_seconds.is_some()
+                || self.duration_seconds.is_some()
+                || self.timeline.is_some())
+        {
+            return Err(
+                "[analysis] compliance/range/timeline settings require `enabled = true`".into(),
+            );
+        }
+        if self.verify_retries > 0 && !self.verify {
+            return Err("output.verify_retries requires `verify = true`".into());
+        }
+        self.validate_config_values()
+    }
+
+    fn validate_config_values(&self) -> Result<(), String> {
+        validate_choice("normalization.mode", &self.mode, &["lufs", "peak", "rms"])?;
+        if let Some(preset) = &self.preset {
+            validate_choice(
+                "normalization.preset",
+                preset,
+                &[
+                    "spotify",
+                    "apple-music",
+                    "youtube",
+                    "podcast-stereo",
+                    "podcast-mono",
+                    "ebu-r128",
+                    "atsc-a85",
+                ],
+            )?;
+        }
+        if let Some(format) = &self.format {
+            validate_choice("output.format", format, &["wav", "flac", "mp3", "opus"])?;
+        }
+        if let Some(bits) = &self.bits {
+            validate_choice("output.bits", bits, &["8", "16", "24", "32", "32f", "64f"])?;
+        }
+        validate_choice(
+            "output.wav_container",
+            &self.wav_container,
+            &["auto", "riff", "rf64", "bw64"],
+        )
+    }
+}
+
+fn is_explicit(matches: &clap::ArgMatches, id: &str) -> bool {
+    matches.value_source(id) == Some(ValueSource::CommandLine)
+}
+
+fn set_if_implicit<T>(
+    matches: &clap::ArgMatches,
+    id: &str,
+    destination: &mut T,
+    configured: Option<T>,
+) {
+    if !is_explicit(matches, id) {
+        if let Some(value) = configured {
+            *destination = value;
+        }
+    }
+}
+
+fn set_option_if_implicit<T>(
+    matches: &clap::ArgMatches,
+    id: &str,
+    destination: &mut Option<T>,
+    configured: Option<T>,
+) {
+    if !is_explicit(matches, id) {
+        if let Some(value) = configured {
+            *destination = Some(value);
+        }
+    }
+}
+
+fn resolve_path(config_path: &Path, value: PathBuf) -> PathBuf {
+    if value.is_absolute() || value.as_os_str() == "-" {
+        value
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(value)
+    }
+}
+
+fn validate_choice(name: &str, value: &str, choices: &[&str]) -> Result<(), String> {
+    if choices.contains(&value) {
+        Ok(())
+    } else {
+        Err(format!("{name} must be one of: {}", choices.join(", ")))
+    }
 }

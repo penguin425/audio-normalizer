@@ -35,6 +35,17 @@ pub struct StreamingMeasurements {
     pub rms_db: f64,
     pub sample_peak: f32,
     pub true_peak: f32,
+    pub timeline: Vec<LoudnessTimelinePoint>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoudnessTimelinePoint {
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub momentary_lufs: Option<f64>,
+    pub short_term_lufs: Option<f64>,
+    pub sample_peak_dbfs: f64,
+    pub true_peak_dbtp: f64,
 }
 
 pub struct StreamingAnalyzer {
@@ -53,10 +64,23 @@ pub struct StreamingAnalyzer {
     frames: usize,
     raw_sum_squares: f64,
     sample_peak: f32,
+    timeline_interval_frames: Option<usize>,
+    timeline: Vec<LoudnessTimelinePoint>,
+    timeline_start_frame: usize,
+    interval_sample_peak: f32,
+    interval_true_peak: f32,
 }
 
 impl StreamingAnalyzer {
     pub fn new(sample_rate: u32, roles: Vec<ChannelRole>) -> Self {
+        Self::with_timeline_interval(sample_rate, roles, None)
+    }
+
+    pub fn with_timeline_interval(
+        sample_rate: u32,
+        roles: Vec<ChannelRole>,
+        interval_frames: Option<usize>,
+    ) -> Self {
         let channels = roles.len();
         Self {
             sample_rate,
@@ -76,6 +100,11 @@ impl StreamingAnalyzer {
             frames: 0,
             raw_sum_squares: 0.0,
             sample_peak: 0.0,
+            timeline_interval_frames: interval_frames,
+            timeline: Vec::new(),
+            timeline_start_frame: 0,
+            interval_sample_peak: 0.0,
+            interval_true_peak: 0.0,
         }
     }
 
@@ -87,10 +116,6 @@ impl StreamingAnalyzer {
         if planar.iter().any(|channel| channel.len() != chunk_frames) {
             return Err("stream channel length mismatch".into());
         }
-        for (meter, channel) in self.true_peak_meters.iter_mut().zip(planar) {
-            meter.process(channel);
-        }
-
         let momentary_window = ((self.sample_rate as usize * 4) / 10).max(1);
         let short_term_window = (self.sample_rate as usize * 3).max(1);
         let hop = (self.sample_rate as usize / 10).max(1);
@@ -99,6 +124,9 @@ impl StreamingAnalyzer {
             for ((index, channel), filter) in planar.iter().enumerate().zip(self.filters.iter_mut())
             {
                 let sample = channel[frame];
+                let reconstructed_peak = self.true_peak_meters[index].process_sample(sample);
+                self.interval_true_peak = self.interval_true_peak.max(reconstructed_peak);
+                self.interval_sample_peak = self.interval_sample_peak.max(sample.abs());
                 let filtered = filter.process(sample) as f64;
                 weighted += channel_weight(self.roles[index]) * filtered * filtered;
                 let raw = sample as f64;
@@ -140,11 +168,22 @@ impl StreamingAnalyzer {
                 self.short_term_blocks
                     .push(self.short_term_sum / short_term_window as f64);
             }
+            if self
+                .timeline_interval_frames
+                .is_some_and(|interval| self.frames.is_multiple_of(interval))
+            {
+                self.record_timeline_point(momentary_window, short_term_window);
+            }
         }
         Ok(())
     }
 
-    pub fn finish(self) -> StreamingMeasurements {
+    pub fn finish(mut self) -> StreamingMeasurements {
+        if self.timeline_interval_frames.is_some() && self.timeline_start_frame < self.frames {
+            let momentary_window = ((self.sample_rate as usize * 4) / 10).max(1);
+            let short_term_window = (self.sample_rate as usize * 3).max(1);
+            self.record_timeline_point(momentary_window, short_term_window);
+        }
         let channels = self.roles.len();
         let total_samples = self.frames * channels;
         let rms = if total_samples == 0 {
@@ -169,7 +208,42 @@ impl StreamingAnalyzer {
                 .iter()
                 .map(TruePeakMeter::peak)
                 .fold(0.0, f32::max),
+            timeline: self.timeline,
         }
+    }
+
+    fn record_timeline_point(&mut self, momentary_window: usize, short_term_window: usize) {
+        self.timeline.push(LoudnessTimelinePoint {
+            start_seconds: self.timeline_start_frame as f64 / self.sample_rate as f64,
+            end_seconds: self.frames as f64 / self.sample_rate as f64,
+            momentary_lufs: complete_window_loudness(
+                self.momentary_sum,
+                self.momentary.len(),
+                momentary_window,
+            ),
+            short_term_lufs: complete_window_loudness(
+                self.short_term_sum,
+                self.short_term.len(),
+                short_term_window,
+            ),
+            sample_peak_dbfs: amplitude_db(self.interval_sample_peak),
+            true_peak_dbtp: amplitude_db(self.interval_true_peak),
+        });
+        self.timeline_start_frame = self.frames;
+        self.interval_sample_peak = 0.0;
+        self.interval_true_peak = 0.0;
+    }
+}
+
+fn complete_window_loudness(sum: f64, length: usize, required: usize) -> Option<f64> {
+    (length == required && sum > 0.0).then(|| mean_square_to_lufs(sum / required as f64))
+}
+
+fn amplitude_db(amplitude: f32) -> f64 {
+    if amplitude > 0.0 {
+        20.0 * (amplitude as f64).log10()
+    } else {
+        f64::NEG_INFINITY
     }
 }
 
@@ -525,5 +599,30 @@ mod tests {
         assert!((streamed.rms_db - whole_rms).abs() < 1e-9);
         assert_eq!(streamed.sample_peak, whole_peak);
         assert_eq!(streamed.true_peak, whole_true_peak);
+    }
+
+    #[test]
+    fn timeline_uses_complete_windows_and_keeps_the_partial_interval() {
+        let samples: Vec<f32> = (0..50_400)
+            .map(|index| ((index as f64 * 0.13).sin() * 0.2) as f32)
+            .collect();
+        let mut analyzer =
+            StreamingAnalyzer::with_timeline_interval(48_000, vec![ChannelRole::Main], Some(4_800));
+        for chunk in samples.chunks(997) {
+            analyzer.process(&[chunk.to_vec()]).unwrap();
+        }
+        let measured = analyzer.finish();
+        assert_eq!(measured.timeline.len(), 11);
+        assert_eq!(measured.timeline[0].start_seconds, 0.0);
+        assert_eq!(measured.timeline[0].end_seconds, 0.1);
+        assert!(measured.timeline[2].momentary_lufs.is_none());
+        assert!(measured.timeline[3].momentary_lufs.is_some());
+        assert!(measured
+            .timeline
+            .iter()
+            .all(|point| point.short_term_lufs.is_none()));
+        assert_eq!(measured.timeline[10].start_seconds, 1.0);
+        assert_eq!(measured.timeline[10].end_seconds, 1.05);
+        assert!(measured.timeline[10].true_peak_dbtp.is_finite());
     }
 }
