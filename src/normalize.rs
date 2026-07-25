@@ -104,6 +104,8 @@ pub struct DialogueMeasurement {
     pub lufs: f64,
     pub duration_seconds: f64,
     pub range_count: usize,
+    pub standard: &'static str,
+    pub method: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -530,9 +532,9 @@ pub fn validate_dialogue_ranges(ranges: &[DialogueRange]) -> Result<(), String> 
     Ok(())
 }
 
-/// Measure explicit dialogue/anchor regions as one combined population of
-/// complete BS.1770 gating blocks. This preserves duration weighting across
-/// regions and avoids averaging already-gated LUFS values.
+/// Measure explicit dialogue/anchor regions for ATSC A/85:2026-07. Dialogue
+/// selection is the gate; the selected K-weighted energy is averaged without
+/// the BS.1770-2+ relative-level gate, as required by A/85 Annex M.
 pub fn analyze_dialogue_ranges_with_roles<P: AsRef<Path>>(
     path: P,
     channel_roles: Option<&[ChannelRole]>,
@@ -594,7 +596,7 @@ pub fn analyze_dialogue_ranges_with_roles<P: AsRef<Path>>(
         }
         Ok(())
     })?;
-    let mut blocks = Vec::new();
+    let mut weighted_energy = 0.0;
     let mut frames = 0usize;
     for (index, analyzer) in analyzers.into_iter().enumerate() {
         let measured = analyzer
@@ -606,16 +608,18 @@ pub fn analyze_dialogue_ranges_with_roles<P: AsRef<Path>>(
                 )
             })?
             .finish();
+        weighted_energy += measured.weighted_mean_square * measured.frames as f64;
         frames += measured.frames;
-        blocks.extend(measured.ebu.gating_blocks);
     }
-    if blocks.is_empty() {
-        return Err("dialogue ranges contain no complete 400 ms loudness blocks".into());
+    if frames == 0 {
+        return Err("dialogue ranges contain no audio".into());
     }
     Ok(DialogueMeasurement {
-        lufs: lufs::gated_lufs(&blocks),
+        lufs: lufs::ungated_lufs(weighted_energy / frames as f64),
         duration_seconds: frames as f64 / info.sample_rate as f64,
         range_count: ranges.len(),
+        standard: "ATSC A/85:2026-07",
+        method: "BS.1770-1 K-weighting + explicit dialogue gate; no relative-level gate",
     })
 }
 
