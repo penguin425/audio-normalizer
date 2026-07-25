@@ -37,6 +37,30 @@ pub struct Cli {
     #[arg(short = 'm', long = "mode", value_parser = ["lufs", "peak", "rms"], default_value = "lufs")]
     pub mode: String,
 
+    /// Apply a named LUFS/true-peak target for a playback or delivery context.
+    #[arg(
+        long,
+        value_parser = [
+            "spotify",
+            "apple-music",
+            "youtube",
+            "podcast-stereo",
+            "podcast-mono",
+            "ebu-r128",
+            "atsc-a85"
+        ],
+        conflicts_with_all = [
+            "mode",
+            "target_lufs",
+            "target_peak_db",
+            "target_rms_db",
+            "ceiling_db",
+            "analyze_only",
+            "write_tags"
+        ]
+    )]
+    pub preset: Option<String>,
+
     /// Target integrated loudness in LUFS (--mode lufs). Spotify ≈ -14, EBU ≈ -23.
     #[arg(long = "target", default_value_t = -16.0)]
     pub target_lufs: f64,

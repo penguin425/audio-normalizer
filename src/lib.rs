@@ -17,5 +17,6 @@ pub mod metadata;
 #[cfg(feature = "mp3-encoding")]
 pub mod mp3enc;
 pub mod normalize;
+pub mod preset;
 pub mod report;
 pub mod wav;

@@ -174,6 +174,10 @@ forge track.wav -o track.flac --verify
 # Reach the loudness target through isolated peaks with a true-peak limiter
 forge track.wav -o track.flac --limiter --verify
 
+# Use a named playback or broadcast target
+forge song.wav -o song.flac --preset spotify --verify
+forge programme.wav -o programme.wav --preset ebu-r128
+
 # Print the gain that would be applied, write nothing
 forge --gain-only track.wav --target=-14
 
@@ -186,6 +190,7 @@ forge in.wav -o out.wav --bits=24 --dither
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-m, --mode` | `lufs` | `lufs`, `peak`, or `rms` |
+| `--preset` | none | Named playback/delivery loudness target (see below) |
 | `--recursive` | off | Recursively process input directories |
 | `--dry-run` | off | Analyze and show output paths without writing |
 | `--overwrite` | off | Replace output files that already exist |
@@ -214,6 +219,26 @@ forge in.wav -o out.wav --bits=24 --dither
 
 > Negative values need `=`: `--target=-16` (clap parses `-16` as a flag otherwise).
 
+### Presets
+
+| Name | Integrated target | True-peak ceiling | Intended context |
+|------|-------------------|-------------------|------------------|
+| `spotify` | −14 LUFS | −1 dBTP | Spotify Normal playback/mastering guidance |
+| `apple-music` | −16 LUFS | −1 dBTP | Apple Music Sound Check playback reference |
+| `youtube` | −14 LUFS | −1 dBTP | YouTube playback-normalization reference |
+| `podcast-stereo` | −16 LUFS | −1 dBTP | Common stereo podcast delivery |
+| `podcast-mono` | −19 LUFS | −1 dBTP | Common mono podcast delivery |
+| `ebu-r128` | −23 LUFS | −1 dBTP | EBU R 128 programme delivery |
+| `atsc-a85` | −24 LUFS | −2 dBTP | ATSC A/85 television delivery |
+
+Spotify, EBU R 128, and ATSC A/85 values follow their published guidance:
+[Spotify loudness normalization](https://support.spotify.com/artists/article/loudness-normalization/),
+[EBU Tech 3343](https://tech.ebu.ch/docs/tech/tech3343.pdf), and
+[ATSC A/85](https://www.atsc.org/atsc-documents/a85-techniques-for-establishing-and-maintaining-audio-loudness-for-digital-television/).
+Service playback behavior can change and is not a substitute for a distributor's
+delivery specification; Apple Music, YouTube, and podcast entries are practical
+playback references rather than acceptance guarantees.
+
 ## Architecture
 
 ```
@@ -237,6 +262,7 @@ src/
     limiter.rs      streaming look-ahead true-peak limiter
     truepeak.rs     4x polyphase FIR true-peak meter
   normalize.rs      analyze -> gain (ceiling-protected) -> apply -> write; album mode
+  preset.rs         named playback and broadcast loudness targets
 build.rs            optionally links libmp3lame for MP3 encoding
 tests/
   integration.rs    in-memory round-trip tests (WAV LUFS/peak/album/silence + MP3)
