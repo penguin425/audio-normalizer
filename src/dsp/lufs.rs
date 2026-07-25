@@ -18,6 +18,15 @@ use crate::dsp::simd;
 use crate::wav::{AudioBuffer, ChannelRole};
 use rayon::prelude::*;
 
+#[derive(Debug, Clone)]
+pub struct EbuMeasurements {
+    pub integrated_lufs: f64,
+    pub max_momentary_lufs: f64,
+    pub max_short_term_lufs: f64,
+    pub loudness_range_lu: f64,
+    pub gating_blocks: Vec<f64>,
+}
+
 /// Per-channel loudness weight (BS.1770).
 pub fn channel_weight(role: ChannelRole) -> f64 {
     match role {
@@ -29,16 +38,28 @@ pub fn channel_weight(role: ChannelRole) -> f64 {
 
 /// Integrated gated loudness in LUFS, or `-inf` for silence.
 pub fn measure_lufs(buf: &AudioBuffer) -> f64 {
-    gated_lufs(&measure_blocks(buf))
+    measure_ebu(buf).integrated_lufs
 }
 
 /// Weighted mean-square energies for every complete 400 ms gating block.
 pub fn measure_blocks(buf: &AudioBuffer) -> Vec<f64> {
+    measure_ebu(buf).gating_blocks
+}
+
+/// Complete EBU Mode file measurement.
+pub fn measure_ebu(buf: &AudioBuffer) -> EbuMeasurements {
     let fs = buf.sample_rate as usize;
-    let block = (0.4 * fs as f64).round() as usize;
+    let momentary_window = (0.4 * fs as f64).round() as usize;
+    let short_term_window = (3.0 * fs as f64).round() as usize;
     let hop = (0.1 * fs as f64).round() as usize;
-    if block == 0 || hop == 0 || buf.frames < block {
-        return Vec::new();
+    if momentary_window == 0 || hop == 0 || buf.frames < momentary_window {
+        return EbuMeasurements {
+            integrated_lufs: f64::NEG_INFINITY,
+            max_momentary_lufs: f64::NEG_INFINITY,
+            max_short_term_lufs: f64::NEG_INFINITY,
+            loudness_range_lu: 0.0,
+            gating_blocks: Vec::new(),
+        };
     }
 
     // K-weight each channel (parallel) and build prefix sums of squares.
@@ -65,23 +86,45 @@ pub fn measure_blocks(buf: &AudioBuffer) -> Vec<f64> {
         .map(|index| channel_weight(buf.channel_role(index)))
         .collect();
 
-    // Block weighted mean squares.
-    let mut block_ms: Vec<f64> = Vec::new();
+    let gating_blocks = window_mean_squares(&prefixes, &weights, buf.frames, momentary_window, hop);
+    let short_term_blocks =
+        window_mean_squares(&prefixes, &weights, buf.frames, short_term_window, hop);
+
+    EbuMeasurements {
+        integrated_lufs: gated_lufs(&gating_blocks),
+        max_momentary_lufs: maximum_loudness(&gating_blocks),
+        max_short_term_lufs: maximum_loudness(&short_term_blocks),
+        loudness_range_lu: loudness_range(&short_term_blocks),
+        gating_blocks,
+    }
+}
+
+fn window_mean_squares(
+    prefixes: &[Vec<f64>],
+    weights: &[f64],
+    frames: usize,
+    window: usize,
+    hop: usize,
+) -> Vec<f64> {
+    if window == 0 || hop == 0 || frames < window {
+        return Vec::new();
+    }
+    let mut means = Vec::new();
     let mut b = 0usize;
-    while b + block <= buf.frames {
+    while b + window <= frames {
         let mut total = 0.0f64;
-        for c in 0..buf.channels as usize {
+        for c in 0..prefixes.len() {
             let w = weights[c];
             if w == 0.0 {
                 continue;
             }
-            let ss = prefixes[c][b + block] - prefixes[c][b];
+            let ss = prefixes[c][b + window] - prefixes[c][b];
             total += w * ss;
         }
-        block_ms.push(total / (block as f64));
+        means.push(total / window as f64);
         b += hop;
     }
-    block_ms
+    means
 }
 
 /// Apply the BS.1770 absolute and relative gates to a population of blocks.
@@ -109,6 +152,53 @@ pub fn gated_lufs(block_ms: &[f64]) -> f64 {
         final_set.iter().sum::<f64>() / final_set.len() as f64
     };
     -0.691 + 10.0 * used.log10()
+}
+
+fn maximum_loudness(blocks: &[f64]) -> f64 {
+    blocks
+        .iter()
+        .copied()
+        .filter(|value| *value > 0.0)
+        .map(mean_square_to_lufs)
+        .fold(f64::NEG_INFINITY, f64::max)
+}
+
+/// Loudness Range per EBU Tech 3342.
+pub fn loudness_range(short_term_ms: &[f64]) -> f64 {
+    let abs_gate_ms = 10.0_f64.powf((-70.0 + 0.691) / 10.0);
+    let absolute: Vec<f64> = short_term_ms
+        .iter()
+        .copied()
+        .filter(|value| *value >= abs_gate_ms)
+        .collect();
+    if absolute.is_empty() {
+        return 0.0;
+    }
+
+    let absolute_mean = absolute.iter().sum::<f64>() / absolute.len() as f64;
+    let relative_gate = absolute_mean / 100.0; // -20 LU
+    let mut gated: Vec<f64> = absolute
+        .into_iter()
+        .filter(|value| *value >= relative_gate)
+        .map(mean_square_to_lufs)
+        .collect();
+    if gated.len() < 2 {
+        return 0.0;
+    }
+    gated.sort_by(f64::total_cmp);
+    percentile(&gated, 0.95) - percentile(&gated, 0.10)
+}
+
+fn mean_square_to_lufs(value: f64) -> f64 {
+    -0.691 + 10.0 * value.log10()
+}
+
+fn percentile(sorted: &[f64], fraction: f64) -> f64 {
+    let position = fraction * (sorted.len() - 1) as f64;
+    let lower = position.floor() as usize;
+    let upper = position.ceil() as usize;
+    let mix = position - lower as f64;
+    sorted[lower] * (1.0 - mix) + sorted[upper] * mix
 }
 
 /// RMS level (dBFS) and sample peak (0..1) across all channels, computed in
@@ -166,5 +256,17 @@ mod tests {
         assert_eq!(channel_weight(ChannelRole::Main), 1.0);
         assert_eq!(channel_weight(ChannelRole::Surround), 1.41);
         assert_eq!(channel_weight(ChannelRole::Lfe), 0.0);
+    }
+
+    #[test]
+    fn loudness_range_uses_tenth_and_ninety_fifth_percentiles() {
+        let blocks: Vec<f64> = (0..=100)
+            .map(|step| {
+                let lufs = -30.0 + step as f64 / 10.0;
+                10.0_f64.powf((lufs + 0.691) / 10.0)
+            })
+            .collect();
+        let range = loudness_range(&blocks);
+        assert!((range - 8.5).abs() < 0.01, "LRA = {range}");
     }
 }

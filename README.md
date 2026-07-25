@@ -72,6 +72,8 @@ Decoded MP3 output lands within ~0.3 LU of the target (lossy round-trip).
 * **Channel-layout-aware weighting** reads WAVE_FORMAT_EXTENSIBLE channel masks
   and codec layouts, excludes LFE channels wherever they occur, and applies the
   BS.1770 surround-channel weighting by role instead of guessed channel index.
+* **EBU Mode analysis** reports Integrated, maximum Momentary (400 ms), maximum
+  Short-term (3 s), and Loudness Range (LRA) measurements.
 * **True peak** is measured by 4× polyphase FIR oversampling (Kaiser-windowed
   lowpass, unity DC gain), so inter-sample peaks that exceed sample peaks are
   caught — and the gain is reduced so the output never clips after DAC
@@ -104,7 +106,8 @@ then standard library paths, and prints a clear install hint if it is missing.
 
 Run the optional conformance suite against the official EBU Loudness Test Set
 v5. The script downloads the archive from a public mirror, verifies its
-SHA-256 checksum, and runs the nine Tech 3341 integrated-loudness cases:
+SHA-256 checksum, and runs the Tech 3341 integrated-loudness and Tech 3342
+Loudness Range cases:
 
 ```sh
 ./tools/test-ebu-conformance.sh
