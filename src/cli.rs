@@ -7,7 +7,7 @@ use std::path::PathBuf;
 #[command(
     name = "forge",
     version,
-    about = "Forge — a SIMD-accelerated EBU R128 / ITU-R BS.1770-4 loudness normalizer",
+    about = "Forge — a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer",
     long_about = None
 )]
 pub struct Cli {

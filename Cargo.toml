@@ -2,7 +2,7 @@
 name = "forge-normalizer"
 version = "0.2.0"
 edition = "2021"
-description = "Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-4 loudness normalizer (WAV/MP3/FLAC/AAC/Vorbis)"
+description = "Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer (WAV/MP3/FLAC/AAC/Vorbis)"
 license = "MIT"
 repository = "https://github.com/penguin425/audio-normalizer"
 

@@ -6,7 +6,7 @@
 //! the entire read -> measure -> gain -> write -> read round trip.
 
 use forge_normalizer::normalize::{self, Mode, OutputFormat, Plan};
-use forge_normalizer::wav::{AudioBuffer, PcmKind, WavReader, WavWriter};
+use forge_normalizer::wav::{default_channel_roles, AudioBuffer, PcmKind, WavReader, WavWriter};
 use std::f64::consts::PI;
 use std::path::PathBuf;
 
@@ -24,6 +24,7 @@ fn synth_sine(sr: u32, dur_s: f64, amp: f32, freq: f64, channels: u16) -> AudioB
         channels,
         frames: n,
         data,
+        channel_roles: default_channel_roles(channels),
         source_kind: PcmKind::F32,
     }
 }

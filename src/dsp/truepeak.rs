@@ -1,4 +1,4 @@
-//! 4x-oversampled true-peak meter (ITU-R BS.1770-4 style).
+//! 4x-oversampled true-peak meter (ITU-R BS.1770-5 style).
 //!
 //! Sample peaks (max of the discrete samples) miss inter-sample peaks that can
 //! exceed 0 dBFS after DAC reconstruction. True peak is measured by 4x

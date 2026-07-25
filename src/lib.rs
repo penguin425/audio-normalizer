@@ -1,4 +1,4 @@
-//! Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-4 loudness normalizer.
+//! Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer.
 //!
 //! This library crate exposes the WAV I/O, DSP, and normalization engine so it
 //! can be embedded in other tools or exercised by integration tests. The

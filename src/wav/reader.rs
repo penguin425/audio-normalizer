@@ -6,7 +6,7 @@
 //! deliberately I/O-optimal for the normalize use case (single sequential read).
 
 use crate::dsp::convert;
-use crate::wav::{AudioBuffer, PcmKind, WaveFormat};
+use crate::wav::{default_channel_roles, AudioBuffer, ChannelRole, PcmKind, WaveFormat};
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
@@ -22,6 +22,15 @@ pub enum WavReadError {
     UnsupportedFormatTag(u16),
     ZeroChannels,
     NoDataChunk,
+}
+
+struct ParsedFormat {
+    wave_format: WaveFormat,
+    real_tag: u16,
+    sample_rate: u32,
+    channels: u16,
+    bits: u16,
+    channel_mask: Option<u32>,
 }
 
 impl fmt::Display for WavReadError {
@@ -72,8 +81,8 @@ impl WavReader {
             return Err(WavReadError::NotWave);
         }
 
-        // (wave_format, real_tag, sample_rate, channels, bits_per_sample)
-        let mut fmt: Option<(WaveFormat, u16, u32, u16, u16)> = None;
+        // (wave_format, real_tag, sample_rate, channels, bits, channel mask)
+        let mut fmt: Option<ParsedFormat> = None;
         let mut data: Option<&[u8]> = None;
 
         while cur + 8 <= bytes.len() {
@@ -95,29 +104,39 @@ impl WavReader {
             }
         }
 
-        let (wformat, tag, sample_rate, channels, bits) =
-            fmt.ok_or(WavReadError::BadFormat("missing fmt chunk"))?;
+        let ParsedFormat {
+            wave_format,
+            real_tag,
+            sample_rate,
+            channels,
+            bits,
+            channel_mask,
+        } = fmt.ok_or(WavReadError::BadFormat("missing fmt chunk"))?;
         if channels == 0 {
             return Err(WavReadError::ZeroChannels);
         }
-        let kind = pick_kind(wformat, tag, bits)?;
+        let kind = pick_kind(wave_format, real_tag, bits)?;
         let data = data.ok_or(WavReadError::NoDataChunk)?;
         let bpp = kind.bytes_per_sample();
         let frames = data.len() / (bpp * channels as usize);
 
         let planar = convert::decode_planar(data, kind, channels as usize);
+        let channel_roles = channel_mask
+            .map(|mask| roles_from_wave_mask(mask, channels))
+            .unwrap_or_else(|| default_channel_roles(channels));
         let buf = AudioBuffer {
             sample_rate,
             channels,
             frames,
             data: planar,
+            channel_roles,
             source_kind: kind,
         };
         Ok(buf)
     }
 }
 
-fn parse_fmt(body: &[u8]) -> Result<(WaveFormat, u16, u32, u16, u16), WavReadError> {
+fn parse_fmt(body: &[u8]) -> Result<ParsedFormat, WavReadError> {
     if body.len() < 16 {
         return Err(WavReadError::BadFormat("fmt chunk too short"));
     }
@@ -132,17 +151,43 @@ fn parse_fmt(body: &[u8]) -> Result<(WaveFormat, u16, u32, u16, u16), WavReadErr
     let wformat = WaveFormat::from_tag(tag).ok_or(WavReadError::UnsupportedFormatTag(tag))?;
 
     // Resolve the *real* format tag for extensible files.
-    let real_tag = if let WaveFormat::Extensible = wformat {
+    let (real_tag, channel_mask) = if let WaveFormat::Extensible = wformat {
         if body.len() < 40 {
             return Err(WavReadError::BadFormat("extensible fmt too short"));
         }
         // SubFormat GUID: first two bytes are the underlying format tag.
-        read_u16_at(body, 24)?
+        (read_u16_at(body, 24)?, Some(read_u32_at(body, 20)?))
     } else {
-        tag
+        (tag, None)
     };
 
-    Ok((wformat, real_tag, rate, channels, bits))
+    Ok(ParsedFormat {
+        wave_format: wformat,
+        real_tag,
+        sample_rate: rate,
+        channels,
+        bits,
+        channel_mask,
+    })
+}
+
+fn roles_from_wave_mask(mask: u32, channels: u16) -> Vec<ChannelRole> {
+    let mut roles = Vec::with_capacity(channels as usize);
+    for bit in 0..32 {
+        if mask & (1 << bit) == 0 {
+            continue;
+        }
+        roles.push(match bit {
+            3 => ChannelRole::Lfe,
+            4 | 5 | 8 | 9 | 10 | 15 | 16 | 17 => ChannelRole::Surround,
+            _ => ChannelRole::Main,
+        });
+    }
+    if roles.len() == channels as usize {
+        roles
+    } else {
+        default_channel_roles(channels)
+    }
 }
 
 fn pick_kind(wformat: WaveFormat, real_tag: u16, bits: u16) -> Result<PcmKind, WavReadError> {
@@ -194,5 +239,45 @@ fn read_u16_at(buf: &[u8], off: usize) -> Result<u16, WavReadError> {
         Ok(u16::from_le_bytes([buf[off], buf[off + 1]]))
     } else {
         Err(WavReadError::Truncated)
+    }
+}
+
+#[inline]
+fn read_u32_at(buf: &[u8], off: usize) -> Result<u32, WavReadError> {
+    if off + 4 <= buf.len() {
+        Ok(u32::from_le_bytes([
+            buf[off],
+            buf[off + 1],
+            buf[off + 2],
+            buf[off + 3],
+        ]))
+    } else {
+        Err(WavReadError::Truncated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wave_mask_identifies_lfe_and_surround_by_position() {
+        // FL, FR, LFE, SL, SR: LFE is deliberately not channel index 3.
+        let mask = 0x0000_0001 | 0x0000_0002 | 0x0000_0008 | 0x0000_0200 | 0x0000_0400;
+        assert_eq!(
+            roles_from_wave_mask(mask, 5),
+            vec![
+                ChannelRole::Main,
+                ChannelRole::Main,
+                ChannelRole::Lfe,
+                ChannelRole::Surround,
+                ChannelRole::Surround,
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_wave_mask_falls_back_to_conventional_layout() {
+        assert_eq!(roles_from_wave_mask(0x3, 6), default_channel_roles(6));
     }
 }
