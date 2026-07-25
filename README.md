@@ -39,10 +39,11 @@ the `-o` extension override this.
   runtime feature detection and a portable scalar fallback (so the binary runs
   anywhere but flies on modern x86-64).
 * **Multi-threaded** via rayon — channels and files are processed in parallel.
-* **Prefix-sum block energies** make the 75%-overlapping LUFS gating blocks
-  O(1) each instead of re-scanning 400 ms windows.
-* **Single sequential I/O pass**: the whole file is read once, then decoded,
-  measured, gained, and written.
+* **Rolling block energies** make the 75%-overlapping LUFS gating blocks O(1)
+  each while retaining only three seconds of filtered energy.
+* **Bounded-memory streaming** decodes analysis and normalization in chunks.
+  Normalization uses two sequential passes so gain is known before encoding,
+  without retaining the complete audio file in RAM.
 * Release profile uses `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`,
   and `-C target-cpu=native` (auto-vectorized scalar fallbacks on top of the
   hand-written AVX2).
@@ -197,7 +198,7 @@ src/
   lib.rs            public engine API (decoder, WAV I/O, DSP, MP3 enc, normalize)
   main.rs           CLI wrapper (format resolution + dispatch)
   cli.rs            clap definition
-  decoder.rs        universal decoder: WAV fast path + symphonia (mp3/flac/aac/vorbis)
+  decoder.rs        full-buffer and streaming universal decoders
   mp3enc.rs         MP3 encoder via LAME FFI (interleaved f32 -> MP3 bytes)
   wav/
     format.rs       PcmKind / WaveFormat
@@ -223,7 +224,7 @@ tests/
   formats need only the Rust crates (symphonia).
 * Forge only *encodes* WAV and MP3. FLAC/AAC/ALAC/Vorbis can be read and
   normalized, but the output is WAV (or MP3 with `--format mp3`).
-* Single-pass linear normalization (no dynamic/look-ahead limiter). The
+* Linear normalization (no dynamic/look-ahead limiter). The
   true-peak ceiling is enforced by reducing the global gain, which is the
   transparent, artifact-free approach used for loudness normalization.
 * MP3 is lossy: re-encoding shifts loudness by ~0.2–0.4 LU per pass. For

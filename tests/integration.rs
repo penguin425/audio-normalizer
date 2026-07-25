@@ -5,6 +5,7 @@
 //! met. No external tools or fixtures are required, so `cargo test` validates
 //! the entire read -> measure -> gain -> write -> read round trip.
 
+use forge_normalizer::decoder;
 use forge_normalizer::normalize::{self, Mode, OutputFormat, Plan};
 use forge_normalizer::wav::{default_channel_roles, AudioBuffer, PcmKind, WavReader, WavWriter};
 use lofty::config::WriteOptions;
@@ -211,6 +212,26 @@ fn silence_normalizes_to_neg_infinity_without_panicking() {
     let an = normalize::analyze(&buf);
     assert!(an.lufs == f64::NEG_INFINITY, "silence LUFS {}", an.lufs);
     assert!(an.sample_peak == 0.0);
+}
+
+#[test]
+fn streaming_decoder_emits_bounded_chunks() {
+    let buffer = synth_sine(48_000, 6.0, 0.1, 440.0, 2);
+    let path = tmp_path("forge_it_stream_chunks.wav");
+    WavWriter::write(&path, &buffer, PcmKind::S16, false).unwrap();
+    let mut total_frames = 0usize;
+    let mut largest_chunk = 0usize;
+    let info = decoder::decode_stream(&path, |_, planar| {
+        let frames = planar[0].len();
+        total_frames += frames;
+        largest_chunk = largest_chunk.max(frames);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(info.channels, 2);
+    assert_eq!(total_frames, buffer.frames);
+    assert!(largest_chunk < total_frames);
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
