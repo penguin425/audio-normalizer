@@ -18,6 +18,8 @@ use crate::metadata;
 #[cfg(feature = "mp3-encoding")]
 use crate::mp3enc;
 use crate::wav::{AudioBuffer, ChannelRole, PcmKind, WavContainer, WavStreamWriter, WavWriter};
+use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +90,26 @@ pub struct Analysis {
 pub struct TimedAnalysis {
     pub analysis: Analysis,
     pub timeline: Vec<lufs::LoudnessTimelinePoint>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DialogueRange {
+    pub start_seconds: f64,
+    pub duration_seconds: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DialogueMeasurement {
+    pub lufs: f64,
+    pub duration_seconds: f64,
+    pub range_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DialogueRangeFile {
+    ranges: Vec<DialogueRange>,
 }
 
 #[derive(Debug, Clone)]
@@ -456,6 +478,144 @@ pub fn analyze_file_range_with_roles<P: AsRef<Path>>(
             loudness_blocks: measured.ebu.gating_blocks,
         },
         timeline,
+    })
+}
+
+/// Load and validate non-overlapping source-time regions used as dialogue
+/// anchors. JSON and TOML files use a top-level `ranges` array.
+pub fn load_dialogue_ranges(path: &Path) -> Result<Vec<DialogueRange>, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("read dialogue ranges {}: {error}", path.display()))?;
+    let file: DialogueRangeFile = match path.extension().and_then(|value| value.to_str()) {
+        Some("json") => serde_json::from_str(&text)
+            .map_err(|error| format!("parse dialogue ranges {}: {error}", path.display()))?,
+        Some("toml") => toml::from_str(&text)
+            .map_err(|error| format!("parse dialogue ranges {}: {error}", path.display()))?,
+        _ => return Err("dialogue ranges must use a .json or .toml extension".into()),
+    };
+    validate_dialogue_ranges(&file.ranges)?;
+    Ok(file.ranges)
+}
+
+pub fn validate_dialogue_ranges(ranges: &[DialogueRange]) -> Result<(), String> {
+    if ranges.is_empty() {
+        return Err("dialogue ranges must contain at least one range".into());
+    }
+    let mut previous_end = 0.0;
+    for (index, range) in ranges.iter().enumerate() {
+        if !range.start_seconds.is_finite() || range.start_seconds < 0.0 {
+            return Err(format!(
+                "dialogue range {} start must be a finite non-negative number",
+                index + 1
+            ));
+        }
+        if !range.duration_seconds.is_finite() || range.duration_seconds <= 0.0 {
+            return Err(format!(
+                "dialogue range {} duration must be a finite positive number",
+                index + 1
+            ));
+        }
+        let range_end = range.start_seconds + range.duration_seconds;
+        if !range_end.is_finite() {
+            return Err(format!("dialogue range {} end is not finite", index + 1));
+        }
+        if index > 0 && range.start_seconds < previous_end {
+            return Err(format!(
+                "dialogue range {} overlaps or is not sorted",
+                index + 1
+            ));
+        }
+        previous_end = range_end;
+    }
+    Ok(())
+}
+
+/// Measure explicit dialogue/anchor regions as one combined population of
+/// complete BS.1770 gating blocks. This preserves duration weighting across
+/// regions and avoids averaging already-gated LUFS values.
+pub fn analyze_dialogue_ranges_with_roles<P: AsRef<Path>>(
+    path: P,
+    channel_roles: Option<&[ChannelRole]>,
+    ranges: &[DialogueRange],
+) -> Result<DialogueMeasurement, String> {
+    validate_dialogue_ranges(ranges)?;
+    let mut analyzers = (0..ranges.len()).map(|_| None).collect::<Vec<_>>();
+    let mut source_frames = 0usize;
+    let info = decoder::decode_stream(path.as_ref(), |info, chunk| {
+        if channel_roles.is_none()
+            && info.channels > 6
+            && info
+                .channel_roles
+                .iter()
+                .all(|role| matches!(role, ChannelRole::Main))
+        {
+            return Err(format!(
+                "{}: ambiguous {}-channel layout; provide --channel-layout",
+                path.as_ref().display(),
+                info.channels
+            ));
+        }
+        let roles = if let Some(roles) = channel_roles {
+            if roles.len() != info.channels as usize {
+                return Err(format!(
+                    "channel layout has {} channels but input has {}",
+                    roles.len(),
+                    info.channels
+                ));
+            }
+            roles
+        } else {
+            &info.channel_roles
+        };
+        let chunk_start = source_frames;
+        let chunk_end = source_frames + chunk.first().map_or(0, Vec::len);
+        source_frames = chunk_end;
+        for (range, analyzer) in ranges.iter().zip(&mut analyzers) {
+            let range_start = (range.start_seconds * info.sample_rate as f64).round() as usize;
+            let range_end =
+                range_start.saturating_add(
+                    (range.duration_seconds * info.sample_rate as f64).round() as usize,
+                );
+            let overlap_start = chunk_start.max(range_start);
+            let overlap_end = chunk_end.min(range_end);
+            if overlap_start < overlap_end {
+                let selected_start = overlap_start - chunk_start;
+                let selected_end = overlap_end - chunk_start;
+                let selected = chunk
+                    .iter()
+                    .map(|channel| channel[selected_start..selected_end].to_vec())
+                    .collect::<Vec<_>>();
+                analyzer
+                    .get_or_insert_with(|| {
+                        lufs::StreamingAnalyzer::new(info.sample_rate, roles.to_vec())
+                    })
+                    .process(&selected)?;
+            }
+        }
+        Ok(())
+    })?;
+    let mut blocks = Vec::new();
+    let mut frames = 0usize;
+    for (index, analyzer) in analyzers.into_iter().enumerate() {
+        let measured = analyzer
+            .ok_or_else(|| {
+                format!(
+                    "{}: dialogue range {} contains no audio",
+                    path.as_ref().display(),
+                    index + 1
+                )
+            })?
+            .finish();
+        frames += measured.frames;
+        blocks.extend(measured.ebu.gating_blocks);
+    }
+    if blocks.is_empty() {
+        return Err("dialogue ranges contain no complete 400 ms loudness blocks".into());
+    }
+    Ok(DialogueMeasurement {
+        lufs: lufs::gated_lufs(&blocks),
+        duration_seconds: frames as f64 / info.sample_rate as f64,
+        range_count: ranges.len(),
     })
 }
 
@@ -1182,6 +1342,27 @@ mod tests {
         let corrected = corrected_gain(1.0, &verification, &plan()).unwrap();
 
         assert!((gain_db(corrected) - (-0.8)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn dialogue_ranges_reject_empty_unsorted_and_overlapping_regions() {
+        assert!(validate_dialogue_ranges(&[]).is_err());
+        assert!(validate_dialogue_ranges(&[
+            DialogueRange {
+                start_seconds: 2.0,
+                duration_seconds: 2.0,
+            },
+            DialogueRange {
+                start_seconds: 3.0,
+                duration_seconds: 1.0,
+            },
+        ])
+        .is_err());
+        assert!(validate_dialogue_ranges(&[DialogueRange {
+            start_seconds: 0.0,
+            duration_seconds: f64::NAN,
+        }])
+        .is_err());
     }
 
     #[test]

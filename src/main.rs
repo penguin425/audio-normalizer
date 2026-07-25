@@ -177,6 +177,24 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
             .as_deref()
             .map(ComplianceProfile::load)
             .transpose()?;
+        if stdin_requested && cli.dialogue_ranges.is_some() {
+            return Err("--dialogue-ranges cannot be used with stdin".into());
+        }
+        let dialogue_ranges = cli
+            .dialogue_ranges
+            .as_deref()
+            .map(normalize::load_dialogue_ranges)
+            .transpose()?;
+        if compliance
+            .as_ref()
+            .is_some_and(ComplianceProfile::requires_dialogue)
+            && dialogue_ranges.is_none()
+        {
+            return Err(format!(
+                "compliance profile {} requires --dialogue-ranges",
+                compliance.as_ref().unwrap().name
+            ));
+        }
         let mut reports = Vec::with_capacity(cli.inputs.len());
         let mut timeline_reports = Vec::new();
         let mut compliance_failed = false;
@@ -189,27 +207,50 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                 cli.timeline.as_ref().map(|_| cli.timeline_interval_ms),
             )?;
             let an = timed.analysis;
-            if compliance
+            let dialogue = dialogue_ranges
+                .as_deref()
+                .map(|ranges| {
+                    normalize::analyze_dialogue_ranges_with_roles(
+                        input,
+                        channel_roles_override.as_deref(),
+                        ranges,
+                    )
+                })
+                .transpose()?;
+            let compliance_result = compliance
                 .as_ref()
-                .is_some_and(|profile| !profile.evaluate(&an).passed)
+                .map(|profile| {
+                    profile.evaluate_with_dialogue(&an, dialogue.as_ref().map(|value| value.lufs))
+                })
+                .transpose()?;
+            if compliance_result
+                .as_ref()
+                .is_some_and(|result| !result.passed)
             {
                 compliance_failed = true;
             }
             if cli.json || cli.ndjson || cli.csv.is_some() {
-                reports.push(AnalysisReport::with_compliance_at(
+                reports.push(AnalysisReport::with_measurements_at(
                     if stdin_requested {
                         Path::new("-")
                     } else {
                         input
                     },
                     &an,
+                    dialogue.as_ref(),
                     compliance.as_ref(),
                     (start_seconds * an.sample_rate as f64).round() / an.sample_rate as f64,
-                ));
+                )?);
             } else {
                 print_analysis(input, &an, None);
+                if let Some(dialogue) = &dialogue {
+                    eprintln!(
+                        "  dialogue: {:.2} LUFS across {} range(s), {:.3} s",
+                        dialogue.lufs, dialogue.range_count, dialogue.duration_seconds
+                    );
+                }
                 if let Some(profile) = &compliance {
-                    print_compliance(profile, &an);
+                    print_compliance(profile, &an, dialogue.as_ref())?;
                 }
             }
             if cli.timeline.is_some() {
@@ -532,8 +573,13 @@ impl PipelineFiles {
     }
 }
 
-fn print_compliance(profile: &ComplianceProfile, analysis: &normalize::Analysis) {
-    let result = profile.evaluate(analysis);
+fn print_compliance(
+    profile: &ComplianceProfile,
+    analysis: &normalize::Analysis,
+    dialogue: Option<&normalize::DialogueMeasurement>,
+) -> Result<(), String> {
+    let result =
+        profile.evaluate_with_dialogue(analysis, dialogue.map(|measurement| measurement.lufs))?;
     eprintln!("  compliance {}:", result.profile);
     for rule in &result.rules {
         let bounds = match (rule.minimum, rule.maximum) {
@@ -554,6 +600,7 @@ fn print_compliance(profile: &ComplianceProfile, analysis: &normalize::Analysis)
         "    result: {}",
         if result.passed { "PASS" } else { "FAIL" }
     );
+    Ok(())
 }
 
 fn print_verification(input: &Path, verification: &normalize::Verification, plan: &Plan) -> bool {

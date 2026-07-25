@@ -1,7 +1,7 @@
 //! Stable machine-readable analysis reports.
 
 use crate::dsp::lufs::LoudnessTimelinePoint;
-use crate::normalize::Analysis;
+use crate::normalize::{Analysis, DialogueMeasurement};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -11,6 +11,8 @@ use std::path::Path;
 #[serde(deny_unknown_fields)]
 pub struct ComplianceProfile {
     pub name: String,
+    #[serde(default)]
+    pub loudness_basis: LoudnessBasis,
     pub target_lufs: Option<f64>,
     pub loudness_tolerance_lu: Option<f64>,
     pub lower_tolerance_lu: Option<f64>,
@@ -22,6 +24,14 @@ pub struct ComplianceProfile {
     pub max_loudness_range_lu: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoudnessBasis {
+    #[default]
+    Programme,
+    Dialogue,
+}
+
 impl ComplianceProfile {
     pub fn builtin(name: &str) -> Option<Self> {
         let profile = match name {
@@ -31,8 +41,13 @@ impl ComplianceProfile {
                 ..Self::symmetric("ebu-r128-short", -23.0, 0.2, -1.0)
             },
             "atsc-a85-short" => Self::symmetric("atsc-a85-short", -24.0, 2.0, -2.0),
+            "atsc-a85-long" => Self {
+                loudness_basis: LoudnessBasis::Dialogue,
+                ..Self::symmetric("atsc-a85-long", -24.0, 2.0, -2.0)
+            },
             "aes77-assorted" => Self {
                 name: "aes77-assorted".into(),
+                loudness_basis: LoudnessBasis::Programme,
                 target_lufs: Some(-18.0),
                 loudness_tolerance_lu: None,
                 lower_tolerance_lu: None,
@@ -53,6 +68,7 @@ impl ComplianceProfile {
     fn symmetric(name: &str, target: f64, tolerance: f64, true_peak: f64) -> Self {
         Self {
             name: name.into(),
+            loudness_basis: LoudnessBasis::Programme,
             target_lufs: Some(target),
             loudness_tolerance_lu: Some(tolerance),
             lower_tolerance_lu: None,
@@ -147,9 +163,33 @@ impl ComplianceProfile {
         Ok(())
     }
 
-    pub fn evaluate(&self, analysis: &Analysis) -> ComplianceResult {
+    pub fn evaluate(&self, analysis: &Analysis) -> Result<ComplianceResult, String> {
+        self.evaluate_with_dialogue(analysis, None)
+    }
+
+    pub fn requires_dialogue(&self) -> bool {
+        self.loudness_basis == LoudnessBasis::Dialogue && self.target_lufs.is_some()
+    }
+
+    pub fn evaluate_with_dialogue(
+        &self,
+        analysis: &Analysis,
+        dialogue_lufs: Option<f64>,
+    ) -> Result<ComplianceResult, String> {
         let mut rules = Vec::new();
         if let Some(target) = self.target_lufs {
+            let (metric, measured) = match self.loudness_basis {
+                LoudnessBasis::Programme => ("integrated_lufs", analysis.lufs),
+                LoudnessBasis::Dialogue => (
+                    "dialogue_lufs",
+                    dialogue_lufs.ok_or_else(|| {
+                        format!(
+                            "compliance profile {} requires --dialogue-ranges",
+                            self.name
+                        )
+                    })?,
+                ),
+            };
             let lower = target
                 - self
                     .loudness_tolerance_lu
@@ -160,12 +200,7 @@ impl ComplianceProfile {
                     .loudness_tolerance_lu
                     .or(self.upper_tolerance_lu)
                     .unwrap_or(f64::INFINITY);
-            rules.push(ComplianceRuleResult::range(
-                "integrated_lufs",
-                analysis.lufs,
-                lower,
-                upper,
-            ));
+            rules.push(ComplianceRuleResult::range(metric, measured, lower, upper));
         }
         add_max_rule(
             &mut rules,
@@ -193,11 +228,11 @@ impl ComplianceProfile {
                 self.max_loudness_range_lu.unwrap_or(f64::INFINITY),
             ));
         }
-        ComplianceResult {
+        Ok(ComplianceResult {
             profile: self.name.clone(),
             passed: rules.iter().all(|rule| rule.passed),
             rules,
-        }
+        })
     }
 }
 
@@ -253,6 +288,9 @@ pub struct AnalysisReport {
     pub channels: u16,
     pub sample_format: &'static str,
     pub integrated_lufs: f64,
+    pub dialogue_lufs: Option<f64>,
+    pub dialogue_duration_seconds: Option<f64>,
+    pub dialogue_range_count: Option<usize>,
     pub max_momentary_lufs: f64,
     pub max_short_term_lufs: f64,
     pub loudness_range_lu: f64,
@@ -261,6 +299,7 @@ pub struct AnalysisReport {
     pub true_peak_dbtp: f64,
     pub peak_to_loudness_ratio_lu: f64,
     pub compliance_profile: Option<String>,
+    pub compliance_loudness_basis: Option<LoudnessBasis>,
     pub compliance_target_lufs: Option<f64>,
     pub compliance_loudness_tolerance_lu: Option<f64>,
     pub compliance_lower_tolerance_lu: Option<f64>,
@@ -356,8 +395,27 @@ impl AnalysisReport {
         profile: Option<&ComplianceProfile>,
         source_start_seconds: f64,
     ) -> Self {
-        let compliance = profile.map(|profile| profile.evaluate(analysis));
-        Self {
+        if profile.is_some_and(ComplianceProfile::requires_dialogue) {
+            return Self::with_measurements_at(path, analysis, None, None, source_start_seconds)
+                .expect("a report without compliance cannot fail");
+        }
+        Self::with_measurements_at(path, analysis, None, profile, source_start_seconds)
+            .expect("programme compliance evaluation cannot fail")
+    }
+
+    pub fn with_measurements_at(
+        path: &Path,
+        analysis: &Analysis,
+        dialogue: Option<&DialogueMeasurement>,
+        profile: Option<&ComplianceProfile>,
+        source_start_seconds: f64,
+    ) -> Result<Self, String> {
+        let compliance = profile
+            .map(|profile| {
+                profile.evaluate_with_dialogue(analysis, dialogue.map(|value| value.lufs))
+            })
+            .transpose()?;
+        Ok(Self {
             path: path.to_string_lossy().into_owned(),
             duration_seconds: analysis.duration_secs(),
             source_start_seconds,
@@ -372,6 +430,9 @@ impl AnalysisReport {
                 crate::wav::PcmKind::F64 => "f64",
             },
             integrated_lufs: analysis.lufs,
+            dialogue_lufs: dialogue.map(|value| value.lufs),
+            dialogue_duration_seconds: dialogue.map(|value| value.duration_seconds),
+            dialogue_range_count: dialogue.map(|value| value.range_count),
             max_momentary_lufs: analysis.max_momentary_lufs,
             max_short_term_lufs: analysis.max_short_term_lufs,
             loudness_range_lu: analysis.loudness_range_lu,
@@ -380,12 +441,14 @@ impl AnalysisReport {
             true_peak_dbtp: analysis.true_peak_db(),
             peak_to_loudness_ratio_lu: analysis.peak_to_loudness_ratio_lu(),
             compliance_profile: compliance.as_ref().map(|result| result.profile.clone()),
+            compliance_loudness_basis: profile.map(|value| value.loudness_basis),
             compliance_target_lufs: profile.and_then(|value| value.target_lufs),
             compliance_loudness_tolerance_lu: profile.and_then(|value| value.loudness_tolerance_lu),
             compliance_lower_tolerance_lu: profile.and_then(|value| value.lower_tolerance_lu),
             compliance_upper_tolerance_lu: profile.and_then(|value| value.upper_tolerance_lu),
             compliance_max_true_peak_dbtp: profile.and_then(|value| value.max_true_peak_dbtp),
-            compliance_loudness_pass: rule_pass(&compliance, "integrated_lufs"),
+            compliance_loudness_pass: rule_pass(&compliance, "integrated_lufs")
+                .or_else(|| rule_pass(&compliance, "dialogue_lufs")),
             compliance_true_peak_pass: rule_pass(&compliance, "true_peak_dbtp"),
             compliance_max_short_term_lufs: profile.and_then(|value| value.max_short_term_lufs),
             compliance_short_term_pass: rule_pass(&compliance, "max_short_term_lufs"),
@@ -398,7 +461,7 @@ impl AnalysisReport {
                 serde_json::to_string(&result.rules).expect("compliance rules are serializable")
             }),
             compliance_passed: compliance.as_ref().map(|result| result.passed),
-        }
+        })
     }
 }
 
@@ -506,6 +569,9 @@ mod tests {
             channels: 2,
             sample_format: "s24",
             integrated_lufs: -23.0,
+            dialogue_lufs: None,
+            dialogue_duration_seconds: None,
+            dialogue_range_count: None,
             max_momentary_lufs: -20.0,
             max_short_term_lufs: -21.0,
             loudness_range_lu: 8.0,
@@ -514,6 +580,7 @@ mod tests {
             true_peak_dbtp: -2.8,
             peak_to_loudness_ratio_lu: 20.2,
             compliance_profile: None,
+            compliance_loudness_basis: None,
             compliance_target_lufs: None,
             compliance_loudness_tolerance_lu: None,
             compliance_lower_tolerance_lu: None,
@@ -576,6 +643,7 @@ mod tests {
         }];
         let profile = ComplianceProfile {
             name: "timeline".into(),
+            loudness_basis: LoudnessBasis::Programme,
             target_lufs: None,
             loudness_tolerance_lu: None,
             lower_tolerance_lu: None,
@@ -618,9 +686,9 @@ mod tests {
             loudness_blocks: Vec::new(),
         };
         let profile = ComplianceProfile::builtin("ebu-r128").unwrap();
-        assert!(profile.evaluate(&analysis).passed);
+        assert!(profile.evaluate(&analysis).unwrap().passed);
         analysis.true_peak = 1.0;
-        let result = profile.evaluate(&analysis);
+        let result = profile.evaluate(&analysis).unwrap();
         assert!(
             result
                 .rules
@@ -638,6 +706,33 @@ mod tests {
                 .passed
         );
         assert!(!result.passed);
+    }
+
+    #[test]
+    fn atsc_long_form_checks_dialogue_instead_of_programme_loudness() {
+        let analysis = crate::normalize::Analysis {
+            sample_rate: 48_000,
+            channels: 2,
+            channel_roles: crate::wav::default_channel_roles(2),
+            frames: 48_000,
+            kind: crate::wav::PcmKind::S24,
+            lufs: -12.0,
+            max_momentary_lufs: -10.0,
+            max_short_term_lufs: -11.0,
+            loudness_range_lu: 4.0,
+            rms_db: -14.0,
+            sample_peak: 0.5,
+            true_peak: 0.5,
+            loudness_blocks: Vec::new(),
+        };
+        let profile = ComplianceProfile::builtin("atsc-a85-long").unwrap();
+        assert!(profile.requires_dialogue());
+        assert!(profile.evaluate_with_dialogue(&analysis, None).is_err());
+        let result = profile
+            .evaluate_with_dialogue(&analysis, Some(-24.0))
+            .unwrap();
+        assert!(result.passed);
+        assert_eq!(result.rules[0].metric, "dialogue_lufs");
     }
 
     #[test]
@@ -659,7 +754,7 @@ mod tests {
             loudness_blocks: Vec::new(),
         };
         let profile = ComplianceProfile::builtin("ebu-r128-short").unwrap();
-        let result = profile.evaluate(&analysis);
+        let result = profile.evaluate(&analysis).unwrap();
         assert!(!result.passed);
         report.compliance_passed = Some(result.passed);
         assert_eq!(report.compliance_passed, Some(false));
@@ -669,6 +764,7 @@ mod tests {
     fn custom_profile_validation_rejects_conflicting_tolerances() {
         let profile = ComplianceProfile {
             name: "custom".into(),
+            loudness_basis: LoudnessBasis::Programme,
             target_lufs: Some(-20.0),
             loudness_tolerance_lu: Some(1.0),
             lower_tolerance_lu: None,

@@ -162,6 +162,15 @@ pub struct Cli {
     #[arg(long, requires = "analyze_only")]
     pub compliance: Option<String>,
 
+    /// JSON/TOML file of explicit dialogue or anchor time ranges.
+    #[arg(
+        long = "dialogue-ranges",
+        value_name = "PATH",
+        requires = "analyze_only",
+        conflicts_with_all = ["start_seconds", "duration_seconds"]
+    )]
+    pub dialogue_ranges: Option<PathBuf>,
+
     /// Start analysis at this source time in seconds.
     #[arg(long = "start", value_name = "SECONDS", requires = "analyze_only")]
     pub start_seconds: Option<f64>,
@@ -282,6 +291,7 @@ struct NormalizationConfig {
 struct AnalysisConfig {
     enabled: Option<bool>,
     compliance: Option<String>,
+    dialogue_ranges: Option<PathBuf>,
     start_seconds: Option<f64>,
     duration_seconds: Option<f64>,
     timeline: Option<PathBuf>,
@@ -410,6 +420,14 @@ impl Cli {
         );
         set_option_if_implicit(
             matches,
+            "dialogue_ranges",
+            &mut self.dialogue_ranges,
+            analysis
+                .dialogue_ranges
+                .map(|path| resolve_path(config_path, path)),
+        );
+        set_option_if_implicit(
+            matches,
             "start_seconds",
             &mut self.start_seconds,
             analysis.start_seconds,
@@ -462,12 +480,21 @@ impl Cli {
         set_if_implicit(matches, "bwf", &mut self.bwf, output.bwf);
         if !self.analyze_only
             && (self.compliance.is_some()
+                || self.dialogue_ranges.is_some()
                 || self.start_seconds.is_some()
                 || self.duration_seconds.is_some()
                 || self.timeline.is_some())
         {
             return Err(
-                "[analysis] compliance/range/timeline settings require `enabled = true`".into(),
+                "[analysis] compliance/dialogue/range/timeline settings require `enabled = true`"
+                    .into(),
+            );
+        }
+        if self.dialogue_ranges.is_some()
+            && (self.start_seconds.is_some() || self.duration_seconds.is_some())
+        {
+            return Err(
+                "analysis.dialogue_ranges conflicts with start_seconds/duration_seconds".into(),
             );
         }
         if self.verify_retries > 0 && !self.verify {
