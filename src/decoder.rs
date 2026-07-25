@@ -32,6 +32,36 @@ pub fn decode(path: &Path) -> Result<AudioBuffer, String> {
     if ext == "wav" || ext == "wave" {
         return WavReader::open(path).map_err(|e| format!("{}: {e}", path.display()));
     }
+    if ext == "opus" {
+        #[cfg(feature = "opus-encoding")]
+        {
+            let mut data: Vec<Vec<f32>> = Vec::new();
+            let info = crate::opus::decode_stream(path, |info, planar| {
+                if data.is_empty() {
+                    data = vec![Vec::new(); info.channels as usize];
+                }
+                for (destination, source) in data.iter_mut().zip(planar) {
+                    destination.extend_from_slice(source);
+                }
+                Ok(())
+            })?;
+            let frames = data.first().map_or(0, Vec::len);
+            return Ok(AudioBuffer {
+                sample_rate: info.sample_rate,
+                channels: info.channels,
+                frames,
+                data,
+                channel_roles: info.channel_roles,
+                source_kind: info.source_kind,
+            });
+        }
+        #[cfg(not(feature = "opus-encoding"))]
+        {
+            return Err(
+                "Ogg Opus support is unavailable; rebuild with `--features opus-encoding`".into(),
+            );
+        }
+    }
 
     // Everything else via symphonia.
     decode_symphonia(path, &ext)
@@ -207,6 +237,18 @@ where
         .unwrap_or_default();
     if matches!(extension.as_str(), "wav" | "wave") {
         return decode_wav_stream(path, consume);
+    }
+    if extension == "opus" {
+        #[cfg(feature = "opus-encoding")]
+        {
+            return crate::opus::decode_stream(path, consume);
+        }
+        #[cfg(not(feature = "opus-encoding"))]
+        {
+            return Err(
+                "Ogg Opus support is unavailable; rebuild with `--features opus-encoding`".into(),
+            );
+        }
     }
     let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let stream = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());

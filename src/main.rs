@@ -430,7 +430,7 @@ fn is_supported_input(path: &Path) -> bool {
             .and_then(|extension| extension.to_str())
             .map(str::to_ascii_lowercase)
             .as_deref(),
-        Some("wav" | "wave" | "mp3" | "flac" | "aac" | "m4a" | "mp4" | "ogg")
+        Some("wav" | "wave" | "mp3" | "flac" | "aac" | "m4a" | "mp4" | "ogg" | "opus")
     )
 }
 
@@ -524,6 +524,7 @@ fn parse_format(s: &str) -> OutputFormat {
     match s {
         "flac" => OutputFormat::Flac,
         "mp3" => OutputFormat::Mp3,
+        "opus" => OutputFormat::Opus,
         _ => OutputFormat::Wav,
     }
 }
@@ -533,6 +534,7 @@ fn fmt_ext(f: OutputFormat) -> &'static str {
         OutputFormat::Wav => "wav",
         OutputFormat::Flac => "flac",
         OutputFormat::Mp3 => "mp3",
+        OutputFormat::Opus => "opus",
     }
 }
 
@@ -545,6 +547,7 @@ fn infer_format(path: &Path) -> Option<OutputFormat> {
     {
         Some("flac") => Some(OutputFormat::Flac),
         Some("mp3") => Some(OutputFormat::Mp3),
+        Some("opus") => Some(OutputFormat::Opus),
         Some("wav") | Some("wave") => Some(OutputFormat::Wav),
         _ => None,
     }
@@ -561,6 +564,7 @@ fn default_format_for_input(path: &Path) -> OutputFormat {
     {
         Some("flac") => OutputFormat::Flac,
         Some("mp3") => OutputFormat::Mp3,
+        Some("opus") => OutputFormat::Opus,
         _ => OutputFormat::Wav,
     }
 }
