@@ -1,4 +1,4 @@
-//! Gated integrated loudness per ITU-R BS.1770-4 / EBU R128.
+//! Gated integrated loudness per ITU-R BS.1770-5 / EBU R128.
 //!
 //! Implements the full two-stage gating scheme:
 //!   1. 400 ms blocks with 75% overlap (100 ms hop), absolute gate at -70 LUFS.
@@ -15,21 +15,15 @@
 
 use crate::dsp::kwfilter::KWeight;
 use crate::dsp::simd;
-use crate::wav::AudioBuffer;
+use crate::wav::{AudioBuffer, ChannelRole};
 use rayon::prelude::*;
 
-/// Per-channel loudness weight (BS.1770). L/R/C = 1.0, surrounds = 1.41
-/// (+1.5 dB), LFE = 0.0 (excluded). The channel *role* is assumed from the
-/// standard FL,FR,FC,LFE,BL,BR ordering when the channel count suggests it.
-pub fn channel_weight(idx: usize, channels: u16) -> f64 {
-    if channels <= 2 {
-        1.0
-    } else {
-        match idx {
-            0..=2 => 1.0,
-            3 if channels >= 5 => 0.0,
-            _ => 1.41,
-        }
+/// Per-channel loudness weight (BS.1770).
+pub fn channel_weight(role: ChannelRole) -> f64 {
+    match role {
+        ChannelRole::Main => 1.0,
+        ChannelRole::Surround => 1.41,
+        ChannelRole::Lfe => 0.0,
     }
 }
 
@@ -68,7 +62,7 @@ pub fn measure_blocks(buf: &AudioBuffer) -> Vec<f64> {
         .collect();
 
     let weights: Vec<f64> = (0..buf.channels as usize)
-        .map(|i| channel_weight(i, buf.channels))
+        .map(|index| channel_weight(buf.channel_role(index)))
         .collect();
 
     // Block weighted mean squares.
@@ -150,6 +144,7 @@ mod tests {
             channels: 1,
             frames: samples.len(),
             data: vec![samples],
+            channel_roles: vec![ChannelRole::Main],
             source_kind: PcmKind::F32,
         }
     }
@@ -164,5 +159,12 @@ mod tests {
 
         assert_eq!(measure_blocks(&with_tail).len(), 1);
         assert_eq!(measure_lufs(&with_tail), measure_lufs(&complete_only));
+    }
+
+    #[test]
+    fn channel_roles_select_bs1770_weights() {
+        assert_eq!(channel_weight(ChannelRole::Main), 1.0);
+        assert_eq!(channel_weight(ChannelRole::Surround), 1.41);
+        assert_eq!(channel_weight(ChannelRole::Lfe), 0.0);
     }
 }

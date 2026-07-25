@@ -1,4 +1,4 @@
-//! K-weighting filter for ITU-R BS.1770-4 / EBU R128 loudness measurement.
+//! K-weighting filter for ITU-R BS.1770-5 / EBU R128 loudness measurement.
 //!
 //! K-weighting is two cascaded second-order biquads: a high-shelving
 //! "pre-filter" and a high-pass "RLB" filter. The coefficients depend on the
@@ -62,7 +62,7 @@ impl KWeight {
     /// Build the K-weighting filter pair for the given sample rate.
     pub fn for_sample_rate(fs: u32) -> Self {
         let fs = fs as f64;
-        // Design parameters from ITU-R BS.1770-4.
+        // Design parameters from ITU-R BS.1770-5.
         let stage1 = high_shelf(fs, 1681.974450955533, 3.999843853973347, 0.7071752369554196);
         let stage2 = high_pass(fs, 38.13547087602444, 0.5003270373238773);
         Self { stage1, stage2 }
@@ -88,7 +88,7 @@ impl KWeight {
     }
 }
 
-/// High-shelf "pre-filter" biquad, ITU-R BS.1770-4 design (the DeMan /
+/// High-shelf "pre-filter" biquad, ITU-R BS.1770-5 design (the DeMan /
 /// libebur128 analytical formula, which reproduces the standard's published
 /// shelf coefficients to full double precision at 48 kHz).
 fn high_shelf(fs: f64, f0: f64, gain_db: f64, q: f64) -> Biquad {
@@ -104,7 +104,7 @@ fn high_shelf(fs: f64, f0: f64, gain_db: f64, q: f64) -> Biquad {
     Biquad::new(b0, b1, b2, a1, a2)
 }
 
-/// RLB high-pass biquad (stage 2), ITU-R BS.1770-4 design. The numerator is the
+/// RLB high-pass biquad (stage 2), ITU-R BS.1770-5 design. The numerator is the
 /// fixed [1, -2, 1] high-pass prototype; only the denominator is shaped by the
 /// bilinear-transformed analog prototype.
 fn high_pass(fs: f64, f0: f64, q: f64) -> Biquad {
@@ -122,7 +122,7 @@ fn high_pass(fs: f64, f0: f64, q: f64) -> Biquad {
 mod tests {
     use super::*;
 
-    /// The RBJ design must reproduce the exact ITU-R BS.1770-4 coefficients at
+    /// The RBJ design must reproduce the exact ITU-R BS.1770-5 coefficients at
     /// 48 kHz. This is the correctness anchor for the whole loudness chain.
     #[test]
     fn kweight_48k_matches_itu() {
@@ -163,7 +163,7 @@ mod tests {
             "stage2.a1 = {}",
             s2.a1
         );
-        // NOTE: the ITU-R BS.1770-4 *table* lists a2 = 0.99709018690653, but
+        // NOTE: the ITU-R BS.1770-5 *table* lists a2 = 0.99709018690653, but
         // Brecht DeMan showed the standard's design *equations* yield
         // 0.99007225036621. Every reference implementation (libebur128/FFmpeg,
         // pyloudnorm's "DeMan" filter class) uses the equation value, so we do

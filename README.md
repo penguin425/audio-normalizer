@@ -1,8 +1,8 @@
-# Forge — a SIMD-accelerated EBU R128 / ITU-R BS.1770-4 loudness normalizer
+# Forge — a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer
 
 Forge is a fast, standards-correct audio loudness normalizer written in Rust.
 It measures loudness the way broadcasters and streaming services do (**EBU R128
-LUFS** with the full ITU-R BS.1770-4 K-weighting and two-stage gating) and
+LUFS** with the full ITU-R BS.1770-5 K-weighting and two-stage gating) and
 applies a single linear gain so the output hits your target — while guaranteeing
 the **inter-sample true peak** never exceeds a ceiling, the way Spotify/Apple
 mastering does.
@@ -61,7 +61,7 @@ Decoded MP3 output lands within ~0.3 LU of the target (lossy round-trip).
 
 ## Why it's correct
 
-* **K-weighting** is implemented from the ITU-R BS.1770-4 design equations
+* **K-weighting** is implemented from the ITU-R BS.1770-5 design equations
   (`K = tan(π·f0/fs)` analog-prototype + bilinear transform). The unit test
   `kweight_48k_matches_itu` asserts the resulting 48 kHz coefficients match the
   reference (libebur128 / FFmpeg / pyloudnorm "DeMan") to 1e-9 — the shelf
@@ -69,6 +69,9 @@ Decoded MP3 output lands within ~0.3 LU of the target (lossy round-trip).
 * **Gated loudness** uses 400 ms blocks, 75% overlap, the −70 LUFS absolute
   gate and the −10 dB relative gate, with the relative gate applied in the
   linear mean-square domain (numerically exact, no repeated log/exp).
+* **Channel-layout-aware weighting** reads WAVE_FORMAT_EXTENSIBLE channel masks
+  and codec layouts, excludes LFE channels wherever they occur, and applies the
+  BS.1770 surround-channel weighting by role instead of guessed channel index.
 * **True peak** is measured by 4× polyphase FIR oversampling (Kaiser-windowed
   lowpass, unity DC gain), so inter-sample peaks that exceed sample peaks are
   caught — and the gain is reduced so the output never clips after DAC

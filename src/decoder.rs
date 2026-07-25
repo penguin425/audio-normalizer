@@ -8,7 +8,7 @@
 //! have. All paths produce the same planar-f32 [`AudioBuffer`] the DSP engine
 //! consumes.
 
-use crate::wav::{AudioBuffer, PcmKind, WavReader};
+use crate::wav::{default_channel_roles, AudioBuffer, ChannelRole, PcmKind, WavReader};
 use std::fs::File;
 use std::path::Path;
 
@@ -132,13 +132,47 @@ fn decode_symphonia(path: &Path, ext: &str) -> Result<AudioBuffer, String> {
     }
 
     let frames = planar[0].len();
+    let channel_roles = track
+        .codec_params
+        .channels
+        .map(roles_from_symphonia)
+        .filter(|roles| roles.len() == channels as usize)
+        .unwrap_or_else(|| default_channel_roles(channels));
     Ok(AudioBuffer {
         sample_rate,
         channels,
         frames,
         data: planar,
+        channel_roles,
         // Compressed inputs have no integer "source kind"; report float, which
         // is also the default WAV output kind for these files.
         source_kind: PcmKind::F32,
     })
+}
+
+fn roles_from_symphonia(channels: symphonia::core::audio::Channels) -> Vec<ChannelRole> {
+    use symphonia::core::audio::Channels;
+    channels
+        .iter()
+        .map(|channel| {
+            if channel.intersects(Channels::LFE1 | Channels::LFE2) {
+                ChannelRole::Lfe
+            } else if channel.intersects(
+                Channels::REAR_LEFT
+                    | Channels::REAR_RIGHT
+                    | Channels::REAR_CENTRE
+                    | Channels::SIDE_LEFT
+                    | Channels::SIDE_RIGHT
+                    | Channels::REAR_LEFT_CENTRE
+                    | Channels::REAR_RIGHT_CENTRE
+                    | Channels::TOP_REAR_LEFT
+                    | Channels::TOP_REAR_CENTRE
+                    | Channels::TOP_REAR_RIGHT,
+            ) {
+                ChannelRole::Surround
+            } else {
+                ChannelRole::Main
+            }
+        })
+        .collect()
 }
