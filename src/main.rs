@@ -67,6 +67,9 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
     if cli.album && plan.mode != Mode::Lufs {
         return Err("--album is only valid with --mode lufs".into());
     }
+    if !cli.verify_tolerance.is_finite() || cli.verify_tolerance < 0.0 {
+        return Err("--verify-tolerance must be a finite non-negative number".into());
+    }
 
     if cli.write_tags {
         return write_loudness_tags(&cli);
@@ -141,6 +144,30 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
             album_l,
             20.0 * (gain as f64).log10()
         );
+        if cli.verify {
+            let mut verified_outputs = Vec::with_capacity(outputs.len());
+            let mut passed = true;
+            for ((output, (source, applied)), input) in
+                outputs.iter().zip(&results).zip(&cli.inputs)
+            {
+                let verification =
+                    normalize::verify_file(output, source, *applied, &plan, cli.verify_tolerance)?;
+                passed &= print_verification(input, &verification, &plan);
+                verified_outputs.push(verification.output);
+            }
+            let actual_album = normalize::album_lufs(&verified_outputs);
+            let expected_album = album_l + 20.0 * (gain as f64).log10();
+            let album_deviation = (actual_album - expected_album).abs();
+            let album_ok = album_deviation <= cli.verify_tolerance;
+            eprintln!(
+                "album verification: expected {expected_album:.2} LUFS, measured \
+                 {actual_album:.2} LUFS, deviation {album_deviation:.2} LU [{}]",
+                if album_ok { "PASS" } else { "FAIL" }
+            );
+            if !passed || !album_ok {
+                return Err("post-encode verification failed".into());
+            }
+        }
         return Ok(());
     }
 
@@ -156,9 +183,46 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
             prepare_output_directories(std::slice::from_ref(output))?;
             let (an, gain) = normalize::normalize_one(input, output, &plan, *fmt)?;
             print_analysis(input, &an, Some(gain));
+            if cli.verify {
+                let verification =
+                    normalize::verify_file(output, &an, gain, &plan, cli.verify_tolerance)?;
+                if !print_verification(input, &verification, &plan) {
+                    return Err(format!(
+                        "post-encode verification failed: {}",
+                        output.display()
+                    ));
+                }
+            }
         }
     }
     Ok(())
+}
+
+fn print_verification(input: &Path, verification: &normalize::Verification, plan: &Plan) -> bool {
+    let unit = match plan.mode {
+        Mode::Lufs => "LUFS",
+        Mode::Peak | Mode::Rms => "dBFS",
+    };
+    eprintln!(
+        "{} verification: expected {:.2} {unit}, measured {:.2} {unit}, deviation \
+         {:.2} dB [{}]; true peak {:.2} dBTP [{}]",
+        input.display(),
+        verification.expected_level,
+        verification.actual_level,
+        verification.deviation,
+        if verification.level_ok {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+        verification.output.true_peak_db(),
+        if verification.true_peak_ok {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    );
+    verification.passed()
 }
 
 fn write_loudness_tags(cli: &cli::Cli) -> Result<(), String> {
