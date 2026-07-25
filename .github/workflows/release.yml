@@ -25,7 +25,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - id: version
         name: Match tag to Cargo package version
@@ -64,7 +64,7 @@ jobs:
             archive: tar
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -96,7 +96,7 @@ jobs:
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
 
       - name: Upload packaged binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: forge-${{ matrix.asset }}
           path: forge-v${{ needs.validate.outputs.version }}-${{ matrix.asset }}.*
@@ -109,9 +109,11 @@ jobs:
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     permissions:
+      attestations: write
       contents: write
+      id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: forge-*
           path: dist
@@ -121,6 +123,13 @@ jobs:
         working-directory: dist
         shell: bash
         run: sha256sum forge-* > SHA256SUMS
+
+      - name: Attest release artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/forge-*
+            dist/SHA256SUMS
 
       - name: Publish release
         env:
