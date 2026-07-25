@@ -159,6 +159,33 @@ fn adm_qc_measures_each_mapped_presentation() {
     let _ = std::fs::remove_file(input);
 }
 
+#[test]
+fn dialogue_detector_emits_auditable_merged_ranges() {
+    let input = tmp_path("forge_it_dialogue_detector.wav");
+    let mut buffer = synth_sine(48_000, 4.0, 0.0, 997.0, 6);
+    for frame in 48_000..144_000 {
+        buffer.data[2][frame] = 0.2 * (2.0 * PI * 180.0 * frame as f64 / 48_000.0).sin() as f32;
+    }
+    WavWriter::write(&input, &buffer, PcmKind::F32, false).unwrap();
+
+    let detection = normalize::detect_dialogue_ranges(&input, None, 0.6).unwrap();
+    assert_eq!(detection.detector, "forge-dialogue-deterministic");
+    assert_eq!(
+        detection.features,
+        vec![
+            "window_rms_dbfs",
+            "center_or_mid_focus",
+            "zero_crossing_rate"
+        ]
+    );
+    assert_eq!(detection.ranges.len(), 1);
+    assert_eq!(detection.ranges[0].start_seconds, 1.0);
+    assert_eq!(detection.ranges[0].duration_seconds, 2.0);
+    assert!(detection.ranges[0].confidence >= 0.6);
+
+    let _ = std::fs::remove_file(input);
+}
+
 #[cfg(feature = "aac-encoding")]
 #[test]
 fn aac_m4a_roundtrips_gaplessly_and_writes_loudness_tags() {

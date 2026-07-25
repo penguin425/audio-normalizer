@@ -167,9 +167,33 @@ pub struct Cli {
         long = "dialogue-ranges",
         value_name = "PATH",
         requires = "analyze_only",
-        conflicts_with_all = ["start_seconds", "duration_seconds"]
+        conflicts_with_all = ["start_seconds", "duration_seconds", "auto_dialogue"]
     )]
     pub dialogue_ranges: Option<PathBuf>,
+
+    /// Detect reviewable dialogue candidates with Forge's deterministic detector.
+    #[arg(
+        long = "auto-dialogue",
+        requires = "analyze_only",
+        conflicts_with = "dialogue_ranges"
+    )]
+    pub auto_dialogue: bool,
+
+    /// Minimum automatic-dialogue confidence from 0 to 1.
+    #[arg(
+        long = "dialogue-confidence",
+        default_value_t = 0.6,
+        requires = "auto_dialogue"
+    )]
+    pub dialogue_confidence: f64,
+
+    /// Write the detector features, confidence, and selected ranges as JSON.
+    #[arg(
+        long = "dialogue-detection-report",
+        value_name = "PATH",
+        requires = "auto_dialogue"
+    )]
+    pub dialogue_detection_report: Option<PathBuf>,
 
     /// Dialogue measurement standard: infer from compliance, ATSC A/85, or EBU R128 s4.
     #[arg(

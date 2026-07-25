@@ -195,8 +195,8 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
             .as_deref()
             .map(ComplianceProfile::load)
             .transpose()?;
-        if stdin_requested && cli.dialogue_ranges.is_some() {
-            return Err("--dialogue-ranges cannot be used with stdin".into());
+        if stdin_requested && (cli.dialogue_ranges.is_some() || cli.auto_dialogue) {
+            return Err("dialogue range analysis cannot be used with stdin".into());
         }
         let dialogue_ranges = cli
             .dialogue_ranges
@@ -238,11 +238,15 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
             .as_ref()
             .is_some_and(ComplianceProfile::requires_dialogue)
             && dialogue_ranges.is_none()
+            && !cli.auto_dialogue
         {
             return Err(format!(
                 "compliance profile {} requires --dialogue-ranges",
                 compliance.as_ref().unwrap().name
             ));
+        }
+        if cli.dialogue_detection_report.is_some() && cli.inputs.len() != 1 {
+            return Err("--dialogue-detection-report requires exactly one input".into());
         }
         if cli.codec_metadata.is_some() && cli.inputs.len() != 1 {
             return Err("--codec-metadata currently requires exactly one input".into());
@@ -265,6 +269,7 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
             .transpose()?;
         let mut reports = Vec::with_capacity(cli.inputs.len());
         let mut timeline_reports = Vec::new();
+        let mut dialogue_detection_output = None;
         let mut qc_failed = false;
         for input in &cli.inputs {
             let timed = normalize::analyze_file_range_with_roles(
@@ -275,8 +280,21 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                 cli.timeline.as_ref().map(|_| cli.timeline_interval_ms),
             )?;
             let an = timed.analysis;
-            let dialogue = dialogue_ranges
-                .as_deref()
+            let detection = cli
+                .auto_dialogue
+                .then(|| {
+                    normalize::detect_dialogue_ranges(
+                        cli.dialogue_stem.as_deref().unwrap_or(input),
+                        channel_roles_override.as_deref(),
+                        cli.dialogue_confidence,
+                    )
+                })
+                .transpose()?;
+            let detected_ranges = detection
+                .as_ref()
+                .map(normalize::DialogueDetection::measurement_ranges);
+            let active_dialogue_ranges = dialogue_ranges.as_deref().or(detected_ranges.as_deref());
+            let dialogue = active_dialogue_ranges
                 .map(|ranges| {
                     normalize::analyze_dialogue_ranges_for_standard_with_roles(
                         cli.dialogue_stem.as_deref().unwrap_or(input),
@@ -287,6 +305,9 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                     )
                 })
                 .transpose()?;
+            if let Some(detection) = detection.clone() {
+                dialogue_detection_output = Some(detection);
+            }
             let compliance_result = compliance
                 .as_ref()
                 .map(|profile| {
@@ -362,6 +383,15 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                     );
                     report.adm_qc_passed = Some(adm.passed);
                 }
+                if let Some(detection) = &detection {
+                    report.dialogue_detector = Some(detection.detector);
+                    report.dialogue_detector_version = Some(detection.detector_version);
+                    report.dialogue_detection_threshold = Some(detection.threshold);
+                    report.dialogue_detection_ranges_json = Some(
+                        serde_json::to_string(&detection.ranges)
+                            .expect("dialogue detections are serializable"),
+                    );
+                }
                 reports.push(report);
             } else {
                 print_analysis(input, &an, None);
@@ -376,6 +406,23 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                         dialogue.method,
                         an.lufs - dialogue.lufs,
                     );
+                }
+                if let Some(detection) = &detection {
+                    eprintln!(
+                        "  dialogue detector: {} {} threshold {:.2}, {} selected range(s)",
+                        detection.detector,
+                        detection.detector_version,
+                        detection.threshold,
+                        detection.ranges.len(),
+                    );
+                    for range in &detection.ranges {
+                        eprintln!(
+                            "    {:.3}..{:.3} s confidence {:.3}",
+                            range.start_seconds,
+                            range.start_seconds + range.duration_seconds,
+                            range.confidence,
+                        );
+                    }
                 }
                 if let Some(profile) = &compliance {
                     print_compliance(profile, &an, dialogue.as_ref())?;
@@ -463,6 +510,15 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                     .map_err(|error| format!("create {}: {error}", path.display()))?;
                 report::write_manifest(file, &reports)?;
             }
+        }
+        if let Some(path) = &cli.dialogue_detection_report {
+            let detection = dialogue_detection_output
+                .as_ref()
+                .expect("auto dialogue always produces a detection result");
+            let file = File::create(path)
+                .map_err(|error| format!("create {}: {error}", path.display()))?;
+            serde_json::to_writer_pretty(file, detection)
+                .map_err(|error| format!("write dialogue detection report: {error}"))?;
         }
         if qc_failed {
             return Err("one or more inputs failed the requested compliance/QC checks".into());

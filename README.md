@@ -424,6 +424,13 @@ referenced by `axml`, and measures its explicit one-based channel selection.
 Reports label this as `direct-channel-map (no ADM object renderer)` so a channel
 selection is never misrepresented as a full object-based render.
 
+`--auto-dialogue` provides deterministic dialogue candidates when reviewed
+ranges are not yet available. The detector uses fixed one-second RMS,
+centre/mid focus, and zero-crossing features; `--dialogue-confidence` controls
+selection. Reports include the detector/version, threshold, every selected
+range, and confidence. `--dialogue-detection-report` writes the same audit data
+separately. This is deliberately described as a heuristic detector, not AI.
+
 Loudness Range (LRA) is reported for every analysis, together with
 `loudness_range_stable`. EBU Tech 3341 notes that LRA is not stable during the
 first 60 seconds, so shorter measurements are marked provisional instead of
