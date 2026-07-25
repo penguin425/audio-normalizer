@@ -11,6 +11,7 @@
 
 use crate::decoder;
 use crate::dsp::{lufs, simd, truepeak};
+use crate::metadata;
 #[cfg(feature = "mp3-encoding")]
 use crate::mp3enc;
 use crate::wav::{AudioBuffer, PcmKind, WavWriter};
@@ -197,6 +198,7 @@ pub fn normalize_one<P: AsRef<Path>>(
     let gain = compute_gain(&an, plan);
     apply_gain_and_protect(&mut buf, gain, plan);
     write(&buf, &output, plan, format)?;
+    metadata::copy_metadata(input.as_ref(), output.as_ref())?;
     Ok((an, gain))
 }
 
@@ -236,6 +238,7 @@ pub fn normalize_album(
         apply_gain_and_protect(&mut buf, gain, plan);
         let fmt = formats.get(i).copied().unwrap_or(OutputFormat::Wav);
         write(&buf, output, plan, fmt)?;
+        metadata::copy_metadata(input, output)?;
         results.push((analyses[i].clone(), gain));
     }
     Ok(results)
