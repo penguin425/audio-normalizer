@@ -9,6 +9,7 @@
 // on emphasis markers, so allow it crate-wide.
 #![allow(clippy::doc_lazy_continuation)]
 
+mod atomic;
 pub mod cli;
 pub mod decoder;
 pub mod dsp;

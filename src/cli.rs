@@ -111,6 +111,14 @@ pub struct Cli {
     #[arg(long, value_name = "PATH", requires = "analyze_only")]
     pub csv: Option<PathBuf>,
 
+    /// Evaluate analysis against a delivery specification.
+    #[arg(
+        long,
+        value_parser = ["ebu-r128"],
+        requires = "analyze_only"
+    )]
+    pub compliance: Option<String>,
+
     /// Print the gain that would be applied; write nothing.
     #[arg(long = "gain-only")]
     pub gain_only: bool,

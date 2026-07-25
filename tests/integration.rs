@@ -74,6 +74,39 @@ fn flac_output_roundtrips_at_16_and_24_bits() {
 }
 
 #[test]
+fn failed_encode_preserves_an_existing_destination() {
+    let input = tmp_path("forge_it_atomic_input.wav");
+    let output = tmp_path("forge_it_atomic_output.wav");
+    let buffer = synth_sine(48_000, 1.0, 0.1, 997.0, 2);
+    WavWriter::write(&input, &buffer, PcmKind::S24, false).unwrap();
+    std::fs::write(&output, b"existing destination").unwrap();
+    let plan = Plan {
+        mode: Mode::Lufs,
+        target_lufs: -16.0,
+        target_peak_db: -1.0,
+        target_rms_db: -18.0,
+        ceiling_db: -1.0,
+        max_gain_db: None,
+        dither: false,
+        output_kind: Some(PcmKind::S24),
+        mp3_bitrate: 192,
+        mp3_quality: 2,
+        limiter: Some(LimiterConfig {
+            lookahead_ms: 0.0,
+            release_ms: 100.0,
+        }),
+    };
+    assert!(normalize::normalize_one(&input, &output, &plan, OutputFormat::Wav).is_err());
+    assert_eq!(
+        std::fs::read(&output).unwrap(),
+        b"existing destination",
+        "a failed render replaced the destination"
+    );
+    let _ = std::fs::remove_file(input);
+    let _ = std::fs::remove_file(output);
+}
+
+#[test]
 fn replaygain_tags_leave_decoded_audio_unchanged() {
     let input = tmp_path("forge_it_replaygain.flac");
     let buf = synth_sine(48_000, 1.0, 0.25, 440.0, 2);
