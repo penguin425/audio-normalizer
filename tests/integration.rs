@@ -6,8 +6,8 @@
 //! the entire read -> measure -> gain -> write -> read round trip.
 
 use forge_normalizer::decoder;
-use forge_normalizer::dsp::limiter::LimiterConfig;
-use forge_normalizer::normalize::{self, Mode, OutputFormat, Plan};
+use forge_normalizer::dsp::{limiter::LimiterConfig, lufs};
+use forge_normalizer::normalize::{self, DialogueRange, Mode, OutputFormat, Plan};
 use forge_normalizer::wav::{
     default_channel_roles, named_channel_layout, AudioBuffer, PcmKind, WavContainer, WavReader,
     WavWriter, WaveChunk,
@@ -55,6 +55,47 @@ fn ambiguous_multichannel_wav_requires_an_explicit_layout() {
     let roles = named_channel_layout("7.1").unwrap();
     let analysis = normalize::analyze_file_with_roles(&input, Some(&roles)).unwrap();
     assert_eq!(analysis.channels, 8);
+
+    let _ = std::fs::remove_file(input);
+}
+
+#[test]
+fn dialogue_loudness_uses_the_combined_block_population() {
+    let input = tmp_path("forge_it_dialogue_ranges.wav");
+    let mut buffer = synth_sine(48_000, 6.0, 0.2, 997.0, 1);
+    for sample in &mut buffer.data[0][..48_000] {
+        *sample *= 0.25;
+    }
+    WavWriter::write(&input, &buffer, PcmKind::F32, false).unwrap();
+    let ranges = [
+        DialogueRange {
+            start_seconds: 0.0,
+            duration_seconds: 1.0,
+        },
+        DialogueRange {
+            start_seconds: 2.0,
+            duration_seconds: 4.0,
+        },
+    ];
+
+    let measured = normalize::analyze_dialogue_ranges_with_roles(&input, None, &ranges).unwrap();
+    let quiet =
+        normalize::analyze_file_range_with_roles(&input, None, 0.0, Some(1.0), None).unwrap();
+    let loud =
+        normalize::analyze_file_range_with_roles(&input, None, 2.0, Some(4.0), None).unwrap();
+    let expected_blocks = quiet
+        .analysis
+        .loudness_blocks
+        .iter()
+        .chain(&loud.analysis.loudness_blocks)
+        .copied()
+        .collect::<Vec<_>>();
+    let naive_track_mean = (quiet.analysis.lufs + loud.analysis.lufs) / 2.0;
+
+    assert!((measured.lufs - lufs::gated_lufs(&expected_blocks)).abs() < 1e-12);
+    assert!((measured.lufs - naive_track_mean).abs() > 2.0);
+    assert_eq!(measured.range_count, 2);
+    assert!((measured.duration_seconds - 5.0).abs() < 1e-12);
 
     let _ = std::fs::remove_file(input);
 }

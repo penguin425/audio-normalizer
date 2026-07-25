@@ -205,6 +205,58 @@ fn analysis_range_writes_a_time_resolved_qc_report() {
 }
 
 #[test]
+fn explicit_dialogue_ranges_drive_long_form_compliance() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("programme.wav");
+    let ranges = directory.path().join("dialogue.json");
+    std::fs::write(&input, wav_fixture_bytes()).unwrap();
+    std::fs::write(
+        &ranges,
+        r#"{"ranges":[{"start_seconds":0.0,"duration_seconds":1.0}]}"#,
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            input.to_str().unwrap(),
+            "--analyze",
+            "--json",
+            "--dialogue-ranges",
+            ranges.to_str().unwrap(),
+            "--compliance",
+            "atsc-a85-long",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert!(report[0]["dialogue_lufs"].is_number());
+    assert_eq!(report[0]["dialogue_range_count"], 1);
+    assert_eq!(report[0]["compliance_loudness_basis"], "dialogue");
+    assert!(report[0]["compliance_passed"].as_bool().unwrap());
+    assert!(report[0]["compliance_rules_json"]
+        .as_str()
+        .unwrap()
+        .contains("dialogue_lufs"));
+
+    let missing = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            input.to_str().unwrap(),
+            "--analyze",
+            "--compliance",
+            "atsc-a85-long",
+        ])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("requires --dialogue-ranges"));
+}
+
+#[test]
 fn toml_job_config_is_relative_and_cli_options_override_it() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("programme.wav");

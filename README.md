@@ -96,9 +96,10 @@ Decoded MP3 output lands within ~0.3 LU of the target (lossy round-trip).
   channels; `--channel-layout` can override missing or incorrect metadata.
 * **EBU Mode analysis** reports Integrated, maximum Momentary (400 ms), maximum
   Short-term (3 s), and Loudness Range (LRA) measurements.
-* **Delivery compliance reports** include EBU R 128, ATSC A/85 short-form, and
-  AES77 presets plus custom JSON/TOML profiles. Every evaluated rule and the
-  aggregate PASS/FAIL result are available in machine-readable reports.
+* **Delivery compliance reports** include EBU R 128, ATSC A/85 short- and
+  long-form, and AES77 presets plus custom JSON/TOML profiles. Every evaluated
+  rule and the aggregate PASS/FAIL result are available in machine-readable
+  reports.
 * **True peak** is measured by 4× polyphase FIR oversampling (Kaiser-windowed
   lowpass, unity DC gain), so inter-sample peaks that exceed sample peaks are
   caught — and the gain is reduced so the output never clips after DAC
@@ -228,6 +229,10 @@ forge --analyze album/*.flac --ndjson | jq -c 'select(.true_peak_dbtp > -1)'
 # Machine-readable EBU R128 delivery checks
 forge --analyze programme.wav --compliance ebu-r128 --json
 
+# Measure explicit dialogue/anchor regions for ATSC A/85 long-form delivery
+forge --analyze programme.wav --compliance atsc-a85-long \
+  --dialogue-ranges dialogue.toml --json
+
 # Locate momentary, short-term, and true-peak violations on a 100 ms timeline
 forge --analyze programme.wav --compliance ebu-r128-short \
   --timeline qc.ndjson
@@ -299,6 +304,7 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--ndjson` | off | Write one compact JSON analysis object per line |
 | `--csv` | none | Write analyze results as CSV to a file or `-` |
 | `--compliance` | none | Built-in delivery profile name or custom `.json`/`.toml` profile |
+| `--dialogue-ranges` | none | Explicit dialogue/anchor regions from JSON/TOML |
 | `--start` | `0` | Analysis start time in source seconds |
 | `--duration` | to end | Maximum analysis duration in seconds |
 | `--timeline` | none | Time-resolved QC report (`.json`, `.ndjson`, `.jsonl`, or `.csv`) |
@@ -337,6 +343,7 @@ dither = true
 [analysis]
 enabled = false
 # compliance = "ebu-r128-short"
+# dialogue_ranges = "dialogue.toml"
 # start_seconds = 60.0
 # duration_seconds = 30.0
 # timeline = "reports/programme.ndjson"
@@ -377,18 +384,41 @@ playback references rather than acceptance guarantees.
 | `ebu-r128` | −23.0 ±0.2 LUFS | true peak ≤ −1 dBTP |
 | `ebu-r128-short` | −23.0 ±0.2 LUFS | true peak ≤ −1 dBTP; max short-term ≤ −18 LUFS |
 | `atsc-a85-short` | −24 ±2 LUFS | true peak ≤ −2 dBTP |
+| `atsc-a85-long` | −24 ±2 LKFS/LUFS, explicit dialogue regions | true peak ≤ −2 dBTP |
 | `aes77-assorted` | ≤ −16 LUFS (target −18, upper tolerance +2) | true peak ≤ −1 dBTP |
 | `aes77-music-track` | −16.0 ±0.2 LUFS | true peak ≤ −1 dBTP |
 | `aes77-interstitial` | −18.0 ±0.2 LUFS | true peak ≤ −1 dBTP |
 
-ATSC long-form programme compliance requires dialogue-gated measurement and is
-therefore deliberately not implied by `atsc-a85-short`.
+ATSC long-form programme compliance uses dialogue/anchor loudness and is
+therefore deliberately not implied by `atsc-a85-short`. Supply deterministic,
+reviewable regions with `--dialogue-ranges`; Forge combines all complete
+400 ms BS.1770 blocks across those regions and applies gating once, so longer
+regions receive their correct weight. It does not guess dialogue with a
+classifier.
+
+Dialogue range files use JSON or TOML:
+
+```toml
+[[ranges]]
+start_seconds = 12.5
+duration_seconds = 8.0
+
+[[ranges]]
+start_seconds = 95.0
+duration_seconds = 20.0
+```
+
+Ranges must be sorted, non-overlapping, and contain at least one complete
+400 ms loudness block in total. Machine-readable reports include programme
+`integrated_lufs` separately from `dialogue_lufs`, dialogue duration, range
+count, and the compliance loudness basis.
 
 Custom profiles use JSON or TOML. All fields except `name` are optional; a
 profile must define at least one rule:
 
 ```toml
 name = "station-qc"
+loudness_basis = "programme" # or "dialogue"
 target_lufs = -23.0
 lower_tolerance_lu = 1.0
 upper_tolerance_lu = 0.5
