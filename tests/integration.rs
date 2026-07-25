@@ -307,6 +307,92 @@ fn opus_album_writes_shared_r128_album_gain() {
     }
 }
 
+#[cfg(feature = "opus-encoding")]
+#[test]
+fn opus_mapping_family_one_roundtrips_5_1_through_7_1() {
+    use ogg::PacketReader;
+    use std::io::BufReader;
+
+    for channels in [6_u16, 7, 8] {
+        let frames = 48_000 * 2;
+        let roles = if channels >= 7 {
+            named_channel_layout(if channels == 7 { "6.1" } else { "7.1" }).unwrap()
+        } else {
+            default_channel_roles(channels)
+        };
+        let data = (0..channels as usize)
+            .map(|channel| {
+                let amplitude = 0.015 * (channel + 1) as f32;
+                (0..frames)
+                    .map(|frame| {
+                        amplitude
+                            * (2.0 * PI * (300.0 + channel as f64 * 97.0) * frame as f64 / 48_000.0)
+                                .sin() as f32
+                    })
+                    .collect()
+            })
+            .collect();
+        let buffer = AudioBuffer {
+            sample_rate: 48_000,
+            channels,
+            frames,
+            data,
+            channel_roles: roles.clone(),
+            source_kind: PcmKind::F32,
+        };
+        let output = tmp_path(&format!("forge_it_opus_{channels}ch.opus"));
+        let plan = Plan {
+            mode: Mode::Lufs,
+            target_lufs: -18.0,
+            target_peak_db: -1.0,
+            target_rms_db: -18.0,
+            ceiling_db: -1.0,
+            max_gain_db: None,
+            dither: false,
+            output_kind: None,
+            mp3_bitrate: 384,
+            mp3_quality: 2,
+            limiter: None,
+            wav_container: WavContainer::Auto,
+            bwf: false,
+        };
+        normalize::write(&buffer, &output, &plan, OutputFormat::Opus).unwrap();
+
+        let mut packets = PacketReader::new(BufReader::new(std::fs::File::open(&output).unwrap()));
+        let head = packets.read_packet().unwrap().unwrap().data;
+        assert_eq!(head[18], 1, "{channels}ch mapping family");
+        assert_eq!(
+            &head[21..],
+            match channels {
+                6 => &[0, 4, 1, 2, 3, 5][..],
+                7 => &[0, 4, 1, 2, 3, 5, 6][..],
+                _ => &[0, 6, 1, 2, 3, 4, 5, 7][..],
+            }
+        );
+
+        let decoded = decoder::decode(&output).unwrap();
+        assert_eq!(decoded.channels, channels);
+        assert_eq!(decoded.channel_roles, roles);
+        let rms: Vec<f64> = decoded
+            .data
+            .iter()
+            .map(|channel| {
+                (channel
+                    .iter()
+                    .map(|sample| f64::from(*sample).powi(2))
+                    .sum::<f64>()
+                    / channel.len() as f64)
+                    .sqrt()
+            })
+            .collect();
+        assert!(
+            rms.windows(2).all(|pair| pair[0] < pair[1]),
+            "{channels}ch order was not preserved: {rms:?}"
+        );
+        let _ = std::fs::remove_file(output);
+    }
+}
+
 #[test]
 fn replaygain_tags_leave_decoded_audio_unchanged() {
     let input = tmp_path("forge_it_replaygain.flac");

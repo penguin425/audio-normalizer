@@ -1,8 +1,8 @@
 //! Ogg Opus streaming I/O with RFC 7845 loudness metadata.
 
 use crate::decoder::StreamInfo;
-use crate::wav::{default_channel_roles, PcmKind};
-use ::opus::{Application, Bitrate, Channels, Decoder, Encoder};
+use crate::wav::{default_channel_roles, named_channel_layout, ChannelRole, PcmKind};
+use ::opus::{Application, Bitrate, Channels, Decoder, Encoder, MSDecoder, MSEncoder};
 use ogg::{PacketReader, PacketWriteEndInfo, PacketWriter};
 use rubato::{FastFixedIn, PolynomialDegree, Resampler};
 use std::fs::File;
@@ -17,8 +17,10 @@ static NEXT_SERIAL: AtomicU32 = AtomicU32::new(0x464f_5247);
 
 pub struct OpusStreamWriter {
     packets: PacketWriter<'static, BufWriter<File>>,
-    encoder: Encoder,
+    encoder: OpusEncoder,
     channels: usize,
+    channel_order: Vec<usize>,
+    max_packet_bytes: usize,
     serial: u32,
     pre_skip: usize,
     expected_output_frames: u64,
@@ -31,21 +33,22 @@ pub struct OpusStreamWriter {
 }
 
 impl OpusStreamWriter {
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         path: &Path,
         input_rate: u32,
         input_frames: usize,
         channels: u16,
+        channel_roles: &[ChannelRole],
         bitrate_kbps: i32,
         track_lufs: f64,
         album_lufs: Option<f64>,
     ) -> Result<Self, String> {
-        let channel_mode = opus_channels(channels)?;
+        let layout = opus_layout(channels, channel_roles)?;
         if bitrate_kbps <= 0 {
             return Err("Opus bitrate must be positive".into());
         }
-        let mut encoder = Encoder::new(OPUS_RATE, channel_mode, Application::Audio)
-            .map_err(|error| format!("create Opus encoder: {error}"))?;
+        let mut encoder = OpusEncoder::new(&layout)?;
         encoder
             .set_bitrate(Bitrate::Bits(bitrate_kbps.saturating_mul(1000)))
             .map_err(|error| format!("set Opus bitrate: {error}"))?;
@@ -59,7 +62,7 @@ impl OpusStreamWriter {
         let mut packets = PacketWriter::new(BufWriter::new(file));
         packets
             .write_packet(
-                opus_head(channels, pre_skip as u16, input_rate),
+                opus_head(channels, pre_skip as u16, input_rate, &layout),
                 serial,
                 PacketWriteEndInfo::EndPage,
                 0,
@@ -96,6 +99,8 @@ impl OpusStreamWriter {
             packets,
             encoder,
             channels: channels as usize,
+            channel_order: layout.to_opus_order,
+            max_packet_bytes: 1275 * layout.streams as usize,
             serial,
             pre_skip,
             expected_output_frames,
@@ -187,11 +192,12 @@ impl OpusStreamWriter {
         }
         self.queued_signal_frames += (end - start) as u64;
         self.encode_pending.reserve((end - start) * self.channels);
-        for frame in start..end {
-            for channel in planar {
-                self.encode_pending.push(channel[frame]);
-            }
-        }
+        let channel_order = &self.channel_order;
+        self.encode_pending.extend((start..end).flat_map(|frame| {
+            channel_order
+                .iter()
+                .map(move |&channel| planar[channel][frame])
+        }));
         let frame_samples = FRAME_SIZE * self.channels;
         while self.encode_pending.len() >= frame_samples * 2 {
             self.encode_one(PacketWriteEndInfo::NormalPacket, None)?;
@@ -204,7 +210,7 @@ impl OpusStreamWriter {
         let frame: Vec<f32> = self.encode_pending.drain(..samples).collect();
         let packet = self
             .encoder
-            .encode_vec_float(&frame, 4000)
+            .encode_vec_float(&frame, self.max_packet_bytes)
             .map_err(|error| format!("encode Opus packet: {error}"))?;
         self.encoded_frames += FRAME_SIZE as u64;
         self.packets
@@ -228,7 +234,9 @@ where
         .read_packet()
         .map_err(|error| format!("{}: read OpusHead: {error}", path.display()))?
         .ok_or_else(|| format!("{}: missing OpusHead", path.display()))?;
-    let (channels, pre_skip) = parse_opus_head(&head.data)?;
+    let parsed = parse_opus_head(&head.data)?;
+    let channels = parsed.channels;
+    let pre_skip = parsed.pre_skip;
     let serial = head.stream_serial();
     let tags = packets
         .read_packet()
@@ -240,11 +248,11 @@ where
     let info = StreamInfo {
         sample_rate: OPUS_RATE,
         channels,
-        channel_roles: default_channel_roles(channels),
+        channel_roles: internal_channel_roles(channels),
         source_kind: PcmKind::F32,
     };
-    let mut decoder = Decoder::new(OPUS_RATE, opus_channels(channels)?)
-        .map_err(|error| format!("create Opus decoder: {error}"))?;
+    let mut decoder = OpusDecoder::new(&parsed)?;
+    let from_opus_order = invert_permutation(&parsed.to_opus_order);
     let mut skip = pre_skip as usize;
     let mut raw_frames = 0_u64;
 
@@ -273,8 +281,8 @@ where
         }
         let mut planar = vec![Vec::with_capacity(end - start); channels as usize];
         for frame in start..end {
-            for channel in 0..channels as usize {
-                planar[channel].push(interleaved[frame * channels as usize + channel]);
+            for (internal, &opus_channel) in from_opus_order.iter().enumerate() {
+                planar[internal].push(interleaved[frame * channels as usize + opus_channel]);
             }
         }
         consume(&info, &mut planar)?;
@@ -355,7 +363,7 @@ fn opus_channels(channels: u16) -> Result<Channels, String> {
         1 => Ok(Channels::Mono),
         2 => Ok(Channels::Stereo),
         _ => Err(format!(
-            "Ogg Opus output currently supports mono or stereo, got {channels} channels"
+            "single-stream Opus requires 1 or 2 channels, got {channels}"
         )),
     }
 }
@@ -371,24 +379,245 @@ fn validate_planar(planar: &[Vec<f32>], channels: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn opus_head(channels: u16, pre_skip: u16, original_rate: u32) -> Vec<u8> {
+fn opus_head(channels: u16, pre_skip: u16, original_rate: u32, layout: &OpusLayout) -> Vec<u8> {
     let mut head = b"OpusHead".to_vec();
     head.push(1);
     head.push(channels as u8);
     head.extend_from_slice(&pre_skip.to_le_bytes());
     head.extend_from_slice(&original_rate.to_le_bytes());
     head.extend_from_slice(&0_i16.to_le_bytes());
-    head.push(0);
+    head.push(layout.mapping_family);
+    if layout.mapping_family != 0 {
+        head.push(layout.streams);
+        head.push(layout.coupled_streams);
+        head.extend_from_slice(&layout.mapping);
+    }
     head
 }
 
-fn parse_opus_head(data: &[u8]) -> Result<(u16, u16), String> {
+fn parse_opus_head(data: &[u8]) -> Result<ParsedOpusHead, String> {
     if data.len() < 19 || &data[..8] != b"OpusHead" || data[8] == 0 {
         return Err("invalid OpusHead".into());
     }
     let channels = data[9] as u16;
-    opus_channels(channels)?;
-    Ok((channels, u16::from_le_bytes([data[10], data[11]])))
+    let pre_skip = u16::from_le_bytes([data[10], data[11]]);
+    let mapping_family = data[18];
+    if mapping_family == 0 {
+        opus_channels(channels)?;
+        return Ok(ParsedOpusHead {
+            channels,
+            pre_skip,
+            mapping_family,
+            streams: 1,
+            coupled_streams: (channels == 2) as u8,
+            mapping: (0..channels as u8).collect(),
+            to_opus_order: (0..channels as usize).collect(),
+        });
+    }
+    if mapping_family != 1 || !(1..=8).contains(&channels) || data.len() < 21 + channels as usize {
+        return Err("unsupported Opus channel mapping family".into());
+    }
+    let standard = family_one_layout(channels)?;
+    let streams = data[19];
+    let coupled_streams = data[20];
+    let mapping = data[21..21 + channels as usize].to_vec();
+    let decoded_channels = streams as u16 + coupled_streams as u16;
+    if streams == 0
+        || coupled_streams > streams
+        || decoded_channels > 255
+        || mapping
+            .iter()
+            .any(|value| *value != 255 && u16::from(*value) >= decoded_channels)
+    {
+        return Err("invalid Opus mapping family 1 table".into());
+    }
+    Ok(ParsedOpusHead {
+        channels,
+        pre_skip,
+        mapping_family,
+        streams,
+        coupled_streams,
+        mapping,
+        to_opus_order: standard.to_opus_order,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct OpusLayout {
+    mapping_family: u8,
+    streams: u8,
+    coupled_streams: u8,
+    mapping: Vec<u8>,
+    /// Opus/Vorbis output channel index -> Forge/WAVE input channel index.
+    to_opus_order: Vec<usize>,
+}
+
+struct ParsedOpusHead {
+    channels: u16,
+    pre_skip: u16,
+    mapping_family: u8,
+    streams: u8,
+    coupled_streams: u8,
+    mapping: Vec<u8>,
+    to_opus_order: Vec<usize>,
+}
+
+fn opus_layout(channels: u16, roles: &[ChannelRole]) -> Result<OpusLayout, String> {
+    if roles.len() != channels as usize {
+        return Err("Opus channel-role count does not match channel count".into());
+    }
+    if channels <= 2 {
+        opus_channels(channels)?;
+        return Ok(OpusLayout {
+            mapping_family: 0,
+            streams: 1,
+            coupled_streams: (channels == 2) as u8,
+            mapping: (0..channels as u8).collect(),
+            to_opus_order: (0..channels as usize).collect(),
+        });
+    }
+    if channels >= 7 {
+        let layout_name = if channels == 7 { "6.1" } else { "7.1" };
+        if named_channel_layout(layout_name).as_deref() != Some(roles) {
+            return Err(format!(
+                "{channels}-channel Opus output requires the {layout_name} channel layout"
+            ));
+        }
+    }
+    if channels < 7 && default_channel_roles(channels) != roles {
+        return Err(format!(
+            "{channels}-channel Opus output requires the conventional channel layout"
+        ));
+    }
+    family_one_layout(channels)
+}
+
+fn family_one_layout(channels: u16) -> Result<OpusLayout, String> {
+    let (streams, coupled_streams, mapping, to_opus_order): (u8, u8, &[u8], &[usize]) =
+        match channels {
+            1 => (1, 0, &[0], &[0]),
+            2 => (1, 1, &[0, 1], &[0, 1]),
+            3 => (2, 1, &[0, 2, 1], &[0, 2, 1]),
+            4 => (2, 2, &[0, 1, 2, 3], &[0, 1, 2, 3]),
+            5 => (3, 2, &[0, 4, 1, 2, 3], &[0, 2, 1, 3, 4]),
+            6 => (4, 2, &[0, 4, 1, 2, 3, 5], &[0, 2, 1, 4, 5, 3]),
+            7 => (4, 3, &[0, 4, 1, 2, 3, 5, 6], &[0, 2, 1, 5, 6, 4, 3]),
+            8 => (5, 3, &[0, 6, 1, 2, 3, 4, 5, 7], &[0, 2, 1, 6, 7, 4, 5, 3]),
+            _ => {
+                return Err(format!(
+                    "Ogg Opus supports 1 through 7.1, got {channels} channels"
+                ))
+            }
+        };
+    Ok(OpusLayout {
+        mapping_family: 1,
+        streams,
+        coupled_streams,
+        mapping: mapping.to_vec(),
+        to_opus_order: to_opus_order.to_vec(),
+    })
+}
+
+fn invert_permutation(permutation: &[usize]) -> Vec<usize> {
+    let mut inverse = vec![0; permutation.len()];
+    for (output, &input) in permutation.iter().enumerate() {
+        inverse[input] = output;
+    }
+    inverse
+}
+
+fn internal_channel_roles(channels: u16) -> Vec<ChannelRole> {
+    if channels >= 7 {
+        named_channel_layout(if channels == 7 { "6.1" } else { "7.1" })
+            .expect("built-in surround layout")
+    } else {
+        default_channel_roles(channels)
+    }
+}
+
+enum OpusEncoder {
+    Single(Encoder),
+    Multi(MSEncoder),
+}
+
+impl OpusEncoder {
+    fn new(layout: &OpusLayout) -> Result<Self, String> {
+        if layout.mapping_family == 0 {
+            Encoder::new(
+                OPUS_RATE,
+                opus_channels(layout.mapping.len() as u16)?,
+                Application::Audio,
+            )
+            .map(Self::Single)
+            .map_err(|error| format!("create Opus encoder: {error}"))
+        } else {
+            MSEncoder::new(
+                OPUS_RATE,
+                layout.streams,
+                layout.coupled_streams,
+                &layout.mapping,
+                Application::Audio,
+            )
+            .map(Self::Multi)
+            .map_err(|error| format!("create multistream Opus encoder: {error}"))
+        }
+    }
+
+    fn set_bitrate(&mut self, bitrate: Bitrate) -> Result<(), ::opus::Error> {
+        match self {
+            Self::Single(encoder) => encoder.set_bitrate(bitrate),
+            Self::Multi(encoder) => encoder.set_bitrate(bitrate),
+        }
+    }
+
+    fn get_lookahead(&mut self) -> Result<i32, ::opus::Error> {
+        match self {
+            Self::Single(encoder) => encoder.get_lookahead(),
+            Self::Multi(encoder) => encoder.get_lookahead(),
+        }
+    }
+
+    fn encode_vec_float(
+        &mut self,
+        samples: &[f32],
+        max_size: usize,
+    ) -> Result<Vec<u8>, ::opus::Error> {
+        match self {
+            Self::Single(encoder) => encoder.encode_vec_float(samples, max_size),
+            Self::Multi(encoder) => encoder.encode_vec_float(samples, max_size),
+        }
+    }
+}
+
+enum OpusDecoder {
+    Single(Decoder),
+    Multi(MSDecoder),
+}
+
+impl OpusDecoder {
+    fn new(head: &ParsedOpusHead) -> Result<Self, String> {
+        if head.mapping_family == 0 {
+            Decoder::new(OPUS_RATE, opus_channels(head.channels)?)
+                .map(Self::Single)
+                .map_err(|error| format!("create Opus decoder: {error}"))
+        } else {
+            MSDecoder::new(OPUS_RATE, head.streams, head.coupled_streams, &head.mapping)
+                .map(Self::Multi)
+                .map_err(|error| format!("create multistream Opus decoder: {error}"))
+        }
+    }
+
+    fn decode_float(
+        &mut self,
+        packet: &[u8],
+        output: &mut [f32],
+        fec: bool,
+    ) -> Result<usize, ::opus::Error> {
+        match self {
+            Self::Single(decoder) => decoder.decode_float(packet, output, fec),
+            Self::Multi(decoder) => decoder.decode_float(packet, output, fec),
+        }
+    }
 }
 
 fn opus_tags(track_lufs: f64, album_lufs: Option<f64>) -> Vec<u8> {

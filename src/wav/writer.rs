@@ -342,6 +342,7 @@ fn format_chunk(
 fn channel_mask(roles: &[ChannelRole]) -> io::Result<u32> {
     for (name, mask) in [
         ("5.1", 0x0000_003f),
+        ("6.1", 0x0000_070f),
         ("7.1", 0x0000_063f),
         ("5.1.4", 0x0002_d03f),
         ("7.1.4", 0x0002_d63f),
@@ -381,6 +382,10 @@ mod tests {
 
     #[test]
     fn advanced_layout_masks_are_stable() {
+        assert_eq!(
+            channel_mask(&named_channel_layout("6.1").unwrap()).unwrap(),
+            0x070f
+        );
         assert_eq!(
             channel_mask(&named_channel_layout("7.1").unwrap()).unwrap(),
             0x063f

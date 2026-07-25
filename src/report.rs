@@ -345,6 +345,17 @@ pub fn write_json<W: Write>(writer: W, reports: &[AnalysisReport]) -> Result<(),
     serde_json::to_writer_pretty(writer, reports).map_err(|error| format!("write JSON: {error}"))
 }
 
+pub fn write_ndjson<W: Write>(mut writer: W, reports: &[AnalysisReport]) -> Result<(), String> {
+    for report in reports {
+        serde_json::to_writer(&mut writer, report)
+            .map_err(|error| format!("write NDJSON: {error}"))?;
+        writer
+            .write_all(b"\n")
+            .map_err(|error| format!("write NDJSON newline: {error}"))?;
+    }
+    Ok(())
+}
+
 pub fn write_csv<W: Write>(writer: W, reports: &[AnalysisReport]) -> Result<(), String> {
     let mut csv = csv::Writer::from_writer(writer);
     for report in reports {
@@ -408,6 +419,19 @@ mod tests {
         let text = String::from_utf8(output).unwrap();
         assert!(text.starts_with("path,duration_seconds,"));
         assert!(text.contains("\"album/track, one.wav\""));
+    }
+
+    #[test]
+    fn ndjson_writes_one_object_per_line() {
+        let mut output = Vec::new();
+        write_ndjson(&mut output, &[sample_report(), sample_report()]).unwrap();
+        let lines: Vec<_> = output.split(|byte| *byte == b'\n').collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(lines[0]).unwrap()["channels"],
+            2
+        );
+        assert!(lines[2].is_empty());
     }
 
     #[test]

@@ -12,6 +12,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use tempfile::{Builder, NamedTempFile, TempDir};
 
 fn main() -> ExitCode {
     let cli = cli::Cli::parse();
@@ -52,6 +53,12 @@ fn parse_wav_container(value: &str) -> WavContainer {
 }
 
 fn run(mut cli: cli::Cli) -> Result<(), String> {
+    let pipeline = PipelineFiles::prepare(&mut cli)?;
+    run_paths(cli, pipeline.stdin_requested())?;
+    pipeline.emit_stdout()
+}
+
+fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
     if let Some(j) = cli.jobs {
         ThreadPoolBuilder::new()
             .num_threads(j)
@@ -150,9 +157,13 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
             {
                 compliance_failed = true;
             }
-            if cli.json || cli.csv.is_some() {
+            if cli.json || cli.ndjson || cli.csv.is_some() {
                 reports.push(AnalysisReport::with_compliance(
-                    input,
+                    if stdin_requested {
+                        Path::new("-")
+                    } else {
+                        input
+                    },
                     &an,
                     compliance.as_ref(),
                 ));
@@ -168,6 +179,9 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
             let mut output = stdout.lock();
             report::write_json(&mut output, &reports)?;
             writeln!(output).map_err(|error| format!("write stdout: {error}"))?;
+        } else if cli.ndjson {
+            let stdout = io::stdout();
+            report::write_ndjson(stdout.lock(), &reports)?;
         } else if let Some(path) = &cli.csv {
             if path.as_os_str() == "-" {
                 let stdout = io::stdout();
@@ -329,6 +343,110 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+struct PipelineFiles {
+    _stdin_file: Option<NamedTempFile>,
+    _stdout_directory: Option<TempDir>,
+    stdout_path: Option<PathBuf>,
+}
+
+impl PipelineFiles {
+    fn stdin_requested(&self) -> bool {
+        self._stdin_file.is_some()
+    }
+
+    fn prepare(cli: &mut cli::Cli) -> Result<Self, String> {
+        let stdin_requested = cli.inputs.iter().any(|path| path.as_os_str() == "-");
+        let stdout_requested = cli
+            .output
+            .as_ref()
+            .is_some_and(|path| path.as_os_str() == "-");
+        let mut stdin_file = None;
+        let mut stdout_directory = None;
+        let mut stdout_path = None;
+
+        if stdout_requested {
+            if cli.inputs.len() != 1 {
+                return Err("stdout (`-`) supports exactly one input".into());
+            }
+            if cli.analyze_only || cli.gain_only || cli.dry_run || cli.write_tags || cli.album {
+                return Err(
+                    "binary stdout cannot be combined with analysis-only, dry-run, tag, or album modes"
+                        .into(),
+                );
+            }
+            if cli.format.is_none() {
+                return Err("stdout output requires --format".into());
+            }
+        }
+
+        if stdin_requested {
+            if cli.inputs.len() != 1 {
+                return Err("stdin (`-`) must be the only input".into());
+            }
+            if cli.recursive || cli.album || cli.write_tags {
+                return Err(
+                    "stdin cannot be combined with --recursive, --album, or --write-tags".into(),
+                );
+            }
+            let format = cli
+                .input_format
+                .as_deref()
+                .ok_or_else(|| "stdin requires --input-format".to_string())?;
+            if !cli.analyze_only && cli.output.is_none() {
+                return Err("stdin normalization requires an explicit --output".into());
+            }
+            let mut temporary = Builder::new()
+                .prefix("forge-stdin-")
+                .suffix(&format!(".{format}"))
+                .tempfile()
+                .map_err(|error| format!("create stdin spool: {error}"))?;
+            io::copy(&mut io::stdin().lock(), temporary.as_file_mut())
+                .map_err(|error| format!("read stdin: {error}"))?;
+            temporary
+                .as_file_mut()
+                .flush()
+                .map_err(|error| format!("flush stdin spool: {error}"))?;
+            cli.inputs[0] = temporary.path().to_owned();
+            stdin_file = Some(temporary);
+        } else if cli.input_format.is_some() {
+            return Err("--input-format is valid only when reading stdin (`-`)".into());
+        }
+
+        if stdout_requested {
+            let format = cli
+                .format
+                .as_deref()
+                .expect("stdout format validated above");
+            let directory =
+                tempfile::tempdir().map_err(|error| format!("create stdout spool: {error}"))?;
+            let path = directory.path().join(format!("output.{format}"));
+            cli.output = Some(path.clone());
+            stdout_path = Some(path);
+            stdout_directory = Some(directory);
+        }
+
+        Ok(Self {
+            _stdin_file: stdin_file,
+            _stdout_directory: stdout_directory,
+            stdout_path,
+        })
+    }
+
+    fn emit_stdout(&self) -> Result<(), String> {
+        let Some(path) = &self.stdout_path else {
+            return Ok(());
+        };
+        let mut source = File::open(path).map_err(|error| format!("open stdout spool: {error}"))?;
+        let stdout = io::stdout();
+        let mut destination = stdout.lock();
+        io::copy(&mut source, &mut destination)
+            .map_err(|error| format!("write encoded audio to stdout: {error}"))?;
+        destination
+            .flush()
+            .map_err(|error| format!("flush stdout: {error}"))
+    }
 }
 
 fn print_compliance(profile: &ComplianceProfile, analysis: &normalize::Analysis) {
