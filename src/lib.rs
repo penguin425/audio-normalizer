@@ -15,4 +15,5 @@ pub mod dsp;
 #[cfg(feature = "mp3-encoding")]
 pub mod mp3enc;
 pub mod normalize;
+pub mod report;
 pub mod wav;
