@@ -96,7 +96,10 @@ impl Default for TruePeakMeter {
 }
 
 impl TruePeakMeter {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        // Build the shared FIR table before this meter reaches a processing
+        // callback. Subsequent `process` calls are allocation-free.
+        let _ = phases();
         Self {
             history: None,
             peak: 0.0,

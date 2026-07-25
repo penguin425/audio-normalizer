@@ -308,11 +308,38 @@ src/
     limiter.rs      streaming look-ahead true-peak limiter
     truepeak.rs     4x polyphase FIR true-peak meter
   normalize.rs      analyze -> gain (ceiling-protected) -> apply -> write; album mode
+  realtime.rs       allocation-free live M/S meter + smoothed gain processor
   preset.rs         named playback and broadcast loudness targets
 build.rs            optionally links libmp3lame for MP3 encoding
 tests/
   integration.rs    in-memory round-trip tests (WAV LUFS/peak/album/silence + MP3)
 ```
+
+## Real-time DSP API
+
+The library exposes callback-safe primitives that allocate their working
+buffers at construction:
+
+```rust
+use forge_normalizer::realtime::{
+    RealtimeGainConfig, RealtimeGainProcessor, RealtimeMeter,
+};
+use forge_normalizer::wav::ChannelRole;
+
+let mut meter =
+    RealtimeMeter::new(48_000, vec![ChannelRole::Main, ChannelRole::Main])?;
+meter.process_planar(&[left, right])?;
+let current = meter.measurement(); // Momentary, Short-term, sample/true peak
+
+let mut gain = RealtimeGainProcessor::new(48_000, 2, RealtimeGainConfig::default())?;
+gain.set_target_gain_db(-3.0)?;
+gain.process_interleaved(interleaved)?;
+# Ok::<(), String>(())
+```
+
+The live API is causal and reports zero processing latency for gain smoothing.
+It deliberately does not label a changing live estimate as final Integrated
+LUFS; programme-integrated normalization remains the two-pass file workflow.
 
 ## Limitations
 
