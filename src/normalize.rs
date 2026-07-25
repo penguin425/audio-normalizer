@@ -129,6 +129,10 @@ impl Analysis {
     pub fn true_peak_db(&self) -> f64 {
         to_db(self.true_peak as f64)
     }
+    /// Peak-to-Loudness Ratio (PLR), expressed in LU.
+    pub fn peak_to_loudness_ratio_lu(&self) -> f64 {
+        self.true_peak_db() - self.lufs
+    }
 }
 
 #[inline]

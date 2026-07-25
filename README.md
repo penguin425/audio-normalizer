@@ -399,7 +399,8 @@ gain.process_interleaved(interleaved)?;
 # Ok::<(), String>(())
 ```
 
-The live API is causal and reports zero processing latency for gain smoothing.
+The live gain API uses a fixed 5 ms look-ahead true-peak limiter and reports
+its exact processing latency through `latency_frames()`.
 It deliberately does not label a changing live estimate as final Integrated
 LUFS; programme-integrated normalization remains the two-pass file workflow.
 
@@ -413,8 +414,8 @@ override whose number of channels does not match the input.
   formats need only the Rust crates (symphonia).
 * AAC/ALAC/Vorbis can be read but are written as WAV/FLAC (or MP3 with its
   optional feature); Forge does not encode those source containers directly.
-* Ogg Opus currently supports mono and stereo streams. Multichannel mapping
-  families and chained logical streams are not yet supported.
+* Ogg Opus supports mapping family 0 mono/stereo and mapping family 1 layouts
+  through 7.1. Chained logical streams are not yet supported.
 * By default, the true-peak ceiling is enforced transparently by reducing
   global gain. `--limiter` opts into dynamic look-ahead limiting when reaching
   the loudness target matters more than preserving dynamics unchanged.

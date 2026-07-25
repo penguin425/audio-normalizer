@@ -150,6 +150,8 @@ impl RealtimeMeter {
 #[derive(Debug, Clone, Copy)]
 pub struct RealtimeGainConfig {
     pub initial_gain_db: f64,
+    /// True-peak ceiling in dBTP. The field retains its original name for API
+    /// compatibility.
     pub ceiling_dbfs: f64,
     pub attack_ms: f64,
     pub release_ms: f64,
@@ -166,10 +168,11 @@ impl Default for RealtimeGainConfig {
     }
 }
 
-/// Zero-latency smoothed gain and safety-ceiling processor for interleaved f32.
+/// Smoothed gain and look-ahead true-peak limiter for interleaved f32.
 ///
 /// It is a deterministic live-leveling building block, not a claim that final
-/// Integrated LUFS can be known before a programme ends.
+/// Integrated LUFS can be known before a programme ends. All working storage
+/// is allocated by [`RealtimeGainProcessor::new`]; processing is allocation-free.
 pub struct RealtimeGainProcessor {
     channels: usize,
     current_gain: f32,
@@ -177,6 +180,14 @@ pub struct RealtimeGainProcessor {
     ceiling: f32,
     attack_coefficient: f32,
     release_coefficient: f32,
+    true_peak: Vec<TruePeakMeter>,
+    delay: Vec<f32>,
+    delay_frame: usize,
+    lookahead_frames: usize,
+    limiter_release_coefficient: f32,
+    limiter_envelope: f32,
+    limiter_hold_frames: usize,
+    max_reduction_db: f64,
 }
 
 impl RealtimeGainProcessor {
@@ -198,6 +209,11 @@ impl RealtimeGainProcessor {
             return Err("invalid real-time gain configuration".into());
         }
         let gain = db_amplitude(config.initial_gain_db);
+        // Five milliseconds covers the 4x true-peak FIR while remaining
+        // suitable for live monitoring. Keeping it fixed preserves the public
+        // configuration shape introduced in v0.6.
+        let lookahead_frames = ((sample_rate as usize * 5) / 1_000).max(16);
+        let limiter_release_samples = sample_rate as f64 * config.release_ms / 1_000.0;
         Ok(Self {
             channels,
             current_gain: gain,
@@ -205,6 +221,14 @@ impl RealtimeGainProcessor {
             ceiling: db_amplitude(config.ceiling_dbfs),
             attack_coefficient: smoothing_coefficient(sample_rate, config.attack_ms),
             release_coefficient: smoothing_coefficient(sample_rate, config.release_ms),
+            true_peak: (0..channels).map(|_| TruePeakMeter::new()).collect(),
+            delay: vec![0.0; lookahead_frames * channels],
+            delay_frame: 0,
+            lookahead_frames,
+            limiter_release_coefficient: (-1.0 / limiter_release_samples).exp() as f32,
+            limiter_envelope: 1.0,
+            limiter_hold_frames: 0,
+            max_reduction_db: 0.0,
         })
     }
 
@@ -221,7 +245,11 @@ impl RealtimeGainProcessor {
     }
 
     pub fn latency_frames(&self) -> usize {
-        0
+        self.lookahead_frames
+    }
+
+    pub fn max_reduction_db(&self) -> f64 {
+        self.max_reduction_db
     }
 
     pub fn process_interleaved(&mut self, samples: &mut [f32]) -> Result<(), String> {
@@ -235,11 +263,45 @@ impl RealtimeGainProcessor {
                 self.release_coefficient
             };
             self.current_gain += (self.target_gain - self.current_gain) * coefficient;
-            for sample in frame {
-                *sample = (*sample * self.current_gain).clamp(-self.ceiling, self.ceiling);
+            let mut detected = 0.0_f32;
+            let delay_offset = self.delay_frame * self.channels;
+            for (channel, sample) in frame.iter_mut().enumerate() {
+                let gained = *sample * self.current_gain;
+                detected = detected.max(self.true_peak[channel].process_sample(gained));
+                *sample = std::mem::replace(&mut self.delay[delay_offset + channel], gained);
             }
+            self.update_limiter_envelope(detected);
+            for sample in frame {
+                *sample *= self.limiter_envelope;
+            }
+            self.delay_frame = (self.delay_frame + 1) % self.lookahead_frames;
         }
         Ok(())
+    }
+
+    fn update_limiter_envelope(&mut self, detected: f32) {
+        let required = if detected > self.ceiling {
+            // Envelope modulation can itself create a small inter-sample
+            // overshoot. Reserve 0.087 dB so the reconstructed output remains
+            // below the requested true-peak ceiling.
+            (self.ceiling / detected) * 0.99
+        } else {
+            1.0
+        };
+        if required < self.limiter_envelope {
+            self.limiter_envelope = required;
+            self.limiter_hold_frames = self.lookahead_frames;
+        } else if self.limiter_hold_frames > 0 {
+            self.limiter_hold_frames -= 1;
+        } else {
+            self.limiter_envelope =
+                1.0 - (1.0 - self.limiter_envelope) * self.limiter_release_coefficient;
+        }
+        if self.limiter_envelope > 0.0 {
+            self.max_reduction_db = self
+                .max_reduction_db
+                .max(-20.0 * (self.limiter_envelope as f64).log10());
+        }
     }
 }
 
@@ -290,15 +352,31 @@ mod tests {
     }
 
     #[test]
-    fn gain_processor_smooths_and_respects_ceiling() {
+    fn gain_processor_smooths_and_respects_true_peak_ceiling() {
         let mut processor =
             RealtimeGainProcessor::new(48_000, 2, RealtimeGainConfig::default()).unwrap();
         processor.set_target_gain_db(12.0).unwrap();
-        let mut samples = vec![0.9; 48_000 * 2];
+        let mut samples = (0..48_000)
+            .flat_map(|index| {
+                let sample =
+                    (1.2 * (index as f64 * std::f64::consts::TAU * 997.0 / 48_000.0).sin()) as f32;
+                [sample, sample]
+            })
+            .collect::<Vec<_>>();
         processor.process_interleaved(&mut samples).unwrap();
         let ceiling = db_amplitude(-1.0);
-        assert!(samples.iter().all(|sample| sample.abs() <= ceiling));
+        let mut meter = TruePeakMeter::new();
+        meter.process(&samples[processor.latency_frames() * 2..]);
+        assert!(
+            meter.peak() <= ceiling * 1.001,
+            "{} > {ceiling}",
+            meter.peak()
+        );
+        assert!(samples[..processor.latency_frames() * 2]
+            .iter()
+            .all(|sample| *sample == 0.0));
         assert!(processor.current_gain_db() > 0.0);
-        assert_eq!(processor.latency_frames(), 0);
+        assert_eq!(processor.latency_frames(), 240);
+        assert!(processor.max_reduction_db() > 0.0);
     }
 }

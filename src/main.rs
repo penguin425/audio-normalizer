@@ -769,7 +769,11 @@ fn print_analysis(path: &Path, an: &normalize::Analysis, gain: Option<f32>) {
         g.map(|x| format!("{x:+.2} dB")).unwrap_or_else(|| "—".to_string())
     );
     eprintln!(
-        "{:<42} Max M {:>7.2}  Max S {:>7.2}  LRA {:>6.2} LU",
-        "", an.max_momentary_lufs, an.max_short_term_lufs, an.loudness_range_lu,
+        "{:<42} Max M {:>7.2}  Max S {:>7.2}  LRA {:>6.2} LU  PLR {:>6.2} LU",
+        "",
+        an.max_momentary_lufs,
+        an.max_short_term_lufs,
+        an.loudness_range_lu,
+        an.peak_to_loudness_ratio_lu(),
     );
 }
