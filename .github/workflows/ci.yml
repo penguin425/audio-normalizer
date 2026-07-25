@@ -55,7 +55,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache official EBU v5 test set
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/forge-normalizer
           key: ebu-v5-9cc500b4df83f7c21855c74dce795ef5209a752bf884253ae57d0ce512efb062
