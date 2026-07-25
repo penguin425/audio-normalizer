@@ -391,10 +391,11 @@ playback references rather than acceptance guarantees.
 
 ATSC long-form programme compliance uses dialogue/anchor loudness and is
 therefore deliberately not implied by `atsc-a85-short`. Supply deterministic,
-reviewable regions with `--dialogue-ranges`; Forge combines all complete
-400 ms BS.1770 blocks across those regions and applies gating once, so longer
-regions receive their correct weight. It does not guess dialogue with a
-classifier.
+reviewable regions with `--dialogue-ranges`. Per ATSC A/85:2026-07 Annex M,
+the dialogue selection acts as the gate and Forge averages K-weighted energy
+without the BS.1770-2+ relative-level gate. Region energies are duration
+weighted. Reports identify the measurement standard and method explicitly.
+Forge does not guess dialogue with a classifier.
 
 Dialogue range files use JSON or TOML:
 
@@ -408,10 +409,10 @@ start_seconds = 95.0
 duration_seconds = 20.0
 ```
 
-Ranges must be sorted, non-overlapping, and contain at least one complete
-400 ms loudness block in total. Machine-readable reports include programme
-`integrated_lufs` separately from `dialogue_lufs`, dialogue duration, range
-count, and the compliance loudness basis.
+Ranges must be sorted, non-overlapping, and contain audio. Machine-readable
+reports include programme `integrated_lufs` separately from `dialogue_lufs`,
+dialogue duration, range count, measurement standard/method, and the
+compliance loudness basis.
 
 Custom profiles use JSON or TOML. All fields except `name` are optional; a
 profile must define at least one rule:

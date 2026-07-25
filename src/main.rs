@@ -245,8 +245,12 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                 print_analysis(input, &an, None);
                 if let Some(dialogue) = &dialogue {
                     eprintln!(
-                        "  dialogue: {:.2} LUFS across {} range(s), {:.3} s",
-                        dialogue.lufs, dialogue.range_count, dialogue.duration_seconds
+                        "  dialogue: {:.2} LUFS across {} range(s), {:.3} s\n    standard: {}\n    method: {}",
+                        dialogue.lufs,
+                        dialogue.range_count,
+                        dialogue.duration_seconds,
+                        dialogue.standard,
+                        dialogue.method
                     );
                 }
                 if let Some(profile) = &compliance {

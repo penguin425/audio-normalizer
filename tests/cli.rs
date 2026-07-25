@@ -236,6 +236,14 @@ fn explicit_dialogue_ranges_drive_long_form_compliance() {
     let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
     assert!(report[0]["dialogue_lufs"].is_number());
     assert_eq!(report[0]["dialogue_range_count"], 1);
+    assert_eq!(
+        report[0]["dialogue_measurement_standard"],
+        "ATSC A/85:2026-07"
+    );
+    assert!(report[0]["dialogue_measurement_method"]
+        .as_str()
+        .unwrap()
+        .contains("no relative-level gate"));
     assert_eq!(report[0]["compliance_loudness_basis"], "dialogue");
     assert!(report[0]["compliance_passed"].as_bool().unwrap());
     assert!(report[0]["compliance_rules_json"]

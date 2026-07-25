@@ -32,6 +32,9 @@ pub struct EbuMeasurements {
 pub struct StreamingMeasurements {
     pub ebu: EbuMeasurements,
     pub frames: usize,
+    /// Mean square after K-weighting and BS.1770 channel weighting, without
+    /// absolute or relative loudness gating.
+    pub weighted_mean_square: f64,
     pub rms_db: f64,
     pub sample_peak: f32,
     pub true_peak: f32,
@@ -63,6 +66,7 @@ pub struct StreamingAnalyzer {
     max_short_term_ms: f64,
     frames: usize,
     raw_sum_squares: f64,
+    weighted_sum_squares: f64,
     sample_peak: f32,
     timeline_interval_frames: Option<usize>,
     timeline: Vec<LoudnessTimelinePoint>,
@@ -99,6 +103,7 @@ impl StreamingAnalyzer {
             max_short_term_ms: 0.0,
             frames: 0,
             raw_sum_squares: 0.0,
+            weighted_sum_squares: 0.0,
             sample_peak: 0.0,
             timeline_interval_frames: interval_frames,
             timeline: Vec::new(),
@@ -133,6 +138,7 @@ impl StreamingAnalyzer {
                 self.raw_sum_squares += raw * raw;
                 self.sample_peak = self.sample_peak.max(sample.abs());
             }
+            self.weighted_sum_squares += weighted;
             push_window(
                 &mut self.momentary,
                 &mut self.momentary_sum,
@@ -197,6 +203,11 @@ impl StreamingAnalyzer {
         StreamingMeasurements {
             ebu,
             frames: self.frames,
+            weighted_mean_square: if self.frames == 0 {
+                0.0
+            } else {
+                self.weighted_sum_squares / self.frames as f64
+            },
             rms_db: if rms > 0.0 {
                 20.0 * rms.log10()
             } else {
@@ -425,6 +436,15 @@ pub fn gated_lufs(block_ms: &[f64]) -> f64 {
         final_set.iter().sum::<f64>() / final_set.len() as f64
     };
     -0.691 + 10.0 * used.log10()
+}
+
+/// Convert an ungated K/channel-weighted mean square to LKFS/LUFS.
+pub fn ungated_lufs(mean_square: f64) -> f64 {
+    if mean_square > 0.0 {
+        mean_square_to_lufs(mean_square)
+    } else {
+        f64::NEG_INFINITY
+    }
 }
 
 fn maximum_loudness(blocks: &[f64]) -> f64 {

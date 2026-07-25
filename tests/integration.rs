@@ -6,7 +6,7 @@
 //! the entire read -> measure -> gain -> write -> read round trip.
 
 use forge_normalizer::decoder;
-use forge_normalizer::dsp::{limiter::LimiterConfig, lufs};
+use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::normalize::{self, DialogueRange, Mode, OutputFormat, Plan};
 use forge_normalizer::wav::{
     default_channel_roles, named_channel_layout, AudioBuffer, PcmKind, WavContainer, WavReader,
@@ -60,7 +60,7 @@ fn ambiguous_multichannel_wav_requires_an_explicit_layout() {
 }
 
 #[test]
-fn dialogue_loudness_uses_the_combined_block_population() {
+fn dialogue_loudness_uses_duration_weighted_ungated_energy() {
     let input = tmp_path("forge_it_dialogue_ranges.wav");
     let mut buffer = synth_sine(48_000, 6.0, 0.2, 997.0, 1);
     for sample in &mut buffer.data[0][..48_000] {
@@ -79,23 +79,19 @@ fn dialogue_loudness_uses_the_combined_block_population() {
     ];
 
     let measured = normalize::analyze_dialogue_ranges_with_roles(&input, None, &ranges).unwrap();
-    let quiet =
-        normalize::analyze_file_range_with_roles(&input, None, 0.0, Some(1.0), None).unwrap();
-    let loud =
-        normalize::analyze_file_range_with_roles(&input, None, 2.0, Some(4.0), None).unwrap();
-    let expected_blocks = quiet
-        .analysis
-        .loudness_blocks
-        .iter()
-        .chain(&loud.analysis.loudness_blocks)
-        .copied()
-        .collect::<Vec<_>>();
-    let naive_track_mean = (quiet.analysis.lufs + loud.analysis.lufs) / 2.0;
+    let quiet = normalize::analyze_dialogue_ranges_with_roles(&input, None, &ranges[..1]).unwrap();
+    let loud = normalize::analyze_dialogue_ranges_with_roles(&input, None, &ranges[1..]).unwrap();
+    let to_energy = |lufs: f64| 10.0_f64.powf((lufs + 0.691) / 10.0);
+    let expected_energy = (to_energy(quiet.lufs) + 4.0 * to_energy(loud.lufs)) / 5.0;
+    let expected_lufs = -0.691 + 10.0 * expected_energy.log10();
+    let naive_region_mean = (quiet.lufs + loud.lufs) / 2.0;
 
-    assert!((measured.lufs - lufs::gated_lufs(&expected_blocks)).abs() < 1e-12);
-    assert!((measured.lufs - naive_track_mean).abs() > 2.0);
+    assert!((measured.lufs - expected_lufs).abs() < 1e-10);
+    assert!((measured.lufs - naive_region_mean).abs() > 2.0);
     assert_eq!(measured.range_count, 2);
     assert!((measured.duration_seconds - 5.0).abs() < 1e-12);
+    assert_eq!(measured.standard, "ATSC A/85:2026-07");
+    assert!(measured.method.contains("no relative-level gate"));
 
     let _ = std::fs::remove_file(input);
 }
