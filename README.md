@@ -218,6 +218,16 @@ forge --analyze album/*.flac --ndjson | jq -c 'select(.true_peak_dbtp > -1)'
 # Machine-readable EBU R128 delivery checks
 forge --analyze programme.wav --compliance ebu-r128 --json
 
+# Locate momentary, short-term, and true-peak violations on a 100 ms timeline
+forge --analyze programme.wav --compliance ebu-r128-short \
+  --timeline qc.ndjson
+
+# Measure only a source-time range
+forge --analyze programme.wav --start 60 --duration 30 --json
+
+# Run a repeatable TOML job; explicit CLI options override the file
+forge programme.wav --config forge.toml
+
 # Short-form broadcast QC and a station-specific JSON/TOML profile
 forge --analyze commercial.wav --compliance ebu-r128-short --json
 forge --analyze programme.wav --compliance station-qc.toml --csv qc.csv
@@ -256,6 +266,7 @@ forge in.wav -o out.wav --bits=24 --dither
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--config` | none | Repeatable TOML job settings; explicit CLI options win |
 | `-m, --mode` | `lufs` | `lufs`, `peak`, or `rms` |
 | `--preset` | none | Named playback/delivery loudness target (see below) |
 | `--recursive` | off | Recursively process input directories |
@@ -265,7 +276,7 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--target` | `-16` | Target LUFS (`--mode lufs`) |
 | `--target-peak` | `-0.1` | Target sample peak dBFS (`--mode peak`) |
 | `--target-rms` | `-18` | Target RMS dBFS (`--mode rms`) |
-| `--ceiling` | `-1.0` | True-peak ceiling dBFS (gain is reduced to respect it) |
+| `--ceiling` | `-1.0` | True-peak ceiling dBTP (gain is reduced to respect it) |
 | `--max-gain` | none | Cap on applied gain (dB), a boost safety limit |
 | `--format` | inferred | `wav`, `flac`, `mp3`, or `opus` output container |
 | `--bitrate` | `192` | Lossy encoder bitrate in kbps (MP3/Opus output) |
@@ -278,6 +289,10 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--ndjson` | off | Write one compact JSON analysis object per line |
 | `--csv` | none | Write analyze results as CSV to a file or `-` |
 | `--compliance` | none | Built-in delivery profile name or custom `.json`/`.toml` profile |
+| `--start` | `0` | Analysis start time in source seconds |
+| `--duration` | to end | Maximum analysis duration in seconds |
+| `--timeline` | none | Time-resolved QC report (`.json`, `.ndjson`, `.jsonl`, or `.csv`) |
+| `--timeline-interval` | `100` | Timeline interval in milliseconds |
 | `--gain-only` | off | Print the gain; write nothing |
 | `--write-tags` | off | Write ReplayGain 2.0 metadata without changing audio |
 | `--verify` | off | Re-decode output and verify achieved level and true peak |
@@ -293,6 +308,37 @@ forge in.wav -o out.wav --bits=24 --dither
 | `-j, --jobs` | all cores | Worker thread count |
 
 > Negative values need `=`: `--target=-16` (clap parses `-16` as a flag otherwise).
+
+### Repeatable job configuration
+
+`--config` accepts TOML. Paths in the file are resolved relative to the
+configuration file, and options written explicitly on the command line take
+precedence:
+
+```toml
+[normalization]
+preset = "ebu-r128"
+max_gain_db = 6.0
+limiter = true
+limiter_lookahead_ms = 5.0
+limiter_release_ms = 100.0
+dither = true
+
+[analysis]
+enabled = false
+# compliance = "ebu-r128-short"
+# start_seconds = 60.0
+# duration_seconds = 30.0
+# timeline = "reports/programme.ndjson"
+# timeline_interval_ms = 100.0
+
+[output]
+format = "flac"
+bits = "24"
+verify = true
+verify_tolerance = 0.5
+verify_retries = 2
+```
 
 ### Presets
 

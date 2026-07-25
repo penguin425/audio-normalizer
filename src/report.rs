@@ -1,5 +1,6 @@
 //! Stable machine-readable analysis reports.
 
+use crate::dsp::lufs::LoudnessTimelinePoint;
 use crate::normalize::Analysis;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -247,6 +248,7 @@ pub struct ComplianceResult {
 pub struct AnalysisReport {
     pub path: String,
     pub duration_seconds: f64,
+    pub source_start_seconds: f64,
     pub sample_rate_hz: u32,
     pub channels: u16,
     pub sample_format: &'static str,
@@ -278,6 +280,63 @@ pub struct AnalysisReport {
     pub compliance_passed: Option<bool>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TimelineReport {
+    pub path: String,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub momentary_lufs: Option<f64>,
+    pub short_term_lufs: Option<f64>,
+    pub sample_peak_dbfs: f64,
+    pub true_peak_dbtp: f64,
+    pub violations: Vec<&'static str>,
+}
+
+impl TimelineReport {
+    pub fn from_points(
+        path: &Path,
+        points: &[LoudnessTimelinePoint],
+        profile: Option<&ComplianceProfile>,
+    ) -> Vec<Self> {
+        points
+            .iter()
+            .map(|point| {
+                let mut violations = Vec::new();
+                if profile
+                    .and_then(|value| value.max_momentary_lufs)
+                    .zip(point.momentary_lufs)
+                    .is_some_and(|(maximum, measured)| measured > maximum)
+                {
+                    violations.push("max_momentary_lufs");
+                }
+                if profile
+                    .and_then(|value| value.max_short_term_lufs)
+                    .zip(point.short_term_lufs)
+                    .is_some_and(|(maximum, measured)| measured > maximum)
+                {
+                    violations.push("max_short_term_lufs");
+                }
+                if profile
+                    .and_then(|value| value.max_true_peak_dbtp)
+                    .is_some_and(|maximum| point.true_peak_dbtp > maximum)
+                {
+                    violations.push("max_true_peak_dbtp");
+                }
+                Self {
+                    path: path.to_string_lossy().into_owned(),
+                    start_seconds: point.start_seconds,
+                    end_seconds: point.end_seconds,
+                    momentary_lufs: point.momentary_lufs,
+                    short_term_lufs: point.short_term_lufs,
+                    sample_peak_dbfs: point.sample_peak_dbfs,
+                    true_peak_dbtp: point.true_peak_dbtp,
+                    violations,
+                }
+            })
+            .collect()
+    }
+}
+
 impl AnalysisReport {
     pub fn new(path: &Path, analysis: &Analysis) -> Self {
         Self::with_compliance(path, analysis, None)
@@ -288,10 +347,20 @@ impl AnalysisReport {
         analysis: &Analysis,
         profile: Option<&ComplianceProfile>,
     ) -> Self {
+        Self::with_compliance_at(path, analysis, profile, 0.0)
+    }
+
+    pub fn with_compliance_at(
+        path: &Path,
+        analysis: &Analysis,
+        profile: Option<&ComplianceProfile>,
+        source_start_seconds: f64,
+    ) -> Self {
         let compliance = profile.map(|profile| profile.evaluate(analysis));
         Self {
             path: path.to_string_lossy().into_owned(),
             duration_seconds: analysis.duration_secs(),
+            source_start_seconds,
             sample_rate_hz: analysis.sample_rate,
             channels: analysis.channels,
             sample_format: match analysis.kind {
@@ -367,6 +436,63 @@ pub fn write_csv<W: Write>(writer: W, reports: &[AnalysisReport]) -> Result<(), 
     csv.flush().map_err(|error| format!("flush CSV: {error}"))
 }
 
+pub fn write_timeline_json<W: Write>(writer: W, reports: &[TimelineReport]) -> Result<(), String> {
+    serde_json::to_writer_pretty(writer, reports)
+        .map_err(|error| format!("write timeline JSON: {error}"))
+}
+
+pub fn write_timeline_ndjson<W: Write>(
+    mut writer: W,
+    reports: &[TimelineReport],
+) -> Result<(), String> {
+    for report in reports {
+        serde_json::to_writer(&mut writer, report)
+            .map_err(|error| format!("write timeline NDJSON: {error}"))?;
+        writer
+            .write_all(b"\n")
+            .map_err(|error| format!("write timeline NDJSON newline: {error}"))?;
+    }
+    Ok(())
+}
+
+pub fn write_timeline_csv<W: Write>(writer: W, reports: &[TimelineReport]) -> Result<(), String> {
+    let mut csv = csv::Writer::from_writer(writer);
+    csv.write_record([
+        "path",
+        "start_seconds",
+        "end_seconds",
+        "momentary_lufs",
+        "short_term_lufs",
+        "sample_peak_dbfs",
+        "true_peak_dbtp",
+        "violations_json",
+    ])
+    .map_err(|error| format!("write timeline CSV header: {error}"))?;
+    for report in reports {
+        let start = report.start_seconds.to_string();
+        let end = report.end_seconds.to_string();
+        let momentary = report.momentary_lufs.map(|value| value.to_string());
+        let short_term = report.short_term_lufs.map(|value| value.to_string());
+        let sample_peak = report.sample_peak_dbfs.to_string();
+        let true_peak = report.true_peak_dbtp.to_string();
+        let violations = serde_json::to_string(&report.violations)
+            .map_err(|error| format!("encode timeline violations: {error}"))?;
+        csv.write_record([
+            report.path.as_str(),
+            &start,
+            &end,
+            momentary.as_deref().unwrap_or(""),
+            short_term.as_deref().unwrap_or(""),
+            &sample_peak,
+            &true_peak,
+            &violations,
+        ])
+        .map_err(|error| format!("write timeline CSV: {error}"))?;
+    }
+    csv.flush()
+        .map_err(|error| format!("flush timeline CSV: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +501,7 @@ mod tests {
         AnalysisReport {
             path: "album/track, one.wav".into(),
             duration_seconds: 12.5,
+            source_start_seconds: 0.0,
             sample_rate_hz: 48_000,
             channels: 2,
             sample_format: "s24",
@@ -435,6 +562,42 @@ mod tests {
             2
         );
         assert!(lines[2].is_empty());
+    }
+
+    #[test]
+    fn timeline_marks_profile_violations_at_their_time_ranges() {
+        let points = vec![LoudnessTimelinePoint {
+            start_seconds: 1.0,
+            end_seconds: 1.1,
+            momentary_lufs: Some(-17.0),
+            short_term_lufs: Some(-20.0),
+            sample_peak_dbfs: -0.5,
+            true_peak_dbtp: -0.4,
+        }];
+        let profile = ComplianceProfile {
+            name: "timeline".into(),
+            target_lufs: None,
+            loudness_tolerance_lu: None,
+            lower_tolerance_lu: None,
+            upper_tolerance_lu: None,
+            max_true_peak_dbtp: Some(-1.0),
+            max_short_term_lufs: Some(-18.0),
+            max_momentary_lufs: Some(-18.0),
+            min_loudness_range_lu: None,
+            max_loudness_range_lu: None,
+        };
+        let reports =
+            TimelineReport::from_points(Path::new("programme.wav"), &points, Some(&profile));
+        assert_eq!(reports[0].start_seconds, 1.0);
+        assert_eq!(
+            reports[0].violations,
+            vec!["max_momentary_lufs", "max_true_peak_dbtp"]
+        );
+        let mut csv = Vec::new();
+        write_timeline_csv(&mut csv, &reports).unwrap();
+        let csv = String::from_utf8(csv).unwrap();
+        assert!(csv.starts_with("path,start_seconds,end_seconds,"));
+        assert!(csv.contains("max_momentary_lufs"));
     }
 
     #[test]

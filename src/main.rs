@@ -1,11 +1,10 @@
 //! Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer.
 
-use clap::Parser;
 use forge_normalizer::cli;
 use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::normalize::{self, Mode, OutputFormat, Plan};
 use forge_normalizer::preset::Preset;
-use forge_normalizer::report::{self, AnalysisReport, ComplianceProfile};
+use forge_normalizer::report::{self, AnalysisReport, ComplianceProfile, TimelineReport};
 use forge_normalizer::wav::{named_channel_layout, ChannelRole, PcmKind, WavContainer};
 use rayon::ThreadPoolBuilder;
 use std::fs::File;
@@ -15,7 +14,13 @@ use std::process::ExitCode;
 use tempfile::{Builder, NamedTempFile, TempDir};
 
 fn main() -> ExitCode {
-    let cli = cli::Cli::parse();
+    let cli = match cli::Cli::parse_with_config() {
+        Ok(cli) => cli,
+        Err(error) => {
+            eprintln!("forge: error: {error}");
+            return ExitCode::from(2);
+        }
+    };
     if let Err(e) = run(cli) {
         eprintln!("forge: error: {e}");
         return ExitCode::from(1);
@@ -142,15 +147,48 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
     }
 
     if cli.analyze_only {
+        let start_seconds = cli.start_seconds.unwrap_or(0.0);
+        if !start_seconds.is_finite() || start_seconds < 0.0 {
+            return Err("--start must be a finite non-negative number".into());
+        }
+        if cli
+            .duration_seconds
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            return Err("--duration must be a finite positive number".into());
+        }
+        if cli.timeline.is_some()
+            && (!cli.timeline_interval_ms.is_finite() || cli.timeline_interval_ms <= 0.0)
+        {
+            return Err("--timeline-interval must be a finite positive number".into());
+        }
+        if cli
+            .timeline
+            .as_ref()
+            .is_some_and(|path| path.as_os_str() == "-")
+            && (cli.json
+                || cli.ndjson
+                || cli.csv.as_ref().is_some_and(|path| path == Path::new("-")))
+        {
+            return Err("analysis report and timeline cannot both use stdout".into());
+        }
         let compliance = cli
             .compliance
             .as_deref()
             .map(ComplianceProfile::load)
             .transpose()?;
         let mut reports = Vec::with_capacity(cli.inputs.len());
+        let mut timeline_reports = Vec::new();
         let mut compliance_failed = false;
         for input in &cli.inputs {
-            let an = normalize::analyze_file_with_roles(input, channel_roles_override.as_deref())?;
+            let timed = normalize::analyze_file_range_with_roles(
+                input,
+                channel_roles_override.as_deref(),
+                start_seconds,
+                cli.duration_seconds,
+                cli.timeline.as_ref().map(|_| cli.timeline_interval_ms),
+            )?;
+            let an = timed.analysis;
             if compliance
                 .as_ref()
                 .is_some_and(|profile| !profile.evaluate(&an).passed)
@@ -158,7 +196,7 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                 compliance_failed = true;
             }
             if cli.json || cli.ndjson || cli.csv.is_some() {
-                reports.push(AnalysisReport::with_compliance(
+                reports.push(AnalysisReport::with_compliance_at(
                     if stdin_requested {
                         Path::new("-")
                     } else {
@@ -166,12 +204,24 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                     },
                     &an,
                     compliance.as_ref(),
+                    (start_seconds * an.sample_rate as f64).round() / an.sample_rate as f64,
                 ));
             } else {
                 print_analysis(input, &an, None);
                 if let Some(profile) = &compliance {
                     print_compliance(profile, &an);
                 }
+            }
+            if cli.timeline.is_some() {
+                timeline_reports.extend(TimelineReport::from_points(
+                    if stdin_requested {
+                        Path::new("-")
+                    } else {
+                        input
+                    },
+                    &timed.timeline,
+                    compliance.as_ref(),
+                ));
             }
         }
         if cli.json {
@@ -191,6 +241,9 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                     .map_err(|error| format!("create {}: {error}", path.display()))?;
                 report::write_csv(file, &reports)?;
             }
+        }
+        if let Some(path) = &cli.timeline {
+            write_timeline(path, &timeline_reports)?;
         }
         if compliance_failed {
             return Err("one or more inputs failed the requested compliance profile".into());
@@ -343,6 +396,36 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn write_timeline(path: &Path, reports: &[TimelineReport]) -> Result<(), String> {
+    let format = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("ndjson")
+        .to_ascii_lowercase();
+    let write = |writer: &mut dyn Write| match format.as_str() {
+        "json" => report::write_timeline_json(writer, reports),
+        "csv" => report::write_timeline_csv(writer, reports),
+        "ndjson" | "jsonl" => report::write_timeline_ndjson(writer, reports),
+        _ => Err("--timeline path must end in .json, .ndjson, .jsonl, or .csv".into()),
+    };
+    if path.as_os_str() == "-" {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        write(&mut output)
+    } else {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("create {}: {error}", parent.display()))?;
+        }
+        let mut file =
+            File::create(path).map_err(|error| format!("create {}: {error}", path.display()))?;
+        write(&mut file)
+    }
 }
 
 struct PipelineFiles {

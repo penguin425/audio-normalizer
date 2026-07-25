@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+#[derive(Debug, Clone)]
 pub struct StreamInfo {
     pub sample_rate: u32,
     pub channels: u16,

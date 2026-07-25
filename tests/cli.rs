@@ -158,5 +158,83 @@ fn standard_streams_support_binary_audio_and_ndjson() {
     assert_eq!(value["channels"], 1);
     assert_eq!(value["path"], "-");
 }
+
+#[test]
+fn analysis_range_writes_a_time_resolved_qc_report() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("programme.wav");
+    let timeline = directory.path().join("timeline.ndjson");
+    std::fs::write(&input, wav_fixture_bytes()).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            input.to_str().unwrap(),
+            "--analyze",
+            "--start",
+            "0.2",
+            "--duration",
+            "0.5",
+            "--timeline",
+            timeline.to_str().unwrap(),
+            "--timeline-interval",
+            "100",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let lines = std::fs::read_to_string(timeline).unwrap();
+    let points = lines
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(points.len(), 5);
+    assert_eq!(points[0]["start_seconds"], 0.2);
+    assert_eq!(points[4]["end_seconds"], 0.7);
+    assert!(points[0]["momentary_lufs"].is_null());
+    assert!(points[3]["momentary_lufs"].is_number());
+}
+
+#[test]
+fn toml_job_config_is_relative_and_cli_options_override_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("programme.wav");
+    let config = directory.path().join("forge.toml");
+    std::fs::write(&input, wav_fixture_bytes()).unwrap();
+    std::fs::write(
+        &config,
+        r#"
+            [analysis]
+            enabled = true
+            start_seconds = 0.1
+            duration_seconds = 0.6
+            timeline = "configured.ndjson"
+            timeline_interval_ms = 100
+        "#,
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            input.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--analyze",
+            "--duration",
+            "0.3",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let timeline = std::fs::read_to_string(directory.path().join("configured.ndjson")).unwrap();
+    assert_eq!(timeline.lines().count(), 3);
+}
 use clap::Parser;
 use forge_normalizer::cli::Cli;

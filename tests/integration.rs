@@ -60,6 +60,31 @@ fn ambiguous_multichannel_wav_requires_an_explicit_layout() {
 }
 
 #[test]
+fn range_analysis_reports_absolute_timeline_times() {
+    let buffer = synth_sine(48_000, 5.0, 0.2, 997.0, 1);
+    let input = tmp_path("forge_it_timeline_range.wav");
+    WavWriter::write(&input, &buffer, PcmKind::F32, false).unwrap();
+
+    let timed = normalize::analyze_file_range_with_roles(&input, None, 0.5, Some(3.5), Some(100.0))
+        .unwrap();
+    assert_eq!(timed.analysis.frames, 168_000);
+    assert_eq!(timed.timeline.len(), 35);
+    assert!((timed.timeline[0].start_seconds - 0.5).abs() < 1e-12);
+    assert!((timed.timeline[0].end_seconds - 0.6).abs() < 1e-12);
+    assert!((timed.timeline.last().unwrap().end_seconds - 4.0).abs() < 1e-12);
+    assert!(timed.timeline[2].momentary_lufs.is_none());
+    assert!(timed.timeline[3].momentary_lufs.is_some());
+    assert!(timed.timeline[28].short_term_lufs.is_none());
+    assert!(timed.timeline[29].short_term_lufs.is_some());
+    assert!(timed
+        .timeline
+        .iter()
+        .all(|point| point.true_peak_dbtp.is_finite()));
+
+    let _ = std::fs::remove_file(input);
+}
+
+#[test]
 fn bw64_output_preserves_bext_and_writes_measured_loudness() {
     let input = tmp_path("forge_it_bwf_input.wav");
     let output = tmp_path("forge_it_bwf_output.wav");
