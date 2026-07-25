@@ -72,6 +72,8 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build release binary
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo build --locked --release --target ${{ matrix.target }} --features opus-encoding
 
       - name: Package Unix binary
