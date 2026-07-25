@@ -40,13 +40,16 @@ fn parse_bits(s: &str) -> PcmKind {
     }
 }
 
-fn run(cli: cli::Cli) -> Result<(), String> {
+fn run(mut cli: cli::Cli) -> Result<(), String> {
     if let Some(j) = cli.jobs {
         ThreadPoolBuilder::new()
             .num_threads(j)
             .build_global()
             .map_err(|e| format!("thread pool: {e}"))?;
     }
+
+    let (expanded, relative_paths) = expand_inputs(&cli.inputs, cli.recursive)?;
+    cli.inputs = expanded;
 
     let plan = Plan {
         mode: parse_mode(&cli.mode),
@@ -65,7 +68,7 @@ fn run(cli: cli::Cli) -> Result<(), String> {
         return Err("--album is only valid with --mode lufs".into());
     }
 
-    let (outputs, formats) = resolve_outputs_and_formats(&cli)?;
+    let (outputs, formats) = resolve_outputs_and_formats(&cli, &relative_paths)?;
 
     if cli.analyze_only {
         let mut reports = Vec::with_capacity(cli.inputs.len());
@@ -95,7 +98,27 @@ fn run(cli: cli::Cli) -> Result<(), String> {
         return Ok(());
     }
 
+    if !cli.gain_only {
+        validate_outputs(&cli.inputs, &outputs, cli.overwrite)?;
+    }
+
     if cli.album {
+        if cli.dry_run {
+            let analyses: Vec<_> = cli
+                .inputs
+                .iter()
+                .map(normalize::analyze_file)
+                .collect::<Result<_, _>>()?;
+            let gain = normalize::album_gain(&analyses, &plan);
+            for ((input, output), analysis) in
+                cli.inputs.iter().zip(outputs.iter()).zip(analyses.iter())
+            {
+                print_analysis(input, analysis, Some(gain));
+                eprintln!("  would write {}", output.display());
+            }
+            return Ok(());
+        }
+        prepare_output_directories(&outputs)?;
         let results = normalize::normalize_album(&cli.inputs, &outputs, &plan, &formats)?;
         let analyses: Vec<_> = results.iter().map(|(a, _)| a.clone()).collect();
         let album_l = normalize::album_lufs(&analyses);
@@ -112,11 +135,15 @@ fn run(cli: cli::Cli) -> Result<(), String> {
     }
 
     for ((input, output), fmt) in cli.inputs.iter().zip(outputs.iter()).zip(formats.iter()) {
-        if cli.gain_only {
+        if cli.gain_only || cli.dry_run {
             let an = normalize::analyze_file(input)?;
             let gain = normalize::compute_gain(&an, &plan);
             print_analysis(input, &an, Some(gain));
+            if cli.dry_run {
+                eprintln!("  would write {}", output.display());
+            }
         } else {
+            prepare_output_directories(std::slice::from_ref(output))?;
             let (an, gain) = normalize::normalize_one(input, output, &plan, *fmt)?;
             print_analysis(input, &an, Some(gain));
         }
@@ -124,19 +151,130 @@ fn run(cli: cli::Cli) -> Result<(), String> {
     Ok(())
 }
 
+fn expand_inputs(
+    inputs: &[PathBuf],
+    recursive: bool,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    let mut expanded = Vec::new();
+    let mut relative = Vec::new();
+    for input in inputs {
+        if input.is_file() {
+            expanded.push(input.clone());
+            relative.push(
+                input
+                    .file_name()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("input")),
+            );
+        } else if input.is_dir() {
+            if !recursive {
+                return Err(format!(
+                    "{} is a directory; use --recursive",
+                    input.display()
+                ));
+            }
+            collect_audio_files(input, input, &mut expanded, &mut relative)?;
+        } else {
+            return Err(format!("input does not exist: {}", input.display()));
+        }
+    }
+    if expanded.is_empty() {
+        return Err("no supported audio files found".into());
+    }
+    Ok((expanded, relative))
+}
+
+fn collect_audio_files(
+    root: &Path,
+    directory: &Path,
+    expanded: &mut Vec<PathBuf>,
+    relative: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let mut entries: Vec<_> = std::fs::read_dir(directory)
+        .map_err(|error| format!("read {}: {error}", directory.display()))?
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("read {}: {error}", directory.display()))?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_audio_files(root, &path, expanded, relative)?;
+        } else if path.is_file() && is_supported_input(&path) {
+            relative.push(
+                path.strip_prefix(root)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| path.clone()),
+            );
+            expanded.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_supported_input(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("wav" | "wave" | "mp3" | "flac" | "aac" | "m4a" | "mp4" | "ogg")
+    )
+}
+
+fn validate_outputs(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    overwrite: bool,
+) -> Result<(), String> {
+    for (input, output) in inputs.iter().zip(outputs) {
+        if input == output {
+            return Err(format!("refusing to overwrite input: {}", input.display()));
+        }
+        if output.exists() && !overwrite {
+            return Err(format!(
+                "output already exists: {} (use --overwrite)",
+                output.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_output_directories(outputs: &[PathBuf]) -> Result<(), String> {
+    for output in outputs {
+        if let Some(parent) = output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("create {}: {error}", parent.display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn resolve_outputs_and_formats(
     cli: &cli::Cli,
+    relative_paths: &[PathBuf],
 ) -> Result<(Vec<PathBuf>, Vec<OutputFormat>), String> {
     let explicit = cli.format.as_deref().map(parse_format);
     let mut outputs = Vec::with_capacity(cli.inputs.len());
     let mut formats = Vec::with_capacity(cli.inputs.len());
 
     if let Some(out) = &cli.output {
-        if out.is_dir() {
-            for inp in &cli.inputs {
+        if out.is_dir() || (!out.exists() && (cli.inputs.len() > 1 || cli.recursive)) {
+            for (index, inp) in cli.inputs.iter().enumerate() {
                 let fmt = explicit.unwrap_or_else(|| default_format_for_input(inp));
-                let stem = inp.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
-                outputs.push(out.join(format!("{stem}_normalized.{}", fmt_ext(fmt))));
+                let relative = relative_paths.get(index).unwrap_or(inp);
+                let stem = relative
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("out");
+                let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+                outputs.push(
+                    out.join(parent)
+                        .join(format!("{stem}_normalized.{}", fmt_ext(fmt))),
+                );
                 formats.push(fmt);
             }
             return Ok((outputs, formats));

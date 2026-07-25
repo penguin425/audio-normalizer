@@ -21,6 +21,18 @@ pub struct Cli {
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
 
+    /// Recursively process supported audio files found in input directories.
+    #[arg(long)]
+    pub recursive: bool,
+
+    /// Show analysis and planned output paths without writing files.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Replace output files that already exist.
+    #[arg(long)]
+    pub overwrite: bool,
+
     /// Normalization mode: lufs (EBU R128), peak, or rms.
     #[arg(short = 'm', long = "mode", value_parser = ["lufs", "peak", "rms"], default_value = "lufs")]
     pub mode: String,
