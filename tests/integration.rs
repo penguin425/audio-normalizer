@@ -10,7 +10,7 @@ use forge_normalizer::normalize::{self, Mode, OutputFormat, Plan};
 use forge_normalizer::wav::{default_channel_roles, AudioBuffer, PcmKind, WavReader, WavWriter};
 use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
-use lofty::tag::{Accessor, Tag, TagExt, TagType};
+use lofty::tag::{Accessor, ItemKey, Tag, TagExt, TagType};
 use std::f64::consts::PI;
 use std::path::PathBuf;
 
@@ -68,6 +68,47 @@ fn flac_output_roundtrips_at_16_and_24_bits() {
         assert!((peak - (-6.0)).abs() < 0.02, "{bits}-bit peak was {peak}");
         let _ = std::fs::remove_file(output);
     }
+    let _ = std::fs::remove_file(input);
+}
+
+#[test]
+fn replaygain_tags_leave_decoded_audio_unchanged() {
+    let input = tmp_path("forge_it_replaygain.flac");
+    let buf = synth_sine(48_000, 1.0, 0.25, 440.0, 2);
+    let plan = Plan {
+        mode: Mode::Lufs,
+        target_lufs: -16.0,
+        target_peak_db: -1.0,
+        target_rms_db: -18.0,
+        ceiling_db: -1.0,
+        max_gain_db: None,
+        dither: false,
+        output_kind: Some(PcmKind::S24),
+        mp3_bitrate: 192,
+        mp3_quality: 2,
+    };
+    normalize::write(&buf, &input, &plan, OutputFormat::Flac).unwrap();
+    let before = decoder::decode(&input).unwrap();
+    let analysis = normalize::analyze(&before);
+    forge_normalizer::metadata::write_replaygain(
+        &input,
+        analysis.lufs,
+        analysis.sample_peak,
+        Some((analysis.lufs - 1.0, analysis.sample_peak)),
+    )
+    .unwrap();
+
+    let tags = lofty::read_from_path(&input).unwrap();
+    let tag = tags.primary_tag().unwrap();
+    assert_eq!(
+        tag.get_string(ItemKey::ReplayGainTrackGain),
+        Some(format!("{:+.2} dB", -18.0 - analysis.lufs).as_str())
+    );
+    assert!(tag.get_string(ItemKey::ReplayGainTrackPeak).is_some());
+    assert!(tag.get_string(ItemKey::ReplayGainAlbumGain).is_some());
+    let after = decoder::decode(&input).unwrap();
+    assert_eq!(before.frames, after.frames);
+    assert_eq!(before.data, after.data);
     let _ = std::fs::remove_file(input);
 }
 

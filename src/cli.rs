@@ -91,6 +91,13 @@ pub struct Cli {
     #[arg(long = "gain-only")]
     pub gain_only: bool,
 
+    /// Measure without changing audio and write ReplayGain 2.0 metadata to the inputs.
+    #[arg(
+        long = "write-tags",
+        conflicts_with_all = ["analyze_only", "gain_only", "output"]
+    )]
+    pub write_tags: bool,
+
     /// Apply TPDF dither when writing integer PCM.
     #[arg(long = "dither")]
     pub dither: bool,
