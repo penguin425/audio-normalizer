@@ -96,13 +96,13 @@ pub struct Cli {
     #[arg(long = "max-gain")]
     pub max_gain_db: Option<f64>,
 
-    /// Output container format: `wav`, `flac`, `mp3`, or `opus`. If omitted, inferred from the
+    /// Output container format: `wav`, `flac`, `mp3`, `opus`, or `m4a`. If omitted, inferred from the
     /// `-o` extension, else defaults to the input's format when supported
     /// (FLAC/MP3 are kept) and otherwise wav.
-    #[arg(long = "format", value_parser = ["wav", "flac", "mp3", "opus"])]
+    #[arg(long = "format", value_parser = ["wav", "flac", "mp3", "opus", "m4a"])]
     pub format: Option<String>,
 
-    /// Lossy encoder bitrate in kbps, used with MP3 and Opus output.
+    /// Lossy encoder bitrate in kbps, used with MP3, Opus, and AAC output.
     #[arg(long = "bitrate", default_value_t = 192)]
     pub bitrate: i32,
 
@@ -494,7 +494,11 @@ impl Cli {
             )?;
         }
         if let Some(format) = &self.format {
-            validate_choice("output.format", format, &["wav", "flac", "mp3", "opus"])?;
+            validate_choice(
+                "output.format",
+                format,
+                &["wav", "flac", "mp3", "opus", "m4a"],
+            )?;
         }
         if let Some(bits) = &self.bits {
             validate_choice("output.bits", bits, &["8", "16", "24", "32", "32f", "64f"])?;

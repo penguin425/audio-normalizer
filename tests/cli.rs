@@ -95,6 +95,12 @@ fn broadcast_wave_options_are_validated_and_exposed() {
     assert!(Cli::try_parse_from(["forge", "track.wav", "--wav-container", "wave64"]).is_err());
 }
 
+#[test]
+fn m4a_output_format_is_exposed() {
+    let cli = Cli::try_parse_from(["forge", "track.wav", "--format", "m4a"]).unwrap();
+    assert_eq!(cli.format.as_deref(), Some("m4a"));
+}
+
 fn wav_fixture_bytes() -> Vec<u8> {
     let file = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
     let buffer = AudioBuffer {

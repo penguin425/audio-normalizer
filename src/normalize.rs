@@ -35,6 +35,7 @@ pub enum OutputFormat {
     Flac,
     Mp3,
     Opus,
+    M4a,
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +292,24 @@ pub fn write<P: AsRef<Path>>(
                     "Ogg Opus output is unavailable; rebuild with `--features opus-encoding`"
                         .into(),
                 )
+            }
+        }
+        OutputFormat::M4a => {
+            #[cfg(feature = "aac-encoding")]
+            {
+                let mut writer = crate::aac::AacStreamWriter::create(
+                    p,
+                    buf.sample_rate,
+                    buf.channels,
+                    plan.mp3_bitrate,
+                )?;
+                writer.write_chunk(&buf.data)?;
+                writer.finish()
+            }
+            #[cfg(not(feature = "aac-encoding"))]
+            {
+                let _ = (buf, plan);
+                Err("AAC/M4A output is unavailable; rebuild with `--features aac-encoding`".into())
             }
         }
     }
@@ -882,6 +901,10 @@ fn finalize_metadata(
             crate::opus::rewrite_r128_tags(output, _track_lufs, _album_lufs)?;
         }
     }
+    if format == OutputFormat::M4a {
+        let measured = analyze_file(output)?;
+        metadata::write_replaygain(output, measured.lufs, measured.true_peak, None)?;
+    }
     Ok(())
 }
 
@@ -1016,6 +1039,26 @@ fn normalize_stream(
                     "Ogg Opus output is unavailable; rebuild with `--features opus-encoding`"
                         .into(),
                 )
+            }
+        }
+        OutputFormat::M4a => {
+            #[cfg(feature = "aac-encoding")]
+            {
+                let mut writer = crate::aac::AacStreamWriter::create(
+                    output,
+                    analysis.sample_rate,
+                    analysis.channels,
+                    plan.mp3_bitrate,
+                )?;
+                process_normalized_stream(input, analysis, gain, ceiling, plan, |planar| {
+                    writer.write_chunk(planar)
+                })?;
+                writer.finish()
+            }
+            #[cfg(not(feature = "aac-encoding"))]
+            {
+                let _ = (input, output, analysis, gain, plan, ceiling);
+                Err("AAC/M4A output is unavailable; rebuild with `--features aac-encoding`".into())
             }
         }
     }

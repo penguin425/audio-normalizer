@@ -32,8 +32,14 @@ jobs:
       - name: Run tests with static Opus support
         run: cargo test --features opus-encoding
 
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Run tests with FFmpeg AAC support
+        run: cargo test --features aac-encoding
+
       - name: Install LAME
-        run: sudo apt-get update && sudo apt-get install -y libmp3lame-dev
+        run: sudo apt-get install -y libmp3lame-dev
 
       - name: Run tests with MP3 encoding
         run: cargo test --features mp3-encoding

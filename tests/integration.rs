@@ -59,6 +59,71 @@ fn ambiguous_multichannel_wav_requires_an_explicit_layout() {
     let _ = std::fs::remove_file(input);
 }
 
+#[cfg(feature = "aac-encoding")]
+#[test]
+fn aac_m4a_roundtrips_gaplessly_and_writes_loudness_tags() {
+    let input = tmp_path("forge_it_aac_input.wav");
+    let output = tmp_path("forge_it_aac_output.m4a");
+    let buffer = synth_sine(44_100, 4.0, 0.1, 997.0, 2);
+    WavWriter::write(&input, &buffer, PcmKind::S24, false).unwrap();
+    let mut input_tag = Tag::new(TagType::Id3v2);
+    input_tag.set_title("AAC Roundtrip".to_string());
+    input_tag
+        .save_to_path(&input, WriteOptions::default())
+        .unwrap();
+    let plan = Plan {
+        mode: Mode::Lufs,
+        target_lufs: -16.0,
+        target_peak_db: -1.0,
+        target_rms_db: -18.0,
+        ceiling_db: -1.0,
+        max_gain_db: None,
+        dither: false,
+        output_kind: None,
+        mp3_bitrate: 192,
+        mp3_quality: 2,
+        limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
+    };
+    let corrected =
+        normalize::normalize_one_corrected(&input, &output, &plan, OutputFormat::M4a, 0.6, 2)
+            .unwrap();
+    assert!(corrected.verification.passed());
+
+    let decoded = decoder::decode(&output).unwrap();
+    assert_eq!((decoded.sample_rate, decoded.channels), (44_100, 2));
+    let probe = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(probe.status.success());
+    let duration: f64 = String::from_utf8(probe.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!((duration - 4.0).abs() < 0.001);
+    let measured = normalize::analyze(&decoded);
+    assert!((measured.lufs - (-16.0)).abs() < 0.6);
+    let output_tags = lofty::read_from_path(&output).unwrap();
+    let tag = output_tags.primary_tag().unwrap();
+    assert_eq!(tag.title().as_deref(), Some("AAC Roundtrip"));
+    assert!(tag.get_string(ItemKey::ReplayGainTrackGain).is_some());
+    assert!(tag.get_string(ItemKey::ReplayGainTrackPeak).is_some());
+
+    let _ = std::fs::remove_file(input);
+    let _ = std::fs::remove_file(output);
+}
+
 #[test]
 fn range_analysis_reports_absolute_timeline_times() {
     let buffer = synth_sine(48_000, 5.0, 0.2, 997.0, 1);

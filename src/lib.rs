@@ -9,6 +9,8 @@
 // on emphasis markers, so allow it crate-wide.
 #![allow(clippy::doc_lazy_continuation)]
 
+#[cfg(feature = "aac-encoding")]
+pub mod aac;
 mod atomic;
 pub mod cli;
 pub mod decoder;

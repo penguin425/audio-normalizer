@@ -781,6 +781,7 @@ fn parse_format(s: &str) -> OutputFormat {
         "flac" => OutputFormat::Flac,
         "mp3" => OutputFormat::Mp3,
         "opus" => OutputFormat::Opus,
+        "m4a" => OutputFormat::M4a,
         _ => OutputFormat::Wav,
     }
 }
@@ -791,6 +792,7 @@ fn fmt_ext(f: OutputFormat) -> &'static str {
         OutputFormat::Flac => "flac",
         OutputFormat::Mp3 => "mp3",
         OutputFormat::Opus => "opus",
+        OutputFormat::M4a => "m4a",
     }
 }
 
@@ -804,6 +806,7 @@ fn infer_format(path: &Path) -> Option<OutputFormat> {
         Some("flac") => Some(OutputFormat::Flac),
         Some("mp3") => Some(OutputFormat::Mp3),
         Some("opus") => Some(OutputFormat::Opus),
+        Some("m4a") | Some("mp4") => Some(OutputFormat::M4a),
         Some("wav") | Some("wave") => Some(OutputFormat::Wav),
         _ => None,
     }
@@ -821,6 +824,16 @@ fn default_format_for_input(path: &Path) -> OutputFormat {
         Some("flac") => OutputFormat::Flac,
         Some("mp3") => OutputFormat::Mp3,
         Some("opus") => OutputFormat::Opus,
+        Some("m4a") | Some("mp4") => {
+            #[cfg(feature = "aac-encoding")]
+            {
+                OutputFormat::M4a
+            }
+            #[cfg(not(feature = "aac-encoding"))]
+            {
+                OutputFormat::Wav
+            }
+        }
         _ => OutputFormat::Wav,
     }
 }
