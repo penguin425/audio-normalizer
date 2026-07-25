@@ -109,6 +109,18 @@ pub struct Cli {
     #[arg(long, default_value_t = 0.5, requires = "verify")]
     pub verify_tolerance: f64,
 
+    /// Use a streaming look-ahead true-peak limiter instead of reducing global gain.
+    #[arg(long)]
+    pub limiter: bool,
+
+    /// Limiter look-ahead in milliseconds.
+    #[arg(long, default_value_t = 5.0, requires = "limiter")]
+    pub limiter_lookahead: f64,
+
+    /// Limiter release time in milliseconds.
+    #[arg(long, default_value_t = 100.0, requires = "limiter")]
+    pub limiter_release: f64,
+
     /// Apply TPDF dither when writing integer PCM.
     #[arg(long = "dither")]
     pub dither: bool,
