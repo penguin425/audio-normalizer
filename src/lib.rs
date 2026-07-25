@@ -18,6 +18,8 @@ pub mod metadata;
 #[cfg(feature = "mp3-encoding")]
 pub mod mp3enc;
 pub mod normalize;
+#[cfg(feature = "opus-encoding")]
+pub mod opus;
 pub mod preset;
 pub mod report;
 pub mod wav;

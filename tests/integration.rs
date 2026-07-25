@@ -106,6 +106,101 @@ fn failed_encode_preserves_an_existing_destination() {
     let _ = std::fs::remove_file(output);
 }
 
+#[cfg(feature = "opus-encoding")]
+#[test]
+fn opus_resamples_roundtrips_and_writes_r128_track_gain() {
+    let input = tmp_path("forge_it_opus_input.wav");
+    let output = tmp_path("forge_it_opus_output.opus");
+    let buffer = synth_sine(44_100, 6.0, 0.1, 997.0, 2);
+    WavWriter::write(&input, &buffer, PcmKind::S24, false).unwrap();
+    let mut input_tag = Tag::new(TagType::Id3v2);
+    input_tag.set_title("Opus Roundtrip".to_string());
+    input_tag
+        .save_to_path(&input, WriteOptions::default())
+        .unwrap();
+    let plan = Plan {
+        mode: Mode::Lufs,
+        target_lufs: -16.0,
+        target_peak_db: -1.0,
+        target_rms_db: -18.0,
+        ceiling_db: -1.0,
+        max_gain_db: None,
+        dither: false,
+        output_kind: None,
+        mp3_bitrate: 128,
+        mp3_quality: 2,
+        limiter: None,
+    };
+    normalize::normalize_one(&input, &output, &plan, OutputFormat::Opus).unwrap();
+    let decoded = decoder::decode(&output).unwrap();
+    assert_eq!(decoded.sample_rate, 48_000);
+    assert_eq!(decoded.channels, 2);
+    assert!((decoded.frames as f64 / decoded.sample_rate as f64 - 6.0).abs() < 0.01);
+    let analysis = normalize::analyze(&decoded);
+    assert!((analysis.lufs - (-16.0)).abs() < 0.5);
+    let (track, album) = forge_normalizer::opus::read_r128_tags(&output).unwrap();
+    assert_eq!(track, Some(-7 * 256));
+    assert_eq!(album, None);
+    let output_tags = lofty::read_from_path(&output).unwrap();
+    assert_eq!(
+        output_tags.primary_tag().unwrap().title().as_deref(),
+        Some("Opus Roundtrip")
+    );
+    let _ = std::fs::remove_file(input);
+    let _ = std::fs::remove_file(output);
+}
+
+#[cfg(feature = "opus-encoding")]
+#[test]
+fn opus_album_writes_shared_r128_album_gain() {
+    let input_a = tmp_path("forge_it_opus_album_a.wav");
+    let input_b = tmp_path("forge_it_opus_album_b.wav");
+    let output_a = tmp_path("forge_it_opus_album_a.opus");
+    let output_b = tmp_path("forge_it_opus_album_b.opus");
+    WavWriter::write(
+        &input_a,
+        &synth_sine(48_000, 4.0, 0.03, 440.0, 2),
+        PcmKind::S24,
+        false,
+    )
+    .unwrap();
+    WavWriter::write(
+        &input_b,
+        &synth_sine(48_000, 4.0, 0.06, 660.0, 2),
+        PcmKind::S24,
+        false,
+    )
+    .unwrap();
+    let plan = Plan {
+        mode: Mode::Lufs,
+        target_lufs: -18.0,
+        target_peak_db: -1.0,
+        target_rms_db: -18.0,
+        ceiling_db: -1.0,
+        max_gain_db: None,
+        dither: false,
+        output_kind: None,
+        mp3_bitrate: 128,
+        mp3_quality: 2,
+        limiter: None,
+    };
+    normalize::normalize_album(
+        &[input_a.clone(), input_b.clone()],
+        &[output_a.clone(), output_b.clone()],
+        &plan,
+        &[OutputFormat::Opus, OutputFormat::Opus],
+    )
+    .unwrap();
+    for output in [&output_a, &output_b] {
+        let (track, album) = forge_normalizer::opus::read_r128_tags(output).unwrap();
+        assert!(track.is_some());
+        assert_eq!(album, Some(-5 * 256));
+    }
+    for path in [input_a, input_b, output_a, output_b] {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 #[test]
 fn replaygain_tags_leave_decoded_audio_unchanged() {
     let input = tmp_path("forge_it_replaygain.flac");

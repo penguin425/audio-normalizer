@@ -34,6 +34,7 @@ pub enum OutputFormat {
     Wav,
     Flac,
     Mp3,
+    Opus,
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +244,30 @@ pub fn write<P: AsRef<Path>>(
                 Err("MP3 output is unavailable; rebuild with `--features mp3-encoding`".into())
             }
         }
+        OutputFormat::Opus => {
+            #[cfg(feature = "opus-encoding")]
+            {
+                let mut writer = crate::opus::OpusStreamWriter::create(
+                    p,
+                    buf.sample_rate,
+                    buf.frames,
+                    buf.channels,
+                    plan.mp3_bitrate,
+                    analyze(buf).lufs,
+                    None,
+                )?;
+                writer.write_chunk(&buf.data)?;
+                writer.finish()
+            }
+            #[cfg(not(feature = "opus-encoding"))]
+            {
+                let _ = (buf, plan);
+                Err(
+                    "Ogg Opus output is unavailable; rebuild with `--features opus-encoding`"
+                        .into(),
+                )
+            }
+        }
     }
 }
 
@@ -371,8 +396,14 @@ pub fn normalize_one<P: AsRef<Path>>(
     let an = analyze_file(&input)?;
     let gain = compute_gain(&an, plan);
     let staged = AtomicOutput::new(output.as_ref())?;
-    normalize_stream(input.as_ref(), staged.path(), &an, gain, plan, format)?;
-    metadata::copy_metadata(input.as_ref(), staged.path())?;
+    normalize_stream(input.as_ref(), staged.path(), &an, gain, plan, format, None)?;
+    finalize_metadata(
+        input.as_ref(),
+        staged.path(),
+        format,
+        an.lufs + gain_db(gain),
+        None,
+    )?;
     staged.commit()?;
     Ok((an, gain))
 }
@@ -399,10 +430,10 @@ pub fn normalize_one_corrected<P: AsRef<Path>>(
     let staged = AtomicOutput::new(output)?;
 
     for attempt in 0..=max_retries {
-        normalize_stream(input, staged.path(), &source, gain, plan, format)?;
+        normalize_stream(input, staged.path(), &source, gain, plan, format, None)?;
         let verification = verify_file_at_level(staged.path(), expected_level, plan, tolerance)?;
         if verification.passed() {
-            metadata::copy_metadata(input, staged.path())?;
+            finalize_metadata(input, staged.path(), format, verification.output.lufs, None)?;
             staged.commit()?;
             return Ok(CorrectedNormalization {
                 source,
@@ -452,6 +483,7 @@ pub fn normalize_album(
 ) -> Result<Vec<(Analysis, f32)>, String> {
     let analyses: Vec<Analysis> = inputs.iter().map(analyze_file).collect::<Result<_, _>>()?;
     let gain = album_gain(&analyses, plan);
+    let album_output_lufs = album_lufs(&analyses) + gain_db(gain);
     let staged: Vec<AtomicOutput> = outputs
         .iter()
         .map(|output| AtomicOutput::new(output))
@@ -459,8 +491,22 @@ pub fn normalize_album(
     let mut results = Vec::with_capacity(inputs.len());
     for (i, (input, output)) in inputs.iter().zip(staged.iter()).enumerate() {
         let fmt = formats.get(i).copied().unwrap_or(OutputFormat::Wav);
-        normalize_stream(input, output.path(), &analyses[i], gain, plan, fmt)?;
-        metadata::copy_metadata(input, output.path())?;
+        normalize_stream(
+            input,
+            output.path(),
+            &analyses[i],
+            gain,
+            plan,
+            fmt,
+            Some(album_output_lufs),
+        )?;
+        finalize_metadata(
+            input,
+            output.path(),
+            fmt,
+            analyses[i].lufs + gain_db(gain),
+            Some(album_output_lufs),
+        )?;
         results.push((analyses[i].clone(), gain));
     }
     for output in staged {
@@ -508,7 +554,15 @@ pub fn normalize_album_corrected(
     for attempt in 0..=max_retries {
         for (index, (input, output)) in inputs.iter().zip(&staged_paths).enumerate() {
             let format = formats.get(index).copied().unwrap_or(OutputFormat::Wav);
-            normalize_stream(input, output, &sources[index], gain, plan, format)?;
+            normalize_stream(
+                input,
+                output,
+                &sources[index],
+                gain,
+                plan,
+                format,
+                Some(album_lufs(&sources) + gain_db(gain)),
+            )?;
         }
         let decoded: Vec<Analysis> = staged_paths
             .iter()
@@ -529,8 +583,15 @@ pub fn normalize_album_corrected(
             && worst_true_peak <= plan.ceiling_db + tolerance
             && verifications.iter().all(Verification::passed);
         if album_passed {
-            for (input, output) in inputs.iter().zip(&staged_paths) {
-                metadata::copy_metadata(input, output)?;
+            for (index, (input, output)) in inputs.iter().zip(&staged_paths).enumerate() {
+                let format = formats.get(index).copied().unwrap_or(OutputFormat::Wav);
+                finalize_metadata(
+                    input,
+                    output,
+                    format,
+                    decoded[index].lufs,
+                    Some(actual_album_lufs),
+                )?;
             }
             for output in staged {
                 output.commit()?;
@@ -577,6 +638,23 @@ fn gain_db(gain: f32) -> f64 {
     20.0 * (gain as f64).log10()
 }
 
+fn finalize_metadata(
+    input: &Path,
+    output: &Path,
+    format: OutputFormat,
+    _track_lufs: f64,
+    _album_lufs: Option<f64>,
+) -> Result<(), String> {
+    metadata::copy_metadata(input, output)?;
+    if format == OutputFormat::Opus {
+        #[cfg(feature = "opus-encoding")]
+        {
+            crate::opus::rewrite_r128_tags(output, _track_lufs, _album_lufs)?;
+        }
+    }
+    Ok(())
+}
+
 fn corrected_gain(
     current_gain: f32,
     verification: &Verification,
@@ -615,6 +693,7 @@ fn normalize_stream(
     gain: f32,
     plan: &Plan,
     format: OutputFormat,
+    _opus_album_lufs: Option<f64>,
 ) -> Result<(), String> {
     let ceiling = 10.0_f64.powf(plan.ceiling_db / 20.0) as f32;
     match format {
@@ -671,6 +750,33 @@ fn normalize_stream(
             {
                 let _ = (input, output, analysis, gain, plan, ceiling);
                 Err("MP3 output is unavailable; rebuild with `--features mp3-encoding`".into())
+            }
+        }
+        OutputFormat::Opus => {
+            #[cfg(feature = "opus-encoding")]
+            {
+                let output_lufs = analysis.lufs + gain_db(gain);
+                let mut writer = crate::opus::OpusStreamWriter::create(
+                    output,
+                    analysis.sample_rate,
+                    analysis.frames,
+                    analysis.channels,
+                    plan.mp3_bitrate,
+                    output_lufs,
+                    _opus_album_lufs,
+                )?;
+                process_normalized_stream(input, analysis, gain, ceiling, plan, |planar| {
+                    writer.write_chunk(planar)
+                })?;
+                writer.finish()
+            }
+            #[cfg(not(feature = "opus-encoding"))]
+            {
+                let _ = (input, output, analysis, gain, plan, ceiling);
+                Err(
+                    "Ogg Opus output is unavailable; rebuild with `--features opus-encoding`"
+                        .into(),
+                )
             }
         }
     }
