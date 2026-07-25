@@ -162,6 +162,12 @@ forge --analyze song.mp3
 forge --analyze album/*.flac --json
 forge --analyze album/*.flac --csv report.csv
 
+# Write ReplayGain 2.0 track tags without changing encoded audio
+forge song.flac --write-tags
+
+# Add shared album tags to every track (audio remains untouched)
+forge album/*.flac --album --write-tags
+
 # Print the gain that would be applied, write nothing
 forge --gain-only track.wav --target=-14
 
@@ -190,6 +196,7 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--json` | off | Write analyze results as JSON to stdout |
 | `--csv` | none | Write analyze results as CSV to a file or `-` |
 | `--gain-only` | off | Print the gain; write nothing |
+| `--write-tags` | off | Write ReplayGain 2.0 metadata without changing audio |
 | `--dither` | off | TPDF dither for integer PCM output |
 | `--bits` | input's | `8`/`16`/`24`/`32`/`32f`/`64f` output format |
 | `-j, --jobs` | all cores | Worker thread count |

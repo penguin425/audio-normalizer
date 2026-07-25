@@ -68,6 +68,10 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
         return Err("--album is only valid with --mode lufs".into());
     }
 
+    if cli.write_tags {
+        return write_loudness_tags(&cli);
+    }
+
     let (outputs, formats) = resolve_outputs_and_formats(&cli, &relative_paths)?;
     if cli.bits.is_some()
         && formats.contains(&OutputFormat::Flac)
@@ -152,6 +156,40 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
             prepare_output_directories(std::slice::from_ref(output))?;
             let (an, gain) = normalize::normalize_one(input, output, &plan, *fmt)?;
             print_analysis(input, &an, Some(gain));
+        }
+    }
+    Ok(())
+}
+
+fn write_loudness_tags(cli: &cli::Cli) -> Result<(), String> {
+    let analyses: Vec<_> = cli
+        .inputs
+        .iter()
+        .map(normalize::analyze_file)
+        .collect::<Result<_, _>>()?;
+    let album = if cli.album {
+        Some((
+            normalize::album_lufs(&analyses),
+            analyses
+                .iter()
+                .map(|analysis| analysis.true_peak)
+                .fold(0.0_f32, f32::max),
+        ))
+    } else {
+        None
+    };
+    for (input, analysis) in cli.inputs.iter().zip(&analyses) {
+        print_analysis(input, analysis, None);
+        if cli.dry_run {
+            eprintln!("  would write ReplayGain tags");
+        } else {
+            forge_normalizer::metadata::write_replaygain(
+                input,
+                analysis.lufs,
+                analysis.true_peak,
+                album,
+            )?;
+            eprintln!("  wrote ReplayGain tags");
         }
     }
     Ok(())
