@@ -435,6 +435,10 @@ pub struct AnalysisReport {
     pub codec_dialnorm_pass: Option<bool>,
     pub codec_encoded_loudness_deviation_lu: Option<f64>,
     pub codec_encoded_loudness_pass: Option<bool>,
+    pub adm_axml_present: Option<bool>,
+    pub adm_chna_present: Option<bool>,
+    pub adm_presentations_json: Option<String>,
+    pub adm_qc_passed: Option<bool>,
     pub compliance_profile: Option<String>,
     pub compliance_loudness_basis: Option<LoudnessBasis>,
     pub compliance_target_lufs: Option<f64>,
@@ -597,6 +601,10 @@ impl AnalysisReport {
             codec_dialnorm_pass: None,
             codec_encoded_loudness_deviation_lu: None,
             codec_encoded_loudness_pass: None,
+            adm_axml_present: None,
+            adm_chna_present: None,
+            adm_presentations_json: None,
+            adm_qc_passed: None,
             compliance_profile: compliance.as_ref().map(|result| result.profile.clone()),
             compliance_loudness_basis: profile.map(|value| value.loudness_basis),
             compliance_target_lufs: profile.and_then(|value| value.target_lufs),
@@ -659,6 +667,7 @@ pub fn write_manifest<W: Write>(writer: W, reports: &[AnalysisReport]) -> Result
             report.compliance_passed != Some(false)
                 && report.codec_dialnorm_pass != Some(false)
                 && report.codec_encoded_loudness_pass != Some(false)
+                && report.adm_qc_passed != Some(false)
         })
         .count();
     let manifest = DeliveryManifest {
@@ -791,6 +800,10 @@ mod tests {
             codec_dialnorm_pass: None,
             codec_encoded_loudness_deviation_lu: None,
             codec_encoded_loudness_pass: None,
+            adm_axml_present: None,
+            adm_chna_present: None,
+            adm_presentations_json: None,
+            adm_qc_passed: None,
             compliance_profile: None,
             compliance_loudness_basis: None,
             compliance_target_lufs: None,
