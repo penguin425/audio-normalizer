@@ -251,6 +251,29 @@ fn explicit_dialogue_ranges_drive_long_form_compliance() {
         .unwrap()
         .contains("dialogue_lufs"));
 
+    let ebu = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            input.to_str().unwrap(),
+            "--analyze",
+            "--json",
+            "--dialogue-ranges",
+            ranges.to_str().unwrap(),
+            "--dialogue-standard",
+            "ebu-r128-s4",
+            "--dialogue-source",
+            "mix",
+        ])
+        .output()
+        .unwrap();
+    assert!(ebu.status.success());
+    let ebu_report: serde_json::Value = serde_json::from_slice(&ebu.stdout).unwrap();
+    assert_eq!(
+        ebu_report[0]["dialogue_measurement_standard"],
+        "EBU R 128 s4"
+    );
+    assert_eq!(ebu_report[0]["dialogue_source"], "mix");
+    assert!(ebu_report[0]["loudness_to_dialogue_ratio_lu"].is_number());
+
     let missing = Command::new(env!("CARGO_BIN_EXE_forge"))
         .args([
             input.to_str().unwrap(),
