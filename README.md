@@ -397,6 +397,11 @@ without the BS.1770-2+ relative-level gate. Region energies are duration
 weighted. Reports identify the measurement standard and method explicitly.
 Forge does not guess dialogue with a classifier.
 
+Loudness Range (LRA) is reported for every analysis, together with
+`loudness_range_stable`. EBU Tech 3341 notes that LRA is not stable during the
+first 60 seconds, so shorter measurements are marked provisional instead of
+being presented as a settled programme characteristic.
+
 Dialogue range files use JSON or TOML:
 
 ```toml
