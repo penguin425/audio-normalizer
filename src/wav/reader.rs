@@ -10,7 +10,7 @@ use crate::wav::{default_channel_roles, AudioBuffer, ChannelRole, PcmKind, WaveF
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 #[derive(Debug)]
@@ -54,6 +54,13 @@ impl From<io::Error> for WavReadError {
 }
 
 pub struct WavReader;
+
+pub struct WavStreamInfo {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub kind: PcmKind,
+    pub channel_roles: Vec<ChannelRole>,
+}
 
 impl WavReader {
     /// Open and fully decode a WAV file into a planar [`AudioBuffer`].
@@ -133,6 +140,39 @@ impl WavReader {
             source_kind: kind,
         };
         Ok(buf)
+    }
+
+    /// Read only the RIFF headers required for streaming decode.
+    pub fn probe<P: AsRef<Path>>(path: P) -> Result<WavStreamInfo, WavReadError> {
+        let mut file = File::open(path)?;
+        let mut riff = [0u8; 12];
+        file.read_exact(&mut riff)?;
+        if &riff[..4] != b"RIFF" || &riff[8..] != b"WAVE" {
+            return Err(WavReadError::NotWave);
+        }
+        loop {
+            let mut header = [0u8; 8];
+            file.read_exact(&mut header)?;
+            let size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+            if &header[..4] == b"fmt " {
+                let mut body = vec![0; size];
+                file.read_exact(&mut body)?;
+                let parsed = parse_fmt(&body)?;
+                let kind = pick_kind(parsed.wave_format, parsed.real_tag, parsed.bits)?;
+                let channel_roles = parsed
+                    .channel_mask
+                    .map(|mask| roles_from_wave_mask(mask, parsed.channels))
+                    .unwrap_or_else(|| default_channel_roles(parsed.channels));
+                return Ok(WavStreamInfo {
+                    sample_rate: parsed.sample_rate,
+                    channels: parsed.channels,
+                    kind,
+                    channel_roles,
+                });
+            }
+            let skip = size + (size & 1);
+            file.seek(SeekFrom::Current(skip as i64))?;
+        }
     }
 }
 

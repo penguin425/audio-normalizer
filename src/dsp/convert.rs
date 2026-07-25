@@ -108,14 +108,31 @@ pub fn encode_interleaved(planar: &[Vec<f32>], kind: PcmKind, dither: bool) -> V
     for ch in planar {
         assert_eq!(ch.len(), frames, "channel length mismatch");
     }
+    // One independent dither RNG per channel (reproducible, no locking).
+    let mut rngs = dither_rngs(channels);
+    encode_interleaved_with_rngs(planar, kind, dither, &mut rngs)
+}
+
+pub(crate) fn dither_rngs(channels: usize) -> Vec<u64> {
+    (0..channels)
+        .map(|i| 0x9E3779B97F4A7C15u64.wrapping_mul(i as u64 + 1))
+        .collect()
+}
+
+pub(crate) fn encode_interleaved_with_rngs(
+    planar: &[Vec<f32>],
+    kind: PcmKind,
+    dither: bool,
+    rngs: &mut [u64],
+) -> Vec<u8> {
+    let channels = planar.len();
+    assert_eq!(rngs.len(), channels);
+    let frames = planar[0].len();
+    for channel in planar {
+        assert_eq!(channel.len(), frames, "channel length mismatch");
+    }
     let bpp = kind.bytes_per_sample();
     let mut out = vec![0u8; frames * channels * bpp];
-
-    // One independent dither RNG per channel (reproducible, no locking).
-    let mut rngs: Vec<u64> = (0..channels)
-        .map(|i| 0x9E3779B97F4A7C15u64.wrapping_mul(i as u64 + 1))
-        .collect();
-
     let mut idx = 0usize;
     for (f, _) in planar[0].iter().enumerate() {
         for (ch, rng) in planar.iter().zip(rngs.iter_mut()) {

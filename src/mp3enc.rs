@@ -11,6 +11,8 @@
 
 use crate::wav::AudioBuffer;
 use std::ffi::c_void;
+use std::fs::File;
+use std::io::Write;
 use std::os::raw::{c_float, c_int};
 use std::path::Path;
 
@@ -42,6 +44,122 @@ extern "C" {
 
 const VBR_OFF: c_int = 0;
 const LAME_OKAY: c_int = 0;
+
+pub struct Mp3StreamWriter {
+    gfp: LameT,
+    channels: usize,
+    output: File,
+    encoded: Vec<u8>,
+}
+
+impl Mp3StreamWriter {
+    pub fn create(
+        path: &Path,
+        sample_rate: u32,
+        channels: u16,
+        bitrate_kbps: i32,
+        quality: i32,
+    ) -> Result<Self, String> {
+        if !(1..=2).contains(&channels) {
+            return Err("MP3 output supports only mono or stereo".into());
+        }
+        let gfp = unsafe { lame_init() };
+        if gfp.is_null() {
+            return Err("lame_init() returned null".into());
+        }
+        let result = unsafe {
+            lame_set_in_samplerate(gfp, sample_rate as c_int);
+            lame_set_num_channels(gfp, channels as c_int);
+            lame_set_out_samplerate(gfp, sample_rate as c_int);
+            lame_set_brate(gfp, bitrate_kbps);
+            lame_set_VBR(gfp, VBR_OFF);
+            lame_set_quality(gfp, quality.clamp(0, 9));
+            lame_set_bWriteVbrTag(gfp, 0);
+            lame_init_params(gfp)
+        };
+        if result != LAME_OKAY {
+            unsafe {
+                lame_close(gfp);
+            }
+            return Err("lame_init_params() failed".into());
+        }
+        let output =
+            File::create(path).map_err(|error| format!("create {}: {error}", path.display()))?;
+        Ok(Self {
+            gfp,
+            channels: channels as usize,
+            output,
+            encoded: vec![0; 32_768],
+        })
+    }
+
+    pub fn write_chunk(&mut self, planar: &[Vec<f32>]) -> Result<(), String> {
+        if planar.len() != self.channels {
+            return Err("MP3 stream channel count changed".into());
+        }
+        let frames = planar.first().map_or(0, Vec::len);
+        if planar.iter().any(|channel| channel.len() != frames) {
+            return Err("MP3 stream channel length mismatch".into());
+        }
+        let mut interleaved = Vec::with_capacity(frames * self.channels);
+        for frame in 0..frames {
+            for channel in planar {
+                interleaved.push(channel[frame]);
+            }
+        }
+        let required = (1.25 * (frames * self.channels) as f64 + 7200.0) as usize + 16;
+        if self.encoded.len() < required {
+            self.encoded.resize(required, 0);
+        }
+        let written = unsafe {
+            lame_encode_buffer_interleaved_ieee_float(
+                self.gfp,
+                interleaved.as_ptr(),
+                frames as c_int,
+                self.encoded.as_mut_ptr(),
+                self.encoded.len() as c_int,
+            )
+        };
+        if written < 0 {
+            return Err(format!("lame_encode_buffer error code {written}"));
+        }
+        self.output
+            .write_all(&self.encoded[..written as usize])
+            .map_err(|error| format!("write MP3: {error}"))
+    }
+
+    pub fn finish(mut self) -> Result<(), String> {
+        let written = unsafe {
+            lame_encode_flush(
+                self.gfp,
+                self.encoded.as_mut_ptr(),
+                self.encoded.len() as c_int,
+            )
+        };
+        if written < 0 {
+            return Err(format!("lame_encode_flush error code {written}"));
+        }
+        self.output
+            .write_all(&self.encoded[..written as usize])
+            .and_then(|_| self.output.flush())
+            .map_err(|error| format!("write MP3: {error}"))?;
+        unsafe {
+            lame_close(self.gfp);
+        }
+        self.gfp = std::ptr::null_mut();
+        Ok(())
+    }
+}
+
+impl Drop for Mp3StreamWriter {
+    fn drop(&mut self) {
+        if !self.gfp.is_null() {
+            unsafe {
+                lame_close(self.gfp);
+            }
+        }
+    }
+}
 
 /// Encode a planar [`AudioBuffer`] to MP3 bytes (CBR).
 pub fn encode_mp3(buf: &AudioBuffer, bitrate_kbps: i32, quality: i32) -> Result<Vec<u8>, String> {

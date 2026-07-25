@@ -5,8 +5,8 @@ pub mod reader;
 pub mod writer;
 
 pub use format::{PcmKind, WaveFormat};
-pub use reader::WavReader;
-pub use writer::WavWriter;
+pub use reader::{WavReader, WavStreamInfo};
+pub use writer::{WavStreamWriter, WavWriter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelRole {

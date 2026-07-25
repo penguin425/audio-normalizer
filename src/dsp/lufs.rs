@@ -15,8 +15,10 @@
 
 use crate::dsp::kwfilter::KWeight;
 use crate::dsp::simd;
+use crate::dsp::truepeak::TruePeakMeter;
 use crate::wav::{AudioBuffer, ChannelRole};
 use rayon::prelude::*;
+use std::collections::VecDeque;
 
 #[derive(Debug, Clone)]
 pub struct EbuMeasurements {
@@ -25,6 +27,141 @@ pub struct EbuMeasurements {
     pub max_short_term_lufs: f64,
     pub loudness_range_lu: f64,
     pub gating_blocks: Vec<f64>,
+}
+
+pub struct StreamingMeasurements {
+    pub ebu: EbuMeasurements,
+    pub frames: usize,
+    pub rms_db: f64,
+    pub sample_peak: f32,
+    pub true_peak: f32,
+}
+
+pub struct StreamingAnalyzer {
+    sample_rate: u32,
+    roles: Vec<ChannelRole>,
+    filters: Vec<KWeight>,
+    true_peak_meters: Vec<TruePeakMeter>,
+    momentary: VecDeque<f64>,
+    short_term: VecDeque<f64>,
+    momentary_sum: f64,
+    short_term_sum: f64,
+    gating_blocks: Vec<f64>,
+    short_term_blocks: Vec<f64>,
+    frames: usize,
+    raw_sum_squares: f64,
+    sample_peak: f32,
+}
+
+impl StreamingAnalyzer {
+    pub fn new(sample_rate: u32, roles: Vec<ChannelRole>) -> Self {
+        let channels = roles.len();
+        Self {
+            sample_rate,
+            roles,
+            filters: (0..channels)
+                .map(|_| KWeight::for_sample_rate(sample_rate))
+                .collect(),
+            true_peak_meters: (0..channels).map(|_| TruePeakMeter::new()).collect(),
+            momentary: VecDeque::new(),
+            short_term: VecDeque::new(),
+            momentary_sum: 0.0,
+            short_term_sum: 0.0,
+            gating_blocks: Vec::new(),
+            short_term_blocks: Vec::new(),
+            frames: 0,
+            raw_sum_squares: 0.0,
+            sample_peak: 0.0,
+        }
+    }
+
+    pub fn process(&mut self, planar: &[Vec<f32>]) -> Result<(), String> {
+        if planar.len() != self.roles.len() {
+            return Err("stream channel count changed".into());
+        }
+        let chunk_frames = planar.first().map_or(0, Vec::len);
+        if planar.iter().any(|channel| channel.len() != chunk_frames) {
+            return Err("stream channel length mismatch".into());
+        }
+        for (meter, channel) in self.true_peak_meters.iter_mut().zip(planar) {
+            meter.process(channel);
+        }
+
+        let momentary_window = ((self.sample_rate as usize * 4) / 10).max(1);
+        let short_term_window = (self.sample_rate as usize * 3).max(1);
+        let hop = (self.sample_rate as usize / 10).max(1);
+        for frame in 0..chunk_frames {
+            let mut weighted = 0.0;
+            for ((index, channel), filter) in planar.iter().enumerate().zip(self.filters.iter_mut())
+            {
+                let sample = channel[frame];
+                let filtered = filter.process(sample) as f64;
+                weighted += channel_weight(self.roles[index]) * filtered * filtered;
+                let raw = sample as f64;
+                self.raw_sum_squares += raw * raw;
+                self.sample_peak = self.sample_peak.max(sample.abs());
+            }
+            push_window(
+                &mut self.momentary,
+                &mut self.momentary_sum,
+                weighted,
+                momentary_window,
+            );
+            push_window(
+                &mut self.short_term,
+                &mut self.short_term_sum,
+                weighted,
+                short_term_window,
+            );
+            self.frames += 1;
+            if self.momentary.len() == momentary_window
+                && (self.frames - momentary_window).is_multiple_of(hop)
+            {
+                self.gating_blocks
+                    .push(self.momentary_sum / momentary_window as f64);
+            }
+            if self.short_term.len() == short_term_window
+                && (self.frames - short_term_window).is_multiple_of(hop)
+            {
+                self.short_term_blocks
+                    .push(self.short_term_sum / short_term_window as f64);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> StreamingMeasurements {
+        let channels = self.roles.len();
+        let total_samples = self.frames * channels;
+        let rms = if total_samples == 0 {
+            0.0
+        } else {
+            (self.raw_sum_squares / total_samples as f64).sqrt()
+        };
+        StreamingMeasurements {
+            ebu: measurements_from_blocks(self.gating_blocks, &self.short_term_blocks),
+            frames: self.frames,
+            rms_db: if rms > 0.0 {
+                20.0 * rms.log10()
+            } else {
+                f64::NEG_INFINITY
+            },
+            sample_peak: self.sample_peak,
+            true_peak: self
+                .true_peak_meters
+                .iter()
+                .map(TruePeakMeter::peak)
+                .fold(0.0, f32::max),
+        }
+    }
+}
+
+fn push_window(queue: &mut VecDeque<f64>, sum: &mut f64, value: f64, limit: usize) {
+    queue.push_back(value);
+    *sum += value;
+    if queue.len() > limit {
+        *sum -= queue.pop_front().unwrap();
+    }
 }
 
 /// Per-channel loudness weight (BS.1770).
@@ -90,11 +227,15 @@ pub fn measure_ebu(buf: &AudioBuffer) -> EbuMeasurements {
     let short_term_blocks =
         window_mean_squares(&prefixes, &weights, buf.frames, short_term_window, hop);
 
+    measurements_from_blocks(gating_blocks, &short_term_blocks)
+}
+
+fn measurements_from_blocks(gating_blocks: Vec<f64>, short_term_blocks: &[f64]) -> EbuMeasurements {
     EbuMeasurements {
         integrated_lufs: gated_lufs(&gating_blocks),
         max_momentary_lufs: maximum_loudness(&gating_blocks),
-        max_short_term_lufs: maximum_loudness(&short_term_blocks),
-        loudness_range_lu: loudness_range(&short_term_blocks),
+        max_short_term_lufs: maximum_loudness(short_term_blocks),
+        loudness_range_lu: loudness_range(short_term_blocks),
         gating_blocks,
     }
 }
@@ -268,5 +409,35 @@ mod tests {
             .collect();
         let range = loudness_range(&blocks);
         assert!((range - 8.5).abs() < 0.01, "LRA = {range}");
+    }
+
+    #[test]
+    fn streaming_measurement_matches_whole_buffer() {
+        let samples: Vec<f32> = (0..192_000)
+            .map(|index| ((index as f64 * 0.071).sin() * 0.3) as f32)
+            .collect();
+        let buffer = mono(samples.clone(), 48_000);
+        let whole_ebu = measure_ebu(&buffer);
+        let (whole_rms, whole_peak) = measure_rms_peak(&buffer);
+        let whole_true_peak = crate::dsp::truepeak::measure_true_peak(&buffer);
+
+        let mut streaming = StreamingAnalyzer::new(48_000, vec![ChannelRole::Main]);
+        for chunk in samples.chunks(137) {
+            streaming.process(&[chunk.to_vec()]).unwrap();
+        }
+        let streamed = streaming.finish();
+
+        assert!(
+            (streamed.ebu.integrated_lufs - whole_ebu.integrated_lufs).abs() < 1e-6,
+            "streamed={}, whole={}",
+            streamed.ebu.integrated_lufs,
+            whole_ebu.integrated_lufs
+        );
+        assert!((streamed.ebu.max_momentary_lufs - whole_ebu.max_momentary_lufs).abs() < 1e-6);
+        assert!((streamed.ebu.max_short_term_lufs - whole_ebu.max_short_term_lufs).abs() < 1e-6);
+        assert!((streamed.ebu.loudness_range_lu - whole_ebu.loudness_range_lu).abs() < 1e-6);
+        assert!((streamed.rms_db - whole_rms).abs() < 1e-9);
+        assert_eq!(streamed.sample_peak, whole_peak);
+        assert_eq!(streamed.true_peak, whole_true_peak);
     }
 }

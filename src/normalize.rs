@@ -14,7 +14,7 @@ use crate::dsp::{lufs, simd, truepeak};
 use crate::metadata;
 #[cfg(feature = "mp3-encoding")]
 use crate::mp3enc;
-use crate::wav::{AudioBuffer, PcmKind, WavWriter};
+use crate::wav::{AudioBuffer, PcmKind, WavStreamWriter, WavWriter};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,8 +182,30 @@ pub fn write<P: AsRef<Path>>(
 
 /// Analyze a file on disk (buffer is dropped after measurement).
 pub fn analyze_file<P: AsRef<Path>>(path: P) -> Result<Analysis, String> {
-    let buf = load(&path)?;
-    Ok(analyze(&buf))
+    let mut analyzer: Option<lufs::StreamingAnalyzer> = None;
+    let info = decoder::decode_stream(path.as_ref(), |info, chunk| {
+        let meter = analyzer.get_or_insert_with(|| {
+            lufs::StreamingAnalyzer::new(info.sample_rate, info.channel_roles.clone())
+        });
+        meter.process(chunk)
+    })?;
+    let measured = analyzer
+        .ok_or_else(|| format!("{}: no audio decoded", path.as_ref().display()))?
+        .finish();
+    Ok(Analysis {
+        sample_rate: info.sample_rate,
+        channels: info.channels,
+        frames: measured.frames,
+        kind: info.source_kind,
+        lufs: measured.ebu.integrated_lufs,
+        max_momentary_lufs: measured.ebu.max_momentary_lufs,
+        max_short_term_lufs: measured.ebu.max_short_term_lufs,
+        loudness_range_lu: measured.ebu.loudness_range_lu,
+        rms_db: measured.rms_db,
+        sample_peak: measured.sample_peak,
+        true_peak: measured.true_peak,
+        loudness_blocks: measured.ebu.gating_blocks,
+    })
 }
 
 /// Normalize a single file in one pass (load, analyze, gain, write).
@@ -193,11 +215,9 @@ pub fn normalize_one<P: AsRef<Path>>(
     plan: &Plan,
     format: OutputFormat,
 ) -> Result<(Analysis, f32), String> {
-    let mut buf = load(&input)?;
-    let an = analyze(&buf);
+    let an = analyze_file(&input)?;
     let gain = compute_gain(&an, plan);
-    apply_gain_and_protect(&mut buf, gain, plan);
-    write(&buf, &output, plan, format)?;
+    normalize_stream(input.as_ref(), output.as_ref(), &an, gain, plan, format)?;
     metadata::copy_metadata(input.as_ref(), output.as_ref())?;
     Ok((an, gain))
 }
@@ -234,12 +254,73 @@ pub fn normalize_album(
     let gain = album_gain(&analyses, plan);
     let mut results = Vec::with_capacity(inputs.len());
     for (i, (input, output)) in inputs.iter().zip(outputs.iter()).enumerate() {
-        let mut buf = load(input)?;
-        apply_gain_and_protect(&mut buf, gain, plan);
         let fmt = formats.get(i).copied().unwrap_or(OutputFormat::Wav);
-        write(&buf, output, plan, fmt)?;
+        normalize_stream(input, output, &analyses[i], gain, plan, fmt)?;
         metadata::copy_metadata(input, output)?;
         results.push((analyses[i].clone(), gain));
     }
     Ok(results)
+}
+
+fn normalize_stream(
+    input: &Path,
+    output: &Path,
+    analysis: &Analysis,
+    gain: f32,
+    plan: &Plan,
+    format: OutputFormat,
+) -> Result<(), String> {
+    let ceiling = 10.0_f64.powf(plan.ceiling_db / 20.0) as f32;
+    match format {
+        OutputFormat::Wav => {
+            let kind = plan.output_kind.unwrap_or(analysis.kind);
+            let mut writer = WavStreamWriter::create(
+                output,
+                analysis.sample_rate,
+                analysis.channels,
+                analysis.frames,
+                kind,
+                plan.dither,
+            )
+            .map_err(|error| format!("write {}: {error}", output.display()))?;
+            decoder::decode_stream(input, |_, planar| {
+                gain_chunk(planar, gain, ceiling);
+                writer
+                    .write_chunk(planar)
+                    .map_err(|error| format!("write {}: {error}", output.display()))
+            })?;
+            writer
+                .finish()
+                .map_err(|error| format!("write {}: {error}", output.display()))
+        }
+        OutputFormat::Mp3 => {
+            #[cfg(feature = "mp3-encoding")]
+            {
+                let mut writer = mp3enc::Mp3StreamWriter::create(
+                    output,
+                    analysis.sample_rate,
+                    analysis.channels,
+                    plan.mp3_bitrate,
+                    plan.mp3_quality,
+                )?;
+                decoder::decode_stream(input, |_, planar| {
+                    gain_chunk(planar, gain, ceiling);
+                    writer.write_chunk(planar)
+                })?;
+                writer.finish()
+            }
+            #[cfg(not(feature = "mp3-encoding"))]
+            {
+                let _ = (input, output, analysis, gain, plan, ceiling);
+                Err("MP3 output is unavailable; rebuild with `--features mp3-encoding`".into())
+            }
+        }
+    }
+}
+
+fn gain_chunk(planar: &mut [Vec<f32>], gain: f32, ceiling: f32) {
+    for channel in planar {
+        simd::apply_gain(channel, gain);
+        simd::hard_clip(channel, ceiling);
+    }
 }

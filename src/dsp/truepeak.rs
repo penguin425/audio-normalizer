@@ -73,44 +73,73 @@ pub fn measure_true_peak(buf: &AudioBuffer) -> f32 {
     if buf.frames == 0 {
         return 0.0;
     }
-    let h = coeffs();
-    let mut phases = [[0.0f32; TAPS_PER_PHASE]; M];
-    for p in 0..M {
-        for k in 0..TAPS_PER_PHASE {
-            phases[p][k] = h[p + M * k];
-        }
-    }
     buf.data
         .par_iter()
-        .map(|ch| true_peak_channel(ch, &phases))
+        .map(|ch| {
+            let mut meter = TruePeakMeter::new();
+            meter.process(ch);
+            meter.peak()
+        })
         .reduce(|| 0.0f32, f32::max)
 }
 
-fn true_peak_channel(x: &[f32], phases: &[[f32; TAPS_PER_PHASE]; M]) -> f32 {
-    if x.is_empty() {
-        return 0.0;
+/// Stateful true-peak meter that accepts consecutive sample chunks.
+pub struct TruePeakMeter {
+    history: Option<[f64; TAPS_PER_PHASE]>,
+    peak: f32,
+}
+
+impl Default for TruePeakMeter {
+    fn default() -> Self {
+        Self::new()
     }
-    // Prime the delay line with the first sample so a steady signal (e.g. DC)
-    // interpolates to its own value immediately, with no start-up edge transient
-    // that would otherwise read as a false inter-sample peak.
-    let mut hist = [x[0] as f64; TAPS_PER_PHASE];
-    let mut max_pk = x[0].abs();
-    for &s in x {
-        // Shift history right by one; hist[0] becomes the newest sample.
-        hist.copy_within(0..TAPS_PER_PHASE - 1, 1);
-        hist[0] = s as f64;
-        for ph in phases {
-            let mut acc = 0.0f64;
-            for k in 0..TAPS_PER_PHASE {
-                acc += ph[k] as f64 * hist[k];
-            }
-            let a = acc.abs() as f32;
-            if a > max_pk {
-                max_pk = a;
+}
+
+impl TruePeakMeter {
+    pub const fn new() -> Self {
+        Self {
+            history: None,
+            peak: 0.0,
+        }
+    }
+
+    pub fn process(&mut self, samples: &[f32]) {
+        let Some(&first) = samples.first() else {
+            return;
+        };
+        let history = self.history.get_or_insert([first as f64; TAPS_PER_PHASE]);
+        let phases = phases();
+        for &sample in samples {
+            history.copy_within(0..TAPS_PER_PHASE - 1, 1);
+            history[0] = sample as f64;
+            self.peak = self.peak.max(sample.abs());
+            for phase in phases {
+                let mut acc = 0.0f64;
+                for k in 0..TAPS_PER_PHASE {
+                    acc += phase[k] as f64 * history[k];
+                }
+                self.peak = self.peak.max(acc.abs() as f32);
             }
         }
     }
-    max_pk
+
+    pub const fn peak(&self) -> f32 {
+        self.peak
+    }
+}
+
+fn phases() -> &'static [[f32; TAPS_PER_PHASE]; M] {
+    static PHASES: OnceLock<[[f32; TAPS_PER_PHASE]; M]> = OnceLock::new();
+    PHASES.get_or_init(|| {
+        let h = coeffs();
+        let mut phases = [[0.0f32; TAPS_PER_PHASE]; M];
+        for p in 0..M {
+            for k in 0..TAPS_PER_PHASE {
+                phases[p][k] = h[p + M * k];
+            }
+        }
+        phases
+    })
 }
 
 #[cfg(test)]
@@ -119,16 +148,24 @@ mod tests {
 
     #[test]
     fn polyphase_dc_gain_is_one() {
-        // A constant input interpolates to the same constant (unity DC gain).
-        let h = coeffs();
-        let mut phases = [[0.0f32; TAPS_PER_PHASE]; M];
-        for p in 0..M {
-            for k in 0..TAPS_PER_PHASE {
-                phases[p][k] = h[p + M * k];
-            }
-        }
         let x = vec![0.5f32; 1000];
-        let tp = true_peak_channel(&x, &phases);
+        let mut meter = TruePeakMeter::new();
+        meter.process(&x);
+        let tp = meter.peak();
         assert!((tp - 0.5).abs() < 1e-4, "true peak of DC = {tp}");
+    }
+
+    #[test]
+    fn chunk_boundaries_do_not_change_true_peak() {
+        let samples: Vec<f32> = (0..1000)
+            .map(|index| ((index as f64 * 0.31).sin() * 0.8) as f32)
+            .collect();
+        let mut whole = TruePeakMeter::new();
+        whole.process(&samples);
+        let mut chunked = TruePeakMeter::new();
+        for chunk in samples.chunks(37) {
+            chunked.process(chunk);
+        }
+        assert_eq!(whole.peak(), chunked.peak());
     }
 }
