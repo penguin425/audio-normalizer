@@ -60,6 +60,8 @@ pub struct WavStreamInfo {
     pub channels: u16,
     pub kind: PcmKind,
     pub channel_roles: Vec<ChannelRole>,
+    pub data_offset: u64,
+    pub data_size: u64,
 }
 
 impl WavReader {
@@ -74,10 +76,8 @@ impl WavReader {
     /// Decode a WAV file already held in memory.
     pub fn read_bytes(bytes: &[u8]) -> Result<AudioBuffer, WavReadError> {
         let mut cur = 0usize;
-        if !take(bytes, &mut cur, 4)
-            .ok_or(WavReadError::Truncated)?
-            .eq(b"RIFF")
-        {
+        let container = take(bytes, &mut cur, 4).ok_or(WavReadError::Truncated)?;
+        if !matches!(container, b"RIFF" | b"RF64" | b"BW64") {
             return Err(WavReadError::NotWave);
         }
         let _riff_size = read_u32(bytes, &mut cur)?; // file size - 8; ignored
@@ -91,10 +91,19 @@ impl WavReader {
         // (wave_format, real_tag, sample_rate, channels, bits, channel mask)
         let mut fmt: Option<ParsedFormat> = None;
         let mut data: Option<&[u8]> = None;
+        let mut ds64_data_size: Option<u64> = None;
 
         while cur + 8 <= bytes.len() {
             let id = take(bytes, &mut cur, 4).unwrap();
-            let size = read_u32(bytes, &mut cur)? as usize;
+            let declared_size = read_u32(bytes, &mut cur)?;
+            let size = if id == b"data" && declared_size == u32::MAX {
+                usize::try_from(ds64_data_size.ok_or(WavReadError::BadFormat(
+                    "RF64/BW64 data chunk is missing ds64",
+                ))?)
+                .map_err(|_| WavReadError::BadFormat("audio data is too large for memory"))?
+            } else {
+                declared_size as usize
+            };
             let end = cur.checked_add(size).ok_or(WavReadError::Truncated)?;
             if end > bytes.len() {
                 return Err(WavReadError::Truncated);
@@ -107,6 +116,9 @@ impl WavReader {
             match id {
                 b"fmt " => fmt = Some(parse_fmt(body)?),
                 b"data" => data = Some(body),
+                b"ds64" if body.len() >= 16 => {
+                    ds64_data_size = Some(u64::from_le_bytes(body[8..16].try_into().unwrap()));
+                }
                 _ => {} // skip fact, LIST, etc.
             }
         }
@@ -147,18 +159,39 @@ impl WavReader {
         let mut file = File::open(path)?;
         let mut riff = [0u8; 12];
         file.read_exact(&mut riff)?;
-        if &riff[..4] != b"RIFF" || &riff[8..] != b"WAVE" {
+        if !matches!(&riff[..4], b"RIFF" | b"RF64" | b"BW64") || &riff[8..] != b"WAVE" {
             return Err(WavReadError::NotWave);
         }
+        let mut parsed_format: Option<(ParsedFormat, PcmKind)> = None;
+        let mut ds64_data_size: Option<u64> = None;
         loop {
             let mut header = [0u8; 8];
             file.read_exact(&mut header)?;
-            let size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+            let declared_size = u32::from_le_bytes(header[4..8].try_into().unwrap());
+            let body_offset = file.stream_position()?;
             if &header[..4] == b"fmt " {
-                let mut body = vec![0; size];
+                let mut body = vec![0; declared_size as usize];
                 file.read_exact(&mut body)?;
                 let parsed = parse_fmt(&body)?;
                 let kind = pick_kind(parsed.wave_format, parsed.real_tag, parsed.bits)?;
+                parsed_format = Some((parsed, kind));
+            } else if &header[..4] == b"ds64" {
+                let mut body = vec![0; declared_size as usize];
+                file.read_exact(&mut body)?;
+                if body.len() < 16 {
+                    return Err(WavReadError::BadFormat("ds64 chunk too short"));
+                }
+                ds64_data_size = Some(u64::from_le_bytes(body[8..16].try_into().unwrap()));
+            } else if &header[..4] == b"data" {
+                let data_size = if declared_size == u32::MAX {
+                    ds64_data_size.ok_or(WavReadError::BadFormat(
+                        "RF64/BW64 data chunk is missing ds64",
+                    ))?
+                } else {
+                    declared_size as u64
+                };
+                let (parsed, kind) =
+                    parsed_format.ok_or(WavReadError::BadFormat("data precedes fmt chunk"))?;
                 let channel_roles = parsed
                     .channel_mask
                     .map(|mask| roles_from_wave_mask(mask, parsed.channels))
@@ -168,10 +201,15 @@ impl WavReader {
                     channels: parsed.channels,
                     kind,
                     channel_roles,
+                    data_offset: body_offset,
+                    data_size,
                 });
             }
-            let skip = size + (size & 1);
-            file.seek(SeekFrom::Current(skip as i64))?;
+            let next = body_offset
+                .checked_add(declared_size as u64)
+                .and_then(|offset| offset.checked_add((declared_size & 1) as u64))
+                .ok_or(WavReadError::Truncated)?;
+            file.seek(SeekFrom::Start(next))?;
         }
     }
 }

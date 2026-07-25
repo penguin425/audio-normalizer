@@ -17,7 +17,7 @@ use crate::flacenc::FlacStreamWriter;
 use crate::metadata;
 #[cfg(feature = "mp3-encoding")]
 use crate::mp3enc;
-use crate::wav::{AudioBuffer, ChannelRole, PcmKind, WavStreamWriter, WavWriter};
+use crate::wav::{AudioBuffer, ChannelRole, PcmKind, WavContainer, WavStreamWriter, WavWriter};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +57,10 @@ pub struct Plan {
     pub mp3_quality: i32,
     /// Optional streaming look-ahead true-peak limiter.
     pub limiter: Option<LimiterConfig>,
+    /// RIFF/RF64/BW64 selection for WAV output.
+    pub wav_container: WavContainer,
+    /// Preserve/create BWF metadata and update its R128 measurement fields.
+    pub bwf: bool,
 }
 
 /// Loudness/peak analysis of a single file.
@@ -64,6 +68,7 @@ pub struct Plan {
 pub struct Analysis {
     pub sample_rate: u32,
     pub channels: u16,
+    pub channel_roles: Vec<ChannelRole>,
     pub frames: usize,
     pub kind: PcmKind,
     pub lufs: f64,
@@ -143,6 +148,7 @@ pub fn analyze(buf: &AudioBuffer) -> Analysis {
     Analysis {
         sample_rate: buf.sample_rate,
         channels: buf.channels,
+        channel_roles: buf.channel_roles.clone(),
         frames: buf.frames,
         kind: buf.source_kind,
         lufs: ebu.integrated_lufs,
@@ -223,8 +229,16 @@ pub fn write<P: AsRef<Path>>(
     match format {
         OutputFormat::Wav => {
             let kind = plan.output_kind.unwrap_or(buf.source_kind);
-            WavWriter::write(p, buf, kind, plan.dither)
-                .map_err(|e| format!("write {}: {e}", p.display()))
+            let bext = plan.bwf.then(metadata::blank_bext);
+            WavWriter::write_with_options(
+                p,
+                buf,
+                kind,
+                plan.dither,
+                plan.wav_container,
+                bext.as_deref(),
+            )
+            .map_err(|e| format!("write {}: {e}", p.display()))
         }
         OutputFormat::Flac => {
             let bits = flac_bits(plan.output_kind.unwrap_or(buf.source_kind))?;
@@ -318,6 +332,9 @@ pub fn analyze_file_with_roles<P: AsRef<Path>>(
     Ok(Analysis {
         sample_rate: info.sample_rate,
         channels: info.channels,
+        channel_roles: channel_roles
+            .map(ToOwned::to_owned)
+            .unwrap_or(info.channel_roles),
         frames: measured.frames,
         kind: info.source_kind,
         lufs: measured.ebu.integrated_lufs,
@@ -455,6 +472,7 @@ pub fn normalize_one_with_roles<P: AsRef<Path>>(
         format,
         an.lufs + gain_db(gain),
         None,
+        plan,
     )?;
     staged.commit()?;
     Ok((an, gain))
@@ -503,7 +521,14 @@ pub fn normalize_one_corrected_with_roles<P: AsRef<Path>>(
             channel_roles,
         )?;
         if verification.passed() {
-            finalize_metadata(input, staged.path(), format, verification.output.lufs, None)?;
+            finalize_metadata(
+                input,
+                staged.path(),
+                format,
+                verification.output.lufs,
+                None,
+                plan,
+            )?;
             staged.commit()?;
             return Ok(CorrectedNormalization {
                 source,
@@ -589,6 +614,7 @@ pub fn normalize_album_with_roles(
             fmt,
             analyses[i].lufs + gain_db(gain),
             Some(album_output_lufs),
+            plan,
         )?;
         results.push((analyses[i].clone(), gain));
     }
@@ -697,6 +723,7 @@ pub fn normalize_album_corrected_with_roles(
                     format,
                     decoded[index].lufs,
                     Some(actual_album_lufs),
+                    plan,
                 )?;
             }
             for output in staged {
@@ -750,8 +777,13 @@ fn finalize_metadata(
     format: OutputFormat,
     _track_lufs: f64,
     _album_lufs: Option<f64>,
+    plan: &Plan,
 ) -> Result<(), String> {
     metadata::copy_metadata(input, output)?;
+    if format == OutputFormat::Wav && plan.bwf {
+        let measured = analyze_file(output)?;
+        metadata::update_bwf_loudness(output, &measured)?;
+    }
     if format == OutputFormat::Opus {
         #[cfg(feature = "opus-encoding")]
         {
@@ -805,13 +837,21 @@ fn normalize_stream(
     match format {
         OutputFormat::Wav => {
             let kind = plan.output_kind.unwrap_or(analysis.kind);
-            let mut writer = WavStreamWriter::create(
+            let metadata_chunks = if plan.bwf {
+                metadata::prepare_broadcast_chunks(input)?
+            } else {
+                Vec::new()
+            };
+            let mut writer = WavStreamWriter::create_with_metadata(
                 output,
                 analysis.sample_rate,
                 analysis.channels,
                 analysis.frames,
                 kind,
                 plan.dither,
+                plan.wav_container,
+                &analysis.channel_roles,
+                &metadata_chunks,
             )
             .map_err(|error| format!("write {}: {error}", output.display()))?;
             process_normalized_stream(input, analysis, gain, ceiling, plan, |planar| {
@@ -958,6 +998,7 @@ mod tests {
         Analysis {
             sample_rate: 48_000,
             channels: 2,
+            channel_roles: crate::wav::default_channel_roles(2),
             frames: 48_000,
             kind: PcmKind::F32,
             lufs: level,
@@ -984,6 +1025,8 @@ mod tests {
             mp3_bitrate: 192,
             mp3_quality: 2,
             limiter: None,
+            wav_container: WavContainer::Auto,
+            bwf: false,
         }
     }
 

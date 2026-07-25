@@ -9,7 +9,8 @@ use forge_normalizer::decoder;
 use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::normalize::{self, Mode, OutputFormat, Plan};
 use forge_normalizer::wav::{
-    default_channel_roles, named_channel_layout, AudioBuffer, PcmKind, WavReader, WavWriter,
+    default_channel_roles, named_channel_layout, AudioBuffer, PcmKind, WavContainer, WavReader,
+    WavWriter, WaveChunk,
 };
 use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
@@ -59,6 +60,85 @@ fn ambiguous_multichannel_wav_requires_an_explicit_layout() {
 }
 
 #[test]
+fn bw64_output_preserves_bext_and_writes_measured_loudness() {
+    let input = tmp_path("forge_it_bwf_input.wav");
+    let output = tmp_path("forge_it_bwf_output.wav");
+    let buffer = synth_sine(48_000, 4.0, 0.1, 997.0, 2);
+    let mut source_bext = forge_normalizer::metadata::blank_bext();
+    source_bext[..14].copy_from_slice(b"Forge BWF test");
+    WavWriter::write_with_metadata(
+        &input,
+        &buffer,
+        PcmKind::S24,
+        false,
+        WavContainer::Riff,
+        &[
+            WaveChunk {
+                id: *b"bext",
+                body: source_bext,
+            },
+            WaveChunk {
+                id: *b"axml",
+                body: b"<ebuCoreMain/>".to_vec(),
+            },
+            WaveChunk {
+                id: *b"chna",
+                body: b"ADM channel assignment".to_vec(),
+            },
+        ],
+    )
+    .unwrap();
+    let plan = Plan {
+        mode: Mode::Lufs,
+        target_lufs: -18.0,
+        target_peak_db: -1.0,
+        target_rms_db: -18.0,
+        ceiling_db: -1.0,
+        max_gain_db: None,
+        dither: false,
+        output_kind: Some(PcmKind::S24),
+        mp3_bitrate: 192,
+        mp3_quality: 2,
+        limiter: None,
+        wav_container: WavContainer::Bw64,
+        bwf: true,
+    };
+    normalize::normalize_one(&input, &output, &plan, OutputFormat::Wav).unwrap();
+
+    assert_eq!(&std::fs::read(&output).unwrap()[..4], b"BW64");
+    let output_bext = forge_normalizer::metadata::read_bext(&output)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&output_bext[..14], b"Forge BWF test");
+    assert_eq!(
+        forge_normalizer::metadata::read_wave_chunk(&output, *b"axml")
+            .unwrap()
+            .unwrap(),
+        b"<ebuCoreMain/>"
+    );
+    assert_eq!(
+        forge_normalizer::metadata::read_wave_chunk(&output, *b"chna")
+            .unwrap()
+            .unwrap(),
+        b"ADM channel assignment"
+    );
+    assert_eq!(
+        u16::from_le_bytes(output_bext[346..348].try_into().unwrap()),
+        2
+    );
+    let measured = normalize::analyze_file(&output).unwrap();
+    let stored_loudness =
+        i16::from_le_bytes(output_bext[412..414].try_into().unwrap()) as f64 / 100.0;
+    let stored_true_peak =
+        i16::from_le_bytes(output_bext[416..418].try_into().unwrap()) as f64 / 100.0;
+    assert!((stored_loudness - measured.lufs).abs() <= 0.01);
+    assert!((stored_true_peak - measured.true_peak_db()).abs() <= 0.01);
+
+    let _ = std::fs::remove_file(input);
+    let _ = std::fs::remove_file(output);
+}
+
+#[test]
 fn flac_output_roundtrips_at_16_and_24_bits() {
     let buf = synth_sine(48_000, 1.0, 0.25, 997.0, 2);
     let input = tmp_path("forge_it_flac_in.wav");
@@ -78,6 +158,8 @@ fn flac_output_roundtrips_at_16_and_24_bits() {
             mp3_bitrate: 192,
             mp3_quality: 2,
             limiter: None,
+            wav_container: WavContainer::Auto,
+            bwf: false,
         };
         normalize::normalize_one(&input, &output, &plan, OutputFormat::Flac).unwrap();
         let decoded = decoder::decode(&output).unwrap();
@@ -113,6 +195,8 @@ fn failed_encode_preserves_an_existing_destination() {
             lookahead_ms: 0.0,
             release_ms: 100.0,
         }),
+        wav_container: WavContainer::Auto,
+        bwf: false,
     };
     assert!(normalize::normalize_one(&input, &output, &plan, OutputFormat::Wav).is_err());
     assert_eq!(
@@ -148,6 +232,8 @@ fn opus_resamples_roundtrips_and_writes_r128_track_gain() {
         mp3_bitrate: 128,
         mp3_quality: 2,
         limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
     };
     normalize::normalize_one(&input, &output, &plan, OutputFormat::Opus).unwrap();
     let decoded = decoder::decode(&output).unwrap();
@@ -201,6 +287,8 @@ fn opus_album_writes_shared_r128_album_gain() {
         mp3_bitrate: 128,
         mp3_quality: 2,
         limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
     };
     normalize::normalize_album(
         &[input_a.clone(), input_b.clone()],
@@ -235,6 +323,8 @@ fn replaygain_tags_leave_decoded_audio_unchanged() {
         mp3_bitrate: 192,
         mp3_quality: 2,
         limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
     };
     normalize::write(&buf, &input, &plan, OutputFormat::Flac).unwrap();
     let before = decoder::decode(&input).unwrap();
@@ -279,6 +369,8 @@ fn post_encode_verification_detects_level_mismatch() {
         mp3_bitrate: 192,
         mp3_quality: 2,
         limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
     };
     let (source, gain) =
         normalize::normalize_one(&input, &output, &plan, OutputFormat::Flac).unwrap();
@@ -316,6 +408,8 @@ fn true_peak_limiter_reaches_loudness_despite_isolated_transient() {
         mp3_bitrate: 192,
         mp3_quality: 2,
         limiter: Some(LimiterConfig::default()),
+        wav_container: WavContainer::Auto,
+        bwf: false,
     };
     let (source, gain) =
         normalize::normalize_one(&input, &output, &plan, OutputFormat::Flac).unwrap();
@@ -357,6 +451,8 @@ fn roundtrip_lufs_hits_target() {
         mp3_bitrate: 192,
         mp3_quality: 2,
         limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
     };
     let (an, _gain) = normalize::normalize_one(&inp, &outp, &plan, OutputFormat::Wav).unwrap();
     assert!(an.lufs < -19.0 && an.lufs > -21.0, "input LUFS {}", an.lufs);
@@ -405,6 +501,8 @@ fn roundtrip_peak_mode_hits_target() {
         mp3_bitrate: 192,
         mp3_quality: 2,
         limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
     };
     let (an, _gain) = normalize::normalize_one(&inp, &outp, &plan, OutputFormat::Wav).unwrap();
     let in_peak_db = an.sample_peak_db();
@@ -449,6 +547,8 @@ fn album_mode_applies_shared_gain() {
         mp3_bitrate: 192,
         mp3_quality: 2,
         limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
     };
     let results = normalize::normalize_album(
         &[i1.clone(), i2.clone()],
@@ -502,6 +602,8 @@ fn corrected_album_verifies_a_shared_gain() {
         mp3_bitrate: 192,
         mp3_quality: 2,
         limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
     };
 
     let result = normalize::normalize_album_corrected(
@@ -596,6 +698,8 @@ fn mp3_encode_and_decode_roundtrip() {
         mp3_bitrate: 192,
         mp3_quality: 2,
         limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
     };
 
     // WAV -> MP3 (encode via LAME).
@@ -645,6 +749,8 @@ fn mp3_post_encode_correction_converges_from_the_original_source() {
         mp3_bitrate: 128,
         mp3_quality: 2,
         limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
     };
 
     let result =

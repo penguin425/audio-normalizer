@@ -378,19 +378,14 @@ where
         source_kind: wav.kind,
     };
     let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    file.seek(SeekFrom::Start(12))
+    file.seek(SeekFrom::Start(wav.data_offset))
         .map_err(|error| format!("{}: {error}", path.display()))?;
-    let data_size = loop {
-        let mut header = [0u8; 8];
-        file.read_exact(&mut header)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        let size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
-        if &header[..4] == b"data" {
-            break size;
-        }
-        file.seek(SeekFrom::Current((size + (size & 1)) as i64))
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-    };
+    let data_size = usize::try_from(wav.data_size).map_err(|_| {
+        format!(
+            "{}: audio data is too large for this platform",
+            path.display()
+        )
+    })?;
 
     let frame_bytes = info.channels as usize * info.source_kind.bytes_per_sample();
     let chunk_bytes = (64 * 1024 / frame_bytes).max(1) * frame_bytes;

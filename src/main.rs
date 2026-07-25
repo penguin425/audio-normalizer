@@ -6,7 +6,7 @@ use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::normalize::{self, Mode, OutputFormat, Plan};
 use forge_normalizer::preset::Preset;
 use forge_normalizer::report::{self, AnalysisReport, ComplianceProfile};
-use forge_normalizer::wav::{named_channel_layout, ChannelRole, PcmKind};
+use forge_normalizer::wav::{named_channel_layout, ChannelRole, PcmKind, WavContainer};
 use rayon::ThreadPoolBuilder;
 use std::fs::File;
 use std::io::{self, Write};
@@ -39,6 +39,15 @@ fn parse_bits(s: &str) -> PcmKind {
         "32f" => PcmKind::F32,
         "64f" => PcmKind::F64,
         _ => PcmKind::S16,
+    }
+}
+
+fn parse_wav_container(value: &str) -> WavContainer {
+    match value {
+        "riff" => WavContainer::Riff,
+        "rf64" => WavContainer::Rf64,
+        "bw64" => WavContainer::Bw64,
+        _ => WavContainer::Auto,
     }
 }
 
@@ -81,6 +90,8 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
             lookahead_ms: cli.limiter_lookahead,
             release_ms: cli.limiter_release,
         }),
+        wav_container: parse_wav_container(&cli.wav_container),
+        bwf: cli.bwf,
     };
     if let Some(preset) = preset {
         eprintln!(
@@ -117,24 +128,37 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
     {
         return Err("FLAC output supports only --bits=16 or --bits=24".into());
     }
+    if (cli.bwf || cli.wav_container != "auto")
+        && formats.iter().any(|format| *format != OutputFormat::Wav)
+    {
+        return Err("--bwf and --wav-container are valid only for WAV output".into());
+    }
 
     if cli.analyze_only {
-        let compliance = cli.compliance.as_deref().map(|name| match name {
-            "ebu-r128" => ComplianceProfile::EbuR128,
-            _ => unreachable!("clap validates compliance profiles"),
-        });
+        let compliance = cli
+            .compliance
+            .as_deref()
+            .map(ComplianceProfile::load)
+            .transpose()?;
         let mut reports = Vec::with_capacity(cli.inputs.len());
         let mut compliance_failed = false;
         for input in &cli.inputs {
             let an = normalize::analyze_file_with_roles(input, channel_roles_override.as_deref())?;
-            if compliance.is_some_and(|profile| !profile.evaluate(&an).passed) {
+            if compliance
+                .as_ref()
+                .is_some_and(|profile| !profile.evaluate(&an).passed)
+            {
                 compliance_failed = true;
             }
             if cli.json || cli.csv.is_some() {
-                reports.push(AnalysisReport::with_compliance(input, &an, compliance));
+                reports.push(AnalysisReport::with_compliance(
+                    input,
+                    &an,
+                    compliance.as_ref(),
+                ));
             } else {
                 print_analysis(input, &an, None);
-                if let Some(profile) = compliance {
+                if let Some(profile) = &compliance {
                     print_compliance(profile, &an);
                 }
             }
@@ -307,19 +331,26 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
     Ok(())
 }
 
-fn print_compliance(profile: ComplianceProfile, analysis: &normalize::Analysis) {
+fn print_compliance(profile: &ComplianceProfile, analysis: &normalize::Analysis) {
     let result = profile.evaluate(analysis);
+    eprintln!("  compliance {}:", result.profile);
+    for rule in &result.rules {
+        let bounds = match (rule.minimum, rule.maximum) {
+            (Some(minimum), Some(maximum)) => format!("{minimum:.2}..={maximum:.2}"),
+            (Some(minimum), None) => format!(">= {minimum:.2}"),
+            (None, Some(maximum)) => format!("<= {maximum:.2}"),
+            (None, None) => "unbounded".into(),
+        };
+        eprintln!(
+            "    {}: {:.2} ({}) [{}]",
+            rule.metric,
+            rule.measured,
+            bounds,
+            if rule.passed { "PASS" } else { "FAIL" }
+        );
+    }
     eprintln!(
-        "  compliance {}: loudness {:.2} LUFS [{}], true peak {:.2} dBTP [{}] => {}",
-        result.profile,
-        analysis.lufs,
-        if result.loudness_pass { "PASS" } else { "FAIL" },
-        analysis.true_peak_db(),
-        if result.true_peak_pass {
-            "PASS"
-        } else {
-            "FAIL"
-        },
+        "    result: {}",
         if result.passed { "PASS" } else { "FAIL" }
     );
 }

@@ -77,5 +77,14 @@ fn channel_layout_is_validated_and_exposed() {
     ])
     .is_err());
 }
+
+#[test]
+fn broadcast_wave_options_are_validated_and_exposed() {
+    let cli =
+        Cli::try_parse_from(["forge", "track.wav", "--bwf", "--wav-container", "bw64"]).unwrap();
+    assert!(cli.bwf);
+    assert_eq!(cli.wav_container, "bw64");
+    assert!(Cli::try_parse_from(["forge", "track.wav", "--wav-container", "wave64"]).is_err());
+}
 use clap::Parser;
 use forge_normalizer::cli::Cli;
