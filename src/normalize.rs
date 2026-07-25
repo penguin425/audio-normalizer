@@ -151,8 +151,14 @@ impl Verification {
 }
 
 impl Analysis {
+    /// EBU Tech 3341 warns that LRA is not stable during the first minute.
+    pub const LRA_STABLE_AFTER_SECONDS: f64 = 60.0;
+
     pub fn duration_secs(&self) -> f64 {
         self.frames as f64 / self.sample_rate as f64
+    }
+    pub fn loudness_range_stable(&self) -> bool {
+        self.duration_secs() >= Self::LRA_STABLE_AFTER_SECONDS
     }
     pub fn sample_peak_db(&self) -> f64 {
         to_db(self.sample_peak as f64)
@@ -1367,6 +1373,16 @@ mod tests {
             duration_seconds: f64::NAN,
         }])
         .is_err());
+    }
+
+    #[test]
+    fn lra_stability_requires_sixty_seconds() {
+        let mut measured = analysis(-23.0, -1.0);
+        measured.frames = 48_000 * 59;
+        assert!(!measured.loudness_range_stable());
+
+        measured.frames = 48_000 * 60;
+        assert!(measured.loudness_range_stable());
     }
 
     #[test]

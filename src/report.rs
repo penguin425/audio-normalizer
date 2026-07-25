@@ -296,6 +296,8 @@ pub struct AnalysisReport {
     pub max_momentary_lufs: f64,
     pub max_short_term_lufs: f64,
     pub loudness_range_lu: f64,
+    pub loudness_range_stable: bool,
+    pub loudness_range_stable_after_seconds: f64,
     pub rms_dbfs: f64,
     pub sample_peak_dbfs: f64,
     pub true_peak_dbtp: f64,
@@ -440,6 +442,8 @@ impl AnalysisReport {
             max_momentary_lufs: analysis.max_momentary_lufs,
             max_short_term_lufs: analysis.max_short_term_lufs,
             loudness_range_lu: analysis.loudness_range_lu,
+            loudness_range_stable: analysis.loudness_range_stable(),
+            loudness_range_stable_after_seconds: Analysis::LRA_STABLE_AFTER_SECONDS,
             rms_dbfs: analysis.rms_db,
             sample_peak_dbfs: analysis.sample_peak_db(),
             true_peak_dbtp: analysis.true_peak_db(),
@@ -581,6 +585,8 @@ mod tests {
             max_momentary_lufs: -20.0,
             max_short_term_lufs: -21.0,
             loudness_range_lu: 8.0,
+            loudness_range_stable: false,
+            loudness_range_stable_after_seconds: 60.0,
             rms_dbfs: -25.0,
             sample_peak_dbfs: -3.0,
             true_peak_dbtp: -2.8,
@@ -613,6 +619,8 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(value[0]["integrated_lufs"], -23.0);
         assert_eq!(value[0]["path"], "album/track, one.wav");
+        assert_eq!(value[0]["loudness_range_stable"], false);
+        assert_eq!(value[0]["loudness_range_stable_after_seconds"], 60.0);
     }
 
     #[test]
