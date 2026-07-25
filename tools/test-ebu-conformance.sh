@@ -26,6 +26,14 @@ unzip -joq "${ARCHIVE_PATH}" \
     "seq-3341-6-6channels-WAVEEX-16bit.wav" \
     "seq-3341-7_seq-3342-5-24bit.wav" \
     "seq-3341-2011-8_seq-3342-6-24bit-v02.wav" \
+    "seq-3341-9-24bit.wav" \
+    "seq-3341-10-*-24bit.wav" \
+    "seq-3341-11-24bit.wav" \
+    "seq-3341-12-24bit.wav" \
+    "seq-3341-13-*-24bit.wav*" \
+    "seq-3341-14-24bit.wav.wav" \
+    "seq-3341-1[5-9]-24bit.wav.wav" \
+    "seq-3341-2[0-3]-24bit.wav.wav" \
     "seq-3342-1-16bit.wav" \
     "seq-3342-2-16bit.wav" \
     "seq-3342-3-16bit.wav" \

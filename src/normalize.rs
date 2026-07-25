@@ -9,6 +9,7 @@
 //! *inter-sample* true peak does not exceed the ceiling, which is how
 //! professional loudness normalizers avoid clipping without a dynamic limiter.
 
+use crate::atomic::AtomicOutput;
 use crate::decoder;
 use crate::dsp::limiter::{LimiterConfig, TruePeakLimiter};
 use crate::dsp::{lufs, simd, truepeak};
@@ -369,8 +370,10 @@ pub fn normalize_one<P: AsRef<Path>>(
 ) -> Result<(Analysis, f32), String> {
     let an = analyze_file(&input)?;
     let gain = compute_gain(&an, plan);
-    normalize_stream(input.as_ref(), output.as_ref(), &an, gain, plan, format)?;
-    metadata::copy_metadata(input.as_ref(), output.as_ref())?;
+    let staged = AtomicOutput::new(output.as_ref())?;
+    normalize_stream(input.as_ref(), staged.path(), &an, gain, plan, format)?;
+    metadata::copy_metadata(input.as_ref(), staged.path())?;
+    staged.commit()?;
     Ok((an, gain))
 }
 
@@ -393,18 +396,26 @@ pub fn normalize_one_corrected<P: AsRef<Path>>(
     let source = analyze_file(input)?;
     let mut gain = compute_gain(&source, plan);
     let expected_level = analysis_level(&source, plan.mode) + gain_db(gain);
+    let staged = AtomicOutput::new(output)?;
 
     for attempt in 0..=max_retries {
-        normalize_stream(input, output, &source, gain, plan, format)?;
-        let verification = verify_file_at_level(output, expected_level, plan, tolerance)?;
-        if verification.passed() || attempt == max_retries {
-            metadata::copy_metadata(input, output)?;
+        normalize_stream(input, staged.path(), &source, gain, plan, format)?;
+        let verification = verify_file_at_level(staged.path(), expected_level, plan, tolerance)?;
+        if verification.passed() {
+            metadata::copy_metadata(input, staged.path())?;
+            staged.commit()?;
             return Ok(CorrectedNormalization {
                 source,
                 gain,
                 verification,
                 attempts: attempt + 1,
             });
+        }
+        if attempt == max_retries {
+            return Err(format!(
+                "post-encode verification failed after {} encoding pass(es)",
+                attempt + 1
+            ));
         }
         gain = corrected_gain(gain, &verification, plan)?;
     }
@@ -441,12 +452,19 @@ pub fn normalize_album(
 ) -> Result<Vec<(Analysis, f32)>, String> {
     let analyses: Vec<Analysis> = inputs.iter().map(analyze_file).collect::<Result<_, _>>()?;
     let gain = album_gain(&analyses, plan);
+    let staged: Vec<AtomicOutput> = outputs
+        .iter()
+        .map(|output| AtomicOutput::new(output))
+        .collect::<Result<_, _>>()?;
     let mut results = Vec::with_capacity(inputs.len());
-    for (i, (input, output)) in inputs.iter().zip(outputs.iter()).enumerate() {
+    for (i, (input, output)) in inputs.iter().zip(staged.iter()).enumerate() {
         let fmt = formats.get(i).copied().unwrap_or(OutputFormat::Wav);
-        normalize_stream(input, output, &analyses[i], gain, plan, fmt)?;
-        metadata::copy_metadata(input, output)?;
+        normalize_stream(input, output.path(), &analyses[i], gain, plan, fmt)?;
+        metadata::copy_metadata(input, output.path())?;
         results.push((analyses[i].clone(), gain));
+    }
+    for output in staged {
+        output.commit()?;
     }
     Ok(results)
 }
@@ -478,13 +496,24 @@ pub fn normalize_album_corrected(
         .iter()
         .map(|source| analysis_level(source, plan.mode) + gain_db(gain))
         .collect();
+    let staged: Vec<AtomicOutput> = outputs
+        .iter()
+        .map(|output| AtomicOutput::new(output))
+        .collect::<Result<_, _>>()?;
+    let staged_paths: Vec<PathBuf> = staged
+        .iter()
+        .map(|output| output.path().to_owned())
+        .collect();
 
     for attempt in 0..=max_retries {
-        for (index, (input, output)) in inputs.iter().zip(outputs).enumerate() {
+        for (index, (input, output)) in inputs.iter().zip(&staged_paths).enumerate() {
             let format = formats.get(index).copied().unwrap_or(OutputFormat::Wav);
             normalize_stream(input, output, &sources[index], gain, plan, format)?;
         }
-        let decoded: Vec<Analysis> = outputs.iter().map(analyze_file).collect::<Result<_, _>>()?;
+        let decoded: Vec<Analysis> = staged_paths
+            .iter()
+            .map(analyze_file)
+            .collect::<Result<_, _>>()?;
         let actual_album_lufs = album_lufs(&decoded);
         let verifications: Vec<Verification> = decoded
             .iter()
@@ -499,9 +528,12 @@ pub fn normalize_album_corrected(
         let album_passed = album_deviation <= tolerance
             && worst_true_peak <= plan.ceiling_db + tolerance
             && verifications.iter().all(Verification::passed);
-        if album_passed || attempt == max_retries {
-            for (input, output) in inputs.iter().zip(outputs) {
+        if album_passed {
+            for (input, output) in inputs.iter().zip(&staged_paths) {
                 metadata::copy_metadata(input, output)?;
+            }
+            for output in staged {
+                output.commit()?;
             }
             return Ok(CorrectedAlbumNormalization {
                 sources,
@@ -511,6 +543,12 @@ pub fn normalize_album_corrected(
                 actual_album_lufs,
                 attempts: attempt + 1,
             });
+        }
+        if attempt == max_retries {
+            return Err(format!(
+                "post-encode album verification failed after {} encoding pass(es)",
+                attempt + 1
+            ));
         }
         let album_verification = Verification {
             output: Analysis {

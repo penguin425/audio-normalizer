@@ -5,7 +5,7 @@ use forge_normalizer::cli;
 use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::normalize::{self, Mode, OutputFormat, Plan};
 use forge_normalizer::preset::Preset;
-use forge_normalizer::report::{self, AnalysisReport};
+use forge_normalizer::report::{self, AnalysisReport, ComplianceProfile};
 use forge_normalizer::wav::PcmKind;
 use rayon::ThreadPoolBuilder;
 use std::fs::File;
@@ -114,13 +114,24 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
     }
 
     if cli.analyze_only {
+        let compliance = cli.compliance.as_deref().map(|name| match name {
+            "ebu-r128" => ComplianceProfile::EbuR128,
+            _ => unreachable!("clap validates compliance profiles"),
+        });
         let mut reports = Vec::with_capacity(cli.inputs.len());
+        let mut compliance_failed = false;
         for input in &cli.inputs {
             let an = normalize::analyze_file(input)?;
+            if compliance.is_some_and(|profile| !profile.evaluate(&an).passed) {
+                compliance_failed = true;
+            }
             if cli.json || cli.csv.is_some() {
-                reports.push(AnalysisReport::new(input, &an));
+                reports.push(AnalysisReport::with_compliance(input, &an, compliance));
             } else {
                 print_analysis(input, &an, None);
+                if let Some(profile) = compliance {
+                    print_compliance(profile, &an);
+                }
             }
         }
         if cli.json {
@@ -137,6 +148,9 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
                     .map_err(|error| format!("create {}: {error}", path.display()))?;
                 report::write_csv(file, &reports)?;
             }
+        }
+        if compliance_failed {
+            return Err("one or more inputs failed the requested compliance profile".into());
         }
         return Ok(());
     }
@@ -270,6 +284,23 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn print_compliance(profile: ComplianceProfile, analysis: &normalize::Analysis) {
+    let result = profile.evaluate(analysis);
+    eprintln!(
+        "  compliance {}: loudness {:.2} LUFS [{}], true peak {:.2} dBTP [{}] => {}",
+        result.profile,
+        analysis.lufs,
+        if result.loudness_pass { "PASS" } else { "FAIL" },
+        analysis.true_peak_db(),
+        if result.true_peak_pass {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+        if result.passed { "PASS" } else { "FAIL" }
+    );
 }
 
 fn print_verification(input: &Path, verification: &normalize::Verification, plan: &Plan) -> bool {

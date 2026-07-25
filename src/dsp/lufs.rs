@@ -48,6 +48,8 @@ pub struct StreamingAnalyzer {
     short_term_sum: f64,
     gating_blocks: Vec<f64>,
     short_term_blocks: Vec<f64>,
+    max_momentary_ms: f64,
+    max_short_term_ms: f64,
     frames: usize,
     raw_sum_squares: f64,
     sample_peak: f32,
@@ -69,6 +71,8 @@ impl StreamingAnalyzer {
             short_term_sum: 0.0,
             gating_blocks: Vec::new(),
             short_term_blocks: Vec::new(),
+            max_momentary_ms: 0.0,
+            max_short_term_ms: 0.0,
             frames: 0,
             raw_sum_squares: 0.0,
             sample_peak: 0.0,
@@ -114,6 +118,16 @@ impl StreamingAnalyzer {
                 short_term_window,
             );
             self.frames += 1;
+            if self.momentary.len() == momentary_window {
+                self.max_momentary_ms = self
+                    .max_momentary_ms
+                    .max(self.momentary_sum / momentary_window as f64);
+            }
+            if self.short_term.len() == short_term_window {
+                self.max_short_term_ms = self
+                    .max_short_term_ms
+                    .max(self.short_term_sum / short_term_window as f64);
+            }
             if self.momentary.len() == momentary_window
                 && (self.frames - momentary_window).is_multiple_of(hop)
             {
@@ -138,8 +152,11 @@ impl StreamingAnalyzer {
         } else {
             (self.raw_sum_squares / total_samples as f64).sqrt()
         };
+        let mut ebu = measurements_from_blocks(self.gating_blocks, &self.short_term_blocks);
+        ebu.max_momentary_lufs = maximum_loudness(&[self.max_momentary_ms]);
+        ebu.max_short_term_lufs = maximum_loudness(&[self.max_short_term_ms]);
         StreamingMeasurements {
-            ebu: measurements_from_blocks(self.gating_blocks, &self.short_term_blocks),
+            ebu,
             frames: self.frames,
             rms_db: if rms > 0.0 {
                 20.0 * rms.log10()
@@ -227,7 +244,35 @@ pub fn measure_ebu(buf: &AudioBuffer) -> EbuMeasurements {
     let short_term_blocks =
         window_mean_squares(&prefixes, &weights, buf.frames, short_term_window, hop);
 
-    measurements_from_blocks(gating_blocks, &short_term_blocks)
+    let mut measurements = measurements_from_blocks(gating_blocks, &short_term_blocks);
+    measurements.max_momentary_lufs =
+        maximum_window_loudness(&prefixes, &weights, buf.frames, momentary_window);
+    measurements.max_short_term_lufs =
+        maximum_window_loudness(&prefixes, &weights, buf.frames, short_term_window);
+    measurements
+}
+
+fn maximum_window_loudness(
+    prefixes: &[Vec<f64>],
+    weights: &[f64],
+    frames: usize,
+    window: usize,
+) -> f64 {
+    if window == 0 || frames < window {
+        return f64::NEG_INFINITY;
+    }
+    let mut maximum = 0.0_f64;
+    for start in 0..=frames - window {
+        let mut total = 0.0;
+        for channel in 0..prefixes.len() {
+            if weights[channel] != 0.0 {
+                total += weights[channel]
+                    * (prefixes[channel][start + window] - prefixes[channel][start]);
+            }
+        }
+        maximum = maximum.max(total / window as f64);
+    }
+    maximum_loudness(&[maximum])
 }
 
 fn measurements_from_blocks(gating_blocks: Vec<f64>, short_term_blocks: &[f64]) -> EbuMeasurements {

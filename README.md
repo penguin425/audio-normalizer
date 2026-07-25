@@ -79,12 +79,18 @@ Decoded MP3 output lands within ~0.3 LU of the target (lossy round-trip).
   BS.1770 surround-channel weighting by role instead of guessed channel index.
 * **EBU Mode analysis** reports Integrated, maximum Momentary (400 ms), maximum
   Short-term (3 s), and Loudness Range (LRA) measurements.
+* **EBU R128 compliance reports** evaluate programme loudness against
+  −23.0 ±0.2 LU and maximum true peak against −1.0 dBTP, with separate and
+  aggregate PASS/FAIL fields in JSON and CSV.
 * **True peak** is measured by 4× polyphase FIR oversampling (Kaiser-windowed
   lowpass, unity DC gain), so inter-sample peaks that exceed sample peaks are
   caught — and the gain is reduced so the output never clips after DAC
   reconstruction.
 * **TPDF dither** is available for integer output to eliminate quantization
   distortion when reducing word length.
+* **Transactional output** stages every encode beside its destination and only
+  replaces the requested path after encoding, metadata, and verification
+  succeed. Failed jobs leave an existing destination untouched.
 
 ## Formats
 
@@ -112,6 +118,8 @@ then standard library paths, and prints a clear install hint if it is missing.
 Versioned tags automatically publish GitHub Releases containing portable Forge
 binaries for Linux x86-64, Windows x86-64, macOS Intel, and macOS Apple
 Silicon. Each release includes generated release notes and `SHA256SUMS`.
+GitHub artifact attestations provide verifiable build provenance for every
+archive and checksum manifest.
 
 Release tags must exactly match the version in `Cargo.toml`:
 
@@ -182,6 +190,9 @@ forge --analyze song.mp3
 forge --analyze album/*.flac --json
 forge --analyze album/*.flac --csv report.csv
 
+# Machine-readable EBU R128 delivery checks
+forge --analyze programme.wav --compliance ebu-r128 --json
+
 # Write ReplayGain 2.0 track tags without changing encoded audio
 forge song.flac --write-tags
 
@@ -230,6 +241,7 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--analyze` | off | Measure only; do not write files |
 | `--json` | off | Write analyze results as JSON to stdout |
 | `--csv` | none | Write analyze results as CSV to a file or `-` |
+| `--compliance` | none | Evaluate analysis against `ebu-r128` delivery limits |
 | `--gain-only` | off | Print the gain; write nothing |
 | `--write-tags` | off | Write ReplayGain 2.0 metadata without changing audio |
 | `--verify` | off | Re-decode output and verify achieved level and true peak |
