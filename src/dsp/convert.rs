@@ -201,7 +201,7 @@ fn clamp(s: f32) -> f32 {
 
 /// Triangular PDF dither in quantizer LSB units (range approximately [-1, 1]).
 #[inline]
-fn tpdf(rng: &mut u64) -> f64 {
+pub(crate) fn tpdf(rng: &mut u64) -> f64 {
     next_uniform(rng) - next_uniform(rng)
 }
 

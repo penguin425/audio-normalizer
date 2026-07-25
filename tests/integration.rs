@@ -40,6 +40,38 @@ fn tmp_path(name: &str) -> PathBuf {
 }
 
 #[test]
+fn flac_output_roundtrips_at_16_and_24_bits() {
+    let buf = synth_sine(48_000, 1.0, 0.25, 997.0, 2);
+    let input = tmp_path("forge_it_flac_in.wav");
+    WavWriter::write(&input, &buf, PcmKind::S24, false).unwrap();
+
+    for (bits, kind) in [("16", PcmKind::S16), ("24", PcmKind::S24)] {
+        let output = tmp_path(&format!("forge_it_flac_{bits}.flac"));
+        let plan = Plan {
+            mode: Mode::Peak,
+            target_lufs: -16.0,
+            target_peak_db: -6.0,
+            target_rms_db: -18.0,
+            ceiling_db: -1.0,
+            max_gain_db: None,
+            dither: true,
+            output_kind: Some(kind),
+            mp3_bitrate: 192,
+            mp3_quality: 2,
+        };
+        normalize::normalize_one(&input, &output, &plan, OutputFormat::Flac).unwrap();
+        let decoded = decoder::decode(&output).unwrap();
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.channels, 2);
+        assert_eq!(decoded.frames, buf.frames);
+        let peak = normalize::analyze(&decoded).sample_peak_db();
+        assert!((peak - (-6.0)).abs() < 0.02, "{bits}-bit peak was {peak}");
+        let _ = std::fs::remove_file(output);
+    }
+    let _ = std::fs::remove_file(input);
+}
+
+#[test]
 fn roundtrip_lufs_hits_target() {
     let sr = 48_000;
     let buf = synth_sine(sr, 6.0, 0.10, 1000.0, 2);

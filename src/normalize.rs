@@ -11,6 +11,7 @@
 
 use crate::decoder;
 use crate::dsp::{lufs, simd, truepeak};
+use crate::flacenc::FlacStreamWriter;
 use crate::metadata;
 #[cfg(feature = "mp3-encoding")]
 use crate::mp3enc;
@@ -29,6 +30,7 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
     Wav,
+    Flac,
     Mp3,
 }
 
@@ -166,6 +168,13 @@ pub fn write<P: AsRef<Path>>(
             WavWriter::write(p, buf, kind, plan.dither)
                 .map_err(|e| format!("write {}: {e}", p.display()))
         }
+        OutputFormat::Flac => {
+            let bits = flac_bits(plan.output_kind.unwrap_or(buf.source_kind))?;
+            let mut writer =
+                FlacStreamWriter::create(p, buf.sample_rate, buf.channels, bits, plan.dither)?;
+            writer.write_chunk(&buf.data)?;
+            writer.finish()
+        }
         OutputFormat::Mp3 => {
             #[cfg(feature = "mp3-encoding")]
             {
@@ -293,6 +302,21 @@ fn normalize_stream(
                 .finish()
                 .map_err(|error| format!("write {}: {error}", output.display()))
         }
+        OutputFormat::Flac => {
+            let bits = flac_bits(plan.output_kind.unwrap_or(analysis.kind))?;
+            let mut writer = FlacStreamWriter::create(
+                output,
+                analysis.sample_rate,
+                analysis.channels,
+                bits,
+                plan.dither,
+            )?;
+            decoder::decode_stream(input, |_, planar| {
+                gain_chunk(planar, gain, ceiling);
+                writer.write_chunk(planar)
+            })?;
+            writer.finish()
+        }
         OutputFormat::Mp3 => {
             #[cfg(feature = "mp3-encoding")]
             {
@@ -315,6 +339,13 @@ fn normalize_stream(
                 Err("MP3 output is unavailable; rebuild with `--features mp3-encoding`".into())
             }
         }
+    }
+}
+
+fn flac_bits(kind: PcmKind) -> Result<u16, String> {
+    match kind {
+        PcmKind::U8 | PcmKind::S16 => Ok(16),
+        PcmKind::S24 | PcmKind::S32 | PcmKind::F32 | PcmKind::F64 => Ok(24),
     }
 }
 

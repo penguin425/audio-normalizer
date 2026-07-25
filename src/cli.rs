@@ -57,10 +57,10 @@ pub struct Cli {
     #[arg(long = "max-gain")]
     pub max_gain_db: Option<f64>,
 
-    /// Output container format: `wav` or `mp3`. If omitted, inferred from the
+    /// Output container format: `wav`, `flac`, or `mp3`. If omitted, inferred from the
     /// `-o` extension, else defaults to the input's format when supported
-    /// (mp3 -> mp3) and otherwise wav.
-    #[arg(long = "format", value_parser = ["wav", "mp3"])]
+    /// (FLAC/MP3 are kept) and otherwise wav.
+    #[arg(long = "format", value_parser = ["wav", "flac", "mp3"])]
     pub format: Option<String>,
 
     /// MP3 bitrate in kbps (CBR), used with `--format mp3`.

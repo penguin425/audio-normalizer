@@ -12,6 +12,7 @@
 pub mod cli;
 pub mod decoder;
 pub mod dsp;
+pub mod flacenc;
 pub mod metadata;
 #[cfg(feature = "mp3-encoding")]
 pub mod mp3enc;
