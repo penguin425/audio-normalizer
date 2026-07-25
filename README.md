@@ -17,7 +17,7 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
 | **MP3** | symphonia (pure Rust) | LAME via FFI |
 | **FLAC** (16/24-bit, up to 8 channels) | symphonia (pure Rust) | flacenc (pure Rust) |
 | **Ogg Opus** (1–8 channels, through 7.1) | libopus + pure-Rust Ogg | libopus + pure-Rust Ogg |
-| **AAC / ALAC** (.m4a/.mp4) | symphonia (pure Rust) | — (output as WAV) |
+| **AAC / ALAC** (.m4a/.mp4) | symphonia (pure Rust) | AAC-LC/M4A via optional FFmpeg runtime |
 | **Vorbis** (.ogg) | symphonia (pure Rust) | — (output as WAV) |
 
 * Decoding of MP3/FLAC/AAC/ALAC/Vorbis is done in pure Rust by
@@ -30,6 +30,8 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
   include it; source builds enable it with the `opus-encoding` feature.
 * Opus output writes RFC 7845 `R128_TRACK_GAIN` and, in album mode,
   `R128_ALBUM_GAIN` comments in signed Q7.8 dB units.
+* AAC-LC/M4A output preserves MP4 gapless timing and writes ReplayGain
+  loudness/peak metadata after measuring the encoded result.
 * Multichannel Opus uses RFC 7845 Mapping Family 1 and preserves standardized
   3.0 through 7.1 speaker assignments.
 * WAV stays on the fast hand-written path; other inputs transparently route
@@ -41,8 +43,9 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
   BWF v2 measured loudness fields are updated from the normalized output.
 
 By default the output container follows the input where Forge can encode it
-(FLAC → FLAC, MP3 → MP3), and otherwise falls back to lossless WAV.
-`--format wav|flac|mp3|opus` and
+(FLAC → FLAC, MP3 → MP3, and M4A → M4A when AAC encoding is enabled), and
+otherwise falls back to lossless WAV.
+`--format wav|flac|mp3|opus|m4a` and
 the `-o` extension override this.
 
 ## Why it's fast
@@ -125,6 +128,9 @@ cargo build --release --features mp3-encoding
 # Optional statically linked Ogg Opus input/output:
 cargo build --release --features opus-encoding
 
+# Optional AAC-LC/M4A output (requires `ffmpeg` on PATH at runtime):
+cargo build --release --features aac-encoding
+
 cargo test
 ```
 
@@ -149,8 +155,9 @@ git tag -a v0.2.0 -m "Forge v0.2.0"
 git push origin v0.2.0
 ```
 
-Prebuilt binaries include statically linked Ogg Opus support and support every
-input format plus WAV/FLAC/Opus output. MP3 output requires a source build with
+Prebuilt binaries include statically linked Ogg Opus and the AAC/M4A adapter.
+WAV/FLAC/Opus output is self-contained; AAC-LC/M4A output additionally requires
+`ffmpeg` on `PATH`. MP3 output requires a source build with
 `--features mp3-encoding` and an installed LAME library.
 
 ### EBU conformance tests
@@ -184,6 +191,9 @@ forge track.wav -o track.mp3 --format=mp3 --bitrate=320
 
 # Lossless streaming FLAC output (16 or 24 bit)
 forge track.wav -o track.flac --format=flac --bits=24 --dither
+
+# AAC-LC in a gapless M4A container; verify codec loudness/peak drift
+forge track.wav -o track.m4a --format=m4a --bitrate=160 --verify
 
 # EBU R128 broadcast target (-23 LUFS)
 forge program.wav -o out.wav --target=-23
@@ -278,8 +288,8 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--target-rms` | `-18` | Target RMS dBFS (`--mode rms`) |
 | `--ceiling` | `-1.0` | True-peak ceiling dBTP (gain is reduced to respect it) |
 | `--max-gain` | none | Cap on applied gain (dB), a boost safety limit |
-| `--format` | inferred | `wav`, `flac`, `mp3`, or `opus` output container |
-| `--bitrate` | `192` | Lossy encoder bitrate in kbps (MP3/Opus output) |
+| `--format` | inferred | `wav`, `flac`, `mp3`, `opus`, or `m4a` output container |
+| `--bitrate` | `192` | Lossy encoder bitrate in kbps (MP3/Opus/AAC output) |
 | `--quality` | `2` | MP3 encoder quality 0(best)…9(fastest) |
 | `--album` | off | One shared gain for all inputs (requires `--mode lufs`) |
 | `--channel-layout` | metadata | Override channel order: `mono`, `stereo`, `5.1`, `6.1`, `7.1`, `5.1.4`, or `7.1.4` |
@@ -458,8 +468,8 @@ override whose number of channels does not match the input.
 * MP3 **encoding** requires the `mp3-encoding` feature and LAME
   (`libmp3lame`) at build/run time. MP3 **decoding** and all other input
   formats need only the Rust crates (symphonia).
-* AAC/ALAC/Vorbis can be read but are written as WAV/FLAC (or MP3 with its
-  optional feature); Forge does not encode those source containers directly.
+* AAC can be written as AAC-LC/M4A when the `aac-encoding` feature is built and
+  `ffmpeg` is available. ALAC/Vorbis remain decode-only.
 * Ogg Opus supports mapping family 0 mono/stereo and mapping family 1 layouts
   through 7.1. Chained logical streams are not yet supported.
 * By default, the true-peak ceiling is enforced transparently by reducing

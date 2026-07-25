@@ -288,36 +288,11 @@ where
         .codec_params
         .sample_rate
         .ok_or_else(|| format!("{}: unknown sample rate", path.display()))?;
-    let signaled_channels = track
-        .codec_params
-        .channels
-        .ok_or_else(|| format!("{}: unknown channel layout", path.display()))?;
-    let channels = signaled_channels.count() as u16;
-    let (channel_roles, source_kind) = if matches!(extension.as_str(), "wav" | "wave") {
-        let wav = WavReader::probe(path).map_err(|error| format!("{}: {error}", path.display()))?;
-        if wav.sample_rate != sample_rate || wav.channels != channels {
-            return Err(format!(
-                "{}: inconsistent WAV stream format",
-                path.display()
-            ));
-        }
-        (wav.channel_roles, wav.kind)
-    } else {
-        (
-            roles_from_symphonia(signaled_channels),
-            source_kind(&extension, track.codec_params.bits_per_sample),
-        )
-    };
-    let info = StreamInfo {
-        sample_rate,
-        channels,
-        channel_roles,
-        source_kind,
-    };
     let mut decoder = get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|error| format!("{}: unsupported codec: {error}", path.display()))?;
     let mut sample_buffer: Option<SampleBuffer<f32>> = None;
+    let mut info: Option<StreamInfo> = None;
 
     loop {
         let packet = match format.next_packet() {
@@ -340,7 +315,16 @@ where
         };
         let spec = *decoded.spec();
         let decoded_channels = spec.channels.count();
-        if decoded_channels != channels as usize || spec.rate != sample_rate {
+        let stream_info = info.get_or_insert_with(|| StreamInfo {
+            sample_rate,
+            channels: decoded_channels as u16,
+            channel_roles: roles_from_symphonia(
+                track.codec_params.channels.unwrap_or(spec.channels),
+            ),
+            source_kind: source_kind(&extension, track.codec_params.bits_per_sample),
+        });
+        if decoded_channels != stream_info.channels as usize || spec.rate != stream_info.sample_rate
+        {
             return Err(format!("{}: mid-stream format change", path.display()));
         }
         let frames = decoded.frames();
@@ -361,10 +345,10 @@ where
                 channel.push(*sample);
             }
         }
-        consume(&info, &mut planar)?;
+        consume(stream_info, &mut planar)?;
     }
 
-    Ok(info)
+    info.ok_or_else(|| format!("{}: no audio decoded", path.display()))
 }
 
 fn decode_wav_stream<F>(path: &Path, mut consume: F) -> Result<StreamInfo, String>

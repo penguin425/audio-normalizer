@@ -74,7 +74,7 @@ jobs:
       - name: Build release binary
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build --locked --release --target ${{ matrix.target }} --features opus-encoding
+        run: cargo build --locked --release --target ${{ matrix.target }} --features opus-encoding,aac-encoding
 
       - name: Package Unix binary
         if: matrix.archive == 'tar'
