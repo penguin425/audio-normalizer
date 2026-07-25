@@ -115,6 +115,50 @@ fn stereo_downmix_uses_center_coefficient_and_omits_lfe() {
     let _ = std::fs::remove_file(input);
 }
 
+#[test]
+fn adm_qc_measures_each_mapped_presentation() {
+    let input = tmp_path("forge_it_adm.wav");
+    let buffer = synth_sine(48_000, 1.0, 0.05, 997.0, 6);
+    WavWriter::write_with_metadata(
+        &input,
+        &buffer,
+        PcmKind::F32,
+        false,
+        WavContainer::Bw64,
+        &[
+            WaveChunk {
+                id: *b"axml",
+                body: br#"<audioProgramme audioProgrammeID="APR_1001"/>"#.to_vec(),
+            },
+            WaveChunk {
+                id: *b"chna",
+                body: vec![1, 0, 1, 0],
+            },
+        ],
+    )
+    .unwrap();
+    let map = normalize::AdmPresentationMap {
+        presentations: vec![normalize::AdmPresentationSpec {
+            id: "APR_1001".into(),
+            name: "English".into(),
+            channels: vec![1, 2],
+        }],
+    };
+
+    let result = normalize::analyze_adm_presentations(&input, None, &map).unwrap();
+    assert!(result.passed);
+    assert!(result.axml_present);
+    assert!(result.chna_present);
+    assert_eq!(result.presentations[0].channels, vec![1, 2]);
+    assert!(result.presentations[0].integrated_lufs.is_finite());
+    assert_eq!(
+        result.presentations[0].render_method,
+        "direct-channel-map (no ADM object renderer)"
+    );
+
+    let _ = std::fs::remove_file(input);
+}
+
 #[cfg(feature = "aac-encoding")]
 #[test]
 fn aac_m4a_roundtrips_gaplessly_and_writes_loudness_tags() {

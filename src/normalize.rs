@@ -115,6 +115,40 @@ pub struct DownmixMeasurement {
     pub method: &'static str,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmPresentationMap {
+    pub presentations: Vec<AdmPresentationSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmPresentationSpec {
+    pub id: String,
+    pub name: String,
+    /// One-based input channel numbers.
+    pub channels: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdmPresentationMeasurement {
+    pub id: String,
+    pub name: String,
+    pub channels: Vec<usize>,
+    pub integrated_lufs: f64,
+    pub true_peak_dbtp: f64,
+    pub render_method: &'static str,
+    pub referenced_by_axml: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdmQcResult {
+    pub axml_present: bool,
+    pub chna_present: bool,
+    pub presentations: Vec<AdmPresentationMeasurement>,
+    pub passed: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DialogueStandard {
@@ -266,6 +300,111 @@ pub fn analyze_stereo_downmix(path: &Path) -> Result<DownmixMeasurement, String>
     Ok(DownmixMeasurement {
         analysis: analyze(&downmix),
         method: "Lo/Ro: L/R + center/surround at -3.01 dB; LFE omitted; WAVE channel order",
+    })
+}
+
+pub fn load_adm_presentation_map(path: &Path) -> Result<AdmPresentationMap, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("read ADM presentation map {}: {error}", path.display()))?;
+    let map = match path.extension().and_then(|value| value.to_str()) {
+        Some("json") => serde_json::from_str(&text)
+            .map_err(|error| format!("parse ADM presentation map {}: {error}", path.display()))?,
+        Some("toml") => toml::from_str(&text)
+            .map_err(|error| format!("parse ADM presentation map {}: {error}", path.display()))?,
+        _ => return Err("ADM presentation maps must use a .json or .toml extension".into()),
+    };
+    validate_adm_presentation_map(&map)?;
+    Ok(map)
+}
+
+fn validate_adm_presentation_map(map: &AdmPresentationMap) -> Result<(), String> {
+    if map.presentations.is_empty() {
+        return Err("ADM presentation map contains no presentations".into());
+    }
+    let mut ids = std::collections::HashSet::new();
+    for presentation in &map.presentations {
+        if presentation.id.trim().is_empty() || presentation.name.trim().is_empty() {
+            return Err("ADM presentation IDs and names cannot be empty".into());
+        }
+        if !ids.insert(&presentation.id) {
+            return Err(format!("duplicate ADM presentation ID {}", presentation.id));
+        }
+        if presentation.channels.is_empty() || presentation.channels.contains(&0) {
+            return Err(format!(
+                "ADM presentation {} requires one-based channel numbers",
+                presentation.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn analyze_adm_presentations(
+    path: &Path,
+    channel_roles: Option<&[ChannelRole]>,
+    map: &AdmPresentationMap,
+) -> Result<AdmQcResult, String> {
+    validate_adm_presentation_map(map)?;
+    let source = decoder::decode(path)?;
+    let roles = channel_roles.unwrap_or(&source.channel_roles);
+    if roles.len() != source.channels as usize {
+        return Err("channel layout does not match the ADM source".into());
+    }
+    let axml = metadata::read_wave_chunk(path, *b"axml")?;
+    let chna_present = metadata::read_wave_chunk(path, *b"chna")?.is_some();
+    let axml_text = axml
+        .as_deref()
+        .map(String::from_utf8_lossy)
+        .unwrap_or_default();
+    let mut presentations = Vec::with_capacity(map.presentations.len());
+    for presentation in &map.presentations {
+        if presentation
+            .channels
+            .iter()
+            .any(|channel| *channel > source.channels as usize)
+        {
+            return Err(format!(
+                "ADM presentation {} references a channel beyond {}",
+                presentation.id, source.channels
+            ));
+        }
+        let indices = presentation
+            .channels
+            .iter()
+            .map(|channel| channel - 1)
+            .collect::<Vec<_>>();
+        let rendered = AudioBuffer {
+            sample_rate: source.sample_rate,
+            channels: indices.len() as u16,
+            frames: source.frames,
+            data: indices
+                .iter()
+                .map(|index| source.data[*index].clone())
+                .collect(),
+            channel_roles: indices.iter().map(|index| roles[*index]).collect(),
+            source_kind: source.source_kind,
+        };
+        let measured = analyze(&rendered);
+        presentations.push(AdmPresentationMeasurement {
+            id: presentation.id.clone(),
+            name: presentation.name.clone(),
+            channels: presentation.channels.clone(),
+            integrated_lufs: measured.lufs,
+            true_peak_dbtp: measured.true_peak_db(),
+            render_method: "direct-channel-map (no ADM object renderer)",
+            referenced_by_axml: axml_text.contains(&presentation.id),
+        });
+    }
+    let passed = axml.is_some()
+        && chna_present
+        && presentations
+            .iter()
+            .all(|presentation| presentation.referenced_by_axml);
+    Ok(AdmQcResult {
+        axml_present: axml.is_some(),
+        chna_present,
+        presentations,
+        passed,
     })
 }
 

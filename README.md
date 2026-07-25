@@ -418,6 +418,12 @@ Use `--manifest delivery.json` with batch analysis to write a versioned,
 per-asset delivery record containing measurements, metadata checks, compliance
 rules, and pass/fail totals.
 
+ADM/BW64 presentation QC uses `--adm-presentations presentations.json`. Forge
+checks for both `axml` and `chna`, verifies each supplied ADM presentation ID is
+referenced by `axml`, and measures its explicit one-based channel selection.
+Reports label this as `direct-channel-map (no ADM object renderer)` so a channel
+selection is never misrepresented as a full object-based render.
+
 Loudness Range (LRA) is reported for every analysis, together with
 `loudness_range_stable`. EBU Tech 3341 notes that LRA is not stable during the
 first 60 seconds, so shorter measurements are marked provisional instead of

@@ -250,10 +250,18 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
         if stdin_requested && cli.downmix_qc {
             return Err("--downmix-qc cannot be used with stdin".into());
         }
+        if stdin_requested && cli.adm_presentations.is_some() {
+            return Err("--adm-presentations cannot be used with stdin".into());
+        }
         let codec_metadata = cli
             .codec_metadata
             .as_deref()
             .map(CodecMetadata::load)
+            .transpose()?;
+        let adm_map = cli
+            .adm_presentations
+            .as_deref()
+            .map(normalize::load_adm_presentation_map)
             .transpose()?;
         let mut reports = Vec::with_capacity(cli.inputs.len());
         let mut timeline_reports = Vec::new();
@@ -303,6 +311,19 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
             }) {
                 qc_failed = true;
             }
+            let adm_qc = adm_map
+                .as_ref()
+                .map(|map| {
+                    normalize::analyze_adm_presentations(
+                        input,
+                        channel_roles_override.as_deref(),
+                        map,
+                    )
+                })
+                .transpose()?;
+            if adm_qc.as_ref().is_some_and(|result| !result.passed) {
+                qc_failed = true;
+            }
             if cli.json || cli.ndjson || cli.csv.is_some() || cli.manifest.is_some() {
                 let mut report = AnalysisReport::with_measurements_at(
                     if stdin_requested {
@@ -331,6 +352,15 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                     report.codec_encoded_loudness_deviation_lu =
                         codec.encoded_loudness_deviation_lu;
                     report.codec_encoded_loudness_pass = codec.encoded_loudness_pass;
+                }
+                if let Some(adm) = &adm_qc {
+                    report.adm_axml_present = Some(adm.axml_present);
+                    report.adm_chna_present = Some(adm.chna_present);
+                    report.adm_presentations_json = Some(
+                        serde_json::to_string(&adm.presentations)
+                            .expect("ADM presentation measurements are serializable"),
+                    );
+                    report.adm_qc_passed = Some(adm.passed);
                 }
                 reports.push(report);
             } else {
@@ -368,6 +398,26 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                         codec.encoded_loudness_deviation_lu,
                         qc_status(codec.encoded_loudness_pass),
                     );
+                }
+                if let Some(adm) = &adm_qc {
+                    eprintln!(
+                        "  ADM QC: axml={} chna={} [{}]",
+                        adm.axml_present,
+                        adm.chna_present,
+                        if adm.passed { "PASS" } else { "FAIL" }
+                    );
+                    for presentation in &adm.presentations {
+                        eprintln!(
+                            "    {} {}: {:.2} LUFS, {:.2} dBTP, channels {:?}, axml-ref={} ({})",
+                            presentation.id,
+                            presentation.name,
+                            presentation.integrated_lufs,
+                            presentation.true_peak_dbtp,
+                            presentation.channels,
+                            presentation.referenced_by_axml,
+                            presentation.render_method,
+                        );
+                    }
                 }
             }
             if cli.timeline.is_some() {

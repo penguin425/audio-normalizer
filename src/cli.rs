@@ -213,6 +213,14 @@ pub struct Cli {
     #[arg(long, value_name = "PATH", requires = "analyze_only")]
     pub manifest: Option<PathBuf>,
 
+    /// JSON/TOML ADM presentation-to-channel map for presentation-aware QC.
+    #[arg(
+        long = "adm-presentations",
+        value_name = "PATH",
+        requires = "analyze_only"
+    )]
+    pub adm_presentations: Option<PathBuf>,
+
     /// Start analysis at this source time in seconds.
     #[arg(long = "start", value_name = "SECONDS", requires = "analyze_only")]
     pub start_seconds: Option<f64>,
