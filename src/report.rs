@@ -7,6 +7,94 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CodecMetadata {
+    pub codec: String,
+    pub dialnorm_lkfs: Option<f64>,
+    pub encoded_loudness_lufs: Option<f64>,
+    pub downmix_mode: Option<String>,
+    pub tolerance_lu: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodecQcResult {
+    pub metadata: CodecMetadata,
+    pub loudness_basis: &'static str,
+    pub dialnorm_deviation_lu: Option<f64>,
+    pub dialnorm_pass: Option<bool>,
+    pub encoded_loudness_deviation_lu: Option<f64>,
+    pub encoded_loudness_pass: Option<bool>,
+}
+
+impl CodecMetadata {
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let text = fs::read_to_string(path)
+            .map_err(|error| format!("read codec metadata {}: {error}", path.display()))?;
+        let metadata: Self = match path.extension().and_then(|value| value.to_str()) {
+            Some("json") => serde_json::from_str(&text)
+                .map_err(|error| format!("parse codec metadata {}: {error}", path.display()))?,
+            Some("toml") => toml::from_str(&text)
+                .map_err(|error| format!("parse codec metadata {}: {error}", path.display()))?,
+            _ => return Err("codec metadata must use a .json or .toml extension".into()),
+        };
+        metadata.validate()?;
+        Ok(metadata)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.codec.trim().is_empty() {
+            return Err("codec metadata requires a non-empty codec".into());
+        }
+        if self
+            .dialnorm_lkfs
+            .is_some_and(|value| !value.is_finite() || !(-31.0..=-1.0).contains(&value))
+        {
+            return Err("dialnorm_lkfs must be between -31 and -1".into());
+        }
+        if self
+            .encoded_loudness_lufs
+            .is_some_and(|value| !value.is_finite())
+        {
+            return Err("encoded_loudness_lufs must be finite".into());
+        }
+        if self
+            .tolerance_lu
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err("tolerance_lu must be a finite non-negative number".into());
+        }
+        if self.dialnorm_lkfs.is_none() && self.encoded_loudness_lufs.is_none() {
+            return Err("codec metadata must define dialnorm or encoded loudness".into());
+        }
+        Ok(())
+    }
+
+    pub fn evaluate(
+        &self,
+        analysis: &Analysis,
+        dialogue: Option<&DialogueMeasurement>,
+    ) -> CodecQcResult {
+        let tolerance = self.tolerance_lu.unwrap_or(1.0);
+        let (basis, measured) = dialogue
+            .map(|value| ("dialogue", value.lufs))
+            .unwrap_or(("programme", analysis.lufs));
+        let dialnorm_deviation_lu = self.dialnorm_lkfs.map(|value| measured - value);
+        let encoded_loudness_deviation_lu = self
+            .encoded_loudness_lufs
+            .map(|value| analysis.lufs - value);
+        CodecQcResult {
+            metadata: self.clone(),
+            loudness_basis: basis,
+            dialnorm_deviation_lu,
+            dialnorm_pass: dialnorm_deviation_lu.map(|value| value.abs() <= tolerance),
+            encoded_loudness_deviation_lu,
+            encoded_loudness_pass: encoded_loudness_deviation_lu
+                .map(|value| value.abs() <= tolerance),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComplianceProfile {
@@ -329,6 +417,18 @@ pub struct AnalysisReport {
     pub sample_peak_dbfs: f64,
     pub true_peak_dbtp: f64,
     pub peak_to_loudness_ratio_lu: f64,
+    pub downmix_integrated_lufs: Option<f64>,
+    pub downmix_true_peak_dbtp: Option<f64>,
+    pub downmix_method: Option<&'static str>,
+    pub codec: Option<String>,
+    pub codec_dialnorm_lkfs: Option<f64>,
+    pub codec_encoded_loudness_lufs: Option<f64>,
+    pub codec_downmix_mode: Option<String>,
+    pub codec_loudness_basis: Option<&'static str>,
+    pub codec_dialnorm_deviation_lu: Option<f64>,
+    pub codec_dialnorm_pass: Option<bool>,
+    pub codec_encoded_loudness_deviation_lu: Option<f64>,
+    pub codec_encoded_loudness_pass: Option<bool>,
     pub compliance_profile: Option<String>,
     pub compliance_loudness_basis: Option<LoudnessBasis>,
     pub compliance_target_lufs: Option<f64>,
@@ -479,6 +579,18 @@ impl AnalysisReport {
             sample_peak_dbfs: analysis.sample_peak_db(),
             true_peak_dbtp: analysis.true_peak_db(),
             peak_to_loudness_ratio_lu: analysis.peak_to_loudness_ratio_lu(),
+            downmix_integrated_lufs: None,
+            downmix_true_peak_dbtp: None,
+            downmix_method: None,
+            codec: None,
+            codec_dialnorm_lkfs: None,
+            codec_encoded_loudness_lufs: None,
+            codec_downmix_mode: None,
+            codec_loudness_basis: None,
+            codec_dialnorm_deviation_lu: None,
+            codec_dialnorm_pass: None,
+            codec_encoded_loudness_deviation_lu: None,
+            codec_encoded_loudness_pass: None,
             compliance_profile: compliance.as_ref().map(|result| result.profile.clone()),
             compliance_loudness_basis: profile.map(|value| value.loudness_basis),
             compliance_target_lufs: profile.and_then(|value| value.target_lufs),
@@ -630,6 +742,18 @@ mod tests {
             sample_peak_dbfs: -3.0,
             true_peak_dbtp: -2.8,
             peak_to_loudness_ratio_lu: 20.2,
+            downmix_integrated_lufs: None,
+            downmix_true_peak_dbtp: None,
+            downmix_method: None,
+            codec: None,
+            codec_dialnorm_lkfs: None,
+            codec_encoded_loudness_lufs: None,
+            codec_downmix_mode: None,
+            codec_loudness_basis: None,
+            codec_dialnorm_deviation_lu: None,
+            codec_dialnorm_pass: None,
+            codec_encoded_loudness_deviation_lu: None,
+            codec_encoded_loudness_pass: None,
             compliance_profile: None,
             compliance_loudness_basis: None,
             compliance_target_lufs: None,
@@ -828,6 +952,44 @@ mod tests {
         assert!((ldr.measured - 5.1).abs() < 1e-12);
         assert!(!ldr.passed);
         assert!(!result.passed);
+    }
+
+    #[test]
+    fn codec_metadata_checks_dialnorm_against_dialogue() {
+        let analysis = crate::normalize::Analysis {
+            sample_rate: 48_000,
+            channels: 2,
+            channel_roles: crate::wav::default_channel_roles(2),
+            frames: 48_000,
+            kind: crate::wav::PcmKind::S24,
+            lufs: -23.0,
+            max_momentary_lufs: -20.0,
+            max_short_term_lufs: -21.0,
+            loudness_range_lu: 4.0,
+            rms_db: -25.0,
+            sample_peak: 0.5,
+            true_peak: 0.5,
+            loudness_blocks: Vec::new(),
+        };
+        let dialogue = DialogueMeasurement {
+            lufs: -27.5,
+            duration_seconds: 10.0,
+            range_count: 1,
+            standard: "EBU R 128 s4",
+            method: "test",
+            source: DialogueSource::Mix,
+        };
+        let metadata = CodecMetadata {
+            codec: "eac3".into(),
+            dialnorm_lkfs: Some(-27.0),
+            encoded_loudness_lufs: Some(-24.5),
+            downmix_mode: Some("loro".into()),
+            tolerance_lu: Some(1.0),
+        };
+        let result = metadata.evaluate(&analysis, Some(&dialogue));
+        assert_eq!(result.loudness_basis, "dialogue");
+        assert_eq!(result.dialnorm_pass, Some(true));
+        assert_eq!(result.encoded_loudness_pass, Some(false));
     }
 
     #[test]

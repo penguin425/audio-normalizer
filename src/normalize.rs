@@ -109,6 +109,12 @@ pub struct DialogueMeasurement {
     pub source: DialogueSource,
 }
 
+#[derive(Debug, Clone)]
+pub struct DownmixMeasurement {
+    pub analysis: Analysis,
+    pub method: &'static str,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DialogueStandard {
@@ -217,6 +223,50 @@ pub fn analyze(buf: &AudioBuffer) -> Analysis {
         true_peak,
         loudness_blocks: ebu.gating_blocks,
     }
+}
+
+/// Render and measure the conventional Lo/Ro stereo presentation from a
+/// WAVE_FORMAT_EXTENSIBLE ordered multichannel source. Centre and surround
+/// channels use -3.01 dB coefficients and LFE is omitted.
+pub fn analyze_stereo_downmix(path: &Path) -> Result<DownmixMeasurement, String> {
+    let source = decoder::decode(path)?;
+    if source.channels < 3 {
+        return Err("stereo downmix QC requires at least three input channels".into());
+    }
+    let mut left = source.data[0].clone();
+    let mut right = source.data[1].clone();
+    let coefficient = std::f32::consts::FRAC_1_SQRT_2;
+    for frame in 0..source.frames {
+        let centre = source.data[2][frame] * coefficient;
+        left[frame] += centre;
+        right[frame] += centre;
+    }
+    let surround_start = if source.channels >= 6 { 4 } else { 3 };
+    for index in surround_start..source.channels as usize {
+        if source.channel_roles[index] == ChannelRole::Lfe {
+            continue;
+        }
+        let destination = if (index - surround_start) % 2 == 0 {
+            &mut left
+        } else {
+            &mut right
+        };
+        for (output, input) in destination.iter_mut().zip(&source.data[index]) {
+            *output += *input * coefficient;
+        }
+    }
+    let downmix = AudioBuffer {
+        sample_rate: source.sample_rate,
+        channels: 2,
+        frames: source.frames,
+        data: vec![left, right],
+        channel_roles: crate::wav::default_channel_roles(2),
+        source_kind: PcmKind::F32,
+    };
+    Ok(DownmixMeasurement {
+        analysis: analyze(&downmix),
+        method: "Lo/Ro: L/R + center/surround at -3.01 dB; LFE omitted; WAVE channel order",
+    })
 }
 
 /// Linear gain that maps `an` onto the plan's target, after ceiling protection.

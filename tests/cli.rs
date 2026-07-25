@@ -205,6 +205,57 @@ fn analysis_range_writes_a_time_resolved_qc_report() {
 }
 
 #[test]
+fn codec_metadata_and_downmix_are_reported() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("surround.wav");
+    let metadata = directory.path().join("delivery.json");
+    let frames = 48_000;
+    let channel = (0..frames)
+        .map(|frame| 0.02 * (std::f32::consts::TAU * 997.0 * frame as f32 / 48_000.0).sin())
+        .collect::<Vec<_>>();
+    let buffer = AudioBuffer {
+        sample_rate: 48_000,
+        channels: 6,
+        frames,
+        data: vec![channel; 6],
+        channel_roles: default_channel_roles(6),
+        source_kind: PcmKind::F32,
+    };
+    WavWriter::write(&input, &buffer, PcmKind::F32, false).unwrap();
+    std::fs::write(
+        &metadata,
+        r#"{"codec":"eac3","encoded_loudness_lufs":-24.0,"downmix_mode":"loro","tolerance_lu":100.0}"#,
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            input.to_str().unwrap(),
+            "--analyze",
+            "--json",
+            "--codec-metadata",
+            metadata.to_str().unwrap(),
+            "--downmix-qc",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report[0]["codec"], "eac3");
+    assert_eq!(report[0]["codec_downmix_mode"], "loro");
+    assert_eq!(report[0]["codec_encoded_loudness_pass"], true);
+    assert!(report[0]["downmix_integrated_lufs"].is_number());
+    assert!(report[0]["downmix_method"]
+        .as_str()
+        .unwrap()
+        .contains("LFE omitted"));
+}
+
+#[test]
 fn explicit_dialogue_ranges_drive_long_form_compliance() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("programme.wav");

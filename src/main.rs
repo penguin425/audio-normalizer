@@ -6,7 +6,9 @@ use forge_normalizer::normalize::{
     self, DialogueSource, DialogueStandard, Mode, OutputFormat, Plan,
 };
 use forge_normalizer::preset::Preset;
-use forge_normalizer::report::{self, AnalysisReport, ComplianceProfile, TimelineReport};
+use forge_normalizer::report::{
+    self, AnalysisReport, CodecMetadata, ComplianceProfile, TimelineReport,
+};
 use forge_normalizer::wav::{named_channel_layout, ChannelRole, PcmKind, WavContainer};
 use rayon::ThreadPoolBuilder;
 use std::fs::File;
@@ -228,9 +230,20 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                 compliance.as_ref().unwrap().name
             ));
         }
+        if cli.codec_metadata.is_some() && cli.inputs.len() != 1 {
+            return Err("--codec-metadata currently requires exactly one input".into());
+        }
+        if stdin_requested && cli.downmix_qc {
+            return Err("--downmix-qc cannot be used with stdin".into());
+        }
+        let codec_metadata = cli
+            .codec_metadata
+            .as_deref()
+            .map(CodecMetadata::load)
+            .transpose()?;
         let mut reports = Vec::with_capacity(cli.inputs.len());
         let mut timeline_reports = Vec::new();
-        let mut compliance_failed = false;
+        let mut qc_failed = false;
         for input in &cli.inputs {
             let timed = normalize::analyze_file_range_with_roles(
                 input,
@@ -262,10 +275,22 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                 .as_ref()
                 .is_some_and(|result| !result.passed)
             {
-                compliance_failed = true;
+                qc_failed = true;
+            }
+            let downmix = cli
+                .downmix_qc
+                .then(|| normalize::analyze_stereo_downmix(input))
+                .transpose()?;
+            let codec_qc = codec_metadata
+                .as_ref()
+                .map(|metadata| metadata.evaluate(&an, dialogue.as_ref()));
+            if codec_qc.as_ref().is_some_and(|result| {
+                result.dialnorm_pass == Some(false) || result.encoded_loudness_pass == Some(false)
+            }) {
+                qc_failed = true;
             }
             if cli.json || cli.ndjson || cli.csv.is_some() {
-                reports.push(AnalysisReport::with_measurements_at(
+                let mut report = AnalysisReport::with_measurements_at(
                     if stdin_requested {
                         Path::new("-")
                     } else {
@@ -275,7 +300,25 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                     dialogue.as_ref(),
                     compliance.as_ref(),
                     (start_seconds * an.sample_rate as f64).round() / an.sample_rate as f64,
-                )?);
+                )?;
+                if let Some(downmix) = &downmix {
+                    report.downmix_integrated_lufs = Some(downmix.analysis.lufs);
+                    report.downmix_true_peak_dbtp = Some(downmix.analysis.true_peak_db());
+                    report.downmix_method = Some(downmix.method);
+                }
+                if let Some(codec) = &codec_qc {
+                    report.codec = Some(codec.metadata.codec.clone());
+                    report.codec_dialnorm_lkfs = codec.metadata.dialnorm_lkfs;
+                    report.codec_encoded_loudness_lufs = codec.metadata.encoded_loudness_lufs;
+                    report.codec_downmix_mode = codec.metadata.downmix_mode.clone();
+                    report.codec_loudness_basis = Some(codec.loudness_basis);
+                    report.codec_dialnorm_deviation_lu = codec.dialnorm_deviation_lu;
+                    report.codec_dialnorm_pass = codec.dialnorm_pass;
+                    report.codec_encoded_loudness_deviation_lu =
+                        codec.encoded_loudness_deviation_lu;
+                    report.codec_encoded_loudness_pass = codec.encoded_loudness_pass;
+                }
+                reports.push(report);
             } else {
                 print_analysis(input, &an, None);
                 if let Some(dialogue) = &dialogue {
@@ -292,6 +335,25 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                 }
                 if let Some(profile) = &compliance {
                     print_compliance(profile, &an, dialogue.as_ref())?;
+                }
+                if let Some(downmix) = &downmix {
+                    eprintln!(
+                        "  stereo downmix: {:.2} LUFS, {:.2} dBTP\n    method: {}",
+                        downmix.analysis.lufs,
+                        downmix.analysis.true_peak_db(),
+                        downmix.method
+                    );
+                }
+                if let Some(codec) = &codec_qc {
+                    eprintln!(
+                        "  codec metadata {} ({} basis): dialnorm deviation {:?} LU [{}], encoded loudness deviation {:?} LU [{}]",
+                        codec.metadata.codec,
+                        codec.loudness_basis,
+                        codec.dialnorm_deviation_lu,
+                        qc_status(codec.dialnorm_pass),
+                        codec.encoded_loudness_deviation_lu,
+                        qc_status(codec.encoded_loudness_pass),
+                    );
                 }
             }
             if cli.timeline.is_some() {
@@ -327,8 +389,8 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
         if let Some(path) = &cli.timeline {
             write_timeline(path, &timeline_reports)?;
         }
-        if compliance_failed {
-            return Err("one or more inputs failed the requested compliance profile".into());
+        if qc_failed {
+            return Err("one or more inputs failed the requested compliance/QC checks".into());
         }
         return Ok(());
     }
@@ -642,6 +704,14 @@ fn print_compliance(
         if result.passed { "PASS" } else { "FAIL" }
     );
     Ok(())
+}
+
+fn qc_status(result: Option<bool>) -> &'static str {
+    match result {
+        Some(true) => "PASS",
+        Some(false) => "FAIL",
+        None => "N/A",
+    }
 }
 
 fn print_verification(input: &Path, verification: &normalize::Verification, plan: &Plan) -> bool {

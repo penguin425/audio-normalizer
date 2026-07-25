@@ -197,6 +197,18 @@ pub struct Cli {
     )]
     pub dialogue_stem: Option<PathBuf>,
 
+    /// JSON/TOML delivery metadata to compare with measured loudness.
+    #[arg(
+        long = "codec-metadata",
+        value_name = "PATH",
+        requires = "analyze_only"
+    )]
+    pub codec_metadata: Option<PathBuf>,
+
+    /// Measure a WAVE-order stereo downmix as a separate delivery presentation.
+    #[arg(long = "downmix-qc", requires = "analyze_only")]
+    pub downmix_qc: bool,
+
     /// Start analysis at this source time in seconds.
     #[arg(long = "start", value_name = "SECONDS", requires = "analyze_only")]
     pub start_seconds: Option<f64>,
