@@ -284,6 +284,44 @@ fn batch_analysis_writes_a_delivery_manifest() {
 }
 
 #[test]
+fn automatic_dialogue_writes_detection_audit() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("speech.wav");
+    let audit = directory.path().join("dialogue-detection.json");
+    std::fs::write(&input, wav_fixture_bytes()).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            input.to_str().unwrap(),
+            "--analyze",
+            "--json",
+            "--auto-dialogue",
+            "--dialogue-detection-report",
+            audit.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        report[0]["dialogue_detector"],
+        "forge-dialogue-deterministic"
+    );
+    assert_eq!(report[0]["dialogue_detection_threshold"], 0.6);
+    assert!(report[0]["dialogue_detection_ranges_json"]
+        .as_str()
+        .unwrap()
+        .contains("confidence"));
+    let audit: serde_json::Value = serde_json::from_slice(&std::fs::read(audit).unwrap()).unwrap();
+    assert_eq!(audit["features"].as_array().unwrap().len(), 3);
+    assert!(audit["ranges"][0]["confidence"].is_number());
+}
+
+#[test]
 fn explicit_dialogue_ranges_drive_long_form_compliance() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("programme.wav");

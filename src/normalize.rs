@@ -109,6 +109,35 @@ pub struct DialogueMeasurement {
     pub source: DialogueSource,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DetectedDialogueRange {
+    pub start_seconds: f64,
+    pub duration_seconds: f64,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DialogueDetection {
+    pub detector: &'static str,
+    pub detector_version: &'static str,
+    pub threshold: f64,
+    pub window_seconds: f64,
+    pub features: Vec<&'static str>,
+    pub ranges: Vec<DetectedDialogueRange>,
+}
+
+impl DialogueDetection {
+    pub fn measurement_ranges(&self) -> Vec<DialogueRange> {
+        self.ranges
+            .iter()
+            .map(|range| DialogueRange {
+                start_seconds: range.start_seconds,
+                duration_seconds: range.duration_seconds,
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DownmixMeasurement {
     pub analysis: Analysis,
@@ -406,6 +435,134 @@ pub fn analyze_adm_presentations(
         presentations,
         passed,
     })
+}
+
+/// Deterministic, auditable dialogue-candidate detector. It intentionally
+/// exposes its fixed features and confidence instead of claiming a learned
+/// classifier.
+pub fn detect_dialogue_ranges(
+    path: &Path,
+    channel_roles: Option<&[ChannelRole]>,
+    threshold: f64,
+) -> Result<DialogueDetection, String> {
+    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        return Err("dialogue confidence threshold must be between 0 and 1".into());
+    }
+    let source = decoder::decode(path)?;
+    if let Some(roles) = channel_roles {
+        if roles.len() != source.channels as usize {
+            return Err("channel layout does not match dialogue detector input".into());
+        }
+    }
+    let window = source.sample_rate as usize;
+    let mut candidates = Vec::new();
+    for start in (0..source.frames).step_by(window) {
+        let end = (start + window).min(source.frames);
+        if end - start < window / 2 {
+            continue;
+        }
+        let (focus_signal, focus_score) = dialogue_focus(&source.data, start, end);
+        let energy = focus_signal
+            .iter()
+            .map(|sample| *sample as f64 * *sample as f64)
+            .sum::<f64>()
+            / focus_signal.len() as f64;
+        let rms_db = if energy > 0.0 {
+            10.0 * energy.log10()
+        } else {
+            f64::NEG_INFINITY
+        };
+        let energy_score = ((rms_db + 50.0) / 30.0).clamp(0.0, 1.0);
+        let crossings = focus_signal
+            .windows(2)
+            .filter(|pair| pair[0].is_sign_positive() != pair[1].is_sign_positive())
+            .count();
+        let zcr = crossings as f64 / focus_signal.len() as f64;
+        let zcr_score = (zcr / 0.02).clamp(0.0, 1.0) * ((0.35 - zcr) / 0.10).clamp(0.0, 1.0);
+        let confidence = 0.5 * energy_score + 0.35 * focus_score + 0.15 * zcr_score;
+        if confidence >= threshold {
+            candidates.push(DetectedDialogueRange {
+                start_seconds: start as f64 / source.sample_rate as f64,
+                duration_seconds: (end - start) as f64 / source.sample_rate as f64,
+                confidence,
+            });
+        }
+    }
+    let mut ranges: Vec<DetectedDialogueRange> = Vec::new();
+    for candidate in candidates {
+        if let Some(previous) = ranges.last_mut() {
+            let previous_end = previous.start_seconds + previous.duration_seconds;
+            if (previous_end - candidate.start_seconds).abs() < 1e-9 {
+                let total = previous.duration_seconds + candidate.duration_seconds;
+                previous.confidence = (previous.confidence * previous.duration_seconds
+                    + candidate.confidence * candidate.duration_seconds)
+                    / total;
+                previous.duration_seconds = total;
+                continue;
+            }
+        }
+        ranges.push(candidate);
+    }
+    if ranges.is_empty() {
+        return Err(format!(
+            "dialogue detector found no candidates at confidence {threshold:.2}"
+        ));
+    }
+    Ok(DialogueDetection {
+        detector: "forge-dialogue-deterministic",
+        detector_version: concat!("v1/", env!("CARGO_PKG_VERSION")),
+        threshold,
+        window_seconds: 1.0,
+        features: vec![
+            "window_rms_dbfs",
+            "center_or_mid_focus",
+            "zero_crossing_rate",
+        ],
+        ranges,
+    })
+}
+
+fn dialogue_focus(channels: &[Vec<f32>], start: usize, end: usize) -> (Vec<f32>, f64) {
+    if channels.len() >= 3 {
+        let center = channels[2][start..end].to_vec();
+        let center_energy = mean_square(&center);
+        let other_channels = channels
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != 2 && !(channels.len() >= 6 && *index == 3))
+            .map(|(_, channel)| mean_square(&channel[start..end]))
+            .collect::<Vec<_>>();
+        let other_energy = other_channels.iter().sum::<f64>() / other_channels.len().max(1) as f64;
+        let focus = center_energy / (center_energy + other_energy + f64::EPSILON);
+        (center, focus)
+    } else if channels.len() == 2 {
+        let mid = channels[0][start..end]
+            .iter()
+            .zip(&channels[1][start..end])
+            .map(|(left, right)| 0.5 * (left + right))
+            .collect::<Vec<_>>();
+        let side = channels[0][start..end]
+            .iter()
+            .zip(&channels[1][start..end])
+            .map(|(left, right)| 0.5 * (left - right))
+            .collect::<Vec<_>>();
+        let mid_energy = mean_square(&mid);
+        let side_energy = mean_square(&side);
+        let focus = mid_energy / (mid_energy + side_energy + f64::EPSILON);
+        (mid, focus)
+    } else {
+        let signal = channels[0][start..end].to_vec();
+        let focus = if mean_square(&signal) > 0.0 { 1.0 } else { 0.0 };
+        (signal, focus)
+    }
+}
+
+fn mean_square(samples: &[f32]) -> f64 {
+    samples
+        .iter()
+        .map(|sample| *sample as f64 * *sample as f64)
+        .sum::<f64>()
+        / samples.len().max(1) as f64
 }
 
 /// Linear gain that maps `an` onto the plan's target, after ceiling protection.
