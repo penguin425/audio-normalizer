@@ -59,6 +59,9 @@ pub struct Analysis {
     pub frames: usize,
     pub kind: PcmKind,
     pub lufs: f64,
+    pub max_momentary_lufs: f64,
+    pub max_short_term_lufs: f64,
+    pub loudness_range_lu: f64,
     pub rms_db: f64,
     pub sample_peak: f32, // 0..1
     pub true_peak: f32,   // 0..1
@@ -90,8 +93,7 @@ fn to_db(x: f64) -> f64 {
 
 /// Analyze an already-decoded buffer.
 pub fn analyze(buf: &AudioBuffer) -> Analysis {
-    let loudness_blocks = lufs::measure_blocks(buf);
-    let lufs_v = lufs::gated_lufs(&loudness_blocks);
+    let ebu = lufs::measure_ebu(buf);
     let (rms_db, sample_peak) = lufs::measure_rms_peak(buf);
     let true_peak = truepeak::measure_true_peak(buf);
     Analysis {
@@ -99,11 +101,14 @@ pub fn analyze(buf: &AudioBuffer) -> Analysis {
         channels: buf.channels,
         frames: buf.frames,
         kind: buf.source_kind,
-        lufs: lufs_v,
+        lufs: ebu.integrated_lufs,
+        max_momentary_lufs: ebu.max_momentary_lufs,
+        max_short_term_lufs: ebu.max_short_term_lufs,
+        loudness_range_lu: ebu.loudness_range_lu,
         rms_db,
         sample_peak,
         true_peak,
-        loudness_blocks,
+        loudness_blocks: ebu.gating_blocks,
     }
 }
 

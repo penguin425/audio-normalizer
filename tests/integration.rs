@@ -57,6 +57,9 @@ fn roundtrip_lufs_hits_target() {
     };
     let (an, _gain) = normalize::normalize_one(&inp, &outp, &plan, OutputFormat::Wav).unwrap();
     assert!(an.lufs < -19.0 && an.lufs > -21.0, "input LUFS {}", an.lufs);
+    assert!((an.max_momentary_lufs - an.lufs).abs() < 0.05);
+    assert!((an.max_short_term_lufs - an.lufs).abs() < 0.05);
+    assert!(an.loudness_range_lu < 0.05);
 
     let out = WavReader::open(&outp).unwrap();
     let an2 = normalize::analyze(&out);
