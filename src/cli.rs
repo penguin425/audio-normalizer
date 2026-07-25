@@ -209,6 +209,10 @@ pub struct Cli {
     #[arg(long = "downmix-qc", requires = "analyze_only")]
     pub downmix_qc: bool,
 
+    /// Write a versioned JSON delivery manifest containing every asset report.
+    #[arg(long, value_name = "PATH", requires = "analyze_only")]
+    pub manifest: Option<PathBuf>,
+
     /// Start analysis at this source time in seconds.
     #[arg(long = "start", value_name = "SECONDS", requires = "analyze_only")]
     pub start_seconds: Option<f64>,

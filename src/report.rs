@@ -126,6 +126,12 @@ impl ComplianceProfile {
     pub fn builtin(name: &str) -> Option<Self> {
         let profile = match name {
             "ebu-r128" => Self::symmetric("ebu-r128", -23.0, 0.2, -1.0),
+            "radio-ebu" => Self::symmetric("radio-ebu", -23.0, 0.5, -1.0),
+            "streaming-music" => Self::symmetric("streaming-music", -14.0, 1.0, -1.0),
+            "streaming-speech-stereo" => {
+                Self::symmetric("streaming-speech-stereo", -16.0, 1.0, -1.0)
+            }
+            "streaming-speech-mono" => Self::symmetric("streaming-speech-mono", -19.0, 1.0, -1.0),
             "ebu-r128-short" => Self {
                 max_short_term_lufs: Some(-18.0),
                 ..Self::symmetric("ebu-r128-short", -23.0, 0.2, -1.0)
@@ -636,6 +642,37 @@ pub fn write_json<W: Write>(writer: W, reports: &[AnalysisReport]) -> Result<(),
     serde_json::to_writer_pretty(writer, reports).map_err(|error| format!("write JSON: {error}"))
 }
 
+#[derive(Serialize)]
+struct DeliveryManifest<'a> {
+    schema: &'static str,
+    generator: &'static str,
+    asset_count: usize,
+    passed_count: usize,
+    failed_count: usize,
+    assets: &'a [AnalysisReport],
+}
+
+pub fn write_manifest<W: Write>(writer: W, reports: &[AnalysisReport]) -> Result<(), String> {
+    let passed_count = reports
+        .iter()
+        .filter(|report| {
+            report.compliance_passed != Some(false)
+                && report.codec_dialnorm_pass != Some(false)
+                && report.codec_encoded_loudness_pass != Some(false)
+        })
+        .count();
+    let manifest = DeliveryManifest {
+        schema: "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v1",
+        generator: concat!("forge-normalizer/", env!("CARGO_PKG_VERSION")),
+        asset_count: reports.len(),
+        passed_count,
+        failed_count: reports.len() - passed_count,
+        assets: reports,
+    };
+    serde_json::to_writer_pretty(writer, &manifest)
+        .map_err(|error| format!("write delivery manifest: {error}"))
+}
+
 pub fn write_ndjson<W: Write>(mut writer: W, reports: &[AnalysisReport]) -> Result<(), String> {
     for report in reports {
         serde_json::to_writer(&mut writer, report)
@@ -786,6 +823,45 @@ mod tests {
         assert_eq!(value[0]["path"], "album/track, one.wav");
         assert_eq!(value[0]["loudness_range_stable"], false);
         assert_eq!(value[0]["loudness_range_stable_after_seconds"], 60.0);
+    }
+
+    #[test]
+    fn delivery_manifest_summarizes_assets() {
+        let passing = sample_report();
+        let mut failing = sample_report();
+        failing.path = "failed.wav".into();
+        failing.compliance_passed = Some(false);
+        let mut output = Vec::new();
+        write_manifest(&mut output, &[passing, failing]).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["asset_count"], 2);
+        assert_eq!(value["passed_count"], 1);
+        assert_eq!(value["failed_count"], 1);
+        assert_eq!(value["assets"][1]["path"], "failed.wav");
+        assert!(value["schema"]
+            .as_str()
+            .unwrap()
+            .ends_with("delivery-manifest-v1"));
+    }
+
+    #[test]
+    fn purpose_based_delivery_profiles_are_available() {
+        assert_eq!(
+            ComplianceProfile::builtin("streaming-music")
+                .unwrap()
+                .target_lufs,
+            Some(-14.0)
+        );
+        assert_eq!(
+            ComplianceProfile::builtin("streaming-speech-mono")
+                .unwrap()
+                .target_lufs,
+            Some(-19.0)
+        );
+        assert_eq!(
+            ComplianceProfile::builtin("radio-ebu").unwrap().target_lufs,
+            Some(-23.0)
+        );
     }
 
     #[test]
