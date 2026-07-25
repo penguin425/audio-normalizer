@@ -3,8 +3,11 @@
 use clap::Parser;
 use forge_normalizer::cli;
 use forge_normalizer::normalize::{self, Mode, OutputFormat, Plan};
+use forge_normalizer::report::{self, AnalysisReport};
 use forge_normalizer::wav::PcmKind;
 use rayon::ThreadPoolBuilder;
+use std::fs::File;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -65,9 +68,29 @@ fn run(cli: cli::Cli) -> Result<(), String> {
     let (outputs, formats) = resolve_outputs_and_formats(&cli)?;
 
     if cli.analyze_only {
+        let mut reports = Vec::with_capacity(cli.inputs.len());
         for input in &cli.inputs {
             let an = normalize::analyze_file(input)?;
-            print_analysis(input, &an, None);
+            if cli.json || cli.csv.is_some() {
+                reports.push(AnalysisReport::new(input, &an));
+            } else {
+                print_analysis(input, &an, None);
+            }
+        }
+        if cli.json {
+            let stdout = io::stdout();
+            let mut output = stdout.lock();
+            report::write_json(&mut output, &reports)?;
+            writeln!(output).map_err(|error| format!("write stdout: {error}"))?;
+        } else if let Some(path) = &cli.csv {
+            if path.as_os_str() == "-" {
+                let stdout = io::stdout();
+                report::write_csv(stdout.lock(), &reports)?;
+            } else {
+                let file = File::create(path)
+                    .map_err(|error| format!("create {}: {error}", path.display()))?;
+                report::write_csv(file, &reports)?;
+            }
         }
         return Ok(());
     }

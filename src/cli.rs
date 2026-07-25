@@ -67,6 +67,14 @@ pub struct Cli {
     #[arg(long = "analyze")]
     pub analyze_only: bool,
 
+    /// Print analyze results as a JSON array to stdout.
+    #[arg(long, requires = "analyze_only", conflicts_with = "csv")]
+    pub json: bool,
+
+    /// Write analyze results as CSV to this path, or `-` for stdout.
+    #[arg(long, value_name = "PATH", requires = "analyze_only")]
+    pub csv: Option<PathBuf>,
+
     /// Print the gain that would be applied; write nothing.
     #[arg(long = "gain-only")]
     pub gain_only: bool,

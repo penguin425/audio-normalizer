@@ -143,6 +143,10 @@ forge --album a.wav b.mp3 c.flac -o ./normalized/
 # Just measure any file, don't write
 forge --analyze song.mp3
 
+# Machine-readable reports
+forge --analyze album/*.flac --json
+forge --analyze album/*.flac --csv report.csv
+
 # Print the gain that would be applied, write nothing
 forge --gain-only track.wav --target=-14
 
@@ -165,6 +169,8 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--quality` | `2` | MP3 encoder quality 0(best)…9(fastest) |
 | `--album` | off | One shared gain for all inputs (requires `--mode lufs`) |
 | `--analyze` | off | Measure only; do not write files |
+| `--json` | off | Write analyze results as JSON to stdout |
+| `--csv` | none | Write analyze results as CSV to a file or `-` |
 | `--gain-only` | off | Print the gain; write nothing |
 | `--dither` | off | TPDF dither for integer PCM output |
 | `--bits` | input's | `8`/`16`/`24`/`32`/`32f`/`64f` output format |
