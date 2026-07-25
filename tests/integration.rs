@@ -8,7 +8,9 @@
 use forge_normalizer::decoder;
 use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::normalize::{self, Mode, OutputFormat, Plan};
-use forge_normalizer::wav::{default_channel_roles, AudioBuffer, PcmKind, WavReader, WavWriter};
+use forge_normalizer::wav::{
+    default_channel_roles, named_channel_layout, AudioBuffer, PcmKind, WavReader, WavWriter,
+};
 use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
 use lofty::tag::{Accessor, ItemKey, Tag, TagExt, TagType};
@@ -38,6 +40,22 @@ fn tmp_path(name: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
     p.push(name);
     p
+}
+
+#[test]
+fn ambiguous_multichannel_wav_requires_an_explicit_layout() {
+    let buffer = synth_sine(48_000, 0.5, 0.1, 997.0, 8);
+    let input = tmp_path("forge_it_ambiguous_8ch.wav");
+    WavWriter::write(&input, &buffer, PcmKind::F32, false).unwrap();
+
+    let error = normalize::analyze_file(&input).unwrap_err();
+    assert!(error.contains("ambiguous 8-channel layout"));
+
+    let roles = named_channel_layout("7.1").unwrap();
+    let analysis = normalize::analyze_file_with_roles(&input, Some(&roles)).unwrap();
+    assert_eq!(analysis.channels, 8);
+
+    let _ = std::fs::remove_file(input);
 }
 
 #[test]

@@ -83,6 +83,8 @@ Decoded MP3 output lands within ~0.3 LU of the target (lossy round-trip).
 * **Channel-layout-aware weighting** reads WAVE_FORMAT_EXTENSIBLE channel masks
   and codec layouts, excludes LFE channels wherever they occur, and applies the
   BS.1770 surround-channel weighting by role instead of guessed channel index.
+  BS.1770-5 Annex 3 position-dependent weights are used for 7.1 and height
+  channels; `--channel-layout` can override missing or incorrect metadata.
 * **EBU Mode analysis** reports Integrated, maximum Momentary (400 ms), maximum
   Short-term (3 s), and Loudness Range (LRA) measurements.
 * **EBU R128 compliance reports** evaluate programme loudness against
@@ -140,8 +142,8 @@ git tag -a v0.2.0 -m "Forge v0.2.0"
 git push origin v0.2.0
 ```
 
-Prebuilt binaries use the dependency-free default feature set and support all
-input formats plus WAV/FLAC output. MP3 output requires a source build with
+Prebuilt binaries include statically linked Ogg Opus support and support every
+input format plus WAV/FLAC/Opus output. MP3 output requires a source build with
 `--features mp3-encoding` and an installed LAME library.
 
 ### EBU conformance tests
@@ -247,6 +249,8 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--bitrate` | `192` | Lossy encoder bitrate in kbps (MP3/Opus output) |
 | `--quality` | `2` | MP3 encoder quality 0(best)…9(fastest) |
 | `--album` | off | One shared gain for all inputs (requires `--mode lufs`) |
+| `--channel-layout` | metadata | Override channel order: `mono`, `stereo`, `5.1`, `7.1`, `5.1.4`, or `7.1.4` |
+| `--dual-mono` | off | Measure mono intended for two-speaker reproduction with −3.01 dB pan-law compensation |
 | `--analyze` | off | Measure only; do not write files |
 | `--json` | off | Write analyze results as JSON to stdout |
 | `--csv` | none | Write analyze results as CSV to a file or `-` |
@@ -340,6 +344,9 @@ gain.process_interleaved(interleaved)?;
 The live API is causal and reports zero processing latency for gain smoothing.
 It deliberately does not label a changing live estimate as final Integrated
 LUFS; programme-integrated normalization remains the two-pass file workflow.
+
+Named channel layouts use WAVE_FORMAT_EXTENSIBLE order. Forge rejects an
+override whose number of channels does not match the input.
 
 ## Limitations
 

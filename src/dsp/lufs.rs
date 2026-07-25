@@ -186,6 +186,19 @@ pub fn channel_weight(role: ChannelRole) -> f64 {
     match role {
         ChannelRole::Main => 1.0,
         ChannelRole::Surround => 1.41,
+        ChannelRole::DualMono => 2.0,
+        ChannelRole::Positioned {
+            azimuth_degrees,
+            elevation_degrees,
+        } => {
+            let azimuth = azimuth_degrees.unsigned_abs();
+            let elevation = elevation_degrees.unsigned_abs();
+            if elevation < 30 && (60..=120).contains(&azimuth) {
+                1.41
+            } else {
+                1.0
+            }
+        }
         ChannelRole::Lfe => 0.0,
     }
 }
@@ -441,7 +454,35 @@ mod tests {
     fn channel_roles_select_bs1770_weights() {
         assert_eq!(channel_weight(ChannelRole::Main), 1.0);
         assert_eq!(channel_weight(ChannelRole::Surround), 1.41);
+        assert_eq!(channel_weight(ChannelRole::DualMono), 2.0);
+        assert_eq!(
+            channel_weight(ChannelRole::positioned(-90, 0)),
+            1.41,
+            "side channels receive the Annex 3 +1.5 dB weighting"
+        );
+        assert_eq!(
+            channel_weight(ChannelRole::positioned(-135, 0)),
+            1.0,
+            "rear channels outside ±120 degrees use unity weighting"
+        );
+        assert_eq!(
+            channel_weight(ChannelRole::positioned(-90, 45)),
+            1.0,
+            "elevated channels use unity weighting"
+        );
         assert_eq!(channel_weight(ChannelRole::Lfe), 0.0);
+    }
+
+    #[test]
+    fn dual_mono_adds_the_two_speaker_pan_law() {
+        let samples: Vec<f32> = (0..48_000)
+            .map(|index| ((index as f64 * 0.13).sin() * 0.1) as f32)
+            .collect();
+        let ordinary = mono(samples.clone(), 48_000);
+        let mut dual = mono(samples, 48_000);
+        dual.channel_roles[0] = ChannelRole::DualMono;
+        let difference = measure_lufs(&dual) - measure_lufs(&ordinary);
+        assert!((difference - 10.0 * 2.0_f64.log10()).abs() < 1e-9);
     }
 
     #[test]

@@ -190,24 +190,38 @@ fn decode_symphonia(path: &Path, ext: &str) -> Result<AudioBuffer, String> {
 
 fn roles_from_symphonia(channels: symphonia::core::audio::Channels) -> Vec<ChannelRole> {
     use symphonia::core::audio::Channels;
+    let advanced = channels.count() > 6;
     channels
         .iter()
         .map(|channel| {
             if channel.intersects(Channels::LFE1 | Channels::LFE2) {
                 ChannelRole::Lfe
-            } else if channel.intersects(
-                Channels::REAR_LEFT
-                    | Channels::REAR_RIGHT
-                    | Channels::REAR_CENTRE
-                    | Channels::SIDE_LEFT
-                    | Channels::SIDE_RIGHT
-                    | Channels::REAR_LEFT_CENTRE
-                    | Channels::REAR_RIGHT_CENTRE
-                    | Channels::TOP_REAR_LEFT
-                    | Channels::TOP_REAR_CENTRE
-                    | Channels::TOP_REAR_RIGHT,
-            ) {
+            } else if !advanced
+                && channel.intersects(
+                    Channels::REAR_LEFT
+                        | Channels::REAR_RIGHT
+                        | Channels::REAR_CENTRE
+                        | Channels::SIDE_LEFT
+                        | Channels::SIDE_RIGHT,
+                )
+            {
                 ChannelRole::Surround
+            } else if channel.intersects(Channels::SIDE_LEFT) {
+                ChannelRole::positioned(-90, 0)
+            } else if channel.intersects(Channels::SIDE_RIGHT) {
+                ChannelRole::positioned(90, 0)
+            } else if channel.intersects(Channels::REAR_LEFT | Channels::REAR_LEFT_CENTRE) {
+                ChannelRole::positioned(-135, 0)
+            } else if channel.intersects(Channels::REAR_RIGHT | Channels::REAR_RIGHT_CENTRE) {
+                ChannelRole::positioned(135, 0)
+            } else if channel.intersects(Channels::REAR_CENTRE) {
+                ChannelRole::positioned(180, 0)
+            } else if channel.intersects(Channels::TOP_REAR_LEFT) {
+                ChannelRole::positioned(-135, 45)
+            } else if channel.intersects(Channels::TOP_REAR_RIGHT) {
+                ChannelRole::positioned(135, 45)
+            } else if channel.intersects(Channels::TOP_REAR_CENTRE) {
+                ChannelRole::positioned(180, 45)
             } else {
                 ChannelRole::Main
             }

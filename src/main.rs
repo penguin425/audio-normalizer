@@ -6,7 +6,7 @@ use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::normalize::{self, Mode, OutputFormat, Plan};
 use forge_normalizer::preset::Preset;
 use forge_normalizer::report::{self, AnalysisReport, ComplianceProfile};
-use forge_normalizer::wav::PcmKind;
+use forge_normalizer::wav::{named_channel_layout, ChannelRole, PcmKind};
 use rayon::ThreadPoolBuilder;
 use std::fs::File;
 use std::io::{self, Write};
@@ -57,6 +57,11 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
         .preset
         .as_deref()
         .map(|name| Preset::named(name).expect("clap validates preset names"));
+    let channel_roles_override = if cli.dual_mono {
+        Some(vec![ChannelRole::DualMono])
+    } else {
+        cli.channel_layout.as_deref().and_then(named_channel_layout)
+    };
     let plan = Plan {
         mode: if preset.is_some() {
             Mode::Lufs
@@ -102,7 +107,7 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
     }
 
     if cli.write_tags {
-        return write_loudness_tags(&cli);
+        return write_loudness_tags(&cli, channel_roles_override.as_deref());
     }
 
     let (outputs, formats) = resolve_outputs_and_formats(&cli, &relative_paths)?;
@@ -121,7 +126,7 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
         let mut reports = Vec::with_capacity(cli.inputs.len());
         let mut compliance_failed = false;
         for input in &cli.inputs {
-            let an = normalize::analyze_file(input)?;
+            let an = normalize::analyze_file_with_roles(input, channel_roles_override.as_deref())?;
             if compliance.is_some_and(|profile| !profile.evaluate(&an).passed) {
                 compliance_failed = true;
             }
@@ -164,7 +169,9 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
             let analyses: Vec<_> = cli
                 .inputs
                 .iter()
-                .map(normalize::analyze_file)
+                .map(|path| {
+                    normalize::analyze_file_with_roles(path, channel_roles_override.as_deref())
+                })
                 .collect::<Result<_, _>>()?;
             let gain = normalize::album_gain(&analyses, &plan);
             for ((input, output), analysis) in
@@ -177,13 +184,14 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
         }
         prepare_output_directories(&outputs)?;
         if cli.verify {
-            let corrected = normalize::normalize_album_corrected(
+            let corrected = normalize::normalize_album_corrected_with_roles(
                 &cli.inputs,
                 &outputs,
                 &plan,
                 &formats,
                 cli.verify_tolerance,
                 cli.verify_retries as usize,
+                channel_roles_override.as_deref(),
             )?;
             for (input, source) in cli.inputs.iter().zip(&corrected.sources) {
                 print_analysis(input, source, Some(corrected.gain));
@@ -229,7 +237,13 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
             }
             return Ok(());
         }
-        let results = normalize::normalize_album(&cli.inputs, &outputs, &plan, &formats)?;
+        let results = normalize::normalize_album_with_roles(
+            &cli.inputs,
+            &outputs,
+            &plan,
+            &formats,
+            channel_roles_override.as_deref(),
+        )?;
         let analyses: Vec<_> = results.iter().map(|(a, _)| a.clone()).collect();
         let album_l = normalize::album_lufs(&analyses);
         let gain = results.first().map(|r| r.1).unwrap_or(1.0);
@@ -246,7 +260,7 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
 
     for ((input, output), fmt) in cli.inputs.iter().zip(outputs.iter()).zip(formats.iter()) {
         if cli.gain_only || cli.dry_run {
-            let an = normalize::analyze_file(input)?;
+            let an = normalize::analyze_file_with_roles(input, channel_roles_override.as_deref())?;
             let gain = normalize::compute_gain(&an, &plan);
             print_analysis(input, &an, Some(gain));
             if cli.dry_run {
@@ -255,13 +269,14 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
         } else {
             prepare_output_directories(std::slice::from_ref(output))?;
             if cli.verify {
-                let corrected = normalize::normalize_one_corrected(
+                let corrected = normalize::normalize_one_corrected_with_roles(
                     input,
                     output,
                     &plan,
                     *fmt,
                     cli.verify_tolerance,
                     cli.verify_retries as usize,
+                    channel_roles_override.as_deref(),
                 )?;
                 print_analysis(input, &corrected.source, Some(corrected.gain));
                 if !print_verification(input, &corrected.verification, &plan) {
@@ -278,7 +293,13 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
                     );
                 }
             } else {
-                let (an, gain) = normalize::normalize_one(input, output, &plan, *fmt)?;
+                let (an, gain) = normalize::normalize_one_with_roles(
+                    input,
+                    output,
+                    &plan,
+                    *fmt,
+                    channel_roles_override.as_deref(),
+                )?;
                 print_analysis(input, &an, Some(gain));
             }
         }
@@ -330,11 +351,14 @@ fn print_verification(input: &Path, verification: &normalize::Verification, plan
     verification.passed()
 }
 
-fn write_loudness_tags(cli: &cli::Cli) -> Result<(), String> {
+fn write_loudness_tags(
+    cli: &cli::Cli,
+    channel_roles: Option<&[forge_normalizer::wav::ChannelRole]>,
+) -> Result<(), String> {
     let analyses: Vec<_> = cli
         .inputs
         .iter()
-        .map(normalize::analyze_file)
+        .map(|path| normalize::analyze_file_with_roles(path, channel_roles))
         .collect::<Result<_, _>>()?;
     let album = if cli.album {
         Some((

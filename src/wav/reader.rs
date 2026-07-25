@@ -212,15 +212,35 @@ fn parse_fmt(body: &[u8]) -> Result<ParsedFormat, WavReadError> {
 }
 
 fn roles_from_wave_mask(mask: u32, channels: u16) -> Vec<ChannelRole> {
+    use ChannelRole::{Lfe, Main, Surround};
+    let p = ChannelRole::positioned;
     let mut roles = Vec::with_capacity(channels as usize);
     for bit in 0..32 {
         if mask & (1 << bit) == 0 {
             continue;
         }
-        roles.push(match bit {
-            3 => ChannelRole::Lfe,
-            4 | 5 | 8 | 9 | 10 | 15 | 16 | 17 => ChannelRole::Surround,
-            _ => ChannelRole::Main,
+        roles.push(match (bit, channels <= 6) {
+            (3, _) => Lfe,
+            // BS.1770 Annex 1 applies +1.5 dB to the surrounds in conventional
+            // mono/stereo/5.1 programmes.
+            (4 | 5 | 8 | 9 | 10, true) => Surround,
+            // WAVE_FORMAT_EXTENSIBLE speaker positions used by Annex 3.
+            (0, false) => p(-30, 0),
+            (1, false) => p(30, 0),
+            (2, false) => p(0, 0),
+            (4, false) => p(-135, 0),
+            (5, false) => p(135, 0),
+            (8, false) => p(180, 0),
+            (9, false) => p(-90, 0),
+            (10, false) => p(90, 0),
+            (11, false) => p(0, 90),
+            (12, false) => p(-30, 45),
+            (13, false) => p(0, 45),
+            (14, false) => p(30, 45),
+            (15, false) => p(-135, 45),
+            (16, false) => p(180, 45),
+            (17, false) => p(135, 45),
+            _ => Main,
         });
     }
     if roles.len() == channels as usize {
@@ -319,5 +339,16 @@ mod tests {
     #[test]
     fn invalid_wave_mask_falls_back_to_conventional_layout() {
         assert_eq!(roles_from_wave_mask(0x3, 6), default_channel_roles(6));
+    }
+
+    #[test]
+    fn advanced_wave_mask_uses_position_dependent_roles() {
+        // FL, FR, FC, LFE, BL, BR, SL, SR.
+        let roles = roles_from_wave_mask(0x0000_063f, 8);
+        assert_eq!(roles[3], ChannelRole::Lfe);
+        assert_eq!(roles[4], ChannelRole::positioned(-135, 0));
+        assert_eq!(roles[5], ChannelRole::positioned(135, 0));
+        assert_eq!(roles[6], ChannelRole::positioned(-90, 0));
+        assert_eq!(roles[7], ChannelRole::positioned(90, 0));
     }
 }

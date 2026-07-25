@@ -62,5 +62,20 @@ fn verification_retries_require_verification_and_are_bounded() {
         Cli::try_parse_from(["forge", "track.wav", "--verify", "--verify-retries", "11"]).is_err()
     );
 }
+
+#[test]
+fn channel_layout_is_validated_and_exposed() {
+    let cli = Cli::try_parse_from(["forge", "track.wav", "--channel-layout", "7.1.4"]).unwrap();
+    assert_eq!(cli.channel_layout.as_deref(), Some("7.1.4"));
+    assert!(Cli::try_parse_from(["forge", "track.wav", "--channel-layout", "unknown"]).is_err());
+    assert!(Cli::try_parse_from([
+        "forge",
+        "track.wav",
+        "--channel-layout",
+        "mono",
+        "--dual-mono"
+    ])
+    .is_err());
+}
 use clap::Parser;
 use forge_normalizer::cli::Cli;
