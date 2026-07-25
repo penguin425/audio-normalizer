@@ -57,6 +57,7 @@ pub fn named_channel_layout(name: &str) -> Option<Vec<ChannelRole>> {
         "mono" => vec![Main],
         "stereo" => vec![Main, Main],
         "5.1" => vec![Main, Main, Main, Lfe, Surround, Surround],
+        "6.1" => vec![Main, Main, Main, Lfe, p(180, 0), p(-90, 0), p(90, 0)],
         "7.1" => vec![
             Main,
             Main,

@@ -16,6 +16,13 @@ pub struct Cli {
     #[arg(required = true)]
     pub inputs: Vec<PathBuf>,
 
+    /// Container hint for stdin (`-`): wav, flac, mp3, opus, aac, m4a, mp4, or ogg.
+    #[arg(
+        long = "input-format",
+        value_parser = ["wav", "flac", "mp3", "opus", "aac", "m4a", "mp4", "ogg"]
+    )]
+    pub input_format: Option<String>,
+
     /// Output file (single input) or existing directory (multiple inputs).
     /// If omitted, writes <stem>_normalized.wav next to each input.
     #[arg(short = 'o', long = "output")]
@@ -103,7 +110,7 @@ pub struct Cli {
     /// wrong. Orders follow WAVE_FORMAT_EXTENSIBLE.
     #[arg(
         long = "channel-layout",
-        value_parser = ["mono", "stereo", "5.1", "7.1", "5.1.4", "7.1.4"]
+        value_parser = ["mono", "stereo", "5.1", "6.1", "7.1", "5.1.4", "7.1.4"]
     )]
     pub channel_layout: Option<String>,
 
@@ -117,11 +124,28 @@ pub struct Cli {
     pub analyze_only: bool,
 
     /// Print analyze results as a JSON array to stdout.
-    #[arg(long, requires = "analyze_only", conflicts_with = "csv")]
+    #[arg(
+        long,
+        requires = "analyze_only",
+        conflicts_with_all = ["csv", "ndjson"]
+    )]
     pub json: bool,
 
+    /// Print one compact JSON analysis object per input line to stdout.
+    #[arg(
+        long,
+        requires = "analyze_only",
+        conflicts_with_all = ["json", "csv"]
+    )]
+    pub ndjson: bool,
+
     /// Write analyze results as CSV to this path, or `-` for stdout.
-    #[arg(long, value_name = "PATH", requires = "analyze_only")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "analyze_only",
+        conflicts_with_all = ["json", "ndjson"]
+    )]
     pub csv: Option<PathBuf>,
 
     /// Evaluate analysis against a delivery specification.

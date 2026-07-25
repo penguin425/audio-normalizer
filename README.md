@@ -16,7 +16,7 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
 | **WAV / RF64 / BW64** (PCM 8/16/24/32-bit, float 32/64-bit) | Forge's own fast parallel demuxer | Forge's own muxer |
 | **MP3** | symphonia (pure Rust) | LAME via FFI |
 | **FLAC** (16/24-bit, up to 8 channels) | symphonia (pure Rust) | flacenc (pure Rust) |
-| **Ogg Opus** (mono/stereo) | libopus + pure-Rust Ogg | libopus + pure-Rust Ogg |
+| **Ogg Opus** (1–8 channels, through 7.1) | libopus + pure-Rust Ogg | libopus + pure-Rust Ogg |
 | **AAC / ALAC** (.m4a/.mp4) | symphonia (pure Rust) | — (output as WAV) |
 | **Vorbis** (.ogg) | symphonia (pure Rust) | — (output as WAV) |
 
@@ -30,6 +30,8 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
   include it; source builds enable it with the `opus-encoding` feature.
 * Opus output writes RFC 7845 `R128_TRACK_GAIN` and, in album mode,
   `R128_ALBUM_GAIN` comments in signed Q7.8 dB units.
+* Multichannel Opus uses RFC 7845 Mapping Family 1 and preserves standardized
+  3.0 through 7.1 speaker assignments.
 * WAV stays on the fast hand-written path; other inputs transparently route
   through the universal decoder and produce the same planar-f32 buffer the DSP
   engine consumes.
@@ -54,6 +56,8 @@ the `-o` extension override this.
 * **Bounded-memory streaming** decodes analysis and normalization in chunks.
   Normalization uses two sequential passes so gain is known before encoding,
   without retaining the complete audio file in RAM.
+  Standard-input audio is spooled to a temporary file so the same correct
+  two-pass algorithm remains available in shell pipelines.
 * Release profile uses `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`,
   and `-C target-cpu=native` (auto-vectorized scalar fallbacks on top of the
   hand-written AVX2).
@@ -203,6 +207,13 @@ forge --analyze song.mp3
 # Machine-readable reports
 forge --analyze album/*.flac --json
 forge --analyze album/*.flac --csv report.csv
+forge --analyze album/*.flac --ndjson
+
+# Pipe audio without mixing diagnostics into the encoded byte stream
+cat input.flac | forge - --input-format flac -o - --format opus > output.opus
+
+# Stream one JSON object per input to jq, log collectors, or job runners
+forge --analyze album/*.flac --ndjson | jq -c 'select(.true_peak_dbtp > -1)'
 
 # Machine-readable EBU R128 delivery checks
 forge --analyze programme.wav --compliance ebu-r128 --json
@@ -248,6 +259,7 @@ forge in.wav -o out.wav --bits=24 --dither
 | `-m, --mode` | `lufs` | `lufs`, `peak`, or `rms` |
 | `--preset` | none | Named playback/delivery loudness target (see below) |
 | `--recursive` | off | Recursively process input directories |
+| `--input-format` | none | Container hint required for stdin (`-`) |
 | `--dry-run` | off | Analyze and show output paths without writing |
 | `--overwrite` | off | Replace output files that already exist |
 | `--target` | `-16` | Target LUFS (`--mode lufs`) |
@@ -259,10 +271,11 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--bitrate` | `192` | Lossy encoder bitrate in kbps (MP3/Opus output) |
 | `--quality` | `2` | MP3 encoder quality 0(best)…9(fastest) |
 | `--album` | off | One shared gain for all inputs (requires `--mode lufs`) |
-| `--channel-layout` | metadata | Override channel order: `mono`, `stereo`, `5.1`, `7.1`, `5.1.4`, or `7.1.4` |
+| `--channel-layout` | metadata | Override channel order: `mono`, `stereo`, `5.1`, `6.1`, `7.1`, `5.1.4`, or `7.1.4` |
 | `--dual-mono` | off | Measure mono intended for two-speaker reproduction with −3.01 dB pan-law compensation |
 | `--analyze` | off | Measure only; do not write files |
 | `--json` | off | Write analyze results as JSON to stdout |
+| `--ndjson` | off | Write one compact JSON analysis object per line |
 | `--csv` | none | Write analyze results as CSV to a file or `-` |
 | `--compliance` | none | Built-in delivery profile name or custom `.json`/`.toml` profile |
 | `--gain-only` | off | Print the gain; write nothing |
@@ -342,6 +355,7 @@ src/
   cli.rs            clap definition
   decoder.rs        full-buffer and streaming universal decoders
   flacenc.rs        bounded-memory pure-Rust FLAC encoder
+  opus.rs           RFC 7845 mono/stereo and Mapping Family 1 Ogg Opus I/O
   mp3enc.rs         MP3 encoder via LAME FFI (interleaved f32 -> MP3 bytes)
   wav/
     format.rs       PcmKind / WaveFormat

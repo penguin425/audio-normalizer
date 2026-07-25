@@ -1,6 +1,7 @@
 use forge_normalizer::wav::{default_channel_roles, AudioBuffer, PcmKind, WavWriter};
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn temp_root() -> PathBuf {
     std::env::temp_dir().join(format!("forge_cli_{}", std::process::id()))
@@ -68,6 +69,13 @@ fn channel_layout_is_validated_and_exposed() {
     let cli = Cli::try_parse_from(["forge", "track.wav", "--channel-layout", "7.1.4"]).unwrap();
     assert_eq!(cli.channel_layout.as_deref(), Some("7.1.4"));
     assert!(Cli::try_parse_from(["forge", "track.wav", "--channel-layout", "unknown"]).is_err());
+    assert_eq!(
+        Cli::try_parse_from(["forge", "track.wav", "--channel-layout", "6.1"])
+            .unwrap()
+            .channel_layout
+            .as_deref(),
+        Some("6.1")
+    );
     assert!(Cli::try_parse_from([
         "forge",
         "track.wav",
@@ -85,6 +93,70 @@ fn broadcast_wave_options_are_validated_and_exposed() {
     assert!(cli.bwf);
     assert_eq!(cli.wav_container, "bw64");
     assert!(Cli::try_parse_from(["forge", "track.wav", "--wav-container", "wave64"]).is_err());
+}
+
+fn wav_fixture_bytes() -> Vec<u8> {
+    let file = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+    let buffer = AudioBuffer {
+        sample_rate: 48_000,
+        channels: 1,
+        frames: 48_000,
+        data: vec![(0..48_000)
+            .map(|frame| 0.1 * (std::f32::consts::TAU * 440.0 * frame as f32 / 48_000.0).sin())
+            .collect()],
+        channel_roles: default_channel_roles(1),
+        source_kind: PcmKind::F32,
+    };
+    WavWriter::write(file.path(), &buffer, PcmKind::S16, false).unwrap();
+    std::fs::read(file.path()).unwrap()
+}
+
+fn run_with_stdin(arguments: &[&str], input: &[u8]) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn standard_streams_support_binary_audio_and_ndjson() {
+    let input = wav_fixture_bytes();
+    let normalized = run_with_stdin(
+        &["-", "--input-format", "wav", "-o", "-", "--format", "wav"],
+        &input,
+    );
+    assert!(
+        normalized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&normalized.stderr)
+    );
+    assert!(normalized.stdout.starts_with(b"RIFF"));
+    let decoded = forge_normalizer::wav::WavReader::read_bytes(&normalized.stdout).unwrap();
+    assert_eq!((decoded.sample_rate, decoded.channels), (48_000, 1));
+
+    let report = run_with_stdin(
+        &["-", "--input-format", "wav", "--analyze", "--ndjson"],
+        &input,
+    );
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let lines: Vec<_> = report
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(lines.len(), 1);
+    let value: serde_json::Value = serde_json::from_slice(lines[0]).unwrap();
+    assert_eq!(value["channels"], 1);
+    assert_eq!(value["path"], "-");
 }
 use clap::Parser;
 use forge_normalizer::cli::Cli;
