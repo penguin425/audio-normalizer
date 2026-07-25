@@ -191,6 +191,10 @@ forge album/*.flac --album --write-tags
 # Re-decode the completed file and fail if level/true-peak verification misses
 forge track.wav -o track.flac --verify
 
+# Automatically compensate for codec-induced loudness or true-peak drift,
+# re-encoding from the original source at most twice
+forge track.wav -o track.mp3 --verify --verify-retries 2
+
 # Reach the loudness target through isolated peaks with a true-peak limiter
 forge track.wav -o track.flac --limiter --verify
 
@@ -230,6 +234,7 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--write-tags` | off | Write ReplayGain 2.0 metadata without changing audio |
 | `--verify` | off | Re-decode output and verify achieved level and true peak |
 | `--verify-tolerance` | `0.5` | Allowed post-encode deviation in LU/dB |
+| `--verify-retries` | `0` | Automatically correct gain and re-encode up to N times |
 | `--limiter` | off | Look-ahead 4× oversampled true-peak limiter |
 | `--limiter-lookahead` | `5` | Limiter look-ahead in milliseconds |
 | `--limiter-release` | `100` | Limiter release time in milliseconds |
@@ -300,3 +305,5 @@ tests/
   the loudness target matters more than preserving dynamics unchanged.
 * MP3 is lossy: re-encoding shifts loudness by ~0.2–0.4 LU per pass. For
   production work, normalize to WAV/FLAC and encode to MP3 once at the end.
+  `--verify --verify-retries N` compensates codec drift by rendering every
+  retry from the original input, avoiding generation loss between attempts.

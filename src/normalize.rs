@@ -86,6 +86,26 @@ pub struct Verification {
     pub true_peak_ok: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct CorrectedNormalization {
+    pub source: Analysis,
+    pub gain: f32,
+    pub verification: Verification,
+    /// Number of encoding passes, including the initial pass.
+    pub attempts: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CorrectedAlbumNormalization {
+    pub sources: Vec<Analysis>,
+    pub gain: f32,
+    pub verifications: Vec<Verification>,
+    pub expected_album_lufs: f64,
+    pub actual_album_lufs: f64,
+    /// Number of complete album encoding passes, including the initial pass.
+    pub attempts: usize,
+}
+
 impl Verification {
     pub fn passed(&self) -> bool {
         self.level_ok && self.true_peak_ok
@@ -269,6 +289,28 @@ pub fn verify_file<P: AsRef<Path>>(
     Ok(verify_analysis(&output, source, gain, plan, tolerance))
 }
 
+/// Verify an encoded output against a fixed intended level.
+///
+/// Unlike [`verify_file`], the expected level does not move when a subsequent
+/// encoding pass uses a corrected gain.
+pub fn verify_file_at_level<P: AsRef<Path>>(
+    output: P,
+    expected_level: f64,
+    plan: &Plan,
+    tolerance: f64,
+) -> Result<Verification, String> {
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err("verification tolerance must be a finite non-negative number".into());
+    }
+    let output = analyze_file(output)?;
+    Ok(verify_analysis_at_level(
+        &output,
+        expected_level,
+        plan,
+        tolerance,
+    ))
+}
+
 pub fn verify_analysis(
     output: &Analysis,
     source: &Analysis,
@@ -277,12 +319,18 @@ pub fn verify_analysis(
     tolerance: f64,
 ) -> Verification {
     let gain_db = 20.0 * (gain as f64).log10();
-    let (source_level, actual_level) = match plan.mode {
-        Mode::Lufs => (source.lufs, output.lufs),
-        Mode::Peak => (source.sample_peak_db(), output.sample_peak_db()),
-        Mode::Rms => (source.rms_db, output.rms_db),
-    };
+    let source_level = analysis_level(source, plan.mode);
     let expected_level = source_level + gain_db;
+    verify_analysis_at_level(output, expected_level, plan, tolerance)
+}
+
+fn verify_analysis_at_level(
+    output: &Analysis,
+    expected_level: f64,
+    plan: &Plan,
+    tolerance: f64,
+) -> Verification {
+    let actual_level = analysis_level(output, plan.mode);
     let deviation = level_deviation(expected_level, actual_level);
     Verification {
         output: output.clone(),
@@ -291,6 +339,14 @@ pub fn verify_analysis(
         deviation,
         level_ok: deviation <= tolerance,
         true_peak_ok: output.true_peak_db() <= plan.ceiling_db + tolerance,
+    }
+}
+
+fn analysis_level(analysis: &Analysis, mode: Mode) -> f64 {
+    match mode {
+        Mode::Lufs => analysis.lufs,
+        Mode::Peak => analysis.sample_peak_db(),
+        Mode::Rms => analysis.rms_db,
     }
 }
 
@@ -316,6 +372,43 @@ pub fn normalize_one<P: AsRef<Path>>(
     normalize_stream(input.as_ref(), output.as_ref(), &an, gain, plan, format)?;
     metadata::copy_metadata(input.as_ref(), output.as_ref())?;
     Ok((an, gain))
+}
+
+/// Normalize, re-decode, and automatically compensate for post-encode level
+/// drift or a true-peak overshoot. Every correction is rendered again from the
+/// original input, so lossy artifacts are never compounded across retries.
+pub fn normalize_one_corrected<P: AsRef<Path>>(
+    input: P,
+    output: P,
+    plan: &Plan,
+    format: OutputFormat,
+    tolerance: f64,
+    max_retries: usize,
+) -> Result<CorrectedNormalization, String> {
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err("verification tolerance must be a finite non-negative number".into());
+    }
+    let input = input.as_ref();
+    let output = output.as_ref();
+    let source = analyze_file(input)?;
+    let mut gain = compute_gain(&source, plan);
+    let expected_level = analysis_level(&source, plan.mode) + gain_db(gain);
+
+    for attempt in 0..=max_retries {
+        normalize_stream(input, output, &source, gain, plan, format)?;
+        let verification = verify_file_at_level(output, expected_level, plan, tolerance)?;
+        if verification.passed() || attempt == max_retries {
+            metadata::copy_metadata(input, output)?;
+            return Ok(CorrectedNormalization {
+                source,
+                gain,
+                verification,
+                attempts: attempt + 1,
+            });
+        }
+        gain = corrected_gain(gain, &verification, plan)?;
+    }
+    unreachable!("the inclusive retry loop always returns")
 }
 
 /// Album loudness from the combined population of all complete gating blocks.
@@ -356,6 +449,125 @@ pub fn normalize_album(
         results.push((analyses[i].clone(), gain));
     }
     Ok(results)
+}
+
+/// Album normalization with a shared gain and iterative post-encode
+/// correction. Corrections use the decoded album loudness and the worst
+/// decoded true peak while preserving one common gain for every track.
+pub fn normalize_album_corrected(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    tolerance: f64,
+    max_retries: usize,
+) -> Result<CorrectedAlbumNormalization, String> {
+    if inputs.is_empty() {
+        return Err("cannot correct an empty album".into());
+    }
+    if inputs.len() != outputs.len() {
+        return Err("album input/output count mismatch".into());
+    }
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err("verification tolerance must be a finite non-negative number".into());
+    }
+    let sources: Vec<Analysis> = inputs.iter().map(analyze_file).collect::<Result<_, _>>()?;
+    let mut gain = album_gain(&sources, plan);
+    let expected_album_lufs = album_lufs(&sources) + gain_db(gain);
+    let expected_track_levels: Vec<f64> = sources
+        .iter()
+        .map(|source| analysis_level(source, plan.mode) + gain_db(gain))
+        .collect();
+
+    for attempt in 0..=max_retries {
+        for (index, (input, output)) in inputs.iter().zip(outputs).enumerate() {
+            let format = formats.get(index).copied().unwrap_or(OutputFormat::Wav);
+            normalize_stream(input, output, &sources[index], gain, plan, format)?;
+        }
+        let decoded: Vec<Analysis> = outputs.iter().map(analyze_file).collect::<Result<_, _>>()?;
+        let actual_album_lufs = album_lufs(&decoded);
+        let verifications: Vec<Verification> = decoded
+            .iter()
+            .zip(&expected_track_levels)
+            .map(|(output, expected)| verify_analysis_at_level(output, *expected, plan, tolerance))
+            .collect();
+        let album_deviation = level_deviation(expected_album_lufs, actual_album_lufs);
+        let worst_true_peak = decoded
+            .iter()
+            .map(Analysis::true_peak_db)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let album_passed = album_deviation <= tolerance
+            && worst_true_peak <= plan.ceiling_db + tolerance
+            && verifications.iter().all(Verification::passed);
+        if album_passed || attempt == max_retries {
+            for (input, output) in inputs.iter().zip(outputs) {
+                metadata::copy_metadata(input, output)?;
+            }
+            return Ok(CorrectedAlbumNormalization {
+                sources,
+                gain,
+                verifications,
+                expected_album_lufs,
+                actual_album_lufs,
+                attempts: attempt + 1,
+            });
+        }
+        let album_verification = Verification {
+            output: Analysis {
+                true_peak: decoded
+                    .iter()
+                    .map(|analysis| analysis.true_peak)
+                    .fold(0.0_f32, f32::max),
+                lufs: actual_album_lufs,
+                ..decoded
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| "cannot correct an empty album".to_string())?
+            },
+            expected_level: expected_album_lufs,
+            actual_level: actual_album_lufs,
+            deviation: album_deviation,
+            level_ok: album_deviation <= tolerance,
+            true_peak_ok: worst_true_peak <= plan.ceiling_db + tolerance,
+        };
+        gain = corrected_gain(gain, &album_verification, plan)?;
+    }
+    unreachable!("the inclusive retry loop always returns")
+}
+
+fn gain_db(gain: f32) -> f64 {
+    20.0 * (gain as f64).log10()
+}
+
+fn corrected_gain(
+    current_gain: f32,
+    verification: &Verification,
+    plan: &Plan,
+) -> Result<f32, String> {
+    let level_adjustment = if verification.expected_level == verification.actual_level {
+        0.0
+    } else if verification.expected_level.is_finite() && verification.actual_level.is_finite() {
+        verification.expected_level - verification.actual_level
+    } else {
+        return Err("cannot automatically correct a non-finite output level".into());
+    };
+    let peak_adjustment = if verification.output.true_peak > 0.0 {
+        plan.ceiling_db - verification.output.true_peak_db()
+    } else {
+        f64::INFINITY
+    };
+    let adjustment_db = level_adjustment.min(peak_adjustment);
+    if !adjustment_db.is_finite() {
+        return Err("cannot automatically correct output gain".into());
+    }
+    let mut corrected = current_gain as f64 * 10.0_f64.powf(adjustment_db / 20.0);
+    if let Some(max_gain_db) = plan.max_gain_db {
+        corrected = corrected.min(10.0_f64.powf(max_gain_db / 20.0));
+    }
+    if !corrected.is_finite() || corrected <= 0.0 {
+        return Err("automatic correction produced an invalid gain".into());
+    }
+    Ok(corrected as f32)
 }
 
 fn normalize_stream(
@@ -484,5 +696,91 @@ fn gain_chunk(planar: &mut [Vec<f32>], gain: f32, ceiling: f32) {
     for channel in planar {
         simd::apply_gain(channel, gain);
         simd::hard_clip(channel, ceiling);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wav::default_channel_roles;
+
+    fn analysis(level: f64, true_peak_db: f64) -> Analysis {
+        Analysis {
+            sample_rate: 48_000,
+            channels: 2,
+            frames: 48_000,
+            kind: PcmKind::F32,
+            lufs: level,
+            max_momentary_lufs: level,
+            max_short_term_lufs: level,
+            loudness_range_lu: 0.0,
+            rms_db: level,
+            sample_peak: 10.0_f64.powf(true_peak_db / 20.0) as f32,
+            true_peak: 10.0_f64.powf(true_peak_db / 20.0) as f32,
+            loudness_blocks: Vec::new(),
+        }
+    }
+
+    fn plan() -> Plan {
+        Plan {
+            mode: Mode::Lufs,
+            target_lufs: -16.0,
+            target_peak_db: -1.0,
+            target_rms_db: -18.0,
+            ceiling_db: -1.0,
+            max_gain_db: None,
+            dither: false,
+            output_kind: None,
+            mp3_bitrate: 192,
+            mp3_quality: 2,
+            limiter: None,
+        }
+    }
+
+    #[test]
+    fn corrected_gain_compensates_a_quiet_encoded_output() {
+        let output = analysis(-16.8, -3.0);
+        let verification = verify_analysis_at_level(&output, -16.0, &plan(), 0.1);
+        let corrected = corrected_gain(1.0, &verification, &plan()).unwrap();
+
+        assert!((gain_db(corrected) - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn corrected_gain_prioritizes_true_peak_ceiling() {
+        let output = analysis(-16.4, -0.2);
+        let verification = verify_analysis_at_level(&output, -16.0, &plan(), 0.1);
+        let corrected = corrected_gain(1.0, &verification, &plan()).unwrap();
+
+        assert!((gain_db(corrected) - (-0.8)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn corrected_normalization_reuses_the_original_source() {
+        let frames = 48_000 * 4;
+        let data = (0..frames)
+            .map(|frame| {
+                0.1 * (2.0 * std::f32::consts::PI * 1_000.0 * frame as f32 / 48_000.0).sin()
+            })
+            .collect::<Vec<_>>();
+        let buffer = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 1,
+            frames,
+            data: vec![data],
+            channel_roles: default_channel_roles(1),
+            source_kind: PcmKind::F32,
+        };
+        let input = std::env::temp_dir().join("forge_corrected_original.wav");
+        let output = std::env::temp_dir().join("forge_corrected_output.wav");
+        WavWriter::write(&input, &buffer, PcmKind::F32, false).unwrap();
+
+        let result =
+            normalize_one_corrected(&input, &output, &plan(), OutputFormat::Wav, 0.01, 2).unwrap();
+
+        assert!(result.verification.passed());
+        assert_eq!(result.attempts, 1);
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(output);
     }
 }

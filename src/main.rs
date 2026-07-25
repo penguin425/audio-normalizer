@@ -162,6 +162,59 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
             return Ok(());
         }
         prepare_output_directories(&outputs)?;
+        if cli.verify {
+            let corrected = normalize::normalize_album_corrected(
+                &cli.inputs,
+                &outputs,
+                &plan,
+                &formats,
+                cli.verify_tolerance,
+                cli.verify_retries as usize,
+            )?;
+            for (input, source) in cli.inputs.iter().zip(&corrected.sources) {
+                print_analysis(input, source, Some(corrected.gain));
+            }
+            let source_album = normalize::album_lufs(&corrected.sources);
+            eprintln!(
+                "album: {:.2} LUFS  shared gain {:+.2} dB",
+                source_album,
+                20.0 * (corrected.gain as f64).log10()
+            );
+            for ((input, verification), output) in cli
+                .inputs
+                .iter()
+                .zip(&corrected.verifications)
+                .zip(&outputs)
+            {
+                if !print_verification(input, verification, &plan) {
+                    return Err(format!(
+                        "post-encode verification failed: {}",
+                        output.display()
+                    ));
+                }
+            }
+            let album_deviation =
+                (corrected.actual_album_lufs - corrected.expected_album_lufs).abs();
+            let album_ok = album_deviation <= cli.verify_tolerance;
+            eprintln!(
+                "album verification: expected {:.2} LUFS, measured {:.2} LUFS, \
+                 deviation {:.2} LU [{}]",
+                corrected.expected_album_lufs,
+                corrected.actual_album_lufs,
+                album_deviation,
+                if album_ok { "PASS" } else { "FAIL" }
+            );
+            if corrected.attempts > 1 {
+                eprintln!(
+                    "album correction: {} re-encode pass(es)",
+                    corrected.attempts - 1
+                );
+            }
+            if !album_ok {
+                return Err("post-encode album verification failed".into());
+            }
+            return Ok(());
+        }
         let results = normalize::normalize_album(&cli.inputs, &outputs, &plan, &formats)?;
         let analyses: Vec<_> = results.iter().map(|(a, _)| a.clone()).collect();
         let album_l = normalize::album_lufs(&analyses);
@@ -174,30 +227,6 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
             album_l,
             20.0 * (gain as f64).log10()
         );
-        if cli.verify {
-            let mut verified_outputs = Vec::with_capacity(outputs.len());
-            let mut passed = true;
-            for ((output, (source, applied)), input) in
-                outputs.iter().zip(&results).zip(&cli.inputs)
-            {
-                let verification =
-                    normalize::verify_file(output, source, *applied, &plan, cli.verify_tolerance)?;
-                passed &= print_verification(input, &verification, &plan);
-                verified_outputs.push(verification.output);
-            }
-            let actual_album = normalize::album_lufs(&verified_outputs);
-            let expected_album = album_l + 20.0 * (gain as f64).log10();
-            let album_deviation = (actual_album - expected_album).abs();
-            let album_ok = album_deviation <= cli.verify_tolerance;
-            eprintln!(
-                "album verification: expected {expected_album:.2} LUFS, measured \
-                 {actual_album:.2} LUFS, deviation {album_deviation:.2} LU [{}]",
-                if album_ok { "PASS" } else { "FAIL" }
-            );
-            if !passed || !album_ok {
-                return Err("post-encode verification failed".into());
-            }
-        }
         return Ok(());
     }
 
@@ -211,17 +240,32 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
             }
         } else {
             prepare_output_directories(std::slice::from_ref(output))?;
-            let (an, gain) = normalize::normalize_one(input, output, &plan, *fmt)?;
-            print_analysis(input, &an, Some(gain));
             if cli.verify {
-                let verification =
-                    normalize::verify_file(output, &an, gain, &plan, cli.verify_tolerance)?;
-                if !print_verification(input, &verification, &plan) {
+                let corrected = normalize::normalize_one_corrected(
+                    input,
+                    output,
+                    &plan,
+                    *fmt,
+                    cli.verify_tolerance,
+                    cli.verify_retries as usize,
+                )?;
+                print_analysis(input, &corrected.source, Some(corrected.gain));
+                if !print_verification(input, &corrected.verification, &plan) {
                     return Err(format!(
                         "post-encode verification failed: {}",
                         output.display()
                     ));
                 }
+                if corrected.attempts > 1 {
+                    eprintln!(
+                        "{} correction: {} re-encode pass(es)",
+                        input.display(),
+                        corrected.attempts - 1
+                    );
+                }
+            } else {
+                let (an, gain) = normalize::normalize_one(input, output, &plan, *fmt)?;
+                print_analysis(input, &an, Some(gain));
             }
         }
     }

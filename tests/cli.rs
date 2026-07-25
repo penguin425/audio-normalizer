@@ -51,5 +51,16 @@ fn preset_is_accepted_but_explicit_target_conflicts() {
         Cli::try_parse_from(["forge", "track.wav", "--preset", "spotify", "--target=-12"]).is_err()
     );
 }
+
+#[test]
+fn verification_retries_require_verification_and_are_bounded() {
+    assert!(Cli::try_parse_from(["forge", "track.wav", "--verify-retries", "2"]).is_err());
+    let cli =
+        Cli::try_parse_from(["forge", "track.wav", "--verify", "--verify-retries", "3"]).unwrap();
+    assert_eq!(cli.verify_retries, 3);
+    assert!(
+        Cli::try_parse_from(["forge", "track.wav", "--verify", "--verify-retries", "11"]).is_err()
+    );
+}
 use clap::Parser;
 use forge_normalizer::cli::Cli;
