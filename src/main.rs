@@ -69,6 +69,12 @@ fn run(mut cli: cli::Cli) -> Result<(), String> {
     }
 
     let (outputs, formats) = resolve_outputs_and_formats(&cli, &relative_paths)?;
+    if cli.bits.is_some()
+        && formats.contains(&OutputFormat::Flac)
+        && !matches!(cli.bits.as_deref(), Some("16" | "24"))
+    {
+        return Err("FLAC output supports only --bits=16 or --bits=24".into());
+    }
 
     if cli.analyze_only {
         let mut reports = Vec::with_capacity(cli.inputs.len());
@@ -309,6 +315,7 @@ fn resolve_outputs_and_formats(
 
 fn parse_format(s: &str) -> OutputFormat {
     match s {
+        "flac" => OutputFormat::Flac,
         "mp3" => OutputFormat::Mp3,
         _ => OutputFormat::Wav,
     }
@@ -317,6 +324,7 @@ fn parse_format(s: &str) -> OutputFormat {
 fn fmt_ext(f: OutputFormat) -> &'static str {
     match f {
         OutputFormat::Wav => "wav",
+        OutputFormat::Flac => "flac",
         OutputFormat::Mp3 => "mp3",
     }
 }
@@ -328,15 +336,15 @@ fn infer_format(path: &Path) -> Option<OutputFormat> {
         .map(|s| s.to_ascii_lowercase())
         .as_deref()
     {
+        Some("flac") => Some(OutputFormat::Flac),
         Some("mp3") => Some(OutputFormat::Mp3),
         Some("wav") | Some("wave") => Some(OutputFormat::Wav),
         _ => None,
     }
 }
 
-/// Default output container for an input we won't otherwise transcode: keep MP3
-/// as MP3; everything else (wav/flac/aac/ogg) falls back to lossless WAV since
-/// Forge only encodes WAV and MP3.
+/// Keep lossless FLAC and MP3 inputs in their original containers; other
+/// decoded formats fall back to lossless WAV.
 fn default_format_for_input(path: &Path) -> OutputFormat {
     match path
         .extension()
@@ -344,6 +352,7 @@ fn default_format_for_input(path: &Path) -> OutputFormat {
         .map(|s| s.to_ascii_lowercase())
         .as_deref()
     {
+        Some("flac") => OutputFormat::Flac,
         Some("mp3") => OutputFormat::Mp3,
         _ => OutputFormat::Wav,
     }

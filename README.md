@@ -15,7 +15,7 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
 |---|---|---|
 | **WAV** (PCM 8/16/24/32-bit, float 32/64-bit) | Forge's own fast parallel demuxer | Forge's own muxer |
 | **MP3** | symphonia (pure Rust) | LAME via FFI |
-| **FLAC** | symphonia (pure Rust) | — (output as WAV) |
+| **FLAC** (16/24-bit, up to 8 channels) | symphonia (pure Rust) | flacenc (pure Rust) |
 | **AAC / ALAC** (.m4a/.mp4) | symphonia (pure Rust) | — (output as WAV) |
 | **Vorbis** (.ogg) | symphonia (pure Rust) | — (output as WAV) |
 
@@ -23,6 +23,7 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
   [`symphonia`](https://github.com/pdelanoe/symphonia) — no system codecs.
 * Optional MP3 encoding uses **LAME** (the reference MP3 encoder) through a
   tiny FFI. Enable it with the `mp3-encoding` Cargo feature.
+* FLAC encoding is pure Rust, streaming, and available in the default build.
 * WAV stays on the fast hand-written path; other inputs transparently route
   through the universal decoder and produce the same planar-f32 buffer the DSP
   engine consumes.
@@ -30,7 +31,8 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
   normalization and remapped to the destination container's primary tag type.
 
 By default the output container follows the input where Forge can encode it
-(mp3 → mp3), and otherwise falls back to lossless WAV. `--format wav|mp3` and
+(FLAC → FLAC, MP3 → MP3), and otherwise falls back to lossless WAV.
+`--format wav|flac|mp3` and
 the `-o` extension override this.
 
 ## Why it's fast
@@ -92,7 +94,7 @@ Reads and writes PCM 8/16/24/32-bit and IEEE float 32/64-bit WAV, including
 ## Build
 
 ```sh
-# The default build supports every input format and WAV output without LAME:
+# The default build supports every input format plus WAV/FLAC output without LAME:
 cargo build --release
 
 # Optional MP3 output (MP3 input needs only the default Rust crates):
@@ -133,6 +135,9 @@ forge song.mp3 -o song.wav --target=-14
 
 # Transcode/normalize: WAV in, MP3 out at 320 kbps
 forge track.wav -o track.mp3 --format=mp3 --bitrate=320
+
+# Lossless streaming FLAC output (16 or 24 bit)
+forge track.wav -o track.flac --format=flac --bits=24 --dither
 
 # EBU R128 broadcast target (-23 LUFS)
 forge program.wav -o out.wav --target=-23
@@ -177,7 +182,7 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--target-rms` | `-18` | Target RMS dBFS (`--mode rms`) |
 | `--ceiling` | `-1.0` | True-peak ceiling dBFS (gain is reduced to respect it) |
 | `--max-gain` | none | Cap on applied gain (dB), a boost safety limit |
-| `--format` | inferred | `wav` or `mp3` output container |
+| `--format` | inferred | `wav`, `flac`, or `mp3` output container |
 | `--bitrate` | `192` | MP3 CBR bitrate in kbps (MP3 output) |
 | `--quality` | `2` | MP3 encoder quality 0(best)…9(fastest) |
 | `--album` | off | One shared gain for all inputs (requires `--mode lufs`) |
@@ -195,10 +200,11 @@ forge in.wav -o out.wav --bits=24 --dither
 
 ```
 src/
-  lib.rs            public engine API (decoder, WAV I/O, DSP, MP3 enc, normalize)
+  lib.rs            public engine API (decoder, audio I/O, DSP, normalize)
   main.rs           CLI wrapper (format resolution + dispatch)
   cli.rs            clap definition
   decoder.rs        full-buffer and streaming universal decoders
+  flacenc.rs        bounded-memory pure-Rust FLAC encoder
   mp3enc.rs         MP3 encoder via LAME FFI (interleaved f32 -> MP3 bytes)
   wav/
     format.rs       PcmKind / WaveFormat
@@ -222,8 +228,8 @@ tests/
 * MP3 **encoding** requires the `mp3-encoding` feature and LAME
   (`libmp3lame`) at build/run time. MP3 **decoding** and all other input
   formats need only the Rust crates (symphonia).
-* Forge only *encodes* WAV and MP3. FLAC/AAC/ALAC/Vorbis can be read and
-  normalized, but the output is WAV (or MP3 with `--format mp3`).
+* AAC/ALAC/Vorbis can be read but are written as WAV/FLAC (or MP3 with its
+  optional feature); Forge does not encode those source containers directly.
 * Linear normalization (no dynamic/look-ahead limiter). The
   true-peak ceiling is enforced by reducing the global gain, which is the
   transparent, artifact-free approach used for loudness normalization.
