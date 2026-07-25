@@ -100,6 +100,19 @@ cargo test
 When `mp3-encoding` is enabled, `build.rs` finds `libmp3lame` via pkg-config,
 then standard library paths, and prints a clear install hint if it is missing.
 
+### EBU conformance tests
+
+Run the optional conformance suite against the official EBU Loudness Test Set
+v5. The script downloads the archive from a public mirror, verifies its
+SHA-256 checksum, and runs the nine Tech 3341 integrated-loudness cases:
+
+```sh
+./tools/test-ebu-conformance.sh
+```
+
+The EBU material is cached outside the repository and is used only for
+technical testing under the terms included in its archive.
+
 ## Usage
 
 ```sh
