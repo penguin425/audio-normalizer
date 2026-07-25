@@ -106,6 +106,22 @@ pub struct DialogueMeasurement {
     pub range_count: usize,
     pub standard: &'static str,
     pub method: &'static str,
+    pub source: DialogueSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DialogueStandard {
+    AtscA85,
+    EbuR128S4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DialogueSource {
+    Mix,
+    Center,
+    Stem,
 }
 
 #[derive(Debug, Deserialize)]
@@ -546,6 +562,22 @@ pub fn analyze_dialogue_ranges_with_roles<P: AsRef<Path>>(
     channel_roles: Option<&[ChannelRole]>,
     ranges: &[DialogueRange],
 ) -> Result<DialogueMeasurement, String> {
+    analyze_dialogue_ranges_for_standard_with_roles(
+        path,
+        channel_roles,
+        ranges,
+        DialogueStandard::AtscA85,
+        DialogueSource::Mix,
+    )
+}
+
+pub fn analyze_dialogue_ranges_for_standard_with_roles<P: AsRef<Path>>(
+    path: P,
+    channel_roles: Option<&[ChannelRole]>,
+    ranges: &[DialogueRange],
+    standard: DialogueStandard,
+    source: DialogueSource,
+) -> Result<DialogueMeasurement, String> {
     validate_dialogue_ranges(ranges)?;
     let mut analyzers = (0..ranges.len()).map(|_| None).collect::<Vec<_>>();
     let mut source_frames = 0usize;
@@ -575,6 +607,9 @@ pub fn analyze_dialogue_ranges_with_roles<P: AsRef<Path>>(
         } else {
             &info.channel_roles
         };
+        if source == DialogueSource::Center && info.channels < 3 {
+            return Err("center dialogue source requires an input with a centre channel".into());
+        }
         let chunk_start = source_frames;
         let chunk_end = source_frames + chunk.first().map_or(0, Vec::len);
         source_frames = chunk_end;
@@ -589,13 +624,22 @@ pub fn analyze_dialogue_ranges_with_roles<P: AsRef<Path>>(
             if overlap_start < overlap_end {
                 let selected_start = overlap_start - chunk_start;
                 let selected_end = overlap_end - chunk_start;
-                let selected = chunk
-                    .iter()
-                    .map(|channel| channel[selected_start..selected_end].to_vec())
-                    .collect::<Vec<_>>();
+                let selected = if source == DialogueSource::Center {
+                    vec![chunk[2][selected_start..selected_end].to_vec()]
+                } else {
+                    chunk
+                        .iter()
+                        .map(|channel| channel[selected_start..selected_end].to_vec())
+                        .collect::<Vec<_>>()
+                };
+                let selected_roles = if source == DialogueSource::Center {
+                    vec![ChannelRole::Main]
+                } else {
+                    roles.to_vec()
+                };
                 analyzer
                     .get_or_insert_with(|| {
-                        lufs::StreamingAnalyzer::new(info.sample_rate, roles.to_vec())
+                        lufs::StreamingAnalyzer::new(info.sample_rate, selected_roles)
                     })
                     .process(&selected)?;
             }
@@ -603,6 +647,7 @@ pub fn analyze_dialogue_ranges_with_roles<P: AsRef<Path>>(
         Ok(())
     })?;
     let mut weighted_energy = 0.0;
+    let mut gating_blocks = Vec::new();
     let mut frames = 0usize;
     for (index, analyzer) in analyzers.into_iter().enumerate() {
         let measured = analyzer
@@ -615,17 +660,37 @@ pub fn analyze_dialogue_ranges_with_roles<P: AsRef<Path>>(
             })?
             .finish();
         weighted_energy += measured.weighted_mean_square * measured.frames as f64;
+        gating_blocks.extend(measured.ebu.gating_blocks);
         frames += measured.frames;
     }
     if frames == 0 {
         return Err("dialogue ranges contain no audio".into());
     }
+    let (loudness, standard_name, method) = match standard {
+        DialogueStandard::AtscA85 => (
+            lufs::ungated_lufs(weighted_energy / frames as f64),
+            "ATSC A/85:2026-07",
+            "BS.1770-1 K-weighting + explicit dialogue gate; no relative-level gate",
+        ),
+        DialogueStandard::EbuR128S4 => (
+            if gating_blocks.is_empty() {
+                return Err(
+                    "EBU dialogue ranges contain no complete 400 ms loudness blocks".into(),
+                );
+            } else {
+                lufs::gated_lufs(&gating_blocks)
+            },
+            "EBU R 128 s4",
+            "BS.1770-5 K-weighting + explicit dialogue selection + absolute/relative gating",
+        ),
+    };
     Ok(DialogueMeasurement {
-        lufs: lufs::ungated_lufs(weighted_energy / frames as f64),
+        lufs: loudness,
         duration_seconds: frames as f64 / info.sample_rate as f64,
         range_count: ranges.len(),
-        standard: "ATSC A/85:2026-07",
-        method: "BS.1770-1 K-weighting + explicit dialogue gate; no relative-level gate",
+        standard: standard_name,
+        method,
+        source,
     })
 }
 

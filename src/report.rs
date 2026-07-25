@@ -1,7 +1,7 @@
 //! Stable machine-readable analysis reports.
 
 use crate::dsp::lufs::LoudnessTimelinePoint;
-use crate::normalize::{Analysis, DialogueMeasurement};
+use crate::normalize::{Analysis, DialogueMeasurement, DialogueSource};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -22,6 +22,8 @@ pub struct ComplianceProfile {
     pub max_momentary_lufs: Option<f64>,
     pub min_loudness_range_lu: Option<f64>,
     pub max_loudness_range_lu: Option<f64>,
+    #[serde(default)]
+    pub max_loudness_to_dialogue_ratio_lu: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +42,10 @@ impl ComplianceProfile {
                 max_short_term_lufs: Some(-18.0),
                 ..Self::symmetric("ebu-r128-short", -23.0, 0.2, -1.0)
             },
+            "ebu-r128-cinematic" => Self {
+                max_loudness_to_dialogue_ratio_lu: Some(5.0),
+                ..Self::symmetric("ebu-r128-cinematic", -23.0, 0.2, -1.0)
+            },
             "atsc-a85-short" => Self::symmetric("atsc-a85-short", -24.0, 2.0, -2.0),
             "atsc-a85-long" => Self {
                 loudness_basis: LoudnessBasis::Dialogue,
@@ -57,6 +63,7 @@ impl ComplianceProfile {
                 max_momentary_lufs: None,
                 min_loudness_range_lu: None,
                 max_loudness_range_lu: None,
+                max_loudness_to_dialogue_ratio_lu: None,
             },
             "aes77-music-track" => Self::symmetric("aes77-music-track", -16.0, 0.2, -1.0),
             "aes77-interstitial" => Self::symmetric("aes77-interstitial", -18.0, 0.2, -1.0),
@@ -78,6 +85,7 @@ impl ComplianceProfile {
             max_momentary_lufs: None,
             min_loudness_range_lu: None,
             max_loudness_range_lu: None,
+            max_loudness_to_dialogue_ratio_lu: None,
         }
     }
 
@@ -129,6 +137,7 @@ impl ComplianceProfile {
             self.max_momentary_lufs,
             self.min_loudness_range_lu,
             self.max_loudness_range_lu,
+            self.max_loudness_to_dialogue_ratio_lu,
         ];
         if values.into_iter().flatten().any(|value| !value.is_finite()) {
             return Err("compliance profile values must be finite".into());
@@ -137,12 +146,13 @@ impl ComplianceProfile {
             self.loudness_tolerance_lu,
             self.lower_tolerance_lu,
             self.upper_tolerance_lu,
+            self.max_loudness_to_dialogue_ratio_lu,
         ]
         .into_iter()
         .flatten()
         .any(|value| value < 0.0)
         {
-            return Err("loudness tolerances must be non-negative".into());
+            return Err("loudness tolerances and LDR limits must be non-negative".into());
         }
         if self.target_lufs.is_none()
             && self.max_true_peak_dbtp.is_none()
@@ -150,6 +160,7 @@ impl ComplianceProfile {
             && self.max_momentary_lufs.is_none()
             && self.min_loudness_range_lu.is_none()
             && self.max_loudness_range_lu.is_none()
+            && self.max_loudness_to_dialogue_ratio_lu.is_none()
         {
             return Err("compliance profile must define at least one rule".into());
         }
@@ -168,7 +179,8 @@ impl ComplianceProfile {
     }
 
     pub fn requires_dialogue(&self) -> bool {
-        self.loudness_basis == LoudnessBasis::Dialogue && self.target_lufs.is_some()
+        (self.loudness_basis == LoudnessBasis::Dialogue && self.target_lufs.is_some())
+            || self.max_loudness_to_dialogue_ratio_lu.is_some()
     }
 
     pub fn evaluate_with_dialogue(
@@ -226,6 +238,19 @@ impl ComplianceProfile {
                 analysis.loudness_range_lu,
                 self.min_loudness_range_lu.unwrap_or(f64::NEG_INFINITY),
                 self.max_loudness_range_lu.unwrap_or(f64::INFINITY),
+            ));
+        }
+        if let Some(maximum) = self.max_loudness_to_dialogue_ratio_lu {
+            let dialogue = dialogue_lufs.ok_or_else(|| {
+                format!(
+                    "compliance profile {} requires --dialogue-ranges",
+                    self.name
+                )
+            })?;
+            rules.push(ComplianceRuleResult::maximum(
+                "loudness_to_dialogue_ratio_lu",
+                analysis.lufs - dialogue,
+                maximum,
             ));
         }
         Ok(ComplianceResult {
@@ -293,6 +318,8 @@ pub struct AnalysisReport {
     pub dialogue_range_count: Option<usize>,
     pub dialogue_measurement_standard: Option<&'static str>,
     pub dialogue_measurement_method: Option<&'static str>,
+    pub dialogue_source: Option<DialogueSource>,
+    pub loudness_to_dialogue_ratio_lu: Option<f64>,
     pub max_momentary_lufs: f64,
     pub max_short_term_lufs: f64,
     pub loudness_range_lu: f64,
@@ -318,6 +345,8 @@ pub struct AnalysisReport {
     pub compliance_min_loudness_range_lu: Option<f64>,
     pub compliance_max_loudness_range_lu: Option<f64>,
     pub compliance_loudness_range_pass: Option<bool>,
+    pub compliance_max_loudness_to_dialogue_ratio_lu: Option<f64>,
+    pub compliance_loudness_to_dialogue_ratio_pass: Option<bool>,
     /// Complete evaluated rule set, encoded as JSON so CSV remains flat.
     pub compliance_rules_json: Option<String>,
     pub compliance_passed: Option<bool>,
@@ -439,6 +468,8 @@ impl AnalysisReport {
             dialogue_range_count: dialogue.map(|value| value.range_count),
             dialogue_measurement_standard: dialogue.map(|value| value.standard),
             dialogue_measurement_method: dialogue.map(|value| value.method),
+            dialogue_source: dialogue.map(|value| value.source),
+            loudness_to_dialogue_ratio_lu: dialogue.map(|value| analysis.lufs - value.lufs),
             max_momentary_lufs: analysis.max_momentary_lufs,
             max_short_term_lufs: analysis.max_short_term_lufs,
             loudness_range_lu: analysis.loudness_range_lu,
@@ -465,6 +496,12 @@ impl AnalysisReport {
             compliance_min_loudness_range_lu: profile.and_then(|value| value.min_loudness_range_lu),
             compliance_max_loudness_range_lu: profile.and_then(|value| value.max_loudness_range_lu),
             compliance_loudness_range_pass: rule_pass(&compliance, "loudness_range_lu"),
+            compliance_max_loudness_to_dialogue_ratio_lu: profile
+                .and_then(|value| value.max_loudness_to_dialogue_ratio_lu),
+            compliance_loudness_to_dialogue_ratio_pass: rule_pass(
+                &compliance,
+                "loudness_to_dialogue_ratio_lu",
+            ),
             compliance_rules_json: compliance.as_ref().map(|result| {
                 serde_json::to_string(&result.rules).expect("compliance rules are serializable")
             }),
@@ -582,6 +619,8 @@ mod tests {
             dialogue_range_count: None,
             dialogue_measurement_standard: None,
             dialogue_measurement_method: None,
+            dialogue_source: None,
+            loudness_to_dialogue_ratio_lu: None,
             max_momentary_lufs: -20.0,
             max_short_term_lufs: -21.0,
             loudness_range_lu: 8.0,
@@ -607,6 +646,8 @@ mod tests {
             compliance_min_loudness_range_lu: None,
             compliance_max_loudness_range_lu: None,
             compliance_loudness_range_pass: None,
+            compliance_max_loudness_to_dialogue_ratio_lu: None,
+            compliance_loudness_to_dialogue_ratio_pass: None,
             compliance_rules_json: None,
             compliance_passed: None,
         }
@@ -667,6 +708,7 @@ mod tests {
             max_momentary_lufs: Some(-18.0),
             min_loudness_range_lu: None,
             max_loudness_range_lu: None,
+            max_loudness_to_dialogue_ratio_lu: None,
         };
         let reports =
             TimelineReport::from_points(Path::new("programme.wav"), &points, Some(&profile));
@@ -750,6 +792,45 @@ mod tests {
     }
 
     #[test]
+    fn cinematic_profile_limits_loudness_to_dialogue_ratio() {
+        let mut analysis = crate::normalize::Analysis {
+            sample_rate: 48_000,
+            channels: 2,
+            channel_roles: crate::wav::default_channel_roles(2),
+            frames: 48_000 * 60,
+            kind: crate::wav::PcmKind::S24,
+            lufs: -23.0,
+            max_momentary_lufs: -20.0,
+            max_short_term_lufs: -21.0,
+            loudness_range_lu: 8.0,
+            rms_db: -25.0,
+            sample_peak: 0.5,
+            true_peak: 0.5,
+            loudness_blocks: Vec::new(),
+        };
+        let profile = ComplianceProfile::builtin("ebu-r128-cinematic").unwrap();
+        assert!(profile.requires_dialogue());
+        assert!(
+            profile
+                .evaluate_with_dialogue(&analysis, Some(-28.0))
+                .unwrap()
+                .passed
+        );
+        analysis.lufs = -22.9;
+        let result = profile
+            .evaluate_with_dialogue(&analysis, Some(-28.0))
+            .unwrap();
+        let ldr = result
+            .rules
+            .iter()
+            .find(|rule| rule.metric == "loudness_to_dialogue_ratio_lu")
+            .unwrap();
+        assert!((ldr.measured - 5.1).abs() < 1e-12);
+        assert!(!ldr.passed);
+        assert!(!result.passed);
+    }
+
+    #[test]
     fn short_form_profile_checks_short_term_loudness() {
         let mut report = sample_report();
         let analysis = crate::normalize::Analysis {
@@ -788,6 +869,7 @@ mod tests {
             max_momentary_lufs: None,
             min_loudness_range_lu: None,
             max_loudness_range_lu: None,
+            max_loudness_to_dialogue_ratio_lu: None,
         };
         assert!(profile.validate().is_err());
     }

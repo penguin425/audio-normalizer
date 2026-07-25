@@ -2,7 +2,9 @@
 
 use forge_normalizer::cli;
 use forge_normalizer::dsp::limiter::LimiterConfig;
-use forge_normalizer::normalize::{self, Mode, OutputFormat, Plan};
+use forge_normalizer::normalize::{
+    self, DialogueSource, DialogueStandard, Mode, OutputFormat, Plan,
+};
 use forge_normalizer::preset::Preset;
 use forge_normalizer::report::{self, AnalysisReport, ComplianceProfile, TimelineReport};
 use forge_normalizer::wav::{named_channel_layout, ChannelRole, PcmKind, WavContainer};
@@ -185,6 +187,37 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
             .as_deref()
             .map(normalize::load_dialogue_ranges)
             .transpose()?;
+        let dialogue_standard = match cli.dialogue_standard.as_str() {
+            "auto"
+                if compliance
+                    .as_ref()
+                    .is_some_and(|profile| profile.max_loudness_to_dialogue_ratio_lu.is_some()) =>
+            {
+                DialogueStandard::EbuR128S4
+            }
+            "auto" | "atsc-a85" => DialogueStandard::AtscA85,
+            "ebu-r128-s4" => DialogueStandard::EbuR128S4,
+            _ => unreachable!("clap validates dialogue standards"),
+        };
+        if dialogue_standard == DialogueStandard::AtscA85
+            && compliance
+                .as_ref()
+                .is_some_and(|profile| profile.max_loudness_to_dialogue_ratio_lu.is_some())
+        {
+            return Err("LDR compliance requires --dialogue-standard ebu-r128-s4 (or auto)".into());
+        }
+        let dialogue_source = match cli.dialogue_source.as_str() {
+            "mix" => DialogueSource::Mix,
+            "center" => DialogueSource::Center,
+            "stem" => DialogueSource::Stem,
+            _ => unreachable!("clap validates dialogue sources"),
+        };
+        if dialogue_source == DialogueSource::Stem && cli.dialogue_stem.is_none() {
+            return Err("--dialogue-source stem requires --dialogue-stem".into());
+        }
+        if dialogue_source != DialogueSource::Stem && cli.dialogue_stem.is_some() {
+            return Err("--dialogue-stem requires --dialogue-source stem".into());
+        }
         if compliance
             .as_ref()
             .is_some_and(ComplianceProfile::requires_dialogue)
@@ -210,10 +243,12 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
             let dialogue = dialogue_ranges
                 .as_deref()
                 .map(|ranges| {
-                    normalize::analyze_dialogue_ranges_with_roles(
-                        input,
+                    normalize::analyze_dialogue_ranges_for_standard_with_roles(
+                        cli.dialogue_stem.as_deref().unwrap_or(input),
                         channel_roles_override.as_deref(),
                         ranges,
+                        dialogue_standard,
+                        dialogue_source,
                     )
                 })
                 .transpose()?;
@@ -245,12 +280,14 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                 print_analysis(input, &an, None);
                 if let Some(dialogue) = &dialogue {
                     eprintln!(
-                        "  dialogue: {:.2} LUFS across {} range(s), {:.3} s\n    standard: {}\n    method: {}",
+                        "  dialogue: {:.2} LUFS across {} range(s), {:.3} s\n    source: {:?}\n    standard: {}\n    method: {}\n    LDR: {:.2} LU",
                         dialogue.lufs,
                         dialogue.range_count,
                         dialogue.duration_seconds,
+                        dialogue.source,
                         dialogue.standard,
-                        dialogue.method
+                        dialogue.method,
+                        an.lufs - dialogue.lufs,
                     );
                 }
                 if let Some(profile) = &compliance {

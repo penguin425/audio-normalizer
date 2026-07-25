@@ -397,6 +397,13 @@ without the BS.1770-2+ relative-level gate. Region energies are duration
 weighted. Reports identify the measurement standard and method explicitly.
 Forge does not guess dialogue with a classifier.
 
+For cinematic EBU R 128 s4 QC, use
+`--compliance ebu-r128-cinematic --dialogue-ranges dialogue.json`. This selects
+BS.1770 absolute/relative gating and enforces a Loudness-to-Dialogue Ratio
+(LDR = programme loudness minus dialogue loudness) of at most 5 LU. Dialogue
+can come from the mix, the centre channel, or a separate stem via
+`--dialogue-source mix|center|stem` and `--dialogue-stem`.
+
 Loudness Range (LRA) is reported for every analysis, together with
 `loudness_range_stable`. EBU Tech 3341 notes that LRA is not stable during the
 first 60 seconds, so shorter measurements are marked provisional instead of

@@ -171,6 +171,32 @@ pub struct Cli {
     )]
     pub dialogue_ranges: Option<PathBuf>,
 
+    /// Dialogue measurement standard: infer from compliance, ATSC A/85, or EBU R128 s4.
+    #[arg(
+        long = "dialogue-standard",
+        value_parser = ["auto", "atsc-a85", "ebu-r128-s4"],
+        default_value = "auto",
+        requires = "dialogue_ranges"
+    )]
+    pub dialogue_standard: String,
+
+    /// Dialogue source: programme mix, centre channel, or a separate stem.
+    #[arg(
+        long = "dialogue-source",
+        value_parser = ["mix", "center", "stem"],
+        default_value = "mix",
+        requires = "dialogue_ranges"
+    )]
+    pub dialogue_source: String,
+
+    /// Separate dialogue stem used with `--dialogue-source stem`.
+    #[arg(
+        long = "dialogue-stem",
+        value_name = "PATH",
+        requires = "dialogue_ranges"
+    )]
+    pub dialogue_stem: Option<PathBuf>,
+
     /// Start analysis at this source time in seconds.
     #[arg(long = "start", value_name = "SECONDS", requires = "analyze_only")]
     pub start_seconds: Option<f64>,
