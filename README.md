@@ -26,6 +26,8 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
 * WAV stays on the fast hand-written path; other inputs transparently route
   through the universal decoder and produce the same planar-f32 buffer the DSP
   engine consumes.
+* Common metadata fields and embedded artwork are preserved across
+  normalization and remapped to the destination container's primary tag type.
 
 By default the output container follows the input where Forge can encode it
 (mp3 → mp3), and otherwise falls back to lossless WAV. `--format wav|mp3` and

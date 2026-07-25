@@ -7,6 +7,9 @@
 
 use forge_normalizer::normalize::{self, Mode, OutputFormat, Plan};
 use forge_normalizer::wav::{default_channel_roles, AudioBuffer, PcmKind, WavReader, WavWriter};
+use lofty::config::WriteOptions;
+use lofty::file::TaggedFileExt;
+use lofty::tag::{Accessor, Tag, TagExt, TagType};
 use std::f64::consts::PI;
 use std::path::PathBuf;
 
@@ -42,6 +45,12 @@ fn roundtrip_lufs_hits_target() {
     let inp = tmp_path("forge_it_lufs_in.wav");
     let outp = tmp_path("forge_it_lufs_out.wav");
     WavWriter::write(&inp, &buf, PcmKind::S16, false).unwrap();
+    let mut input_tag = Tag::new(TagType::Id3v2);
+    input_tag.set_title("Conformance Tone".to_string());
+    input_tag.set_artist("Forge Tests".to_string());
+    input_tag
+        .save_to_path(&inp, WriteOptions::default())
+        .unwrap();
 
     let plan = Plan {
         mode: Mode::Lufs,
@@ -74,6 +83,10 @@ fn roundtrip_lufs_hits_target() {
         "true peak {} exceeded ceiling",
         an2.true_peak_db()
     );
+    let output_tags = lofty::read_from_path(&outp).unwrap();
+    let output_tag = output_tags.primary_tag().unwrap();
+    assert_eq!(output_tag.title().as_deref(), Some("Conformance Tone"));
+    assert_eq!(output_tag.artist().as_deref(), Some("Forge Tests"));
     let _ = std::fs::remove_file(&inp);
     let _ = std::fs::remove_file(&outp);
 }
