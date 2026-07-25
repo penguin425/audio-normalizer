@@ -113,6 +113,39 @@ fn replaygain_tags_leave_decoded_audio_unchanged() {
 }
 
 #[test]
+fn post_encode_verification_detects_level_mismatch() {
+    let input = tmp_path("forge_it_verify_in.wav");
+    let output = tmp_path("forge_it_verify_out.flac");
+    let buf = synth_sine(48_000, 4.0, 0.1, 1000.0, 2);
+    WavWriter::write(&input, &buf, PcmKind::S24, false).unwrap();
+    let plan = Plan {
+        mode: Mode::Lufs,
+        target_lufs: -16.0,
+        target_peak_db: -1.0,
+        target_rms_db: -18.0,
+        ceiling_db: -1.0,
+        max_gain_db: None,
+        dither: false,
+        output_kind: Some(PcmKind::S24),
+        mp3_bitrate: 192,
+        mp3_quality: 2,
+    };
+    let (source, gain) =
+        normalize::normalize_one(&input, &output, &plan, OutputFormat::Flac).unwrap();
+
+    let valid = normalize::verify_file(&output, &source, gain, &plan, 0.05).unwrap();
+    assert!(valid.passed(), "{valid:?}");
+    assert!(valid.deviation < 0.01);
+
+    let wrong_gain = gain * 10.0_f32.powf(3.0 / 20.0);
+    let invalid = normalize::verify_file(&output, &source, wrong_gain, &plan, 0.5).unwrap();
+    assert!(!invalid.level_ok);
+    assert!(!invalid.passed());
+    let _ = std::fs::remove_file(input);
+    let _ = std::fs::remove_file(output);
+}
+
+#[test]
 fn roundtrip_lufs_hits_target() {
     let sr = 48_000;
     let buf = synth_sine(sr, 6.0, 0.10, 1000.0, 2);

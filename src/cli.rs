@@ -98,6 +98,17 @@ pub struct Cli {
     )]
     pub write_tags: bool,
 
+    /// Decode and measure each completed output to verify level and true peak.
+    #[arg(
+        long,
+        conflicts_with_all = ["analyze_only", "gain_only", "write_tags", "dry_run"]
+    )]
+    pub verify: bool,
+
+    /// Maximum verification deviation in LU/dB, including true-peak overshoot.
+    #[arg(long, default_value_t = 0.5, requires = "verify")]
+    pub verify_tolerance: f64,
+
     /// Apply TPDF dither when writing integer PCM.
     #[arg(long = "dither")]
     pub dither: bool,

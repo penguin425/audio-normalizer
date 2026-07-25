@@ -168,6 +168,9 @@ forge song.flac --write-tags
 # Add shared album tags to every track (audio remains untouched)
 forge album/*.flac --album --write-tags
 
+# Re-decode the completed file and fail if level/true-peak verification misses
+forge track.wav -o track.flac --verify
+
 # Print the gain that would be applied, write nothing
 forge --gain-only track.wav --target=-14
 
@@ -197,6 +200,8 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--csv` | none | Write analyze results as CSV to a file or `-` |
 | `--gain-only` | off | Print the gain; write nothing |
 | `--write-tags` | off | Write ReplayGain 2.0 metadata without changing audio |
+| `--verify` | off | Re-decode output and verify achieved level and true peak |
+| `--verify-tolerance` | `0.5` | Allowed post-encode deviation in LU/dB |
 | `--dither` | off | TPDF dither for integer PCM output |
 | `--bits` | input's | `8`/`16`/`24`/`32`/`32f`/`64f` output format |
 | `-j, --jobs` | all cores | Worker thread count |

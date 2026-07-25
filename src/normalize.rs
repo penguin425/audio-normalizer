@@ -73,6 +73,22 @@ pub struct Analysis {
     pub loudness_blocks: Vec<f64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct Verification {
+    pub output: Analysis,
+    pub expected_level: f64,
+    pub actual_level: f64,
+    pub deviation: f64,
+    pub level_ok: bool,
+    pub true_peak_ok: bool,
+}
+
+impl Verification {
+    pub fn passed(&self) -> bool {
+        self.level_ok && self.true_peak_ok
+    }
+}
+
 impl Analysis {
     pub fn duration_secs(&self) -> f64 {
         self.frames as f64 / self.sample_rate as f64
@@ -215,6 +231,57 @@ pub fn analyze_file<P: AsRef<Path>>(path: P) -> Result<Analysis, String> {
         true_peak: measured.true_peak,
         loudness_blocks: measured.ebu.gating_blocks,
     })
+}
+
+/// Re-decode an encoded output and compare it with the level predicted from
+/// the source analysis and applied gain.
+pub fn verify_file<P: AsRef<Path>>(
+    output: P,
+    source: &Analysis,
+    gain: f32,
+    plan: &Plan,
+    tolerance: f64,
+) -> Result<Verification, String> {
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err("verification tolerance must be a finite non-negative number".into());
+    }
+    let output = analyze_file(output)?;
+    Ok(verify_analysis(&output, source, gain, plan, tolerance))
+}
+
+pub fn verify_analysis(
+    output: &Analysis,
+    source: &Analysis,
+    gain: f32,
+    plan: &Plan,
+    tolerance: f64,
+) -> Verification {
+    let gain_db = 20.0 * (gain as f64).log10();
+    let (source_level, actual_level) = match plan.mode {
+        Mode::Lufs => (source.lufs, output.lufs),
+        Mode::Peak => (source.sample_peak_db(), output.sample_peak_db()),
+        Mode::Rms => (source.rms_db, output.rms_db),
+    };
+    let expected_level = source_level + gain_db;
+    let deviation = level_deviation(expected_level, actual_level);
+    Verification {
+        output: output.clone(),
+        expected_level,
+        actual_level,
+        deviation,
+        level_ok: deviation <= tolerance,
+        true_peak_ok: output.true_peak_db() <= plan.ceiling_db + tolerance,
+    }
+}
+
+fn level_deviation(expected: f64, actual: f64) -> f64 {
+    if expected == actual {
+        0.0
+    } else if expected.is_finite() && actual.is_finite() {
+        (actual - expected).abs()
+    } else {
+        f64::INFINITY
+    }
 }
 
 /// Normalize a single file in one pass (load, analyze, gain, write).
