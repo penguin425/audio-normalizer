@@ -107,6 +107,26 @@ cargo test
 When `mp3-encoding` is enabled, `build.rs` finds `libmp3lame` via pkg-config,
 then standard library paths, and prints a clear install hint if it is missing.
 
+## Releases
+
+Versioned tags automatically publish GitHub Releases containing portable Forge
+binaries for Linux x86-64, Windows x86-64, macOS Intel, and macOS Apple
+Silicon. Each release includes generated release notes and `SHA256SUMS`.
+
+Release tags must exactly match the version in `Cargo.toml`:
+
+```sh
+# After merging the Cargo.toml version change into main:
+git switch main
+git pull --ff-only
+git tag -a v0.2.0 -m "Forge v0.2.0"
+git push origin v0.2.0
+```
+
+Prebuilt binaries use the dependency-free default feature set and support all
+input formats plus WAV/FLAC output. MP3 output requires a source build with
+`--features mp3-encoding` and an installed LAME library.
+
 ### EBU conformance tests
 
 Run the optional conformance suite against the official EBU Loudness Test Set
