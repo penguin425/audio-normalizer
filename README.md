@@ -411,6 +411,13 @@ dialogue loudness when available, otherwise programme loudness. Use
 `--downmix-qc` to also render and measure the conventional WAVE-order Lo/Ro
 presentation (centre/surround at -3.01 dB, LFE omitted).
 
+Purpose-based compliance profiles avoid assuming that a named platform target
+will never change: `streaming-music` (-14 LUFS), `streaming-speech-stereo`
+(-16 LUFS), `streaming-speech-mono` (-19 LUFS), and `radio-ebu` (-23 LUFS).
+Use `--manifest delivery.json` with batch analysis to write a versioned,
+per-asset delivery record containing measurements, metadata checks, compliance
+rules, and pass/fail totals.
+
 Loudness Range (LRA) is reported for every analysis, together with
 `loudness_range_stable`. EBU Tech 3341 notes that LRA is not stable during the
 first 60 seconds, so shorter measurements are marked provisional instead of

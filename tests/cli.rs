@@ -256,6 +256,34 @@ fn codec_metadata_and_downmix_are_reported() {
 }
 
 #[test]
+fn batch_analysis_writes_a_delivery_manifest() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("one.wav");
+    let second = directory.path().join("two.wav");
+    let manifest = directory.path().join("delivery.json");
+    let bytes = wav_fixture_bytes();
+    std::fs::write(&first, &bytes).unwrap();
+    std::fs::write(&second, &bytes).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            first.to_str().unwrap(),
+            second.to_str().unwrap(),
+            "--analyze",
+            "--manifest",
+            manifest.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(manifest).unwrap()).unwrap();
+    assert_eq!(value["asset_count"], 2);
+    assert_eq!(value["passed_count"], 2);
+    assert_eq!(value["assets"][0]["path"], first.to_str().unwrap());
+}
+
+#[test]
 fn explicit_dialogue_ranges_drive_long_form_compliance() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("programme.wav");

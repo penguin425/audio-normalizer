@@ -176,6 +176,20 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
         {
             return Err("analysis report and timeline cannot both use stdout".into());
         }
+        if cli
+            .manifest
+            .as_ref()
+            .is_some_and(|path| path.as_os_str() == "-")
+            && (cli.json
+                || cli.ndjson
+                || cli.csv.as_ref().is_some_and(|path| path == Path::new("-"))
+                || cli
+                    .timeline
+                    .as_ref()
+                    .is_some_and(|path| path == Path::new("-")))
+        {
+            return Err("delivery manifest cannot share stdout with another report".into());
+        }
         let compliance = cli
             .compliance
             .as_deref()
@@ -289,7 +303,7 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
             }) {
                 qc_failed = true;
             }
-            if cli.json || cli.ndjson || cli.csv.is_some() {
+            if cli.json || cli.ndjson || cli.csv.is_some() || cli.manifest.is_some() {
                 let mut report = AnalysisReport::with_measurements_at(
                     if stdin_requested {
                         Path::new("-")
@@ -388,6 +402,17 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
         }
         if let Some(path) = &cli.timeline {
             write_timeline(path, &timeline_reports)?;
+        }
+        if let Some(path) = &cli.manifest {
+            if path.as_os_str() == "-" {
+                let stdout = io::stdout();
+                report::write_manifest(stdout.lock(), &reports)?;
+                println!();
+            } else {
+                let file = File::create(path)
+                    .map_err(|error| format!("create {}: {error}", path.display()))?;
+                report::write_manifest(file, &reports)?;
+            }
         }
         if qc_failed {
             return Err("one or more inputs failed the requested compliance/QC checks".into());
