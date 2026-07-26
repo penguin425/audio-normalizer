@@ -1,6 +1,6 @@
 [package]
 name = "forge-normalizer"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2021"
 description = "Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer (WAV/MP3/FLAC/Opus/AAC/Vorbis)"
 license = "MIT"
@@ -9,16 +9,22 @@ repository = "https://github.com/penguin425/audio-normalizer"
 [lib]
 name = "forge_normalizer"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 
 [features]
 default = []
 aac-encoding = []
 mp3-encoding = []
 opus-encoding = ["dep:audiopus_sys", "dep:ogg", "dep:opus", "dep:rubato"]
+lv2-plugin = []
 
 [[bin]]
 name = "forge"
 path = "src/main.rs"
+
+[[bin]]
+name = "forge-live"
+path = "src/bin/forge-live.rs"
 
 [dependencies]
 rayon = "1.10"
