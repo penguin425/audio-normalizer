@@ -78,7 +78,7 @@ jobs:
       - name: Build release binary
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build --locked --release --target ${{ matrix.target }} --features opus-encoding,aac-encoding,lv2-plugin,clap-plugin
+        run: cargo build --locked --release --target ${{ matrix.target }} --features opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin
 
       - name: Package Unix binary
         if: matrix.archive == 'tar'
@@ -89,7 +89,8 @@ jobs:
           mkdir "$staging"
           cp "target/${{ matrix.target }}/release/forge" \
              "target/${{ matrix.target }}/release/forge-live" \
-             "target/${{ matrix.target }}/release/forge-compare" "$staging/"
+             "target/${{ matrix.target }}/release/forge-compare" \
+             "target/${{ matrix.target }}/release/forge-container-qc" "$staging/"
           cp "target/${{ matrix.target }}/release/${{ matrix.library }}" \
              "$staging/forge-live.clap"
           if [[ "${{ matrix.asset }}" == "linux-x86_64" ]]; then
@@ -106,7 +107,7 @@ jobs:
         run: |
           $staging = "forge-v${{ needs.validate.outputs.version }}-${{ matrix.asset }}"
           New-Item -ItemType Directory -Path $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/forge.exe","target/${{ matrix.target }}/release/forge-live.exe","target/${{ matrix.target }}/release/forge-compare.exe" $staging
+          Copy-Item "target/${{ matrix.target }}/release/forge.exe","target/${{ matrix.target }}/release/forge-live.exe","target/${{ matrix.target }}/release/forge-compare.exe","target/${{ matrix.target }}/release/forge-container-qc.exe" $staging
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.library }}" "$staging/forge-live.clap"
           Copy-Item README.md, LICENSE $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"

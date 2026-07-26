@@ -9,7 +9,7 @@
 // on emphasis markers, so allow it crate-wide.
 #![allow(clippy::doc_lazy_continuation)]
 
-#[cfg(feature = "aac-encoding")]
+#[cfg(feature = "ffmpeg-encoding")]
 pub mod aac;
 pub mod adm;
 mod atomic;
@@ -18,6 +18,7 @@ pub mod clap_plugin;
 pub mod cli;
 pub mod codec_qc;
 pub mod compare;
+pub mod container_qc;
 pub mod decoder;
 pub mod dsp;
 pub mod flacenc;

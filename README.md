@@ -17,8 +17,8 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
 | **MP3** | symphonia (pure Rust) | LAME via FFI |
 | **FLAC** (16/24-bit, up to 8 channels) | symphonia (pure Rust) | flacenc (pure Rust) |
 | **Ogg Opus** (1–8 channels, through 7.1) | libopus + pure-Rust Ogg | libopus + pure-Rust Ogg |
-| **AAC / ALAC** (.m4a/.mp4) | symphonia (pure Rust) | AAC-LC/M4A via optional FFmpeg runtime |
-| **Vorbis** (.ogg) | symphonia (pure Rust) | — (output as WAV) |
+| **AAC / ALAC** (.m4a/.mp4) | symphonia (pure Rust) | AAC-LC or ALAC via optional FFmpeg runtime |
+| **Vorbis** (.ogg) | symphonia (pure Rust) | libvorbis via optional FFmpeg runtime |
 
 * Decoding of MP3/FLAC/AAC/ALAC/Vorbis is done in pure Rust by
   [`symphonia`](https://github.com/pdelanoe/symphonia) — no system codecs.
@@ -30,10 +30,13 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
   include it; source builds enable it with the `opus-encoding` feature.
 * Opus output writes RFC 7845 `R128_TRACK_GAIN` and, in album mode,
   `R128_ALBUM_GAIN` comments in signed Q7.8 dB units.
-* AAC-LC/M4A output preserves MP4 gapless timing and writes ReplayGain
-  loudness/peak metadata after measuring the encoded result.
+* AAC-LC, ALAC, and Vorbis output use the optional FFmpeg runtime. MP4 gapless
+  timing is preserved and Forge writes ReplayGain loudness/peak metadata after
+  measuring the encoded result.
 * Multichannel Opus uses RFC 7845 Mapping Family 1 and preserves standardized
   3.0 through 7.1 speaker assignments.
+* Chained Ogg Opus applies each logical stream's pre-skip, final-granule trim,
+  output gain, and channel mapping independently before concatenating samples.
 * WAV stays on the fast hand-written path; other inputs transparently route
   through the universal decoder and produce the same planar-f32 buffer the DSP
   engine consumes.
@@ -43,9 +46,9 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
   BWF v2 measured loudness fields are updated from the normalized output.
 
 By default the output container follows the input where Forge can encode it
-(FLAC → FLAC, MP3 → MP3, and M4A → M4A when AAC encoding is enabled), and
-otherwise falls back to lossless WAV.
-`--format wav|flac|mp3|opus|m4a` and
+(FLAC → FLAC, MP3 → MP3, Ogg Vorbis → Ogg Vorbis, and M4A → AAC/M4A when
+FFmpeg encoding is enabled), and otherwise falls back to lossless WAV.
+`--format wav|flac|mp3|opus|m4a|alac|vorbis` and
 the `-o` extension override this.
 
 ## Why it's fast
@@ -129,8 +132,8 @@ cargo build --release --features mp3-encoding
 # Optional statically linked Ogg Opus input/output:
 cargo build --release --features opus-encoding
 
-# Optional AAC-LC/M4A output (requires `ffmpeg` on PATH at runtime):
-cargo build --release --features aac-encoding
+# Optional AAC-LC, ALAC, and Vorbis output (`ffmpeg` on PATH at runtime):
+cargo build --release --features ffmpeg-encoding
 
 # Optional cross-platform CLAP and Linux LV2 plug-ins:
 cargo build --release --features clap-plugin,lv2-plugin
@@ -160,9 +163,9 @@ git tag -a v0.2.0 -m "Forge v0.2.0"
 git push origin v0.2.0
 ```
 
-Prebuilt binaries include statically linked Ogg Opus and the AAC/M4A adapter.
-WAV/FLAC/Opus output is self-contained; AAC-LC/M4A output additionally requires
-`ffmpeg` on `PATH`. MP3 output requires a source build with
+Prebuilt binaries include statically linked Ogg Opus and the FFmpeg codec
+adapter. WAV/FLAC/Opus output is self-contained; AAC-LC/ALAC/Vorbis output
+additionally requires `ffmpeg` on `PATH`. MP3 output requires a source build with
 `--features mp3-encoding` and an installed LAME library.
 
 ### CI baseline comparison
@@ -184,6 +187,24 @@ input/configuration error. `--format json`, `junit`, and `sarif` provide
 machine-readable CI evidence. Tolerances can also be stored in a JSON or TOML
 file passed with `--config`; findings have stable `FORGE-COMPARE-*` rule IDs
 and deterministic asset/rule/metric ordering.
+
+### Container quality control
+
+`forge-container-qc` audits the original delivery bytes without decoding them:
+
+```sh
+forge-container-qc master.bw64 --output container-qc.json
+forge-container-qc programme.opus
+```
+
+For RIFF/WAVE, RF64, and BW64 it checks declared sizes, chunk bounds and
+alignment, required/unique `fmt` and `data` chunks, `ds64` placement/table/data
+sizes/sample counts, byte rate, block alignment, BWF `bext`, and paired ADM
+`axml`/`chna` metadata. For Ogg Opus it verifies page CRCs, sequential chains,
+headers/tags, mapping-family tables, monotonic granules, pre-skip/end trim, and
+consistent layouts. Results use versioned JSON with stable `FORGE-*` rule IDs
+and separate `wrapper`, `bitstream`, and `x-check` layers. Exit status is 0 for
+pass, 1 for a QC failure, and 2 for an I/O or unsupported-format error.
 
 ### Standards conformance tests
 
@@ -626,6 +647,7 @@ src/
   realtime.rs       allocation-free live M/S meter + smoothed gain processor
   bin/forge-live.rs raw f32le real-time pipeline and NDJSON meter
   bin/forge-compare.rs delivery-manifest regression gate for CI
+  bin/forge-container-qc.rs wrapper/bitstream/metadata audit CLI
   lv2.rs            hard-real-time-capable LV2 stereo plugin ABI
   clap_plugin.rs    CLAP stereo effect, automation, state, and latency ABI
   preset.rs         named playback and broadcast loudness targets
@@ -695,10 +717,12 @@ override whose number of channels does not match the input.
 * MP3 **encoding** requires the `mp3-encoding` feature and LAME
   (`libmp3lame`) at build/run time. MP3 **decoding** and all other input
   formats need only the Rust crates (symphonia).
-* AAC can be written as AAC-LC/M4A when the `aac-encoding` feature is built and
-  `ffmpeg` is available. ALAC/Vorbis remain decode-only.
+* AAC-LC, ALAC, and Vorbis encoding require the `ffmpeg-encoding` feature and
+  `ffmpeg` at runtime. `aac-encoding` remains an alias that enables the shared
+  FFmpeg adapter for compatibility.
 * Ogg Opus supports mapping family 0 mono/stereo and mapping family 1 layouts
-  through 7.1. Chained logical streams are not yet supported.
+  through 7.1. Sequential chained streams must keep a consistent channel
+  layout; multiplexed concurrent Ogg streams are rejected.
 * By default, the true-peak ceiling is enforced transparently by reducing
   global gain. `--limiter` opts into dynamic look-ahead limiting when reaching
   the loudness target matters more than preserving dynamics unchanged.

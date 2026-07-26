@@ -1369,6 +1369,8 @@ fn parse_format(s: &str) -> OutputFormat {
         "mp3" => OutputFormat::Mp3,
         "opus" => OutputFormat::Opus,
         "m4a" => OutputFormat::M4a,
+        "alac" => OutputFormat::Alac,
+        "vorbis" => OutputFormat::Vorbis,
         _ => OutputFormat::Wav,
     }
 }
@@ -1380,6 +1382,8 @@ fn fmt_ext(f: OutputFormat) -> &'static str {
         OutputFormat::Mp3 => "mp3",
         OutputFormat::Opus => "opus",
         OutputFormat::M4a => "m4a",
+        OutputFormat::Alac => "m4a",
+        OutputFormat::Vorbis => "ogg",
     }
 }
 
@@ -1394,6 +1398,7 @@ fn infer_format(path: &Path) -> Option<OutputFormat> {
         Some("mp3") => Some(OutputFormat::Mp3),
         Some("opus") => Some(OutputFormat::Opus),
         Some("m4a") | Some("mp4") => Some(OutputFormat::M4a),
+        Some("oga") | Some("ogg") => Some(OutputFormat::Vorbis),
         Some("wav") | Some("wave") | Some("bwf") | Some("bw64") | Some("rf64") => {
             Some(OutputFormat::Wav)
         }
@@ -1413,6 +1418,16 @@ fn default_format_for_input(path: &Path) -> OutputFormat {
         Some("flac") => OutputFormat::Flac,
         Some("mp3") => OutputFormat::Mp3,
         Some("opus") => OutputFormat::Opus,
+        Some("ogg") | Some("oga") => {
+            #[cfg(feature = "ffmpeg-encoding")]
+            {
+                OutputFormat::Vorbis
+            }
+            #[cfg(not(feature = "ffmpeg-encoding"))]
+            {
+                OutputFormat::Wav
+            }
+        }
         Some("m4a") | Some("mp4") => {
             #[cfg(feature = "aac-encoding")]
             {

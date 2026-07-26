@@ -35,8 +35,8 @@ jobs:
       - name: Install FFmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
-      - name: Run tests with FFmpeg AAC support
-        run: cargo test --features aac-encoding
+      - name: Run tests with FFmpeg AAC, ALAC, and Vorbis support
+        run: cargo test --features ffmpeg-encoding
 
       - name: Install LAME
         run: sudo apt-get install -y libmp3lame-dev

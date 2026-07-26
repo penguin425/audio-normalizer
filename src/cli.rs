@@ -96,10 +96,13 @@ pub struct Cli {
     #[arg(long = "max-gain")]
     pub max_gain_db: Option<f64>,
 
-    /// Output container format: `wav`, `flac`, `mp3`, `opus`, or `m4a`. If omitted, inferred from the
+    /// Output container format: `wav`, `flac`, `mp3`, `opus`, `m4a`, `alac`, or `vorbis`. If omitted, inferred from the
     /// `-o` extension, else defaults to the input's format when supported
     /// (FLAC/MP3 are kept) and otherwise wav.
-    #[arg(long = "format", value_parser = ["wav", "flac", "mp3", "opus", "m4a"])]
+    #[arg(
+        long = "format",
+        value_parser = ["wav", "flac", "mp3", "opus", "m4a", "alac", "vorbis"]
+    )]
     pub format: Option<String>,
 
     /// Output sample rate in Hz, using delay-compensated windowed-sinc conversion.

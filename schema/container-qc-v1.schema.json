@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/container-qc-v1",
+  "title": "Forge container QC v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "generator", "path", "format", "passed", "layers", "properties"],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/container-qc-v1"
+    },
+    "generator": {"type": "string"},
+    "path": {"type": "string"},
+    "format": {"enum": ["wave", "ogg-opus"]},
+    "passed": {"type": "boolean"},
+    "layers": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["layer", "passed", "checks"],
+        "properties": {
+          "layer": {"enum": ["wrapper", "bitstream", "x-check"]},
+          "passed": {"type": "boolean"},
+          "checks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["rule_id", "passed", "message"],
+              "properties": {
+                "rule_id": {"type": "string", "pattern": "^FORGE-"},
+                "passed": {"type": "boolean"},
+                "message": {"type": "string"},
+                "observed": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "properties": {"type": "object"}
+  }
+}

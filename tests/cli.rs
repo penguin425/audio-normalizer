@@ -101,6 +101,10 @@ fn broadcast_wave_options_are_validated_and_exposed() {
 fn m4a_output_format_is_exposed() {
     let cli = Cli::try_parse_from(["forge", "track.wav", "--format", "m4a"]).unwrap();
     assert_eq!(cli.format.as_deref(), Some("m4a"));
+    for format in ["alac", "vorbis"] {
+        let cli = Cli::try_parse_from(["forge", "track.wav", "--format", format]).unwrap();
+        assert_eq!(cli.format.as_deref(), Some(format));
+    }
 }
 
 #[test]
