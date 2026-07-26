@@ -165,6 +165,26 @@ WAV/FLAC/Opus output is self-contained; AAC-LC/M4A output additionally requires
 `ffmpeg` on `PATH`. MP3 output requires a source build with
 `--features mp3-encoding` and an installed LAME library.
 
+### CI baseline comparison
+
+Release archives include `forge-compare`, a deterministic quality gate for two
+Forge delivery manifests. It detects missing assets or evidence, format
+changes, newly failing compliance/ADM/codec/EBU QC rules, and measurement drift
+beyond configurable tolerances:
+
+```sh
+forge-compare baseline.json candidate.json \
+  --loudness-tolerance-lu 0.1 \
+  --true-peak-tolerance-db 0.1 \
+  --format sarif --output forge-results.sarif
+```
+
+The command exits with 0 for a pass, 1 for a detected regression, and 2 for an
+input/configuration error. `--format json`, `junit`, and `sarif` provide
+machine-readable CI evidence. Tolerances can also be stored in a JSON or TOML
+file passed with `--config`; findings have stable `FORGE-COMPARE-*` rule IDs
+and deterministic asset/rule/metric ordering.
+
 ### Standards conformance tests
 
 Run the optional conformance suite against the official EBU Loudness Test Set
@@ -605,6 +625,7 @@ src/
   normalize.rs      analyze -> gain (ceiling-protected) -> apply -> write; album mode
   realtime.rs       allocation-free live M/S meter + smoothed gain processor
   bin/forge-live.rs raw f32le real-time pipeline and NDJSON meter
+  bin/forge-compare.rs delivery-manifest regression gate for CI
   lv2.rs            hard-real-time-capable LV2 stereo plugin ABI
   clap_plugin.rs    CLAP stereo effect, automation, state, and latency ABI
   preset.rs         named playback and broadcast loudness targets

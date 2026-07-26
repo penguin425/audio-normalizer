@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/manifest-comparison-v1",
+  "title": "Forge manifest comparison v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generator",
+    "baseline_schema",
+    "candidate_schema",
+    "passed",
+    "compared_assets",
+    "compared_asset_paths",
+    "error_count",
+    "warning_count",
+    "findings"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/manifest-comparison-v1"
+    },
+    "generator": {"type": "string"},
+    "baseline_schema": {"type": "string"},
+    "candidate_schema": {"type": "string"},
+    "passed": {"type": "boolean"},
+    "compared_assets": {"type": "integer", "minimum": 0},
+    "compared_asset_paths": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "error_count": {"type": "integer", "minimum": 0},
+    "warning_count": {"type": "integer", "minimum": 0},
+    "findings": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/finding"}
+    }
+  },
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "rule_id", "asset", "metric", "message"],
+      "properties": {
+        "level": {"enum": ["error", "warning", "note"]},
+        "rule_id": {"type": "string", "pattern": "^FORGE-COMPARE-"},
+        "asset": {"type": "string"},
+        "metric": {"type": "string"},
+        "baseline": {},
+        "candidate": {},
+        "tolerance": {"type": "number", "minimum": 0},
+        "message": {"type": "string"}
+      }
+    }
+  }
+}

@@ -17,6 +17,7 @@ mod atomic;
 pub mod clap_plugin;
 pub mod cli;
 pub mod codec_qc;
+pub mod compare;
 pub mod decoder;
 pub mod dsp;
 pub mod flacenc;

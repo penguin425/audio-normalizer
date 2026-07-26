@@ -1,7 +1,7 @@
 use forge_normalizer::normalize::Analysis;
 use forge_normalizer::report::{self, AnalysisReport};
 use forge_normalizer::wav::{ChannelRole, PcmKind};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 #[test]
 fn emitted_delivery_manifest_conforms_to_published_schema() {
@@ -26,6 +26,35 @@ fn emitted_delivery_manifest_conforms_to_published_schema() {
     let instance: Value = serde_json::from_slice(&output).expect("manifest JSON");
     let schema: Value =
         serde_json::from_str(include_str!("../schema/delivery-manifest-v2.schema.json"))
+            .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
+
+#[test]
+fn emitted_comparison_conforms_to_published_schema() {
+    let manifest = serde_json::to_vec(&json!({
+        "schema": "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v2",
+        "assets": [{
+            "path": "programme.wav",
+            "integrated_lufs": -23.0,
+            "true_peak_dbtp": -1.2
+        }]
+    }))
+    .unwrap();
+    let comparison = forge_normalizer::compare::compare_manifests(
+        &manifest,
+        &manifest,
+        &forge_normalizer::compare::CompareOptions::default(),
+    )
+    .unwrap();
+    let instance = serde_json::to_value(comparison).unwrap();
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/manifest-comparison-v1.schema.json"))
             .expect("schema JSON");
     let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
     let errors: Vec<_> = validator
