@@ -37,6 +37,7 @@ pub mod opus;
 mod pcm_container_qc;
 pub mod presentation_qc;
 pub mod preset;
+pub mod provenance;
 pub mod qc;
 pub mod realtime;
 pub mod report;
