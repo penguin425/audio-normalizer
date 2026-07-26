@@ -33,6 +33,7 @@ pub mod metadata;
 #[cfg(feature = "mp3-encoding")]
 pub mod mp3enc;
 pub mod normalize;
+mod ogg_qc;
 #[cfg(feature = "opus-encoding")]
 pub mod opus;
 mod pcm_container_qc;

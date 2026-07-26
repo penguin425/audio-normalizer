@@ -155,6 +155,49 @@ fn emitted_flac_container_qc_conforms_to_published_schema() {
 }
 
 #[test]
+fn emitted_default_ogg_opus_qc_conforms_to_published_schema() {
+    use ogg::writing::{PacketWriteEndInfo, PacketWriter};
+    use std::io::Write;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("programme.opus");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut writer = PacketWriter::new(std::io::BufWriter::new(file));
+    let mut head = b"OpusHead\x01\x01".to_vec();
+    head.extend_from_slice(&0_u16.to_le_bytes());
+    head.extend_from_slice(&48_000_u32.to_le_bytes());
+    head.extend_from_slice(&0_i16.to_le_bytes());
+    head.push(0);
+    let mut tags = b"OpusTags".to_vec();
+    tags.extend_from_slice(&4_u32.to_le_bytes());
+    tags.extend_from_slice(b"test");
+    tags.extend_from_slice(&0_u32.to_le_bytes());
+    writer
+        .write_packet(head, 42, PacketWriteEndInfo::EndPage, 0)
+        .unwrap();
+    writer
+        .write_packet(tags, 42, PacketWriteEndInfo::EndPage, 0)
+        .unwrap();
+    writer
+        .write_packet(vec![0], 42, PacketWriteEndInfo::EndStream, 480)
+        .unwrap();
+    writer.into_inner().flush().unwrap();
+
+    let audit = forge_normalizer::container_qc::audit(&path).unwrap();
+    assert!(audit.passed, "{audit:#?}");
+    assert_eq!(audit.format, "ogg-opus");
+    let instance = serde_json::to_value(audit).unwrap();
+    let schema: Value = serde_json::from_str(include_str!("../schema/container-qc-v1.schema.json"))
+        .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
+
+#[test]
 fn emitted_isobmff_container_qc_conforms_to_published_schema() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("truncated.m4a");

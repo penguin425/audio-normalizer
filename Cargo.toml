@@ -16,7 +16,7 @@ default = []
 ffmpeg-encoding = []
 aac-encoding = ["ffmpeg-encoding"]
 mp3-encoding = []
-opus-encoding = ["dep:audiopus_sys", "dep:ogg", "dep:opus"]
+opus-encoding = ["dep:audiopus_sys", "dep:opus"]
 lv2-plugin = []
 clap-plugin = ["dep:clack-plugin", "dep:clack-extensions"]
 
@@ -71,7 +71,7 @@ clack-extensions = { version = "0.1", optional = true, features = ["audio-ports"
 flacenc = { version = "0.5.1", default-features = false }
 tempfile = "3"
 audiopus_sys = { version = "0.2.2", features = ["static"], optional = true }
-ogg = { version = "0.9.2", optional = true }
+ogg = "0.9.2"
 opus = { version = "0.3.1", optional = true }
 rubato = { version = "0.16.2", default-features = false }
 
