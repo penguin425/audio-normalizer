@@ -8,7 +8,7 @@ use std::process::ExitCode;
 #[command(
     name = "forge-container-qc",
     version,
-    about = "Audit WAVE/RF64/BW64, Ogg Opus, and ISO-BMFF MP4/M4A/fMP4 delivery containers"
+    about = "Audit WAVE, AIFF/AIFC, CAF, AU, Ogg Opus, and ISO-BMFF delivery containers"
 )]
 struct Cli {
     input: PathBuf,

@@ -34,6 +34,7 @@ pub mod mp3enc;
 pub mod normalize;
 #[cfg(feature = "opus-encoding")]
 pub mod opus;
+mod pcm_container_qc;
 pub mod presentation_qc;
 pub mod preset;
 pub mod qc;

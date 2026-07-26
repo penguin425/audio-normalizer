@@ -195,11 +195,23 @@ and deterministic asset/rule/metric ordering.
 ```sh
 forge-container-qc master.bw64 --output container-qc.json
 forge-container-qc programme.opus
+forge-container-qc archive.aiff
+forge-container-qc capture.caf
 ```
 
 WAVE/RF64/BW64 chunk tables are scanned with bounded memory: audio payloads are
 seeked over rather than loaded, including files larger than 4 GiB. Oversized
 control chunks and pathological chunk counts fail closed with stable rule IDs.
+
+AIFF/AIFF-C audits validate `FORM` and even-byte chunk boundaries, unique
+`COMM`/`SSND`, the 80-bit sample rate, PCM frame geometry, and AIFF-C `FVER`,
+compression type, and Pascal-string bounds. CAF audits follow Apple's Core
+Audio Format 1.0 rules for the versioned header, required `desc`/`data`
+placement, variable-packet `pakt` requirements, channel layouts, and
+constant-packet byte alignment. Sun/NeXT AU audits validate its big-endian
+header, annotation/data boundary, declared data size, audio description, and
+linear-PCM frame alignment. All three scanners skip audio payloads and cap the
+number of control chunks.
 
 For RIFF/WAVE, RF64, and BW64 it checks declared sizes, chunk bounds and
 alignment, required/unique `fmt` and `data` chunks, `ds64` placement/table/data

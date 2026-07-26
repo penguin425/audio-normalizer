@@ -102,6 +102,34 @@ fn emitted_container_qc_conforms_to_published_schema() {
 }
 
 #[test]
+fn emitted_additional_pcm_container_qc_conforms_to_published_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("programme.au");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b".snd");
+    bytes.extend_from_slice(&24_u32.to_be_bytes());
+    bytes.extend_from_slice(&4_u32.to_be_bytes());
+    bytes.extend_from_slice(&3_u32.to_be_bytes());
+    bytes.extend_from_slice(&48_000_u32.to_be_bytes());
+    bytes.extend_from_slice(&1_u32.to_be_bytes());
+    bytes.extend_from_slice(&[0, 1, 0, 2]);
+    std::fs::write(&path, bytes).unwrap();
+
+    let audit = forge_normalizer::container_qc::audit(&path).unwrap();
+    assert_eq!(audit.format, "au");
+    assert!(audit.passed);
+    let instance = serde_json::to_value(audit).unwrap();
+    let schema: Value = serde_json::from_str(include_str!("../schema/container-qc-v1.schema.json"))
+        .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
+
+#[test]
 fn emitted_isobmff_container_qc_conforms_to_published_schema() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("truncated.m4a");
