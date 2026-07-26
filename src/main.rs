@@ -2,6 +2,7 @@
 
 use forge_normalizer::adm::{self, ReferenceRendererOptions};
 use forge_normalizer::cli;
+use forge_normalizer::codec_qc;
 use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::normalize::{
     self, DialogueSource, DialogueStandard, Mode, OutputFormat, Plan,
@@ -122,6 +123,9 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
     }
     if !cli.verify_tolerance.is_finite() || cli.verify_tolerance < 0.0 {
         return Err("--verify-tolerance must be a finite non-negative number".into());
+    }
+    if !cli.codec_qc_tolerance.is_finite() || cli.codec_qc_tolerance < 0.0 {
+        return Err("--codec-qc-tolerance must be a finite non-negative number".into());
     }
     if cli.limiter
         && (!cli.limiter_lookahead.is_finite()
@@ -252,6 +256,12 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
         if cli.codec_metadata.is_some() && cli.inputs.len() != 1 {
             return Err("--codec-metadata currently requires exactly one input".into());
         }
+        if cli.codec_reference.is_some() && cli.inputs.len() != 1 {
+            return Err("--codec-reference requires exactly one input".into());
+        }
+        if stdin_requested && cli.codec_qc {
+            return Err("--codec-qc cannot be used with stdin".into());
+        }
         if stdin_requested && cli.downmix_qc {
             return Err("--downmix-qc cannot be used with stdin".into());
         }
@@ -334,8 +344,28 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
             let codec_qc = codec_metadata
                 .as_ref()
                 .map(|metadata| metadata.evaluate(&an, dialogue.as_ref()));
+            let automatic_codec_qc = cli
+                .codec_qc
+                .then(|| {
+                    codec_qc::probe_and_evaluate(
+                        input,
+                        cli.codec_prober
+                            .as_deref()
+                            .unwrap_or_else(|| Path::new("ffprobe")),
+                        &an,
+                        dialogue.as_ref(),
+                        cli.codec_reference.as_deref(),
+                        cli.codec_qc_tolerance,
+                    )
+                })
+                .transpose()?;
             if codec_qc.as_ref().is_some_and(|result| {
                 result.dialnorm_pass == Some(false) || result.encoded_loudness_pass == Some(false)
+            }) {
+                qc_failed = true;
+            }
+            if automatic_codec_qc.as_ref().is_some_and(|result| {
+                result.dialnorm_pass == Some(false) || result.roundtrip_pass == Some(false)
             }) {
                 qc_failed = true;
             }
@@ -398,6 +428,31 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                     report.codec_encoded_loudness_deviation_lu =
                         codec.encoded_loudness_deviation_lu;
                     report.codec_encoded_loudness_pass = codec.encoded_loudness_pass;
+                }
+                if let Some(codec) = &automatic_codec_qc {
+                    report.codec = Some(codec.probe.codec.clone());
+                    report.codec_dialnorm_lkfs = codec.probe.dialnorm_lkfs;
+                    report.codec_downmix_mode = codec.probe.downmix_mode.clone();
+                    report.codec_loudness_basis = Some(codec.loudness_basis);
+                    report.codec_dialnorm_deviation_lu = codec.dialnorm_deviation_lu;
+                    report.codec_dialnorm_pass = codec.dialnorm_pass;
+                    report.codec_probe_tool = Some(codec.probe.tool.clone());
+                    report.codec_probe_schema = Some(codec_qc::PROBE_SCHEMA);
+                    report.codec_profile = codec.probe.profile.clone();
+                    report.codec_container = codec.probe.container.clone();
+                    report.codec_sample_rate_hz = codec.probe.sample_rate_hz;
+                    report.codec_channels = codec.probe.channels;
+                    report.codec_channel_layout = codec.probe.channel_layout.clone();
+                    report.codec_bitrate_bps = codec.probe.bitrate_bps;
+                    report.codec_drc_profile = codec.probe.drc_profile.clone();
+                    report.codec_reference_path = codec
+                        .reference_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned());
+                    report.codec_loudness_drift_lu = codec.loudness_drift_lu;
+                    report.codec_true_peak_drift_db = codec.true_peak_drift_db;
+                    report.codec_duration_drift_seconds = codec.duration_drift_seconds;
+                    report.codec_roundtrip_pass = codec.roundtrip_pass;
                 }
                 if let Some(adm) = &adm_qc {
                     report.adm_axml_present = Some(adm.axml_present);
@@ -487,6 +542,44 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                         qc_status(codec.dialnorm_pass),
                         codec.encoded_loudness_deviation_lu,
                         qc_status(codec.encoded_loudness_pass),
+                    );
+                }
+                if let Some(codec) = &automatic_codec_qc {
+                    eprintln!(
+                        "  codec QC: {}{}{}{} [{}]\n    prober: {} ({})\n    dialnorm deviation: {:?} LU [{}]\n    reference drift: loudness {:?} LU, true peak {:?} dB, duration {:?} s [{}]",
+                        codec.probe.codec,
+                        codec
+                            .probe
+                            .profile
+                            .as_deref()
+                            .map(|value| format!(" profile={value}"))
+                            .unwrap_or_default(),
+                        codec
+                            .probe
+                            .container
+                            .as_deref()
+                            .map(|value| format!(" container={value}"))
+                            .unwrap_or_default(),
+                        codec
+                            .probe
+                            .bitrate_bps
+                            .map(|value| format!(" bitrate={value}"))
+                            .unwrap_or_default(),
+                        if codec.dialnorm_pass != Some(false)
+                            && codec.roundtrip_pass != Some(false)
+                        {
+                            "PASS"
+                        } else {
+                            "FAIL"
+                        },
+                        codec.probe.tool,
+                        codec_qc::PROBE_SCHEMA,
+                        codec.dialnorm_deviation_lu,
+                        qc_status(codec.dialnorm_pass),
+                        codec.loudness_drift_lu,
+                        codec.true_peak_drift_db,
+                        codec.duration_drift_seconds,
+                        qc_status(codec.roundtrip_pass),
                     );
                 }
                 if let Some(adm) = &adm_qc {

@@ -303,6 +303,60 @@ fn codec_metadata_and_downmix_are_reported() {
         .contains("LFE omitted"));
 }
 
+#[cfg(unix)]
+#[test]
+fn automatic_codec_probe_and_reference_roundtrip_are_reported() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("delivery.wav");
+    let prober = directory.path().join("fake-ffprobe");
+    std::fs::write(&input, wav_fixture_bytes()).unwrap();
+    std::fs::write(
+        &prober,
+        r#"#!/bin/sh
+printf '%s\n' '{"streams":[{"codec_name":"eac3","profile":"E-AC-3","sample_rate":"48000","channels":1,"channel_layout":"mono","bit_rate":"192000","side_data_list":[{"dialnorm":24,"downmix_mode":"loro","drc_profile":"film_standard"}]}],"format":{"format_name":"eac3"}}'
+"#,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&prober).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&prober, permissions).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            input.to_str().unwrap(),
+            "--analyze",
+            "--json",
+            "--codec-qc",
+            "--codec-prober",
+            prober.to_str().unwrap(),
+            "--codec-reference",
+            input.to_str().unwrap(),
+            "--codec-qc-tolerance",
+            "100",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report[0]["codec"], "eac3");
+    assert_eq!(report[0]["codec_profile"], "E-AC-3");
+    assert_eq!(report[0]["codec_container"], "eac3");
+    assert_eq!(report[0]["codec_bitrate_bps"], 192_000);
+    assert_eq!(report[0]["codec_downmix_mode"], "loro");
+    assert_eq!(report[0]["codec_drc_profile"], "film_standard");
+    assert_eq!(report[0]["codec_probe_schema"], "ffprobe-json-v1");
+    assert_eq!(report[0]["codec_loudness_drift_lu"], 0.0);
+    assert_eq!(report[0]["codec_true_peak_drift_db"], 0.0);
+    assert_eq!(report[0]["codec_duration_drift_seconds"], 0.0);
+    assert_eq!(report[0]["codec_roundtrip_pass"], true);
+}
+
 #[test]
 fn batch_analysis_writes_a_delivery_manifest() {
     let directory = tempfile::tempdir().unwrap();
@@ -492,3 +546,31 @@ fn toml_job_config_is_relative_and_cli_options_override_it() {
 }
 use clap::Parser;
 use forge_normalizer::cli::Cli;
+
+#[test]
+fn automatic_codec_qc_options_are_scoped_and_exclusive() {
+    assert!(Cli::try_parse_from(["forge", "track.eac3", "--codec-qc"]).is_err());
+    let cli = Cli::try_parse_from([
+        "forge",
+        "track.eac3",
+        "--analyze",
+        "--codec-qc",
+        "--codec-prober",
+        "custom-probe",
+    ])
+    .unwrap();
+    assert!(cli.codec_qc);
+    assert_eq!(
+        cli.codec_prober.as_deref(),
+        Some(std::path::Path::new("custom-probe"))
+    );
+    assert!(Cli::try_parse_from([
+        "forge",
+        "track.eac3",
+        "--analyze",
+        "--codec-qc",
+        "--codec-metadata",
+        "delivery.json"
+    ])
+    .is_err());
+}

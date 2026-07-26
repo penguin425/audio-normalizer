@@ -319,6 +319,10 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--ndjson` | off | Write one compact JSON analysis object per line |
 | `--csv` | none | Write analyze results as CSV to a file or `-` |
 | `--compliance` | none | Built-in delivery profile name or custom `.json`/`.toml` profile |
+| `--codec-qc` | off | Extract codec metadata automatically and run decoded-delivery QC |
+| `--codec-prober` | `ffprobe` | ffprobe-compatible metadata extractor used by `--codec-qc` |
+| `--codec-reference` | none | Unencoded reference for loudness/peak/duration round-trip comparison |
+| `--codec-qc-tolerance` | `0.5` | Allowed codec/dialnorm deviation in LU/dB |
 | `--dialogue-ranges` | none | Explicit dialogue/anchor regions from JSON/TOML |
 | `--start` | `0` | Analysis start time in source seconds |
 | `--duration` | to end | Maximum analysis duration in seconds |
@@ -419,12 +423,29 @@ BS.1770 absolute/relative gating and enforces a Loudness-to-Dialogue Ratio
 can come from the mix, the centre channel, or a separate stem via
 `--dialogue-source mix|center|stem` and `--dialogue-stem`.
 
-Codec delivery QC accepts a reviewable JSON/TOML sidecar with `--codec-metadata`.
-Fields include `codec`, `dialnorm_lkfs`, `encoded_loudness_lufs`,
-`downmix_mode`, and `tolerance_lu`. Dialnorm is checked against measured
-dialogue loudness when available, otherwise programme loudness. Use
-`--downmix-qc` to also render and measure the conventional WAVE-order Lo/Ro
-presentation (centre/surround at -3.01 dB, LFE omitted).
+Codec delivery QC can extract metadata directly with an optional
+ffprobe-compatible executable:
+
+```bash
+forge delivery.eac3 --analyze --json --codec-qc
+forge delivery.m4a --analyze --manifest delivery.json \
+  --codec-qc --codec-reference master.wav
+```
+
+The report records codec/profile, container, bitrate, sample rate, channel
+layout, dialnorm, downmix and DRC metadata when the prober exposes them. With
+`--codec-reference`, Forge decodes and measures both files and gates loudness,
+true-peak, and sample-accurate duration drift. The exact prober path and
+`ffprobe-json-v1` extraction schema are preserved for auditability. `ffprobe`
+is not a build or runtime requirement unless `--codec-qc` is requested.
+
+The reviewable JSON/TOML sidecar flow remains available through
+`--codec-metadata`. Fields include `codec`, `dialnorm_lkfs`,
+`encoded_loudness_lufs`, `downmix_mode`, and `tolerance_lu`. Dialnorm is
+checked against measured dialogue loudness when available, otherwise
+programme loudness. Use `--downmix-qc` to also render and measure the
+conventional WAVE-order Lo/Ro presentation (centre/surround at -3.01 dB, LFE
+omitted).
 
 Purpose-based compliance profiles avoid assuming that a named platform target
 will never change: `streaming-music` (-14 LUFS), `streaming-speech-stereo`

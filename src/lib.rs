@@ -14,6 +14,7 @@ pub mod aac;
 pub mod adm;
 mod atomic;
 pub mod cli;
+pub mod codec_qc;
 pub mod decoder;
 pub mod dsp;
 pub mod flacenc;
