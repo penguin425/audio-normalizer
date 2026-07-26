@@ -53,6 +53,8 @@ fn preset_is_accepted_but_explicit_target_conflicts() {
     assert!(
         Cli::try_parse_from(["forge", "track.wav", "--preset", "spotify", "--target=-12"]).is_err()
     );
+    let arib = Cli::try_parse_from(["forge", "track.wav", "--preset", "arib-tr-b32"]).unwrap();
+    assert_eq!(arib.preset.as_deref(), Some("arib-tr-b32"));
 }
 
 #[test]

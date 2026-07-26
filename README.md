@@ -548,11 +548,14 @@ verify_retries = 2
 | `podcast-mono` | −19 LUFS | −1 dBTP | Common mono podcast delivery |
 | `ebu-r128` | −23 LUFS | −1 dBTP | EBU R 128 programme delivery |
 | `atsc-a85` | −24 LUFS | −2 dBTP | ATSC A/85 television delivery |
+| `arib-tr-b32` | −24 LKFS | −1 dBTP | ARIB TR-B32 Japanese digital television delivery |
 
 Spotify, EBU R 128, and ATSC A/85 values follow their published guidance:
 [Spotify loudness normalization](https://support.spotify.com/artists/article/loudness-normalization/),
 [EBU Tech 3343](https://tech.ebu.ch/docs/tech/tech3343.pdf), and
 [ATSC A/85](https://www.atsc.org/atsc-documents/a85-techniques-for-establishing-and-maintaining-audio-loudness-for-digital-television/).
+The Japanese broadcast preset follows
+[ARIB TR-B32 1.6](https://www.arib.or.jp/english/std_tr/broadcasting/desc/tr-b32.html).
 Service playback behavior can change and is not a substitute for a distributor's
 delivery specification; Apple Music, YouTube, and podcast entries are practical
 playback references rather than acceptance guarantees.
@@ -562,6 +565,8 @@ playback references rather than acceptance guarantees.
 | Name | Integrated loudness | Additional limits |
 |------|---------------------|-------------------|
 | `ebu-r128` | −23.0 ±0.2 LUFS | true peak ≤ −1 dBTP |
+| `ebu-r128-live` | −23.0 ±1.0 LUFS | EBU R 128 v5 live-programme allowance; true peak ≤ −1 dBTP |
+| `ebu-r128-creative` | ≤ −22.8 LUFS | explicitly signalled lower-target exception; true peak ≤ −1 dBTP |
 | `ebu-r128-s2-streaming` | −23.0 ±0.2 LUFS | EBU R 128 s2 v3.0 unchanged stream; true peak ≤ −1 dBTP |
 | `ebu-r128-s2-streaming-adapted` | −18.0 ±0.2 LUFS | EBU R 128 s2 v3.0 interim adaptation; true peak ≤ −1 dBTP |
 | `ebu-r128-s2-music-low-plr` | −16.0 ±0.2 LUFS | EBU R 128 s2 v3.0 allowance for mostly-music PLR < 15 dB; true peak ≤ −1 dBTP |
@@ -569,9 +574,18 @@ playback references rather than acceptance guarantees.
 | `ebu-r128-short` | −23.0 ±0.2 LUFS | true peak ≤ −1 dBTP; max short-term ≤ −18 LUFS |
 | `atsc-a85-short` | −24 ±2 LUFS | true peak ≤ −2 dBTP |
 | `atsc-a85-long` | −24 ±2 LKFS/LUFS, explicit dialogue regions | true peak ≤ −2 dBTP |
+| `arib-tr-b32` | −24 ±1 LKFS/LUFS | ARIB TR-B32 1.6 completed-programme delivery; true peak ≤ −1 dBTP |
+| `arib-tr-b32-creative` | ≤ −23 LKFS/LUFS | explicitly signalled creative lower-target exception; true peak ≤ −1 dBTP |
 | `aes77-assorted` | ≤ −16 LUFS (target −18, upper tolerance +2) | true peak ≤ −1 dBTP |
 | `aes77-music-track` | −16.0 ±0.2 LUFS | true peak ≤ −1 dBTP |
 | `aes77-interstitial` | −18.0 ±0.2 LUFS | true peak ≤ −1 dBTP |
+
+ARIB TR-B32 1.6 extends measurement guidance to object-based programmes.
+The built-in ARIB profiles evaluate the selected linear PCM presentation; an
+object master must first be rendered into every delivered presentation and
+each render audited (for ADM workflows, use `forge-presentation-qc` or the
+external BS.2127 renderer adapter). Forge does not label an unrendered object
+bed as compliant.
 
 ATSC long-form programme compliance uses dialogue/anchor loudness and is
 therefore deliberately not implied by `atsc-a85-short`. Supply deterministic,

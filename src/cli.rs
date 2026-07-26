@@ -62,7 +62,8 @@ pub struct Cli {
             "podcast-stereo",
             "podcast-mono",
             "ebu-r128",
-            "atsc-a85"
+            "atsc-a85",
+            "arib-tr-b32"
         ],
         conflicts_with_all = [
             "mode",
@@ -768,6 +769,7 @@ impl Cli {
                     "podcast-mono",
                     "ebu-r128",
                     "atsc-a85",
+                    "arib-tr-b32",
                 ],
             )?;
         }
