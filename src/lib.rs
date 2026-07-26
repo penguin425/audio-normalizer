@@ -27,6 +27,7 @@ pub mod normalize;
 #[cfg(feature = "opus-encoding")]
 pub mod opus;
 pub mod preset;
+pub mod qc;
 pub mod realtime;
 pub mod report;
 pub mod wav;

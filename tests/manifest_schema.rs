@@ -25,7 +25,7 @@ fn emitted_delivery_manifest_conforms_to_published_schema() {
     report::write_manifest(&mut output, &reports).expect("manifest serialization");
     let instance: Value = serde_json::from_slice(&output).expect("manifest JSON");
     let schema: Value =
-        serde_json::from_str(include_str!("../schema/delivery-manifest-v1.schema.json"))
+        serde_json::from_str(include_str!("../schema/delivery-manifest-v2.schema.json"))
             .expect("schema JSON");
     let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
     let errors: Vec<_> = validator
