@@ -155,6 +155,32 @@ fn emitted_flac_container_qc_conforms_to_published_schema() {
 }
 
 #[test]
+fn emitted_mp3_container_qc_conforms_to_published_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("programme.mp3");
+    let header = [0xff, 0xfb, 0x90, 0x00];
+    let mut bytes = Vec::new();
+    for _ in 0..3 {
+        bytes.extend_from_slice(&header);
+        bytes.resize(bytes.len() + 413, 0);
+    }
+    std::fs::write(&path, bytes).unwrap();
+
+    let audit = forge_normalizer::container_qc::audit(&path).unwrap();
+    assert_eq!(audit.format, "mp3");
+    assert!(audit.passed, "{audit:#?}");
+    let instance = serde_json::to_value(audit).unwrap();
+    let schema: Value = serde_json::from_str(include_str!("../schema/container-qc-v1.schema.json"))
+        .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
+
+#[test]
 fn emitted_default_ogg_opus_qc_conforms_to_published_schema() {
     use ogg::writing::{PacketWriteEndInfo, PacketWriter};
     use std::io::Write;

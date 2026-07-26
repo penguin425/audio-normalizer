@@ -7,6 +7,9 @@ applies a single linear gain so the output hits your target — while guaranteei
 the **inter-sample true peak** never exceeds a ceiling, the way Spotify/Apple
 mastering does.
 
+See [ROADMAP.md](ROADMAP.md) for the standards-backed implementation backlog,
+research candidates, and acceptance criteria.
+
 ## Formats
 
 Forge reads and writes a wide range of formats through a format-agnostic engine:
@@ -198,6 +201,7 @@ forge-container-qc programme.opus
 forge-container-qc archive.aiff
 forge-container-qc capture.caf
 forge-container-qc master.flac
+forge-container-qc delivery.mp3
 ```
 
 WAVE/RF64/BW64 chunk tables are scanned with bounded memory: audio payloads are
@@ -221,6 +225,15 @@ points, comments, cuesheet tracks/indexes, and picture fields. A strict
 streaming decode checks frame/header CRCs, decoded sample count and format, and
 the PCM MD5 digest when present, without buffering the complete decoded
 programme.
+
+Native MP3 audits validate ID3v2.2/2.3/2.4 headers, extended headers, frames,
+padding, optional footer bounds, ID3v1/APEv2 trailing metadata, and every
+MPEG-1/2/2.5 Layer III frame boundary. Stream version, sample rate, channel
+count, CBR/VBR bitrates, and CRC-protected frame counts are exposed without
+requiring LAME. Optional Xing/Info frame and byte counts, seek-table ordering,
+CBR identity, and LAME encoder delay/padding are cross-checked against the
+scanned stream. Forge MP3 output now backpatches the Info/LAME tag so gapless
+duration is preserved; mono encoding uses LAME's planar API.
 
 For RIFF/WAVE, RF64, and BW64 it checks declared sizes, chunk bounds and
 alignment, required/unique `fmt` and `data` chunks, `ds64` placement/table/data
@@ -364,8 +377,8 @@ CI runs the EBU and ITU suites as separate required evidence.
 
 Property tests exercise arbitrary WAVE and delivery-manifest bytes during the
 normal Rust test suite. Four `cargo-fuzz` targets cover the WAVE decoder,
-delivery-container QC including Ogg Opus/Vorbis, ADM XML profile validation,
-and delivery-manifest comparison:
+delivery-container QC including FLAC, MP3, and Ogg Opus/Vorbis, ADM XML profile
+validation, and delivery-manifest comparison:
 
 ```sh
 cargo fuzz run wave_reader
@@ -871,7 +884,8 @@ src/
   decoder.rs        full-buffer and streaming universal decoders
   flacenc.rs        bounded-memory pure-Rust FLAC encoder
   opus.rs           RFC 7845 mono/stereo and Mapping Family 1 Ogg Opus I/O
-  mp3enc.rs         MP3 encoder via LAME FFI (interleaved f32 -> MP3 bytes)
+  mp3enc.rs         mono/stereo LAME encoder with gapless Info/LAME backpatch
+  mp3_qc.rs         ID3, MPEG Layer III, Xing/Info, and LAME structural QC
   wav/
     format.rs       PcmKind / WaveFormat
     reader.rs       RIFF/WAVE, RF64, and BW64 demuxer

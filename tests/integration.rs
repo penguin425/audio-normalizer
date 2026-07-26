@@ -5,6 +5,8 @@
 //! met. No external tools or fixtures are required, so `cargo test` validates
 //! the entire read -> measure -> gain -> write -> read round trip.
 
+#[cfg(feature = "mp3-encoding")]
+use forge_normalizer::container_qc;
 use forge_normalizer::decoder;
 use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::normalize::{self, DialogueRange, Mode, OutputFormat, Plan};
@@ -1248,6 +1250,13 @@ fn mp3_encode_and_decode_roundtrip() {
     // The MP3 file must be a real, non-empty encoded stream.
     let mp3_size = std::fs::metadata(&mp3_out).unwrap().len();
     assert!(mp3_size > 50_000, "mp3 output too small: {mp3_size} bytes");
+    let container = container_qc::audit(&mp3_out).unwrap();
+    assert!(container.passed, "{container:#?}");
+    assert_eq!(container.format, "mp3");
+    assert_eq!(container.properties["lame"]["encoder"], "LAME3.100");
+    assert!(container.properties["lame"]["encoder_delay"]
+        .as_u64()
+        .is_some_and(|value| value > 0));
 
     // MP3 -> planar buffer (decode via symphonia) and re-measure.
     let mp3_buf = normalize::load(&mp3_out).unwrap();
@@ -1266,6 +1275,24 @@ fn mp3_encode_and_decode_roundtrip() {
 
     let _ = std::fs::remove_file(&wav_in);
     let _ = std::fs::remove_file(&mp3_out);
+}
+
+#[test]
+#[cfg(feature = "mp3-encoding")]
+fn mp3_mono_encoding_is_gapless_and_does_not_abort_lame() {
+    let buffer = synth_sine(44_100, 2.0, 0.1, 440.0, 1);
+    let output = tmp_path("forge_it_mp3_mono.mp3");
+    forge_normalizer::mp3enc::write_mp3(&output, &buffer, 192, 2).unwrap();
+
+    let audit = container_qc::audit(&output).unwrap();
+    assert!(audit.passed, "{audit:#?}");
+    assert_eq!(audit.properties["channels"], 1);
+    assert_eq!(audit.properties["gapless_samples"], 88_200);
+    let decoded = normalize::load(&output).unwrap();
+    assert_eq!(decoded.channels, 1);
+    assert_eq!(decoded.sample_rate, 44_100);
+
+    let _ = std::fs::remove_file(output);
 }
 
 #[test]

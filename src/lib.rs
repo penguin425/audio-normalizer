@@ -30,6 +30,7 @@ mod isobmff_qc;
 #[cfg(feature = "lv2-plugin")]
 mod lv2;
 pub mod metadata;
+mod mp3_qc;
 #[cfg(feature = "mp3-encoding")]
 pub mod mp3enc;
 pub mod normalize;
