@@ -252,6 +252,33 @@ The profiles track [RFC 8216](https://www.rfc-editor.org/rfc/rfc8216),
 Apple's current [HLS authoring specification](https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices),
 and the segmented-media model in ISO/IEC 23000-19:2024 CMAF.
 
+### DASH and CMAF package QC
+
+`forge-streaming-qc stream.mpd --profile iso23009` performs bounded-memory
+MPEG-DASH MPD checks for the required namespace and timing attributes, Period
+and AdaptationSet structure, unique Representation identifiers, bandwidth,
+inherited content/codec/audio properties, and inherited
+`SegmentTemplate`/`SegmentTimeline` addressing. Static presentations must have
+an explicit duration bound.
+When `--profile` is omitted, `.mpd` inputs select `iso23009` and other inputs
+select `rfc8216`.
+
+Use `--profile dash-if-iop` to additionally check aligned segment boundaries
+across representations and report missing audio language declarations. Local
+initialization and media templates are expanded with a fixed resource cap.
+CMAF/fMP4 resources are passed through the ISO-BMFF auditor, including
+zero-duration initialization headers, `mvex` order, movie-fragment-relative
+addressing, sequence continuity, and monotonic `tfdt` decode times. Remote,
+absolute, parent-directory, and unresolved template references are never
+fetched implicitly. Results conform to
+`schema/dash-qc-v1.schema.json`.
+
+The profiles track
+[ISO/IEC 23009-1:2026 MPEG-DASH](https://www.iso.org/standard/23009-1), the
+[DASH-IF Conformance Software](https://github.com/Dash-Industry-Forum/DASH-IF-Conformance),
+and ISO/IEC 23000-19:2024 CMAF. DASH-IF recommendations are kept distinct from
+normative ISO failures.
+
 ### Standards conformance tests
 
 Run the optional conformance suite against the official EBU Loudness Test Set

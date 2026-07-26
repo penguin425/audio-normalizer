@@ -150,3 +150,34 @@ fn emitted_hls_qc_conforms_to_published_schema() {
         .collect();
     assert!(errors.is_empty(), "schema violations: {errors:#?}");
 }
+
+#[test]
+fn emitted_dash_qc_conforms_to_published_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("audio.mpd");
+    std::fs::write(
+        &path,
+        r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+ mediaPresentationDuration="PT2S" minBufferTime="PT1S">
+ <Period id="p0"><AdaptationSet contentType="audio" mimeType="audio/mp4"
+ codecs="mp4a.40.2" audioSamplingRate="48000">
+  <SegmentTemplate timescale="48000" duration="96000"
+   initialization="init-$RepresentationID$.mp4" media="$RepresentationID$-$Number$.m4s"/>
+  <Representation id="a1" bandwidth="128000"/>
+ </AdaptationSet></Period></MPD>"#,
+    )
+    .unwrap();
+
+    let audit =
+        forge_normalizer::dash_qc::audit(&path, forge_normalizer::dash_qc::DashProfile::Iso23009)
+            .unwrap();
+    let instance = serde_json::to_value(audit).unwrap();
+    let schema: Value = serde_json::from_str(include_str!("../schema/dash-qc-v1.schema.json"))
+        .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
