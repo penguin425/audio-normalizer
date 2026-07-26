@@ -473,7 +473,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "forge-normalizer"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "audiopus_sys",
  "clap",
@@ -483,6 +483,7 @@ dependencies = [
  "lofty",
  "ogg",
  "opus",
+ "quick-xml",
  "rayon",
  "rubato",
  "serde",
@@ -1037,6 +1038,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.38.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

@@ -1,4 +1,6 @@
-use forge_normalizer::wav::{default_channel_roles, AudioBuffer, PcmKind, WavWriter};
+use forge_normalizer::wav::{
+    default_channel_roles, AudioBuffer, PcmKind, WavContainer, WavWriter, WaveChunk,
+};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -164,6 +166,69 @@ fn adm_reference_renderer_options_are_validated_and_exposed() {
         "map.json"
     ])
     .is_err());
+}
+
+#[test]
+fn ebu_production_profile_writes_a_rule_audit() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("production.bw64");
+    let audit = directory.path().join("tech3393.json");
+    let buffer = AudioBuffer {
+        sample_rate: 48_000,
+        channels: 1,
+        frames: 48_000,
+        data: vec![vec![0.0; 48_000]],
+        channel_roles: default_channel_roles(1),
+        source_kind: PcmKind::F32,
+    };
+    WavWriter::write_with_metadata(
+        &input,
+        &buffer,
+        PcmKind::F32,
+        false,
+        WavContainer::Bw64,
+        &[
+            WaveChunk {
+                id: *b"axml",
+                body: br#"<audioFormatExtended><profileList><profile profileName="EBU Production Profile" profileVersion="1.0" profileLevel="1">EBU Tech 3393</profile></profileList></audioFormatExtended>"#.to_vec(),
+            },
+            WaveChunk {
+                id: *b"chna",
+                body: vec![1, 0, 1, 0],
+            },
+        ],
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            input.to_str().unwrap(),
+            "--analyze",
+            "--json",
+            "--adm-profile",
+            "ebu-production",
+            "--adm-profile-mode",
+            "write",
+            "--adm-profile-report",
+            audit.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        report[0]["adm_production_profile_standard"],
+        "EBU Tech 3393"
+    );
+    assert_eq!(report[0]["adm_production_profile_mode"], "write");
+    assert_eq!(report[0]["adm_production_profile_passed"], true);
+    let audit: serde_json::Value = serde_json::from_slice(&std::fs::read(audit).unwrap()).unwrap();
+    assert_eq!(audit["validator"], "forge-tech3393-core-1");
+    assert!(audit["rules"].as_array().unwrap().len() >= 8);
 }
 
 fn wav_fixture_bytes() -> Vec<u8> {
