@@ -4,6 +4,7 @@ use forge_normalizer::adm::{self, ReferenceRendererOptions};
 use forge_normalizer::cli;
 use forge_normalizer::codec_qc;
 use forge_normalizer::dsp::limiter::LimiterConfig;
+use forge_normalizer::dsp::resample::ResampleQuality;
 use forge_normalizer::normalize::{
     self, DialogueSource, DialogueStandard, Mode, OutputFormat, Plan,
 };
@@ -111,6 +112,8 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
         }),
         wav_container: parse_wav_container(&cli.wav_container),
         bwf: cli.bwf,
+        output_sample_rate: cli.sample_rate_hz,
+        resample_quality: ResampleQuality::parse(&cli.resample_quality),
     };
     if let Some(preset) = preset {
         eprintln!(
@@ -154,6 +157,11 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
         && formats.iter().any(|format| *format != OutputFormat::Wav)
     {
         return Err("--bwf and --wav-container are valid only for WAV output".into());
+    }
+    if cli.sample_rate_hz.is_some_and(|rate| rate != 48_000)
+        && formats.contains(&OutputFormat::Opus)
+    {
+        return Err("Ogg Opus output supports only --sample-rate 48000".into());
     }
 
     if cli.analyze_only {
@@ -748,7 +756,7 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                 .inputs
                 .iter()
                 .map(|path| {
-                    normalize::analyze_file_with_roles(path, channel_roles_override.as_deref())
+                    normalize::analyze_file_for_plan(path, channel_roles_override.as_deref(), &plan)
                 })
                 .collect::<Result<_, _>>()?;
             let gain = normalize::album_gain(&analyses, &plan);
@@ -838,7 +846,8 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
 
     for ((input, output), fmt) in cli.inputs.iter().zip(outputs.iter()).zip(formats.iter()) {
         if cli.gain_only || cli.dry_run {
-            let an = normalize::analyze_file_with_roles(input, channel_roles_override.as_deref())?;
+            let an =
+                normalize::analyze_file_for_plan(input, channel_roles_override.as_deref(), &plan)?;
             let gain = normalize::compute_gain(&an, &plan);
             print_analysis(input, &an, Some(gain));
             if cli.dry_run {

@@ -210,6 +210,10 @@ forge track.wav -o track.mp3 --format=mp3 --bitrate=320
 # Lossless streaming FLAC output (16 or 24 bit)
 forge track.wav -o track.flac --format=flac --bits=24 --dither
 
+# Convert before output-domain loudness and true-peak decisions
+forge programme.wav -o master.wav --sample-rate 44100 \
+  --resample-quality best --bits 24 --dither --verify
+
 # AAC-LC in a gapless M4A container; verify codec loudness/peak drift
 forge track.wav -o track.m4a --format=m4a --bitrate=160 --verify
 
@@ -315,6 +319,8 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--ceiling` | `-1.0` | True-peak ceiling dBTP (gain is reduced to respect it) |
 | `--max-gain` | none | Cap on applied gain (dB), a boost safety limit |
 | `--format` | inferred | `wav`, `flac`, `mp3`, `opus`, or `m4a` output container |
+| `--sample-rate` | source rate | Output sample rate from 8000 to 384000 Hz |
+| `--resample-quality` | `balanced` | Windowed-sinc quality: `fast`, `balanced`, or `best` |
 | `--bitrate` | `192` | Lossy encoder bitrate in kbps (MP3/Opus/AAC output) |
 | `--quality` | `2` | MP3 encoder quality 0(best)…9(fastest) |
 | `--album` | off | One shared gain for all inputs (requires `--mode lufs`) |
@@ -385,6 +391,8 @@ enabled = false
 
 [output]
 format = "flac"
+sample_rate_hz = 48000
+resample_quality = "balanced"
 bits = "24"
 verify = true
 verify_tolerance = 0.5

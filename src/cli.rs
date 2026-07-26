@@ -102,6 +102,24 @@ pub struct Cli {
     #[arg(long = "format", value_parser = ["wav", "flac", "mp3", "opus", "m4a"])]
     pub format: Option<String>,
 
+    /// Output sample rate in Hz, using delay-compensated windowed-sinc conversion.
+    #[arg(
+        long = "sample-rate",
+        value_name = "HZ",
+        value_parser = clap::value_parser!(u32).range(8000..=384000),
+        conflicts_with_all = ["analyze_only", "write_tags"]
+    )]
+    pub sample_rate_hz: Option<u32>,
+
+    /// Sample-rate conversion quality.
+    #[arg(
+        long = "resample-quality",
+        value_parser = ["fast", "balanced", "best"],
+        default_value = "balanced",
+        requires = "sample_rate_hz"
+    )]
+    pub resample_quality: String,
+
     /// Lossy encoder bitrate in kbps, used with MP3, Opus, and AAC output.
     #[arg(long = "bitrate", default_value_t = 192)]
     pub bitrate: i32,
@@ -493,6 +511,8 @@ struct AnalysisConfig {
 #[serde(default, deny_unknown_fields)]
 struct OutputConfig {
     format: Option<String>,
+    sample_rate_hz: Option<u32>,
+    resample_quality: Option<String>,
     bits: Option<String>,
     bitrate_kbps: Option<i32>,
     quality: Option<i32>,
@@ -646,6 +666,18 @@ impl Cli {
 
         let output = config.output;
         set_option_if_implicit(matches, "format", &mut self.format, output.format);
+        set_option_if_implicit(
+            matches,
+            "sample_rate_hz",
+            &mut self.sample_rate_hz,
+            output.sample_rate_hz,
+        );
+        set_if_implicit(
+            matches,
+            "resample_quality",
+            &mut self.resample_quality,
+            output.resample_quality,
+        );
         set_option_if_implicit(matches, "bits", &mut self.bits, output.bits);
         set_if_implicit(matches, "bitrate", &mut self.bitrate, output.bitrate_kbps);
         set_if_implicit(matches, "quality", &mut self.quality, output.quality);
@@ -720,6 +752,17 @@ impl Cli {
         }
         if let Some(bits) = &self.bits {
             validate_choice("output.bits", bits, &["8", "16", "24", "32", "32f", "64f"])?;
+        }
+        validate_choice(
+            "output.resample_quality",
+            &self.resample_quality,
+            &["fast", "balanced", "best"],
+        )?;
+        if self
+            .sample_rate_hz
+            .is_some_and(|rate| !(8_000..=384_000).contains(&rate))
+        {
+            return Err("output.sample_rate_hz must be between 8000 and 384000".into());
         }
         validate_choice(
             "output.wav_container",

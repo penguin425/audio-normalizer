@@ -258,6 +258,8 @@ fn aac_m4a_roundtrips_gaplessly_and_writes_loudness_tags() {
         limiter: None,
         wav_container: WavContainer::Auto,
         bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
     };
     let corrected =
         normalize::normalize_one_corrected(&input, &output, &plan, OutputFormat::M4a, 0.6, 2)
@@ -365,6 +367,8 @@ fn bw64_output_preserves_bext_and_writes_measured_loudness() {
         limiter: None,
         wav_container: WavContainer::Bw64,
         bwf: true,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
     };
     normalize::normalize_one(&input, &output, &plan, OutputFormat::Wav).unwrap();
 
@@ -423,6 +427,8 @@ fn flac_output_roundtrips_at_16_and_24_bits() {
             limiter: None,
             wav_container: WavContainer::Auto,
             bwf: false,
+            output_sample_rate: None,
+            resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
         };
         normalize::normalize_one(&input, &output, &plan, OutputFormat::Flac).unwrap();
         let decoded = decoder::decode(&output).unwrap();
@@ -460,6 +466,8 @@ fn failed_encode_preserves_an_existing_destination() {
         }),
         wav_container: WavContainer::Auto,
         bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
     };
     assert!(normalize::normalize_one(&input, &output, &plan, OutputFormat::Wav).is_err());
     assert_eq!(
@@ -497,6 +505,8 @@ fn opus_resamples_roundtrips_and_writes_r128_track_gain() {
         limiter: None,
         wav_container: WavContainer::Auto,
         bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
     };
     normalize::normalize_one(&input, &output, &plan, OutputFormat::Opus).unwrap();
     let decoded = decoder::decode(&output).unwrap();
@@ -552,6 +562,8 @@ fn opus_album_writes_shared_r128_album_gain() {
         limiter: None,
         wav_container: WavContainer::Auto,
         bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
     };
     normalize::normalize_album(
         &[input_a.clone(), input_b.clone()],
@@ -618,6 +630,8 @@ fn opus_mapping_family_one_roundtrips_5_1_through_7_1() {
             limiter: None,
             wav_container: WavContainer::Auto,
             bwf: false,
+            output_sample_rate: None,
+            resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
         };
         normalize::write(&buffer, &output, &plan, OutputFormat::Opus).unwrap();
 
@@ -674,6 +688,8 @@ fn replaygain_tags_leave_decoded_audio_unchanged() {
         limiter: None,
         wav_container: WavContainer::Auto,
         bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
     };
     normalize::write(&buf, &input, &plan, OutputFormat::Flac).unwrap();
     let before = decoder::decode(&input).unwrap();
@@ -720,6 +736,8 @@ fn post_encode_verification_detects_level_mismatch() {
         limiter: None,
         wav_container: WavContainer::Auto,
         bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
     };
     let (source, gain) =
         normalize::normalize_one(&input, &output, &plan, OutputFormat::Flac).unwrap();
@@ -759,6 +777,8 @@ fn true_peak_limiter_reaches_loudness_despite_isolated_transient() {
         limiter: Some(LimiterConfig::default()),
         wav_container: WavContainer::Auto,
         bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
     };
     let (source, gain) =
         normalize::normalize_one(&input, &output, &plan, OutputFormat::Flac).unwrap();
@@ -802,6 +822,8 @@ fn roundtrip_lufs_hits_target() {
         limiter: None,
         wav_container: WavContainer::Auto,
         bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
     };
     let (an, _gain) = normalize::normalize_one(&inp, &outp, &plan, OutputFormat::Wav).unwrap();
     assert!(an.lufs < -19.0 && an.lufs > -21.0, "input LUFS {}", an.lufs);
@@ -852,6 +874,8 @@ fn roundtrip_peak_mode_hits_target() {
         limiter: None,
         wav_container: WavContainer::Auto,
         bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
     };
     let (an, _gain) = normalize::normalize_one(&inp, &outp, &plan, OutputFormat::Wav).unwrap();
     let in_peak_db = an.sample_peak_db();
@@ -870,6 +894,41 @@ fn roundtrip_peak_mode_hits_target() {
     );
     let _ = std::fs::remove_file(&inp);
     let _ = std::fs::remove_file(&outp);
+}
+
+#[test]
+fn output_sample_rate_conversion_is_exact_and_normalized_after_src() {
+    let input = tmp_path("forge_it_src_48k.wav");
+    let output = tmp_path("forge_it_src_44k1.wav");
+    let buffer = synth_sine(48_000, 2.0, 0.2, 997.0, 2);
+    WavWriter::write(&input, &buffer, PcmKind::F32, false).unwrap();
+    let plan = Plan {
+        mode: Mode::Peak,
+        target_lufs: -16.0,
+        target_peak_db: -6.0,
+        target_rms_db: -18.0,
+        ceiling_db: -1.0,
+        max_gain_db: None,
+        dither: true,
+        output_kind: Some(PcmKind::S24),
+        mp3_bitrate: 192,
+        mp3_quality: 2,
+        limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
+        output_sample_rate: Some(44_100),
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Best,
+    };
+    let (source, _) = normalize::normalize_one(&input, &output, &plan, OutputFormat::Wav).unwrap();
+    assert_eq!(source.sample_rate, 44_100);
+    assert_eq!(source.frames, 88_200);
+    let decoded = decoder::decode(&output).unwrap();
+    assert_eq!(decoded.sample_rate, 44_100);
+    assert_eq!(decoded.frames, 88_200);
+    let measured = normalize::analyze(&decoded);
+    assert!((measured.sample_peak_db() - (-6.0)).abs() < 0.02);
+    let _ = std::fs::remove_file(input);
+    let _ = std::fs::remove_file(output);
 }
 
 #[test]
@@ -898,6 +957,8 @@ fn album_mode_applies_shared_gain() {
         limiter: None,
         wav_container: WavContainer::Auto,
         bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
     };
     let results = normalize::normalize_album(
         &[i1.clone(), i2.clone()],
@@ -953,6 +1014,8 @@ fn corrected_album_verifies_a_shared_gain() {
         limiter: None,
         wav_container: WavContainer::Auto,
         bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
     };
 
     let result = normalize::normalize_album_corrected(
@@ -1049,6 +1112,8 @@ fn mp3_encode_and_decode_roundtrip() {
         limiter: None,
         wav_container: WavContainer::Auto,
         bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
     };
 
     // WAV -> MP3 (encode via LAME).
@@ -1100,6 +1165,8 @@ fn mp3_post_encode_correction_converges_from_the_original_source() {
         limiter: None,
         wav_container: WavContainer::Auto,
         bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
     };
 
     let result =
