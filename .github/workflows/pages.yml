@@ -1,0 +1,44 @@
+name: Publish schemas
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "schema/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Stage versioned schema endpoints
+        shell: bash
+        run: |
+          mkdir -p _site/schema
+          cp schema/delivery-manifest-v1.schema.json _site/schema/delivery-manifest-v1
+          cp schema/delivery-manifest-v1.schema.json _site/schema/delivery-manifest-v1.schema.json
+
+      - uses: actions/configure-pages@v6
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -161,7 +161,7 @@ WAV/FLAC/Opus output is self-contained; AAC-LC/M4A output additionally requires
 `ffmpeg` on `PATH`. MP3 output requires a source build with
 `--features mp3-encoding` and an installed LAME library.
 
-### EBU conformance tests
+### Standards conformance tests
 
 Run the optional conformance suite against the official EBU Loudness Test Set
 v5. The script downloads the archive from a public mirror, verifies its
@@ -174,6 +174,21 @@ Loudness Range cases:
 
 The EBU material is cached outside the repository and is used only for
 technical testing under the terms included in its archive.
+
+Run the independent ITU-R BS.2217-2 core compliance set (frequency response,
+absolute and relative gating, LFE exclusion, channel weighting, summation, and
+programme material) with:
+
+```sh
+./tools/test-itu-conformance.sh
+```
+
+The script downloads the official attachments directly from ITU, pins every
+archive by SHA-256, and keeps the copyrighted WAV files outside the repository.
+CI runs the EBU and ITU suites as separate required evidence.
+
+The versioned JSON Schema for `--manifest` output is published at
+<https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v1>.
 
 ## Usage
 
