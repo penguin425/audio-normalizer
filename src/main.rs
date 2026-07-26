@@ -489,6 +489,10 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                         serde_json::to_string(&detection.ranges)
                             .expect("dialogue detections are serializable"),
                     );
+                    report.dialogue_detection_frames_json = Some(
+                        serde_json::to_string(&detection.frames)
+                            .expect("dialogue detection frames are serializable"),
+                    );
                 }
                 reports.push(report);
             } else {

@@ -418,9 +418,15 @@ fn automatic_dialogue_writes_detection_audit() {
         .as_str()
         .unwrap()
         .contains("confidence"));
+    assert!(report[0]["dialogue_detection_frames_json"]
+        .as_str()
+        .unwrap()
+        .contains("speech_band_energy_ratio"));
     let audit: serde_json::Value = serde_json::from_slice(&std::fs::read(audit).unwrap()).unwrap();
-    assert_eq!(audit["features"].as_array().unwrap().len(), 3);
+    assert_eq!(audit["features"].as_array().unwrap().len(), 8);
     assert!(audit["ranges"][0]["confidence"].is_number());
+    assert!(audit["frames"][0]["adaptive_noise_floor_dbfs"].is_number());
+    assert!(audit["frames"][0]["selected"].is_boolean());
 }
 
 #[test]

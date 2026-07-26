@@ -93,6 +93,7 @@
         "dialogue_detector_version": {"$ref": "#/$defs/nullableString"},
         "dialogue_detection_threshold": {"$ref": "#/$defs/nullableNumber"},
         "dialogue_detection_ranges_json": {"$ref": "#/$defs/nullableString"},
+        "dialogue_detection_frames_json": {"$ref": "#/$defs/nullableString"},
         "max_momentary_lufs": {"type": "number"},
         "max_short_term_lufs": {"type": "number"},
         "loudness_range_lu": {"type": "number", "minimum": 0},
