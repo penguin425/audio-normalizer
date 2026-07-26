@@ -20,6 +20,7 @@ pub mod codec_qc;
 pub mod compare;
 pub mod container_qc;
 pub mod decoder;
+pub mod dialogue_provider;
 pub mod dsp;
 pub mod flacenc;
 #[cfg(feature = "lv2-plugin")]

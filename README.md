@@ -568,6 +568,22 @@ changedIDs status values. It validates captured metadata frames; transport and
 audio/metadata synchronization remain the responsibility of the carrying
 interface.
 
+Optional ASR/VAD engines can feed dialogue QC through a versioned, reviewable
+adapter instead of being trusted implicitly:
+
+```bash
+forge-dialogue-provider provider.json --threshold 0.6 \
+  --ranges-output dialogue.json --output provider-audit.json
+forge programme.wav --analyze --compliance ebu-r128-cinematic \
+  --dialogue-ranges dialogue.json
+```
+
+Provider JSON records the ASR/VAD/hybrid engine and version, model name,
+model version, model SHA-256, source duration, and confidence for every sorted
+non-overlapping segment. Forge validates that provenance and the time bounds,
+then exports only accepted ranges. Transcripts are deliberately not copied
+into the audit report; their presence is recorded for privacy review.
+
 The reviewable JSON/TOML sidecar flow remains available through
 `--codec-metadata`. Fields include `codec`, `dialnorm_lkfs`,
 `encoded_loudness_lufs`, `downmix_mode`, and `tolerance_lu`. Dialnorm is
