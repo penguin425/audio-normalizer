@@ -36,6 +36,10 @@ path = "src/bin/forge-compare.rs"
 name = "forge-container-qc"
 path = "src/bin/forge-container-qc.rs"
 
+[[bin]]
+name = "forge-presentation-qc"
+path = "src/bin/forge-presentation-qc.rs"
+
 [dependencies]
 rayon = "1.10"
 clap = { version = "4.5", features = ["derive"] }

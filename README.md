@@ -541,6 +541,20 @@ boundaries, RFC 6716 packet duration, and RFC 7845 granule increments. Initial
 granule offsets, pre-skip, chained streams, and final-page end trimming are
 reported without decoding the audio payload.
 
+AC-4 and MPEG-H workflows can audit every externally rendered Presentation
+without claiming that Forge is a normative immersive renderer:
+
+```bash
+forge-presentation-qc presentations.json -o presentation-qc.json
+```
+
+The JSON/TOML specification records `codec`, renderer name/version, and a
+unique ID plus rendered WAVE path for every Presentation. Optional reference
+paths gate loudness, true-peak, and sample-accurate duration drift; optional
+compliance profiles gate each Presentation independently. The report identifies
+ETSI TS 103 190 for AC-4 or ISO/IEC 23008-3 for MPEG-H and preserves renderer
+provenance as audit evidence.
+
 The reviewable JSON/TOML sidecar flow remains available through
 `--codec-metadata`. Fields include `codec`, `dialnorm_lkfs`,
 `encoded_loudness_lufs`, `downmix_mode`, and `tolerance_lu`. Dialnorm is
