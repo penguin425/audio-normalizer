@@ -130,6 +130,31 @@ fn emitted_additional_pcm_container_qc_conforms_to_published_schema() {
 }
 
 #[test]
+fn emitted_flac_container_qc_conforms_to_published_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("programme.flac");
+    let mut writer =
+        forge_normalizer::flacenc::FlacStreamWriter::create(&path, 48_000, 2, 16, false).unwrap();
+    writer
+        .write_chunk(&[vec![0.1; 1_000], vec![-0.1; 1_000]])
+        .unwrap();
+    writer.finish().unwrap();
+
+    let audit = forge_normalizer::container_qc::audit(&path).unwrap();
+    assert_eq!(audit.format, "flac");
+    assert!(audit.passed, "{audit:#?}");
+    let instance = serde_json::to_value(audit).unwrap();
+    let schema: Value = serde_json::from_str(include_str!("../schema/container-qc-v1.schema.json"))
+        .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
+
+#[test]
 fn emitted_isobmff_container_qc_conforms_to_published_schema() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("truncated.m4a");

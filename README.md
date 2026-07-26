@@ -197,6 +197,7 @@ forge-container-qc master.bw64 --output container-qc.json
 forge-container-qc programme.opus
 forge-container-qc archive.aiff
 forge-container-qc capture.caf
+forge-container-qc master.flac
 ```
 
 WAVE/RF64/BW64 chunk tables are scanned with bounded memory: audio payloads are
@@ -212,6 +213,14 @@ constant-packet byte alignment. Sun/NeXT AU audits validate its big-endian
 header, annotation/data boundary, declared data size, audio description, and
 linear-PCM frame alignment. All three scanners skip audio payloads and cap the
 number of control chunks.
+
+Native FLAC audits follow [RFC 9639](https://www.rfc-editor.org/rfc/rfc9639):
+they validate the bounded metadata chain, unique
+`STREAMINFO`/`SEEKTABLE`/`VORBIS_COMMENT`/`CUESHEET` blocks, padding, seek
+points, comments, cuesheet tracks/indexes, and picture fields. A strict
+streaming decode checks frame/header CRCs, decoded sample count and format, and
+the PCM MD5 digest when present, without buffering the complete decoded
+programme.
 
 For RIFF/WAVE, RF64, and BW64 it checks declared sizes, chunk bounds and
 alignment, required/unique `fmt` and `data` chunks, `ds64` placement/table/data

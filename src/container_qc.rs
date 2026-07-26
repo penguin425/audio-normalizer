@@ -42,7 +42,7 @@ pub struct AuditCheck {
 pub fn audit(path: &Path) -> Result<ContainerAudit, String> {
     audit_if_supported(path)?.ok_or_else(|| {
         format!(
-            "{}: unsupported container (expected WAVE, AIFF/AIFC, CAF, AU, Ogg Opus, or ISO-BMFF MP4/M4A/fMP4)",
+            "{}: unsupported container (expected WAVE, AIFF/AIFC, CAF, AU, FLAC, Ogg Opus, or ISO-BMFF MP4/M4A/fMP4)",
             path.display()
         )
     })
@@ -69,6 +69,8 @@ pub fn audit_if_supported(path: &Path) -> Result<Option<ContainerAudit>, String>
         crate::pcm_container_qc::audit_caf(path, file, file_size).map(Some)
     } else if header_size >= 4 && &header[..4] == b".snd" {
         crate::pcm_container_qc::audit_au(path, file, file_size).map(Some)
+    } else if header_size >= 4 && &header[..4] == b"fLaC" {
+        crate::flac_qc::audit(path, file, file_size).map(Some)
     } else if header_size >= 4 && &header[..4] == b"OggS" {
         audit_ogg_opus(path).map(Some)
     } else if crate::isobmff_qc::looks_like_isobmff(&header[..header_size], file_size) {

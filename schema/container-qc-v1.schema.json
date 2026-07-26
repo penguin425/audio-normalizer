@@ -11,7 +11,7 @@
     },
     "generator": {"type": "string"},
     "path": {"type": "string"},
-    "format": {"enum": ["wave", "aiff", "aifc", "caf", "au", "ogg-opus", "isobmff"]},
+    "format": {"enum": ["wave", "aiff", "aifc", "caf", "au", "flac", "ogg-opus", "isobmff"]},
     "passed": {"type": "boolean"},
     "layers": {
       "type": "array",
