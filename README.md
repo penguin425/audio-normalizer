@@ -439,6 +439,24 @@ referenced by `axml`, and measures its explicit one-based channel selection.
 Reports label this as `direct-channel-map (no ADM object renderer)` so a channel
 selection is never misrepresented as a full object-based render.
 
+Full object/scene presentation QC uses the EBU ADM Toolbox reference
+implementation:
+
+```sh
+forge --analyze programme.bw64 --adm-render \
+  --adm-layout 4+5+0 --adm-profile-level 0 --json
+```
+
+Forge first validates the document against the selected ITU-R BS.2168 emission
+profile level, then invokes the ITU-R BS.2127 renderer for DirectSpeakers,
+Matrix, Objects, HOA, and Binaural rendering items, and finally measures the
+rendered BS.2051 loudspeaker signals with Forge's BS.1770 engine. Install
+`eat-process` from the
+[EBU ADM Toolbox](https://github.com/ebu/ebu-adm-toolbox), or select an
+executable with `--adm-renderer`. `--adm-rendered-output rendered.wav` retains
+the rendered signals for audition and downstream QC. The renderer remains an
+optional runtime dependency; ordinary PCM/ADM preservation does not require it.
+
 `--auto-dialogue` provides deterministic dialogue candidates when reviewed
 ranges are not yet available. The detector uses fixed one-second RMS,
 centre/mid focus, and zero-crossing features; `--dialogue-confidence` controls
@@ -484,8 +502,9 @@ min_loudness_range_lu = 3.0
 max_loudness_range_lu = 18.0
 ```
 
-ADM chunks are carried through unchanged; Forge normalizes the rendered PCM
-bed and does not currently render or modify individual ADM objects.
+ADM chunks are carried through unchanged during normal normalization. Forge
+does not modify individual ADM objects; `--adm-render` provides standards-based
+render-and-measure QC through the EBU reference implementation.
 
 ## Architecture
 
@@ -494,6 +513,7 @@ src/
   lib.rs            public engine API (decoder, audio I/O, DSP, normalize)
   main.rs           CLI wrapper (format resolution + dispatch)
   cli.rs            clap definition
+  adm.rs            optional EBU BS.2127 renderer + BS.2168 validation adapter
   decoder.rs        full-buffer and streaming universal decoders
   flacenc.rs        bounded-memory pure-Rust FLAC encoder
   opus.rs           RFC 7845 mono/stereo and Mapping Family 1 Ogg Opus I/O

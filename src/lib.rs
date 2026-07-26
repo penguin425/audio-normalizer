@@ -11,6 +11,7 @@
 
 #[cfg(feature = "aac-encoding")]
 pub mod aac;
+pub mod adm;
 mod atomic;
 pub mod cli;
 pub mod decoder;

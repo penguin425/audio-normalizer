@@ -1,5 +1,6 @@
 //! Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer.
 
+use forge_normalizer::adm::{self, ReferenceRendererOptions};
 use forge_normalizer::cli;
 use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::normalize::{
@@ -257,6 +258,12 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
         if stdin_requested && cli.adm_presentations.is_some() {
             return Err("--adm-presentations cannot be used with stdin".into());
         }
+        if stdin_requested && cli.adm_render {
+            return Err("--adm-render cannot be used with stdin".into());
+        }
+        if cli.adm_render && cli.inputs.len() != 1 {
+            return Err("--adm-render currently requires exactly one input".into());
+        }
         let codec_metadata = cli
             .codec_metadata
             .as_deref()
@@ -342,6 +349,24 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                     )
                 })
                 .transpose()?;
+            let adm_render = cli
+                .adm_render
+                .then(|| {
+                    adm::validate_and_render(
+                        input,
+                        cli.adm_rendered_output.as_deref(),
+                        &ReferenceRendererOptions {
+                            command: cli
+                                .adm_renderer
+                                .clone()
+                                .unwrap_or_else(|| PathBuf::from("eat-process")),
+                            layout: cli.adm_layout.clone(),
+                            profile_level: cli.adm_profile_level,
+                            overwrite: cli.overwrite,
+                        },
+                    )
+                })
+                .transpose()?;
             if adm_qc.as_ref().is_some_and(|result| !result.passed) {
                 qc_failed = true;
             }
@@ -382,6 +407,24 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                             .expect("ADM presentation measurements are serializable"),
                     );
                     report.adm_qc_passed = Some(adm.passed);
+                }
+                if let Some(render) = &adm_render {
+                    report.adm_axml_present = Some(true);
+                    report.adm_chna_present = Some(true);
+                    report.adm_qc_passed = Some(true);
+                    report.adm_render_renderer = Some(render.renderer.clone());
+                    report.adm_render_standard = Some(render.renderer_standard);
+                    report.adm_render_profile = Some(render.profile_standard);
+                    report.adm_render_profile_level = Some(render.profile_level);
+                    report.adm_render_layout = Some(render.layout.clone());
+                    report.adm_render_validation_passed = Some(true);
+                    report.adm_render_integrated_lufs = Some(render.analysis.lufs);
+                    report.adm_render_true_peak_dbtp = Some(render.analysis.true_peak_db());
+                    report.adm_render_channels = Some(render.analysis.channels);
+                    report.adm_render_output_path = render
+                        .output_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned());
                 }
                 if let Some(detection) = &detection {
                     report.dialogue_detector = Some(detection.detector);
@@ -464,6 +507,22 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                             presentation.referenced_by_axml,
                             presentation.render_method,
                         );
+                    }
+                }
+                if let Some(render) = &adm_render {
+                    eprintln!(
+                        "  ADM reference render: {:.2} LUFS, {:.2} dBTP, {} ch [PASS]\n    renderer: {} ({})\n    validation: {} level {}\n    layout: {}",
+                        render.analysis.lufs,
+                        render.analysis.true_peak_db(),
+                        render.analysis.channels,
+                        render.renderer,
+                        render.renderer_standard,
+                        render.profile_standard,
+                        render.profile_level,
+                        render.layout,
+                    );
+                    if let Some(path) = &render.output_path {
+                        eprintln!("    output: {}", path.display());
                     }
                 }
             }
