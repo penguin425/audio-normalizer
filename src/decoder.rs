@@ -149,6 +149,9 @@ fn decode_symphonia(path: &Path, ext: &str) -> Result<AudioBuffer, String> {
             planar = (0..ch).map(|_| Vec::new()).collect();
         }
         let frames = decoded.frames();
+        if frames == 0 {
+            continue;
+        }
         let need = frames * ch;
         if sample_buf.as_ref().is_none_or(|b| b.len() < need) {
             // `Duration` is a u64 frame count; the buffer stores frames*ch samples.
@@ -328,6 +331,9 @@ where
             return Err(format!("{}: mid-stream format change", path.display()));
         }
         let frames = decoded.frames();
+        if frames == 0 {
+            continue;
+        }
         if sample_buffer
             .as_ref()
             .is_none_or(|buffer| buffer.capacity() < frames * decoded_channels)

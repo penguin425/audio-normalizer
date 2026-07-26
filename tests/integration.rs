@@ -299,6 +299,62 @@ fn aac_m4a_roundtrips_gaplessly_and_writes_loudness_tags() {
     let _ = std::fs::remove_file(output);
 }
 
+#[cfg(feature = "ffmpeg-encoding")]
+#[test]
+fn alac_and_vorbis_outputs_roundtrip() {
+    let buffer = synth_sine(48_000, 2.0, 0.1, 997.0, 2);
+    let input = tmp_path("forge_it_ffmpeg_codec_input.wav");
+    WavWriter::write(&input, &buffer, PcmKind::S24, false).unwrap();
+    let plan = Plan {
+        mode: Mode::Lufs,
+        target_lufs: -16.0,
+        target_peak_db: -1.0,
+        target_rms_db: -18.0,
+        ceiling_db: -1.0,
+        max_gain_db: None,
+        dither: false,
+        output_kind: None,
+        mp3_bitrate: 192,
+        mp3_quality: 2,
+        limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
+    };
+    for (format, extension, codec) in [
+        (OutputFormat::Alac, "m4a", "alac"),
+        (OutputFormat::Vorbis, "ogg", "vorbis"),
+    ] {
+        let output = tmp_path(&format!("forge_it_{codec}_output.{extension}"));
+        normalize::normalize_one(&input, &output, &plan, format).unwrap();
+        let decoded = decoder::decode(&output).unwrap();
+        assert_eq!((decoded.sample_rate, decoded.channels), (48_000, 2));
+        assert!(
+            decoded.frames.abs_diff(buffer.frames) <= 1_024,
+            "{codec} duration drifted: {} vs {} frames",
+            decoded.frames,
+            buffer.frames
+        );
+        let probe = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(probe.status.success());
+        assert_eq!(String::from_utf8(probe.stdout).unwrap().trim(), codec);
+        let _ = std::fs::remove_file(output);
+    }
+    let _ = std::fs::remove_file(input);
+}
+
 #[test]
 fn range_analysis_reports_absolute_timeline_times() {
     let buffer = synth_sine(48_000, 5.0, 0.2, 997.0, 1);
@@ -525,6 +581,74 @@ fn opus_resamples_roundtrips_and_writes_r128_track_gain() {
     );
     let _ = std::fs::remove_file(input);
     let _ = std::fs::remove_file(output);
+}
+
+#[cfg(feature = "opus-encoding")]
+#[test]
+fn chained_opus_preserves_each_pre_skip_and_end_trim() {
+    let first = tmp_path("forge_it_opus_chain_first.opus");
+    let second = tmp_path("forge_it_opus_chain_second.opus");
+    let chained = tmp_path("forge_it_opus_chained.opus");
+    let plan = Plan {
+        mode: Mode::Lufs,
+        target_lufs: -18.0,
+        target_peak_db: -1.0,
+        target_rms_db: -18.0,
+        ceiling_db: -1.0,
+        max_gain_db: None,
+        dither: false,
+        output_kind: None,
+        mp3_bitrate: 128,
+        mp3_quality: 2,
+        limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
+    };
+    let first_audio = synth_sine(48_000, 1.013, 0.05, 440.0, 2);
+    let second_audio = synth_sine(48_000, 0.527, 0.05, 880.0, 2);
+    normalize::write(&first_audio, &first, &plan, OutputFormat::Opus).unwrap();
+    normalize::write(&second_audio, &second, &plan, OutputFormat::Opus).unwrap();
+    let mut bytes = std::fs::read(&first).unwrap();
+    bytes.extend_from_slice(&std::fs::read(&second).unwrap());
+    std::fs::write(&chained, bytes).unwrap();
+
+    let inspection = forge_normalizer::opus::inspect(&chained).unwrap();
+    assert_eq!(inspection.chain_count, 2);
+    assert_ne!(inspection.chains[0].serial, inspection.chains[1].serial);
+    assert_eq!(
+        inspection.total_frames,
+        (first_audio.frames + second_audio.frames) as u64
+    );
+    let decoded = decoder::decode(&chained).unwrap();
+    assert_eq!(decoded.frames, first_audio.frames + second_audio.frames);
+    let audit = forge_normalizer::container_qc::audit(&chained).unwrap();
+    assert!(audit.passed);
+    assert_eq!(audit.properties["chain_count"], 2);
+
+    forge_normalizer::opus::rewrite_r128_tags(&chained, -18.0, Some(-20.0)).unwrap();
+    let inspection = forge_normalizer::opus::inspect(&chained).unwrap();
+    assert!(inspection
+        .chains
+        .iter()
+        .all(|chain| chain.r128_track_gain_q7_8 == Some(-5 * 256)));
+    assert!(inspection
+        .chains
+        .iter()
+        .all(|chain| chain.r128_album_gain_q7_8 == Some(-3 * 256)));
+
+    let corrupt = tmp_path("forge_it_opus_chained_corrupt.opus");
+    let mut bytes = std::fs::read(&chained).unwrap();
+    bytes[30] ^= 1;
+    std::fs::write(&corrupt, bytes).unwrap();
+    let audit = forge_normalizer::container_qc::audit(&corrupt).unwrap();
+    assert!(!audit.passed);
+    assert!(!audit.layers[0].passed);
+
+    for path in [first, second, chained, corrupt] {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[cfg(feature = "opus-encoding")]

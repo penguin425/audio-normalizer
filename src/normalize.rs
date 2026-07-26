@@ -39,6 +39,8 @@ pub enum OutputFormat {
     Mp3,
     Opus,
     M4a,
+    Alac,
+    Vorbis,
 }
 
 #[derive(Debug, Clone)]
@@ -847,22 +849,32 @@ pub fn write<P: AsRef<Path>>(
                 )
             }
         }
-        OutputFormat::M4a => {
-            #[cfg(feature = "aac-encoding")]
+        OutputFormat::M4a | OutputFormat::Alac | OutputFormat::Vorbis => {
+            #[cfg(feature = "ffmpeg-encoding")]
             {
-                let mut writer = crate::aac::AacStreamWriter::create(
+                let codec = match format {
+                    OutputFormat::M4a => crate::aac::FfmpegCodec::Aac,
+                    OutputFormat::Alac => crate::aac::FfmpegCodec::Alac,
+                    OutputFormat::Vorbis => crate::aac::FfmpegCodec::Vorbis,
+                    _ => unreachable!(),
+                };
+                let mut writer = crate::aac::AacStreamWriter::create_codec(
                     p,
                     buf.sample_rate,
                     buf.channels,
                     plan.mp3_bitrate,
+                    codec,
                 )?;
                 writer.write_chunk(&buf.data)?;
                 writer.finish()
             }
-            #[cfg(not(feature = "aac-encoding"))]
+            #[cfg(not(feature = "ffmpeg-encoding"))]
             {
                 let _ = (buf, plan);
-                Err("AAC/M4A output is unavailable; rebuild with `--features aac-encoding`".into())
+                Err(
+                    "AAC/ALAC/Vorbis output is unavailable; rebuild with `--features ffmpeg-encoding`"
+                        .into(),
+                )
             }
         }
     }
@@ -1688,7 +1700,10 @@ fn finalize_metadata(
             crate::opus::rewrite_r128_tags(output, _track_lufs, _album_lufs)?;
         }
     }
-    if format == OutputFormat::M4a {
+    if matches!(
+        format,
+        OutputFormat::M4a | OutputFormat::Alac | OutputFormat::Vorbis
+    ) {
         let measured = analyze_file(output)?;
         metadata::write_replaygain(output, measured.lufs, measured.true_peak, None)?;
     }
@@ -1828,24 +1843,34 @@ fn normalize_stream(
                 )
             }
         }
-        OutputFormat::M4a => {
-            #[cfg(feature = "aac-encoding")]
+        OutputFormat::M4a | OutputFormat::Alac | OutputFormat::Vorbis => {
+            #[cfg(feature = "ffmpeg-encoding")]
             {
-                let mut writer = crate::aac::AacStreamWriter::create(
+                let codec = match format {
+                    OutputFormat::M4a => crate::aac::FfmpegCodec::Aac,
+                    OutputFormat::Alac => crate::aac::FfmpegCodec::Alac,
+                    OutputFormat::Vorbis => crate::aac::FfmpegCodec::Vorbis,
+                    _ => unreachable!(),
+                };
+                let mut writer = crate::aac::AacStreamWriter::create_codec(
                     output,
                     analysis.sample_rate,
                     analysis.channels,
                     plan.mp3_bitrate,
+                    codec,
                 )?;
                 process_normalized_stream(input, analysis, gain, ceiling, plan, |planar| {
                     writer.write_chunk(planar)
                 })?;
                 writer.finish()
             }
-            #[cfg(not(feature = "aac-encoding"))]
+            #[cfg(not(feature = "ffmpeg-encoding"))]
             {
                 let _ = (input, output, analysis, gain, plan, ceiling);
-                Err("AAC/M4A output is unavailable; rebuild with `--features aac-encoding`".into())
+                Err(
+                    "AAC/ALAC/Vorbis output is unavailable; rebuild with `--features ffmpeg-encoding`"
+                        .into(),
+                )
             }
         }
     }
