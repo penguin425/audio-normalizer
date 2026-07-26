@@ -344,6 +344,9 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--tone-duration` | `0.5` | Minimum test-tone duration in seconds |
 | `--expected-duration` | none | Expected duration for EBU 0009F |
 | `--duration-tolerance` | `0.01` | Allowed duration deviation in seconds |
+| `--adm-profile` | none | Validate `ebu-production` ADM profile rules |
+| `--adm-profile-mode` | `read` | Apply Tech 3393 `read` or `write` requirements |
+| `--adm-profile-report` | none | Write rule IDs, ADM paths, observations and results as JSON |
 | `--dialogue-ranges` | none | Explicit dialogue/anchor regions from JSON/TOML |
 | `--start` | `0` | Analysis start time in source seconds |
 | `--duration` | to end | Maximum analysis duration in seconds |
@@ -483,6 +486,22 @@ checks for both `axml` and `chna`, verifies each supplied ADM presentation ID is
 referenced by `axml`, and measures its explicit one-based channel selection.
 Reports label this as `direct-channel-map (no ADM object renderer)` so a channel
 selection is never misrepresented as a full object-based render.
+
+EBU Tech 3393 Production Profile auditing is available without an external
+renderer:
+
+```sh
+forge --analyze programme.bw64 --adm-profile ebu-production \
+  --adm-profile-mode write --adm-profile-report tech3393.json --json
+```
+
+The validator distinguishes the profile's reading and writing requirements. It
+checks well-formed `axml`, profileList/profile cardinality, the `EBU Tech 3393`
+identifier, required profile name/version/level attributes, unique ADM IDs, and
+the Table 49 audioTrackFormat stream reference rule. Every result records its
+Tech 3393 rule ID, ADM path, requirement, observation, validator version, and
+pass/fail state. External common-definition references are reported but are not
+incorrectly rejected merely because they are not embedded in `axml`.
 
 Full object/scene presentation QC uses the EBU ADM Toolbox reference
 implementation:

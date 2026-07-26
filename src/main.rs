@@ -280,8 +280,14 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
         if stdin_requested && cli.adm_render {
             return Err("--adm-render cannot be used with stdin".into());
         }
+        if stdin_requested && cli.adm_profile.is_some() {
+            return Err("--adm-profile cannot be used with stdin".into());
+        }
         if cli.adm_render && cli.inputs.len() != 1 {
             return Err("--adm-render currently requires exactly one input".into());
+        }
+        if cli.adm_profile_report.is_some() && cli.inputs.len() != 1 {
+            return Err("--adm-profile-report requires exactly one input".into());
         }
         let codec_metadata = cli
             .codec_metadata
@@ -309,6 +315,7 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
         let mut reports = Vec::with_capacity(cli.inputs.len());
         let mut timeline_reports = Vec::new();
         let mut dialogue_detection_output = None;
+        let mut adm_profile_audit_output = None;
         let mut qc_failed = false;
         for input in &cli.inputs {
             let timed = normalize::analyze_file_range_with_roles(
@@ -419,11 +426,27 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                     )
                 })
                 .transpose()?;
+            let adm_profile = cli
+                .adm_profile
+                .as_ref()
+                .map(|_| {
+                    adm::validate_production_profile(
+                        input,
+                        adm::ProductionProfileMode::parse(&cli.adm_profile_mode),
+                    )
+                })
+                .transpose()?;
+            if let Some(audit) = adm_profile.clone() {
+                adm_profile_audit_output = Some(audit);
+            }
             let ebu_qc = ebu_qc_options
                 .as_ref()
                 .map(|options| qc::analyze_file(input, &an, options))
                 .transpose()?;
             if adm_qc.as_ref().is_some_and(|result| !result.passed) {
+                qc_failed = true;
+            }
+            if adm_profile.as_ref().is_some_and(|result| !result.passed) {
                 qc_failed = true;
             }
             if ebu_qc
@@ -526,6 +549,18 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                             .expect("ADM presentation measurements are serializable"),
                     );
                     report.adm_qc_passed = Some(adm.passed);
+                }
+                if let Some(audit) = &adm_profile {
+                    report.adm_production_profile_standard = Some(audit.standard);
+                    report.adm_production_profile_version = Some(audit.profile_version);
+                    report.adm_production_profile_level = Some(audit.profile_level);
+                    report.adm_production_profile_mode = Some(audit.mode);
+                    report.adm_production_profile_validator = Some(audit.validator);
+                    report.adm_production_profile_rules_json = Some(
+                        serde_json::to_string(&audit.rules)
+                            .expect("ADM profile rules are serializable"),
+                    );
+                    report.adm_production_profile_passed = Some(audit.passed);
                 }
                 if let Some(render) = &adm_render {
                     report.adm_axml_present = Some(true);
@@ -670,6 +705,26 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                         );
                     }
                 }
+                if let Some(audit) = &adm_profile {
+                    eprintln!(
+                        "  ADM {} {} level {} {:?} [{}]\n    validator: {}",
+                        audit.standard,
+                        audit.profile_version,
+                        audit.profile_level,
+                        audit.mode,
+                        if audit.passed { "PASS" } else { "FAIL" },
+                        audit.validator,
+                    );
+                    for rule in &audit.rules {
+                        eprintln!(
+                            "    {} {}: {} [{}]",
+                            rule.rule_id,
+                            rule.path,
+                            rule.observed,
+                            if rule.passed { "PASS" } else { "FAIL" },
+                        );
+                    }
+                }
                 if let Some(render) = &adm_render {
                     eprintln!(
                         "  ADM reference render: {:.2} LUFS, {:.2} dBTP, {} ch [PASS]\n    renderer: {} ({})\n    validation: {} level {}\n    layout: {}",
@@ -739,6 +794,15 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                 .map_err(|error| format!("create {}: {error}", path.display()))?;
             serde_json::to_writer_pretty(file, detection)
                 .map_err(|error| format!("write dialogue detection report: {error}"))?;
+        }
+        if let Some(path) = &cli.adm_profile_report {
+            let audit = adm_profile_audit_output
+                .as_ref()
+                .expect("ADM profile validation always produces an audit");
+            let file = File::create(path)
+                .map_err(|error| format!("create {}: {error}", path.display()))?;
+            serde_json::to_writer_pretty(file, audit)
+                .map_err(|error| format!("write ADM profile report: {error}"))?;
         }
         if qc_failed {
             return Err("one or more inputs failed the requested compliance/QC checks".into());
@@ -1196,7 +1260,20 @@ fn is_supported_input(path: &Path) -> bool {
             .and_then(|extension| extension.to_str())
             .map(str::to_ascii_lowercase)
             .as_deref(),
-        Some("wav" | "wave" | "mp3" | "flac" | "aac" | "m4a" | "mp4" | "ogg" | "opus")
+        Some(
+            "wav"
+                | "wave"
+                | "bwf"
+                | "bw64"
+                | "rf64"
+                | "mp3"
+                | "flac"
+                | "aac"
+                | "m4a"
+                | "mp4"
+                | "ogg"
+                | "opus",
+        )
     )
 }
 
@@ -1317,7 +1394,9 @@ fn infer_format(path: &Path) -> Option<OutputFormat> {
         Some("mp3") => Some(OutputFormat::Mp3),
         Some("opus") => Some(OutputFormat::Opus),
         Some("m4a") | Some("mp4") => Some(OutputFormat::M4a),
-        Some("wav") | Some("wave") => Some(OutputFormat::Wav),
+        Some("wav") | Some("wave") | Some("bwf") | Some("bw64") | Some("rf64") => {
+            Some(OutputFormat::Wav)
+        }
         _ => None,
     }
 }

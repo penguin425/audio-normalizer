@@ -341,6 +341,31 @@ pub struct Cli {
     )]
     pub adm_presentations: Option<PathBuf>,
 
+    /// Validate ADM against a named production profile.
+    #[arg(
+        long = "adm-profile",
+        value_parser = ["ebu-production"],
+        requires = "analyze_only"
+    )]
+    pub adm_profile: Option<String>,
+
+    /// Apply the EBU Tech 3393 reading or writing requirements.
+    #[arg(
+        long = "adm-profile-mode",
+        value_parser = ["read", "write"],
+        default_value = "read",
+        requires = "adm_profile"
+    )]
+    pub adm_profile_mode: String,
+
+    /// Write the complete rule-by-rule ADM production-profile audit as JSON.
+    #[arg(
+        long = "adm-profile-report",
+        value_name = "PATH",
+        requires = "adm_profile"
+    )]
+    pub adm_profile_report: Option<PathBuf>,
+
     /// Validate ADM against BS.2168, render through the EBU BS.2127 reference
     /// implementation, and measure the rendered loudspeaker presentation.
     #[arg(

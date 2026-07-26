@@ -30,7 +30,7 @@ pub fn decode(path: &Path) -> Result<AudioBuffer, String> {
         .unwrap_or_default();
 
     // Fast path: Forge's own WAV demuxer (parallel, SIMD-friendly).
-    if ext == "wav" || ext == "wave" {
+    if matches!(ext.as_str(), "wav" | "wave" | "bwf" | "bw64" | "rf64") {
         return WavReader::open(path).map_err(|e| format!("{}: {e}", path.display()));
     }
     if ext == "opus" {
@@ -250,7 +250,7 @@ where
         .and_then(|value| value.to_str())
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
-    if matches!(extension.as_str(), "wav" | "wave") {
+    if matches!(extension.as_str(), "wav" | "wave" | "bwf" | "bw64" | "rf64") {
         return decode_wav_stream(path, consume);
     }
     if extension == "opus" {
@@ -393,7 +393,7 @@ where
 }
 
 fn source_kind(extension: &str, bits: Option<u32>) -> PcmKind {
-    if matches!(extension, "wav" | "wave") {
+    if matches!(extension, "wav" | "wave" | "bwf" | "bw64" | "rf64") {
         match bits {
             Some(8) => PcmKind::U8,
             Some(16) => PcmKind::S16,

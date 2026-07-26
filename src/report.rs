@@ -462,6 +462,13 @@ pub struct AnalysisReport {
     pub adm_chna_present: Option<bool>,
     pub adm_presentations_json: Option<String>,
     pub adm_qc_passed: Option<bool>,
+    pub adm_production_profile_standard: Option<&'static str>,
+    pub adm_production_profile_version: Option<&'static str>,
+    pub adm_production_profile_level: Option<&'static str>,
+    pub adm_production_profile_mode: Option<crate::adm::ProductionProfileMode>,
+    pub adm_production_profile_validator: Option<&'static str>,
+    pub adm_production_profile_rules_json: Option<String>,
+    pub adm_production_profile_passed: Option<bool>,
     pub adm_render_renderer: Option<String>,
     pub adm_render_standard: Option<&'static str>,
     pub adm_render_profile: Option<&'static str>,
@@ -659,6 +666,13 @@ impl AnalysisReport {
             adm_chna_present: None,
             adm_presentations_json: None,
             adm_qc_passed: None,
+            adm_production_profile_standard: None,
+            adm_production_profile_version: None,
+            adm_production_profile_level: None,
+            adm_production_profile_mode: None,
+            adm_production_profile_validator: None,
+            adm_production_profile_rules_json: None,
+            adm_production_profile_passed: None,
             adm_render_renderer: None,
             adm_render_standard: None,
             adm_render_profile: None,
@@ -747,6 +761,7 @@ pub fn write_manifest<W: Write>(writer: W, reports: &[AnalysisReport]) -> Result
                 && report.codec_encoded_loudness_pass != Some(false)
                 && report.codec_roundtrip_pass != Some(false)
                 && report.adm_qc_passed != Some(false)
+                && report.adm_production_profile_passed != Some(false)
                 && report.ebu_qc_passed != Some(false)
         })
         .count();
@@ -921,6 +936,13 @@ mod tests {
             adm_chna_present: None,
             adm_presentations_json: None,
             adm_qc_passed: None,
+            adm_production_profile_standard: None,
+            adm_production_profile_version: None,
+            adm_production_profile_level: None,
+            adm_production_profile_mode: None,
+            adm_production_profile_validator: None,
+            adm_production_profile_rules_json: None,
+            adm_production_profile_passed: None,
             adm_render_renderer: None,
             adm_render_standard: None,
             adm_render_profile: None,
