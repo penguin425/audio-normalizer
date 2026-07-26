@@ -386,6 +386,43 @@ fn batch_analysis_writes_a_delivery_manifest() {
 }
 
 #[test]
+fn ebu_qc_writes_versioned_baseband_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("programme.wav");
+    let manifest = directory.path().join("delivery.json");
+    std::fs::write(&input, wav_fixture_bytes()).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            input.to_str().unwrap(),
+            "--analyze",
+            "--ebu-qc",
+            "--silence-threshold=-200",
+            "--tone-threshold=1",
+            "--manifest",
+            manifest.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(manifest).unwrap()).unwrap();
+    assert!(value["schema"]
+        .as_str()
+        .unwrap()
+        .ends_with("delivery-manifest-v2"));
+    let results = value["assets"][0]["qc"]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 6);
+    assert_eq!(results[0]["ebu_qc_id"], "0078B");
+    assert_eq!(results[4]["ebu_qc_id"], "0010B");
+    assert_eq!(results[5]["ebu_qc_id"], "0084B");
+}
+
+#[test]
 fn automatic_dialogue_writes_detection_audit() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("speech.wav");

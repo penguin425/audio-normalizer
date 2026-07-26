@@ -188,7 +188,9 @@ archive by SHA-256, and keeps the copyrighted WAV files outside the repository.
 CI runs the EBU and ITU suites as separate required evidence.
 
 The versioned JSON Schema for `--manifest` output is published at
-<https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v1>.
+<https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v2>.
+Schema v2 embeds versioned, per-channel and time-resolved EBU QC evidence while
+retaining the flat analysis fields used by JSON, NDJSON, and CSV integrations.
 
 ## Usage
 
@@ -243,6 +245,10 @@ forge --analyze album/*.flac --ndjson | jq -c 'select(.true_peak_dbtp > -1)'
 
 # Machine-readable EBU R128 delivery checks
 forge --analyze programme.wav --compliance ebu-r128 --json
+
+# Published EBU baseband QC: silence, clipping, tones, duration, loudness and TP
+forge --analyze programme.wav --ebu-qc --expected-duration 1800 \
+  --manifest delivery.json
 
 # Measure explicit dialogue/anchor regions for ATSC A/85 long-form delivery
 forge --analyze programme.wav --compliance atsc-a85-long \
@@ -323,6 +329,15 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--codec-prober` | `ffprobe` | ffprobe-compatible metadata extractor used by `--codec-qc` |
 | `--codec-reference` | none | Unencoded reference for loudness/peak/duration round-trip comparison |
 | `--codec-qc-tolerance` | `0.5` | Allowed codec/dialnorm deviation in LU/dB |
+| `--ebu-qc` | off | Run published EBU baseband QC Items |
+| `--silence-threshold` | `-60` | EBU 0078B silence threshold in dBFS |
+| `--silence-duration` | `1` | Minimum silence duration in seconds |
+| `--clipping-samples` | `3` | Consecutive full-scale samples for EBU 0005B |
+| `--tone-frequency` | `1000` | EBU 0014B test-tone frequency in Hz |
+| `--tone-threshold` | `-30` | Minimum test-tone level in dBFS |
+| `--tone-duration` | `0.5` | Minimum test-tone duration in seconds |
+| `--expected-duration` | none | Expected duration for EBU 0009F |
+| `--duration-tolerance` | `0.01` | Allowed duration deviation in seconds |
 | `--dialogue-ranges` | none | Explicit dialogue/anchor regions from JSON/TOML |
 | `--start` | `0` | Analysis start time in source seconds |
 | `--duration` | to end | Maximum analysis duration in seconds |

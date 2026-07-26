@@ -8,6 +8,7 @@ use forge_normalizer::normalize::{
     self, DialogueSource, DialogueStandard, Mode, OutputFormat, Plan,
 };
 use forge_normalizer::preset::Preset;
+use forge_normalizer::qc::{self, QcOptions};
 use forge_normalizer::report::{
     self, AnalysisReport, CodecMetadata, ComplianceProfile, TimelineReport,
 };
@@ -284,6 +285,19 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
             .as_deref()
             .map(normalize::load_adm_presentation_map)
             .transpose()?;
+        let ebu_qc_options = cli.ebu_qc.then_some(QcOptions {
+            silence_threshold_dbfs: cli.silence_threshold_dbfs,
+            silence_minimum_seconds: cli.silence_duration_seconds,
+            clipping_minimum_samples: cli.clipping_minimum_samples,
+            tone_frequency_hz: cli.tone_frequency_hz,
+            tone_threshold_dbfs: cli.tone_threshold_dbfs,
+            tone_minimum_seconds: cli.tone_duration_seconds,
+            expected_duration_seconds: cli.expected_duration_seconds,
+            duration_tolerance_seconds: cli.duration_tolerance_seconds,
+        });
+        if let Some(options) = &ebu_qc_options {
+            options.validate()?;
+        }
         let mut reports = Vec::with_capacity(cli.inputs.len());
         let mut timeline_reports = Vec::new();
         let mut dialogue_detection_output = None;
@@ -397,7 +411,17 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                     )
                 })
                 .transpose()?;
+            let ebu_qc = ebu_qc_options
+                .as_ref()
+                .map(|options| qc::analyze_file(input, &an, options))
+                .transpose()?;
             if adm_qc.as_ref().is_some_and(|result| !result.passed) {
+                qc_failed = true;
+            }
+            if ebu_qc
+                .as_ref()
+                .is_some_and(|results| results.iter().any(|result| !result.passed))
+            {
                 qc_failed = true;
             }
             if cli.json || cli.ndjson || cli.csv.is_some() || cli.manifest.is_some() {
@@ -417,6 +441,12 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                     report.downmix_true_peak_dbtp = Some(downmix.analysis.true_peak_db());
                     report.downmix_method = Some(downmix.method);
                 }
+                if let Some(results) = &ebu_qc {
+                    report.ebu_qc_results_json = Some(
+                        serde_json::to_string(results).expect("EBU QC results are serializable"),
+                    );
+                    report.ebu_qc_passed = Some(results.iter().all(|result| result.passed));
+                }
                 if let Some(codec) = &codec_qc {
                     report.codec = Some(codec.metadata.codec.clone());
                     report.codec_dialnorm_lkfs = codec.metadata.dialnorm_lkfs;
@@ -428,6 +458,32 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                     report.codec_encoded_loudness_deviation_lu =
                         codec.encoded_loudness_deviation_lu;
                     report.codec_encoded_loudness_pass = codec.encoded_loudness_pass;
+                }
+                if let Some(results) = &ebu_qc {
+                    eprintln!("  EBU QC baseband:");
+                    for result in results {
+                        eprintln!(
+                            "    {} v{} {}: {} event(s) [{}]",
+                            result.ebu_qc_id,
+                            result.version,
+                            result.name,
+                            result.events.len(),
+                            if result.passed { "PASS" } else { "FAIL" },
+                        );
+                        for event in &result.events {
+                            eprintln!(
+                                "      ch {} {:.3}..{:.3} s{}",
+                                event.channel,
+                                event.start_seconds,
+                                event.end_seconds,
+                                event
+                                    .measured
+                                    .zip(event.unit.as_deref())
+                                    .map(|(value, unit)| format!(" ({value:.3} {unit})"))
+                                    .unwrap_or_default(),
+                            );
+                        }
+                    }
                 }
                 if let Some(codec) = &automatic_codec_qc {
                     report.codec = Some(codec.probe.codec.clone());

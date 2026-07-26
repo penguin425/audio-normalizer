@@ -262,6 +262,59 @@ pub struct Cli {
     #[arg(long, value_name = "PATH", requires = "analyze_only")]
     pub manifest: Option<PathBuf>,
 
+    /// Run published EBU QC baseband checks (silence, clipping, tones, duration,
+    /// programme loudness, and true peak).
+    #[arg(long = "ebu-qc", requires = "analyze_only")]
+    pub ebu_qc: bool,
+
+    /// Level at or below which EBU 0078B silence is detected.
+    #[arg(
+        long = "silence-threshold",
+        default_value_t = -60.0,
+        requires = "ebu_qc"
+    )]
+    pub silence_threshold_dbfs: f64,
+
+    /// Minimum EBU 0078B silence duration in seconds.
+    #[arg(long = "silence-duration", default_value_t = 1.0, requires = "ebu_qc")]
+    pub silence_duration_seconds: f64,
+
+    /// Consecutive full-scale samples required by EBU 0005B.
+    #[arg(long = "clipping-samples", default_value_t = 3, requires = "ebu_qc")]
+    pub clipping_minimum_samples: usize,
+
+    /// Test-tone frequency detected by EBU 0014B.
+    #[arg(long = "tone-frequency", default_value_t = 1000.0, requires = "ebu_qc")]
+    pub tone_frequency_hz: f64,
+
+    /// Minimum test-tone level in dBFS.
+    #[arg(
+        long = "tone-threshold",
+        default_value_t = -30.0,
+        requires = "ebu_qc"
+    )]
+    pub tone_threshold_dbfs: f64,
+
+    /// Minimum continuous test-tone duration in seconds.
+    #[arg(long = "tone-duration", default_value_t = 0.5, requires = "ebu_qc")]
+    pub tone_duration_seconds: f64,
+
+    /// Expected decoded programme duration for EBU 0009F.
+    #[arg(
+        long = "expected-duration",
+        value_name = "SECONDS",
+        requires = "ebu_qc"
+    )]
+    pub expected_duration_seconds: Option<f64>,
+
+    /// Allowed deviation from --expected-duration.
+    #[arg(
+        long = "duration-tolerance",
+        default_value_t = 0.01,
+        requires = "expected_duration_seconds"
+    )]
+    pub duration_tolerance_seconds: f64,
+
     /// JSON/TOML ADM presentation-to-channel map for presentation-aware QC.
     #[arg(
         long = "adm-presentations",

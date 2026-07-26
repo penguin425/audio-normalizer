@@ -2,6 +2,7 @@
 
 use crate::dsp::lufs::LoudnessTimelinePoint;
 use crate::normalize::{Analysis, DialogueMeasurement, DialogueSource};
+use crate::qc::{QcResult, QC_SCHEMA};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -428,6 +429,9 @@ pub struct AnalysisReport {
     pub sample_peak_dbfs: f64,
     pub true_peak_dbtp: f64,
     pub peak_to_loudness_ratio_lu: f64,
+    /// Complete EBU QC result set encoded as JSON so CSV remains flat.
+    pub ebu_qc_results_json: Option<String>,
+    pub ebu_qc_passed: Option<bool>,
     pub downmix_integrated_lufs: Option<f64>,
     pub downmix_true_peak_dbtp: Option<f64>,
     pub downmix_method: Option<&'static str>,
@@ -623,6 +627,8 @@ impl AnalysisReport {
             sample_peak_dbfs: analysis.sample_peak_db(),
             true_peak_dbtp: analysis.true_peak_db(),
             peak_to_loudness_ratio_lu: analysis.peak_to_loudness_ratio_lu(),
+            ebu_qc_results_json: None,
+            ebu_qc_passed: None,
             downmix_integrated_lufs: None,
             downmix_true_peak_dbtp: None,
             downmix_method: None,
@@ -715,7 +721,21 @@ struct DeliveryManifest<'a> {
     asset_count: usize,
     passed_count: usize,
     failed_count: usize,
-    assets: &'a [AnalysisReport],
+    assets: Vec<DeliveryAsset<'a>>,
+}
+
+#[derive(Serialize)]
+struct DeliveryAsset<'a> {
+    #[serde(flatten)]
+    report: &'a AnalysisReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qc: Option<QcEnvelope>,
+}
+
+#[derive(Serialize)]
+struct QcEnvelope {
+    schema: &'static str,
+    results: Vec<QcResult>,
 }
 
 pub fn write_manifest<W: Write>(writer: W, reports: &[AnalysisReport]) -> Result<(), String> {
@@ -727,15 +747,32 @@ pub fn write_manifest<W: Write>(writer: W, reports: &[AnalysisReport]) -> Result
                 && report.codec_encoded_loudness_pass != Some(false)
                 && report.codec_roundtrip_pass != Some(false)
                 && report.adm_qc_passed != Some(false)
+                && report.ebu_qc_passed != Some(false)
         })
         .count();
+    let assets = reports
+        .iter()
+        .map(|report| {
+            let qc = report
+                .ebu_qc_results_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| format!("decode EBU QC results: {error}"))?
+                .map(|results| QcEnvelope {
+                    schema: QC_SCHEMA,
+                    results,
+                });
+            Ok(DeliveryAsset { report, qc })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let manifest = DeliveryManifest {
-        schema: "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v1",
+        schema: "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v2",
         generator: concat!("forge-normalizer/", env!("CARGO_PKG_VERSION")),
         asset_count: reports.len(),
         passed_count,
         failed_count: reports.len() - passed_count,
-        assets: reports,
+        assets,
     };
     serde_json::to_writer_pretty(writer, &manifest)
         .map_err(|error| format!("write delivery manifest: {error}"))
@@ -852,6 +889,8 @@ mod tests {
             sample_peak_dbfs: -3.0,
             true_peak_dbtp: -2.8,
             peak_to_loudness_ratio_lu: 20.2,
+            ebu_qc_results_json: None,
+            ebu_qc_passed: None,
             downmix_integrated_lufs: None,
             downmix_true_peak_dbtp: None,
             downmix_method: None,
@@ -942,7 +981,7 @@ mod tests {
         assert!(value["schema"]
             .as_str()
             .unwrap()
-            .ends_with("delivery-manifest-v1"));
+            .ends_with("delivery-manifest-v2"));
     }
 
     #[test]
