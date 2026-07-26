@@ -117,12 +117,29 @@ pub struct DetectedDialogueRange {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct DialogueDetectionFrame {
+    pub start_seconds: f64,
+    pub duration_seconds: f64,
+    pub rms_dbfs: f64,
+    pub adaptive_noise_floor_dbfs: f64,
+    pub signal_to_noise_db: f64,
+    pub center_or_mid_focus: f64,
+    pub zero_crossing_rate: f64,
+    pub speech_band_energy_ratio: f64,
+    pub amplitude_modulation_db: f64,
+    pub periodicity: f64,
+    pub confidence: f64,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct DialogueDetection {
     pub detector: &'static str,
     pub detector_version: &'static str,
     pub threshold: f64,
     pub window_seconds: f64,
     pub features: Vec<&'static str>,
+    pub frames: Vec<DialogueDetectionFrame>,
     pub ranges: Vec<DetectedDialogueRange>,
 }
 
@@ -437,9 +454,7 @@ pub fn analyze_adm_presentations(
     })
 }
 
-/// Deterministic, auditable dialogue-candidate detector. It intentionally
-/// exposes its fixed features and confidence instead of claiming a learned
-/// classifier.
+/// Deterministic, auditable multi-feature dialogue-candidate detector.
 pub fn detect_dialogue_ranges(
     path: &Path,
     channel_roles: Option<&[ChannelRole]>,
@@ -454,8 +469,8 @@ pub fn detect_dialogue_ranges(
             return Err("channel layout does not match dialogue detector input".into());
         }
     }
-    let window = source.sample_rate as usize;
-    let mut candidates = Vec::new();
+    let window = (source.sample_rate as usize / 4).max(1);
+    let mut frames = Vec::new();
     for start in (0..source.frames).step_by(window) {
         let end = (start + window).min(source.frames);
         if end - start < window / 2 {
@@ -467,29 +482,88 @@ pub fn detect_dialogue_ranges(
             .map(|sample| *sample as f64 * *sample as f64)
             .sum::<f64>()
             / focus_signal.len() as f64;
-        let rms_db = if energy > 0.0 {
+        let rms_dbfs = if energy > 0.0 {
             10.0 * energy.log10()
         } else {
-            f64::NEG_INFINITY
+            -120.0
         };
-        let energy_score = ((rms_db + 50.0) / 30.0).clamp(0.0, 1.0);
         let crossings = focus_signal
             .windows(2)
             .filter(|pair| pair[0].is_sign_positive() != pair[1].is_sign_positive())
             .count();
         let zcr = crossings as f64 / focus_signal.len() as f64;
-        let zcr_score = (zcr / 0.02).clamp(0.0, 1.0) * ((0.35 - zcr) / 0.10).clamp(0.0, 1.0);
-        let confidence = 0.5 * energy_score + 0.35 * focus_score + 0.15 * zcr_score;
-        if confidence >= threshold {
-            candidates.push(DetectedDialogueRange {
-                start_seconds: start as f64 / source.sample_rate as f64,
-                duration_seconds: (end - start) as f64 / source.sample_rate as f64,
-                confidence,
-            });
+        frames.push(DialogueDetectionFrame {
+            start_seconds: start as f64 / source.sample_rate as f64,
+            duration_seconds: (end - start) as f64 / source.sample_rate as f64,
+            rms_dbfs,
+            adaptive_noise_floor_dbfs: 0.0,
+            signal_to_noise_db: 0.0,
+            center_or_mid_focus: focus_score,
+            zero_crossing_rate: zcr,
+            speech_band_energy_ratio: speech_band_energy_ratio(&focus_signal, source.sample_rate),
+            amplitude_modulation_db: amplitude_modulation_db(&focus_signal, source.sample_rate),
+            periodicity: speech_periodicity(&focus_signal, source.sample_rate),
+            confidence: 0.0,
+            selected: false,
+        });
+    }
+    let mut ordered_levels = frames
+        .iter()
+        .map(|frame| frame.rms_dbfs)
+        .collect::<Vec<_>>();
+    ordered_levels.sort_by(f64::total_cmp);
+    let noise_index = ordered_levels.len().saturating_sub(1) / 5;
+    let adaptive_noise_floor = ordered_levels
+        .get(noise_index)
+        .copied()
+        .unwrap_or(-120.0)
+        .min(-45.0);
+    for frame in &mut frames {
+        frame.adaptive_noise_floor_dbfs = adaptive_noise_floor;
+        frame.signal_to_noise_db = frame.rms_dbfs - adaptive_noise_floor;
+        let energy_score = (((frame.rms_dbfs + 55.0) / 30.0).clamp(0.0, 1.0)
+            + ((frame.signal_to_noise_db - 3.0) / 15.0).clamp(0.0, 1.0))
+        .min(1.0);
+        let zcr_score = (frame.zero_crossing_rate / 0.005).clamp(0.0, 1.0)
+            * ((0.30 - frame.zero_crossing_rate) / 0.10).clamp(0.0, 1.0);
+        let band_score = ((frame.speech_band_energy_ratio - 0.15) / 0.55).clamp(0.0, 1.0);
+        let modulation_score = (frame.amplitude_modulation_db / 6.0).clamp(0.0, 1.0);
+        let periodicity_score = ((frame.periodicity - 0.10) / 0.65).clamp(0.0, 1.0);
+        frame.confidence = 0.30 * energy_score
+            + 0.20 * frame.center_or_mid_focus
+            + 0.20 * band_score
+            + 0.10 * zcr_score
+            + 0.10 * modulation_score
+            + 0.10 * periodicity_score;
+    }
+
+    let exit_threshold = (threshold - 0.12).max(0.0);
+    let mut active = false;
+    let mut hangover_used = false;
+    for frame in &mut frames {
+        if !active {
+            active = frame.confidence >= threshold;
+            hangover_used = false;
+            frame.selected = active;
+        } else if frame.confidence >= exit_threshold {
+            frame.selected = true;
+            hangover_used = false;
+        } else if !hangover_used {
+            frame.selected = true;
+            hangover_used = true;
+        } else {
+            active = false;
+            hangover_used = false;
         }
     }
+
     let mut ranges: Vec<DetectedDialogueRange> = Vec::new();
-    for candidate in candidates {
+    for frame in frames.iter().filter(|frame| frame.selected) {
+        let candidate = DetectedDialogueRange {
+            start_seconds: frame.start_seconds,
+            duration_seconds: frame.duration_seconds,
+            confidence: frame.confidence,
+        };
         if let Some(previous) = ranges.last_mut() {
             let previous_end = previous.start_seconds + previous.duration_seconds;
             if (previous_end - candidate.start_seconds).abs() < 1e-9 {
@@ -510,16 +584,99 @@ pub fn detect_dialogue_ranges(
     }
     Ok(DialogueDetection {
         detector: "forge-dialogue-deterministic",
-        detector_version: concat!("v1/", env!("CARGO_PKG_VERSION")),
+        detector_version: concat!("v2/", env!("CARGO_PKG_VERSION")),
         threshold,
-        window_seconds: 1.0,
+        window_seconds: 0.25,
         features: vec![
             "window_rms_dbfs",
+            "adaptive_noise_floor_dbfs",
+            "signal_to_noise_db",
             "center_or_mid_focus",
             "zero_crossing_rate",
+            "speech_band_energy_ratio",
+            "amplitude_modulation_db",
+            "periodicity",
         ],
+        frames,
         ranges,
     })
+}
+
+fn speech_band_energy_ratio(samples: &[f32], sample_rate: u32) -> f64 {
+    if samples.is_empty() || sample_rate == 0 {
+        return 0.0;
+    }
+    let dt = 1.0 / sample_rate as f64;
+    let high_pass_rc = 1.0 / (std::f64::consts::TAU * 80.0);
+    let high_pass_alpha = high_pass_rc / (high_pass_rc + dt);
+    let low_pass_rc = 1.0 / (std::f64::consts::TAU * 4_000.0);
+    let low_pass_alpha = dt / (low_pass_rc + dt);
+    let mut previous_input = 0.0;
+    let mut high_pass = 0.0;
+    let mut speech_band = 0.0;
+    let mut band_energy = 0.0;
+    let mut total_energy = 0.0;
+    for sample in samples {
+        let input = f64::from(*sample);
+        high_pass = high_pass_alpha * (high_pass + input - previous_input);
+        speech_band += low_pass_alpha * (high_pass - speech_band);
+        previous_input = input;
+        band_energy += speech_band * speech_band;
+        total_energy += input * input;
+    }
+    (band_energy / (total_energy + f64::EPSILON)).clamp(0.0, 1.0)
+}
+
+fn amplitude_modulation_db(samples: &[f32], sample_rate: u32) -> f64 {
+    let subwindow = (sample_rate as usize / 50).max(1);
+    let levels = samples
+        .chunks(subwindow)
+        .filter(|chunk| chunk.len() >= subwindow / 2)
+        .map(|chunk| {
+            let energy = mean_square(chunk);
+            10.0 * energy.max(1e-12).log10()
+        })
+        .collect::<Vec<_>>();
+    if levels.len() < 2 {
+        return 0.0;
+    }
+    let mean = levels.iter().sum::<f64>() / levels.len() as f64;
+    (levels
+        .iter()
+        .map(|level| (level - mean).powi(2))
+        .sum::<f64>()
+        / levels.len() as f64)
+        .sqrt()
+}
+
+fn speech_periodicity(samples: &[f32], sample_rate: u32) -> f64 {
+    const FREQUENCIES: [u32; 7] = [80, 100, 125, 160, 200, 250, 300];
+    let energy = samples
+        .iter()
+        .step_by(4)
+        .map(|sample| f64::from(*sample).powi(2))
+        .sum::<f64>();
+    if energy <= f64::EPSILON {
+        return 0.0;
+    }
+    FREQUENCIES
+        .into_iter()
+        .filter_map(|frequency| {
+            let lag = (sample_rate / frequency) as usize;
+            (lag < samples.len()).then(|| {
+                let mut correlation = 0.0;
+                let mut delayed_energy = 0.0;
+                for index in (lag..samples.len()).step_by(4) {
+                    let current = f64::from(samples[index]);
+                    let delayed = f64::from(samples[index - lag]);
+                    correlation += current * delayed;
+                    delayed_energy += delayed * delayed;
+                }
+                (correlation / (energy * delayed_energy).sqrt().max(f64::EPSILON)).max(0.0)
+            })
+        })
+        .fold(0.0, f64::max)
+        .clamp(0.0, 1.0)
 }
 
 fn dialogue_focus(channels: &[Vec<f32>], start: usize, end: usize) -> (Vec<f32>, f64) {

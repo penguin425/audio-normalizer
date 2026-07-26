@@ -414,7 +414,8 @@ reviewable regions with `--dialogue-ranges`. Per ATSC A/85:2026-07 Annex M,
 the dialogue selection acts as the gate and Forge averages K-weighted energy
 without the BS.1770-2+ relative-level gate. Region energies are duration
 weighted. Reports identify the measurement standard and method explicitly.
-Forge does not guess dialogue with a classifier.
+Forge does not silently guess dialogue: use explicit regions or opt into the
+auditable detector with `--auto-dialogue`.
 
 For cinematic EBU R 128 s4 QC, use
 `--compliance ebu-r128-cinematic --dialogue-ranges dialogue.json`. This selects
@@ -479,11 +480,15 @@ the rendered signals for audition and downstream QC. The renderer remains an
 optional runtime dependency; ordinary PCM/ADM preservation does not require it.
 
 `--auto-dialogue` provides deterministic dialogue candidates when reviewed
-ranges are not yet available. The detector uses fixed one-second RMS,
-centre/mid focus, and zero-crossing features; `--dialogue-confidence` controls
-selection. Reports include the detector/version, threshold, every selected
-range, and confidence. `--dialogue-detection-report` writes the same audit data
-separately. This is deliberately described as a heuristic detector, not AI.
+ranges are not yet available. Detector v2 evaluates 250 ms frames using
+adaptive noise floor/SNR, centre or mid focus, zero-crossing rate, 80 Hz–4 kHz
+speech-band energy, short-frame amplitude modulation, and voiced periodicity.
+Threshold hysteresis and a one-frame hangover avoid fragmented regions.
+`--dialogue-confidence` controls selection. Reports preserve the
+detector/version, threshold, selected ranges, and every frame's raw features,
+confidence, and decision; `--dialogue-detection-report` writes the audit record
+separately. This remains a reviewable deterministic detector, not a claim of
+AI transcription or semantic understanding.
 
 Loudness Range (LRA) is reported for every analysis, together with
 `loudness_range_stable`. EBU Tech 3341 notes that LRA is not stable during the

@@ -174,15 +174,61 @@ fn dialogue_detector_emits_auditable_merged_ranges() {
         detection.features,
         vec![
             "window_rms_dbfs",
+            "adaptive_noise_floor_dbfs",
+            "signal_to_noise_db",
             "center_or_mid_focus",
-            "zero_crossing_rate"
+            "zero_crossing_rate",
+            "speech_band_energy_ratio",
+            "amplitude_modulation_db",
+            "periodicity",
         ]
     );
+    assert!(detection.detector_version.starts_with("v2/"));
+    assert_eq!(detection.window_seconds, 0.25);
+    assert_eq!(detection.frames.len(), 16);
+    assert!(detection
+        .frames
+        .iter()
+        .all(|frame| frame.confidence.is_finite()));
+    assert!(detection.frames.iter().any(|frame| frame.selected));
     assert_eq!(detection.ranges.len(), 1);
     assert_eq!(detection.ranges[0].start_seconds, 1.0);
-    assert_eq!(detection.ranges[0].duration_seconds, 2.0);
+    assert_eq!(detection.ranges[0].duration_seconds, 2.25);
     assert!(detection.ranges[0].confidence >= 0.6);
+    let repeated = normalize::detect_dialogue_ranges(&input, None, 0.6).unwrap();
+    assert_eq!(
+        serde_json::to_value(&detection).unwrap(),
+        serde_json::to_value(&repeated).unwrap(),
+        "detector output must be bit-for-bit deterministic"
+    );
 
+    let _ = std::fs::remove_file(input);
+}
+
+#[test]
+fn dialogue_detector_rejects_broadband_noise() {
+    let input = tmp_path("forge_it_dialogue_detector_noise.wav");
+    let mut state = 0x1234_5678_u32;
+    let samples = (0..192_000)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 16_777_215.0 - 0.5) * 0.4
+        })
+        .collect::<Vec<_>>();
+    let buffer = AudioBuffer {
+        sample_rate: 48_000,
+        channels: 1,
+        frames: samples.len(),
+        data: vec![samples],
+        channel_roles: default_channel_roles(1),
+        source_kind: PcmKind::F32,
+    };
+    WavWriter::write(&input, &buffer, PcmKind::F32, false).unwrap();
+    let result = normalize::detect_dialogue_ranges(&input, None, 0.6);
+    assert!(
+        result.is_err(),
+        "broadband noise was classified as dialogue"
+    );
     let _ = std::fs::remove_file(input);
 }
 
