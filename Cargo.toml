@@ -1,6 +1,6 @@
 [package]
 name = "forge-normalizer"
-version = "0.25.0"
+version = "0.26.0"
 edition = "2021"
 description = "Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer (WAV/MP3/FLAC/Opus/AAC/Vorbis)"
 license = "MIT"
@@ -17,6 +17,7 @@ aac-encoding = []
 mp3-encoding = []
 opus-encoding = ["dep:audiopus_sys", "dep:ogg", "dep:opus"]
 lv2-plugin = []
+clap-plugin = ["dep:clack-plugin", "dep:clack-extensions"]
 
 [[bin]]
 name = "forge"
@@ -36,6 +37,8 @@ csv = "1"
 toml = "1.1"
 lofty = "0.24"
 quick-xml = "0.38"
+clack-plugin = { version = "0.1", optional = true }
+clack-extensions = { version = "0.1", optional = true, features = ["audio-ports", "params", "state", "render", "latency", "clack-plugin"] }
 flacenc = { version = "0.5.1", default-features = false }
 tempfile = "3"
 audiopus_sys = { version = "0.2.2", features = ["static"], optional = true }
@@ -47,6 +50,7 @@ rubato = { version = "0.16.2", default-features = false }
 
 [dev-dependencies]
 jsonschema = { version = "0.49.1", default-features = false }
+clack-host = { version = "0.1", features = ["clack-plugin"] }
 
 [profile.release]
 opt-level = 3

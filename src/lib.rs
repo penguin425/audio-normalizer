@@ -13,6 +13,8 @@
 pub mod aac;
 pub mod adm;
 mod atomic;
+#[cfg(feature = "clap-plugin")]
+pub mod clap_plugin;
 pub mod cli;
 pub mod codec_qc;
 pub mod decoder;
