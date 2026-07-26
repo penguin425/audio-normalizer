@@ -536,6 +536,11 @@ true-peak, and sample-accurate duration drift. The exact prober path and
 `ffprobe-json-v1` extraction schema are preserved for auditability. `ffprobe`
 is not a build or runtime requirement unless `--codec-qc` is requested.
 
+For Ogg Opus inputs, container QC validates CRCs, mandatory header-page
+boundaries, RFC 6716 packet duration, and RFC 7845 granule increments. Initial
+granule offsets, pre-skip, chained streams, and final-page end trimming are
+reported without decoding the audio payload.
+
 The reviewable JSON/TOML sidecar flow remains available through
 `--codec-metadata`. Fields include `codec`, `dialnorm_lkfs`,
 `encoded_loudness_lufs`, `downmix_mode`, and `tolerance_lu`. Dialnorm is

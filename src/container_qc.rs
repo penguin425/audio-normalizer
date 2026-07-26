@@ -96,7 +96,7 @@ fn audit_ogg_opus(path: &Path) -> Result<ContainerAudit, String> {
                 bitstream.push(check(
                     "FORGE-OPUS-GRANULES",
                     true,
-                    "granule positions are monotonic and cover each pre-skip",
+                    "granule increments equal completed RFC 6716 packet durations; initial offset, pre-skip, and EOS trimming are valid",
                     Some(json!(inspection.total_frames)),
                 ));
                 xcheck.push(check(
