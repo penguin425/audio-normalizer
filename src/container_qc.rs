@@ -42,7 +42,7 @@ pub struct AuditCheck {
 pub fn audit(path: &Path) -> Result<ContainerAudit, String> {
     audit_if_supported(path)?.ok_or_else(|| {
         format!(
-            "{}: unsupported container (expected RIFF/RF64/BW64 WAVE or Ogg Opus)",
+            "{}: unsupported container (expected RIFF/RF64/BW64 WAVE, Ogg Opus, or ISO-BMFF MP4/M4A/fMP4)",
             path.display()
         )
     })
@@ -62,6 +62,8 @@ pub fn audit_if_supported(path: &Path) -> Result<Option<ContainerAudit>, String>
         audit_wave(path, &mut file, &header[..header_size], file_size).map(Some)
     } else if header_size >= 4 && &header[..4] == b"OggS" {
         audit_ogg_opus(path).map(Some)
+    } else if crate::isobmff_qc::looks_like_isobmff(&header[..header_size], file_size) {
+        crate::isobmff_qc::audit(path, file, file_size).map(Some)
     } else {
         Ok(None)
     }
@@ -620,7 +622,7 @@ fn parse_wave_fmt(body: &[u8], checks: &mut Vec<AuditCheck>) -> Option<WaveForma
     Some(format)
 }
 
-fn check(
+pub(crate) fn check(
     rule_id: &'static str,
     passed: bool,
     message: impl Into<String>,
@@ -634,7 +636,7 @@ fn check(
     }
 }
 
-fn finish_audit(
+pub(crate) fn finish_audit(
     path: &Path,
     format: &str,
     wrapper: Vec<AuditCheck>,

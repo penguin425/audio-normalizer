@@ -23,6 +23,7 @@ pub mod decoder;
 pub mod dialogue_provider;
 pub mod dsp;
 pub mod flacenc;
+mod isobmff_qc;
 #[cfg(feature = "lv2-plugin")]
 mod lv2;
 pub mod metadata;
