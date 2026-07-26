@@ -254,9 +254,9 @@ CI builds and smoke-runs every target on relevant pull requests and `main`;
 a scheduled workflow repeats the bounded run weekly.
 
 The versioned JSON Schema for `--manifest` output is published at
-<https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v2>.
-Schema v2 embeds versioned, per-channel and time-resolved EBU QC evidence while
-retaining the flat analysis fields used by JSON, NDJSON, and CSV integrations.
+<https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v3>.
+Schema v3 embeds versioned container and EBU QC evidence while retaining the
+flat analysis fields used by JSON, NDJSON, and CSV integrations.
 
 ## Usage
 

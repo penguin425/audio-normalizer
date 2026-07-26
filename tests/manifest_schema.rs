@@ -5,6 +5,17 @@ use serde_json::{json, Value};
 
 #[test]
 fn emitted_delivery_manifest_conforms_to_published_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("programme.wav");
+    let audio = forge_normalizer::wav::AudioBuffer {
+        sample_rate: 48_000,
+        channels: 2,
+        frames: 100,
+        data: vec![vec![0.0; 100], vec![0.0; 100]],
+        channel_roles: vec![ChannelRole::Main, ChannelRole::Main],
+        source_kind: PcmKind::S16,
+    };
+    forge_normalizer::wav::WavWriter::write(&path, &audio, PcmKind::S16, false).unwrap();
     let analysis = Analysis {
         sample_rate: 48_000,
         channels: 2,
@@ -20,12 +31,12 @@ fn emitted_delivery_manifest_conforms_to_published_schema() {
         true_peak: 0.25,
         loudness_blocks: vec![],
     };
-    let reports = [AnalysisReport::new("programme.wav".as_ref(), &analysis)];
+    let reports = [AnalysisReport::new(&path, &analysis)];
     let mut output = Vec::new();
     report::write_manifest(&mut output, &reports).expect("manifest serialization");
     let instance: Value = serde_json::from_slice(&output).expect("manifest JSON");
     let schema: Value =
-        serde_json::from_str(include_str!("../schema/delivery-manifest-v2.schema.json"))
+        serde_json::from_str(include_str!("../schema/delivery-manifest-v3.schema.json"))
             .expect("schema JSON");
     let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
     let errors: Vec<_> = validator
@@ -33,6 +44,7 @@ fn emitted_delivery_manifest_conforms_to_published_schema() {
         .map(|error| error.to_string())
         .collect();
     assert!(errors.is_empty(), "schema violations: {errors:#?}");
+    assert_eq!(instance["assets"][0]["container_qc"]["passed"], true);
 }
 
 #[test]

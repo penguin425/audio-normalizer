@@ -3,6 +3,7 @@
 use crate::dsp::lufs::LoudnessTimelinePoint;
 use crate::normalize::{Analysis, DialogueMeasurement, DialogueSource};
 use crate::qc::{QcResult, QC_SCHEMA};
+use crate::{container_qc, container_qc::ContainerAudit};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -744,6 +745,8 @@ struct DeliveryAsset<'a> {
     report: &'a AnalysisReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     qc: Option<QcEnvelope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    container_qc: Option<ContainerAudit>,
 }
 
 #[derive(Serialize)]
@@ -753,18 +756,6 @@ struct QcEnvelope {
 }
 
 pub fn write_manifest<W: Write>(writer: W, reports: &[AnalysisReport]) -> Result<(), String> {
-    let passed_count = reports
-        .iter()
-        .filter(|report| {
-            report.compliance_passed != Some(false)
-                && report.codec_dialnorm_pass != Some(false)
-                && report.codec_encoded_loudness_pass != Some(false)
-                && report.codec_roundtrip_pass != Some(false)
-                && report.adm_qc_passed != Some(false)
-                && report.adm_production_profile_passed != Some(false)
-                && report.ebu_qc_passed != Some(false)
-        })
-        .count();
     let assets = reports
         .iter()
         .map(|report| {
@@ -778,11 +769,35 @@ pub fn write_manifest<W: Write>(writer: W, reports: &[AnalysisReport]) -> Result
                     schema: QC_SCHEMA,
                     results,
                 });
-            Ok(DeliveryAsset { report, qc })
+            let path = Path::new(&report.path);
+            let container_qc = if path.is_file() {
+                container_qc::audit_if_supported(path)?
+            } else {
+                None
+            };
+            Ok(DeliveryAsset {
+                report,
+                qc,
+                container_qc,
+            })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let passed_count = assets
+        .iter()
+        .filter(|asset| {
+            let report = asset.report;
+            report.compliance_passed != Some(false)
+                && report.codec_dialnorm_pass != Some(false)
+                && report.codec_encoded_loudness_pass != Some(false)
+                && report.codec_roundtrip_pass != Some(false)
+                && report.adm_qc_passed != Some(false)
+                && report.adm_production_profile_passed != Some(false)
+                && report.ebu_qc_passed != Some(false)
+                && asset.container_qc.as_ref().is_none_or(|audit| audit.passed)
+        })
+        .count();
     let manifest = DeliveryManifest {
-        schema: "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v2",
+        schema: "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v3",
         generator: concat!("forge-normalizer/", env!("CARGO_PKG_VERSION")),
         asset_count: reports.len(),
         passed_count,
@@ -1003,7 +1018,34 @@ mod tests {
         assert!(value["schema"]
             .as_str()
             .unwrap()
-            .ends_with("delivery-manifest-v2"));
+            .ends_with("delivery-manifest-v3"));
+    }
+
+    #[test]
+    fn delivery_manifest_counts_container_qc_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("damaged.wav");
+        let audio = crate::wav::AudioBuffer {
+            sample_rate: 48_000,
+            channels: 1,
+            frames: 16,
+            data: vec![vec![0.0; 16]],
+            channel_roles: vec![crate::wav::ChannelRole::Main],
+            source_kind: crate::wav::PcmKind::S16,
+        };
+        crate::wav::WavWriter::write(&path, &audio, crate::wav::PcmKind::S16, false).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut report = sample_report();
+        report.path = path.to_string_lossy().into_owned();
+        let mut output = Vec::new();
+        write_manifest(&mut output, &[report]).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["passed_count"], 0);
+        assert_eq!(value["failed_count"], 1);
+        assert_eq!(value["assets"][0]["container_qc"]["passed"], false);
     }
 
     #[test]

@@ -40,6 +40,15 @@ pub struct AuditCheck {
 }
 
 pub fn audit(path: &Path) -> Result<ContainerAudit, String> {
+    audit_if_supported(path)?.ok_or_else(|| {
+        format!(
+            "{}: unsupported container (expected RIFF/RF64/BW64 WAVE or Ogg Opus)",
+            path.display()
+        )
+    })
+}
+
+pub fn audit_if_supported(path: &Path) -> Result<Option<ContainerAudit>, String> {
     let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
     let file_size = file
         .metadata()
@@ -50,14 +59,11 @@ pub fn audit(path: &Path) -> Result<ContainerAudit, String> {
     file.read_exact(&mut header[..header_size])
         .map_err(|error| format!("read {} header: {error}", path.display()))?;
     if header_size >= 4 && matches!(&header[..4], b"RIFF" | b"RF64" | b"BW64") {
-        audit_wave(path, &mut file, &header[..header_size], file_size)
+        audit_wave(path, &mut file, &header[..header_size], file_size).map(Some)
     } else if header_size >= 4 && &header[..4] == b"OggS" {
-        audit_ogg_opus(path)
+        audit_ogg_opus(path).map(Some)
     } else {
-        Err(format!(
-            "{}: unsupported container (expected RIFF/RF64/BW64 WAVE or Ogg Opus)",
-            path.display()
-        ))
+        Ok(None)
     }
 }
 
