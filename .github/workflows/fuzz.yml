@@ -8,6 +8,7 @@ on:
       - "src/adm.rs"
       - "src/compare.rs"
       - "src/container_qc.rs"
+      - "src/isobmff_qc.rs"
       - "src/wav/reader.rs"
   push:
     branches: [main]
@@ -17,6 +18,7 @@ on:
       - "src/adm.rs"
       - "src/compare.rs"
       - "src/container_qc.rs"
+      - "src/isobmff_qc.rs"
       - "src/wav/reader.rs"
   schedule:
     - cron: "23 3 * * 1"

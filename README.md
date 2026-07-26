@@ -206,9 +206,20 @@ alignment, required/unique `fmt` and `data` chunks, `ds64` placement/table/data
 sizes/sample counts, byte rate, block alignment, BWF `bext`, and paired ADM
 `axml`/`chna` metadata. For Ogg Opus it verifies page CRCs, sequential chains,
 headers/tags, mapping-family tables, monotonic granules, pre-skip/end trim, and
-consistent layouts. Results use versioned JSON with stable `FORGE-*` rule IDs
-and separate `wrapper`, `bitstream`, and `x-check` layers. Exit status is 0 for
-pass, 1 for a QC failure, and 2 for an I/O or unsupported-format error.
+consistent layouts.
+
+For ISO-BMFF MP4, M4A, and fragmented MP4 it scans the complete nested box
+structure with bounded memory, validates 32/64-bit box sizes and file roles,
+extracts audio sample descriptions, verifies `stts`/`stsz`/`stz2`/`stsc` and
+`stco`/`co64` sample tables, cross-checks counts, durations, sample bytes, and
+`mdat` offsets, and checks `moof` sequence numbers and per-track `tfdt`
+timelines. Complete files, fragmented initialization segments, and standalone
+media segments are distinguished explicitly. `mdat` payloads are seeked over,
+not loaded.
+
+Results use versioned JSON with stable `FORGE-*` rule IDs and separate
+`wrapper`, `bitstream`, and `x-check` layers. Exit status is 0 for pass, 1 for a
+QC failure, and 2 for an I/O or unsupported-format error.
 
 ### Standards conformance tests
 
