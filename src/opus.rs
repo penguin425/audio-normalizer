@@ -34,7 +34,10 @@ pub struct OpusChainInspection {
     pub original_sample_rate_hz: u32,
     pub output_gain_q7_8: i16,
     pub audio_packet_count: u64,
+    pub encoded_samples: u64,
+    pub initial_granule_offset_samples: u64,
     pub final_granule_position: u64,
+    pub end_trim_samples: u64,
     pub decoded_frames: u64,
     pub r128_track_gain_q7_8: Option<i16>,
     pub r128_album_gain_q7_8: Option<i16>,
@@ -432,7 +435,11 @@ pub fn inspect(path: &Path) -> Result<OpusInspection, String> {
     let mut expected_channels = None;
     while let Some(head) = read_ogg_packet(&mut packets, path, "OpusHead")? {
         let index = chains.len() + 1;
-        if !head.first_in_stream() || !head.data.starts_with(b"OpusHead") {
+        if !head.first_in_stream()
+            || !head.last_in_page()
+            || head.absgp_page() != 0
+            || !head.data.starts_with(b"OpusHead")
+        {
             return Err(format!("chain {index} does not start with OpusHead"));
         }
         let serial = head.stream_serial();
@@ -450,6 +457,8 @@ pub fn inspect(path: &Path) -> Result<OpusInspection, String> {
         if tags.stream_serial() != serial
             || tags.first_in_stream()
             || tags.last_in_stream()
+            || !tags.last_in_page()
+            || tags.absgp_page() != 0
             || !tags.data.starts_with(b"OpusTags")
         {
             return Err(format!("chain {index} has invalid OpusTags"));
@@ -457,7 +466,10 @@ pub fn inspect(path: &Path) -> Result<OpusInspection, String> {
         let (track_gain, album_gain) =
             parse_r128_comments(&tags.data).map_err(|error| format!("chain {index}: {error}"))?;
         let mut audio_packet_count = 0_u64;
-        let mut previous_page_granule = 0_u64;
+        let mut encoded_samples = 0_u64;
+        let mut page_samples = 0_u64;
+        let mut previous_page_granule = None;
+        let mut initial_granule_offset_samples = 0_u64;
         let final_granule_position = loop {
             let packet = read_ogg_packet(&mut packets, path, "Ogg Opus packet")?
                 .ok_or_else(|| format!("chain {index} ended without an Ogg EOS page"))?;
@@ -470,21 +482,43 @@ pub fn inspect(path: &Path) -> Result<OpusInspection, String> {
             if packet.data.is_empty() {
                 return Err(format!("chain {index} contains an empty Opus packet"));
             }
+            let packet_samples = opus_packet_samples(&packet.data).map_err(|error| {
+                format!("chain {index}: packet {}: {error}", audio_packet_count + 1)
+            })?;
             audio_packet_count += 1;
+            encoded_samples = encoded_samples
+                .checked_add(packet_samples)
+                .ok_or_else(|| format!("chain {index} encoded duration overflow"))?;
+            page_samples = page_samples
+                .checked_add(packet_samples)
+                .ok_or_else(|| format!("chain {index} page duration overflow"))?;
             if packet.last_in_page() {
                 let granule = packet.absgp_page();
-                if granule < previous_page_granule {
-                    return Err(format!("chain {index} has a decreasing granule position"));
+                if previous_page_granule.is_none() && !packet.last_in_stream() {
+                    initial_granule_offset_samples = granule.saturating_sub(page_samples);
                 }
-                previous_page_granule = granule;
+                validate_page_granule(
+                    index,
+                    previous_page_granule,
+                    granule,
+                    page_samples,
+                    packet.last_in_stream(),
+                )?;
+                previous_page_granule = Some(granule);
+                page_samples = 0;
             }
             if packet.last_in_stream() {
                 break packet.absgp_page();
             }
         };
-        if final_granule_position < u64::from(parsed.pre_skip) {
+        let playable_origin =
+            initial_granule_offset_samples.saturating_add(u64::from(parsed.pre_skip));
+        if final_granule_position < playable_origin {
             return Err(format!("chain {index} final granule precedes its pre-skip"));
         }
+        let end_trim_samples = initial_granule_offset_samples
+            .saturating_add(encoded_samples)
+            .saturating_sub(final_granule_position);
         chains.push(OpusChainInspection {
             index,
             serial,
@@ -494,8 +528,11 @@ pub fn inspect(path: &Path) -> Result<OpusInspection, String> {
             original_sample_rate_hz: parsed.original_sample_rate,
             output_gain_q7_8: parsed.output_gain_q7_8,
             audio_packet_count,
+            encoded_samples,
+            initial_granule_offset_samples,
             final_granule_position,
-            decoded_frames: final_granule_position - u64::from(parsed.pre_skip),
+            end_trim_samples,
+            decoded_frames: final_granule_position - playable_origin,
             r128_track_gain_q7_8: track_gain,
             r128_album_gain_q7_8: album_gain,
         });
@@ -513,6 +550,50 @@ pub fn inspect(path: &Path) -> Result<OpusInspection, String> {
         total_frames,
         chains,
     })
+}
+
+fn opus_packet_samples(packet: &[u8]) -> Result<u64, String> {
+    let length = i32::try_from(packet.len()).map_err(|_| "Opus packet is too large")?;
+    // SAFETY: libopus only reads `length` bytes from the non-empty packet slice.
+    let samples = unsafe {
+        audiopus_sys::opus_packet_get_nb_samples(packet.as_ptr(), length, OPUS_RATE as i32)
+    };
+    if samples <= 0 {
+        return Err(format!("invalid RFC 6716 packet (libopus error {samples})"));
+    }
+    Ok(samples as u64)
+}
+
+fn validate_page_granule(
+    chain_index: usize,
+    previous: Option<u64>,
+    granule: u64,
+    completed_samples: u64,
+    eos: bool,
+) -> Result<(), String> {
+    let Some(previous) = previous else {
+        if !eos && granule < completed_samples {
+            return Err(format!(
+                "chain {chain_index} first audio-page granule {granule} is smaller than its {completed_samples} completed sample(s)"
+            ));
+        }
+        return Ok(());
+    };
+    let expected = previous
+        .checked_add(completed_samples)
+        .ok_or_else(|| format!("chain {chain_index} granule position overflow"))?;
+    if eos {
+        if granule < previous || granule > expected {
+            return Err(format!(
+                "chain {chain_index} EOS granule {granule} is outside the RFC 7845 end-trim range {previous}..={expected}"
+            ));
+        }
+    } else if granule != expected {
+        return Err(format!(
+            "chain {chain_index} granule {granule} does not equal previous {previous} plus {completed_samples} completed sample(s)"
+        ));
+    }
+    Ok(())
 }
 
 pub fn rewrite_r128_tags(
@@ -969,4 +1050,27 @@ fn read_u32(data: &[u8], offset: &mut usize) -> Result<u32, String> {
     let value = u32::from_le_bytes(data[*offset..end].try_into().unwrap());
     *offset = end;
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn granules_follow_completed_packet_durations() {
+        validate_page_granule(1, None, 1_200, 960, false).unwrap();
+        validate_page_granule(1, Some(1_200), 3_120, 1_920, false).unwrap();
+        validate_page_granule(1, Some(3_120), 3_700, 960, true).unwrap();
+
+        assert!(validate_page_granule(1, Some(1_200), 3_000, 1_920, false).is_err());
+        assert!(validate_page_granule(1, Some(3_120), 4_200, 960, true).is_err());
+        assert!(validate_page_granule(1, None, 800, 960, false).is_err());
+    }
+
+    #[test]
+    fn libopus_reports_rfc_6716_packet_duration() {
+        // A one-byte code-0 TOC packet has one 20 ms frame at 48 kHz.
+        assert_eq!(opus_packet_samples(&[0x98]).unwrap(), 960);
+        assert!(opus_packet_samples(&[]).is_err());
+    }
 }
