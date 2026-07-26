@@ -229,6 +229,31 @@ pub struct Cli {
     )]
     pub codec_metadata: Option<PathBuf>,
 
+    /// Automatically extract codec delivery metadata with an ffprobe-compatible
+    /// tool and evaluate it against the decoded programme.
+    #[arg(
+        long = "codec-qc",
+        requires = "analyze_only",
+        conflicts_with = "codec_metadata"
+    )]
+    pub codec_qc: bool,
+
+    /// Path to the ffprobe-compatible codec metadata extractor.
+    #[arg(long = "codec-prober", value_name = "PATH", requires = "codec_qc")]
+    pub codec_prober: Option<PathBuf>,
+
+    /// Unencoded reference audio for decoded codec round-trip comparison.
+    #[arg(long = "codec-reference", value_name = "PATH", requires = "codec_qc")]
+    pub codec_reference: Option<PathBuf>,
+
+    /// Maximum absolute loudness, true-peak, and dialnorm deviation in LU/dB.
+    #[arg(
+        long = "codec-qc-tolerance",
+        default_value_t = 0.5,
+        requires = "codec_qc"
+    )]
+    pub codec_qc_tolerance: f64,
+
     /// Measure a WAVE-order stereo downmix as a separate delivery presentation.
     #[arg(long = "downmix-qc", requires = "analyze_only")]
     pub downmix_qc: bool,
