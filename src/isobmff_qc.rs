@@ -45,6 +45,31 @@ struct Track {
     chunk_offsets: Vec<u64>,
     sample_to_chunk: Vec<(u32, u32, u32)>,
     chunk_samples: Option<u64>,
+    ludt_count: usize,
+    loudness: Vec<LoudnessEntry>,
+    drc_boxes: Vec<String>,
+}
+
+#[derive(Clone)]
+struct LoudnessEntry {
+    scope: &'static str,
+    version: u8,
+    eq_set_id: Option<u8>,
+    downmix_id: u8,
+    drc_set_id: u8,
+    sample_peak_code: i16,
+    true_peak_code: i16,
+    true_peak_measurement_system: u8,
+    true_peak_reliability: u8,
+    measurements: Vec<LoudnessMeasurement>,
+}
+
+#[derive(Clone)]
+struct LoudnessMeasurement {
+    method_definition: u8,
+    method_value: u8,
+    measurement_system: u8,
+    reliability: u8,
 }
 
 #[derive(Default)]
@@ -469,10 +494,238 @@ fn parse_trak(
         match &child.kind {
             b"tkhd" => track.id = parse_tkhd(path, file, child, bitstream)?,
             b"mdia" => parse_mdia(path, file, child, box_count, &mut track, bitstream, xcheck)?,
+            b"udta" => parse_udta(path, file, child, box_count, &mut track, bitstream)?,
             _ => {}
         }
     }
     Ok(track)
+}
+
+fn parse_udta(
+    path: &Path,
+    file: &mut File,
+    header: BoxHeader,
+    box_count: &mut usize,
+    track: &mut Track,
+    checks: &mut Vec<AuditCheck>,
+) -> Result<(), String> {
+    for child in list_boxes(path, file, header.body_start, header.end, box_count)? {
+        if child.kind != *b"ludt" {
+            continue;
+        }
+        track.ludt_count += 1;
+        if let Err(error) = parse_ludt(path, file, child, box_count, track, checks) {
+            checks.push(check(
+                "FORGE-ISOBMFF-LOUDNESS-STRUCTURE",
+                false,
+                error,
+                None,
+            ));
+        }
+    }
+    checks.push(check(
+        "FORGE-ISOBMFF-LOUDNESS-BOX-COUNT",
+        track.ludt_count <= 1,
+        if track.ludt_count <= 1 {
+            "track user data contains at most one LoudnessBox"
+        } else {
+            "track user data contains multiple LoudnessBox values"
+        },
+        Some(json!(track.ludt_count)),
+    ));
+    Ok(())
+}
+
+fn parse_ludt(
+    path: &Path,
+    file: &mut File,
+    header: BoxHeader,
+    box_count: &mut usize,
+    track: &mut Track,
+    checks: &mut Vec<AuditCheck>,
+) -> Result<(), String> {
+    let children = list_boxes(path, file, header.body_start, header.end, box_count)?;
+    let mut known_children = true;
+    let mut version_one_track = 0_usize;
+    let mut version_one_album = 0_usize;
+    let before = track.loudness.len();
+    for child in children {
+        let scope = match &child.kind {
+            b"tlou" => "track",
+            b"alou" => "album",
+            _ => {
+                known_children = false;
+                continue;
+            }
+        };
+        let entries = parse_loudness_base(path, file, child, scope)?;
+        if entries.first().is_some_and(|entry| entry.version >= 1) {
+            if scope == "track" {
+                version_one_track += 1;
+            } else {
+                version_one_album += 1;
+            }
+        }
+        track.loudness.extend(entries);
+    }
+    let added = &track.loudness[before..];
+    let has_track = added.iter().any(|entry| entry.scope == "track");
+    let mut keys = HashSet::new();
+    let unique = added.iter().all(|entry| {
+        keys.insert((
+            entry.scope,
+            entry.version,
+            entry.eq_set_id,
+            entry.downmix_id,
+            entry.drc_set_id,
+        ))
+    });
+    let valid =
+        known_children && has_track && version_one_track <= 1 && version_one_album <= 1 && unique;
+    checks.push(check(
+        "FORGE-ISOBMFF-LOUDNESS-STRUCTURE",
+        valid,
+        if valid {
+            "LoudnessBox has bounded, unique track/album loudness entries"
+        } else {
+            "LoudnessBox has unknown, missing, duplicate, or conflicting loudness entries"
+        },
+        Some(json!({
+            "entries": added.len(),
+            "track_entries": added.iter().filter(|entry| entry.scope == "track").count(),
+            "album_entries": added.iter().filter(|entry| entry.scope == "album").count(),
+            "version_1_track_boxes": version_one_track,
+            "version_1_album_boxes": version_one_album
+        })),
+    ));
+    Ok(())
+}
+
+fn parse_loudness_base(
+    path: &Path,
+    file: &mut File,
+    header: BoxHeader,
+    scope: &'static str,
+) -> Result<Vec<LoudnessEntry>, String> {
+    let body = read_control(path, file, header)?;
+    if body.len() < 4 {
+        return Err(format!("{} is truncated", header.name()));
+    }
+    let version = body[0];
+    if body[1..4] != [0, 0, 0] {
+        return Err(format!("{} FullBox flags must be zero", header.name()));
+    }
+    let mut offset = 4_usize;
+    let count = if version >= 1 {
+        let value = *body
+            .get(offset)
+            .ok_or_else(|| format!("{} is missing loudness_base_count", header.name()))?;
+        offset += 1;
+        if value & 0xc0 != 0 {
+            return Err(format!(
+                "{} loudness_base_count reserved bits are non-zero",
+                header.name()
+            ));
+        }
+        usize::from(value & 0x3f)
+    } else {
+        1
+    };
+    if count == 0 {
+        return Err(format!(
+            "{} contains no loudness base entries",
+            header.name()
+        ));
+    }
+
+    let mut output = Vec::with_capacity(count);
+    for _ in 0..count {
+        let eq_set_id = if version >= 1 {
+            let value = *body
+                .get(offset)
+                .ok_or_else(|| format!("{} is missing EQ_set_ID", header.name()))?;
+            offset += 1;
+            if value & 0xc0 != 0 {
+                return Err(format!(
+                    "{} EQ_set_ID reserved bits are non-zero",
+                    header.name()
+                ));
+            }
+            Some(value & 0x3f)
+        } else {
+            None
+        };
+        let ids = body
+            .get(offset..offset + 2)
+            .ok_or_else(|| format!("{} is missing downmix/DRC IDs", header.name()))?;
+        offset += 2;
+        let ids = u16::from_be_bytes(ids.try_into().unwrap());
+        if ids & 0xe000 != 0 {
+            return Err(format!(
+                "{} downmix/DRC reserved bits are non-zero",
+                header.name()
+            ));
+        }
+        let peaks = body
+            .get(offset..offset + 3)
+            .ok_or_else(|| format!("{} is missing peak metadata", header.name()))?;
+        offset += 3;
+        let peaks = (u32::from(peaks[0]) << 16) | (u32::from(peaks[1]) << 8) | u32::from(peaks[2]);
+        let systems = *body
+            .get(offset)
+            .ok_or_else(|| format!("{} is missing true-peak provenance", header.name()))?;
+        offset += 1;
+        let measurement_count = usize::from(
+            *body
+                .get(offset)
+                .ok_or_else(|| format!("{} is missing measurement_count", header.name()))?,
+        );
+        offset += 1;
+        let measurement_bytes = measurement_count
+            .checked_mul(3)
+            .ok_or_else(|| format!("{} measurement count overflows", header.name()))?;
+        let payload = body
+            .get(offset..offset + measurement_bytes)
+            .ok_or_else(|| format!("{} measurement list is truncated", header.name()))?;
+        offset += measurement_bytes;
+        let measurements = payload
+            .chunks_exact(3)
+            .map(|item| LoudnessMeasurement {
+                method_definition: item[0],
+                method_value: item[1],
+                measurement_system: item[2] >> 4,
+                reliability: item[2] & 0x0f,
+            })
+            .collect();
+        output.push(LoudnessEntry {
+            scope,
+            version,
+            eq_set_id,
+            downmix_id: ((ids >> 6) & 0x7f) as u8,
+            drc_set_id: (ids & 0x3f) as u8,
+            sample_peak_code: sign_extend_12((peaks >> 12) as u16),
+            true_peak_code: sign_extend_12((peaks & 0x0fff) as u16),
+            true_peak_measurement_system: systems >> 4,
+            true_peak_reliability: systems & 0x0f,
+            measurements,
+        });
+    }
+    if offset != body.len() {
+        return Err(format!(
+            "{} has {} trailing byte(s)",
+            header.name(),
+            body.len() - offset
+        ));
+    }
+    Ok(output)
+}
+
+fn sign_extend_12(value: u16) -> i16 {
+    if value & 0x0800 == 0 {
+        value as i16
+    } else {
+        (value | 0xf000) as i16
+    }
 }
 
 fn parse_tkhd(
@@ -679,6 +932,37 @@ fn parse_stsd(
                 body[offset + 24..offset + 26].try_into().unwrap(),
             ));
             track.sample_rate = Some(be_u32(&body[offset + 32..offset + 36]) >> 16);
+            match sample_entry_child_boxes(&body[offset..offset + size]) {
+                Ok(children) => {
+                    let drc: Vec<_> = children
+                        .into_iter()
+                        .filter(|kind| {
+                            matches!(
+                                kind.as_str(),
+                                "udc1" | "udc2" | "udi1" | "udi2" | "udex" | "dmix"
+                            )
+                        })
+                        .collect();
+                    if !drc.is_empty() {
+                        checks.push(check(
+                            "FORGE-ISOBMFF-MPEG-D-DRC-STRUCTURE",
+                            true,
+                            "MPEG-D DRC boxes have bounded FullBox payloads and zero flags",
+                            Some(json!(drc)),
+                        ));
+                    }
+                    track.drc_boxes.extend(drc);
+                }
+                Err(()) => {
+                    valid = false;
+                    checks.push(check(
+                        "FORGE-ISOBMFF-MPEG-D-DRC-STRUCTURE",
+                        false,
+                        "audio sample-entry child boxes are malformed or have invalid DRC FullBox fields",
+                        None,
+                    ));
+                }
+            }
         }
         offset += size;
     }
@@ -689,7 +973,74 @@ fn parse_stsd(
         "sample description entries are bounded and complete",
         Some(json!({"declared": count, "codecs": track.codecs})),
     ));
+    if !track.drc_boxes.is_empty() {
+        let basic = track.drc_boxes.iter().any(|kind| kind == "udc1")
+            == track.drc_boxes.iter().any(|kind| kind == "udi1");
+        let unified = track.drc_boxes.iter().any(|kind| kind == "udc2")
+            == track.drc_boxes.iter().any(|kind| kind == "udi2");
+        checks.push(check(
+            "FORGE-ISOBMFF-MPEG-D-DRC-PAIRING",
+            basic && unified,
+            if basic && unified {
+                "MPEG-D DRC coefficient and instruction boxes are paired"
+            } else {
+                "MPEG-D DRC coefficient and instruction boxes must be paired by profile"
+            },
+            Some(json!(track.drc_boxes)),
+        ));
+    }
     Ok(())
+}
+
+fn sample_entry_child_boxes(entry: &[u8]) -> Result<Vec<String>, ()> {
+    if entry.len() < 36 {
+        return Err(());
+    }
+    let version = u16::from_be_bytes(entry[16..18].try_into().unwrap());
+    let mut offset = match version {
+        0 => 36,
+        1 => 52,
+        2 => 72,
+        _ => return Err(()),
+    };
+    if offset > entry.len() {
+        return Err(());
+    }
+    let mut output = Vec::new();
+    while offset < entry.len() {
+        if entry.len() - offset < 8 {
+            return Err(());
+        }
+        let size32 = be_u32(&entry[offset..offset + 4]);
+        let kind = fourcc(&entry[offset + 4..offset + 8]);
+        let (header_size, size) = if size32 == 1 {
+            if entry.len() - offset < 16 {
+                return Err(());
+            }
+            (
+                16_usize,
+                usize::try_from(be_u64(&entry[offset + 8..offset + 16])).map_err(|_| ())?,
+            )
+        } else if size32 == 0 {
+            (8, entry.len() - offset)
+        } else {
+            (8, usize::try_from(size32).map_err(|_| ())?)
+        };
+        if size < header_size || size > entry.len() - offset {
+            return Err(());
+        }
+        if matches!(
+            kind.as_str(),
+            "udc1" | "udc2" | "udi1" | "udi2" | "udex" | "dmix"
+        ) && (size < header_size + 4
+            || entry[offset + header_size + 1..offset + header_size + 4] != [0, 0, 0])
+        {
+            return Err(());
+        }
+        output.push(kind);
+        offset += size;
+    }
+    Ok(output)
 }
 
 fn parse_stts(
@@ -1130,7 +1481,30 @@ fn track_json(track: &Track) -> Value {
         "sample_count": track.sample_count,
         "sample_bytes": track.sample_bytes,
         "chunk_count": track.chunk_offsets.len(),
-        "chunk_samples": track.chunk_samples
+        "chunk_samples": track.chunk_samples,
+        "loudness_box_count": track.ludt_count,
+        "loudness": track.loudness.iter().map(loudness_json).collect::<Vec<_>>(),
+        "mpeg_d_drc_boxes": track.drc_boxes
+    })
+}
+
+fn loudness_json(entry: &LoudnessEntry) -> Value {
+    json!({
+        "scope": entry.scope,
+        "version": entry.version,
+        "eq_set_id": entry.eq_set_id,
+        "downmix_id": entry.downmix_id,
+        "drc_set_id": entry.drc_set_id,
+        "sample_peak_code": entry.sample_peak_code,
+        "true_peak_code": entry.true_peak_code,
+        "true_peak_measurement_system": entry.true_peak_measurement_system,
+        "true_peak_reliability": entry.true_peak_reliability,
+        "measurements": entry.measurements.iter().map(|measurement| json!({
+            "method_definition": measurement.method_definition,
+            "method_value": measurement.method_value,
+            "measurement_system": measurement.measurement_system,
+            "reliability": measurement.reliability
+        })).collect::<Vec<_>>()
     })
 }
 
@@ -1166,6 +1540,14 @@ mod tests {
     }
 
     fn minimal_audio_mp4(chunk_offset: u32) -> Vec<u8> {
+        minimal_audio_mp4_with_metadata(chunk_offset, Vec::new(), Vec::new())
+    }
+
+    fn minimal_audio_mp4_with_metadata(
+        chunk_offset: u32,
+        track_user_data: Vec<u8>,
+        sample_entry_children: Vec<u8>,
+    ) -> Vec<u8> {
         let ftyp = boxed(
             b"ftyp",
             [b"M4A ".as_slice(), &[0, 0, 0, 0], b"isom"].concat(),
@@ -1199,6 +1581,7 @@ mod tests {
         sample_entry[16..18].copy_from_slice(&2_u16.to_be_bytes());
         sample_entry[18..20].copy_from_slice(&16_u16.to_be_bytes());
         sample_entry[24..28].copy_from_slice(&(48_000_u32 << 16).to_be_bytes());
+        sample_entry.extend(sample_entry_children);
         let stsd = boxed(
             b"stsd",
             full_box(
@@ -1245,7 +1628,7 @@ mod tests {
         let stbl = boxed(b"stbl", [stsd, stts, stsz, stsc, stco].concat());
         let minf = boxed(b"minf", stbl);
         let mdia = boxed(b"mdia", [mdhd, hdlr, minf].concat());
-        let trak = boxed(b"trak", [tkhd, mdia].concat());
+        let trak = boxed(b"trak", [tkhd, mdia, track_user_data].concat());
         let moov = boxed(b"moov", trak);
         let mdat = boxed(b"mdat", vec![1, 2, 3, 4]);
         [ftyp, moov, mdat].concat()
@@ -1293,6 +1676,121 @@ mod tests {
         assert!(result.passed, "{result:#?}");
         assert_eq!(result.format, "isobmff");
         assert_eq!(result.properties["tracks"][0]["codecs"][0], "mp4a");
+    }
+
+    #[test]
+    fn parses_version_one_loudness_and_paired_mpeg_d_drc_boxes() {
+        let mut loudness = vec![1, 0, 0, 0, 1, 0];
+        loudness.extend_from_slice(&0_u16.to_be_bytes());
+        loudness.extend_from_slice(&[0, 0, 0]);
+        loudness.push(0x21);
+        loudness.push(1);
+        loudness.extend_from_slice(&[2, 100, 0x23]);
+        let user_data = boxed(b"udta", boxed(b"ludt", boxed(b"tlou", loudness)));
+        let drc = [
+            boxed(b"udc2", full_box(0, Vec::new())),
+            boxed(b"udi2", full_box(0, Vec::new())),
+        ]
+        .concat();
+        let preliminary = minimal_audio_mp4_with_metadata(0, user_data.clone(), drc.clone());
+        let mdat_start = preliminary
+            .windows(4)
+            .position(|window| window == b"mdat")
+            .unwrap() as u32
+            + 4;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("loudness.m4a");
+        File::create(&path)
+            .unwrap()
+            .write_all(&minimal_audio_mp4_with_metadata(mdat_start, user_data, drc))
+            .unwrap();
+
+        let result = crate::container_qc::audit(&path).unwrap();
+        assert!(result.passed, "{result:#?}");
+        let track = &result.properties["tracks"][0];
+        assert_eq!(track["loudness_box_count"], 1);
+        assert_eq!(track["loudness"][0]["scope"], "track");
+        assert_eq!(
+            track["loudness"][0]["measurements"][0]["method_definition"],
+            2
+        );
+        assert_eq!(track["mpeg_d_drc_boxes"], json!(["udc2", "udi2"]));
+    }
+
+    #[test]
+    fn parses_version_zero_track_and_album_loudness() {
+        let payload = full_box(
+            0,
+            [
+                0_u16.to_be_bytes().as_slice(),
+                &[0xff, 0xf8, 0x00],
+                &[0x21, 1, 1, 96, 0x23],
+            ]
+            .concat(),
+        );
+        let user_data = boxed(
+            b"udta",
+            boxed(
+                b"ludt",
+                [boxed(b"tlou", payload.clone()), boxed(b"alou", payload)].concat(),
+            ),
+        );
+        let preliminary = minimal_audio_mp4_with_metadata(0, user_data.clone(), Vec::new());
+        let mdat_start = preliminary
+            .windows(4)
+            .position(|window| window == b"mdat")
+            .unwrap() as u32
+            + 4;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("album-loudness.m4a");
+        File::create(&path)
+            .unwrap()
+            .write_all(&minimal_audio_mp4_with_metadata(
+                mdat_start,
+                user_data,
+                Vec::new(),
+            ))
+            .unwrap();
+
+        let result = crate::container_qc::audit(&path).unwrap();
+        assert!(result.passed, "{result:#?}");
+        let loudness = result.properties["tracks"][0]["loudness"]
+            .as_array()
+            .unwrap();
+        assert_eq!(loudness.len(), 2);
+        assert_eq!(loudness[0]["sample_peak_code"], -1);
+        assert_eq!(loudness[0]["true_peak_code"], -2048);
+        assert_eq!(loudness[1]["scope"], "album");
+    }
+
+    #[test]
+    fn rejects_nonzero_loudness_reserved_bits() {
+        let loudness = vec![1, 0, 0, 0, 0xc1];
+        let user_data = boxed(b"udta", boxed(b"ludt", boxed(b"tlou", loudness)));
+        let preliminary = minimal_audio_mp4_with_metadata(0, user_data.clone(), Vec::new());
+        let mdat_start = preliminary
+            .windows(4)
+            .position(|window| window == b"mdat")
+            .unwrap() as u32
+            + 4;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("invalid-loudness.m4a");
+        File::create(&path)
+            .unwrap()
+            .write_all(&minimal_audio_mp4_with_metadata(
+                mdat_start,
+                user_data,
+                Vec::new(),
+            ))
+            .unwrap();
+
+        let result = crate::container_qc::audit(&path).unwrap();
+        assert!(!result.passed);
+        assert!(result
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.checks)
+            .any(|item| item.rule_id == "FORGE-ISOBMFF-LOUDNESS-STRUCTURE" && !item.passed));
     }
 
     #[test]
