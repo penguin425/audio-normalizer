@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "forge-normalizer"
-version = "0.39.0"
+version = "0.40.0"
 dependencies = [
  "audiopus_sys",
  "clap",
