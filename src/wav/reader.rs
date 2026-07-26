@@ -357,6 +357,7 @@ fn read_u32_at(buf: &[u8], off: usize) -> Result<u32, WavReadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn wave_mask_identifies_lfe_and_surround_by_position() {
@@ -388,5 +389,16 @@ mod tests {
         assert_eq!(roles[5], ChannelRole::positioned(135, 0));
         assert_eq!(roles[6], ChannelRole::positioned(-90, 0));
         assert_eq!(roles[7], ChannelRole::positioned(90, 0));
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_wave_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..8192)) {
+            let _ = WavReader::read_bytes(&bytes);
+
+            let mut wave = b"RIFF\0\0\0\0WAVE".to_vec();
+            wave.extend_from_slice(&bytes);
+            let _ = WavReader::read_bytes(&wave);
+        }
     }
 }

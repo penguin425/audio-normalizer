@@ -236,6 +236,23 @@ The script downloads the official attachments directly from ITU, pins every
 archive by SHA-256, and keeps the copyrighted WAV files outside the repository.
 CI runs the EBU and ITU suites as separate required evidence.
 
+### Parser hardening
+
+Property tests exercise arbitrary WAVE and delivery-manifest bytes during the
+normal Rust test suite. Four `cargo-fuzz` targets cover the WAVE decoder,
+WAVE/RF64/BW64 and Ogg Opus container QC, ADM XML profile validation, and
+delivery-manifest comparison:
+
+```sh
+cargo fuzz run wave_reader
+cargo fuzz run container_qc
+cargo fuzz run adm_profile
+cargo fuzz run manifest_compare
+```
+
+CI builds and smoke-runs every target on relevant pull requests and `main`;
+a scheduled workflow repeats the bounded run weekly.
+
 The versioned JSON Schema for `--manifest` output is published at
 <https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v2>.
 Schema v2 embeds versioned, per-channel and time-resolved EBU QC evidence while

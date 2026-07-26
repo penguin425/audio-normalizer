@@ -1,0 +1,49 @@
+name: Parser fuzzing
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/fuzz.yml"
+      - "fuzz/**"
+      - "src/adm.rs"
+      - "src/compare.rs"
+      - "src/container_qc.rs"
+      - "src/wav/reader.rs"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/fuzz.yml"
+      - "fuzz/**"
+      - "src/adm.rs"
+      - "src/compare.rs"
+      - "src/container_qc.rs"
+      - "src/wav/reader.rs"
+  schedule:
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Build fuzz targets
+        run: cargo fuzz build
+
+      - name: Run bounded parser fuzzing
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in wave_reader container_qc adm_profile manifest_compare; do
+            cargo fuzz run "$target" -- -runs=1000
+          done
