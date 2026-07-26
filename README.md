@@ -440,8 +440,9 @@ forge --analyze album/*.flac --ndjson | jq -c 'select(.true_peak_dbtp > -1)'
 # Machine-readable EBU R128 delivery checks
 forge --analyze programme.wav --compliance ebu-r128 --json
 
-# Published EBU baseband QC: silence, clipping, tones, duration, loudness and TP
+# Published EBU QC: structure, signal health, loudness, and true peak
 forge --analyze programme.wav --ebu-qc --expected-duration 1800 \
+  --expected-channels 2 \
   --manifest delivery.json
 
 # Measure explicit dialogue/anchor regions for ATSC A/85 long-form delivery
@@ -534,6 +535,16 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--tone-duration` | `0.5` | Minimum test-tone duration in seconds |
 | `--expected-duration` | none | Expected duration for EBU 0009F |
 | `--duration-tolerance` | `0.01` | Allowed duration deviation in seconds |
+| `--expected-channels` | none | Expected decoded channel count for EBU 0004F |
+| `--dropout-threshold` | `-70` | Maximum short-dropout level for EBU 0008B |
+| `--dropout-duration` | `0.002` | Minimum interior dropout duration in seconds |
+| `--dropout-max-duration` | `0.1` | Maximum interior dropout duration in seconds |
+| `--phase-correlation-threshold` | `-0.5` | Reversed stereo-pair correlation threshold for EBU 0012B |
+| `--phase-window` | `0.5` | Stereo correlation window in seconds |
+| `--click-threshold` | `0.5` | Local impulse threshold in full-scale units for EBU 0057B |
+| `--minimum-average-level` | `-50` | Minimum whole-programme RMS dBFS for EBU 0077B |
+| `--hum-threshold` | `-50` | Minimum fitted 50/60 Hz harmonic level for EBU 0088B |
+| `--hum-duration` | `1` | Minimum continuous hum/buzz duration in seconds |
 | `--adm-profile` | none | Validate `ebu-production` ADM profile rules |
 | `--adm-profile-mode` | `read` | Apply Tech 3393 `read` or `write` requirements |
 | `--adm-profile-report` | none | Write rule IDs, ADM paths, observations and results as JSON |
@@ -555,6 +566,14 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--wav-container` | `auto` | `auto`, `riff`, `rf64`, or `bw64` WAV container |
 | `--bwf` | off | Preserve/write BWF v2 metadata and measured loudness fields |
 | `-j, --jobs` | all cores | Worker thread count |
+
+The signal-health checks use bounded, deterministic PCM analysis: dropouts are
+short interior low-level runs, phase reversal is measured over consecutive
+stereo pairs, clicks are isolated local impulses, average level is
+whole-programme RMS per channel, and hum/buzz fits 50 Hz and 60 Hz plus their
+first four harmonics. All thresholds are explicit so a delivery profile can
+trade sensitivity against false positives. EBU Item versions in the JSON
+evidence follow the current published catalogue.
 
 > Negative values need `=`: `--target=-16` (clap parses `-16` as a flag otherwise).
 

@@ -308,6 +308,16 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
             tone_minimum_seconds: cli.tone_duration_seconds,
             expected_duration_seconds: cli.expected_duration_seconds,
             duration_tolerance_seconds: cli.duration_tolerance_seconds,
+            expected_channel_count: cli.expected_channel_count,
+            dropout_threshold_dbfs: cli.dropout_threshold_dbfs,
+            dropout_minimum_seconds: cli.dropout_minimum_seconds,
+            dropout_maximum_seconds: cli.dropout_maximum_seconds,
+            phase_correlation_threshold: cli.phase_correlation_threshold,
+            phase_window_seconds: cli.phase_window_seconds,
+            click_threshold: cli.click_threshold,
+            minimum_average_level_dbfs: cli.minimum_average_level_dbfs,
+            hum_threshold_dbfs: cli.hum_threshold_dbfs,
+            hum_minimum_seconds: cli.hum_minimum_seconds,
         });
         if let Some(options) = &ebu_qc_options {
             options.validate()?;

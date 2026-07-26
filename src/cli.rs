@@ -284,8 +284,7 @@ pub struct Cli {
     #[arg(long, value_name = "PATH", requires = "analyze_only")]
     pub manifest: Option<PathBuf>,
 
-    /// Run published EBU QC baseband checks (silence, clipping, tones, duration,
-    /// programme loudness, and true peak).
+    /// Run published EBU QC baseband checks, including signal-health checks.
     #[arg(long = "ebu-qc", requires = "analyze_only")]
     pub ebu_qc: bool,
 
@@ -336,6 +335,70 @@ pub struct Cli {
         requires = "expected_duration_seconds"
     )]
     pub duration_tolerance_seconds: f64,
+
+    /// Expected decoded audio channel count for EBU 0004F.
+    #[arg(long = "expected-channels", requires = "ebu_qc")]
+    pub expected_channel_count: Option<u16>,
+
+    /// Maximum level treated as a short EBU 0008B dropout.
+    #[arg(
+        long = "dropout-threshold",
+        default_value_t = -70.0,
+        requires = "ebu_qc"
+    )]
+    pub dropout_threshold_dbfs: f64,
+
+    /// Minimum interior dropout duration in seconds.
+    #[arg(
+        long = "dropout-duration",
+        default_value_t = 0.002,
+        requires = "ebu_qc"
+    )]
+    pub dropout_minimum_seconds: f64,
+
+    /// Maximum interior dropout duration in seconds.
+    #[arg(
+        long = "dropout-max-duration",
+        default_value_t = 0.1,
+        requires = "ebu_qc"
+    )]
+    pub dropout_maximum_seconds: f64,
+
+    /// Maximum accepted stereo-pair correlation for EBU 0012B detection.
+    #[arg(
+        long = "phase-correlation-threshold",
+        default_value_t = -0.5,
+        requires = "ebu_qc"
+    )]
+    pub phase_correlation_threshold: f64,
+
+    /// EBU 0012B correlation window duration in seconds.
+    #[arg(long = "phase-window", default_value_t = 0.5, requires = "ebu_qc")]
+    pub phase_window_seconds: f64,
+
+    /// Local full-scale impulse threshold for EBU 0057B clicks.
+    #[arg(long = "click-threshold", default_value_t = 0.5, requires = "ebu_qc")]
+    pub click_threshold: f64,
+
+    /// Minimum whole-programme RMS level for EBU 0077B.
+    #[arg(
+        long = "minimum-average-level",
+        default_value_t = -50.0,
+        requires = "ebu_qc"
+    )]
+    pub minimum_average_level_dbfs: f64,
+
+    /// Minimum fitted 50/60 Hz harmonic level for EBU 0088B.
+    #[arg(
+        long = "hum-threshold",
+        default_value_t = -50.0,
+        requires = "ebu_qc"
+    )]
+    pub hum_threshold_dbfs: f64,
+
+    /// Minimum continuous hum/buzz duration in seconds.
+    #[arg(long = "hum-duration", default_value_t = 1.0, requires = "ebu_qc")]
+    pub hum_minimum_seconds: f64,
 
     /// JSON/TOML ADM presentation-to-channel map for presentation-aware QC.
     #[arg(
