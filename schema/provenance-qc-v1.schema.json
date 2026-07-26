@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/provenance-qc-v1",
+  "title": "Forge C2PA provenance QC v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "generator", "path", "passed", "policy", "manifest_present",
+    "integrity_valid", "trusted", "manifest_count", "verifier",
+    "validation_status"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/provenance-qc-v1"
+    },
+    "generator": {"type": "string"},
+    "path": {"type": "string"},
+    "passed": {"type": "boolean"},
+    "policy": {"enum": ["integrity", "trusted"]},
+    "manifest_present": {"type": "boolean"},
+    "integrity_valid": {"type": "boolean"},
+    "trusted": {"type": "boolean"},
+    "validation_state": {"type": "string"},
+    "active_manifest": {"type": "string"},
+    "manifest_count": {"type": "integer", "minimum": 0},
+    "verifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "implementation", "version", "executable",
+        "trust_anchors_configured", "allowed_list_configured",
+        "trust_config_configured", "external_manifest"
+      ],
+      "properties": {
+        "implementation": {"const": "contentauth/c2patool"},
+        "version": {"type": "string"},
+        "executable": {"type": "string"},
+        "trust_anchors_configured": {"type": "boolean"},
+        "allowed_list_configured": {"type": "boolean"},
+        "trust_config_configured": {"type": "boolean"},
+        "external_manifest": {"type": "boolean"}
+      }
+    },
+    "validation_status": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "report": {}
+  }
+}

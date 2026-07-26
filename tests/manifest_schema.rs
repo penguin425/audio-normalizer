@@ -154,6 +154,47 @@ fn emitted_isobmff_container_qc_conforms_to_published_schema() {
 }
 
 #[test]
+fn emitted_provenance_qc_conforms_to_published_schema() {
+    use forge_normalizer::provenance::{
+        ProvenanceAudit, ValidationPolicy, VerifierEvidence, PROVENANCE_QC_SCHEMA,
+    };
+    let audit = ProvenanceAudit {
+        schema: PROVENANCE_QC_SCHEMA,
+        generator: "forge-normalizer/test",
+        path: "signed.wav".into(),
+        passed: true,
+        policy: ValidationPolicy::Integrity,
+        manifest_present: true,
+        integrity_valid: true,
+        trusted: false,
+        validation_state: Some("Valid".into()),
+        active_manifest: Some("urn:uuid:active".into()),
+        manifest_count: 1,
+        verifier: VerifierEvidence {
+            implementation: "contentauth/c2patool",
+            version: "c2patool 0.26.59".into(),
+            executable: "c2patool".into(),
+            trust_anchors_configured: false,
+            allowed_list_configured: false,
+            trust_config_configured: false,
+            external_manifest: false,
+        },
+        validation_status: vec![json!({"code": "signingCredential.untrusted"})],
+        report: Some(json!({"validation_state": "Valid"})),
+    };
+    let instance = serde_json::to_value(audit).unwrap();
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/provenance-qc-v1.schema.json"))
+            .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
+
+#[test]
 fn emitted_hls_qc_conforms_to_published_schema() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("audio.m3u8");

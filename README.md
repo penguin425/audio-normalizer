@@ -242,6 +242,37 @@ Results use versioned JSON with stable `FORGE-*` rule IDs and separate
 `wrapper`, `bitstream`, and `x-check` layers. Exit status is 0 for pass, 1 for a
 QC failure, and 2 for an I/O or unsupported-format error.
 
+### C2PA provenance QC
+
+`forge-provenance-qc` validates audio Content Credentials using the official
+Content Authenticity Initiative `c2patool` implementation:
+
+```sh
+forge-provenance-qc signed.wav --output provenance.json
+forge-provenance-qc signed.m4a --policy trusted \
+  --trust-anchors ./C2PA-TRUST-LIST.pem
+forge-provenance-qc asset.flac --external-manifest asset.c2pa
+```
+
+The command records the exact verifier version and preserves its JSON evidence.
+The default `integrity` policy requires a manifest whose signature and content
+hard binding validate, but reports an untrusted signing certificate separately.
+`--policy trusted` additionally requires an empty C2PA validation-problem list;
+configure a current trust anchor or allowed list when using that gate. This
+distinction prevents a cryptographically intact self-signed credential from
+being presented as a trusted identity.
+
+Validation is delegated instead of partially reimplementing C2PA's COSE, JUMBF,
+certificate, timestamp, and evolving assertion rules. `c2patool` is optional
+and only required when this command is invoked. Execution has a configurable
+timeout, output is spooled with a bounded size, standard input is closed, and
+trust-list network access occurs only when the user explicitly supplies a URL.
+The report follows `schema/provenance-qc-v1.schema.json`; exit status is 0 for a
+policy pass, 1 for missing/invalid/untrusted credentials, and 2 for tool,
+configuration, or I/O errors. See the
+[C2PA 2.2 specification](https://spec.c2pa.org/specifications/specifications/2.2/specs/C2PA_Specification.html)
+and [official c2patool documentation](https://github.com/contentauth/c2pa-rs/blob/main/cli/docs/usage.md).
+
 ### HLS and CMAF package QC
 
 `forge-streaming-qc master.m3u8 --profile rfc8216` validates Media and
@@ -825,6 +856,7 @@ src/
   bin/forge-live.rs raw f32le real-time pipeline and NDJSON meter
   bin/forge-compare.rs delivery-manifest regression gate for CI
   bin/forge-container-qc.rs wrapper/bitstream/metadata audit CLI
+  bin/forge-provenance-qc.rs C2PA integrity and trust-policy audit CLI
   lv2.rs            hard-real-time-capable LV2 stereo plugin ABI
   clap_plugin.rs    CLAP stereo effect, automation, state, and latency ABI
   preset.rs         named playback and broadcast loudness targets
