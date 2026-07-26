@@ -1,4 +1,7 @@
 /target/
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
 
 # Local editor and OS metadata
 .DS_Store

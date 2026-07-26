@@ -595,6 +595,7 @@ fn escape_xml(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn manifest(asset: Value) -> Vec<u8> {
         serde_json::to_vec(&json!({
@@ -653,5 +654,15 @@ mod tests {
         let mut junit = Vec::new();
         write_junit(&mut junit, &result).unwrap();
         assert!(String::from_utf8(junit).unwrap().contains("<testsuite"));
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_manifest_bytes_never_panic(
+            baseline in proptest::collection::vec(any::<u8>(), 0..8192),
+            candidate in proptest::collection::vec(any::<u8>(), 0..8192),
+        ) {
+            let _ = compare_manifests(&baseline, &candidate, &CompareOptions::default());
+        }
     }
 }
