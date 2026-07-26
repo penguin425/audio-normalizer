@@ -12,6 +12,7 @@
 use crate::atomic::AtomicOutput;
 use crate::decoder;
 use crate::dsp::limiter::{LimiterConfig, TruePeakLimiter};
+use crate::dsp::resample::{ResampleQuality, SampleRateConverter};
 use crate::dsp::{lufs, simd, truepeak};
 use crate::flacenc::FlacStreamWriter;
 use crate::metadata;
@@ -64,6 +65,9 @@ pub struct Plan {
     pub wav_container: WavContainer,
     /// Preserve/create BWF metadata and update its R128 measurement fields.
     pub bwf: bool,
+    /// Output-domain sample rate and converter quality.
+    pub output_sample_rate: Option<u32>,
+    pub resample_quality: ResampleQuality,
 }
 
 /// Loudness/peak analysis of a single file.
@@ -877,6 +881,51 @@ pub fn analyze_file_with_roles<P: AsRef<Path>>(
     Ok(analyze_file_range_with_roles(path, channel_roles, 0.0, None, None)?.analysis)
 }
 
+/// Analyze the exact output-domain signal when a plan requests sample-rate
+/// conversion. This keeps gain and true-peak decisions after the anti-aliasing
+/// filter rather than predicting them from the source rate.
+pub fn analyze_file_for_plan<P: AsRef<Path>>(
+    path: P,
+    channel_roles: Option<&[ChannelRole]>,
+    plan: &Plan,
+) -> Result<Analysis, String> {
+    let source = analyze_file_with_roles(path.as_ref(), channel_roles)?;
+    let Some(output_rate) = plan
+        .output_sample_rate
+        .filter(|rate| *rate != source.sample_rate)
+    else {
+        return Ok(source);
+    };
+    let mut converter = SampleRateConverter::new(
+        source.sample_rate,
+        output_rate,
+        source.frames,
+        source.channels as usize,
+        plan.resample_quality,
+    )?;
+    let mut analyzer = lufs::StreamingAnalyzer::new(output_rate, source.channel_roles.clone());
+    decoder::decode_stream(path.as_ref(), |_, chunk| {
+        converter.process(chunk, |output| analyzer.process(output))
+    })?;
+    converter.finish(|output| analyzer.process(output))?;
+    let measured = analyzer.finish();
+    Ok(Analysis {
+        sample_rate: output_rate,
+        channels: source.channels,
+        channel_roles: source.channel_roles,
+        frames: measured.frames,
+        kind: source.kind,
+        lufs: measured.ebu.integrated_lufs,
+        max_momentary_lufs: measured.ebu.max_momentary_lufs,
+        max_short_term_lufs: measured.ebu.max_short_term_lufs,
+        loudness_range_lu: measured.ebu.loudness_range_lu,
+        rms_db: measured.rms_db,
+        sample_peak: measured.sample_peak,
+        true_peak: measured.true_peak,
+        loudness_blocks: measured.ebu.gating_blocks,
+    })
+}
+
 /// Analyze an optional source-time range and optionally capture a loudness
 /// timeline at the requested interval.
 pub fn analyze_file_range_with_roles<P: AsRef<Path>>(
@@ -1311,7 +1360,7 @@ pub fn normalize_one_with_roles<P: AsRef<Path>>(
     format: OutputFormat,
     channel_roles: Option<&[ChannelRole]>,
 ) -> Result<(Analysis, f32), String> {
-    let an = analyze_file_with_roles(input.as_ref(), channel_roles)?;
+    let an = analyze_file_for_plan(input.as_ref(), channel_roles, plan)?;
     let gain = compute_gain(&an, plan);
     let staged = AtomicOutput::new(output.as_ref())?;
     normalize_stream(input.as_ref(), staged.path(), &an, gain, plan, format, None)?;
@@ -1355,7 +1404,7 @@ pub fn normalize_one_corrected_with_roles<P: AsRef<Path>>(
     }
     let input = input.as_ref();
     let output = output.as_ref();
-    let source = analyze_file_with_roles(input, channel_roles)?;
+    let source = analyze_file_for_plan(input, channel_roles, plan)?;
     let mut gain = compute_gain(&source, plan);
     let expected_level = analysis_level(&source, plan.mode) + gain_db(gain);
     let staged = AtomicOutput::new(output)?;
@@ -1437,7 +1486,7 @@ pub fn normalize_album_with_roles(
 ) -> Result<Vec<(Analysis, f32)>, String> {
     let analyses: Vec<Analysis> = inputs
         .iter()
-        .map(|path| analyze_file_with_roles(path, channel_roles))
+        .map(|path| analyze_file_for_plan(path, channel_roles, plan))
         .collect::<Result<_, _>>()?;
     let gain = album_gain(&analyses, plan);
     let album_output_lufs = album_lufs(&analyses) + gain_db(gain);
@@ -1515,7 +1564,7 @@ pub fn normalize_album_corrected_with_roles(
     }
     let sources: Vec<Analysis> = inputs
         .iter()
-        .map(|path| analyze_file_with_roles(path, channel_roles))
+        .map(|path| analyze_file_for_plan(path, channel_roles, plan))
         .collect::<Result<_, _>>()?;
     let mut gain = album_gain(&sources, plan);
     let expected_album_lufs = album_lufs(&sources) + gain_db(gain);
@@ -1821,24 +1870,54 @@ fn process_normalized_stream(
             )
         })
         .transpose()?;
-    decoder::decode_stream(input, |_, planar| {
-        if let Some(limiter) = limiter.as_mut() {
-            apply_gain(planar, gain);
-            let output = limiter.process(planar)?;
-            if output.first().is_some_and(|channel| !channel.is_empty()) {
-                write(&output)?;
-            }
-        } else {
-            gain_chunk(planar, gain, ceiling);
-            write(planar)?;
+    let mut converter: Option<SampleRateConverter> = None;
+    decoder::decode_stream(input, |info, planar| {
+        if info.sample_rate == analysis.sample_rate {
+            return process_normalized_chunk(planar, gain, ceiling, &mut limiter, &mut write);
         }
-        Ok(())
+        if converter.is_none() {
+            converter = Some(SampleRateConverter::new_with_expected_output(
+                info.sample_rate,
+                analysis.sample_rate,
+                analysis.frames,
+                analysis.channels as usize,
+                plan.resample_quality,
+            )?);
+        }
+        converter.as_mut().unwrap().process(planar, |output| {
+            process_normalized_chunk(output, gain, ceiling, &mut limiter, &mut write)
+        })
     })?;
+    if let Some(converter) = converter.as_mut() {
+        converter.finish(|output| {
+            process_normalized_chunk(output, gain, ceiling, &mut limiter, &mut write)
+        })?;
+    }
     if let Some(limiter) = limiter {
         let tail = limiter.finish();
         if tail.first().is_some_and(|channel| !channel.is_empty()) {
             write(&tail)?;
         }
+    }
+    Ok(())
+}
+
+fn process_normalized_chunk(
+    planar: &mut [Vec<f32>],
+    gain: f32,
+    ceiling: f32,
+    limiter: &mut Option<TruePeakLimiter>,
+    write: &mut impl FnMut(&[Vec<f32>]) -> Result<(), String>,
+) -> Result<(), String> {
+    if let Some(limiter) = limiter.as_mut() {
+        apply_gain(planar, gain);
+        let output = limiter.process(planar)?;
+        if output.first().is_some_and(|channel| !channel.is_empty()) {
+            write(&output)?;
+        }
+    } else {
+        gain_chunk(planar, gain, ceiling);
+        write(planar)?;
     }
     Ok(())
 }
@@ -1901,6 +1980,8 @@ mod tests {
             limiter: None,
             wav_container: WavContainer::Auto,
             bwf: false,
+            output_sample_rate: None,
+            resample_quality: ResampleQuality::Balanced,
         }
     }
 

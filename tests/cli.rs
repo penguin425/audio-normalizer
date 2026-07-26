@@ -102,6 +102,23 @@ fn m4a_output_format_is_exposed() {
 }
 
 #[test]
+fn sample_rate_conversion_options_are_validated_and_exposed() {
+    let cli = Cli::try_parse_from([
+        "forge",
+        "track.wav",
+        "--sample-rate",
+        "44100",
+        "--resample-quality",
+        "best",
+    ])
+    .unwrap();
+    assert_eq!(cli.sample_rate_hz, Some(44_100));
+    assert_eq!(cli.resample_quality, "best");
+    assert!(Cli::try_parse_from(["forge", "track.wav", "--sample-rate", "1000"]).is_err());
+    assert!(Cli::try_parse_from(["forge", "track.wav", "--resample-quality", "best"]).is_err());
+}
+
+#[test]
 fn adm_reference_renderer_options_are_validated_and_exposed() {
     let cli = Cli::try_parse_from([
         "forge",
