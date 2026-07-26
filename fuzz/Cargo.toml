@@ -47,3 +47,10 @@ path = "fuzz_targets/hls_qc.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "dash_qc"
+path = "fuzz_targets/dash_qc.rs"
+test = false
+doc = false
+bench = false

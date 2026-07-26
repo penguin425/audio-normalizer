@@ -33,3 +33,35 @@ fn streaming_qc_cli_separates_errors_from_apple_warnings() {
     let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(audit["passed"], false);
 }
+
+#[test]
+fn streaming_qc_cli_audits_dash_and_selects_profile() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("audio.mpd");
+    let output = directory.path().join("audit.json");
+    std::fs::write(
+        &input,
+        r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+ mediaPresentationDuration="PT2S" minBufferTime="PT1S">
+ <Period><AdaptationSet contentType="audio" mimeType="audio/mp4" codecs="opus">
+  <SegmentTemplate timescale="48000" duration="96000"
+   initialization="init-$RepresentationID$.mp4" media="$RepresentationID$-$Number$.m4s"/>
+  <Representation id="a1" bandwidth="96000"/>
+ </AdaptationSet></Period></MPD>"#,
+    )
+    .unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_forge-streaming-qc"))
+        .arg(&input)
+        .args(["--profile", "dash-if-iop", "--output"])
+        .arg(&output)
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(1));
+    let audit: serde_json::Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(audit["profile"], "dash-if-iop");
+    assert_eq!(
+        audit["schema"],
+        "https://penguin425.github.io/audio-normalizer/schema/dash-qc-v1"
+    );
+}

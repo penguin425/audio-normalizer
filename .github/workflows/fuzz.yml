@@ -8,6 +8,7 @@ on:
       - "src/adm.rs"
       - "src/compare.rs"
       - "src/container_qc.rs"
+      - "src/dash_qc.rs"
       - "src/hls_qc.rs"
       - "src/isobmff_qc.rs"
       - "src/wav/reader.rs"
@@ -19,6 +20,7 @@ on:
       - "src/adm.rs"
       - "src/compare.rs"
       - "src/container_qc.rs"
+      - "src/dash_qc.rs"
       - "src/hls_qc.rs"
       - "src/isobmff_qc.rs"
       - "src/wav/reader.rs"
@@ -48,6 +50,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for target in wave_reader container_qc adm_profile manifest_compare hls_qc; do
+          for target in wave_reader container_qc adm_profile manifest_compare hls_qc dash_qc; do
             cargo fuzz run "$target" -- -runs=1000
           done
