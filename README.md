@@ -564,8 +564,12 @@ forge --analyze programme.bw64 --adm-profile ebu-production \
 The validator distinguishes the profile's reading and writing requirements. It
 checks well-formed `axml`, profileList/profile cardinality, the `EBU Tech 3393`
 identifier, required profile name/version/level attributes, unique ADM IDs, and
-the Table 49 audioTrackFormat stream reference rule. Every result records its
-Tech 3393 rule ID, ADM path, requirement, observation, validator version, and
+the Table 49 audioTrackFormat stream reference rule. The same audit validates
+the current ITU-R BS.2076-3 model version, element-specific ID syntax, local
+content/track references, decimal and fractional-sample time syntax, tagList
+constraints, removal of the deprecated `audioMXFLookUp`, and `chna` structure,
+track coverage, UID uniqueness, and `axml` cross-references. Every result
+records its rule ID, ADM path, requirement, observation, validator version, and
 pass/fail state. External common-definition references are reported but are not
 incorrectly rejected merely because they are not embedded in `axml`.
 

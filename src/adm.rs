@@ -23,7 +23,9 @@ pub const PRODUCTION_PROFILE_STANDARD: &str = "EBU Tech 3393";
 pub const PRODUCTION_PROFILE_NAME: &str = "EBU Production Profile";
 pub const PRODUCTION_PROFILE_VERSION: &str = "1.0";
 pub const PRODUCTION_PROFILE_LEVEL: &str = "1";
-pub const PRODUCTION_VALIDATOR: &str = "forge-tech3393-core-1";
+pub const PRODUCTION_VALIDATOR: &str = "forge-tech3393-bs2076-3-2";
+pub const ADM_STANDARD: &str = "ITU-R BS.2076-3";
+pub const ADM_VERSION: &str = "ITU-R_BS.2076-3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +56,8 @@ pub struct AdmProfileRule {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProductionProfileResult {
     pub standard: &'static str,
+    pub adm_standard: &'static str,
+    pub adm_version: &'static str,
     pub profile_name: &'static str,
     pub profile_version: &'static str,
     pub profile_level: &'static str,
@@ -65,11 +69,23 @@ pub struct ProductionProfileResult {
 
 #[derive(Debug, Default)]
 struct ParsedAdm {
+    roots: Vec<(String, Option<String>)>,
     profile_lists: usize,
     profiles: Vec<ParsedProfile>,
+    tag_lists: usize,
+    tag_groups: Vec<(String, usize)>,
     track_format_stream_refs: Vec<(String, usize)>,
-    ids: Vec<(String, String)>,
+    ids: Vec<ParsedId>,
     references: Vec<(String, String)>,
+    time_values: Vec<(String, String)>,
+    deprecated_mxf_lookups: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ParsedId {
+    path: String,
+    element: String,
+    value: String,
 }
 
 #[derive(Debug, Default)]
@@ -214,6 +230,82 @@ pub fn validate_production_profile(
         passed: true,
     }];
 
+    rules.push(AdmProfileRule {
+        rule_id: "BS2076-3-AUDIO-FORMAT-EXTENDED",
+        path: "/audioFormatExtended".into(),
+        requirement: "exactly one audioFormatExtended root element".into(),
+        observed: format!("{} root element(s)", parsed.roots.len()),
+        passed: parsed.roots.len() == 1,
+    });
+    let version = parsed
+        .roots
+        .first()
+        .and_then(|(_, version)| version.as_deref());
+    rules.push(AdmProfileRule {
+        rule_id: "BS2076-3-VERSION",
+        path: "/audioFormatExtended/@version".into(),
+        requirement: match mode {
+            ProductionProfileMode::Read => {
+                "version shall identify a published BS.2076 revision when present".into()
+            }
+            ProductionProfileMode::Write => {
+                format!("version shall be present and equal {ADM_VERSION}")
+            }
+        },
+        observed: version.unwrap_or("not present").into(),
+        passed: match mode {
+            ProductionProfileMode::Read => version.is_none_or(is_supported_adm_version),
+            ProductionProfileMode::Write => version == Some(ADM_VERSION),
+        },
+    });
+    rules.push(AdmProfileRule {
+        rule_id: "BS2076-3-TAG-LIST-CARDINALITY",
+        path: "/audioFormatExtended/tagList".into(),
+        requirement: "zero or one tagList element".into(),
+        observed: format!("{} tagList element(s)", parsed.tag_lists),
+        passed: parsed.tag_lists <= 1,
+    });
+    for (path, reference_count) in &parsed.tag_groups {
+        rules.push(AdmProfileRule {
+            rule_id: "BS2076-3-TAG-GROUP-REFERENCE",
+            path: path.clone(),
+            requirement:
+                "tagGroup shall reference at least one audioProgramme, audioContent, or audioObject"
+                    .into(),
+            observed: format!("{reference_count} associated ADM reference(s)"),
+            passed: *reference_count > 0,
+        });
+    }
+    rules.push(AdmProfileRule {
+        rule_id: "BS2076-3-DEPRECATED-MXF-LOOKUP",
+        path: "/audioFormatExtended/audioTrackUID/audioMXFLookUp".into(),
+        requirement: "audioMXFLookUp shall not be used in BS.2076-3".into(),
+        observed: if parsed.deprecated_mxf_lookups.is_empty() {
+            "not present".into()
+        } else {
+            parsed.deprecated_mxf_lookups.join(", ")
+        },
+        passed: parsed.deprecated_mxf_lookups.is_empty(),
+    });
+    let invalid_times = parsed
+        .time_values
+        .iter()
+        .filter(|(_, value)| !valid_adm_time(value))
+        .map(|(path, value)| format!("{path}={value}"))
+        .collect::<Vec<_>>();
+    rules.push(AdmProfileRule {
+        rule_id: "BS2076-3-TIME-FORMAT",
+        path: "/audioFormatExtended".into(),
+        requirement: "ADM time attributes shall use valid decimal or sample-fraction time syntax"
+            .into(),
+        observed: if invalid_times.is_empty() {
+            format!("{} valid time value(s)", parsed.time_values.len())
+        } else {
+            format!("invalid value(s): {}", invalid_times.join(", "))
+        },
+        passed: invalid_times.is_empty(),
+    });
+
     let profile_list_pass = match mode {
         ProductionProfileMode::Read => parsed.profile_lists <= 1,
         ProductionProfileMode::Write => parsed.profile_lists == 1,
@@ -313,18 +405,65 @@ pub fn validate_production_profile(
         passed: duplicate_ids.is_empty(),
     });
 
+    let invalid_ids = parsed
+        .ids
+        .iter()
+        .filter(|id| !valid_adm_id(&id.element, &id.value))
+        .map(|id| format!("{}={}", id.path, id.value))
+        .collect::<Vec<_>>();
+    rules.push(AdmProfileRule {
+        rule_id: "BS2076-3-ID-SYNTAX",
+        path: "/audioFormatExtended".into(),
+        requirement: "defined ADM IDs shall match the BS.2076-3 element-specific syntax".into(),
+        observed: if invalid_ids.is_empty() {
+            format!("{} valid ID(s)", parsed.ids.len())
+        } else {
+            format!("invalid ID(s): {}", invalid_ids.join(", "))
+        },
+        passed: invalid_ids.is_empty(),
+    });
+
+    let defined_ids = parsed
+        .ids
+        .iter()
+        .map(|id| id.value.as_str())
+        .collect::<HashSet<_>>();
+    let unresolved = parsed
+        .references
+        .iter()
+        .filter(|(_, reference)| {
+            requires_local_definition(reference) && !defined_ids.contains(reference.as_str())
+        })
+        .map(|(path, reference)| format!("{path}={reference}"))
+        .collect::<Vec<_>>();
+    rules.push(AdmProfileRule {
+        rule_id: "BS2076-3-LOCAL-REFERENCES",
+        path: "/audioFormatExtended".into(),
+        requirement:
+            "programme, content, object, alternative-value-set, and track-UID references shall resolve locally"
+                .into(),
+        observed: if unresolved.is_empty() {
+            format!("{} resolvable or common-definition reference(s)", parsed.references.len())
+        } else {
+            format!("unresolved reference(s): {}", unresolved.join(", "))
+        },
+        passed: unresolved.is_empty(),
+    });
+
     if mode == ProductionProfileMode::Read {
-        for (path, count) in parsed.track_format_stream_refs {
+        for (path, count) in &parsed.track_format_stream_refs {
             rules.push(AdmProfileRule {
                 rule_id: "TECH3393-TABLE49-STREAM-REFERENCE",
-                path,
+                path: path.clone(),
                 requirement: "audioTrackFormat shall contain exactly one audioStreamFormatIDRef"
                     .into(),
                 observed: format!("{count} audioStreamFormatIDRef element(s)"),
-                passed: count == 1,
+                passed: *count == 1,
             });
         }
     }
+
+    rules.extend(validate_chna(input, &parsed)?);
 
     // Retain the observed reference count in an auditable rule without
     // rejecting common-definition references that are valid outside axml.
@@ -344,6 +483,8 @@ fn profile_result(
 ) -> ProductionProfileResult {
     ProductionProfileResult {
         standard: PRODUCTION_PROFILE_STANDARD,
+        adm_standard: ADM_STANDARD,
+        adm_version: ADM_VERSION,
         profile_name: PRODUCTION_PROFILE_NAME,
         profile_version: PRODUCTION_PROFILE_VERSION,
         profile_level: PRODUCTION_PROFILE_LEVEL,
@@ -361,6 +502,7 @@ fn parse_adm(xml: &[u8]) -> Result<ParsedAdm, String> {
     let mut stack = Vec::<String>::new();
     let mut active_profiles = Vec::<(usize, usize)>::new();
     let mut active_tracks = Vec::<(usize, usize)>::new();
+    let mut active_tag_groups = Vec::<(usize, usize)>::new();
     loop {
         match reader.read_event() {
             Ok(Event::Start(element)) => {
@@ -373,6 +515,7 @@ fn parse_adm(xml: &[u8]) -> Result<ParsedAdm, String> {
                     &mut parsed,
                     &mut active_profiles,
                     &mut active_tracks,
+                    &mut active_tag_groups,
                 )?;
             }
             Ok(Event::Empty(element)) => {
@@ -385,8 +528,14 @@ fn parse_adm(xml: &[u8]) -> Result<ParsedAdm, String> {
                     &mut parsed,
                     &mut active_profiles,
                     &mut active_tracks,
+                    &mut active_tag_groups,
                 )?;
-                close_depth(stack.len(), &mut active_profiles, &mut active_tracks);
+                close_depth(
+                    stack.len(),
+                    &mut active_profiles,
+                    &mut active_tracks,
+                    &mut active_tag_groups,
+                );
                 stack.pop();
             }
             Ok(Event::Text(text)) => {
@@ -399,7 +548,12 @@ fn parse_adm(xml: &[u8]) -> Result<ParsedAdm, String> {
                 }
             }
             Ok(Event::End(_)) => {
-                close_depth(stack.len(), &mut active_profiles, &mut active_tracks);
+                close_depth(
+                    stack.len(),
+                    &mut active_profiles,
+                    &mut active_tracks,
+                    &mut active_tag_groups,
+                );
                 stack.pop();
             }
             Ok(Event::Eof) => break,
@@ -425,6 +579,7 @@ fn observe_element(
     parsed: &mut ParsedAdm,
     active_profiles: &mut Vec<(usize, usize)>,
     active_tracks: &mut Vec<(usize, usize)>,
+    active_tag_groups: &mut Vec<(usize, usize)>,
 ) -> Result<(), String> {
     let name = stack.last().map(String::as_str).unwrap_or_default();
     let path = xml_path(stack);
@@ -436,8 +591,12 @@ fn observe_element(
             .decode_and_unescape_value(reader.decoder())
             .map_err(|error| format!("XML attribute value at {path}: {error}"))?
             .into_owned();
-        if key.ends_with("ID") {
-            parsed.ids.push((path.clone(), value.clone()));
+        if key.ends_with("ID") || key == "UID" {
+            parsed.ids.push(ParsedId {
+                path: format!("{path}/@{key}"),
+                element: name.to_owned(),
+                value: value.clone(),
+            });
         } else if key.ends_with("IDRef") || key.ends_with("IDRefs") {
             parsed.references.extend(
                 value
@@ -445,9 +604,21 @@ fn observe_element(
                     .map(|reference| (path.clone(), reference.to_owned())),
             );
         }
+        if matches!(
+            key.as_str(),
+            "start" | "duration" | "rtime" | "interpolationLength"
+        ) {
+            parsed
+                .time_values
+                .push((format!("{path}/@{key}"), value.clone()));
+        }
         attributes.insert(key, value);
     }
-    if name == "profileList" {
+    if name == "audioFormatExtended" {
+        parsed
+            .roots
+            .push((path, attributes.get("version").cloned()));
+    } else if name == "profileList" {
         parsed.profile_lists += 1;
     } else if name == "profile" {
         let index = parsed.profiles.len();
@@ -465,16 +636,39 @@ fn observe_element(
         if let Some((_, index)) = active_tracks.last() {
             parsed.track_format_stream_refs[*index].1 += 1;
         }
+    } else if name == "tagList" {
+        parsed.tag_lists += 1;
+    } else if name == "tagGroup" {
+        let index = parsed.tag_groups.len();
+        parsed.tag_groups.push((path, 0));
+        active_tag_groups.push((stack.len(), index));
+    } else if matches!(
+        name,
+        "audioProgrammeIDRef" | "audioContentIDRef" | "audioObjectIDRef"
+    ) {
+        if let Some((_, index)) = active_tag_groups.last() {
+            parsed.tag_groups[*index].1 += 1;
+        }
+    } else if name == "audioMXFLookUp" {
+        parsed.deprecated_mxf_lookups.push(path);
     }
     Ok(())
 }
 
-fn close_depth(depth: usize, profiles: &mut Vec<(usize, usize)>, tracks: &mut Vec<(usize, usize)>) {
+fn close_depth(
+    depth: usize,
+    profiles: &mut Vec<(usize, usize)>,
+    tracks: &mut Vec<(usize, usize)>,
+    tag_groups: &mut Vec<(usize, usize)>,
+) {
     if profiles.last().is_some_and(|(start, _)| *start == depth) {
         profiles.pop();
     }
     if tracks.last().is_some_and(|(start, _)| *start == depth) {
         tracks.pop();
+    }
+    if tag_groups.last().is_some_and(|(start, _)| *start == depth) {
+        tag_groups.pop();
     }
 }
 
@@ -487,15 +681,230 @@ fn xml_path(stack: &[String]) -> String {
     format!("/{}", stack.join("/"))
 }
 
-fn duplicate_ids(ids: &[(String, String)]) -> Vec<String> {
+fn duplicate_ids(ids: &[ParsedId]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut duplicates = ids
         .iter()
-        .filter_map(|(_, id)| (!seen.insert(id.as_str())).then_some(id.clone()))
+        .filter_map(|id| (!seen.insert(id.value.as_str())).then_some(id.value.clone()))
         .collect::<Vec<_>>();
     duplicates.sort();
     duplicates.dedup();
     duplicates
+}
+
+fn is_supported_adm_version(value: &str) -> bool {
+    matches!(
+        value,
+        "ITU-R_BS.2076-1" | "ITU-R_BS.2076-2" | "ITU-R_BS.2076-3"
+    )
+}
+
+fn valid_adm_id(element: &str, value: &str) -> bool {
+    let specification: Option<(&str, &[usize])> = match element {
+        "audioPackFormat" => Some(("AP", &[8])),
+        "audioChannelFormat" => Some(("AC", &[8])),
+        "audioBlockFormat" => Some(("AB", &[8, 8])),
+        "audioStreamFormat" => Some(("AS", &[8])),
+        "audioTrackFormat" => Some(("AT", &[8, 2])),
+        "audioProgramme" => Some(("APR", &[4])),
+        "audioContent" => Some(("ACO", &[4])),
+        "audioObject" => Some(("AO", &[4])),
+        "alternativeValueSet" => Some(("AVS", &[4, 4])),
+        "audioTrackUID" => Some(("ATU", &[8])),
+        _ => None,
+    };
+    let Some((prefix, lengths)) = specification else {
+        return true;
+    };
+    let Some(remainder) = value
+        .strip_prefix(prefix)
+        .and_then(|value| value.strip_prefix('_'))
+    else {
+        return false;
+    };
+    let segments = remainder.split('_').collect::<Vec<_>>();
+    segments.len() == lengths.len()
+        && segments.iter().zip(lengths).all(|(segment, length)| {
+            segment.len() == *length && segment.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+fn requires_local_definition(reference: &str) -> bool {
+    ["APR_", "ACO_", "AO_", "AVS_", "ATU_"]
+        .iter()
+        .any(|prefix| reference.starts_with(prefix))
+}
+
+fn valid_adm_time(value: &str) -> bool {
+    if value.is_empty() || value.starts_with('-') {
+        return false;
+    }
+    if let Some((numerator_part, denominator)) = value.split_once('S') {
+        if denominator.is_empty()
+            || !denominator.bytes().all(|byte| byte.is_ascii_digit())
+            || denominator.bytes().all(|byte| byte == b'0')
+            || numerator_part.contains('S')
+        {
+            return false;
+        }
+        let numerator = numerator_part.rsplit('.').next().unwrap_or_default();
+        if numerator.is_empty() || !numerator.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        if numerator_part.contains(':') {
+            if !valid_clock_time(numerator_part) || numerator.len() != denominator.len() {
+                return false;
+            }
+            return decimal_digits_less_than(numerator, denominator);
+        }
+        return numerator_part.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    if value.contains(':') {
+        valid_clock_time(value)
+    } else {
+        valid_decimal_seconds(value)
+    }
+}
+
+fn valid_clock_time(value: &str) -> bool {
+    let parts = value.split(':').collect::<Vec<_>>();
+    if parts.len() != 3
+        || parts[0].is_empty()
+        || !parts[0].bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let Ok(minutes) = parts[1].parse::<u8>() else {
+        return false;
+    };
+    let seconds = parts[2].split('.').next().unwrap_or_default();
+    let Ok(seconds) = seconds.parse::<u8>() else {
+        return false;
+    };
+    minutes < 60 && seconds < 60 && valid_decimal_seconds(parts[2])
+}
+
+fn valid_decimal_seconds(value: &str) -> bool {
+    let mut parts = value.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fraction = parts.next();
+    parts.next().is_none()
+        && !whole.is_empty()
+        && whole.bytes().all(|byte| byte.is_ascii_digit())
+        && fraction.is_none_or(|fraction| {
+            !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn decimal_digits_less_than(left: &str, right: &str) -> bool {
+    left.len() < right.len() || (left.len() == right.len() && left < right)
+}
+
+fn validate_chna(input: &Path, parsed: &ParsedAdm) -> Result<Vec<AdmProfileRule>, String> {
+    let Some(body) = metadata::read_wave_chunk(input, *b"chna")? else {
+        return Ok(vec![AdmProfileRule {
+            rule_id: "BS2076-3-CHNA-REQUIRED",
+            path: "/chna".into(),
+            requirement: "ADM BW64 shall contain a chna chunk".into(),
+            observed: "not present".into(),
+            passed: false,
+        }]);
+    };
+    if body.len() < 4 {
+        return Ok(vec![AdmProfileRule {
+            rule_id: "BS2076-3-CHNA-STRUCTURE",
+            path: "/chna".into(),
+            requirement: "chna shall contain its four-byte header and every declared audioID"
+                .into(),
+            observed: format!("{} byte(s)", body.len()),
+            passed: false,
+        }]);
+    }
+    let num_tracks = u16::from_le_bytes(body[0..2].try_into().unwrap());
+    let num_uids = u16::from_le_bytes(body[2..4].try_into().unwrap());
+    let expected_size = 4_usize.saturating_add(usize::from(num_uids).saturating_mul(40));
+    let structure_passed = body.len() == expected_size;
+    let mut rules = vec![AdmProfileRule {
+        rule_id: "BS2076-3-CHNA-STRUCTURE",
+        path: "/chna".into(),
+        requirement: "chna size shall equal its header plus 40 bytes per declared audioID".into(),
+        observed: format!(
+            "{} byte(s), {num_tracks} track(s), {num_uids} audioID record(s)",
+            body.len()
+        ),
+        passed: structure_passed,
+    }];
+    if !structure_passed {
+        return Ok(rules);
+    }
+
+    let channels = crate::wav::WavReader::probe(input)
+        .map_err(|error| format!("probe {} for chna validation: {error}", input.display()))?
+        .channels;
+    rules.push(AdmProfileRule {
+        rule_id: "BS2076-3-CHNA-TRACK-COUNT",
+        path: "/chna/@numTracks".into(),
+        requirement: "chna numTracks shall equal the number of PCM tracks".into(),
+        observed: format!("{num_tracks} declared, {channels} PCM track(s)"),
+        passed: num_tracks == channels,
+    });
+
+    let mut track_indices = Vec::with_capacity(usize::from(num_uids));
+    let mut chna_uids = Vec::with_capacity(usize::from(num_uids));
+    for entry in body[4..].chunks_exact(40) {
+        track_indices.push(u16::from_le_bytes(entry[..2].try_into().unwrap()));
+        chna_uids.push(
+            String::from_utf8_lossy(&entry[2..14])
+                .trim_end_matches('\0')
+                .trim_end()
+                .to_owned(),
+        );
+    }
+    let indices_valid = track_indices
+        .iter()
+        .all(|index| (1..=channels).contains(index));
+    let all_tracks_described = (1..=channels).all(|track| track_indices.contains(&track));
+    let unique_uids = chna_uids.iter().collect::<HashSet<_>>().len() == chna_uids.len();
+    let uids_valid = chna_uids
+        .iter()
+        .all(|uid| valid_adm_id("audioTrackUID", uid));
+    rules.push(AdmProfileRule {
+        rule_id: "BS2076-3-CHNA-AUDIO-ID-UNIQUE",
+        path: "/chna/audioID".into(),
+        requirement:
+            "audioID records shall cover every PCM track with unique, syntactically valid UIDs"
+                .into(),
+        observed: format!(
+            "track indices [{}], UIDs [{}]",
+            track_indices
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            chna_uids.join(", ")
+        ),
+        passed: indices_valid && all_tracks_described && unique_uids && uids_valid,
+    });
+
+    let xml_uids = parsed
+        .ids
+        .iter()
+        .filter(|id| id.element == "audioTrackUID")
+        .map(|id| id.value.as_str())
+        .collect::<HashSet<_>>();
+    let chna_uid_set = chna_uids.iter().map(String::as_str).collect::<HashSet<_>>();
+    rules.push(AdmProfileRule {
+        rule_id: "BS2076-3-CHNA-UID-XCHECK",
+        path: "/chna/audioID/UID".into(),
+        requirement: "embedded audioTrackUID definitions shall match chna UID records".into(),
+        observed: format!(
+            "{} embedded UID(s), {} chna UID(s)",
+            xml_uids.len(),
+            chna_uid_set.len()
+        ),
+        passed: xml_uids.is_empty() || xml_uids == chna_uid_set,
+    });
+    Ok(rules)
 }
 
 fn validate_options(options: &ReferenceRendererOptions) -> Result<(), String> {
@@ -637,6 +1046,14 @@ mod tests {
             channel_roles: default_channel_roles(1),
             source_kind: PcmKind::F32,
         };
+        let mut chna = Vec::with_capacity(44);
+        chna.extend_from_slice(&1_u16.to_le_bytes());
+        chna.extend_from_slice(&1_u16.to_le_bytes());
+        chna.extend_from_slice(&1_u16.to_le_bytes());
+        chna.extend_from_slice(b"ATU_00000001");
+        chna.extend_from_slice(&[0; 14]);
+        chna.extend_from_slice(&[0; 11]);
+        chna.push(0);
         WavWriter::write_with_metadata(
             path,
             &buffer,
@@ -650,7 +1067,7 @@ mod tests {
                 },
                 WaveChunk {
                     id: *b"chna",
-                    body: vec![1, 0, 1, 0],
+                    body: chna,
                 },
             ],
         )
@@ -663,7 +1080,7 @@ mod tests {
         let input = work.path().join("production.bw64");
         write_adm_fixture(
             &input,
-            br#"<audioFormatExtended>
+            br#"<audioFormatExtended version="ITU-R_BS.2076-3">
   <profileList>
     <profile profileName="EBU Production Profile" profileVersion="1.0" profileLevel="1">EBU Tech 3393</profile>
   </profileList>
@@ -724,6 +1141,76 @@ mod tests {
             .rules
             .iter()
             .any(|rule| { rule.rule_id == "TECH3393-TABLE50-PROFILE-IDENTIFIER" && rule.passed }));
+    }
+
+    #[test]
+    fn bs2076_3_rules_validate_ids_times_tags_references_and_chna() {
+        let work = tempfile::tempdir().unwrap();
+        let input = work.path().join("bs2076-3.bw64");
+        write_adm_fixture(
+            &input,
+            br#"<audioFormatExtended version="ITU-R_BS.2076-3">
+  <profileList>
+    <profile profileName="EBU Production Profile" profileVersion="1.0" profileLevel="1">EBU Tech 3393</profile>
+  </profileList>
+  <tagList><tagGroup><tag class="genre">Speech</tag><audioObjectIDRef>AO_1001</audioObjectIDRef></tagGroup></tagList>
+  <audioObject audioObjectID="AO_1001" start="00:00:00.12000S48000">
+    <audioTrackUIDRef>ATU_00000001</audioTrackUIDRef>
+  </audioObject>
+  <audioTrackUID UID="ATU_00000001">
+    <audioChannelFormatIDRef>AC_00010001</audioChannelFormatIDRef>
+  </audioTrackUID>
+</audioFormatExtended>"#,
+        );
+        let result = validate_production_profile(&input, ProductionProfileMode::Write).unwrap();
+        assert!(result.passed, "{:#?}", result.rules);
+        for rule_id in [
+            "BS2076-3-VERSION",
+            "BS2076-3-ID-SYNTAX",
+            "BS2076-3-TIME-FORMAT",
+            "BS2076-3-TAG-GROUP-REFERENCE",
+            "BS2076-3-LOCAL-REFERENCES",
+            "BS2076-3-CHNA-UID-XCHECK",
+        ] {
+            assert!(result
+                .rules
+                .iter()
+                .any(|rule| rule.rule_id == rule_id && rule.passed));
+        }
+    }
+
+    #[test]
+    fn bs2076_3_rules_reject_deprecated_invalid_and_unresolved_metadata() {
+        let work = tempfile::tempdir().unwrap();
+        let input = work.path().join("invalid-bs2076-3.bw64");
+        write_adm_fixture(
+            &input,
+            br#"<audioFormatExtended version="ITU-R_BS.2076-99">
+  <profileList>
+    <profile profileName="EBU Production Profile" profileVersion="1.0" profileLevel="1">EBU Tech 3393</profile>
+  </profileList>
+  <tagList><tagGroup><tag>orphan</tag></tagGroup></tagList>
+  <audioObject audioObjectID="not-an-id" start="00:61:00.00000">
+    <audioTrackUIDRef>ATU_ffffffff</audioTrackUIDRef>
+  </audioObject>
+  <audioTrackUID UID="ATU_00000001"><audioMXFLookUp/></audioTrackUID>
+</audioFormatExtended>"#,
+        );
+        let result = validate_production_profile(&input, ProductionProfileMode::Write).unwrap();
+        assert!(!result.passed);
+        for rule_id in [
+            "BS2076-3-VERSION",
+            "BS2076-3-ID-SYNTAX",
+            "BS2076-3-TIME-FORMAT",
+            "BS2076-3-TAG-GROUP-REFERENCE",
+            "BS2076-3-DEPRECATED-MXF-LOOKUP",
+            "BS2076-3-LOCAL-REFERENCES",
+        ] {
+            assert!(result
+                .rules
+                .iter()
+                .any(|rule| rule.rule_id == rule_id && !rule.passed));
+        }
     }
 
     #[test]

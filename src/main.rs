@@ -551,6 +551,8 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                     report.adm_qc_passed = Some(adm.passed);
                 }
                 if let Some(audit) = &adm_profile {
+                    report.adm_model_standard = Some(audit.adm_standard);
+                    report.adm_model_version = Some(audit.adm_version);
                     report.adm_production_profile_standard = Some(audit.standard);
                     report.adm_production_profile_version = Some(audit.profile_version);
                     report.adm_production_profile_level = Some(audit.profile_level);
