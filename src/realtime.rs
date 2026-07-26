@@ -209,6 +209,7 @@ impl Default for RealtimeGainConfig {
 /// Integrated LUFS can be known before a programme ends. All working storage
 /// is allocated by [`RealtimeGainProcessor::new`]; processing is allocation-free.
 pub struct RealtimeGainProcessor {
+    sample_rate: u32,
     channels: usize,
     current_gain: f32,
     target_gain: f32,
@@ -250,6 +251,7 @@ impl RealtimeGainProcessor {
         let lookahead_frames = ((sample_rate as usize * 5) / 1_000).max(16);
         let limiter_release_samples = sample_rate as f64 * config.release_ms / 1_000.0;
         Ok(Self {
+            sample_rate,
             channels,
             current_gain: gain,
             target_gain: gain,
@@ -272,6 +274,29 @@ impl RealtimeGainProcessor {
             return Err("real-time target gain must be finite".into());
         }
         self.target_gain = db_amplitude(gain_db);
+        Ok(())
+    }
+
+    pub fn set_ceiling_dbfs(&mut self, ceiling_dbfs: f64) -> Result<(), String> {
+        if !ceiling_dbfs.is_finite() || ceiling_dbfs > 0.0 {
+            return Err("real-time ceiling must be finite and no greater than 0 dBTP".into());
+        }
+        self.ceiling = db_amplitude(ceiling_dbfs);
+        Ok(())
+    }
+
+    pub fn set_smoothing(&mut self, attack_ms: f64, release_ms: f64) -> Result<(), String> {
+        if !attack_ms.is_finite()
+            || attack_ms <= 0.0
+            || !release_ms.is_finite()
+            || release_ms <= 0.0
+        {
+            return Err("real-time attack and release must be finite and positive".into());
+        }
+        self.attack_coefficient = smoothing_coefficient(self.sample_rate, attack_ms);
+        self.release_coefficient = smoothing_coefficient(self.sample_rate, release_ms);
+        let limiter_release_samples = self.sample_rate as f64 * release_ms / 1_000.0;
+        self.limiter_release_coefficient = (-1.0 / limiter_release_samples).exp() as f32;
         Ok(())
     }
 

@@ -132,6 +132,9 @@ cargo build --release --features opus-encoding
 # Optional AAC-LC/M4A output (requires `ffmpeg` on PATH at runtime):
 cargo build --release --features aac-encoding
 
+# Optional cross-platform CLAP and Linux LV2 plug-ins:
+cargo build --release --features clap-plugin,lv2-plugin
+
 cargo test
 ```
 
@@ -142,7 +145,8 @@ then standard library paths, and prints a clear install hint if it is missing.
 
 Versioned tags automatically publish GitHub Releases containing portable Forge
 binaries for Linux x86-64, Windows x86-64, macOS Intel, and macOS Apple
-Silicon. Each release includes generated release notes and `SHA256SUMS`.
+Silicon. Archives also contain the cross-platform `forge-live.clap` plug-in.
+Each release includes generated release notes and `SHA256SUMS`.
 GitHub artifact attestations provide verifiable build provenance for every
 archive and checksum manifest.
 
@@ -602,6 +606,7 @@ src/
   realtime.rs       allocation-free live M/S meter + smoothed gain processor
   bin/forge-live.rs raw f32le real-time pipeline and NDJSON meter
   lv2.rs            hard-real-time-capable LV2 stereo plugin ABI
+  clap_plugin.rs    CLAP stereo effect, automation, state, and latency ABI
   preset.rs         named playback and broadcast loudness targets
 build.rs            optionally links libmp3lame for MP3 encoding
 tests/
@@ -627,6 +632,14 @@ release archives also contain the `forge-live.lv2` stereo plugin bundle; copy
 it to an LV2 search directory such as `$HOME/.lv2/`. Its audio callback uses
 only preallocated Forge DSP state and exposes a ±24 dB gain control with a
 fixed −1 dBTP, 5 ms look-ahead limiter.
+
+Every release archive contains `forge-live.clap`, a CLAP 1.x stereo effect for
+Linux, Windows, and macOS. Copy it to a CLAP directory scanned by your host
+(for example `$HOME/.clap` on Linux or
+`$HOME/Library/Audio/Plug-Ins/CLAP` on macOS). It exposes automatable Gain,
+True Peak Ceiling, Attack, Release, and Bypass parameters, persists host
+state, reports the exact 5 ms look-ahead latency, and supports both real-time
+and offline render modes.
 
 The library exposes callback-safe primitives that allocate their working
 buffers at construction:

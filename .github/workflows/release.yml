@@ -50,18 +50,22 @@ jobs:
             target: x86_64-unknown-linux-gnu
             asset: linux-x86_64
             archive: tar
+            library: libforge_normalizer.so
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
             asset: windows-x86_64
             archive: zip
+            library: forge_normalizer.dll
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             asset: macos-x86_64
             archive: tar
+            library: libforge_normalizer.dylib
           - runner: macos-15
             target: aarch64-apple-darwin
             asset: macos-aarch64
             archive: tar
+            library: libforge_normalizer.dylib
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -74,7 +78,7 @@ jobs:
       - name: Build release binary
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build --locked --release --target ${{ matrix.target }} --features opus-encoding,aac-encoding,lv2-plugin
+        run: cargo build --locked --release --target ${{ matrix.target }} --features opus-encoding,aac-encoding,lv2-plugin,clap-plugin
 
       - name: Package Unix binary
         if: matrix.archive == 'tar'
@@ -85,6 +89,8 @@ jobs:
           mkdir "$staging"
           cp "target/${{ matrix.target }}/release/forge" \
              "target/${{ matrix.target }}/release/forge-live" "$staging/"
+          cp "target/${{ matrix.target }}/release/${{ matrix.library }}" \
+             "$staging/forge-live.clap"
           if [[ "${{ matrix.asset }}" == "linux-x86_64" ]]; then
             cp -R plugins/forge-live.lv2 "$staging/"
             cp "target/${{ matrix.target }}/release/libforge_normalizer.so" \
@@ -100,6 +106,7 @@ jobs:
           $staging = "forge-v${{ needs.validate.outputs.version }}-${{ matrix.asset }}"
           New-Item -ItemType Directory -Path $staging | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/forge.exe","target/${{ matrix.target }}/release/forge-live.exe" $staging
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.library }}" "$staging/forge-live.clap"
           Copy-Item README.md, LICENSE $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
 
