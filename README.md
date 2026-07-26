@@ -217,6 +217,15 @@ timelines. Complete files, fragmented initialization segments, and standalone
 media segments are distinguished explicitly. `mdat` payloads are seeked over,
 not loaded.
 
+Track user data is also inspected for ISO/IEC 14496-12 `ludt`, `tlou`, and
+`alou` loudness metadata. Version 0 and version 1 layouts, reserved bits,
+entry counts, track/album uniqueness, peak provenance, and every MPEG-D DRC
+measurement tuple are validated and exposed in JSON. MPEG-D DRC `udc1`/`udi1`
+and `udc2`/`udi2` sample-entry boxes are structurally checked and required to
+occur as coefficient/instruction pairs when present. This supplies the
+container evidence needed by later Apple HLS and xHE-AAC delivery profiles
+without treating optional metadata as mandatory for every MP4 file.
+
 Results use versioned JSON with stable `FORGE-*` rule IDs and separate
 `wrapper`, `bitstream`, and `x-check` layers. Exit status is 0 for pass, 1 for a
 QC failure, and 2 for an I/O or unsupported-format error.
