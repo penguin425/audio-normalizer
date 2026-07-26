@@ -3,8 +3,9 @@
 //! There is no mature pure-Rust MP3 encoder, so Forge links to LAME — the
 //! reference MP3 encoder — through a tiny, hand-written FFI surface (just the
 //! handful of C functions we need). `build.rs` locates `libmp3lame`. We feed
-//! LAME interleaved IEEE-f32 samples directly (no integer conversion), so the
-//! full float precision of the gained signal reaches the encoder.
+//! LAME planar mono or interleaved stereo IEEE-f32 samples directly (no integer
+//! conversion), so the full float precision of the gained signal reaches the
+//! encoder.
 //!
 //! The encoding is CBR by default (transparent and predictable for loudness
 //! work); quality and bitrate are configurable.
@@ -12,7 +13,7 @@
 use crate::wav::AudioBuffer;
 use std::ffi::c_void;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::os::raw::{c_float, c_int};
 use std::path::Path;
 
@@ -38,7 +39,16 @@ extern "C" {
         mp3buf: *mut u8,
         mp3buf_size: c_int,
     ) -> c_int;
+    fn lame_encode_buffer_ieee_float(
+        gfp: LameT,
+        pcm_l: *const c_float,
+        pcm_r: *const c_float,
+        nsamples: c_int,
+        mp3buf: *mut u8,
+        mp3buf_size: c_int,
+    ) -> c_int;
     fn lame_encode_flush(gfp: LameT, mp3buf: *mut u8, mp3buf_size: c_int) -> c_int;
+    fn lame_get_lametag_frame(gfp: LameT, buffer: *mut u8, size: usize) -> usize;
     fn lame_close(gfp: LameT) -> c_int;
 }
 
@@ -74,7 +84,7 @@ impl Mp3StreamWriter {
             lame_set_brate(gfp, bitrate_kbps);
             lame_set_VBR(gfp, VBR_OFF);
             lame_set_quality(gfp, quality.clamp(0, 9));
-            lame_set_bWriteVbrTag(gfp, 0);
+            lame_set_bWriteVbrTag(gfp, 1);
             lame_init_params(gfp)
         };
         if result != LAME_OKAY {
@@ -101,24 +111,40 @@ impl Mp3StreamWriter {
         if planar.iter().any(|channel| channel.len() != frames) {
             return Err("MP3 stream channel length mismatch".into());
         }
-        let mut interleaved = Vec::with_capacity(frames * self.channels);
-        for frame in 0..frames {
-            for channel in planar {
-                interleaved.push(channel[frame]);
+        let interleaved = if self.channels == 2 {
+            let mut samples = Vec::with_capacity(frames * self.channels);
+            for frame in 0..frames {
+                for channel in planar {
+                    samples.push(channel[frame]);
+                }
             }
-        }
+            samples
+        } else {
+            Vec::new()
+        };
         let required = (1.25 * (frames * self.channels) as f64 + 7200.0) as usize + 16;
         if self.encoded.len() < required {
             self.encoded.resize(required, 0);
         }
         let written = unsafe {
-            lame_encode_buffer_interleaved_ieee_float(
-                self.gfp,
-                interleaved.as_ptr(),
-                frames as c_int,
-                self.encoded.as_mut_ptr(),
-                self.encoded.len() as c_int,
-            )
+            if self.channels == 1 {
+                lame_encode_buffer_ieee_float(
+                    self.gfp,
+                    planar[0].as_ptr(),
+                    planar[0].as_ptr(),
+                    frames as c_int,
+                    self.encoded.as_mut_ptr(),
+                    self.encoded.len() as c_int,
+                )
+            } else {
+                lame_encode_buffer_interleaved_ieee_float(
+                    self.gfp,
+                    interleaved.as_ptr(),
+                    frames as c_int,
+                    self.encoded.as_mut_ptr(),
+                    self.encoded.len() as c_int,
+                )
+            }
         };
         if written < 0 {
             return Err(format!("lame_encode_buffer error code {written}"));
@@ -141,8 +167,22 @@ impl Mp3StreamWriter {
         }
         self.output
             .write_all(&self.encoded[..written as usize])
-            .and_then(|_| self.output.flush())
             .map_err(|error| format!("write MP3: {error}"))?;
+        let tag_size = unsafe {
+            lame_get_lametag_frame(self.gfp, self.encoded.as_mut_ptr(), self.encoded.len())
+        };
+        if tag_size > self.encoded.len() {
+            return Err(format!("LAME tag requires {tag_size} bytes"));
+        }
+        if tag_size > 0 {
+            self.output
+                .seek(SeekFrom::Start(0))
+                .and_then(|_| self.output.write_all(&self.encoded[..tag_size]))
+                .map_err(|error| format!("write MP3 LAME tag: {error}"))?;
+        }
+        self.output
+            .flush()
+            .map_err(|error| format!("flush MP3: {error}"))?;
         unsafe {
             lame_close(self.gfp);
         }
@@ -203,8 +243,8 @@ pub fn encode_mp3(buf: &AudioBuffer, bitrate_kbps: i32, quality: i32) -> Result<
         lame_set_VBR(gfp, VBR_OFF);
         // Clamp quality to LAME's 0..=9 range; 0 is best/slowest, 2 is a great default.
         lame_set_quality(gfp, quality.clamp(0, 9));
-        // No Xing/LAME info tag — plain CBR stream.
-        lame_set_bWriteVbrTag(gfp, 0);
+        // Reserve a first-frame Info/LAME tag and backpatch it after flushing.
+        lame_set_bWriteVbrTag(gfp, 1);
 
         if lame_init_params(gfp) != LAME_OKAY {
             lame_close(gfp);
@@ -215,14 +255,26 @@ pub fn encode_mp3(buf: &AudioBuffer, bitrate_kbps: i32, quality: i32) -> Result<
         let total = buf.frames as i32;
         while (pos as i32) < total {
             let n = CHUNK_FRAMES.min(total - pos as i32);
-            let ptr = inter.as_ptr().add(pos * channels);
-            let written = lame_encode_buffer_interleaved_ieee_float(
-                gfp,
-                ptr,
-                n,
-                mp3buf.as_mut_ptr(),
-                mp3buf.len() as c_int,
-            );
+            let written = if channels == 1 {
+                let ptr = buf.data[0].as_ptr().add(pos);
+                lame_encode_buffer_ieee_float(
+                    gfp,
+                    ptr,
+                    ptr,
+                    n,
+                    mp3buf.as_mut_ptr(),
+                    mp3buf.len() as c_int,
+                )
+            } else {
+                let ptr = inter.as_ptr().add(pos * channels);
+                lame_encode_buffer_interleaved_ieee_float(
+                    gfp,
+                    ptr,
+                    n,
+                    mp3buf.as_mut_ptr(),
+                    mp3buf.len() as c_int,
+                )
+            };
             if written < 0 {
                 lame_close(gfp);
                 return Err(format!("lame_encode_buffer error code {written}"));
@@ -237,6 +289,15 @@ pub fn encode_mp3(buf: &AudioBuffer, bitrate_kbps: i32, quality: i32) -> Result<
             return Err(format!("lame_encode_flush error code {written}"));
         }
         out.extend_from_slice(&mp3buf[..written as usize]);
+
+        let tag_size = lame_get_lametag_frame(gfp, mp3buf.as_mut_ptr(), mp3buf.len());
+        if tag_size > mp3buf.len() || tag_size > out.len() {
+            lame_close(gfp);
+            return Err(format!("invalid LAME tag size {tag_size}"));
+        }
+        if tag_size > 0 {
+            out[..tag_size].copy_from_slice(&mp3buf[..tag_size]);
+        }
 
         lame_close(gfp);
     }
