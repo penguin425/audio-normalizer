@@ -40,6 +40,10 @@ path = "src/bin/forge-container-qc.rs"
 name = "forge-presentation-qc"
 path = "src/bin/forge-presentation-qc.rs"
 
+[[bin]]
+name = "forge-sadm-qc"
+path = "src/bin/forge-sadm-qc.rs"
+
 [dependencies]
 rayon = "1.10"
 clap = { version = "4.5", features = ["derive"] }

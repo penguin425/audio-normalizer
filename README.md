@@ -555,6 +555,19 @@ compliance profiles gate each Presentation independently. The report identifies
 ETSI TS 103 190 for AC-4 or ISO/IEC 23008-3 for MPEG-H and preserves renderer
 provenance as audit evidence.
 
+Ordered S-ADM XML frames can be checked as a live-flow capture:
+
+```bash
+forge-sadm-qc frame-0001.xml frame-0002.xml -o sadm-qc.json
+```
+
+The ITU-R BS.2125-1 audit checks mandatory frame structure, frameFormat ID
+syntax and sequence, valid types and times, flowID/timeReference stability,
+contiguous non-overlapping frame timing, transportTrackFormat presence, and
+changedIDs status values. It validates captured metadata frames; transport and
+audio/metadata synchronization remain the responsibility of the carrying
+interface.
+
 The reviewable JSON/TOML sidecar flow remains available through
 `--codec-metadata`. Fields include `codec`, `dialnorm_lkfs`,
 `encoded_loudness_lufs`, `downmix_mode`, and `tolerance_lu`. Dialnorm is
