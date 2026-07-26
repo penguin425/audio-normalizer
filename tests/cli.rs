@@ -517,10 +517,16 @@ fn ebu_qc_writes_versioned_baseband_evidence() {
         .unwrap()
         .ends_with("delivery-manifest-v3"));
     let results = value["assets"][0]["qc"]["results"].as_array().unwrap();
-    assert_eq!(results.len(), 6);
+    assert_eq!(results.len(), 12);
     assert_eq!(results[0]["ebu_qc_id"], "0078B");
     assert_eq!(results[4]["ebu_qc_id"], "0010B");
     assert_eq!(results[5]["ebu_qc_id"], "0084B");
+    assert_eq!(results[6]["ebu_qc_id"], "0004F");
+    assert_eq!(results[7]["ebu_qc_id"], "0008B");
+    assert_eq!(results[8]["ebu_qc_id"], "0012B");
+    assert_eq!(results[9]["ebu_qc_id"], "0057B");
+    assert_eq!(results[10]["ebu_qc_id"], "0077B");
+    assert_eq!(results[11]["ebu_qc_id"], "0088B");
 }
 
 #[test]
