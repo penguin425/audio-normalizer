@@ -101,6 +101,54 @@ fn m4a_output_format_is_exposed() {
     assert_eq!(cli.format.as_deref(), Some("m4a"));
 }
 
+#[test]
+fn adm_reference_renderer_options_are_validated_and_exposed() {
+    let cli = Cli::try_parse_from([
+        "forge",
+        "programme.wav",
+        "--analyze",
+        "--adm-render",
+        "--adm-renderer",
+        "/opt/eat-process",
+        "--adm-layout",
+        "0+5+0",
+        "--adm-profile-level",
+        "2",
+        "--adm-rendered-output",
+        "rendered.wav",
+    ])
+    .unwrap();
+    assert!(cli.adm_render);
+    assert_eq!(
+        cli.adm_renderer.as_deref(),
+        Some(std::path::Path::new("/opt/eat-process"))
+    );
+    assert_eq!(cli.adm_layout, "0+5+0");
+    assert_eq!(cli.adm_profile_level, 2);
+    assert_eq!(
+        cli.adm_rendered_output.as_deref(),
+        Some(std::path::Path::new("rendered.wav"))
+    );
+    assert!(Cli::try_parse_from([
+        "forge",
+        "programme.wav",
+        "--analyze",
+        "--adm-render",
+        "--adm-profile-level",
+        "3"
+    ])
+    .is_err());
+    assert!(Cli::try_parse_from([
+        "forge",
+        "programme.wav",
+        "--analyze",
+        "--adm-render",
+        "--adm-presentations",
+        "map.json"
+    ])
+    .is_err());
+}
+
 fn wav_fixture_bytes() -> Vec<u8> {
     let file = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
     let buffer = AudioBuffer {

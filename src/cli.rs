@@ -245,6 +245,45 @@ pub struct Cli {
     )]
     pub adm_presentations: Option<PathBuf>,
 
+    /// Validate ADM against BS.2168, render through the EBU BS.2127 reference
+    /// implementation, and measure the rendered loudspeaker presentation.
+    #[arg(
+        long = "adm-render",
+        requires = "analyze_only",
+        conflicts_with_all = ["adm_presentations", "start_seconds", "duration_seconds"]
+    )]
+    pub adm_render: bool,
+
+    /// Path to the EBU ADM Toolbox `eat-process` executable.
+    #[arg(long = "adm-renderer", value_name = "PATH", requires = "adm_render")]
+    pub adm_renderer: Option<PathBuf>,
+
+    /// ITU-R BS.2051 target layout name passed to the reference renderer.
+    #[arg(
+        long = "adm-layout",
+        value_name = "LAYOUT",
+        default_value = "4+5+0",
+        requires = "adm_render"
+    )]
+    pub adm_layout: String,
+
+    /// ITU-R BS.2168 emission-profile level used for validation.
+    #[arg(
+        long = "adm-profile-level",
+        default_value_t = 0,
+        value_parser = clap::value_parser!(u8).range(0..=2),
+        requires = "adm_render"
+    )]
+    pub adm_profile_level: u8,
+
+    /// Keep the rendered BS.2051 loudspeaker signals at this path.
+    #[arg(
+        long = "adm-rendered-output",
+        value_name = "PATH",
+        requires = "adm_render"
+    )]
+    pub adm_rendered_output: Option<PathBuf>,
+
     /// Start analysis at this source time in seconds.
     #[arg(long = "start", value_name = "SECONDS", requires = "analyze_only")]
     pub start_seconds: Option<f64>,

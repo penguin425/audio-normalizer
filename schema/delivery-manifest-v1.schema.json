@@ -118,6 +118,20 @@
         "adm_chna_present": {"$ref": "#/$defs/nullableBoolean"},
         "adm_presentations_json": {"$ref": "#/$defs/nullableString"},
         "adm_qc_passed": {"$ref": "#/$defs/nullableBoolean"},
+        "adm_render_renderer": {"$ref": "#/$defs/nullableString"},
+        "adm_render_standard": {"$ref": "#/$defs/nullableString"},
+        "adm_render_profile": {"$ref": "#/$defs/nullableString"},
+        "adm_render_profile_level": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 2
+        },
+        "adm_render_layout": {"$ref": "#/$defs/nullableString"},
+        "adm_render_validation_passed": {"$ref": "#/$defs/nullableBoolean"},
+        "adm_render_integrated_lufs": {"$ref": "#/$defs/nullableNumber"},
+        "adm_render_true_peak_dbtp": {"$ref": "#/$defs/nullableNumber"},
+        "adm_render_channels": {"type": ["integer", "null"], "minimum": 1},
+        "adm_render_output_path": {"$ref": "#/$defs/nullableString"},
         "compliance_profile": {"$ref": "#/$defs/nullableString"},
         "compliance_loudness_basis": {
           "type": ["string", "null"],
