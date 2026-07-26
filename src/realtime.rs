@@ -113,6 +113,41 @@ impl RealtimeMeter {
         Ok(())
     }
 
+    /// Process frame-major interleaved samples without allocating.
+    pub fn process_interleaved(&mut self, samples: &[f32]) -> Result<(), String> {
+        if !samples.len().is_multiple_of(self.channels()) {
+            return Err("real-time meter interleaved buffer is not frame-aligned".into());
+        }
+        for frame in samples.chunks_exact(self.channels()) {
+            let mut weighted = 0.0;
+            for (channel, sample) in frame.iter().copied().enumerate() {
+                self.sample_peak = self.sample_peak.max(sample.abs());
+                self.true_peak[channel].process_sample(sample);
+                let filtered = self.filters[channel].process(sample) as f64;
+                weighted += channel_weight(self.roles[channel]) * filtered * filtered;
+            }
+            self.push_energy(weighted);
+        }
+        Ok(())
+    }
+
+    fn push_energy(&mut self, weighted: f64) {
+        if self.filled >= self.momentary_window {
+            let index =
+                (self.position + self.energy.len() - self.momentary_window) % self.energy.len();
+            self.momentary_sum -= self.energy[index];
+        }
+        if self.filled == self.energy.len() {
+            self.short_term_sum -= self.energy[self.position];
+        }
+        self.energy[self.position] = weighted;
+        self.momentary_sum += weighted;
+        self.short_term_sum += weighted;
+        self.position = (self.position + 1) % self.energy.len();
+        self.filled = (self.filled + 1).min(self.energy.len());
+        self.frames += 1;
+    }
+
     pub fn measurement(&self) -> RealtimeMeasurement {
         RealtimeMeasurement {
             frames: self.frames,
@@ -346,6 +381,29 @@ mod tests {
         }
         let a = whole.measurement();
         let b = chunked.measurement();
+        assert!((a.momentary_lufs - b.momentary_lufs).abs() < 1e-10);
+        assert!((a.short_term_lufs - b.short_term_lufs).abs() < 1e-10);
+        assert!((a.true_peak_dbtp - b.true_peak_dbtp).abs() < 1e-10);
+    }
+
+    #[test]
+    fn interleaved_meter_matches_planar_meter() {
+        let left: Vec<f32> = (0..192_000)
+            .map(|index| (index as f32 * 0.013).sin() * 0.1)
+            .collect();
+        let right: Vec<f32> = left.iter().map(|sample| -*sample * 0.5).collect();
+        let interleaved = left
+            .iter()
+            .zip(&right)
+            .flat_map(|(left, right)| [*left, *right])
+            .collect::<Vec<_>>();
+        let roles = vec![ChannelRole::Main, ChannelRole::Main];
+        let mut planar = RealtimeMeter::new(48_000, roles.clone()).unwrap();
+        planar.process_planar(&[&left, &right]).unwrap();
+        let mut frame_major = RealtimeMeter::new(48_000, roles).unwrap();
+        frame_major.process_interleaved(&interleaved).unwrap();
+        let a = planar.measurement();
+        let b = frame_major.measurement();
         assert!((a.momentary_lufs - b.momentary_lufs).abs() < 1e-10);
         assert!((a.short_term_lufs - b.short_term_lufs).abs() < 1e-10);
         assert!((a.true_peak_dbtp - b.true_peak_dbtp).abs() < 1e-10);

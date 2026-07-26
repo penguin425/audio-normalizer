@@ -74,7 +74,7 @@ jobs:
       - name: Build release binary
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build --locked --release --target ${{ matrix.target }} --features opus-encoding,aac-encoding
+        run: cargo build --locked --release --target ${{ matrix.target }} --features opus-encoding,aac-encoding,lv2-plugin
 
       - name: Package Unix binary
         if: matrix.archive == 'tar'
@@ -83,7 +83,13 @@ jobs:
           set -euo pipefail
           staging="forge-v${{ needs.validate.outputs.version }}-${{ matrix.asset }}"
           mkdir "$staging"
-          cp "target/${{ matrix.target }}/release/forge" "$staging/"
+          cp "target/${{ matrix.target }}/release/forge" \
+             "target/${{ matrix.target }}/release/forge-live" "$staging/"
+          if [[ "${{ matrix.asset }}" == "linux-x86_64" ]]; then
+            cp -R plugins/forge-live.lv2 "$staging/"
+            cp "target/${{ matrix.target }}/release/libforge_normalizer.so" \
+               "$staging/forge-live.lv2/forge_live.so"
+          fi
           cp README.md LICENSE "$staging/"
           tar -czf "${staging}.tar.gz" "$staging"
 
@@ -93,7 +99,7 @@ jobs:
         run: |
           $staging = "forge-v${{ needs.validate.outputs.version }}-${{ matrix.asset }}"
           New-Item -ItemType Directory -Path $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/forge.exe" $staging
+          Copy-Item "target/${{ matrix.target }}/release/forge.exe","target/${{ matrix.target }}/release/forge-live.exe" $staging
           Copy-Item README.md, LICENSE $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
 

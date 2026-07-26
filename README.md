@@ -553,6 +553,8 @@ src/
     truepeak.rs     4x polyphase FIR true-peak meter
   normalize.rs      analyze -> gain (ceiling-protected) -> apply -> write; album mode
   realtime.rs       allocation-free live M/S meter + smoothed gain processor
+  bin/forge-live.rs raw f32le real-time pipeline and NDJSON meter
+  lv2.rs            hard-real-time-capable LV2 stereo plugin ABI
   preset.rs         named playback and broadcast loudness targets
 build.rs            optionally links libmp3lame for MP3 encoding
 tests/
@@ -560,6 +562,24 @@ tests/
 ```
 
 ## Real-time DSP API
+
+Release archives include `forge-live`, a streaming CLI for shells, OBS/FFmpeg
+filter graphs, and audio-pipe integrations. It reads and writes interleaved
+little-endian `f32` PCM and sends versioned meter NDJSON to stderr, keeping
+stdout binary-clean:
+
+```bash
+ffmpeg -i input.wav -f f32le -ac 2 -ar 48000 - \
+  | forge-live --sample-rate 48000 --channels 2 --gain-db=3 --ceiling-dbtp=-1 \
+  | ffmpeg -f f32le -ac 2 -ar 48000 -i - output.wav
+```
+
+The report includes Momentary and Short-term LUFS, sample/true peak, current
+gain, maximum limiter reduction, processed frames, and exact latency. Linux
+release archives also contain the `forge-live.lv2` stereo plugin bundle; copy
+it to an LV2 search directory such as `$HOME/.lv2/`. Its audio callback uses
+only preallocated Forge DSP state and exposes a ±24 dB gain control with a
+fixed −1 dBTP, 5 ms look-ahead limiter.
 
 The library exposes callback-safe primitives that allocate their working
 buffers at construction:

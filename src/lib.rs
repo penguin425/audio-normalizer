@@ -18,6 +18,8 @@ pub mod codec_qc;
 pub mod decoder;
 pub mod dsp;
 pub mod flacenc;
+#[cfg(feature = "lv2-plugin")]
+mod lv2;
 pub mod metadata;
 #[cfg(feature = "mp3-encoding")]
 pub mod mp3enc;
