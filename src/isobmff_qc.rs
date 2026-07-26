@@ -32,6 +32,7 @@ impl BoxHeader {
 #[derive(Default)]
 struct Track {
     id: Option<u32>,
+    header_duration: Option<u64>,
     handler: Option<[u8; 4]>,
     timescale: Option<u32>,
     duration: Option<u64>,
@@ -78,6 +79,7 @@ struct Fragment {
     track_ids: Vec<u32>,
     decode_times: Vec<(u32, u64)>,
     sample_count: u64,
+    movie_relative: Option<bool>,
 }
 
 #[derive(Default)]
@@ -87,6 +89,8 @@ struct State {
     major_brand: Option<String>,
     compatible_brands: Vec<String>,
     moov_count: usize,
+    movie_duration: Option<u64>,
+    mvex_after_tracks: bool,
     mdat_ranges: Vec<(u64, u64)>,
     has_mvex: bool,
     tracks: Vec<Track>,
@@ -406,6 +410,20 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
         "compatible_brands": state.compatible_brands,
         "fragmented": state.has_mvex || has_moof,
         "movie_fragments": state.fragments.len(),
+        "fragment_sequences": state.fragments.iter()
+            .filter_map(|fragment| fragment.sequence)
+            .collect::<Vec<_>>(),
+        "fragment_decode_times": state.fragments.iter()
+            .flat_map(|fragment| fragment.decode_times.iter())
+            .map(|(track_id, time)| json!({"track_id": track_id, "time": time}))
+            .collect::<Vec<_>>(),
+        "fragment_movie_relative": state.fragments.iter()
+            .all(|fragment| fragment.movie_relative == Some(true)),
+        "movie_duration": state.movie_duration,
+        "track_header_durations": state.tracks.iter()
+            .map(|track| track.header_duration)
+            .collect::<Vec<_>>(),
+        "mvex_after_tracks": state.mvex_after_tracks,
         "media_data_boxes": state.mdat_ranges.len(),
         "tracks": state.tracks.iter().map(track_json).collect::<Vec<_>>()
     });
@@ -456,28 +474,60 @@ fn parse_moov(
         &mut state.box_count,
     )?;
     state.has_mvex |= children.iter().any(|item| item.kind == *b"mvex");
+    let last_track = children.iter().rposition(|item| item.kind == *b"trak");
+    let first_mvex = children.iter().position(|item| item.kind == *b"mvex");
+    state.mvex_after_tracks = first_mvex
+        .zip(last_track)
+        .is_some_and(|(mvex, track)| mvex > track);
     for child in children {
-        if child.kind == *b"trak" {
-            if state.tracks.len() == MAX_TRACKS {
-                bitstream.push(check(
-                    "FORGE-ISOBMFF-TRACK-LIMIT",
-                    false,
-                    "track count exceeds the bounded safety limit",
-                    Some(json!(MAX_TRACKS)),
-                ));
-                break;
+        match &child.kind {
+            b"mvhd" => {
+                state.movie_duration = parse_mvhd(path, file, child, bitstream)?;
             }
-            state.tracks.push(parse_trak(
-                path,
-                file,
-                child,
-                &mut state.box_count,
-                bitstream,
-                xcheck,
-            )?);
+            b"trak" => {
+                if state.tracks.len() == MAX_TRACKS {
+                    bitstream.push(check(
+                        "FORGE-ISOBMFF-TRACK-LIMIT",
+                        false,
+                        "track count exceeds the bounded safety limit",
+                        Some(json!(MAX_TRACKS)),
+                    ));
+                    break;
+                }
+                state.tracks.push(parse_trak(
+                    path,
+                    file,
+                    child,
+                    &mut state.box_count,
+                    bitstream,
+                    xcheck,
+                )?);
+            }
+            _ => {}
         }
     }
     Ok(())
+}
+
+fn parse_mvhd(
+    path: &Path,
+    file: &mut File,
+    header: BoxHeader,
+    checks: &mut Vec<AuditCheck>,
+) -> Result<Option<u64>, String> {
+    let body = read_control(path, file, header)?;
+    let duration = match body.first() {
+        Some(0) => body.get(16..20).map(be_u32).map(u64::from),
+        Some(1) => body.get(24..32).map(be_u64),
+        _ => None,
+    };
+    checks.push(check(
+        "FORGE-ISOBMFF-MOVIE-HEADER",
+        duration.is_some(),
+        "movie header contains a duration",
+        duration.map(Value::from),
+    ));
+    Ok(duration)
 }
 
 fn parse_trak(
@@ -492,7 +542,9 @@ fn parse_trak(
     let mut track = Track::default();
     for child in children {
         match &child.kind {
-            b"tkhd" => track.id = parse_tkhd(path, file, child, bitstream)?,
+            b"tkhd" => {
+                (track.id, track.header_duration) = parse_tkhd(path, file, child, bitstream)?
+            }
             b"mdia" => parse_mdia(path, file, child, box_count, &mut track, bitstream, xcheck)?,
             b"udta" => parse_udta(path, file, child, box_count, &mut track, bitstream)?,
             _ => {}
@@ -733,22 +785,30 @@ fn parse_tkhd(
     file: &mut File,
     header: BoxHeader,
     checks: &mut Vec<AuditCheck>,
-) -> Result<Option<u32>, String> {
+) -> Result<(Option<u32>, Option<u64>), String> {
     let body = read_control(path, file, header)?;
     let version = body.first().copied();
-    let offset = match version {
-        Some(0) => 12,
-        Some(1) => 20,
-        _ => usize::MAX,
+    let (id_offset, duration_offset, duration_bytes) = match version {
+        Some(0) => (12, 20, 4),
+        Some(1) => (20, 28, 8),
+        _ => (usize::MAX, usize::MAX, 0),
     };
-    let id = body.get(offset..offset.saturating_add(4)).map(be_u32);
+    let id = body.get(id_offset..id_offset.saturating_add(4)).map(be_u32);
+    let duration = match duration_bytes {
+        4 => body
+            .get(duration_offset..duration_offset + 4)
+            .map(be_u32)
+            .map(u64::from),
+        8 => body.get(duration_offset..duration_offset + 8).map(be_u64),
+        _ => None,
+    };
     checks.push(check(
         "FORGE-ISOBMFF-TRACK-HEADER",
-        id.is_some_and(|value| value != 0),
-        "track header has a non-zero track ID",
-        id.map(Value::from),
+        id.is_some_and(|value| value != 0) && duration.is_some(),
+        "track header has a non-zero track ID and duration",
+        Some(json!({"track_id": id, "duration": duration})),
     ));
-    Ok(id)
+    Ok((id, duration))
 }
 
 fn parse_mdia(
@@ -1320,6 +1380,13 @@ fn parse_traf(
             b"tfhd" => {
                 let body = read_control(path, file, child)?;
                 track_id = body.get(4..8).map(be_u32);
+                if body.len() >= 8 {
+                    let flags =
+                        (u32::from(body[1]) << 16) | (u32::from(body[2]) << 8) | u32::from(body[3]);
+                    let relative = flags & 0x000001 == 0 && flags & 0x020000 != 0;
+                    fragment.movie_relative =
+                        Some(fragment.movie_relative.unwrap_or(true) && relative);
+                }
             }
             b"tfdt" => {
                 let body = read_control(path, file, child)?;
@@ -1472,6 +1539,7 @@ fn parse_counted_entries(body: &[u8], width: usize) -> Option<Vec<&[u8]>> {
 fn track_json(track: &Track) -> Value {
     json!({
         "track_id": track.id,
+        "track_header_duration": track.header_duration,
         "handler": track.handler.map(|value| fourcc(&value)),
         "timescale": track.timescale,
         "duration": track.duration,
@@ -1636,7 +1704,10 @@ mod tests {
 
     fn media_fragment(sequence: u32, decode_time: u64) -> Vec<u8> {
         let mfhd = boxed(b"mfhd", full_box(0, sequence.to_be_bytes().to_vec()));
-        let tfhd = boxed(b"tfhd", full_box(0, 1_u32.to_be_bytes().to_vec()));
+        let tfhd = boxed(
+            b"tfhd",
+            [vec![0, 2, 0, 0], 1_u32.to_be_bytes().to_vec()].concat(),
+        );
         let tfdt = boxed(b"tfdt", full_box(1, decode_time.to_be_bytes().to_vec()));
         let trun = boxed(b"trun", full_box(0, 1_u32.to_be_bytes().to_vec()));
         boxed(

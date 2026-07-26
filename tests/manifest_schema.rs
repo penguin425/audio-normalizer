@@ -124,3 +124,29 @@ fn emitted_isobmff_container_qc_conforms_to_published_schema() {
         .collect();
     assert!(errors.is_empty(), "schema violations: {errors:#?}");
 }
+
+#[test]
+fn emitted_hls_qc_conforms_to_published_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("audio.m3u8");
+    std::fs::write(
+        &path,
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n\
+         #EXTINF:6,\na.ts\n#EXT-X-ENDLIST\n",
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("a.ts"), []).unwrap();
+
+    let audit =
+        forge_normalizer::hls_qc::audit(&path, forge_normalizer::hls_qc::HlsProfile::Rfc8216)
+            .unwrap();
+    let instance = serde_json::to_value(audit).unwrap();
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/hls-qc-v1.schema.json")).expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}

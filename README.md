@@ -230,6 +230,28 @@ Results use versioned JSON with stable `FORGE-*` rule IDs and separate
 `wrapper`, `bitstream`, and `x-check` layers. Exit status is 0 for pass, 1 for a
 QC failure, and 2 for an I/O or unsupported-format error.
 
+### HLS and CMAF package QC
+
+`forge-streaming-qc master.m3u8 --profile rfc8216` validates Media and
+Multivariant Playlists, singleton and URI-bearing tags, attribute uniqueness,
+required rendition attributes, protocol versions, target/segment durations,
+local resource presence, and fMP4 initialization signaling. Local fMP4/CMAF
+headers and segments are passed through the container auditor; fragment
+sequence numbers and `tfdt` decode times are then cross-checked across segment
+boundaries.
+
+Use `--profile apple-hls` to add current Apple authoring requirements:
+six-second target and aligned-boundary recommendations, equal rendition target
+and content durations, playlist-type consistency, the 0.5-second segment ceiling,
+`CODECS`, and fMP4 `ludt` evidence. Normative violations fail the command;
+recommendations remain explicit warnings and do not change exit status. Remote
+resources are never fetched implicitly. Results conform to the published
+`schema/hls-qc-v1.schema.json` contract.
+
+The profiles track [RFC 8216](https://www.rfc-editor.org/rfc/rfc8216),
+Apple's current [HLS authoring specification](https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices),
+and the segmented-media model in ISO/IEC 23000-19:2024 CMAF.
+
 ### Standards conformance tests
 
 Run the optional conformance suite against the official EBU Loudness Test Set

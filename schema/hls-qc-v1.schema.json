@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/hls-qc-v1",
+  "title": "Forge HLS package QC audit",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generator",
+    "path",
+    "profile",
+    "kind",
+    "passed",
+    "warning_count",
+    "findings",
+    "properties"
+  ],
+  "properties": {
+    "schema": {"const": "https://penguin425.github.io/audio-normalizer/schema/hls-qc-v1"},
+    "generator": {"type": "string"},
+    "path": {"type": "string"},
+    "profile": {"enum": ["rfc8216", "apple-hls"]},
+    "kind": {"enum": ["media", "multivariant"]},
+    "passed": {"type": "boolean"},
+    "warning_count": {"type": "integer", "minimum": 0},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rule_id", "severity", "passed", "message"],
+        "properties": {
+          "rule_id": {"type": "string", "pattern": "^FORGE-(HLS|APPLE-HLS)-"},
+          "severity": {"enum": ["error", "warning"]},
+          "passed": {"type": "boolean"},
+          "message": {"type": "string"},
+          "observed": true
+        }
+      }
+    },
+    "properties": {"type": "object"}
+  }
+}

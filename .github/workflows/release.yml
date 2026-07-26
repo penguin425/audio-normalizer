@@ -91,6 +91,7 @@ jobs:
              "target/${{ matrix.target }}/release/forge-live" \
              "target/${{ matrix.target }}/release/forge-compare" \
              "target/${{ matrix.target }}/release/forge-container-qc" \
+             "target/${{ matrix.target }}/release/forge-streaming-qc" \
              "target/${{ matrix.target }}/release/forge-presentation-qc" \
              "target/${{ matrix.target }}/release/forge-sadm-qc" \
              "target/${{ matrix.target }}/release/forge-dialogue-provider" "$staging/"
@@ -110,7 +111,7 @@ jobs:
         run: |
           $staging = "forge-v${{ needs.validate.outputs.version }}-${{ matrix.asset }}"
           New-Item -ItemType Directory -Path $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/forge.exe","target/${{ matrix.target }}/release/forge-live.exe","target/${{ matrix.target }}/release/forge-compare.exe","target/${{ matrix.target }}/release/forge-container-qc.exe","target/${{ matrix.target }}/release/forge-presentation-qc.exe","target/${{ matrix.target }}/release/forge-sadm-qc.exe","target/${{ matrix.target }}/release/forge-dialogue-provider.exe" $staging
+          Copy-Item "target/${{ matrix.target }}/release/forge.exe","target/${{ matrix.target }}/release/forge-live.exe","target/${{ matrix.target }}/release/forge-compare.exe","target/${{ matrix.target }}/release/forge-container-qc.exe","target/${{ matrix.target }}/release/forge-streaming-qc.exe","target/${{ matrix.target }}/release/forge-presentation-qc.exe","target/${{ matrix.target }}/release/forge-sadm-qc.exe","target/${{ matrix.target }}/release/forge-dialogue-provider.exe" $staging
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.library }}" "$staging/forge-live.clap"
           Copy-Item README.md, LICENSE $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
