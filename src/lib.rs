@@ -30,6 +30,7 @@ pub mod mp3enc;
 pub mod normalize;
 #[cfg(feature = "opus-encoding")]
 pub mod opus;
+pub mod presentation_qc;
 pub mod preset;
 pub mod qc;
 pub mod realtime;
