@@ -279,7 +279,7 @@ pub struct Cli {
     #[arg(long = "downmix-qc", requires = "analyze_only")]
     pub downmix_qc: bool,
 
-    /// Write a versioned JSON delivery manifest containing every asset report.
+    /// Write a versioned JSON delivery manifest containing every asset and container QC report.
     #[arg(long, value_name = "PATH", requires = "analyze_only")]
     pub manifest: Option<PathBuf>,
 

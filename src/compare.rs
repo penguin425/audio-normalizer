@@ -309,7 +309,50 @@ fn compare_asset(
     ] {
         compare_pass(path, metric, baseline, candidate, options, findings);
     }
+    compare_nested_pass(
+        path,
+        "container_qc.passed",
+        baseline.get("container_qc"),
+        candidate.get("container_qc"),
+        options,
+        findings,
+    );
     compare_qc_results(path, baseline, candidate, findings);
+    compare_container_qc_results(path, baseline, candidate, findings);
+}
+
+fn compare_nested_pass(
+    path: &str,
+    metric: &str,
+    baseline: Option<&Value>,
+    candidate: Option<&Value>,
+    options: &CompareOptions,
+    findings: &mut Vec<Finding>,
+) {
+    let before = baseline.and_then(|value| value.get("passed"));
+    let after = candidate.and_then(|value| value.get("passed"));
+    match (
+        before.and_then(Value::as_bool),
+        after.and_then(Value::as_bool),
+    ) {
+        (Some(true), Some(false)) | (None, Some(false)) => findings.push(Finding {
+            level: FindingLevel::Error,
+            rule_id: "FORGE-COMPARE-NEW-FAILURE".into(),
+            asset: path.into(),
+            metric: metric.into(),
+            baseline: before.cloned(),
+            candidate: after.cloned(),
+            tolerance: None,
+            message: format!("{metric} changed from pass to fail"),
+        }),
+        (Some(_), None) if !options.allow_missing_metrics => findings.push(missing_finding(
+            path,
+            metric,
+            before.expect("baseline nested pass exists"),
+            "QC evidence",
+        )),
+        _ => {}
+    }
 }
 
 fn compare_exact(
@@ -472,6 +515,59 @@ fn qc_passes(asset: &Map<String, Value>) -> BTreeMap<String, bool> {
         .filter_map(|result| {
             Some((
                 result.get("ebu_qc_id")?.as_str()?.to_owned(),
+                result.get("passed")?.as_bool()?,
+            ))
+        })
+        .collect()
+}
+
+fn compare_container_qc_results(
+    path: &str,
+    baseline: &Map<String, Value>,
+    candidate: &Map<String, Value>,
+    findings: &mut Vec<Finding>,
+) {
+    let before = container_qc_passes(baseline);
+    let after = container_qc_passes(candidate);
+    for (id, before_passed) in before {
+        match after.get(&id) {
+            Some(false) if before_passed => findings.push(Finding {
+                level: FindingLevel::Error,
+                rule_id: "FORGE-COMPARE-NEW-CONTAINER-QC-FAILURE".into(),
+                asset: path.into(),
+                metric: format!("container_qc.{id}"),
+                baseline: Some(Value::Bool(true)),
+                candidate: Some(Value::Bool(false)),
+                tolerance: None,
+                message: format!("container QC rule {id} newly fails"),
+            }),
+            None => findings.push(Finding {
+                level: FindingLevel::Error,
+                rule_id: "FORGE-COMPARE-CONTAINER-QC-EVIDENCE-MISSING".into(),
+                asset: path.into(),
+                metric: format!("container_qc.{id}"),
+                baseline: Some(Value::Bool(before_passed)),
+                candidate: None,
+                tolerance: None,
+                message: format!("candidate is missing container QC rule {id}"),
+            }),
+            _ => {}
+        }
+    }
+}
+
+fn container_qc_passes(asset: &Map<String, Value>) -> BTreeMap<String, bool> {
+    asset
+        .get("container_qc")
+        .and_then(|audit| audit.get("layers"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|layer| layer.get("checks").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|result| {
+            Some((
+                result.get("rule_id")?.as_str()?.to_owned(),
                 result.get("passed")?.as_bool()?,
             ))
         })
@@ -654,6 +750,39 @@ mod tests {
         let mut junit = Vec::new();
         write_junit(&mut junit, &result).unwrap();
         assert!(String::from_utf8(junit).unwrap().contains("<testsuite"));
+    }
+
+    #[test]
+    fn detects_container_qc_regressions_and_missing_rules() {
+        let baseline = manifest(json!({
+            "path": "programme.wav",
+            "container_qc": {
+                "passed": true,
+                "layers": [{"checks": [
+                    {"rule_id": "FORGE-WAVE-RIFF-SIZE", "passed": true},
+                    {"rule_id": "FORGE-WAVE-FMT-REQUIRED", "passed": true}
+                ]}]
+            }
+        }));
+        let candidate = manifest(json!({
+            "path": "programme.wav",
+            "container_qc": {
+                "passed": false,
+                "layers": [{"checks": [
+                    {"rule_id": "FORGE-WAVE-RIFF-SIZE", "passed": false}
+                ]}]
+            }
+        }));
+        let result = compare_manifests(&baseline, &candidate, &CompareOptions::default()).unwrap();
+        assert!(!result.passed);
+        assert!(result.findings.iter().any(|finding| {
+            finding.rule_id == "FORGE-COMPARE-NEW-CONTAINER-QC-FAILURE"
+                && finding.metric == "container_qc.FORGE-WAVE-RIFF-SIZE"
+        }));
+        assert!(result.findings.iter().any(|finding| {
+            finding.rule_id == "FORGE-COMPARE-CONTAINER-QC-EVIDENCE-MISSING"
+                && finding.metric == "container_qc.FORGE-WAVE-FMT-REQUIRED"
+        }));
     }
 
     proptest! {

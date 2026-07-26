@@ -469,6 +469,8 @@ fn batch_analysis_writes_a_delivery_manifest() {
     assert_eq!(value["asset_count"], 2);
     assert_eq!(value["passed_count"], 2);
     assert_eq!(value["assets"][0]["path"], first.to_str().unwrap());
+    assert_eq!(value["assets"][0]["container_qc"]["passed"], true);
+    assert_eq!(value["assets"][0]["container_qc"]["format"], "wave");
 }
 
 #[test]
@@ -500,7 +502,7 @@ fn ebu_qc_writes_versioned_baseband_evidence() {
     assert!(value["schema"]
         .as_str()
         .unwrap()
-        .ends_with("delivery-manifest-v2"));
+        .ends_with("delivery-manifest-v3"));
     let results = value["assets"][0]["qc"]["results"].as_array().unwrap();
     assert_eq!(results.len(), 6);
     assert_eq!(results[0]["ebu_qc_id"], "0078B");

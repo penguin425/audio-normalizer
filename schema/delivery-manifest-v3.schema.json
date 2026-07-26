@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v3",
+  "title": "Forge delivery manifest v3",
+  "description": "Versioned loudness, ADM, codec, EBU and container QC evidence emitted by forge --manifest.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generator",
+    "asset_count",
+    "passed_count",
+    "failed_count",
+    "assets"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v3"
+    },
+    "generator": {
+      "type": "string",
+      "pattern": "^forge-normalizer/[0-9]+\\.[0-9]+\\.[0-9]+"
+    },
+    "asset_count": {"type": "integer", "minimum": 0},
+    "passed_count": {"type": "integer", "minimum": 0},
+    "failed_count": {"type": "integer", "minimum": 0},
+    "assets": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/asset"}
+    }
+  },
+  "$defs": {
+    "nullableString": {"type": ["string", "null"]},
+    "nullableBoolean": {"type": ["boolean", "null"]},
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channel", "start_seconds", "end_seconds"],
+      "properties": {
+        "channel": {"type": "integer", "minimum": 0},
+        "start_seconds": {"type": "number", "minimum": 0},
+        "end_seconds": {"type": "number", "minimum": 0},
+        "measured": {"type": "number"},
+        "unit": {"type": "string"}
+      }
+    },
+    "qcResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ebu_qc_id",
+        "version",
+        "name",
+        "layer",
+        "passed",
+        "calculated",
+        "events"
+      ],
+      "properties": {
+        "ebu_qc_id": {"type": "string", "pattern": "^[0-9]{4}[A-Z]$"},
+        "version": {"type": "string"},
+        "name": {"type": "string"},
+        "layer": {
+          "enum": ["wrapper", "bitstream", "baseband", "x-check", "programme-layout"]
+        },
+        "passed": {"type": "boolean"},
+        "calculated": {"type": "boolean"},
+        "events": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/event"}
+        }
+      }
+    },
+    "qc": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "results"],
+      "properties": {
+        "schema": {
+          "const": "https://penguin425.github.io/audio-normalizer/schema/ebu-qc-results-v1"
+        },
+        "results": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/qcResult"}
+        }
+      }
+    },
+    "containerCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rule_id", "passed", "message"],
+      "properties": {
+        "rule_id": {"type": "string", "pattern": "^FORGE-"},
+        "passed": {"type": "boolean"},
+        "message": {"type": "string"},
+        "observed": {}
+      }
+    },
+    "containerLayer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["layer", "passed", "checks"],
+      "properties": {
+        "layer": {"enum": ["wrapper", "bitstream", "x-check"]},
+        "passed": {"type": "boolean"},
+        "checks": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/containerCheck"}
+        }
+      }
+    },
+    "containerQc": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "generator",
+        "path",
+        "format",
+        "passed",
+        "layers",
+        "properties"
+      ],
+      "properties": {
+        "schema": {
+          "const": "https://penguin425.github.io/audio-normalizer/schema/container-qc-v1"
+        },
+        "generator": {"type": "string"},
+        "path": {"type": "string"},
+        "format": {"enum": ["wave", "ogg-opus"]},
+        "passed": {"type": "boolean"},
+        "layers": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {"$ref": "#/$defs/containerLayer"}
+        },
+        "properties": {"type": "object"}
+      }
+    },
+    "asset": {
+      "type": "object",
+      "required": [
+        "path",
+        "duration_seconds",
+        "source_start_seconds",
+        "sample_rate_hz",
+        "channels",
+        "sample_format",
+        "integrated_lufs",
+        "max_momentary_lufs",
+        "max_short_term_lufs",
+        "loudness_range_lu",
+        "rms_dbfs",
+        "sample_peak_dbfs",
+        "true_peak_dbtp",
+        "peak_to_loudness_ratio_lu"
+      ],
+      "properties": {
+        "path": {"type": "string"},
+        "duration_seconds": {"type": "number", "minimum": 0},
+        "source_start_seconds": {"type": "number", "minimum": 0},
+        "sample_rate_hz": {"type": "integer", "minimum": 1},
+        "channels": {"type": "integer", "minimum": 1},
+        "sample_format": {"type": "string"},
+        "integrated_lufs": {"type": "number"},
+        "max_momentary_lufs": {"type": "number"},
+        "max_short_term_lufs": {"type": "number"},
+        "loudness_range_lu": {"type": "number", "minimum": 0},
+        "rms_dbfs": {"type": "number"},
+        "sample_peak_dbfs": {"type": "number"},
+        "true_peak_dbtp": {"type": "number"},
+        "peak_to_loudness_ratio_lu": {"type": "number"},
+        "ebu_qc_results_json": {"$ref": "#/$defs/nullableString"},
+        "ebu_qc_passed": {"$ref": "#/$defs/nullableBoolean"},
+        "qc": {"$ref": "#/$defs/qc"},
+        "container_qc": {"$ref": "#/$defs/containerQc"}
+      }
+    }
+  }
+}
