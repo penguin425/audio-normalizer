@@ -37,6 +37,10 @@ name = "forge-container-qc"
 path = "src/bin/forge-container-qc.rs"
 
 [[bin]]
+name = "forge-streaming-qc"
+path = "src/bin/forge-streaming-qc.rs"
+
+[[bin]]
 name = "forge-presentation-qc"
 path = "src/bin/forge-presentation-qc.rs"
 

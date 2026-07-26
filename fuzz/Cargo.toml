@@ -40,3 +40,10 @@ path = "fuzz_targets/manifest_compare.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "hls_qc"
+path = "fuzz_targets/hls_qc.rs"
+test = false
+doc = false
+bench = false
