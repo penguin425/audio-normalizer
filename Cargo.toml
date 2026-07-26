@@ -44,6 +44,10 @@ path = "src/bin/forge-presentation-qc.rs"
 name = "forge-sadm-qc"
 path = "src/bin/forge-sadm-qc.rs"
 
+[[bin]]
+name = "forge-dialogue-provider"
+path = "src/bin/forge-dialogue-provider.rs"
+
 [dependencies]
 rayon = "1.10"
 clap = { version = "4.5", features = ["derive"] }
