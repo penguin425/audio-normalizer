@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v1",
+  "title": "Forge delivery manifest v1",
+  "description": "Versioned batch loudness and delivery-QC results emitted by forge --manifest.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generator",
+    "asset_count",
+    "passed_count",
+    "failed_count",
+    "assets"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v1"
+    },
+    "generator": {
+      "type": "string",
+      "pattern": "^forge-normalizer/[0-9]+\\.[0-9]+\\.[0-9]+"
+    },
+    "asset_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "passed_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "failed_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "assets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/asset"
+      }
+    }
+  },
+  "$defs": {
+    "nullableNumber": {
+      "type": ["number", "null"]
+    },
+    "nullableString": {
+      "type": ["string", "null"]
+    },
+    "nullableBoolean": {
+      "type": ["boolean", "null"]
+    },
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "duration_seconds",
+        "source_start_seconds",
+        "sample_rate_hz",
+        "channels",
+        "sample_format",
+        "integrated_lufs",
+        "max_momentary_lufs",
+        "max_short_term_lufs",
+        "loudness_range_lu",
+        "loudness_range_stable",
+        "loudness_range_stable_after_seconds",
+        "rms_dbfs",
+        "sample_peak_dbfs",
+        "true_peak_dbtp",
+        "peak_to_loudness_ratio_lu"
+      ],
+      "properties": {
+        "path": {"type": "string"},
+        "duration_seconds": {"type": "number", "minimum": 0},
+        "source_start_seconds": {"type": "number", "minimum": 0},
+        "sample_rate_hz": {"type": "integer", "minimum": 1},
+        "channels": {"type": "integer", "minimum": 1},
+        "sample_format": {"type": "string"},
+        "integrated_lufs": {"type": "number"},
+        "dialogue_lufs": {"$ref": "#/$defs/nullableNumber"},
+        "dialogue_duration_seconds": {"$ref": "#/$defs/nullableNumber"},
+        "dialogue_range_count": {"type": ["integer", "null"], "minimum": 0},
+        "dialogue_measurement_standard": {"$ref": "#/$defs/nullableString"},
+        "dialogue_measurement_method": {"$ref": "#/$defs/nullableString"},
+        "dialogue_source": {
+          "type": ["string", "null"],
+          "enum": ["mix", "center", "stem", null]
+        },
+        "loudness_to_dialogue_ratio_lu": {"$ref": "#/$defs/nullableNumber"},
+        "dialogue_detector": {"$ref": "#/$defs/nullableString"},
+        "dialogue_detector_version": {"$ref": "#/$defs/nullableString"},
+        "dialogue_detection_threshold": {"$ref": "#/$defs/nullableNumber"},
+        "dialogue_detection_ranges_json": {"$ref": "#/$defs/nullableString"},
+        "max_momentary_lufs": {"type": "number"},
+        "max_short_term_lufs": {"type": "number"},
+        "loudness_range_lu": {"type": "number", "minimum": 0},
+        "loudness_range_stable": {"type": "boolean"},
+        "loudness_range_stable_after_seconds": {"type": "number", "minimum": 0},
+        "rms_dbfs": {"type": "number"},
+        "sample_peak_dbfs": {"type": "number"},
+        "true_peak_dbtp": {"type": "number"},
+        "peak_to_loudness_ratio_lu": {"type": "number"},
+        "downmix_integrated_lufs": {"$ref": "#/$defs/nullableNumber"},
+        "downmix_true_peak_dbtp": {"$ref": "#/$defs/nullableNumber"},
+        "downmix_method": {"$ref": "#/$defs/nullableString"},
+        "codec": {"$ref": "#/$defs/nullableString"},
+        "codec_dialnorm_lkfs": {"$ref": "#/$defs/nullableNumber"},
+        "codec_encoded_loudness_lufs": {"$ref": "#/$defs/nullableNumber"},
+        "codec_downmix_mode": {"$ref": "#/$defs/nullableString"},
+        "codec_loudness_basis": {"$ref": "#/$defs/nullableString"},
+        "codec_dialnorm_deviation_lu": {"$ref": "#/$defs/nullableNumber"},
+        "codec_dialnorm_pass": {"$ref": "#/$defs/nullableBoolean"},
+        "codec_encoded_loudness_deviation_lu": {"$ref": "#/$defs/nullableNumber"},
+        "codec_encoded_loudness_pass": {"$ref": "#/$defs/nullableBoolean"},
+        "adm_axml_present": {"$ref": "#/$defs/nullableBoolean"},
+        "adm_chna_present": {"$ref": "#/$defs/nullableBoolean"},
+        "adm_presentations_json": {"$ref": "#/$defs/nullableString"},
+        "adm_qc_passed": {"$ref": "#/$defs/nullableBoolean"},
+        "compliance_profile": {"$ref": "#/$defs/nullableString"},
+        "compliance_loudness_basis": {
+          "type": ["string", "null"],
+          "enum": ["programme", "dialogue", null]
+        },
+        "compliance_target_lufs": {"$ref": "#/$defs/nullableNumber"},
+        "compliance_loudness_tolerance_lu": {"$ref": "#/$defs/nullableNumber"},
+        "compliance_lower_tolerance_lu": {"$ref": "#/$defs/nullableNumber"},
+        "compliance_upper_tolerance_lu": {"$ref": "#/$defs/nullableNumber"},
+        "compliance_max_true_peak_dbtp": {"$ref": "#/$defs/nullableNumber"},
+        "compliance_loudness_pass": {"$ref": "#/$defs/nullableBoolean"},
+        "compliance_true_peak_pass": {"$ref": "#/$defs/nullableBoolean"},
+        "compliance_max_short_term_lufs": {"$ref": "#/$defs/nullableNumber"},
+        "compliance_short_term_pass": {"$ref": "#/$defs/nullableBoolean"},
+        "compliance_max_momentary_lufs": {"$ref": "#/$defs/nullableNumber"},
+        "compliance_momentary_pass": {"$ref": "#/$defs/nullableBoolean"},
+        "compliance_min_loudness_range_lu": {"$ref": "#/$defs/nullableNumber"},
+        "compliance_max_loudness_range_lu": {"$ref": "#/$defs/nullableNumber"},
+        "compliance_loudness_range_pass": {"$ref": "#/$defs/nullableBoolean"},
+        "compliance_max_loudness_to_dialogue_ratio_lu": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "compliance_loudness_to_dialogue_ratio_pass": {
+          "$ref": "#/$defs/nullableBoolean"
+        },
+        "compliance_rules_json": {"$ref": "#/$defs/nullableString"},
+        "compliance_passed": {"$ref": "#/$defs/nullableBoolean"}
+      }
+    }
+  }
+}

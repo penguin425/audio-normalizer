@@ -21,3 +21,23 @@ jobs:
 
       - name: Run the official EBU Loudness Test Set v5
         run: ./tools/test-ebu-conformance.sh
+
+  itu-bs2217:
+    name: ITU BS.2217 conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache official ITU-R BS.2217-2 material
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/forge-normalizer/bs2217-2
+          key: itu-bs2217-2-core-v1
+
+      - name: Run the official ITU-R BS.2217-2 conformance tests
+        run: ./tools/test-itu-conformance.sh

@@ -62,3 +62,22 @@ jobs:
 
       - name: Run official EBU Tech 3341/3342 conformance tests
         run: tools/test-ebu-conformance.sh
+
+  itu-conformance:
+    name: ITU BS.2217 conformance
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache official ITU-R BS.2217-2 material
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/forge-normalizer/bs2217-2
+          key: itu-bs2217-2-core-v1
+
+      - name: Run official ITU-R BS.2217-2 conformance tests
+        run: tools/test-itu-conformance.sh
