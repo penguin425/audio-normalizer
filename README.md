@@ -197,6 +197,10 @@ forge-container-qc master.bw64 --output container-qc.json
 forge-container-qc programme.opus
 ```
 
+WAVE/RF64/BW64 chunk tables are scanned with bounded memory: audio payloads are
+seeked over rather than loaded, including files larger than 4 GiB. Oversized
+control chunks and pathological chunk counts fail closed with stable rule IDs.
+
 For RIFF/WAVE, RF64, and BW64 it checks declared sizes, chunk bounds and
 alignment, required/unique `fmt` and `data` chunks, `ds64` placement/table/data
 sizes/sample counts, byte rate, block alignment, BWF `bext`, and paired ADM

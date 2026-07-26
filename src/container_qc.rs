@@ -2,11 +2,15 @@
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::fs;
+use std::collections::{HashMap, VecDeque};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 pub const CONTAINER_QC_SCHEMA: &str =
     "https://penguin425.github.io/audio-normalizer/schema/container-qc-v1";
+const MAX_WAVE_CHUNKS: usize = 100_000;
+const MAX_CONTROL_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ContainerAudit {
@@ -36,10 +40,18 @@ pub struct AuditCheck {
 }
 
 pub fn audit(path: &Path) -> Result<ContainerAudit, String> {
-    let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    if bytes.starts_with(b"RIFF") || bytes.starts_with(b"RF64") || bytes.starts_with(b"BW64") {
-        Ok(audit_wave(path, &bytes))
-    } else if bytes.starts_with(b"OggS") {
+    let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let file_size = file
+        .metadata()
+        .map_err(|error| format!("stat {}: {error}", path.display()))?
+        .len();
+    let mut header = [0_u8; 12];
+    let header_size = usize::try_from(file_size.min(header.len() as u64)).unwrap();
+    file.read_exact(&mut header[..header_size])
+        .map_err(|error| format!("read {} header: {error}", path.display()))?;
+    if header_size >= 4 && matches!(&header[..4], b"RIFF" | b"RF64" | b"BW64") {
+        audit_wave(path, &mut file, &header[..header_size], file_size)
+    } else if header_size >= 4 && &header[..4] == b"OggS" {
         audit_ogg_opus(path)
     } else {
         Err(format!(
@@ -147,6 +159,7 @@ struct WaveState {
     bext_size: Option<u64>,
     axml: bool,
     chna: bool,
+    ds64_table: HashMap<[u8; 4], VecDeque<u64>>,
 }
 
 #[derive(Clone, Copy)]
@@ -159,29 +172,41 @@ struct WaveFormat {
     bits_per_sample: u16,
 }
 
-fn audit_wave(path: &Path, bytes: &[u8]) -> ContainerAudit {
+fn audit_wave(
+    path: &Path,
+    file: &mut File,
+    header: &[u8],
+    file_size: u64,
+) -> Result<ContainerAudit, String> {
     let mut wrapper = Vec::new();
     let mut bitstream = Vec::new();
     let mut xcheck = Vec::new();
     let mut state = WaveState::default();
-    if bytes.len() < 12 || &bytes[8..12] != b"WAVE" {
+    if header.len() < 12 || &header[8..12] != b"WAVE" {
         wrapper.push(check(
             "FORGE-WAVE-SIGNATURE",
             false,
             "truncated or invalid WAVE signature",
             None,
         ));
-        return finish_audit(path, "wave", wrapper, bitstream, xcheck, json!({}));
+        return Ok(finish_audit(
+            path,
+            "wave",
+            wrapper,
+            bitstream,
+            xcheck,
+            json!({}),
+        ));
     }
-    state.container = String::from_utf8_lossy(&bytes[..4]).into_owned();
+    state.container = String::from_utf8_lossy(&header[..4]).into_owned();
     wrapper.push(check(
         "FORGE-WAVE-SIGNATURE",
         true,
         format!("{} WAVE signature is valid", state.container),
         Some(json!(state.container)),
     ));
-    let declared_riff_size = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-    let large = matches!(&bytes[..4], b"RF64" | b"BW64");
+    let declared_riff_size = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    let large = matches!(&header[..4], b"RF64" | b"BW64");
     wrapper.push(check(
         "FORGE-WAVE-RIFF-SENTINEL",
         !large || declared_riff_size == u32::MAX,
@@ -193,11 +218,21 @@ fn audit_wave(path: &Path, bytes: &[u8]) -> ContainerAudit {
         Some(json!(declared_riff_size)),
     ));
 
-    let mut offset = 12_usize;
+    let mut offset = 12_u64;
     let mut chunk_index = 0_usize;
     let mut scan_ok = true;
-    while offset < bytes.len() {
-        if bytes.len() - offset < 8 {
+    while offset < file_size {
+        if chunk_index == MAX_WAVE_CHUNKS {
+            wrapper.push(check(
+                "FORGE-WAVE-CHUNK-LIMIT",
+                false,
+                format!("chunk count exceeds safety limit {MAX_WAVE_CHUNKS}"),
+                Some(json!(chunk_index)),
+            ));
+            scan_ok = false;
+            break;
+        }
+        if file_size - offset < 8 {
             wrapper.push(check(
                 "FORGE-WAVE-CHUNK-HEADER",
                 false,
@@ -207,57 +242,62 @@ fn audit_wave(path: &Path, bytes: &[u8]) -> ContainerAudit {
             scan_ok = false;
             break;
         }
-        let id: [u8; 4] = bytes[offset..offset + 4].try_into().unwrap();
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| format!("seek {} to {offset}: {error}", path.display()))?;
+        let mut chunk_header = [0_u8; 8];
+        file.read_exact(&mut chunk_header)
+            .map_err(|error| format!("read {} chunk at {offset}: {error}", path.display()))?;
+        let id: [u8; 4] = chunk_header[..4].try_into().unwrap();
         let id_text = String::from_utf8_lossy(&id).into_owned();
-        let declared = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+        let declared = u32::from_le_bytes(chunk_header[4..8].try_into().unwrap());
         offset += 8;
         chunk_index += 1;
-        let effective = if id == *b"data" && declared == u32::MAX {
+        let effective = if declared != u32::MAX {
+            Some(u64::from(declared))
+        } else if id == *b"data" {
             state.ds64_data_size
         } else {
-            Some(u64::from(declared))
+            state.ds64_table.get_mut(&id).and_then(VecDeque::pop_front)
         };
         let Some(size) = effective else {
             wrapper.push(check(
                 "FORGE-WAVE-DS64-ORDER",
                 false,
-                "0xffffffff data size appears before a usable ds64 chunk",
-                None,
+                format!("0xffffffff {id_text} size appears before a matching ds64 size entry"),
+                Some(json!(id_text)),
             ));
             scan_ok = false;
             break;
         };
-        let Ok(size_usize) = usize::try_from(size) else {
+        let Some(end) = offset.checked_add(size) else {
             wrapper.push(check(
                 "FORGE-WAVE-CHUNK-SIZE",
                 false,
-                format!("{id_text} chunk is too large for this platform"),
+                format!("{id_text} chunk size overflows its file offset"),
                 Some(json!(size)),
             ));
             scan_ok = false;
             break;
         };
-        let Some(end) = offset.checked_add(size_usize) else {
-            scan_ok = false;
-            break;
-        };
-        if end > bytes.len() {
+        if end > file_size {
             wrapper.push(check(
                 "FORGE-WAVE-CHUNK-BOUNDS",
                 false,
-                format!(
-                    "{id_text} chunk ending at byte {end} exceeds file size {}",
-                    bytes.len()
-                ),
+                format!("{id_text} chunk ending at byte {end} exceeds file size {file_size}"),
                 Some(json!({"offset": offset, "size": size})),
             ));
             scan_ok = false;
             break;
         }
-        let body = &bytes[offset..end];
         state.chunks.push(id_text.clone());
         match &id {
-            b"ds64" => parse_ds64(body, chunk_index, &mut state, &mut wrapper, large),
+            b"ds64" => {
+                if let Some(body) =
+                    read_control_chunk(path, file, offset, size, &mut wrapper, "ds64")?
+                {
+                    parse_ds64(&body, chunk_index, &mut state, &mut wrapper, large);
+                }
+            }
             b"fmt " => {
                 if state.fmt.is_some() {
                     bitstream.push(check(
@@ -266,8 +306,10 @@ fn audit_wave(path: &Path, bytes: &[u8]) -> ContainerAudit {
                         "multiple fmt chunks are not allowed",
                         None,
                     ));
-                } else {
-                    state.fmt = parse_wave_fmt(body, &mut bitstream);
+                } else if let Some(body) =
+                    read_control_chunk(path, file, offset, size, &mut wrapper, "fmt ")?
+                {
+                    state.fmt = parse_wave_fmt(&body, &mut bitstream);
                 }
             }
             b"data" => {
@@ -289,7 +331,7 @@ fn audit_wave(path: &Path, bytes: &[u8]) -> ContainerAudit {
         }
         offset = end;
         if size & 1 == 1 {
-            if offset == bytes.len() {
+            if offset == file_size {
                 wrapper.push(check(
                     "FORGE-WAVE-CHUNK-ALIGNMENT",
                     false,
@@ -304,8 +346,8 @@ fn audit_wave(path: &Path, bytes: &[u8]) -> ContainerAudit {
     }
     wrapper.push(check(
         "FORGE-WAVE-CHUNK-SCAN",
-        scan_ok && offset == bytes.len(),
-        if scan_ok && offset == bytes.len() {
+        scan_ok && offset == file_size,
+        if scan_ok && offset == file_size {
             format!("{} aligned chunk(s) cover the file", state.chunks.len())
         } else {
             "chunk table does not cover the file exactly".into()
@@ -323,31 +365,31 @@ fn audit_wave(path: &Path, bytes: &[u8]) -> ContainerAudit {
         if let Some(riff_size) = state.ds64_riff_size {
             wrapper.push(check(
                 "FORGE-WAVE-RF64-SIZE",
-                riff_size.checked_add(8) == Some(bytes.len() as u64),
+                riff_size.checked_add(8) == Some(file_size),
                 format!(
                     "ds64 RIFF size {} file size",
-                    if riff_size.checked_add(8) == Some(bytes.len() as u64) {
+                    if riff_size.checked_add(8) == Some(file_size) {
                         "matches"
                     } else {
                         "does not match"
                     }
                 ),
-                Some(json!({"declared": riff_size, "actual": bytes.len() - 8})),
+                Some(json!({"declared": riff_size, "actual": file_size - 8})),
             ));
         }
     } else {
         wrapper.push(check(
             "FORGE-WAVE-RIFF-SIZE",
-            u64::from(declared_riff_size).checked_add(8) == Some(bytes.len() as u64),
+            u64::from(declared_riff_size).checked_add(8) == Some(file_size),
             format!(
                 "RIFF size {} file size",
-                if u64::from(declared_riff_size).checked_add(8) == Some(bytes.len() as u64) {
+                if u64::from(declared_riff_size).checked_add(8) == Some(file_size) {
                     "matches"
                 } else {
                     "does not match"
                 }
             ),
-            Some(json!({"declared": declared_riff_size, "actual": bytes.len() - 8})),
+            Some(json!({"declared": declared_riff_size, "actual": file_size - 8})),
         ));
     }
 
@@ -454,7 +496,35 @@ fn audit_wave(path: &Path, bytes: &[u8]) -> ContainerAudit {
         "channels": state.fmt.map(|fmt| fmt.channels),
         "bits_per_sample": state.fmt.map(|fmt| fmt.bits_per_sample)
     });
-    finish_audit(path, "wave", wrapper, bitstream, xcheck, properties)
+    Ok(finish_audit(
+        path, "wave", wrapper, bitstream, xcheck, properties,
+    ))
+}
+
+fn read_control_chunk(
+    path: &Path,
+    file: &mut File,
+    offset: u64,
+    size: u64,
+    wrapper: &mut Vec<AuditCheck>,
+    name: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    if size > MAX_CONTROL_CHUNK_BYTES {
+        wrapper.push(check(
+            "FORGE-WAVE-CONTROL-CHUNK-LIMIT",
+            false,
+            format!("{name} chunk exceeds the bounded-read safety limit"),
+            Some(json!({"size": size, "limit": MAX_CONTROL_CHUNK_BYTES})),
+        ));
+        return Ok(None);
+    }
+    let size = usize::try_from(size).expect("bounded control chunk fits usize");
+    let mut body = vec![0_u8; size];
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| format!("seek {} to {offset}: {error}", path.display()))?;
+    file.read_exact(&mut body)
+        .map_err(|error| format!("read {} {name} chunk: {error}", path.display()))?;
+    Ok(Some(body))
 }
 
 fn parse_ds64(
@@ -491,12 +561,20 @@ fn parse_ds64(
         state.ds64_sample_count = Some(u64::from_le_bytes(body[16..24].try_into().unwrap()));
         let table_length = u32::from_le_bytes(body[24..28].try_into().unwrap()) as usize;
         let required = 28_usize.saturating_add(table_length.saturating_mul(12));
+        let table_fits = body.len() >= required;
         wrapper.push(check(
             "FORGE-WAVE-DS64-TABLE",
-            body.len() >= required,
+            table_fits,
             "ds64 table length fits the chunk",
             Some(json!({"entries": table_length, "size": body.len()})),
         ));
+        if table_fits {
+            for entry in body[28..required].chunks_exact(12) {
+                let id = entry[..4].try_into().unwrap();
+                let size = u64::from_le_bytes(entry[4..12].try_into().unwrap());
+                state.ds64_table.entry(id).or_default().push_back(size);
+            }
+        }
     }
 }
 
@@ -586,6 +664,7 @@ fn finish_audit(
 mod tests {
     use super::*;
     use crate::wav::{AudioBuffer, PcmKind, WavContainer, WavWriter};
+    use std::io::{Seek, SeekFrom, Write};
 
     #[test]
     fn wave_audit_detects_wrapper_size_corruption() {
@@ -602,9 +681,9 @@ mod tests {
         WavWriter::write(&path, &audio, PcmKind::S16, false).unwrap();
         let valid = audit(&path).unwrap();
         assert!(valid.passed);
-        let mut bytes = fs::read(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
         bytes[4..8].copy_from_slice(&1_u32.to_le_bytes());
-        fs::write(&path, bytes).unwrap();
+        std::fs::write(&path, bytes).unwrap();
         let invalid = audit(&path).unwrap();
         assert!(!invalid.passed);
         assert!(invalid.layers[0]
@@ -631,5 +710,42 @@ mod tests {
             let audit = audit(&path).unwrap();
             assert!(audit.passed, "{container:?}: {audit:#?}");
         }
+    }
+
+    #[test]
+    fn sparse_rf64_larger_than_four_gib_is_audited_without_reading_audio() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large.rf64");
+        let data_size = u64::from(u32::MAX) + 1;
+        let data_offset = 12 + 8 + 28 + 8 + 16 + 8;
+        let file_size = data_offset + data_size;
+        let mut file = File::create(&path).unwrap();
+        file.write_all(b"RF64").unwrap();
+        file.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        file.write_all(b"WAVE").unwrap();
+        file.write_all(b"ds64").unwrap();
+        file.write_all(&28_u32.to_le_bytes()).unwrap();
+        file.write_all(&(file_size - 8).to_le_bytes()).unwrap();
+        file.write_all(&data_size.to_le_bytes()).unwrap();
+        file.write_all(&(data_size / 2).to_le_bytes()).unwrap();
+        file.write_all(&0_u32.to_le_bytes()).unwrap();
+        file.write_all(b"fmt ").unwrap();
+        file.write_all(&16_u32.to_le_bytes()).unwrap();
+        file.write_all(&1_u16.to_le_bytes()).unwrap();
+        file.write_all(&1_u16.to_le_bytes()).unwrap();
+        file.write_all(&48_000_u32.to_le_bytes()).unwrap();
+        file.write_all(&96_000_u32.to_le_bytes()).unwrap();
+        file.write_all(&2_u16.to_le_bytes()).unwrap();
+        file.write_all(&16_u16.to_le_bytes()).unwrap();
+        file.write_all(b"data").unwrap();
+        file.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        assert_eq!(file.stream_position().unwrap(), data_offset);
+        file.seek(SeekFrom::Start(file_size - 1)).unwrap();
+        file.write_all(&[0]).unwrap();
+        drop(file);
+
+        let result = audit(&path).unwrap();
+        assert!(result.passed, "{result:#?}");
+        assert_eq!(result.properties["data_size_bytes"], json!(data_size));
     }
 }
