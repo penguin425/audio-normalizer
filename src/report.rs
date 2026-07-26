@@ -102,6 +102,10 @@ impl CodecMetadata {
 pub struct ComplianceProfile {
     pub name: String,
     #[serde(default)]
+    pub standard: Option<String>,
+    #[serde(default)]
+    pub standard_version: Option<String>,
+    #[serde(default)]
     pub loudness_basis: LoudnessBasis,
     pub target_lufs: Option<f64>,
     pub loudness_tolerance_lu: Option<f64>,
@@ -127,8 +131,21 @@ pub enum LoudnessBasis {
 impl ComplianceProfile {
     pub fn builtin(name: &str) -> Option<Self> {
         let profile = match name {
-            "ebu-r128" => Self::symmetric("ebu-r128", -23.0, 0.2, -1.0),
-            "radio-ebu" => Self::symmetric("radio-ebu", -23.0, 0.5, -1.0),
+            "ebu-r128" => {
+                Self::symmetric("ebu-r128", -23.0, 0.2, -1.0).sourced("EBU R 128", "5.0 (2023)")
+            }
+            "radio-ebu" | "ebu-r128-s3-radio" => {
+                Self::symmetric(name, -23.0, 0.2, -1.0).sourced("EBU R 128 s3", "2023")
+            }
+            "ebu-r128-s2-streaming" => {
+                Self::symmetric(name, -23.0, 0.2, -1.0).sourced("EBU R 128 s2", "3.0 (2023)")
+            }
+            "ebu-r128-s2-streaming-adapted" => {
+                Self::symmetric(name, -18.0, 0.2, -1.0).sourced("EBU R 128 s2", "3.0 (2023)")
+            }
+            "ebu-r128-s2-music-low-plr" => {
+                Self::symmetric(name, -16.0, 0.2, -1.0).sourced("EBU R 128 s2", "3.0 (2023)")
+            }
             "streaming-music" => Self::symmetric("streaming-music", -14.0, 1.0, -1.0),
             "streaming-speech-stereo" => {
                 Self::symmetric("streaming-speech-stereo", -16.0, 1.0, -1.0)
@@ -137,10 +154,12 @@ impl ComplianceProfile {
             "ebu-r128-short" => Self {
                 max_short_term_lufs: Some(-18.0),
                 ..Self::symmetric("ebu-r128-short", -23.0, 0.2, -1.0)
+                    .sourced("EBU R 128 s1", "2023")
             },
             "ebu-r128-cinematic" => Self {
                 max_loudness_to_dialogue_ratio_lu: Some(5.0),
                 ..Self::symmetric("ebu-r128-cinematic", -23.0, 0.2, -1.0)
+                    .sourced("EBU R 128 s4", "2023")
             },
             "atsc-a85-short" => Self::symmetric("atsc-a85-short", -24.0, 2.0, -2.0),
             "atsc-a85-long" => Self {
@@ -149,6 +168,8 @@ impl ComplianceProfile {
             },
             "aes77-assorted" => Self {
                 name: "aes77-assorted".into(),
+                standard: Some("AES77".into()),
+                standard_version: Some("2023".into()),
                 loudness_basis: LoudnessBasis::Programme,
                 target_lufs: Some(-18.0),
                 loudness_tolerance_lu: None,
@@ -161,8 +182,12 @@ impl ComplianceProfile {
                 max_loudness_range_lu: None,
                 max_loudness_to_dialogue_ratio_lu: None,
             },
-            "aes77-music-track" => Self::symmetric("aes77-music-track", -16.0, 0.2, -1.0),
-            "aes77-interstitial" => Self::symmetric("aes77-interstitial", -18.0, 0.2, -1.0),
+            "aes77-music-track" => {
+                Self::symmetric("aes77-music-track", -16.0, 0.2, -1.0).sourced("AES77", "2023")
+            }
+            "aes77-interstitial" => {
+                Self::symmetric("aes77-interstitial", -18.0, 0.2, -1.0).sourced("AES77", "2023")
+            }
             _ => return None,
         };
         Some(profile)
@@ -171,6 +196,8 @@ impl ComplianceProfile {
     fn symmetric(name: &str, target: f64, tolerance: f64, true_peak: f64) -> Self {
         Self {
             name: name.into(),
+            standard: None,
+            standard_version: None,
             loudness_basis: LoudnessBasis::Programme,
             target_lufs: Some(target),
             loudness_tolerance_lu: Some(tolerance),
@@ -183,6 +210,12 @@ impl ComplianceProfile {
             max_loudness_range_lu: None,
             max_loudness_to_dialogue_ratio_lu: None,
         }
+    }
+
+    fn sourced(mut self, standard: &str, version: &str) -> Self {
+        self.standard = Some(standard.into());
+        self.standard_version = Some(version.into());
+        self
     }
 
     pub fn load(name_or_path: &str) -> Result<Self, String> {
@@ -483,6 +516,8 @@ pub struct AnalysisReport {
     pub adm_render_channels: Option<u16>,
     pub adm_render_output_path: Option<String>,
     pub compliance_profile: Option<String>,
+    pub compliance_standard: Option<String>,
+    pub compliance_standard_version: Option<String>,
     pub compliance_loudness_basis: Option<LoudnessBasis>,
     pub compliance_target_lufs: Option<f64>,
     pub compliance_loudness_tolerance_lu: Option<f64>,
@@ -689,6 +724,8 @@ impl AnalysisReport {
             adm_render_channels: None,
             adm_render_output_path: None,
             compliance_profile: compliance.as_ref().map(|result| result.profile.clone()),
+            compliance_standard: profile.and_then(|value| value.standard.clone()),
+            compliance_standard_version: profile.and_then(|value| value.standard_version.clone()),
             compliance_loudness_basis: profile.map(|value| value.loudness_basis),
             compliance_target_lufs: profile.and_then(|value| value.target_lufs),
             compliance_loudness_tolerance_lu: profile.and_then(|value| value.loudness_tolerance_lu),
@@ -975,6 +1012,8 @@ mod tests {
             adm_render_channels: None,
             adm_render_output_path: None,
             compliance_profile: None,
+            compliance_standard: None,
+            compliance_standard_version: None,
             compliance_loudness_basis: None,
             compliance_target_lufs: None,
             compliance_loudness_tolerance_lu: None,
@@ -1075,6 +1114,23 @@ mod tests {
     }
 
     #[test]
+    fn versioned_ebu_distribution_profiles_preserve_their_source() {
+        let unchanged = ComplianceProfile::builtin("ebu-r128-s2-streaming").unwrap();
+        assert_eq!(unchanged.target_lufs, Some(-23.0));
+        assert_eq!(unchanged.standard.as_deref(), Some("EBU R 128 s2"));
+        assert_eq!(unchanged.standard_version.as_deref(), Some("3.0 (2023)"));
+
+        let adapted = ComplianceProfile::builtin("ebu-r128-s2-streaming-adapted").unwrap();
+        assert_eq!(adapted.target_lufs, Some(-18.0));
+        let music = ComplianceProfile::builtin("ebu-r128-s2-music-low-plr").unwrap();
+        assert_eq!(music.target_lufs, Some(-16.0));
+
+        let radio = ComplianceProfile::builtin("ebu-r128-s3-radio").unwrap();
+        assert_eq!(radio.target_lufs, Some(-23.0));
+        assert_eq!(radio.standard_version.as_deref(), Some("2023"));
+    }
+
+    #[test]
     fn csv_has_headers_and_quotes_paths() {
         let mut output = Vec::new();
         write_csv(&mut output, &[sample_report()]).unwrap();
@@ -1108,6 +1164,8 @@ mod tests {
         }];
         let profile = ComplianceProfile {
             name: "timeline".into(),
+            standard: None,
+            standard_version: None,
             loudness_basis: LoudnessBasis::Programme,
             target_lufs: None,
             loudness_tolerance_lu: None,
@@ -1307,6 +1365,8 @@ mod tests {
     fn custom_profile_validation_rejects_conflicting_tolerances() {
         let profile = ComplianceProfile {
             name: "custom".into(),
+            standard: None,
+            standard_version: None,
             loudness_basis: LoudnessBasis::Programme,
             target_lufs: Some(-20.0),
             loudness_tolerance_lu: Some(1.0),
