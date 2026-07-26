@@ -227,6 +227,8 @@ fn compare_asset(
         "codec_container",
         "codec_profile",
         "codec_channel_layout",
+        "adm_model_standard",
+        "adm_model_version",
         "adm_production_profile_standard",
         "adm_production_profile_version",
         "adm_production_profile_level",

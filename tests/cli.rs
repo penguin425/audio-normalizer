@@ -185,6 +185,14 @@ fn ebu_production_profile_writes_a_rule_audit() {
         channel_roles: default_channel_roles(1),
         source_kind: PcmKind::F32,
     };
+    let mut chna = Vec::with_capacity(44);
+    chna.extend_from_slice(&1_u16.to_le_bytes());
+    chna.extend_from_slice(&1_u16.to_le_bytes());
+    chna.extend_from_slice(&1_u16.to_le_bytes());
+    chna.extend_from_slice(b"ATU_00000001");
+    chna.extend_from_slice(&[0; 14]);
+    chna.extend_from_slice(&[0; 11]);
+    chna.push(0);
     WavWriter::write_with_metadata(
         &input,
         &buffer,
@@ -194,11 +202,11 @@ fn ebu_production_profile_writes_a_rule_audit() {
         &[
             WaveChunk {
                 id: *b"axml",
-                body: br#"<audioFormatExtended><profileList><profile profileName="EBU Production Profile" profileVersion="1.0" profileLevel="1">EBU Tech 3393</profile></profileList></audioFormatExtended>"#.to_vec(),
+                body: br#"<audioFormatExtended version="ITU-R_BS.2076-3"><profileList><profile profileName="EBU Production Profile" profileVersion="1.0" profileLevel="1">EBU Tech 3393</profile></profileList></audioFormatExtended>"#.to_vec(),
             },
             WaveChunk {
                 id: *b"chna",
-                body: vec![1, 0, 1, 0],
+                body: chna,
             },
         ],
     )
@@ -228,11 +236,14 @@ fn ebu_production_profile_writes_a_rule_audit() {
         report[0]["adm_production_profile_standard"],
         "EBU Tech 3393"
     );
+    assert_eq!(report[0]["adm_model_standard"], "ITU-R BS.2076-3");
+    assert_eq!(report[0]["adm_model_version"], "ITU-R_BS.2076-3");
     assert_eq!(report[0]["adm_production_profile_mode"], "write");
     assert_eq!(report[0]["adm_production_profile_passed"], true);
     let audit: serde_json::Value = serde_json::from_slice(&std::fs::read(audit).unwrap()).unwrap();
-    assert_eq!(audit["validator"], "forge-tech3393-core-1");
-    assert!(audit["rules"].as_array().unwrap().len() >= 8);
+    assert_eq!(audit["validator"], "forge-tech3393-bs2076-3-2");
+    assert_eq!(audit["adm_standard"], "ITU-R BS.2076-3");
+    assert!(audit["rules"].as_array().unwrap().len() >= 16);
 }
 
 fn wav_fixture_bytes() -> Vec<u8> {
