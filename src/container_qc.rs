@@ -42,7 +42,7 @@ pub struct AuditCheck {
 pub fn audit(path: &Path) -> Result<ContainerAudit, String> {
     audit_if_supported(path)?.ok_or_else(|| {
         format!(
-            "{}: unsupported container (expected WAVE, AIFF/AIFC, CAF, AU, FLAC, Ogg Opus, or ISO-BMFF MP4/M4A/fMP4)",
+            "{}: unsupported container (expected WAVE, AIFF/AIFC, CAF, AU, FLAC, Ogg Opus/Vorbis, or ISO-BMFF MP4/M4A/fMP4)",
             path.display()
         )
     })
@@ -72,97 +72,11 @@ pub fn audit_if_supported(path: &Path) -> Result<Option<ContainerAudit>, String>
     } else if header_size >= 4 && &header[..4] == b"fLaC" {
         crate::flac_qc::audit(path, file, file_size).map(Some)
     } else if header_size >= 4 && &header[..4] == b"OggS" {
-        audit_ogg_opus(path).map(Some)
+        crate::ogg_qc::audit(path).map(Some)
     } else if crate::isobmff_qc::looks_like_isobmff(&header[..header_size], file_size) {
         crate::isobmff_qc::audit(path, file, file_size).map(Some)
     } else {
         Ok(None)
-    }
-}
-
-fn audit_ogg_opus(path: &Path) -> Result<ContainerAudit, String> {
-    #[cfg(feature = "opus-encoding")]
-    {
-        let mut wrapper = Vec::new();
-        let mut bitstream = Vec::new();
-        let mut xcheck = Vec::new();
-        let inspection = match crate::opus::inspect(path) {
-            Ok(inspection) => {
-                wrapper.push(check(
-                    "FORGE-OGG-CRC",
-                    true,
-                    "every Ogg page checksum is valid",
-                    None,
-                ));
-                wrapper.push(check(
-                    "FORGE-OGG-SEQUENTIAL-CHAINS",
-                    true,
-                    format!("{} sequential logical stream(s)", inspection.chain_count),
-                    Some(json!(inspection.chain_count)),
-                ));
-                bitstream.push(check(
-                    "FORGE-OPUS-HEADERS",
-                    true,
-                    "every chain has valid OpusHead and OpusTags packets",
-                    None,
-                ));
-                bitstream.push(check(
-                    "FORGE-OPUS-GRANULES",
-                    true,
-                    "granule increments equal completed RFC 6716 packet durations; initial offset, pre-skip, and EOS trimming are valid",
-                    Some(json!(inspection.total_frames)),
-                ));
-                xcheck.push(check(
-                    "FORGE-OPUS-CHAIN-LAYOUT",
-                    true,
-                    format!(
-                        "all chains use the same {}-channel layout",
-                        inspection.channels
-                    ),
-                    Some(json!(inspection.channels)),
-                ));
-                Some(inspection)
-            }
-            Err(error) => {
-                let lower = error.to_ascii_lowercase();
-                let wrapper_failure = lower.contains("hash mismatch")
-                    || lower.contains("hashmismatch")
-                    || lower.contains("checksum")
-                    || lower.contains("crc")
-                    || error.contains("Ogg");
-                let target = if wrapper_failure {
-                    &mut wrapper
-                } else {
-                    &mut bitstream
-                };
-                target.push(check(
-                    if wrapper_failure {
-                        "FORGE-OGG-WRAPPER"
-                    } else {
-                        "FORGE-OPUS-BITSTREAM"
-                    },
-                    false,
-                    error,
-                    None,
-                ));
-                None
-            }
-        };
-        Ok(finish_audit(
-            path,
-            "ogg-opus",
-            wrapper,
-            bitstream,
-            xcheck,
-            inspection
-                .map(|value| serde_json::to_value(value).expect("Opus inspection serializes"))
-                .unwrap_or_else(|| json!({})),
-        ))
-    }
-    #[cfg(not(feature = "opus-encoding"))]
-    {
-        let _ = path;
-        Err("Ogg Opus QC requires `--features opus-encoding`".into())
     }
 }
 

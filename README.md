@@ -225,9 +225,12 @@ programme.
 For RIFF/WAVE, RF64, and BW64 it checks declared sizes, chunk bounds and
 alignment, required/unique `fmt` and `data` chunks, `ds64` placement/table/data
 sizes/sample counts, byte rate, block alignment, BWF `bext`, and paired ADM
-`axml`/`chna` metadata. For Ogg Opus it verifies page CRCs, sequential chains,
-headers/tags, mapping-family tables, monotonic granules, pre-skip/end trim, and
-consistent layouts.
+`axml`/`chna` metadata. Dependency-free Ogg QC follows
+[RFC 3533](https://www.rfc-editor.org/rfc/rfc3533) for page bounds, CRCs,
+sequences, continuation state, and sequential chains. Ogg Opus adds RFC 7845
+headers/tags, mapping-family tables, packet durations, granules, pre-skip, and
+end-trim checks. Ogg Vorbis adds Vorbis I identification/comment/setup header
+validation, PCM granules, and strict streaming decode verification.
 
 For ISO-BMFF MP4, M4A, and fragmented MP4 it scans the complete nested box
 structure with bounded memory, validates 32/64-bit box sizes and file roles,
@@ -361,8 +364,8 @@ CI runs the EBU and ITU suites as separate required evidence.
 
 Property tests exercise arbitrary WAVE and delivery-manifest bytes during the
 normal Rust test suite. Four `cargo-fuzz` targets cover the WAVE decoder,
-WAVE/RF64/BW64 and Ogg Opus container QC, ADM XML profile validation, and
-delivery-manifest comparison:
+delivery-container QC including Ogg Opus/Vorbis, ADM XML profile validation,
+and delivery-manifest comparison:
 
 ```sh
 cargo fuzz run wave_reader
@@ -672,9 +675,11 @@ true-peak, and sample-accurate duration drift. The exact prober path and
 is not a build or runtime requirement unless `--codec-qc` is requested.
 
 For Ogg Opus inputs, container QC validates CRCs, mandatory header-page
-boundaries, RFC 6716 packet duration, and RFC 7845 granule increments. Initial
-granule offsets, pre-skip, chained streams, and final-page end trimming are
-reported without decoding the audio payload.
+boundaries, RFC 6716 packet duration, and RFC 7845 granule increments without
+requiring libopus. Initial granule offsets, pre-skip, chained streams, and
+final-page end trimming are reported without decoding the audio payload. Ogg
+Vorbis QC validates the three mandatory Vorbis I headers, comments, page
+boundaries, monotonic PCM granules, and a strict packet-by-packet decode.
 
 AC-4 and MPEG-H workflows can audit every externally rendered Presentation
 without claiming that Forge is a normative immersive renderer:
