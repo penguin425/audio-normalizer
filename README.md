@@ -493,6 +493,10 @@ playback references rather than acceptance guarantees.
 | Name | Integrated loudness | Additional limits |
 |------|---------------------|-------------------|
 | `ebu-r128` | −23.0 ±0.2 LUFS | true peak ≤ −1 dBTP |
+| `ebu-r128-s2-streaming` | −23.0 ±0.2 LUFS | EBU R 128 s2 v3.0 unchanged stream; true peak ≤ −1 dBTP |
+| `ebu-r128-s2-streaming-adapted` | −18.0 ±0.2 LUFS | EBU R 128 s2 v3.0 interim adaptation; true peak ≤ −1 dBTP |
+| `ebu-r128-s2-music-low-plr` | −16.0 ±0.2 LUFS | EBU R 128 s2 v3.0 allowance for mostly-music PLR < 15 dB; true peak ≤ −1 dBTP |
+| `ebu-r128-s3-radio` | −23.0 ±0.2 LUFS | EBU R 128 s3:2023 production/exchange; true peak ≤ −1 dBTP |
 | `ebu-r128-short` | −23.0 ±0.2 LUFS | true peak ≤ −1 dBTP; max short-term ≤ −18 LUFS |
 | `atsc-a85-short` | −24 ±2 LUFS | true peak ≤ −2 dBTP |
 | `atsc-a85-long` | −24 ±2 LKFS/LUFS, explicit dialogue regions | true peak ≤ −2 dBTP |
@@ -546,6 +550,11 @@ will never change: `streaming-music` (-14 LUFS), `streaming-speech-stereo`
 Use `--manifest delivery.json` with batch analysis to write a versioned,
 per-asset delivery record containing measurements, metadata checks, compliance
 rules, and pass/fail totals.
+
+Versioned EBU profiles also record `compliance_standard` and
+`compliance_standard_version` in reports and manifests. The s2 adapted and
+low-PLR profiles are conditional alternatives, not replacements for the
+recommended unchanged −23 LUFS stream.
 
 ADM/BW64 presentation QC uses `--adm-presentations presentations.json`. Forge
 checks for both `axml` and `chna`, verifies each supplied ADM presentation ID is
