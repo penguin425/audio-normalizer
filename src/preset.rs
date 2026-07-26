@@ -53,6 +53,12 @@ impl Preset {
                 ceiling_db: -2.0,
                 description: "ATSC A/85 television delivery",
             }),
+            "arib-tr-b32" => Some(Self {
+                name: "arib-tr-b32",
+                target_lufs: -24.0,
+                ceiling_db: -1.0,
+                description: "ARIB TR-B32 Japanese digital television delivery",
+            }),
             _ => None,
         }
     }
@@ -68,6 +74,8 @@ mod tests {
         assert_eq!((ebu.target_lufs, ebu.ceiling_db), (-23.0, -1.0));
         let atsc = Preset::named("atsc-a85").unwrap();
         assert_eq!((atsc.target_lufs, atsc.ceiling_db), (-24.0, -2.0));
+        let arib = Preset::named("arib-tr-b32").unwrap();
+        assert_eq!((arib.target_lufs, arib.ceiling_db), (-24.0, -1.0));
     }
 
     #[test]

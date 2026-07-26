@@ -134,6 +134,12 @@ impl ComplianceProfile {
             "ebu-r128" => {
                 Self::symmetric("ebu-r128", -23.0, 0.2, -1.0).sourced("EBU R 128", "5.0 (2023)")
             }
+            "ebu-r128-live" => {
+                Self::symmetric(name, -23.0, 1.0, -1.0).sourced("EBU R 128", "5.0 (2023)")
+            }
+            "ebu-r128-creative" => {
+                Self::upper_bounded(name, -23.0, 0.2, -1.0).sourced("EBU R 128", "5.0 (2023)")
+            }
             "radio-ebu" | "ebu-r128-s3-radio" => {
                 Self::symmetric(name, -23.0, 0.2, -1.0).sourced("EBU R 128 s3", "2023")
             }
@@ -161,11 +167,19 @@ impl ComplianceProfile {
                 ..Self::symmetric("ebu-r128-cinematic", -23.0, 0.2, -1.0)
                     .sourced("EBU R 128 s4", "2023")
             },
-            "atsc-a85-short" => Self::symmetric("atsc-a85-short", -24.0, 2.0, -2.0),
+            "atsc-a85-short" => {
+                Self::symmetric("atsc-a85-short", -24.0, 2.0, -2.0).sourced("ATSC A/85", "2026-07")
+            }
             "atsc-a85-long" => Self {
                 loudness_basis: LoudnessBasis::Dialogue,
-                ..Self::symmetric("atsc-a85-long", -24.0, 2.0, -2.0)
+                ..Self::symmetric("atsc-a85-long", -24.0, 2.0, -2.0).sourced("ATSC A/85", "2026-07")
             },
+            "arib-tr-b32" => {
+                Self::symmetric(name, -24.0, 1.0, -1.0).sourced("ARIB TR-B32", "1.6 (2025)")
+            }
+            "arib-tr-b32-creative" => {
+                Self::upper_bounded(name, -24.0, 1.0, -1.0).sourced("ARIB TR-B32", "1.6 (2025)")
+            }
             "aes77-assorted" => Self {
                 name: "aes77-assorted".into(),
                 standard: Some("AES77".into()),
@@ -203,6 +217,25 @@ impl ComplianceProfile {
             loudness_tolerance_lu: Some(tolerance),
             lower_tolerance_lu: None,
             upper_tolerance_lu: None,
+            max_true_peak_dbtp: Some(true_peak),
+            max_short_term_lufs: None,
+            max_momentary_lufs: None,
+            min_loudness_range_lu: None,
+            max_loudness_range_lu: None,
+            max_loudness_to_dialogue_ratio_lu: None,
+        }
+    }
+
+    fn upper_bounded(name: &str, target: f64, tolerance: f64, true_peak: f64) -> Self {
+        Self {
+            name: name.into(),
+            standard: None,
+            standard_version: None,
+            loudness_basis: LoudnessBasis::Programme,
+            target_lufs: Some(target),
+            loudness_tolerance_lu: None,
+            lower_tolerance_lu: None,
+            upper_tolerance_lu: Some(tolerance),
             max_true_peak_dbtp: Some(true_peak),
             max_short_term_lufs: None,
             max_momentary_lufs: None,
@@ -1257,6 +1290,61 @@ mod tests {
             .unwrap();
         assert!(result.passed);
         assert_eq!(result.rules[0].metric, "dialogue_lufs");
+    }
+
+    #[test]
+    fn broadcast_exception_profiles_keep_the_upper_limit() {
+        let mut analysis = crate::normalize::Analysis {
+            sample_rate: 48_000,
+            channels: 2,
+            channel_roles: crate::wav::default_channel_roles(2),
+            frames: 48_000,
+            kind: crate::wav::PcmKind::S24,
+            lufs: -30.0,
+            max_momentary_lufs: -28.0,
+            max_short_term_lufs: -29.0,
+            loudness_range_lu: 4.0,
+            rms_db: -32.0,
+            sample_peak: 0.1,
+            true_peak: 0.2,
+            loudness_blocks: Vec::new(),
+        };
+        for name in ["arib-tr-b32-creative", "ebu-r128-creative"] {
+            let profile = ComplianceProfile::builtin(name).unwrap();
+            assert!(profile.evaluate(&analysis).unwrap().passed);
+        }
+        analysis.lufs = -22.7;
+        assert!(
+            !ComplianceProfile::builtin("arib-tr-b32-creative")
+                .unwrap()
+                .evaluate(&analysis)
+                .unwrap()
+                .passed
+        );
+        assert!(
+            !ComplianceProfile::builtin("ebu-r128-creative")
+                .unwrap()
+                .evaluate(&analysis)
+                .unwrap()
+                .passed
+        );
+        let live = ComplianceProfile::builtin("ebu-r128-live").unwrap();
+        analysis.lufs = -22.0;
+        assert!(live.evaluate(&analysis).unwrap().passed);
+        assert_eq!(
+            ComplianceProfile::builtin("arib-tr-b32")
+                .unwrap()
+                .standard_version
+                .as_deref(),
+            Some("1.6 (2025)")
+        );
+        assert_eq!(
+            ComplianceProfile::builtin("atsc-a85-short")
+                .unwrap()
+                .standard_version
+                .as_deref(),
+            Some("2026-07")
+        );
     }
 
     #[test]
