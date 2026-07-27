@@ -20,6 +20,8 @@ Forge already provides:
   SeekHead/Cues, CRC-32, codec-private data, and Opus gapless timing.
 - Dependency-free ADTS and LOAS/LATM AAC QC, including ASC SBR/PS signalling,
   decoded timing, and ISO-BMFF edit-list/sample-group gapless reconciliation.
+- Bounded MPEG-TS/M2TS QC for packet layout, continuity, PAT/PMT CRC and
+  programme maps, audio PES headers, and PTS continuity.
 - HLS, DASH, and CMAF package checks; ISO loudness and MPEG-D DRC metadata.
 - ADM, S-ADM, presentation-aware rendering/QC, C2PA validation, CI comparison,
   real-time processing, LV2, and CLAP integration.

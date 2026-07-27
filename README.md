@@ -233,9 +233,17 @@ forge-container-qc master.flac
 forge-container-qc delivery.mp3
 forge-container-qc broadcast.aac
 forge-container-qc contribution.loas
+forge-container-qc broadcast.ts
+forge-container-qc camera.m2ts
 forge-container-qc programme.mka
 forge-container-qc delivery.webm
 ```
+
+MPEG-TS/M2TS audits detect 188/192-byte packet layout, transport and
+adaptation-field errors, payload continuity gaps, exact retransmissions,
+CRC-protected PAT/PMT programme maps, declared audio codecs, bounded PES
+headers, and monotonic 90 kHz audio PTS values. The report keeps programme,
+PID, language, PCR, and timing evidence without decoding the audio.
 
 WAVE/RF64/BW64 chunk tables are scanned with bounded memory: audio payloads are
 seeked over rather than loaded, including files larger than 4 GiB. Oversized
