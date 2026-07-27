@@ -168,6 +168,147 @@ fn container_qc_cli_audits_real_aac_lc_and_he_aac_without_runtime_decoding() {
 }
 
 #[test]
+fn container_qc_cli_audits_mpegts_program_maps_audio_pes_and_continuity() {
+    if !Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|result| result.status.success())
+    {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("broadcast.ts");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=997:sample_rate=48000:duration=0.5",
+            "-c:a",
+            "aac",
+            "-profile:a",
+            "aac_low",
+            "-mpegts_flags",
+            "+resend_headers",
+            "-f",
+            "mpegts",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{generated:#?}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(audit["format"], "mpegts");
+    assert_eq!(audit["passed"], true);
+    assert_eq!(audit["properties"]["packet_size"], 188);
+    assert_eq!(audit["properties"]["audio_streams"][0]["codec"], "aac-adts");
+    assert!(
+        audit["properties"]["audio_streams"][0]["last_pts_90khz"]
+            .as_u64()
+            .unwrap()
+            >= audit["properties"]["audio_streams"][0]["first_pts_90khz"]
+                .as_u64()
+                .unwrap()
+    );
+
+    let m2ts = directory.path().join("camera.m2ts");
+    let bytes = fs::read(&path).unwrap();
+    let mut wrapped = Vec::with_capacity(bytes.len() / 188 * 192);
+    for (index, packet) in bytes.chunks_exact(188).enumerate() {
+        wrapped.extend_from_slice(&(index as u32).to_be_bytes());
+        wrapped.extend_from_slice(packet);
+    }
+    fs::write(&m2ts, wrapped).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&m2ts)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(audit["format"], "m2ts");
+    assert_eq!(audit["properties"]["packet_size"], 192);
+
+    let mut corrupt = fs::read(&path).unwrap();
+    let audio_pid = audit_audio_pid(&path);
+    let mut matching = corrupt.chunks_exact_mut(188).filter(|packet| {
+        let pid = (u16::from(packet[1] & 0x1f) << 8) | u16::from(packet[2]);
+        pid == audio_pid && packet[3] & 0x10 != 0
+    });
+    let first_counter = matching.next().unwrap()[3] & 0x0f;
+    let second = matching.next().unwrap();
+    second[3] = (second[3] & 0xf0) | first_counter.wrapping_add(5) & 0x0f;
+    let corrupt_path = directory.path().join("continuity-error.ts");
+    fs::write(&corrupt_path, corrupt).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&corrupt_path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(audit["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|layer| layer["checks"].as_array().unwrap())
+        .any(|check| check["rule_id"] == "FORGE-MPEGTS-CONTINUITY" && check["passed"] == false));
+
+    let mut corrupt = fs::read(&path).unwrap();
+    let pat = corrupt
+        .chunks_exact_mut(188)
+        .find(|packet| packet[1] & 0x1f == 0 && packet[2] == 0 && packet[1] & 0x40 != 0)
+        .unwrap();
+    let payload = ts_payload_offset(pat).unwrap();
+    let section = payload + 1 + usize::from(pat[payload]);
+    pat[section + 8] ^= 1;
+    let corrupt_path = directory.path().join("pat-crc-error.ts");
+    fs::write(&corrupt_path, corrupt).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&corrupt_path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(audit["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|layer| layer["checks"].as_array().unwrap())
+        .any(|check| check["rule_id"] == "FORGE-MPEGTS-PSI" && check["passed"] == false));
+}
+
+fn audit_audio_pid(path: &std::path::Path) -> u16 {
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(path)
+        .output()
+        .unwrap();
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    audit["properties"]["audio_streams"][0]["pid"]
+        .as_u64()
+        .unwrap() as u16
+}
+
+fn ts_payload_offset(packet: &[u8]) -> Option<usize> {
+    let adaptation_control = packet[3] >> 4 & 3;
+    if adaptation_control & 1 == 0 {
+        return None;
+    }
+    if adaptation_control & 2 == 0 {
+        Some(4)
+    } else {
+        Some(5 + usize::from(packet[4])).filter(|offset| *offset < packet.len())
+    }
+}
+
+#[test]
 fn container_qc_cli_audits_real_matroska_and_webm_files() {
     if !Command::new("ffmpeg")
         .arg("-version")
