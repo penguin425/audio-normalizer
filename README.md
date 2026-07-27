@@ -362,9 +362,13 @@ and [official c2patool documentation](https://github.com/contentauth/c2pa-rs/blo
 `forge-streaming-qc master.m3u8 --profile rfc8216` validates Media and
 Multivariant Playlists, singleton and URI-bearing tags, attribute uniqueness,
 required rendition attributes, protocol versions, target/segment durations,
-local resource presence, and fMP4 initialization signaling. Local fMP4/CMAF
-headers and segments are passed through the container auditor; fragment
-sequence numbers and `tfdt` decode times are then cross-checked across segment
+local resource presence, discontinuity placement, sequence numbers, and fMP4
+initialization signaling. Local fMP4/CMAF headers and segments are passed
+through the container auditor; fragment sequence numbers and `tfdt` decode
+times are then cross-checked across segment boundaries. Local MPEG-TS/M2TS
+segments receive bounded packet, continuity, PAT/PMT, PES, and PTS audits.
+Outside an explicit `EXT-X-DISCONTINUITY`, programme/PID/codec/language
+configuration must remain stable and audio PTS must advance across segment
 boundaries.
 
 Use `--profile apple-hls` to add current Apple authoring requirements:

@@ -1,4 +1,4 @@
-//! RFC 8216 and Apple HLS package validation with local CMAF cross-checks.
+//! RFC 8216 and Apple HLS package validation with local CMAF/MPEG-TS cross-checks.
 
 use crate::container_qc;
 use serde::Serialize;
@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 pub const HLS_QC_SCHEMA: &str = "https://penguin425.github.io/audio-normalizer/schema/hls-qc-v1";
 const MAX_PLAYLIST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REFERENCED_PLAYLISTS: usize = 4_096;
+const MPEG_PTS_MODULUS: u64 = 1_u64 << 33;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -56,12 +57,38 @@ struct Playlist {
     total_duration: f64,
     segment_durations: Vec<f64>,
     segment_uris: Vec<String>,
+    segment_discontinuities: Vec<bool>,
     map_uri: Option<String>,
     referenced_playlists: Vec<String>,
     has_endlist: bool,
     playlist_type: Option<String>,
     version: Option<u64>,
+    media_sequence: Option<u64>,
+    discontinuity_sequence: Option<u64>,
     is_fmp4: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TsAudioStream {
+    program: u64,
+    pid: u64,
+    stream_type: u64,
+    codec: String,
+    language: Option<String>,
+    first_pts: Option<u64>,
+    last_pts: Option<u64>,
+}
+
+impl TsAudioStream {
+    fn configuration(&self) -> (u64, u64, u64, &str, Option<&str>) {
+        (
+            self.program,
+            self.pid,
+            self.stream_type,
+            &self.codec,
+            self.language.as_deref(),
+        )
+    }
 }
 
 pub fn audit(path: &Path, profile: HlsProfile) -> Result<HlsAudit, String> {
@@ -165,6 +192,9 @@ pub fn audit(path: &Path, profile: HlsProfile) -> Result<HlsAudit, String> {
                 "map_uri": item.map_uri,
                 "playlist_type": item.playlist_type,
                 "version": item.version,
+                "media_sequence": item.media_sequence,
+                "discontinuity_sequence": item.discontinuity_sequence,
+                "discontinuities": item.segment_discontinuities.iter().filter(|value| **value).count(),
                 "fmp4": item.is_fmp4
             })).collect::<Vec<_>>()
         }),
@@ -222,6 +252,7 @@ fn parse_playlist(
     let mut singleton = HashSet::new();
     let mut pending_stream = false;
     let mut pending_duration = None;
+    let mut pending_discontinuity = false;
     let mut map_count = 0_usize;
     for (index, line) in lines.iter().enumerate().skip(1) {
         if line.is_empty() {
@@ -236,14 +267,32 @@ fn parse_playlist(
             if !line.starts_with('#') {
                 playlist.segment_durations.push(duration);
                 playlist.segment_uris.push((*line).into());
+                playlist.segment_discontinuities.push(pending_discontinuity);
                 playlist.total_duration += duration;
                 pending_duration = None;
+                pending_discontinuity = false;
                 continue;
             }
         }
         if let Some(value) = line.strip_prefix("#EXT-X-VERSION:") {
             singleton_tag(&mut singleton, "EXT-X-VERSION", findings);
             playlist.version = value.parse().ok();
+        } else if let Some(value) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            singleton_tag(&mut singleton, "EXT-X-MEDIA-SEQUENCE", findings);
+            playlist.media_sequence =
+                parse_sequence_tag("EXT-X-MEDIA-SEQUENCE", value, index, findings);
+        } else if let Some(value) = line.strip_prefix("#EXT-X-DISCONTINUITY-SEQUENCE:") {
+            singleton_tag(&mut singleton, "EXT-X-DISCONTINUITY-SEQUENCE", findings);
+            let before_segments = playlist.segment_uris.is_empty();
+            findings.push(finding(
+                "FORGE-HLS-DISCONTINUITY-SEQUENCE-ORDER",
+                Severity::Error,
+                before_segments,
+                "EXT-X-DISCONTINUITY-SEQUENCE precedes every Media Segment",
+                Some(json!({"line": index + 1})),
+            ));
+            playlist.discontinuity_sequence =
+                parse_sequence_tag("EXT-X-DISCONTINUITY-SEQUENCE", value, index, findings);
         } else if let Some(value) = line.strip_prefix("#EXT-X-TARGETDURATION:") {
             singleton_tag(&mut singleton, "EXT-X-TARGETDURATION", findings);
             playlist.target_duration = value.parse().ok();
@@ -342,6 +391,16 @@ fn parse_playlist(
                     None,
                 )),
             }
+        } else if *line == "#EXT-X-DISCONTINUITY" {
+            let valid = pending_duration.is_none() && !pending_discontinuity;
+            findings.push(finding(
+                "FORGE-HLS-DISCONTINUITY-PLACEMENT",
+                Severity::Error,
+                valid,
+                "EXT-X-DISCONTINUITY appears once between Media Segments",
+                Some(json!({"line": index + 1})),
+            ));
+            pending_discontinuity = true;
         } else if *line == "#EXT-X-ENDLIST" {
             singleton_tag(&mut singleton, "EXT-X-ENDLIST", findings);
             playlist.has_endlist = true;
@@ -358,7 +417,7 @@ fn parse_playlist(
     findings.push(finding(
         "FORGE-HLS-DANGLING-TAG",
         Severity::Error,
-        !pending_stream && pending_duration.is_none(),
+        !pending_stream && pending_duration.is_none() && !pending_discontinuity,
         "every URI-bearing tag is followed by its URI",
         None,
     ));
@@ -461,7 +520,18 @@ fn audit_media_files(playlist: &Playlist, profile: HlsProfile, findings: &mut Ve
     }
     let mut previous_sequences = None;
     let mut last_decode: HashMap<u64, u64> = HashMap::new();
-    for uri in &playlist.segment_uris {
+    let mut previous_ts_streams: Option<Vec<TsAudioStream>> = None;
+    for (segment_index, uri) in playlist.segment_uris.iter().enumerate() {
+        let discontinuity = playlist
+            .segment_discontinuities
+            .get(segment_index)
+            .copied()
+            .unwrap_or(false);
+        if discontinuity {
+            previous_sequences = None;
+            last_decode.clear();
+            previous_ts_streams = None;
+        }
         let Some(path) = local_reference(&playlist.path, uri) else {
             findings.push(finding(
                 "FORGE-HLS-REMOTE-REFERENCE",
@@ -480,7 +550,17 @@ fn audit_media_files(playlist: &Playlist, profile: HlsProfile, findings: &mut Ve
             format!("segment resource exists: {}", path.display()),
             None,
         ));
-        if !exists || !playlist.is_fmp4 {
+        if !exists {
+            continue;
+        }
+        if !playlist.is_fmp4 {
+            audit_transport_segment(
+                playlist,
+                segment_index,
+                &path,
+                &mut previous_ts_streams,
+                findings,
+            );
             continue;
         }
         match container_qc::audit(&path) {
@@ -547,6 +627,142 @@ fn audit_media_files(playlist: &Playlist, profile: HlsProfile, findings: &mut Ve
             )),
         }
     }
+}
+
+fn audit_transport_segment(
+    playlist: &Playlist,
+    segment_index: usize,
+    path: &Path,
+    previous_streams: &mut Option<Vec<TsAudioStream>>,
+    findings: &mut Vec<HlsFinding>,
+) {
+    let expected_transport = path.extension().is_some_and(|extension| {
+        matches!(
+            extension.to_string_lossy().to_ascii_lowercase().as_str(),
+            "ts" | "m2ts" | "mts"
+        )
+    });
+    let audit = match container_qc::audit_if_supported(path) {
+        Ok(Some(audit)) => audit,
+        Ok(None) if !expected_transport => return,
+        Ok(None) => {
+            findings.push(finding(
+                "FORGE-HLS-SEGMENT-CONTAINER",
+                Severity::Error,
+                false,
+                format!(
+                    "MPEG-TS segment container is not recognized: {}",
+                    path.display()
+                ),
+                None,
+            ));
+            return;
+        }
+        Err(error) => {
+            findings.push(finding(
+                "FORGE-HLS-SEGMENT-READ",
+                Severity::Error,
+                false,
+                error,
+                Some(json!(path)),
+            ));
+            return;
+        }
+    };
+    let transport = matches!(audit.format.as_str(), "mpegts" | "m2ts");
+    if !transport && !expected_transport {
+        return;
+    }
+    findings.push(finding(
+        "FORGE-HLS-SEGMENT-CONTAINER",
+        Severity::Error,
+        audit.passed && transport,
+        format!("MPEG-TS segment container audited: {}", path.display()),
+        Some(json!({"passed": audit.passed, "format": audit.format})),
+    ));
+    if !transport {
+        return;
+    }
+    let streams = transport_streams(&audit.properties);
+    findings.push(finding(
+        "FORGE-HLS-TS-AUDIO-STREAMS",
+        Severity::Error,
+        !streams.is_empty(),
+        "MPEG-TS segment exposes recognized audio stream timing",
+        Some(json!({"segment": segment_index, "streams": streams.len()})),
+    ));
+    if let Some(previous) = previous_streams.as_ref() {
+        let previous_configuration = previous
+            .iter()
+            .map(TsAudioStream::configuration)
+            .collect::<Vec<_>>();
+        let configuration = streams
+            .iter()
+            .map(TsAudioStream::configuration)
+            .collect::<Vec<_>>();
+        findings.push(finding(
+            "FORGE-HLS-TS-PROGRAM-CONTINUITY",
+            Severity::Error,
+            configuration == previous_configuration,
+            "MPEG-TS programme, PID, codec, and language configuration is stable across segments",
+            Some(json!({
+                "segment": segment_index,
+                "previous": previous_configuration,
+                "current": configuration
+            })),
+        ));
+        let maximum_gap = playlist
+            .target_duration
+            .map_or(7.0, |duration| duration as f64 + 1.0);
+        for old in previous {
+            let Some(current) = streams.iter().find(|stream| stream.pid == old.pid) else {
+                continue;
+            };
+            let (Some(last), Some(first)) = (old.last_pts, current.first_pts) else {
+                continue;
+            };
+            let delta = pts_forward_delta(last, first);
+            let delta_seconds = delta as f64 / 90_000.0;
+            findings.push(finding(
+                "FORGE-HLS-TS-PTS-CONTINUITY",
+                Severity::Error,
+                delta > 0 && delta_seconds <= maximum_gap,
+                "audio PTS advances across the MPEG-TS segment boundary",
+                Some(json!({
+                    "segment": segment_index,
+                    "pid": old.pid,
+                    "previous_last_pts_90khz": last,
+                    "current_first_pts_90khz": first,
+                    "forward_delta_90khz": delta,
+                    "maximum_gap_seconds": maximum_gap
+                })),
+            ));
+        }
+    }
+    *previous_streams = Some(streams);
+}
+
+fn transport_streams(properties: &Value) -> Vec<TsAudioStream> {
+    properties["audio_streams"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|stream| {
+            Some(TsAudioStream {
+                program: stream["program"].as_u64()?,
+                pid: stream["pid"].as_u64()?,
+                stream_type: stream["stream_type"].as_u64()?,
+                codec: stream["codec"].as_str()?.into(),
+                language: stream["language"].as_str().map(str::to_owned),
+                first_pts: stream["first_pts_90khz"].as_u64(),
+                last_pts: stream["last_pts_90khz"].as_u64(),
+            })
+        })
+        .collect()
+}
+
+fn pts_forward_delta(previous: u64, current: u64) -> u64 {
+    (current + MPEG_PTS_MODULUS - previous) % MPEG_PTS_MODULUS
 }
 
 fn audit_isobmff(
@@ -687,6 +903,23 @@ fn singleton_tag(
     ));
 }
 
+fn parse_sequence_tag(
+    name: &'static str,
+    value: &str,
+    line_index: usize,
+    findings: &mut Vec<HlsFinding>,
+) -> Option<u64> {
+    let parsed = value.parse::<u64>().ok();
+    findings.push(finding(
+        "FORGE-HLS-SEQUENCE-NUMBER",
+        Severity::Error,
+        parsed.is_some(),
+        format!("{name} is a non-negative decimal integer"),
+        Some(json!({"line": line_index + 1, "value": value})),
+    ));
+    parsed
+}
+
 fn attributes(value: &str) -> Result<HashMap<String, String>, String> {
     let mut values = HashMap::new();
     let mut start = 0_usize;
@@ -803,14 +1036,12 @@ mod tests {
              #EXT-X-TARGETDURATION:7\n\
              #EXT-X-PLAYLIST-TYPE:VOD\n\
              #EXTINF:6.2,\n\
-             one.ts\n\
+             https://example.invalid/one.ts\n\
              #EXTINF:6.2,\n\
-             two.ts\n\
+             https://example.invalid/two.ts\n\
              #EXT-X-ENDLIST\n",
         )
         .unwrap();
-        fs::write(directory.path().join("one.ts"), []).unwrap();
-        fs::write(directory.path().join("two.ts"), []).unwrap();
 
         let rfc = audit(&path, HlsProfile::Rfc8216).unwrap();
         assert!(rfc.passed, "{rfc:#?}");
