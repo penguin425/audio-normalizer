@@ -556,6 +556,7 @@ dependencies = [
  "clack-host",
  "clack-plugin",
  "clap",
+ "crc32fast",
  "csv",
  "flacenc",
  "jsonschema",

@@ -30,6 +30,7 @@ pub mod hls_qc;
 mod isobmff_qc;
 #[cfg(feature = "lv2-plugin")]
 mod lv2;
+mod matroska_qc;
 pub mod metadata;
 mod mp3_qc;
 #[cfg(feature = "mp3-encoding")]

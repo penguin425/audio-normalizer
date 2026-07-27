@@ -483,7 +483,7 @@ fn inspect_packets(path: &Path) -> Result<(Codec, Vec<ChainInspection>), String>
                     (head.channels, 48_000, Some(head.pre_skip), Some(head))
                 }
                 Codec::Vorbis => {
-                    let (channels, sample_rate) = parse_vorbis_identification(&packet.data)?;
+                    let (channels, sample_rate) = validate_vorbis_identification(&packet.data)?;
                     (channels, sample_rate, None, None)
                 }
             };
@@ -634,7 +634,12 @@ fn parse_opus_head(packet: &[u8]) -> Result<OpusHead, String> {
     })
 }
 
-fn parse_vorbis_identification(packet: &[u8]) -> Result<(u8, u32), String> {
+pub(crate) fn validate_opus_identification(packet: &[u8]) -> Result<(u8, u16), String> {
+    let header = parse_opus_head(packet)?;
+    Ok((header.channels, header.pre_skip))
+}
+
+pub(crate) fn validate_vorbis_identification(packet: &[u8]) -> Result<(u8, u32), String> {
     if packet.len() != 30 || &packet[..7] != b"\x01vorbis" {
         return Err("Vorbis identification header must be exactly 30 bytes".into());
     }

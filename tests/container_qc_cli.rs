@@ -166,3 +166,78 @@ fn container_qc_cli_audits_real_aac_lc_and_he_aac_without_runtime_decoding() {
         48_000
     );
 }
+
+#[test]
+fn container_qc_cli_audits_real_matroska_and_webm_files() {
+    if !Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|result| result.status.success())
+    {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let matroska = directory.path().join("pcm.mka");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=997:sample_rate=48000:duration=0.2",
+            "-c:a",
+            "pcm_s16le",
+            "-write_crc32",
+            "1",
+        ])
+        .arg(&matroska)
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{generated:#?}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&matroska)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(audit["format"], "matroska");
+    assert_eq!(audit["passed"], true);
+    assert!(audit["properties"]["crc32_elements"].as_u64().unwrap() > 0);
+
+    let webm = directory.path().join("opus.webm");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=997:sample_rate=48000:duration=0.2",
+            "-c:a",
+            "libopus",
+            "-f",
+            "webm",
+        ])
+        .arg(&webm)
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{generated:#?}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&webm)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(audit["format"], "webm");
+    assert_eq!(audit["passed"], true);
+    assert_eq!(audit["properties"]["audio_tracks"][0]["codec_id"], "A_OPUS");
+    assert_eq!(
+        audit["properties"]["audio_tracks"][0]["seek_preroll_ns"],
+        80_000_000
+    );
+}
