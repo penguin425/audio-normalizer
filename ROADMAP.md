@@ -28,7 +28,7 @@ Forge already provides:
 - Forge-specific decoded-audio rules for DC offset, inter-channel sample
   delay, stuck samples, and discontinuities, with bounded/coalesced evidence.
 - SPDX/CycloneDX release SBOMs, verified SLSA provenance, byte-reproducible
-  Linux archives, dependency policy, Rust 1.87 MSRV checks, cargo-binstall
+  Linux archives, dependency policy, Rust 1.89 MSRV checks, cargo-binstall
   metadata, and generated Homebrew/Scoop/WinGet manifests.
 
 ## P0 — next correctness and interoperability work

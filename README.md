@@ -182,7 +182,7 @@ jq -e . "forge-${tag}.spdx.json" "forge-${tag}.cdx.json" >/dev/null
 
 The same attestation command can be run for any filename listed in
 `SHA256SUMS`. Release inputs are pinned in the workflow; dependency advisory,
-licence, source, duplicate-version, and MSRV policies run on every relevant
+licence, source, duplicate-version, and Rust 1.89 MSRV policies run on every relevant
 change. Documented advisory exceptions remain visible in `deny.toml`.
 
 Release tags must exactly match the version in `Cargo.toml`:

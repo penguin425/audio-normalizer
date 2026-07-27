@@ -28,11 +28,11 @@ jobs:
           rust-version: "1.97.0"
 
   minimum-rust:
-    name: Rust 1.87 MSRV
+    name: Rust 1.89 MSRV
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
-      - name: Install Rust 1.87.0
-        uses: dtolnay/rust-toolchain@c4743642b206695ff6aa863032b1037759ee95ea # 1.87.0
+      - name: Install Rust 1.89.0
+        uses: dtolnay/rust-toolchain@451ce45ce31d200b52705aadd15ce75018b006de # 1.89.0
       - name: Check minimum-supported Rust
         run: cargo check --locked --no-default-features --all-targets
