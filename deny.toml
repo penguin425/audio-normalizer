@@ -1,0 +1,41 @@
+[graph]
+all-features = true
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "x86_64-pc-windows-msvc" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-darwin" },
+]
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2026-0150", reason = "No maintained audiopus_sys replacement is available; Opus encoding is opt-in and CI continues to surface this exception." },
+    { id = "RUSTSEC-2024-0436", reason = "paste is transitive through lofty and has no security impact; remove when lofty replaces it." },
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

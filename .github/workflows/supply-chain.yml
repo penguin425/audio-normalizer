@@ -1,0 +1,38 @@
+name: Supply chain
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - ".github/workflows/supply-chain.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-policy:
+    name: Dependency policy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+      - name: Audit advisories, licences, bans, and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features
+          rust-version: "1.97.0"
+
+  minimum-rust:
+    name: Rust 1.89 MSRV
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+      - name: Install Rust 1.89.0
+        uses: dtolnay/rust-toolchain@451ce45ce31d200b52705aadd15ce75018b006de # 1.89.0
+      - name: Check minimum-supported Rust
+        run: cargo check --locked --no-default-features --all-targets

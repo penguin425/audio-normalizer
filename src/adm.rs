@@ -9,7 +9,7 @@
 use crate::metadata;
 use crate::normalize::{self, Analysis};
 use quick_xml::events::Event;
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -588,7 +588,7 @@ fn observe_element(
         let attribute = attribute.map_err(|error| format!("XML attribute at {path}: {error}"))?;
         let key = local_name(attribute.key.as_ref());
         let value = attribute
-            .decode_and_unescape_value(reader.decoder())
+            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
             .map_err(|error| format!("XML attribute value at {path}: {error}"))?
             .into_owned();
         if key.ends_with("ID") || key == "UID" {

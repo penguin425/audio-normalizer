@@ -27,6 +27,9 @@ Forge already provides:
   assignment, and mono delivery.
 - Forge-specific decoded-audio rules for DC offset, inter-channel sample
   delay, stuck samples, and discontinuities, with bounded/coalesced evidence.
+- SPDX/CycloneDX release SBOMs, verified SLSA provenance, byte-reproducible
+  Linux archives, dependency policy, Rust 1.89 MSRV checks, cargo-binstall
+  metadata, and generated Homebrew/Scoop/WinGet manifests.
 
 ## P0 — next correctness and interoperability work
 
@@ -52,16 +55,6 @@ The normative target is [RFC 9559](https://www.rfc-editor.org/rfc/rfc9559.html).
 
 - Codec-output true-peak iteration using the final AAC/HE-AAC/xHE-AAC decoder
   result rather than PCM-only prediction.
-
-### Supply-chain and reproducibility
-
-- SPDX and CycloneDX SBOM assets for every release.
-- SLSA provenance verification in addition to GitHub artifact attestations.
-- Reproducible-build comparison for Linux artifacts.
-- Dependency licence policy, vulnerability audit, and minimum-supported Rust
-  version jobs.
-- Homebrew, Scoop/WinGet, cargo-binstall metadata, shell completions, and
-  signed package checksums.
 
 ## P1 — professional delivery expansion
 
