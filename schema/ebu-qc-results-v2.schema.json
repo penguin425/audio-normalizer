@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/ebu-qc-results-v2",
+  "title": "Forge decoded-audio QC evidence v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "results"],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/ebu-qc-results-v2"
+    },
+    "results": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/result"}
+    }
+  },
+  "$defs": {
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id", "ebu_qc_id", "version", "name", "layer", "passed",
+        "calculated", "source_url", "method", "events"
+      ],
+      "properties": {
+        "rule_id": {"type": "string", "minLength": 1},
+        "ebu_qc_id": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+        "name": {"type": "string", "minLength": 1},
+        "layer": {"enum": ["baseband", "bitstream"]},
+        "passed": {"type": "boolean"},
+        "calculated": {"type": "boolean"},
+        "source_url": {"type": "string", "format": "uri"},
+        "method": {"type": "string", "minLength": 1},
+        "events_truncated": {"type": "boolean"},
+        "events": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": {"$ref": "#/$defs/event"}
+        }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channel", "start_seconds", "end_seconds"],
+      "properties": {
+        "channel": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "related_channel": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "start_seconds": {"type": "number", "minimum": 0},
+        "end_seconds": {"type": "number", "minimum": 0},
+        "measured": {"type": "number"},
+        "unit": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}
