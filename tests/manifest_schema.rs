@@ -4,6 +4,37 @@ use forge_normalizer::wav::{ChannelRole, PcmKind};
 use serde_json::{json, Value};
 
 #[test]
+fn emitted_ebu_qc_conforms_to_published_schema() {
+    let audio = forge_normalizer::wav::AudioBuffer {
+        sample_rate: 48_000,
+        channels: 2,
+        frames: 48_000,
+        data: vec![vec![0.1; 48_000], vec![0.1; 48_000]],
+        channel_roles: vec![ChannelRole::Main, ChannelRole::Main],
+        source_kind: PcmKind::S16,
+    };
+    let analysis = forge_normalizer::normalize::analyze(&audio);
+    let results = forge_normalizer::qc::analyze(
+        &audio,
+        &analysis,
+        &forge_normalizer::qc::QcOptions::default(),
+    );
+    let instance = json!({
+        "schema": forge_normalizer::qc::QC_SCHEMA,
+        "results": results
+    });
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/ebu-qc-results-v2.schema.json"))
+            .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
+
+#[test]
 fn emitted_delivery_manifest_conforms_to_published_schema() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("programme.wav");

@@ -558,6 +558,23 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--minimum-average-level` | `-50` | Minimum whole-programme RMS dBFS for EBU 0077B |
 | `--hum-threshold` | `-50` | Minimum fitted 50/60 Hz harmonic level for EBU 0088B |
 | `--hum-duration` | `1` | Minimum continuous hum/buzz duration in seconds |
+| `--noise-threshold` | `-60` | Minimum EBU 0086B band-limited noise level in dBFS |
+| `--noise-gate` | `-35` | Maximum programme RMS level at which noise is evaluated |
+| `--noise-duration` | `1` | Minimum continuous EBU 0086B noise duration |
+| `--noise-low-hz` / `--noise-high-hz` | `200` / `15000` | Declared noise-measurement bandwidth |
+| `--crosstalk-coherence` | `0.95` | Minimum time-frequency coherence for EBU 0170B |
+| `--crosstalk-level-delta` | `18` | Minimum source/victim level delta in dB |
+| `--crosstalk-duration` | `1` | Minimum continuous cross-talk duration |
+| `--panning-imbalance` | `18` | Stereo-pair imbalance for EBU 0230B in dB |
+| `--panning-duration` | `2` | Minimum continuous panning-anomaly duration |
+| `--lfe-cutoff` | `120` | Highest expected LFE frequency for EBU 0095B |
+| `--lfe-out-of-band-ratio` | `0.25` | Maximum accepted LFE energy above the cutoff |
+| `--expect-mono` | off | Require mono or dual-mono for EBU 0124B |
+| `--mono-difference-threshold` | `1/32768` | Maximum dual-mono sample difference |
+| `--dc-offset-threshold` | `-40` | Forge DC mean limit in dBFS |
+| `--interchannel-delay-samples` | `1` | Maximum accepted stereo-pair delay |
+| `--stuck-sample-duration` | `0.05` | Minimum active constant-sample run |
+| `--discontinuity-threshold` | `0.75` | Adjacent-sample full-scale delta limit |
 | `--adm-profile` | none | Validate `ebu-production` ADM profile rules |
 | `--adm-profile-mode` | `read` | Apply Tech 3393 `read` or `write` requirements |
 | `--adm-profile-report` | none | Write rule IDs, ADM paths, observations and results as JSON |
@@ -584,9 +601,17 @@ The signal-health checks use bounded, deterministic PCM analysis: dropouts are
 short interior low-level runs, phase reversal is measured over consecutive
 stereo pairs, clicks are isolated local impulses, average level is
 whole-programme RMS per channel, and hum/buzz fits 50 Hz and 60 Hz plus their
-first four harmonics. All thresholds are explicit so a delivery profile can
-trade sensitivity against false positives. EBU Item versions in the JSON
-evidence follow the current published catalogue.
+first four harmonics. Noise uses a declared high-pass/low-pass bandwidth and a
+quiet-programme gate. Cross-talk combines windowed correlation with
+multi-band spectral similarity; panning and delay evidence names both channels.
+LFE checks report the energy ratio above the configured cutoff. Forge-specific
+rules cover DC offset, sample delay, stuck samples, and discontinuities.
+
+Every rule retains at most 10,000 coalesced events and reports
+`events_truncated` when the cap is reached. All thresholds are explicit so a
+delivery profile can trade sensitivity against false positives. EBU Item
+versions and `source_url` fields follow the current
+[EBU QC API v2](https://qc.ebu.io/help/api) catalogue.
 
 > Negative values need `=`: `--target=-16` (clap parses `-16` as a flag otherwise).
 

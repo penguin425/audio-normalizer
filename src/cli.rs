@@ -400,6 +400,122 @@ pub struct Cli {
     #[arg(long = "hum-duration", default_value_t = 1.0, requires = "ebu_qc")]
     pub hum_minimum_seconds: f64,
 
+    /// Minimum band-limited EBU 0086B noise level in dBFS.
+    #[arg(long = "noise-threshold", default_value_t = -60.0, requires = "ebu_qc")]
+    pub noise_threshold_dbfs: f64,
+
+    /// Maximum programme RMS level at which EBU 0086B noise is evaluated.
+    #[arg(long = "noise-gate", default_value_t = -35.0, requires = "ebu_qc")]
+    pub noise_gate_dbfs: f64,
+
+    /// Minimum continuous EBU 0086B noise duration in seconds.
+    #[arg(long = "noise-duration", default_value_t = 1.0, requires = "ebu_qc")]
+    pub noise_minimum_seconds: f64,
+
+    /// Lower edge of the declared EBU 0086B measurement bandwidth.
+    #[arg(long = "noise-low-hz", default_value_t = 200.0, requires = "ebu_qc")]
+    pub noise_low_hz: f64,
+
+    /// Upper edge of the declared EBU 0086B measurement bandwidth.
+    #[arg(
+        long = "noise-high-hz",
+        default_value_t = 15_000.0,
+        requires = "ebu_qc"
+    )]
+    pub noise_high_hz: f64,
+
+    /// Minimum time-frequency coherence for EBU 0170B cross-talk.
+    #[arg(
+        long = "crosstalk-coherence",
+        default_value_t = 0.95,
+        requires = "ebu_qc"
+    )]
+    pub crosstalk_coherence_threshold: f64,
+
+    /// Minimum source-to-victim level delta for EBU 0170B.
+    #[arg(
+        long = "crosstalk-level-delta",
+        default_value_t = 18.0,
+        requires = "ebu_qc"
+    )]
+    pub crosstalk_level_delta_db: f64,
+
+    /// Minimum continuous EBU 0170B cross-talk duration.
+    #[arg(
+        long = "crosstalk-duration",
+        default_value_t = 1.0,
+        requires = "ebu_qc"
+    )]
+    pub crosstalk_minimum_seconds: f64,
+
+    /// Stereo-pair level imbalance that triggers EBU 0230B.
+    #[arg(
+        long = "panning-imbalance",
+        default_value_t = 18.0,
+        requires = "ebu_qc"
+    )]
+    pub panning_imbalance_db: f64,
+
+    /// Minimum continuous EBU 0230B panning anomaly duration.
+    #[arg(long = "panning-duration", default_value_t = 2.0, requires = "ebu_qc")]
+    pub panning_minimum_seconds: f64,
+
+    /// Highest expected LFE frequency for EBU 0095B.
+    #[arg(long = "lfe-cutoff", default_value_t = 120.0, requires = "ebu_qc")]
+    pub lfe_cutoff_hz: f64,
+
+    /// Maximum accepted LFE energy ratio above --lfe-cutoff.
+    #[arg(
+        long = "lfe-out-of-band-ratio",
+        default_value_t = 0.25,
+        requires = "ebu_qc"
+    )]
+    pub lfe_out_of_band_ratio: f64,
+
+    /// Require mono or sample-identical dual-mono presentation for EBU 0124B.
+    #[arg(long = "expect-mono", requires = "ebu_qc")]
+    pub expect_mono: bool,
+
+    /// Maximum full-scale sample difference accepted for dual mono.
+    #[arg(
+        long = "mono-difference-threshold",
+        default_value_t = 1.0 / 32_768.0,
+        requires = "expect_mono"
+    )]
+    pub mono_difference_threshold: f64,
+
+    /// Maximum accepted absolute DC mean in dBFS.
+    #[arg(
+        long = "dc-offset-threshold",
+        default_value_t = -40.0,
+        requires = "ebu_qc"
+    )]
+    pub dc_offset_threshold_dbfs: f64,
+
+    /// Maximum accepted stereo-pair sample delay.
+    #[arg(
+        long = "interchannel-delay-samples",
+        default_value_t = 1,
+        requires = "ebu_qc"
+    )]
+    pub interchannel_delay_samples: usize,
+
+    /// Minimum duration of an active constant sample run.
+    #[arg(
+        long = "stuck-sample-duration",
+        default_value_t = 0.05,
+        requires = "ebu_qc"
+    )]
+    pub stuck_sample_seconds: f64,
+
+    /// Adjacent-sample full-scale delta treated as a discontinuity.
+    #[arg(
+        long = "discontinuity-threshold",
+        default_value_t = 0.75,
+        requires = "ebu_qc"
+    )]
+    pub discontinuity_threshold: f64,
+
     /// JSON/TOML ADM presentation-to-channel map for presentation-aware QC.
     #[arg(
         long = "adm-presentations",

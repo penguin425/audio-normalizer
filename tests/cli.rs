@@ -517,7 +517,7 @@ fn ebu_qc_writes_versioned_baseband_evidence() {
         .unwrap()
         .ends_with("delivery-manifest-v3"));
     let results = value["assets"][0]["qc"]["results"].as_array().unwrap();
-    assert_eq!(results.len(), 12);
+    assert_eq!(results.len(), 21);
     assert_eq!(results[0]["ebu_qc_id"], "0078B");
     assert_eq!(results[4]["ebu_qc_id"], "0010B");
     assert_eq!(results[5]["ebu_qc_id"], "0084B");
@@ -527,6 +527,22 @@ fn ebu_qc_writes_versioned_baseband_evidence() {
     assert_eq!(results[9]["ebu_qc_id"], "0057B");
     assert_eq!(results[10]["ebu_qc_id"], "0077B");
     assert_eq!(results[11]["ebu_qc_id"], "0088B");
+    assert_eq!(results[12]["ebu_qc_id"], "0086B");
+    assert_eq!(results[13]["ebu_qc_id"], "0170B");
+    assert_eq!(results[14]["ebu_qc_id"], "0230B");
+    assert_eq!(results[15]["ebu_qc_id"], "0095B");
+    assert_eq!(results[16]["ebu_qc_id"], "0124B");
+    assert_eq!(results[17]["ebu_qc_id"], "FORGE-DC-OFFSET");
+    assert_eq!(results[18]["ebu_qc_id"], "FORGE-INTERCHANNEL-DELAY");
+    assert_eq!(results[19]["ebu_qc_id"], "FORGE-STUCK-SAMPLES");
+    assert_eq!(results[20]["ebu_qc_id"], "FORGE-DISCONTINUITY");
+    assert!(results
+        .iter()
+        .all(|result| result["source_url"].is_string()));
+    assert!(value["assets"][0]["qc"]["schema"]
+        .as_str()
+        .unwrap()
+        .ends_with("ebu-qc-results-v2"));
 }
 
 #[test]

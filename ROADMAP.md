@@ -21,33 +21,14 @@ Forge already provides:
   real-time processing, LV2, and CLAP integration.
 - EBU QC Items for channel count, clipping, duration, dropouts, loudness,
   phase reversal, test tones, clicks, minimum average level, silence, true
-  peak, and hum/buzz.
+  peak, hum/buzz, band-limited noise, cross-talk, panning, LFE/centre
+  assignment, and mono delivery.
+- Forge-specific decoded-audio rules for DC offset, inter-channel sample
+  delay, stuck samples, and discontinuities, with bounded/coalesced evidence.
 
 ## P0 — next correctness and interoperability work
 
 These are the strongest candidates for the next releases.
-
-### Remaining deterministic audio-health QC
-
-- EBU 0086B audio-noise measurement with a declared measurement bandwidth,
-  gating method, and calibration fixtures.
-- EBU 0170B cross-talk/bleed detection using time-frequency coherence rather
-  than whole-track correlation.
-- EBU 0230B channel-panning anomaly detection with explicit channel-layout
-  and time-window evidence.
-- EBU 0095B LFE/centre assignment checks, including configurable LFE cutoff
-  and dialogue-band evidence.
-- EBU 0124B mono/dual-mono conformance and duplicated-channel detection.
-- DC offset, inter-channel sample delay, polarity, channel imbalance, stuck
-  samples, and discontinuity detection under Forge-specific rule IDs where no
-  matching published EBU Item exists.
-- Windowed statistics and event coalescing for every health check so multi-hour
-  programmes retain bounded memory and stable report size.
-- Public synthetic fixtures containing one isolated defect per file, plus
-  clean music, speech, ambience, and test-tone negative controls.
-
-The current catalogue and API are maintained by the
-[EBU QC group](https://qc.ebu.io/help/api).
 
 ### Matroska and WebM
 

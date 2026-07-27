@@ -8,12 +8,19 @@ use std::f64::consts::TAU;
 use std::path::Path;
 
 pub const QC_SCHEMA: &str =
-    "https://penguin425.github.io/audio-normalizer/schema/ebu-qc-results-v1";
+    "https://penguin425.github.io/audio-normalizer/schema/ebu-qc-results-v2";
+pub const EBU_QC_CATALOGUE: &str = "https://qc.ebu.io/items";
+pub const FORGE_QC_SOURCE: &str =
+    "https://github.com/penguin425/audio-normalizer/blob/main/ROADMAP.md";
+const MAX_QC_EVENTS: usize = 10_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QcEvent {
     /// One-based channel number.
     pub channel: u16,
+    /// One-based related channel for pair-wise checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_channel: Option<u16>,
     pub start_seconds: f64,
     pub end_seconds: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -24,12 +31,19 @@ pub struct QcEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QcResult {
+    /// Stable rule identifier. EBU rules use their published Item identifier.
+    pub rule_id: String,
+    /// Backwards-compatible alias retained from the v1 envelope.
     pub ebu_qc_id: String,
     pub version: String,
     pub name: String,
     pub layer: String,
     pub passed: bool,
     pub calculated: bool,
+    pub source_url: String,
+    pub method: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub events_truncated: bool,
     pub events: Vec<QcEvent>,
 }
 
@@ -53,6 +67,24 @@ pub struct QcOptions {
     pub minimum_average_level_dbfs: f64,
     pub hum_threshold_dbfs: f64,
     pub hum_minimum_seconds: f64,
+    pub noise_threshold_dbfs: f64,
+    pub noise_gate_dbfs: f64,
+    pub noise_minimum_seconds: f64,
+    pub noise_low_hz: f64,
+    pub noise_high_hz: f64,
+    pub crosstalk_coherence_threshold: f64,
+    pub crosstalk_level_delta_db: f64,
+    pub crosstalk_minimum_seconds: f64,
+    pub panning_imbalance_db: f64,
+    pub panning_minimum_seconds: f64,
+    pub lfe_cutoff_hz: f64,
+    pub lfe_out_of_band_ratio: f64,
+    pub expect_mono: bool,
+    pub mono_difference_threshold: f64,
+    pub dc_offset_threshold_dbfs: f64,
+    pub interchannel_delay_samples: usize,
+    pub stuck_sample_seconds: f64,
+    pub discontinuity_threshold: f64,
 }
 
 impl Default for QcOptions {
@@ -76,6 +108,24 @@ impl Default for QcOptions {
             minimum_average_level_dbfs: -50.0,
             hum_threshold_dbfs: -50.0,
             hum_minimum_seconds: 1.0,
+            noise_threshold_dbfs: -60.0,
+            noise_gate_dbfs: -35.0,
+            noise_minimum_seconds: 1.0,
+            noise_low_hz: 200.0,
+            noise_high_hz: 15_000.0,
+            crosstalk_coherence_threshold: 0.95,
+            crosstalk_level_delta_db: 18.0,
+            crosstalk_minimum_seconds: 1.0,
+            panning_imbalance_db: 18.0,
+            panning_minimum_seconds: 2.0,
+            lfe_cutoff_hz: 120.0,
+            lfe_out_of_band_ratio: 0.25,
+            expect_mono: false,
+            mono_difference_threshold: 1.0 / 32_768.0,
+            dc_offset_threshold_dbfs: -40.0,
+            interchannel_delay_samples: 1,
+            stuck_sample_seconds: 0.05,
+            discontinuity_threshold: 0.75,
         }
     }
 }
@@ -98,6 +148,22 @@ impl QcOptions {
             self.minimum_average_level_dbfs,
             self.hum_threshold_dbfs,
             self.hum_minimum_seconds,
+            self.noise_threshold_dbfs,
+            self.noise_gate_dbfs,
+            self.noise_minimum_seconds,
+            self.noise_low_hz,
+            self.noise_high_hz,
+            self.crosstalk_coherence_threshold,
+            self.crosstalk_level_delta_db,
+            self.crosstalk_minimum_seconds,
+            self.panning_imbalance_db,
+            self.panning_minimum_seconds,
+            self.lfe_cutoff_hz,
+            self.lfe_out_of_band_ratio,
+            self.mono_difference_threshold,
+            self.dc_offset_threshold_dbfs,
+            self.stuck_sample_seconds,
+            self.discontinuity_threshold,
         ]
         .into_iter()
         .all(f64::is_finite);
@@ -114,6 +180,21 @@ impl QcOptions {
             || self.phase_window_seconds <= 0.0
             || !(0.0..=2.0).contains(&self.click_threshold)
             || self.hum_minimum_seconds <= 0.0
+            || self.noise_minimum_seconds <= 0.0
+            || self.noise_low_hz <= 0.0
+            || self.noise_high_hz <= self.noise_low_hz
+            || self.noise_high_hz >= 24_000.0
+            || !(0.0..=1.0).contains(&self.crosstalk_coherence_threshold)
+            || self.crosstalk_level_delta_db < 0.0
+            || self.crosstalk_minimum_seconds <= 0.0
+            || self.panning_imbalance_db < 0.0
+            || self.panning_minimum_seconds <= 0.0
+            || self.lfe_cutoff_hz <= 0.0
+            || !(0.0..=1.0).contains(&self.lfe_out_of_band_ratio)
+            || self.mono_difference_threshold < 0.0
+            || self.interchannel_delay_samples > 64
+            || self.stuck_sample_seconds <= 0.0
+            || !(0.0..=2.0).contains(&self.discontinuity_threshold)
             || self
                 .expected_duration_seconds
                 .is_some_and(|value| !value.is_finite() || value < 0.0)
@@ -143,6 +224,15 @@ pub fn analyze(audio: &AudioBuffer, analysis: &Analysis, options: &QcOptions) ->
     let clicks = click_events(audio, options);
     let low_average_levels = low_average_level_events(audio, options);
     let hum = hum_events(audio, options);
+    let noise = noise_events(audio, options);
+    let crosstalk = crosstalk_events(audio, options);
+    let panning = panning_events(audio, options);
+    let lfe_centre = lfe_centre_events(audio, options);
+    let mono = mono_events(audio, options);
+    let dc_offset = dc_offset_events(audio, options);
+    let interchannel_delay = interchannel_delay_events(audio, options);
+    let stuck_samples = stuck_sample_events(audio, options);
+    let discontinuities = discontinuity_events(audio, options);
     let duration = audio.frames as f64 / audio.sample_rate as f64;
     let duration_events = options
         .expected_duration_seconds
@@ -150,6 +240,7 @@ pub fn analyze(audio: &AudioBuffer, analysis: &Analysis, options: &QcOptions) ->
         .map(|_| {
             vec![QcEvent {
                 channel: 0,
+                related_channel: None,
                 start_seconds: 0.0,
                 end_seconds: duration,
                 measured: Some(duration),
@@ -163,6 +254,7 @@ pub fn analyze(audio: &AudioBuffer, analysis: &Analysis, options: &QcOptions) ->
         .map(|_| {
             vec![QcEvent {
                 channel: 0,
+                related_channel: None,
                 start_seconds: 0.0,
                 end_seconds: duration,
                 measured: Some(audio.channels as f64),
@@ -176,14 +268,19 @@ pub fn analyze(audio: &AudioBuffer, analysis: &Analysis, options: &QcOptions) ->
         result("0014B", "2.0", "Audio Test Tones", tones),
         result("0009F", "2.0", "Audio Duration", duration_events),
         QcResult {
+            rule_id: "0010B".into(),
             ebu_qc_id: "0010B".into(),
             version: "2.0".into(),
             name: "Audio Programme Loudness".into(),
             layer: "baseband".into(),
             passed: true,
             calculated: true,
+            source_url: ebu_source("0010B"),
+            method: method_for("0010B").into(),
+            events_truncated: false,
             events: vec![QcEvent {
                 channel: 0,
+                related_channel: None,
                 start_seconds: 0.0,
                 end_seconds: duration,
                 measured: Some(analysis.lufs),
@@ -191,14 +288,19 @@ pub fn analyze(audio: &AudioBuffer, analysis: &Analysis, options: &QcOptions) ->
             }],
         },
         QcResult {
+            rule_id: "0084B".into(),
             ebu_qc_id: "0084B".into(),
             version: "1.0".into(),
             name: "Audio Peaks TP".into(),
             layer: "baseband".into(),
             passed: true,
             calculated: true,
+            source_url: ebu_source("0084B"),
+            method: method_for("0084B").into(),
+            events_truncated: false,
             events: vec![QcEvent {
                 channel: 0,
+                related_channel: None,
                 start_seconds: 0.0,
                 end_seconds: duration,
                 measured: Some(analysis.true_peak_db()),
@@ -206,12 +308,16 @@ pub fn analyze(audio: &AudioBuffer, analysis: &Analysis, options: &QcOptions) ->
             }],
         },
         QcResult {
+            rule_id: "0004F".into(),
             ebu_qc_id: "0004F".into(),
             version: "2.0".into(),
             name: "Audio Channel Count".into(),
             layer: "bitstream".into(),
             passed: channel_count_events.is_empty(),
             calculated: channel_count.is_some(),
+            source_url: ebu_source("0004F"),
+            method: method_for("0004F").into(),
+            events_truncated: false,
             events: channel_count_events,
         },
         result("0008B", "2.0", "Audio Dropouts", dropouts),
@@ -224,6 +330,23 @@ pub fn analyze(audio: &AudioBuffer, analysis: &Analysis, options: &QcOptions) ->
             low_average_levels,
         ),
         result("0088B", "1.0", "Audio Hum & Buzz", hum),
+        result("0086B", "1.0", "Audio Noise", noise),
+        result("0170B", "1.0", "Audio Cross Talk", crosstalk),
+        result("0230B", "1.0", "Audio Channel Panning", panning),
+        result("0095B", "1.0", "LFE/Centre Channel Assignment", lfe_centre),
+        conditional_result("0124B", "2.0", "Mono Audio", options.expect_mono, mono),
+        forge_result("FORGE-DC-OFFSET", "DC Offset", dc_offset),
+        forge_result(
+            "FORGE-INTERCHANNEL-DELAY",
+            "Inter-channel Sample Delay",
+            interchannel_delay,
+        ),
+        forge_result("FORGE-STUCK-SAMPLES", "Stuck Samples", stuck_samples),
+        forge_result(
+            "FORGE-DISCONTINUITY",
+            "Sample Discontinuity",
+            discontinuities,
+        ),
     ]
 }
 
@@ -233,14 +356,74 @@ fn result(
     name: &'static str,
     events: Vec<QcEvent>,
 ) -> QcResult {
+    conditional_result(id, version, name, true, events)
+}
+
+fn conditional_result(
+    id: &'static str,
+    version: &'static str,
+    name: &'static str,
+    calculated: bool,
+    mut events: Vec<QcEvent>,
+) -> QcResult {
+    let events_truncated = events.len() > MAX_QC_EVENTS;
+    events.truncate(MAX_QC_EVENTS);
     QcResult {
+        rule_id: id.into(),
         ebu_qc_id: id.into(),
         version: version.into(),
         name: name.into(),
         layer: "baseband".into(),
         passed: events.is_empty(),
-        calculated: true,
+        calculated,
+        source_url: ebu_source(id),
+        method: method_for(id).into(),
+        events_truncated,
         events,
+    }
+}
+
+fn forge_result(id: &'static str, name: &'static str, mut events: Vec<QcEvent>) -> QcResult {
+    let events_truncated = events.len() > MAX_QC_EVENTS;
+    events.truncate(MAX_QC_EVENTS);
+    QcResult {
+        rule_id: id.into(),
+        ebu_qc_id: id.into(),
+        version: "1.0".into(),
+        name: name.into(),
+        layer: "baseband".into(),
+        passed: events.is_empty(),
+        calculated: true,
+        source_url: FORGE_QC_SOURCE.into(),
+        method: method_for(id).into(),
+        events_truncated,
+        events,
+    }
+}
+
+fn ebu_source(id: &str) -> String {
+    format!("{EBU_QC_CATALOGUE}/{id}/")
+}
+
+fn method_for(id: &str) -> &'static str {
+    match id {
+        "0086B" => {
+            "250 ms gated band-limited RMS with adjacent-sample decorrelation noise criterion"
+        }
+        "0170B" => "250 ms pair-wise correlation multiplied by eight-band spectral similarity",
+        "0230B" => "250 ms declared stereo-pair RMS imbalance with duration coalescing",
+        "0095B" => "whole-programme LFE energy ratio above the configured low-pass cutoff",
+        "0124B" => "channel-count and maximum sample difference for configured mono delivery",
+        "FORGE-DC-OFFSET" => "whole-programme arithmetic mean per channel",
+        "FORGE-INTERCHANNEL-DELAY" => {
+            "bounded-lag correlation over 2048-sample excerpts at one-second intervals"
+        }
+        "FORGE-STUCK-SAMPLES" => "bit-identical active sample runs with duration threshold",
+        "FORGE-DISCONTINUITY" => "coalesced adjacent-sample absolute difference",
+        "0010B" => "ITU-R BS.1770-5 integrated programme loudness",
+        "0084B" => "ITU-R BS.1770-5 four-times oversampled true peak",
+        "0004F" => "decoded channel count compared with configured expectation",
+        _ => "deterministic decoded-PCM analysis with configured threshold",
     }
 }
 
@@ -352,13 +535,17 @@ fn push_tone_event(
     context: &ToneRunContext,
 ) {
     if end.saturating_sub(first) >= context.minimum_windows {
-        events.push(QcEvent {
-            channel: channel as u16 + 1,
-            start_seconds: (first * context.window) as f64 / context.sample_rate as f64,
-            end_seconds: (end * context.window) as f64 / context.sample_rate as f64,
-            measured: Some(context.frequency),
-            unit: Some("Hz".into()),
-        });
+        push_bounded(
+            events,
+            QcEvent {
+                channel: channel as u16 + 1,
+                related_channel: None,
+                start_seconds: (first * context.window) as f64 / context.sample_rate as f64,
+                end_seconds: (end * context.window) as f64 / context.sample_rate as f64,
+                measured: Some(context.frequency),
+                unit: Some("Hz".into()),
+            },
+        );
     }
 }
 
@@ -402,13 +589,17 @@ fn push_dropout_event(
 ) {
     let length = end.saturating_sub(first);
     if first > 0 && end < sample_count && length >= minimum && length <= maximum {
-        events.push(QcEvent {
-            channel: channel as u16 + 1,
-            start_seconds: first as f64 / sample_rate as f64,
-            end_seconds: end as f64 / sample_rate as f64,
-            measured: Some(length as f64 / sample_rate as f64),
-            unit: Some("s".into()),
-        });
+        push_bounded(
+            events,
+            QcEvent {
+                channel: channel as u16 + 1,
+                related_channel: None,
+                start_seconds: first as f64 / sample_rate as f64,
+                end_seconds: end as f64 / sample_rate as f64,
+                measured: Some(length as f64 / sample_rate as f64),
+                unit: Some("s".into()),
+            },
+        );
     }
 }
 
@@ -546,13 +737,17 @@ fn click_events(audio: &AudioBuffer, options: &QcOptions) -> Vec<QcEvent> {
                 if last.is_some_and(|previous_index| index - previous_index <= coalesce) {
                     continue;
                 }
-                events.push(QcEvent {
-                    channel: channel as u16 + 1,
-                    start_seconds: index as f64 / audio.sample_rate as f64,
-                    end_seconds: (index + 1) as f64 / audio.sample_rate as f64,
-                    measured: Some(residual),
-                    unit: Some("FS".into()),
-                });
+                push_bounded(
+                    &mut events,
+                    QcEvent {
+                        channel: channel as u16 + 1,
+                        related_channel: None,
+                        start_seconds: index as f64 / audio.sample_rate as f64,
+                        end_seconds: (index + 1) as f64 / audio.sample_rate as f64,
+                        measured: Some(residual),
+                        unit: Some("FS".into()),
+                    },
+                );
                 last = Some(index);
             }
         }
@@ -570,6 +765,7 @@ fn low_average_level_events(audio: &AudioBuffer, options: &QcOptions) -> Vec<QcE
             let level = 20.0 * rms(samples).max(1e-30).log10();
             (level < options.minimum_average_level_dbfs).then(|| QcEvent {
                 channel: channel as u16 + 1,
+                related_channel: None,
                 start_seconds: 0.0,
                 end_seconds: duration,
                 measured: Some(level),
@@ -691,6 +887,488 @@ fn goertzel_amplitude(samples: &[f32], sample_rate: u32, frequency: f64) -> f64 
     2.0 * power.max(0.0).sqrt() / samples.len().max(1) as f64
 }
 
+fn noise_events(audio: &AudioBuffer, options: &QcOptions) -> Vec<QcEvent> {
+    let window = (audio.sample_rate as usize / 4).max(1);
+    let minimum_windows =
+        (options.noise_minimum_seconds * audio.sample_rate as f64 / window as f64).ceil() as usize;
+    let mut events = Vec::new();
+    for (channel, samples) in audio.data.iter().enumerate() {
+        let mut start = None;
+        let mut maximum_level = f64::NEG_INFINITY;
+        let windows = samples.len() / window;
+        for index in 0..windows {
+            let slice = &samples[index * window..(index + 1) * window];
+            let programme_level = level_dbfs(slice);
+            let noise_level = band_limited_level(
+                slice,
+                audio.sample_rate,
+                options.noise_low_hz,
+                options.noise_high_hz.min(audio.sample_rate as f64 * 0.49),
+            );
+            let detected = programme_level <= options.noise_gate_dbfs
+                && noise_level >= options.noise_threshold_dbfs
+                && noise_likeness(slice) >= 0.5;
+            update_window_run(
+                &mut events,
+                &mut start,
+                &mut maximum_level,
+                detected,
+                channel,
+                None,
+                index,
+                windows,
+                minimum_windows,
+                window,
+                audio.sample_rate,
+                noise_level,
+                &format!(
+                    "dBFS {}Hz-{}Hz",
+                    options.noise_low_hz, options.noise_high_hz
+                ),
+            );
+        }
+    }
+    events
+}
+
+fn noise_likeness(samples: &[f32]) -> f64 {
+    if samples.len() < 2 {
+        return 0.0;
+    }
+    1.0 - correlation(&samples[..samples.len() - 1], &samples[1..]).abs()
+}
+
+fn band_limited_level(samples: &[f32], sample_rate: u32, low_hz: f64, high_hz: f64) -> f64 {
+    if samples.is_empty() || high_hz <= low_hz {
+        return f64::NEG_INFINITY;
+    }
+    let dt = 1.0 / sample_rate as f64;
+    let high_pass_rc = 1.0 / (TAU * low_hz);
+    let high_pass_alpha = high_pass_rc / (high_pass_rc + dt);
+    let low_pass_rc = 1.0 / (TAU * high_hz);
+    let low_pass_alpha = dt / (low_pass_rc + dt);
+    let mut previous_input = 0.0;
+    let mut high_pass = 0.0;
+    let mut low_pass = 0.0;
+    let mut energy = 0.0;
+    for &sample in samples {
+        let input = sample as f64;
+        high_pass = high_pass_alpha * (high_pass + input - previous_input);
+        low_pass += low_pass_alpha * (high_pass - low_pass);
+        previous_input = input;
+        energy += low_pass * low_pass;
+    }
+    10.0 * (energy / samples.len() as f64).max(1e-30).log10()
+}
+
+fn crosstalk_events(audio: &AudioBuffer, options: &QcOptions) -> Vec<QcEvent> {
+    let window = (audio.sample_rate as usize / 4).max(1);
+    let minimum_windows = (options.crosstalk_minimum_seconds * audio.sample_rate as f64
+        / window as f64)
+        .ceil() as usize;
+    let mut events = Vec::new();
+    for first in 0..audio.data.len() {
+        if audio.channel_roles.get(first) == Some(&ChannelRole::Lfe) {
+            continue;
+        }
+        for second in first + 1..audio.data.len() {
+            if audio.channel_roles.get(second) == Some(&ChannelRole::Lfe) {
+                continue;
+            }
+            let windows = audio.data[first].len().min(audio.data[second].len()) / window;
+            let mut start = None;
+            let mut maximum_coherence = 0.0;
+            for index in 0..windows {
+                let range = index * window..(index + 1) * window;
+                let left = &audio.data[first][range.clone()];
+                let right = &audio.data[second][range];
+                let left_level = level_dbfs(left);
+                let right_level = level_dbfs(right);
+                let (victim, source, delta) = if left_level <= right_level {
+                    (first, second, right_level - left_level)
+                } else {
+                    (second, first, left_level - right_level)
+                };
+                let eligible = left_level.max(right_level) >= options.noise_gate_dbfs
+                    && left_level.min(right_level) >= options.noise_threshold_dbfs
+                    && delta >= options.crosstalk_level_delta_db;
+                let coherence = if eligible {
+                    time_frequency_coherence(left, right, audio.sample_rate)
+                } else {
+                    0.0
+                };
+                let detected = eligible && coherence >= options.crosstalk_coherence_threshold;
+                update_window_run(
+                    &mut events,
+                    &mut start,
+                    &mut maximum_coherence,
+                    detected,
+                    victim,
+                    Some(source),
+                    index,
+                    windows,
+                    minimum_windows,
+                    window,
+                    audio.sample_rate,
+                    coherence,
+                    "coherence",
+                );
+            }
+        }
+    }
+    events
+}
+
+fn time_frequency_coherence(left: &[f32], right: &[f32], sample_rate: u32) -> f64 {
+    const FREQUENCIES: [f64; 8] = [
+        250.0, 375.0, 500.0, 750.0, 1_000.0, 2_000.0, 4_000.0, 8_000.0,
+    ];
+    let mut dot = 0.0;
+    let mut left_energy = 0.0;
+    let mut right_energy = 0.0;
+    for frequency in FREQUENCIES {
+        if frequency >= sample_rate as f64 * 0.49 {
+            continue;
+        }
+        let left_amplitude = goertzel_amplitude(left, sample_rate, frequency);
+        let right_amplitude = goertzel_amplitude(right, sample_rate, frequency);
+        dot += left_amplitude * right_amplitude;
+        left_energy += left_amplitude * left_amplitude;
+        right_energy += right_amplitude * right_amplitude;
+    }
+    let spectral = dot / (left_energy * right_energy).sqrt().max(1e-30);
+    correlation(left, right).abs() * spectral.clamp(0.0, 1.0)
+}
+
+fn panning_events(audio: &AudioBuffer, options: &QcOptions) -> Vec<QcEvent> {
+    let window = (audio.sample_rate as usize / 4).max(1);
+    let minimum_windows = (options.panning_minimum_seconds * audio.sample_rate as f64
+        / window as f64)
+        .ceil() as usize;
+    let mut events = Vec::new();
+    for (left_channel, right_channel) in stereo_pairs(audio) {
+        let windows = audio.data[left_channel]
+            .len()
+            .min(audio.data[right_channel].len())
+            / window;
+        let mut start = None;
+        let mut maximum_imbalance = 0.0;
+        for index in 0..windows {
+            let range = index * window..(index + 1) * window;
+            let left_level = level_dbfs(&audio.data[left_channel][range.clone()]);
+            let right_level = level_dbfs(&audio.data[right_channel][range]);
+            let imbalance = (left_level - right_level).abs();
+            let (louder, quieter) = if left_level >= right_level {
+                (left_channel, right_channel)
+            } else {
+                (right_channel, left_channel)
+            };
+            let detected = left_level.max(right_level) >= options.noise_gate_dbfs
+                && imbalance >= options.panning_imbalance_db;
+            update_window_run(
+                &mut events,
+                &mut start,
+                &mut maximum_imbalance,
+                detected,
+                louder,
+                Some(quieter),
+                index,
+                windows,
+                minimum_windows,
+                window,
+                audio.sample_rate,
+                imbalance,
+                "dB imbalance",
+            );
+        }
+    }
+    events
+}
+
+fn lfe_centre_events(audio: &AudioBuffer, options: &QcOptions) -> Vec<QcEvent> {
+    let duration = audio.frames as f64 / audio.sample_rate as f64;
+    let mut events = Vec::new();
+    for (channel, role) in audio.channel_roles.iter().enumerate() {
+        if *role != ChannelRole::Lfe {
+            continue;
+        }
+        let samples = &audio.data[channel];
+        let total = rms(samples).powi(2);
+        if total <= 1e-30 {
+            continue;
+        }
+        let low_level = band_limited_level(
+            samples,
+            audio.sample_rate,
+            10.0,
+            options.lfe_cutoff_hz.min(audio.sample_rate as f64 * 0.49),
+        );
+        let low_energy = 10.0_f64.powf(low_level / 10.0);
+        let out_of_band_ratio = (1.0 - low_energy / total).clamp(0.0, 1.0);
+        if out_of_band_ratio >= options.lfe_out_of_band_ratio {
+            push_bounded(
+                &mut events,
+                QcEvent {
+                    channel: channel as u16 + 1,
+                    related_channel: centre_channel(audio).map(|index| index as u16 + 1),
+                    start_seconds: 0.0,
+                    end_seconds: duration,
+                    measured: Some(out_of_band_ratio),
+                    unit: Some(format!("ratio above {} Hz", options.lfe_cutoff_hz)),
+                },
+            );
+        }
+    }
+    events
+}
+
+fn centre_channel(audio: &AudioBuffer) -> Option<usize> {
+    (audio.data.len() >= 5
+        && audio.channel_roles.get(2) == Some(&ChannelRole::Main)
+        && audio.channel_roles.contains(&ChannelRole::Lfe))
+    .then_some(2)
+}
+
+fn mono_events(audio: &AudioBuffer, options: &QcOptions) -> Vec<QcEvent> {
+    if !options.expect_mono || audio.channels == 1 {
+        return Vec::new();
+    }
+    let duration = audio.frames as f64 / audio.sample_rate as f64;
+    let mut events = Vec::new();
+    let (measured, related_channel, unit) = if audio.channels == 2 {
+        let maximum_difference = audio.data[0]
+            .iter()
+            .zip(&audio.data[1])
+            .map(|(&left, &right)| (left as f64 - right as f64).abs())
+            .fold(0.0_f64, f64::max);
+        if maximum_difference <= options.mono_difference_threshold {
+            return events;
+        }
+        (maximum_difference, Some(2), "max FS difference")
+    } else {
+        (audio.channels as f64, None, "channels")
+    };
+    push_bounded(
+        &mut events,
+        QcEvent {
+            channel: 1,
+            related_channel,
+            start_seconds: 0.0,
+            end_seconds: duration,
+            measured: Some(measured),
+            unit: Some(unit.into()),
+        },
+    );
+    events
+}
+
+fn dc_offset_events(audio: &AudioBuffer, options: &QcOptions) -> Vec<QcEvent> {
+    let duration = audio.frames as f64 / audio.sample_rate as f64;
+    let threshold = 10.0_f64.powf(options.dc_offset_threshold_dbfs / 20.0);
+    let mut events = Vec::new();
+    for (channel, samples) in audio.data.iter().enumerate() {
+        let mean =
+            samples.iter().map(|sample| *sample as f64).sum::<f64>() / samples.len().max(1) as f64;
+        if mean.abs() >= threshold {
+            push_bounded(
+                &mut events,
+                QcEvent {
+                    channel: channel as u16 + 1,
+                    related_channel: None,
+                    start_seconds: 0.0,
+                    end_seconds: duration,
+                    measured: Some(20.0 * mean.abs().max(1e-30).log10()),
+                    unit: Some("dBFS mean".into()),
+                },
+            );
+        }
+    }
+    events
+}
+
+fn interchannel_delay_events(audio: &AudioBuffer, options: &QcOptions) -> Vec<QcEvent> {
+    let mut events = Vec::new();
+    let step = audio.sample_rate as usize;
+    let comparison_length = 2_048;
+    let search = (options.interchannel_delay_samples + 8).min(64);
+    for (first, second) in stereo_pairs(audio) {
+        let length = audio.data[first].len().min(audio.data[second].len());
+        for start in (0..length.saturating_sub(comparison_length + search)).step_by(step.max(1)) {
+            let left = &audio.data[first][start..start + comparison_length + search];
+            let right = &audio.data[second][start..start + comparison_length + search];
+            let (delay, coefficient, delayed_channel, reference_channel) =
+                best_pair_delay(left, right, first, second, search);
+            if delay > options.interchannel_delay_samples && coefficient >= 0.8 {
+                push_bounded(
+                    &mut events,
+                    QcEvent {
+                        channel: delayed_channel as u16 + 1,
+                        related_channel: Some(reference_channel as u16 + 1),
+                        start_seconds: start as f64 / audio.sample_rate as f64,
+                        end_seconds: (start + comparison_length) as f64 / audio.sample_rate as f64,
+                        measured: Some(delay as f64),
+                        unit: Some("samples delayed".into()),
+                    },
+                );
+            }
+        }
+    }
+    events
+}
+
+fn best_pair_delay(
+    first_samples: &[f32],
+    second_samples: &[f32],
+    first_channel: usize,
+    second_channel: usize,
+    maximum: usize,
+) -> (usize, f64, usize, usize) {
+    let comparison_length = first_samples.len().min(second_samples.len()) - maximum;
+    let second_delayed =
+        best_positive_delay(&first_samples[..comparison_length], second_samples, maximum);
+    let first_delayed =
+        best_positive_delay(&second_samples[..comparison_length], first_samples, maximum);
+    if first_delayed.1 > second_delayed.1 {
+        (
+            first_delayed.0,
+            first_delayed.1,
+            first_channel,
+            second_channel,
+        )
+    } else {
+        (
+            second_delayed.0,
+            second_delayed.1,
+            second_channel,
+            first_channel,
+        )
+    }
+}
+
+fn best_positive_delay(reference: &[f32], delayed: &[f32], maximum: usize) -> (usize, f64) {
+    (0..=maximum)
+        .map(|delay| {
+            (
+                delay,
+                correlation(reference, &delayed[delay..delay + reference.len()]),
+            )
+        })
+        .max_by(|left, right| left.1.total_cmp(&right.1))
+        .unwrap_or((0, 0.0))
+}
+
+fn stuck_sample_events(audio: &AudioBuffer, options: &QcOptions) -> Vec<QcEvent> {
+    let minimum = seconds_to_frames(audio, options.stuck_sample_seconds);
+    let active = 10.0_f32.powf((options.silence_threshold_dbfs / 20.0) as f32);
+    let mut events = Vec::new();
+    for (channel, samples) in audio.data.iter().enumerate() {
+        let mut first = 0;
+        while first < samples.len() {
+            let mut end = first + 1;
+            while end < samples.len() && samples[end].to_bits() == samples[first].to_bits() {
+                end += 1;
+            }
+            if end - first >= minimum && samples[first].abs() > active {
+                push_bounded(
+                    &mut events,
+                    QcEvent {
+                        channel: channel as u16 + 1,
+                        related_channel: None,
+                        start_seconds: first as f64 / audio.sample_rate as f64,
+                        end_seconds: end as f64 / audio.sample_rate as f64,
+                        measured: Some(samples[first] as f64),
+                        unit: Some("FS constant".into()),
+                    },
+                );
+            }
+            first = end;
+        }
+    }
+    events
+}
+
+fn discontinuity_events(audio: &AudioBuffer, options: &QcOptions) -> Vec<QcEvent> {
+    let mut events = Vec::new();
+    let coalesce = (audio.sample_rate as usize / 1_000).max(1);
+    for (channel, samples) in audio.data.iter().enumerate() {
+        let mut previous_event = None;
+        for index in 1..samples.len() {
+            let delta = (samples[index] as f64 - samples[index - 1] as f64).abs();
+            if delta >= options.discontinuity_threshold
+                && previous_event.is_none_or(|previous| index - previous > coalesce)
+            {
+                push_bounded(
+                    &mut events,
+                    QcEvent {
+                        channel: channel as u16 + 1,
+                        related_channel: None,
+                        start_seconds: index as f64 / audio.sample_rate as f64,
+                        end_seconds: (index + 1) as f64 / audio.sample_rate as f64,
+                        measured: Some(delta),
+                        unit: Some("FS delta".into()),
+                    },
+                );
+                previous_event = Some(index);
+            }
+        }
+    }
+    events
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_window_run(
+    events: &mut Vec<QcEvent>,
+    start: &mut Option<usize>,
+    maximum: &mut f64,
+    detected: bool,
+    channel: usize,
+    related_channel: Option<usize>,
+    index: usize,
+    windows: usize,
+    minimum_windows: usize,
+    window: usize,
+    sample_rate: u32,
+    measured: f64,
+    unit: &str,
+) {
+    if detected {
+        start.get_or_insert(index);
+        *maximum = maximum.max(measured);
+    }
+    if let Some(first) = *start {
+        if (!detected || index + 1 == windows)
+            && index + usize::from(detected) - first >= minimum_windows
+        {
+            let end = index + usize::from(detected);
+            push_bounded(
+                events,
+                QcEvent {
+                    channel: channel as u16 + 1,
+                    related_channel: related_channel.map(|value| value as u16 + 1),
+                    start_seconds: (first * window) as f64 / sample_rate as f64,
+                    end_seconds: (end * window) as f64 / sample_rate as f64,
+                    measured: Some(*maximum),
+                    unit: Some(unit.into()),
+                },
+            );
+        }
+        if !detected || index + 1 == windows {
+            *start = None;
+            *maximum = f64::NEG_INFINITY;
+        }
+    }
+}
+
+fn level_dbfs(samples: &[f32]) -> f64 {
+    20.0 * rms(samples).max(1e-30).log10()
+}
+
+fn push_bounded(events: &mut Vec<QcEvent>, event: QcEvent) {
+    if events.len() <= MAX_QC_EVENTS {
+        events.push(event);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_window_event(
     events: &mut Vec<QcEvent>,
@@ -702,13 +1380,17 @@ fn push_window_event(
     measured: f64,
     unit: &'static str,
 ) {
-    events.push(QcEvent {
-        channel: channel as u16 + 1,
-        start_seconds: (first * window) as f64 / sample_rate as f64,
-        end_seconds: (end * window) as f64 / sample_rate as f64,
-        measured: Some(measured),
-        unit: Some(unit.into()),
-    });
+    push_bounded(
+        events,
+        QcEvent {
+            channel: channel as u16 + 1,
+            related_channel: None,
+            start_seconds: (first * window) as f64 / sample_rate as f64,
+            end_seconds: (end * window) as f64 / sample_rate as f64,
+            measured: Some(measured),
+            unit: Some(unit.into()),
+        },
+    );
 }
 
 fn run_events<F, M>(
@@ -730,25 +1412,33 @@ where
                 start.get_or_insert(index);
             } else if let Some(first) = start.take() {
                 if index - first >= minimum {
-                    events.push(QcEvent {
-                        channel: channel as u16 + 1,
-                        start_seconds: first as f64 / audio.sample_rate as f64,
-                        end_seconds: index as f64 / audio.sample_rate as f64,
-                        measured: measure(&samples[first..index]),
-                        unit: unit.map(str::to_owned),
-                    });
+                    push_bounded(
+                        &mut events,
+                        QcEvent {
+                            channel: channel as u16 + 1,
+                            related_channel: None,
+                            start_seconds: first as f64 / audio.sample_rate as f64,
+                            end_seconds: index as f64 / audio.sample_rate as f64,
+                            measured: measure(&samples[first..index]),
+                            unit: unit.map(str::to_owned),
+                        },
+                    );
                 }
             }
         }
         if let Some(first) = start {
             if samples.len() - first >= minimum {
-                events.push(QcEvent {
-                    channel: channel as u16 + 1,
-                    start_seconds: first as f64 / audio.sample_rate as f64,
-                    end_seconds: samples.len() as f64 / audio.sample_rate as f64,
-                    measured: measure(&samples[first..]),
-                    unit: unit.map(str::to_owned),
-                });
+                push_bounded(
+                    &mut events,
+                    QcEvent {
+                        channel: channel as u16 + 1,
+                        related_channel: None,
+                        start_seconds: first as f64 / audio.sample_rate as f64,
+                        end_seconds: samples.len() as f64 / audio.sample_rate as f64,
+                        measured: measure(&samples[first..]),
+                        unit: unit.map(str::to_owned),
+                    },
+                );
             }
         }
     }
@@ -788,6 +1478,13 @@ mod tests {
         }
     }
 
+    fn result_by_id<'a>(results: &'a [QcResult], id: &str) -> &'a QcResult {
+        results
+            .iter()
+            .find(|result| result.ebu_qc_id == id)
+            .unwrap_or_else(|| panic!("missing QC result {id}"))
+    }
+
     #[test]
     fn detects_silence_clipping_and_tone_with_channel_ranges() {
         let mut samples = vec![0.0; 48_000];
@@ -824,7 +1521,7 @@ mod tests {
         };
         let results = analyze(&audio, &analysis, &options);
 
-        assert_eq!(results.len(), 12);
+        assert_eq!(results.len(), 21);
         assert_eq!(results[6].ebu_qc_id, "0004F");
         assert!(!results[6].passed);
         assert_eq!(results[6].events[0].measured, Some(2.0));
@@ -862,5 +1559,157 @@ mod tests {
             source_kind: PcmKind::S16,
         };
         assert_eq!(stereo_pairs(&audio), vec![(0, 1), (4, 5)]);
+    }
+
+    #[test]
+    fn detects_noise_crosstalk_and_panning_with_pair_evidence() {
+        let mut state = 0x1234_5678_u32;
+        let noise = (0..96_000)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((state >> 8) as f32 / 16_777_216.0 - 0.5) * 0.008
+            })
+            .collect::<Vec<_>>();
+        let noise_audio = buffer(noise);
+        let noise_analysis = normalize::analyze(&noise_audio);
+        let noise_options = QcOptions {
+            noise_threshold_dbfs: -65.0,
+            ..QcOptions::default()
+        };
+        let noise_results = analyze(&noise_audio, &noise_analysis, &noise_options);
+        assert!(!result_by_id(&noise_results, "0086B").passed);
+
+        let source = (0..96_000)
+            .map(|index| 0.2 * (TAU * 997.0 * index as f64 / 48_000.0).sin() as f32)
+            .collect::<Vec<_>>();
+        let victim = source.iter().map(|sample| sample * 0.04).collect();
+        let pair_audio = stereo_buffer(source, victim);
+        let pair_analysis = normalize::analyze(&pair_audio);
+        let pair_results = analyze(&pair_audio, &pair_analysis, &QcOptions::default());
+        let crosstalk = result_by_id(&pair_results, "0170B");
+        assert!(!crosstalk.passed);
+        assert_eq!(crosstalk.events[0].channel, 2);
+        assert_eq!(crosstalk.events[0].related_channel, Some(1));
+        assert!(!result_by_id(&pair_results, "0230B").passed);
+    }
+
+    #[test]
+    fn detects_lfe_assignment_and_configured_non_mono_delivery() {
+        let frames = 96_000;
+        let mut data = vec![vec![0.0; frames]; 6];
+        data[3] = (0..frames)
+            .map(|index| 0.2 * (TAU * 1_000.0 * index as f64 / 48_000.0).sin() as f32)
+            .collect();
+        let audio = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 6,
+            frames,
+            data,
+            channel_roles: default_channel_roles(6),
+            source_kind: PcmKind::S16,
+        };
+        let analysis = normalize::analyze(&audio);
+        let results = analyze(&audio, &analysis, &QcOptions::default());
+        let assignment = result_by_id(&results, "0095B");
+        assert!(!assignment.passed);
+        assert_eq!(assignment.events[0].channel, 4);
+        assert_eq!(assignment.events[0].related_channel, Some(3));
+
+        let left = vec![0.1; 48_000];
+        let right = vec![0.11; 48_000];
+        let stereo = stereo_buffer(left, right);
+        let stereo_analysis = normalize::analyze(&stereo);
+        let mono_results = analyze(
+            &stereo,
+            &stereo_analysis,
+            &QcOptions {
+                expect_mono: true,
+                ..QcOptions::default()
+            },
+        );
+        assert!(!result_by_id(&mono_results, "0124B").passed);
+        assert!(result_by_id(&mono_results, "0124B").calculated);
+    }
+
+    #[test]
+    fn detects_forge_dc_delay_stuck_sample_and_discontinuity_rules() {
+        let mut first = (0..96_000)
+            .map(|index| {
+                let value = ((index * 7_919) % 65_521) as f32 / 65_521.0;
+                (value - 0.5) * 0.2
+            })
+            .collect::<Vec<_>>();
+        let mut second = vec![0.0; first.len()];
+        second[4..].copy_from_slice(&first[..first.len() - 4]);
+        first[20_000..23_000].fill(0.1);
+        first[40_000] = 1.0;
+        first[40_001] = -1.0;
+        for sample in &mut second {
+            *sample += 0.02;
+        }
+        let audio = stereo_buffer(first, second);
+        let analysis = normalize::analyze(&audio);
+        let results = analyze(&audio, &analysis, &QcOptions::default());
+        for id in [
+            "FORGE-DC-OFFSET",
+            "FORGE-INTERCHANNEL-DELAY",
+            "FORGE-STUCK-SAMPLES",
+            "FORGE-DISCONTINUITY",
+        ] {
+            assert!(!result_by_id(&results, id).passed, "{id} did not fail");
+        }
+    }
+
+    #[test]
+    fn clean_music_speech_and_ambience_controls_do_not_trigger_new_rules() {
+        let fixtures = [
+            stereo_buffer(
+                (0..96_000)
+                    .map(|index| 0.1 * (TAU * 440.0 * index as f64 / 48_000.0).sin() as f32)
+                    .collect(),
+                (0..96_000)
+                    .map(|index| 0.1 * (TAU * 554.37 * index as f64 / 48_000.0).sin() as f32)
+                    .collect(),
+            ),
+            stereo_buffer(
+                (0..96_000)
+                    .map(|index| 0.08 * (TAU * 180.0 * index as f64 / 48_000.0).sin() as f32)
+                    .collect(),
+                (0..96_000)
+                    .map(|index| 0.08 * (TAU * 230.0 * index as f64 / 48_000.0).sin() as f32)
+                    .collect(),
+            ),
+            stereo_buffer(
+                (0..96_000)
+                    .map(|index| (((index * 7_919) % 65_521) as f32 / 65_521.0 - 0.5) * 0.1)
+                    .collect(),
+                (0..96_000)
+                    .map(|index| (((index * 3_571) % 65_519) as f32 / 65_519.0 - 0.5) * 0.1)
+                    .collect(),
+            ),
+        ];
+        for audio in fixtures {
+            let analysis = normalize::analyze(&audio);
+            let results = analyze(&audio, &analysis, &QcOptions::default());
+            for id in ["0086B", "0170B", "0230B", "0095B"] {
+                assert!(result_by_id(&results, id).passed, "{id} false positive");
+            }
+            assert!(!result_by_id(&results, "0124B").calculated);
+        }
+    }
+
+    #[test]
+    fn bounds_event_evidence_and_reports_truncation() {
+        let samples = (0..550_000)
+            .map(|index| if index % 2 == 0 { -1.0 } else { 1.0 })
+            .collect();
+        let audio = buffer(samples);
+        let discontinuities = forge_result(
+            "FORGE-DISCONTINUITY",
+            "Sample Discontinuity",
+            discontinuity_events(&audio, &QcOptions::default()),
+        );
+        assert_eq!(discontinuities.events.len(), MAX_QC_EVENTS);
+        assert!(discontinuities.events_truncated);
     }
 }
