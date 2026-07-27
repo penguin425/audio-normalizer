@@ -375,6 +375,7 @@ version = "0.43.0"
 dependencies = [
  "audiopus_sys",
  "clap",
+ "crc32fast",
  "csv",
  "flacenc",
  "lofty",

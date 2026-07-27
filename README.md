@@ -233,11 +233,20 @@ forge-container-qc master.flac
 forge-container-qc delivery.mp3
 forge-container-qc broadcast.aac
 forge-container-qc contribution.loas
+forge-container-qc programme.mka
+forge-container-qc delivery.webm
 ```
 
 WAVE/RF64/BW64 chunk tables are scanned with bounded memory: audio payloads are
 seeked over rather than loaded, including files larger than 4 GiB. Oversized
 control chunks and pathological chunk counts fail closed with stable rule IDs.
+
+Matroska/WebM audits use a bounded RFC 9559 EBML parser. They validate element
+sizes/depth/counts, Header/Segment/Info/Tracks/Cluster ordering, track identity
+and audio geometry, Block timestamps and all lacing modes, SeekHead/Cue
+positions, streaming CRC-32, and Opus codec delay/pre-roll/private data without
+buffering complete media payloads. Normative failures and RFC recommendations
+use distinct stable rule IDs.
 
 AIFF/AIFF-C audits validate `FORM` and even-byte chunk boundaries, unique
 `COMM`/`SSND`, the 80-bit sample rate, PCM frame geometry, and AIFF-C `FVER`,

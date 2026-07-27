@@ -87,6 +87,7 @@ symphonia = { version = "0.5", features = ["mp3", "isomp4", "aac", "alac", "flac
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 csv = "1"
+crc32fast = "1"
 toml = "1.1"
 lofty = "0.24"
 quick-xml = "0.41"

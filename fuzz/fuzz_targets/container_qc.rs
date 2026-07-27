@@ -15,7 +15,7 @@ fn audit_bytes(bytes: &[u8]) {
 fuzz_target!(|data: &[u8]| {
     audit_bytes(data);
 
-    let mut container = match data.first().copied().unwrap_or_default() % 10 {
+    let mut container = match data.first().copied().unwrap_or_default() % 11 {
         0 => b"RIFF\0\0\0\0WAVE".to_vec(),
         1 => b"RF64\xff\xff\xff\xffWAVE".to_vec(),
         2 => b"BW64\xff\xff\xff\xffWAVE".to_vec(),
@@ -25,7 +25,8 @@ fuzz_target!(|data: &[u8]| {
         6 => b".snd".to_vec(),
         7 => b"fLaC".to_vec(),
         8 => b"\xff\xf1\x4c\x80\x00\xff\xfc".to_vec(),
-        _ => b"\x56\xe0\x00".to_vec(),
+        9 => b"\x56\xe0\x00".to_vec(),
+        _ => b"\x1a\x45\xdf\xa3".to_vec(),
     };
     container.extend_from_slice(data.get(1..).unwrap_or_default());
     audit_bytes(&container);

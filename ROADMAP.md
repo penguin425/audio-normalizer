@@ -16,6 +16,8 @@ Forge already provides:
   loudness metadata.
 - WAVE/RF64/BW64, AIFF/AIFC, CAF, AU, FLAC, MP3, Ogg Opus/Vorbis, and
   ISO-BMFF/fMP4 structural QC.
+- Bounded RFC 9559 Matroska/WebM QC for EBML structure, tracks, blocks,
+  SeekHead/Cues, CRC-32, codec-private data, and Opus gapless timing.
 - Dependency-free ADTS and LOAS/LATM AAC QC, including ASC SBR/PS signalling,
   decoded timing, and ISO-BMFF edit-list/sample-group gapless reconciliation.
 - HLS, DASH, and CMAF package checks; ISO loudness and MPEG-D DRC metadata.
@@ -34,22 +36,6 @@ Forge already provides:
 ## P0 — next correctness and interoperability work
 
 These are the strongest candidates for the next releases.
-
-### Matroska and WebM
-
-- Bounded EBML variable-integer parser with element depth, count, and size
-  limits.
-- Segment/Info/Tracks/Cluster ordering and uniqueness.
-- Track UID/number consistency, codec IDs/private data, audio geometry, block
-  lacing, timestamps, and duration.
-- SeekHead and Cue target/offset cross-checks.
-- CRC-32 validation and unknown-size rules for files versus live streams.
-- Opus `CodecDelay`, `SeekPreRoll`, and `DiscardPadding` validation, including
-  decoded-duration cross-checks.
-- FLAC, Vorbis, PCM, and MP3-in-Matroska codec-private validation by reusing
-  native Forge parsers.
-
-The normative target is [RFC 9559](https://www.rfc-editor.org/rfc/rfc9559.html).
 
 ### Codec-output verification
 
