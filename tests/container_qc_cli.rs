@@ -168,6 +168,109 @@ fn container_qc_cli_audits_real_aac_lc_and_he_aac_without_runtime_decoding() {
 }
 
 #[test]
+fn container_qc_cli_audits_ac3_and_eac3_syncframes_and_dialnorm() {
+    if !Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|result| result.status.success())
+    {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    for (codec, muxer, dialnorm, expected_bsid) in
+        [("ac3", "ac3", -24_i64, 8_i64), ("eac3", "eac3", -27, 16)]
+    {
+        let path = directory.path().join(format!("delivery.{muxer}"));
+        let generated = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=997:sample_rate=48000:duration=0.1",
+                "-c:a",
+                codec,
+                "-b:a",
+                "192k",
+                "-dialnorm",
+                &dialnorm.to_string(),
+                "-f",
+                muxer,
+            ])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(generated.status.success(), "{generated:#?}");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:#?}");
+        let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(audit["format"], muxer);
+        assert_eq!(audit["passed"], true);
+        assert_eq!(audit["properties"]["sample_rate_hz"], 48_000);
+        assert_eq!(audit["properties"]["bsid"], expected_bsid);
+        assert_eq!(audit["properties"]["dialnorm_db"][0], dialnorm);
+        assert!(audit["properties"]["frames"].as_u64().unwrap() > 0);
+    }
+}
+
+#[test]
+fn container_qc_cli_rejects_truncated_ac3_syncframe() {
+    if !Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|result| result.status.success())
+    {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("truncated.ac3");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=997:sample_rate=48000:duration=0.1",
+            "-c:a",
+            "ac3",
+            "-b:a",
+            "192k",
+            "-f",
+            "ac3",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{generated:#?}");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes.pop();
+    fs::write(&path, bytes).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(audit["format"], "ac3");
+    assert_eq!(audit["passed"], false);
+    assert!(audit["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|layer| layer["checks"].as_array().unwrap())
+        .any(|check| check["rule_id"] == "FORGE-AC3-BOUNDS" && check["passed"] == false));
+}
+
+#[test]
 fn container_qc_cli_audits_mpegts_program_maps_audio_pes_and_continuity() {
     if !Command::new("ffmpeg")
         .arg("-version")

@@ -233,6 +233,8 @@ forge-container-qc master.flac
 forge-container-qc delivery.mp3
 forge-container-qc broadcast.aac
 forge-container-qc contribution.loas
+forge-container-qc delivery.ac3
+forge-container-qc delivery.eac3
 forge-container-qc broadcast.ts
 forge-container-qc camera.m2ts
 forge-container-qc programme.mka
@@ -244,6 +246,20 @@ adaptation-field errors, payload continuity gaps, exact retransmissions,
 CRC-protected PAT/PMT programme maps, declared audio codecs, bounded PES
 headers, and monotonic 90 kHz audio PTS values. The report keeps programme,
 PID, language, PCR, and timing evidence without decoding the audio.
+
+AC-3/E-AC-3 elementary-stream audits scan bounded syncframes without FFmpeg.
+They validate frame sizes, sample rates, bitstream IDs, channel mode/LFE,
+`dialnorm`, compression-control words, and stable codec configuration.
+E-AC-3 reports independent/dependent substreams and channel maps and rejects a
+dependent substream without a compatible preceding independent substream.
+Syntax follows
+[ATSC A/52:2018](https://www.atsc.org/wp-content/uploads/2021/04/A52-2018.pdf)
+and
+[ETSI TS 102 366 V1.4.1](https://www.etsi.org/deliver/etsi_ts/102300_102399/102366/01.04.01_60/ts_102366v010401p.pdf).
+The `compr` field is reported as an encoded control word rather than
+mislabelled as a decoded DRC profile. Atmos/JOC is likewise not inferred from
+the core syncframe fields; use codec/presentation QC with an authoritative
+decoder for that claim.
 
 WAVE/RF64/BW64 chunk tables are scanned with bounded memory: audio payloads are
 seeked over rather than loaded, including files larger than 4 GiB. Oversized

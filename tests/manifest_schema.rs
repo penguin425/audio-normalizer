@@ -242,6 +242,51 @@ fn emitted_mpegts_container_qc_conforms_to_published_schema() {
 }
 
 #[test]
+fn emitted_eac3_container_qc_conforms_to_published_schema() {
+    if !Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|result| result.status.success())
+    {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("programme.eac3");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=997:sample_rate=48000:duration=0.1",
+            "-c:a",
+            "eac3",
+            "-dialnorm",
+            "-27",
+            "-f",
+            "eac3",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{generated:#?}");
+    let audit = forge_normalizer::container_qc::audit(&path).unwrap();
+    assert_eq!(audit.format, "eac3");
+    assert!(audit.passed, "{audit:#?}");
+    let instance = serde_json::to_value(audit).unwrap();
+    let schema: Value = serde_json::from_str(include_str!("../schema/container-qc-v1.schema.json"))
+        .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
+
+#[test]
 fn emitted_additional_pcm_container_qc_conforms_to_published_schema() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("programme.au");

@@ -20,6 +20,9 @@ Forge already provides:
   SeekHead/Cues, CRC-32, codec-private data, and Opus gapless timing.
 - Dependency-free ADTS and LOAS/LATM AAC QC, including ASC SBR/PS signalling,
   decoded timing, and ISO-BMFF edit-list/sample-group gapless reconciliation.
+- Dependency-free AC-3/E-AC-3 elementary-stream QC for bounded syncframes,
+  `dialnorm`, compression-control words, channel mode, and dependent-substream
+  ordering.
 - Bounded MPEG-TS/M2TS QC for packet layout, continuity, PAT/PMT CRC and
   programme maps, audio PES headers, and PTS continuity.
 - HLS MPEG-TS segment audits with discontinuity-aware programme/PID/codec
@@ -63,8 +66,10 @@ These are the strongest candidates for the next releases.
 
 ### Codec-specific QC
 
-- AC-3/E-AC-3 syncframe, `dialnorm`, DRC profile, channel mode, dependent
-  substream, Atmos/JOC signalling, and decoded-presentation checks.
+- AC-3/E-AC-3 interpreted DRC profiles, strict Atmos/JOC `addbsi` signalling,
+  access-unit grouping, and decoded-presentation checks. Core syncframe,
+  `dialnorm`, compression-control-word, channel-mode, and dependent-substream
+  validation has shipped.
 - AC-4 presentation and loudness metadata through a licensed/reference
   decoder adapter.
 - MPEG-H MHAS packets, scene metadata, profile/level, loudness, and
