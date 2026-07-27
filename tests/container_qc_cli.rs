@@ -1,3 +1,5 @@
+mod common;
+
 use forge_normalizer::wav::{AudioBuffer, ChannelRole, PcmKind, WavWriter};
 use serde_json::Value;
 use std::fs;
@@ -70,4 +72,97 @@ fn container_qc_cli_reports_malformed_isobmff_as_qc_failure() {
         .iter()
         .flat_map(|layer| layer["checks"].as_array().unwrap())
         .any(|check| check["rule_id"] == "FORGE-ISOBMFF-MOVIE-STRUCTURE"));
+}
+
+#[test]
+fn container_qc_cli_audits_real_aac_lc_and_he_aac_without_runtime_decoding() {
+    let directory = tempfile::tempdir().unwrap();
+    let he_path = directory.path().join("he-aac.aac");
+    fs::write(&he_path, common::HE_AAC_ADTS).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&he_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(audit["format"], "aac-adts");
+    assert_eq!(audit["passed"], true);
+    assert_eq!(audit["properties"]["frames"], 4);
+
+    if !Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|result| result.status.success())
+    {
+        return;
+    }
+    let lc_path = directory.path().join("aac-lc.aac");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=997:sample_rate=48000:duration=0.1",
+            "-c:a",
+            "aac",
+            "-profile:a",
+            "aac_low",
+            "-f",
+            "adts",
+        ])
+        .arg(&lc_path)
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{generated:#?}");
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&lc_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(audit["format"], "aac-adts");
+    assert_eq!(audit["passed"], true);
+    assert_eq!(audit["properties"]["audio_object_type"], 2);
+    assert_eq!(audit["properties"]["sample_rate_hz"], 48_000);
+
+    let loas_path = directory.path().join("aac-lc.loas");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=997:sample_rate=48000:duration=0.1",
+            "-c:a",
+            "aac",
+            "-profile:a",
+            "aac_low",
+            "-f",
+            "latm",
+        ])
+        .arg(&loas_path)
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{generated:#?}");
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&loas_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(audit["format"], "aac-loas");
+    assert_eq!(audit["passed"], true);
+    assert_eq!(
+        audit["properties"]["audio_specific_config"]["audio_object_type"],
+        2
+    );
+    assert_eq!(
+        audit["properties"]["audio_specific_config"]["output_sample_rate_hz"],
+        48_000
+    );
 }

@@ -10,6 +10,7 @@ use std::path::Path;
 const MAX_BOXES: usize = 200_000;
 const MAX_CONTROL_BOX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TRACKS: usize = 4_096;
+const MAX_TABLE_ENTRIES: usize = 10_000_000;
 
 #[derive(Clone, Copy, Debug)]
 struct BoxHeader {
@@ -49,6 +50,12 @@ struct Track {
     ludt_count: usize,
     loudness: Vec<LoudnessEntry>,
     drc_boxes: Vec<String>,
+    aac_config: Option<crate::aac_qc::AscInfo>,
+    edit_media_time: Option<i64>,
+    edit_segment_duration: Option<u64>,
+    sample_group_types: Vec<String>,
+    roll_distances: Vec<i16>,
+    sample_group_samples: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -90,6 +97,7 @@ struct State {
     compatible_brands: Vec<String>,
     moov_count: usize,
     movie_duration: Option<u64>,
+    movie_timescale: Option<u32>,
     mvex_after_tracks: bool,
     mdat_ranges: Vec<(u64, u64)>,
     has_mvex: bool,
@@ -308,6 +316,20 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
                     ),
                 ));
             }
+            if let (Some(group_samples), Some(sample_count)) =
+                (track.sample_group_samples, track.sample_count)
+            {
+                xcheck.push(check(
+                    "FORGE-ISOBMFF-SAMPLE-GROUP-COUNT-XCHECK",
+                    group_samples == sample_count,
+                    "sample-to-group runs cover the declared sample count",
+                    Some(json!({
+                        "track_id": track.id,
+                        "sample_groups": group_samples,
+                        "sample_count": sample_count
+                    })),
+                ));
+            }
             if let (Some(stts_duration), Some(duration)) = (track.stts_duration, track.duration) {
                 xcheck.push(check(
                     "FORGE-ISOBMFF-DURATION-XCHECK",
@@ -315,6 +337,74 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
                     "media duration matches the time-to-sample table",
                     Some(json!({"track_id": track.id, "mdhd": duration, "stts": stts_duration})),
                 ));
+            }
+            if let (Some(asc), Some(access_units), Some(stts_duration)) = (
+                track.aac_config.as_ref(),
+                track.stts_samples,
+                track.stts_duration,
+            ) {
+                let coded_samples = access_units.saturating_mul(u64::from(asc.frame_samples));
+                let timing_valid = track.timescale == Some(asc.output_sample_rate_hz)
+                    && stts_duration <= coded_samples
+                    && coded_samples - stts_duration < u64::from(asc.frame_samples);
+                xcheck.push(check(
+                    "FORGE-ISOBMFF-AAC-SAMPLE-TIMING",
+                    timing_valid,
+                    "AAC access-unit count, ASC frame length, media timescale, and stts duration agree",
+                    Some(json!({
+                        "track_id": track.id,
+                        "access_units": access_units,
+                        "frame_samples": asc.frame_samples,
+                        "coded_samples": coded_samples,
+                        "stts_duration": stts_duration,
+                        "transport_end_trim_samples": coded_samples - stts_duration,
+                        "media_timescale": track.timescale,
+                        "output_sample_rate_hz": asc.output_sample_rate_hz
+                    })),
+                ));
+                if let Some(media_time) = track.edit_media_time {
+                    let presentation_samples = track
+                        .edit_segment_duration
+                        .zip(state.movie_timescale)
+                        .and_then(|(duration, timescale)| {
+                            duration
+                                .checked_mul(u64::from(asc.output_sample_rate_hz))
+                                .map(|scaled| {
+                                    (scaled + u64::from(timescale) / 2) / u64::from(timescale)
+                                })
+                        });
+                    let delay = u64::try_from(media_time).ok();
+                    let end_padding =
+                        delay
+                            .zip(presentation_samples)
+                            .and_then(|(delay, presentation)| {
+                                coded_samples.checked_sub(delay)?.checked_sub(presentation)
+                            });
+                    xcheck.push(check(
+                        "FORGE-ISOBMFF-AAC-GAPLESS",
+                        end_padding.is_some(),
+                        "AAC edit-list encoder delay and end padding fit inside coded samples",
+                        Some(json!({
+                            "track_id": track.id,
+                            "coded_samples": coded_samples,
+                            "encoder_delay_samples": delay,
+                            "presentation_samples": presentation_samples,
+                            "end_padding_samples": end_padding
+                        })),
+                    ));
+                }
+                if !track.roll_distances.is_empty() {
+                    xcheck.push(check(
+                        "FORGE-ISOBMFF-AAC-ROLL-GROUP",
+                        track.roll_distances.iter().all(|distance| *distance <= 0),
+                        "AAC roll/prol sample-group distances describe non-positive decoder pre-roll",
+                        Some(json!({
+                            "track_id": track.id,
+                            "grouping_types": track.sample_group_types,
+                            "roll_distances": track.roll_distances
+                        })),
+                    ));
+                }
             }
             if !track.chunk_offsets.is_empty() && !state.mdat_ranges.is_empty() {
                 let invalid: Vec<_> = track
@@ -420,6 +510,7 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
         "fragment_movie_relative": state.fragments.iter()
             .all(|fragment| fragment.movie_relative == Some(true)),
         "movie_duration": state.movie_duration,
+        "movie_timescale": state.movie_timescale,
         "track_header_durations": state.tracks.iter()
             .map(|track| track.header_duration)
             .collect::<Vec<_>>(),
@@ -482,7 +573,8 @@ fn parse_moov(
     for child in children {
         match &child.kind {
             b"mvhd" => {
-                state.movie_duration = parse_mvhd(path, file, child, bitstream)?;
+                (state.movie_timescale, state.movie_duration) =
+                    parse_mvhd(path, file, child, bitstream)?;
             }
             b"trak" => {
                 if state.tracks.len() == MAX_TRACKS {
@@ -514,20 +606,23 @@ fn parse_mvhd(
     file: &mut File,
     header: BoxHeader,
     checks: &mut Vec<AuditCheck>,
-) -> Result<Option<u64>, String> {
+) -> Result<(Option<u32>, Option<u64>), String> {
     let body = read_control(path, file, header)?;
-    let duration = match body.first() {
-        Some(0) => body.get(16..20).map(be_u32).map(u64::from),
-        Some(1) => body.get(24..32).map(be_u64),
-        _ => None,
+    let (timescale, duration) = match body.first() {
+        Some(0) => (
+            body.get(12..16).map(be_u32),
+            body.get(16..20).map(be_u32).map(u64::from),
+        ),
+        Some(1) => (body.get(20..24).map(be_u32), body.get(24..32).map(be_u64)),
+        _ => (None, None),
     };
     checks.push(check(
         "FORGE-ISOBMFF-MOVIE-HEADER",
-        duration.is_some(),
-        "movie header contains a duration",
-        duration.map(Value::from),
+        timescale.is_some_and(|value| value > 0) && duration.is_some(),
+        "movie header contains a positive timescale and duration",
+        Some(json!({"timescale": timescale, "duration": duration})),
     ));
-    Ok(duration)
+    Ok((timescale, duration))
 }
 
 fn parse_trak(
@@ -546,11 +641,83 @@ fn parse_trak(
                 (track.id, track.header_duration) = parse_tkhd(path, file, child, bitstream)?
             }
             b"mdia" => parse_mdia(path, file, child, box_count, &mut track, bitstream, xcheck)?,
+            b"edts" => parse_edts(path, file, child, box_count, &mut track, bitstream)?,
             b"udta" => parse_udta(path, file, child, box_count, &mut track, bitstream)?,
             _ => {}
         }
     }
     Ok(track)
+}
+
+fn parse_edts(
+    path: &Path,
+    file: &mut File,
+    header: BoxHeader,
+    box_count: &mut usize,
+    track: &mut Track,
+    checks: &mut Vec<AuditCheck>,
+) -> Result<(), String> {
+    let children = list_boxes(path, file, header.body_start, header.end, box_count)?;
+    let edit_lists: Vec<_> = children
+        .into_iter()
+        .filter(|child| child.kind == *b"elst")
+        .collect();
+    let mut valid = edit_lists.len() <= 1;
+    if let Some(header) = edit_lists.first().copied() {
+        let body = read_control(path, file, header)?;
+        let version = body.first().copied();
+        let width = match version {
+            Some(0) => 12,
+            Some(1) => 20,
+            _ => 0,
+        };
+        let entries = (width > 0)
+            .then(|| parse_counted_entries(&body, width))
+            .flatten();
+        if let Some(entries) = entries {
+            let mut selected = None;
+            for entry in entries {
+                let (segment_duration, media_time, rate_offset) = if width == 12 {
+                    (
+                        u64::from(be_u32(&entry[..4])),
+                        i64::from(i32::from_be_bytes(entry[4..8].try_into().unwrap())),
+                        8,
+                    )
+                } else {
+                    (
+                        be_u64(&entry[..8]),
+                        i64::from_be_bytes(entry[8..16].try_into().unwrap()),
+                        16,
+                    )
+                };
+                let rate_integer =
+                    i16::from_be_bytes(entry[rate_offset..rate_offset + 2].try_into().unwrap());
+                let rate_fraction =
+                    i16::from_be_bytes(entry[rate_offset + 2..rate_offset + 4].try_into().unwrap());
+                valid &= rate_integer == 1 && rate_fraction == 0;
+                if media_time >= 0 && selected.is_none() {
+                    selected = Some((media_time, segment_duration));
+                }
+            }
+            if let Some((media_time, segment_duration)) = selected {
+                track.edit_media_time = Some(media_time);
+                track.edit_segment_duration = Some(segment_duration);
+            }
+        } else {
+            valid = false;
+        }
+    }
+    checks.push(check(
+        "FORGE-ISOBMFF-EDIT-LIST",
+        valid,
+        "track edit list is unique, bounded, and uses normal playback rate",
+        Some(json!({
+            "count": edit_lists.len(),
+            "media_time": track.edit_media_time,
+            "segment_duration": track.edit_segment_duration
+        })),
+    ));
+    Ok(())
 }
 
 fn parse_udta(
@@ -922,6 +1089,8 @@ fn parse_stbl(
             b"stsz" => parse_stsz(path, file, child, track, bitstream)?,
             b"stz2" => parse_stz2(path, file, child, track, bitstream)?,
             b"stsc" => parse_stsc(path, file, child, track, bitstream)?,
+            b"sgpd" => parse_sgpd(path, file, child, track, bitstream)?,
+            b"sbgp" => parse_sbgp(path, file, child, track, bitstream)?,
             b"stco" => track.chunk_offsets = parse_offsets(path, file, child, false, bitstream)?,
             b"co64" => track.chunk_offsets = parse_offsets(path, file, child, true, bitstream)?,
             _ => {}
@@ -995,13 +1164,14 @@ fn parse_stsd(
             match sample_entry_child_boxes(&body[offset..offset + size]) {
                 Ok(children) => {
                     let drc: Vec<_> = children
-                        .into_iter()
-                        .filter(|kind| {
+                        .iter()
+                        .filter(|(kind, _)| {
                             matches!(
                                 kind.as_str(),
                                 "udc1" | "udc2" | "udi1" | "udi2" | "udex" | "dmix"
                             )
                         })
+                        .map(|(kind, _)| kind.clone())
                         .collect();
                     if !drc.is_empty() {
                         checks.push(check(
@@ -1012,6 +1182,20 @@ fn parse_stsd(
                         ));
                     }
                     track.drc_boxes.extend(drc);
+                    if track.codecs.last().is_some_and(|codec| codec == "mp4a") {
+                        let asc = children
+                            .iter()
+                            .find(|(kind, _)| kind == "esds")
+                            .and_then(|(_, payload)| decoder_specific_info(payload).ok())
+                            .and_then(|bytes| crate::aac_qc::parse_asc_bytes(bytes).ok());
+                        checks.push(check(
+                            "FORGE-ISOBMFF-AAC-ASC",
+                            asc.is_some(),
+                            "mp4a sample entry contains a bounded AudioSpecificConfig",
+                            asc.as_ref().map(|value| json!(value)),
+                        ));
+                        track.aac_config = asc;
+                    }
                 }
                 Err(()) => {
                     valid = false;
@@ -1052,7 +1236,7 @@ fn parse_stsd(
     Ok(())
 }
 
-fn sample_entry_child_boxes(entry: &[u8]) -> Result<Vec<String>, ()> {
+fn sample_entry_child_boxes(entry: &[u8]) -> Result<Vec<(String, &[u8])>, ()> {
     if entry.len() < 36 {
         return Err(());
     }
@@ -1097,10 +1281,72 @@ fn sample_entry_child_boxes(entry: &[u8]) -> Result<Vec<String>, ()> {
         {
             return Err(());
         }
-        output.push(kind);
+        output.push((kind, &entry[offset + header_size..offset + size]));
         offset += size;
     }
     Ok(output)
+}
+
+fn decoder_specific_info(esds_body: &[u8]) -> Result<&[u8], ()> {
+    if esds_body.len() < 4 || esds_body[1..4] != [0, 0, 0] {
+        return Err(());
+    }
+    let (tag, payload, _) = descriptor(esds_body, 4)?;
+    if tag != 0x03 || payload.len() < 3 {
+        return Err(());
+    }
+    let flags = payload[2];
+    let mut offset = 3;
+    if flags & 0x80 != 0 {
+        offset += 2;
+    }
+    if flags & 0x40 != 0 {
+        let length = usize::from(*payload.get(offset).ok_or(())?);
+        offset = offset.checked_add(1 + length).ok_or(())?;
+    }
+    if flags & 0x20 != 0 {
+        offset += 2;
+    }
+    while offset < payload.len() {
+        let (child_tag, child, end) = descriptor(payload, offset)?;
+        if child_tag == 0x04 {
+            if child.len() < 13 {
+                return Err(());
+            }
+            let mut decoder_offset = 13;
+            while decoder_offset < child.len() {
+                let (decoder_tag, decoder_payload, decoder_end) =
+                    descriptor(child, decoder_offset)?;
+                if decoder_tag == 0x05 {
+                    return Ok(decoder_payload);
+                }
+                decoder_offset = decoder_end;
+            }
+        }
+        offset = end;
+    }
+    Err(())
+}
+
+fn descriptor(data: &[u8], offset: usize) -> Result<(u8, &[u8], usize), ()> {
+    let tag = *data.get(offset).ok_or(())?;
+    let mut cursor = offset + 1;
+    let mut length = 0_usize;
+    let mut complete = false;
+    for _ in 0..4 {
+        let byte = *data.get(cursor).ok_or(())?;
+        cursor += 1;
+        length = length.checked_shl(7).ok_or(())? | usize::from(byte & 0x7f);
+        if byte & 0x80 == 0 {
+            complete = true;
+            break;
+        }
+    }
+    if !complete {
+        return Err(());
+    }
+    let end = cursor.checked_add(length).ok_or(())?;
+    Ok((tag, data.get(cursor..end).ok_or(())?, end))
 }
 
 fn parse_stts(
@@ -1264,6 +1510,129 @@ fn parse_stsc(
         valid,
         "sample-to-chunk entries are ordered, positive, and complete",
         Some(json!(track.sample_to_chunk)),
+    ));
+    Ok(())
+}
+
+fn parse_sgpd(
+    path: &Path,
+    file: &mut File,
+    header: BoxHeader,
+    track: &mut Track,
+    checks: &mut Vec<AuditCheck>,
+) -> Result<(), String> {
+    let body = read_control(path, file, header)?;
+    let version = body.first().copied();
+    let grouping_type = body.get(4..8).map(fourcc);
+    let (mut offset, default_length, entry_count) = match version {
+        Some(0) if body.len() >= 12 => (12, None, be_u32(&body[8..12]) as usize),
+        Some(1) if body.len() >= 16 => (
+            16,
+            Some(be_u32(&body[8..12]) as usize),
+            be_u32(&body[12..16]) as usize,
+        ),
+        Some(2) if body.len() >= 20 => (
+            20,
+            Some(be_u32(&body[8..12]) as usize),
+            be_u32(&body[16..20]) as usize,
+        ),
+        _ => (body.len(), None, 0),
+    };
+    let mut valid = grouping_type.is_some() && entry_count <= MAX_TABLE_ENTRIES;
+    let mut roll_distances = Vec::new();
+    for _ in 0..entry_count {
+        let length = match default_length {
+            Some(0) => {
+                if body.len().saturating_sub(offset) < 4 {
+                    valid = false;
+                    break;
+                }
+                let value = be_u32(&body[offset..offset + 4]) as usize;
+                offset += 4;
+                value
+            }
+            Some(value) => value,
+            None if matches!(grouping_type.as_deref(), Some("roll" | "prol")) => 2,
+            None => {
+                valid = false;
+                break;
+            }
+        };
+        if length > body.len().saturating_sub(offset) {
+            valid = false;
+            break;
+        }
+        if matches!(grouping_type.as_deref(), Some("roll" | "prol")) {
+            if length != 2 {
+                valid = false;
+                break;
+            }
+            roll_distances.push(i16::from_be_bytes(
+                body[offset..offset + 2].try_into().unwrap(),
+            ));
+        }
+        offset += length;
+    }
+    valid &= offset == body.len();
+    if let Some(grouping_type) = grouping_type {
+        track.sample_group_types.push(grouping_type);
+    }
+    track.roll_distances.extend(roll_distances);
+    checks.push(check(
+        "FORGE-ISOBMFF-SAMPLE-GROUP-DESCRIPTION",
+        valid,
+        "sample-group descriptions are bounded and roll/prol entries have signed distances",
+        Some(json!({
+            "grouping_types": track.sample_group_types,
+            "roll_distances": track.roll_distances
+        })),
+    ));
+    Ok(())
+}
+
+fn parse_sbgp(
+    path: &Path,
+    file: &mut File,
+    header: BoxHeader,
+    track: &mut Track,
+    checks: &mut Vec<AuditCheck>,
+) -> Result<(), String> {
+    let body = read_control(path, file, header)?;
+    let version = body.first().copied();
+    let grouping_type = body.get(4..8).map(fourcc);
+    let offset = match version {
+        Some(0) => 8,
+        Some(1) => 12,
+        _ => body.len(),
+    };
+    let entries = body.get(offset..).and_then(|tail| {
+        let count = tail
+            .get(..4)
+            .map(be_u32)
+            .and_then(|value| usize::try_from(value).ok())?;
+        if count > MAX_TABLE_ENTRIES || tail.len() != 4_usize.checked_add(count.checked_mul(8)?)? {
+            return None;
+        }
+        Some(tail[4..].chunks_exact(8).collect::<Vec<_>>())
+    });
+    let mut samples = 0_u64;
+    let mut valid = grouping_type.is_some();
+    if let Some(entries) = entries {
+        for entry in entries {
+            let count = u64::from(be_u32(&entry[..4]));
+            let description_index = be_u32(&entry[4..8]);
+            valid &= count > 0 && description_index <= MAX_TABLE_ENTRIES as u32;
+            samples = samples.saturating_add(count);
+        }
+        track.sample_group_samples = Some(samples);
+    } else {
+        valid = false;
+    }
+    checks.push(check(
+        "FORGE-ISOBMFF-SAMPLE-TO-GROUP",
+        valid,
+        "sample-to-group runs are bounded and use valid positive sample counts",
+        Some(json!({"grouping_type": grouping_type, "samples": samples})),
     ));
     Ok(())
 }
@@ -1552,7 +1921,13 @@ fn track_json(track: &Track) -> Value {
         "chunk_samples": track.chunk_samples,
         "loudness_box_count": track.ludt_count,
         "loudness": track.loudness.iter().map(loudness_json).collect::<Vec<_>>(),
-        "mpeg_d_drc_boxes": track.drc_boxes
+        "mpeg_d_drc_boxes": track.drc_boxes,
+        "aac_audio_specific_config": track.aac_config,
+        "edit_media_time": track.edit_media_time,
+        "edit_segment_duration": track.edit_segment_duration,
+        "sample_group_types": track.sample_group_types,
+        "roll_distances": track.roll_distances,
+        "sample_group_samples": track.sample_group_samples
     })
 }
 
@@ -1607,6 +1982,28 @@ mod tests {
         body
     }
 
+    fn aac_esds() -> Vec<u8> {
+        let decoder_config = [vec![0x40, 0x15], vec![0; 11], vec![0x05, 0x02, 0x11, 0x90]].concat();
+        let es_descriptor = [
+            vec![0x00, 0x01, 0x00],
+            vec![0x04, u8::try_from(decoder_config.len()).unwrap()],
+            decoder_config,
+            vec![0x06, 0x01, 0x02],
+        ]
+        .concat();
+        boxed(
+            b"esds",
+            full_box(
+                0,
+                [
+                    vec![0x03, u8::try_from(es_descriptor.len()).unwrap()],
+                    es_descriptor,
+                ]
+                .concat(),
+            ),
+        )
+    }
+
     fn minimal_audio_mp4(chunk_offset: u32) -> Vec<u8> {
         minimal_audio_mp4_with_metadata(chunk_offset, Vec::new(), Vec::new())
     }
@@ -1615,6 +2012,24 @@ mod tests {
         chunk_offset: u32,
         track_user_data: Vec<u8>,
         sample_entry_children: Vec<u8>,
+    ) -> Vec<u8> {
+        minimal_audio_mp4_advanced(
+            chunk_offset,
+            track_user_data,
+            sample_entry_children,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn minimal_audio_mp4_advanced(
+        chunk_offset: u32,
+        track_user_data: Vec<u8>,
+        sample_entry_children: Vec<u8>,
+        track_children: Vec<u8>,
+        stbl_children: Vec<u8>,
+        movie_children: Vec<u8>,
     ) -> Vec<u8> {
         let ftyp = boxed(
             b"ftyp",
@@ -1649,6 +2064,7 @@ mod tests {
         sample_entry[16..18].copy_from_slice(&2_u16.to_be_bytes());
         sample_entry[18..20].copy_from_slice(&16_u16.to_be_bytes());
         sample_entry[24..28].copy_from_slice(&(48_000_u32 << 16).to_be_bytes());
+        sample_entry.extend(aac_esds());
         sample_entry.extend(sample_entry_children);
         let stsd = boxed(
             b"stsd",
@@ -1693,11 +2109,17 @@ mod tests {
                 [1_u32.to_be_bytes(), chunk_offset.to_be_bytes()].concat(),
             ),
         );
-        let stbl = boxed(b"stbl", [stsd, stts, stsz, stsc, stco].concat());
+        let stbl = boxed(
+            b"stbl",
+            [stsd, stts, stsz, stsc, stco, stbl_children].concat(),
+        );
         let minf = boxed(b"minf", stbl);
         let mdia = boxed(b"mdia", [mdhd, hdlr, minf].concat());
-        let trak = boxed(b"trak", [tkhd, mdia, track_user_data].concat());
-        let moov = boxed(b"moov", trak);
+        let trak = boxed(
+            b"trak",
+            [tkhd, mdia, track_user_data, track_children].concat(),
+        );
+        let moov = boxed(b"moov", [movie_children, trak].concat());
         let mdat = boxed(b"mdat", vec![1, 2, 3, 4]);
         [ftyp, moov, mdat].concat()
     }
@@ -1747,6 +2169,101 @@ mod tests {
         assert!(result.passed, "{result:#?}");
         assert_eq!(result.format, "isobmff");
         assert_eq!(result.properties["tracks"][0]["codecs"][0], "mp4a");
+    }
+
+    #[test]
+    fn reconciles_aac_edit_list_and_roll_sample_groups() {
+        let mvhd = boxed(
+            b"mvhd",
+            full_box(
+                0,
+                [
+                    vec![0; 8],
+                    1_000_u32.to_be_bytes().to_vec(),
+                    21_u32.to_be_bytes().to_vec(),
+                ]
+                .concat(),
+            ),
+        );
+        let elst = boxed(
+            b"elst",
+            full_box(
+                0,
+                [
+                    1_u32.to_be_bytes().to_vec(),
+                    21_u32.to_be_bytes().to_vec(),
+                    16_i32.to_be_bytes().to_vec(),
+                    1_i16.to_be_bytes().to_vec(),
+                    0_i16.to_be_bytes().to_vec(),
+                ]
+                .concat(),
+            ),
+        );
+        let edts = boxed(b"edts", elst);
+        let sgpd = boxed(
+            b"sgpd",
+            full_box(
+                1,
+                [
+                    b"roll".to_vec(),
+                    2_u32.to_be_bytes().to_vec(),
+                    1_u32.to_be_bytes().to_vec(),
+                    (-1_i16).to_be_bytes().to_vec(),
+                ]
+                .concat(),
+            ),
+        );
+        let sbgp = boxed(
+            b"sbgp",
+            full_box(
+                0,
+                [
+                    b"roll".to_vec(),
+                    1_u32.to_be_bytes().to_vec(),
+                    1_u32.to_be_bytes().to_vec(),
+                    1_u32.to_be_bytes().to_vec(),
+                ]
+                .concat(),
+            ),
+        );
+        let preliminary = minimal_audio_mp4_advanced(
+            0,
+            Vec::new(),
+            Vec::new(),
+            edts.clone(),
+            [sgpd.clone(), sbgp.clone()].concat(),
+            mvhd.clone(),
+        );
+        let mdat_start = preliminary
+            .windows(4)
+            .position(|window| window == b"mdat")
+            .unwrap() as u32
+            + 4;
+        let bytes = minimal_audio_mp4_advanced(
+            mdat_start,
+            Vec::new(),
+            Vec::new(),
+            edts,
+            [sgpd, sbgp].concat(),
+            mvhd,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("gapless.m4a");
+        File::create(&path).unwrap().write_all(&bytes).unwrap();
+
+        let result = crate::container_qc::audit(&path).unwrap();
+        assert!(result.passed, "{result:#?}");
+        let checks = result
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.checks)
+            .collect::<Vec<_>>();
+        assert!(checks
+            .iter()
+            .any(|check| check.rule_id == "FORGE-ISOBMFF-AAC-GAPLESS" && check.passed));
+        assert!(checks
+            .iter()
+            .any(|check| check.rule_id == "FORGE-ISOBMFF-AAC-ROLL-GROUP" && check.passed));
     }
 
     #[test]

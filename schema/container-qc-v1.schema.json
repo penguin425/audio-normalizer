@@ -11,7 +11,7 @@
     },
     "generator": {"type": "string"},
     "path": {"type": "string"},
-    "format": {"enum": ["wave", "aiff", "aifc", "caf", "au", "flac", "mp3", "ogg", "ogg-opus", "ogg-vorbis", "isobmff"]},
+    "format": {"enum": ["wave", "aiff", "aifc", "caf", "au", "flac", "mp3", "aac-adts", "aac-loas", "ogg", "ogg-opus", "ogg-vorbis", "isobmff"]},
     "passed": {"type": "boolean"},
     "layers": {
       "type": "array",

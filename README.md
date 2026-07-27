@@ -202,6 +202,8 @@ forge-container-qc archive.aiff
 forge-container-qc capture.caf
 forge-container-qc master.flac
 forge-container-qc delivery.mp3
+forge-container-qc broadcast.aac
+forge-container-qc contribution.loas
 ```
 
 WAVE/RF64/BW64 chunk tables are scanned with bounded memory: audio payloads are
@@ -235,6 +237,14 @@ CBR identity, and LAME encoder delay/padding are cross-checked against the
 scanned stream. Forge MP3 output now backpatches the Info/LAME tag so gapless
 duration is preserved; mono encoding uses LAME's planar API.
 
+Dependency-free AAC elementary-stream audits cover ADTS and LOAS/LATM without
+requiring FFmpeg. ADTS checks every fixed and variable header, frame boundary,
+CRC-field presence, buffer-fullness mode, profile, sample rate, channel
+configuration, and configuration continuity. LOAS/LATM checks bounded
+AudioMuxElement payloads, in-band StreamMuxConfig reuse, AudioSpecificConfig,
+explicit and backward-compatible SBR/PS signalling, output rate/channels, and
+decoded sample timing.
+
 For RIFF/WAVE, RF64, and BW64 it checks declared sizes, chunk bounds and
 alignment, required/unique `fmt` and `data` chunks, `ds64` placement/table/data
 sizes/sample counts, byte rate, block alignment, BWF `bext`, and paired ADM
@@ -252,7 +262,10 @@ extracts audio sample descriptions, verifies `stts`/`stsz`/`stz2`/`stsc` and
 `mdat` offsets, and checks `moof` sequence numbers and per-track `tfdt`
 timelines. Complete files, fragmented initialization segments, and standalone
 media segments are distinguished explicitly. `mdat` payloads are seeked over,
-not loaded.
+not loaded. AAC sample entries additionally expose and validate their
+AudioSpecificConfig, reconcile access-unit timing with the core/output sample
+rate, and cross-check gapless encoder delay/end padding from edit lists and
+roll/prol sample groups.
 
 Track user data is also inspected for ISO/IEC 14496-12 `ludt`, `tlou`, and
 `alou` loudness metadata. Version 0 and version 1 layouts, reserved bits,
@@ -377,8 +390,8 @@ CI runs the EBU and ITU suites as separate required evidence.
 
 Property tests exercise arbitrary WAVE and delivery-manifest bytes during the
 normal Rust test suite. Four `cargo-fuzz` targets cover the WAVE decoder,
-delivery-container QC including FLAC, MP3, and Ogg Opus/Vorbis, ADM XML profile
-validation, and delivery-manifest comparison:
+delivery-container QC including AAC ADTS/LOAS, FLAC, MP3, and Ogg Opus/Vorbis,
+ADM XML profile validation, and delivery-manifest comparison:
 
 ```sh
 cargo fuzz run wave_reader
