@@ -42,7 +42,7 @@ pub struct AuditCheck {
 pub fn audit(path: &Path) -> Result<ContainerAudit, String> {
     audit_if_supported(path)?.ok_or_else(|| {
         format!(
-            "{}: unsupported container (expected WAVE, AIFF/AIFC, CAF, AU, FLAC, MP3, AAC ADTS/LOAS, AC-3/E-AC-3, MPEG-TS/M2TS, Ogg Opus/Vorbis, Matroska/WebM, or ISO-BMFF MP4/M4A/fMP4)",
+            "{}: unsupported container (expected WAVE, AIFF/AIFC, CAF, AU, FLAC, MP3, AAC ADTS/LOAS, AC-3/E-AC-3, standalone IAMF, MPEG-TS/M2TS, Ogg Opus/Vorbis, Matroska/WebM, or ISO-BMFF MP4/M4A/fMP4)",
             path.display()
         )
     })
@@ -75,6 +75,8 @@ pub fn audit_if_supported(path: &Path) -> Result<Option<ContainerAudit>, String>
         crate::ogg_qc::audit(path).map(Some)
     } else if crate::ac3_qc::looks_like_ac3(&header[..header_size]) {
         crate::ac3_qc::audit(path, file, file_size).map(Some)
+    } else if crate::iamf_qc::looks_like_iamf(&header[..header_size]) {
+        crate::iamf_qc::audit(path, file, file_size).map(Some)
     } else if crate::aac_qc::looks_like_aac(&header[..header_size]) {
         crate::aac_qc::audit(path, file, file_size).map(Some)
     } else if crate::mpegts_qc::looks_like_mpegts(&header[..header_size]) {

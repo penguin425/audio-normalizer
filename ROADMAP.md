@@ -23,6 +23,8 @@ Forge already provides:
 - Dependency-free AC-3/E-AC-3 elementary-stream QC for bounded syncframes,
   `dialnorm`, compression-control words, channel mode, and dependent-substream
   ordering.
+- Bounded standalone AOMedia IAMF v1.1 OBU QC plus external OAR v1.0.0
+  presentation-render loudness, true-peak, duration, and reference checks.
 - Bounded MPEG-TS/M2TS QC for packet layout, continuity, PAT/PMT CRC and
   programme maps, audio PES headers, and PTS continuity.
 - HLS MPEG-TS segment audits with discontinuity-aware programme/PID/codec
@@ -80,6 +82,10 @@ These are the strongest candidates for the next releases.
 - MP3 protected-frame CRC validation, VBRI parsing, ReplayGain-in-LAME-field
   validation, and safe support for documented free-format streams.
 - Opus projection mapping family 2 and ambisonics validation.
+- IAMF descriptor payload linking, codec-config semantics, profile channel
+  limits, parameter/audio-frame timeline reconciliation, ISO-BMFF IAMF
+  encapsulation, and OAR conformance vectors. Standalone OBU bounds/order and
+  externally rendered presentation QC have shipped.
 
 ### Streaming and platform delivery
 

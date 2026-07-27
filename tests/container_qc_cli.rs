@@ -271,6 +271,83 @@ fn container_qc_cli_rejects_truncated_ac3_syncframe() {
 }
 
 #[test]
+fn container_qc_cli_audits_standalone_iamf_obu_structure() {
+    fn obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() < 128);
+        let mut bytes = vec![obu_type << 3, payload.len() as u8];
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("presentation.iamf");
+    let mut bytes = obu(31, b"iamf\x00\x00");
+    bytes.extend(obu(0, &[0]));
+    bytes.extend(obu(1, &[0]));
+    bytes.extend(obu(2, &[0]));
+    bytes.extend(obu(6, &[0]));
+    fs::write(&path, bytes).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(audit["format"], "iamf");
+    assert_eq!(audit["passed"], true);
+    assert_eq!(audit["properties"]["primary_profile"], "simple");
+    assert_eq!(audit["properties"]["obu_counts"]["audio-frame-id0"], 1);
+}
+
+#[test]
+fn container_qc_cli_rejects_oversized_and_misordered_iamf_obus() {
+    fn obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![obu_type << 3, payload.len() as u8];
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let order_path = directory.path().join("misordered.iamf");
+    let mut bytes = obu(31, b"iamf\x00\x00");
+    bytes.extend(obu(0, &[0]));
+    bytes.extend(obu(2, &[0]));
+    bytes.extend(obu(1, &[0]));
+    bytes.extend(obu(6, &[0]));
+    fs::write(&order_path, bytes).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&order_path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(audit["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|layer| layer["checks"].as_array().unwrap())
+        .any(|check| check["rule_id"] == "FORGE-IAMF-ORDER" && check["passed"] == false));
+
+    let size_path = directory.path().join("oversized.iamf");
+    let mut bytes = obu(31, b"iamf\x00\x00");
+    bytes.extend_from_slice(&[24 << 3, 0x80, 0x80, 0x80, 0x01]);
+    fs::write(&size_path, bytes).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&size_path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(audit["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|layer| layer["checks"].as_array().unwrap())
+        .any(|check| check["rule_id"] == "FORGE-IAMF-OBU-BOUNDS" && check["passed"] == false));
+}
+
+#[test]
 fn container_qc_cli_audits_mpegts_program_maps_audio_pes_and_continuity() {
     if !Command::new("ffmpeg")
         .arg("-version")
