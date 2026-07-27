@@ -152,9 +152,38 @@ then standard library paths, and prints a clear install hint if it is missing.
 Versioned tags automatically publish GitHub Releases containing portable Forge
 binaries for Linux x86-64, Windows x86-64, macOS Intel, and macOS Apple
 Silicon. Archives also contain the cross-platform `forge-live.clap` plug-in.
-Each release includes generated release notes and `SHA256SUMS`.
-GitHub artifact attestations provide verifiable build provenance for every
-archive and checksum manifest.
+Each release includes generated release notes, `SHA256SUMS`, SPDX and
+CycloneDX SBOMs, an offline SLSA provenance bundle, and generated Homebrew,
+Scoop, and WinGet manifests. GitHub artifact attestations provide verifiable
+build provenance for every checksummed release asset. Publication is blocked
+unless an independent Linux rebuild is byte-for-byte identical and every
+checksum and attestation verifies.
+
+Install a release directly with
+[`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall):
+
+```sh
+cargo binstall forge-normalizer
+```
+
+Verify a downloaded release before using it:
+
+```sh
+tag=v0.43.0
+mkdir "forge-${tag}" && cd "forge-${tag}"
+gh release download "$tag" --repo penguin425/audio-normalizer
+sha256sum -c SHA256SUMS
+gh attestation verify "forge-${tag}-linux-x86_64.tar.gz" \
+  --repo penguin425/audio-normalizer \
+  --bundle "forge-${tag}.slsa.jsonl" \
+  --signer-workflow penguin425/audio-normalizer/.github/workflows/release.yml
+jq -e . "forge-${tag}.spdx.json" "forge-${tag}.cdx.json" >/dev/null
+```
+
+The same attestation command can be run for any filename listed in
+`SHA256SUMS`. Release inputs are pinned in the workflow; dependency advisory,
+licence, source, duplicate-version, and MSRV policies run on every relevant
+change. Documented advisory exceptions remain visible in `deny.toml`.
 
 Release tags must exactly match the version in `Cargo.toml`:
 
