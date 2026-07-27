@@ -287,6 +287,37 @@ fn emitted_eac3_container_qc_conforms_to_published_schema() {
 }
 
 #[test]
+fn emitted_iamf_container_qc_conforms_to_published_schema() {
+    fn obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![obu_type << 3, payload.len() as u8];
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("presentation.iamf");
+    let mut bytes = obu(31, b"iamf\x00\x00");
+    bytes.extend(obu(0, &[0]));
+    bytes.extend(obu(1, &[0]));
+    bytes.extend(obu(2, &[0]));
+    bytes.extend(obu(6, &[0]));
+    std::fs::write(&path, bytes).unwrap();
+
+    let audit = forge_normalizer::container_qc::audit(&path).unwrap();
+    assert_eq!(audit.format, "iamf");
+    assert!(audit.passed, "{audit:#?}");
+    let instance = serde_json::to_value(audit).unwrap();
+    let schema: Value = serde_json::from_str(include_str!("../schema/container-qc-v1.schema.json"))
+        .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
+
+#[test]
 fn emitted_additional_pcm_container_qc_conforms_to_published_schema() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("programme.au");

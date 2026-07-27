@@ -1,4 +1,4 @@
-//! Auditable loudness QC for externally rendered AC-4 and MPEG-H presentations.
+//! Auditable loudness QC for externally rendered immersive presentations.
 
 use crate::normalize;
 use crate::report::{ComplianceProfile, ComplianceResult};
@@ -25,6 +25,7 @@ pub struct PresentationQcSpec {
 #[serde(rename_all = "kebab-case")]
 pub enum ImmersiveCodec {
     Ac4,
+    Iamf,
     MpegH,
 }
 
@@ -32,6 +33,7 @@ impl ImmersiveCodec {
     fn standard(self) -> &'static str {
         match self {
             Self::Ac4 => "ETSI TS 103 190",
+            Self::Iamf => "AOMedia IAMF v1.1 / Open Audio Renderer v1.0.0",
             Self::MpegH => "ISO/IEC 23008-3",
         }
     }
@@ -226,6 +228,24 @@ fn metric_delta(measured: f64, reference: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::wav::{default_channel_roles, AudioBuffer, PcmKind, WavWriter};
+
+    #[test]
+    fn iamf_uses_aomedia_renderer_standard() {
+        assert_eq!(
+            ImmersiveCodec::Iamf.standard(),
+            "AOMedia IAMF v1.1 / Open Audio Renderer v1.0.0"
+        );
+        let spec: PresentationQcSpec = serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "codec": "iamf",
+                "renderer": {"name": "oar", "version": "1.0.0"},
+                "presentations": [{"id": "stereo", "rendered_path": "stereo.wav"}]
+            }"#,
+        )
+        .unwrap();
+        assert!(matches!(spec.codec, ImmersiveCodec::Iamf));
+    }
 
     #[test]
     fn evaluates_every_external_presentation() {

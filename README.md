@@ -235,6 +235,7 @@ forge-container-qc broadcast.aac
 forge-container-qc contribution.loas
 forge-container-qc delivery.ac3
 forge-container-qc delivery.eac3
+forge-container-qc immersive.iamf
 forge-container-qc broadcast.ts
 forge-container-qc camera.m2ts
 forge-container-qc programme.mka
@@ -260,6 +261,19 @@ The `compr` field is reported as an encoded control word rather than
 mislabelled as a decoded DRC profile. Atmos/JOC is likewise not inferred from
 the core syncframe fields; use codec/presentation QC with an authoritative
 decoder for that claim.
+
+Standalone IAMF audits follow
+[AOMedia IAMF v1.1](https://aomediacodec.github.io/iamf/v1.1.0.html).
+They enforce bounded LEB128 OBU framing, the normative 2 MiB OBU limit,
+sequence headers and profiles, descriptor ordering, data redundancy/trimming
+flags, and complete-file consumption without decoding codec payloads.
+Rendering is deliberately separate: render every Mix Presentation and target
+layout with an
+[Open Audio Renderer v1.0.0](https://aomedia.org/specifications/oar/)
+implementation, then list the WAVE outputs under `codec = "iamf"` for
+`forge-presentation-qc`. This measures integrated loudness, true peak,
+duration, optional compliance, and reference drift while retaining renderer
+name/version evidence.
 
 WAVE/RF64/BW64 chunk tables are scanned with bounded memory: audio payloads are
 seeked over rather than loaded, including files larger than 4 GiB. Oversized
@@ -817,7 +831,8 @@ final-page end trimming are reported without decoding the audio payload. Ogg
 Vorbis QC validates the three mandatory Vorbis I headers, comments, page
 boundaries, monotonic PCM granules, and a strict packet-by-packet decode.
 
-AC-4 and MPEG-H workflows can audit every externally rendered Presentation
+AC-4, IAMF/OAR, and MPEG-H workflows can audit every externally rendered
+Presentation
 without claiming that Forge is a normative immersive renderer:
 
 ```bash
@@ -828,8 +843,8 @@ The JSON/TOML specification records `codec`, renderer name/version, and a
 unique ID plus rendered WAVE path for every Presentation. Optional reference
 paths gate loudness, true-peak, and sample-accurate duration drift; optional
 compliance profiles gate each Presentation independently. The report identifies
-ETSI TS 103 190 for AC-4 or ISO/IEC 23008-3 for MPEG-H and preserves renderer
-provenance as audit evidence.
+ETSI TS 103 190 for AC-4, AOMedia IAMF v1.1/OAR v1.0.0 for IAMF, or
+ISO/IEC 23008-3 for MPEG-H and preserves renderer provenance as audit evidence.
 
 Ordered S-ADM XML frames can be checked as a live-flow capture:
 
