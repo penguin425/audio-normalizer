@@ -16,6 +16,8 @@ Forge already provides:
   loudness metadata.
 - WAVE/RF64/BW64, AIFF/AIFC, CAF, AU, FLAC, MP3, Ogg Opus/Vorbis, and
   ISO-BMFF/fMP4 structural QC.
+- Dependency-free ADTS and LOAS/LATM AAC QC, including ASC SBR/PS signalling,
+  decoded timing, and ISO-BMFF edit-list/sample-group gapless reconciliation.
 - HLS, DASH, and CMAF package checks; ISO loudness and MPEG-D DRC metadata.
 - ADM, S-ADM, presentation-aware rendering/QC, C2PA validation, CI comparison,
   real-time processing, LV2, and CLAP integration.
@@ -46,15 +48,8 @@ These are the strongest candidates for the next releases.
 
 The normative target is [RFC 9559](https://www.rfc-editor.org/rfc/rfc9559.html).
 
-### AAC elementary streams and gapless delivery
+### Codec-output verification
 
-- ADTS fixed/variable header, frame-length, buffer-fullness, CRC, profile,
-  sample-rate, and channel-configuration checks.
-- LOAS/LATM AudioMuxElement bounds and StreamMuxConfig continuity.
-- ASC, implicit/explicit SBR and PS, frame-length, and decoded-rate
-  cross-checks.
-- Encoder delay/end padding consistency across ISO-BMFF edit lists, sample
-  groups, and decoded output.
 - Codec-output true-peak iteration using the final AAC/HE-AAC/xHE-AAC decoder
   result rather than PCM-only prediction.
 
