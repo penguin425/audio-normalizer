@@ -22,6 +22,8 @@ Forge already provides:
   decoded timing, and ISO-BMFF edit-list/sample-group gapless reconciliation.
 - Bounded MPEG-TS/M2TS QC for packet layout, continuity, PAT/PMT CRC and
   programme maps, audio PES headers, and PTS continuity.
+- HLS MPEG-TS segment audits with discontinuity-aware programme/PID/codec
+  stability and cross-segment audio PTS continuity.
 - HLS, DASH, and CMAF package checks; ISO loudness and MPEG-D DRC metadata.
 - ADM, S-ADM, presentation-aware rendering/QC, C2PA validation, CI comparison,
   real-time processing, LV2, and CLAP integration.
