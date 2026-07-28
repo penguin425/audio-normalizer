@@ -64,6 +64,9 @@ Forge already provides:
 - Bounded MP3 free-format structural QC with unique three-frame geometry
   inference, per-frame padding and full-stream boundary validation, and
   explicit separation from unsupported decode/normalization paths.
+- RFC 8486 Ogg Opus mapping-family-2 Ambisonics QC for allowed order/channel
+  geometry, ACN/SN3D declarations, optional non-diegetic stereo, mixed-order
+  inactive ACNs, and consistent chained layouts.
 
 ## P0 — next correctness and interoperability work
 
@@ -93,7 +96,6 @@ generations.
 - DTS core/HD metadata and decoded presentation checks through an optional
   adapter.
 - WavPack, Monkey's Audio, and ALAC native frame/checksum validation.
-- Opus projection mapping family 2 and ambisonics validation.
 - IAMF descriptor payload linking, codec-config semantics, profile channel
   limits, parameter/audio-frame timeline reconciliation, ISO-BMFF IAMF
   encapsulation, and OAR conformance vectors. Standalone OBU bounds/order and

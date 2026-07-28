@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 forge-normalizer = { path = "..", features = ["opus-encoding"] }
 libfuzzer-sys = "0.4"
+ogg = "0.9"
 serde_json = "1"
 tempfile = "3"
 

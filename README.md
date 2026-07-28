@@ -392,9 +392,15 @@ preserves `axml`, `bxml`, `sxml`, and `chna` byte-for-byte.
 Dependency-free Ogg QC follows [RFC 3533](https://www.rfc-editor.org/rfc/rfc3533)
 for page bounds, CRCs, sequences, continuation state, and sequential chains.
 Ogg Opus adds RFC 7845 headers/tags, mapping-family tables, packet durations,
-granules, pre-skip, and end-trim checks. Ogg Vorbis adds Vorbis I
-identification/comment/setup header validation, PCM granules, and strict
-streaming decode verification.
+granules, pre-skip, and end-trim checks. Mapping family 2 additionally follows
+[RFC 8486](https://www.rfc-editor.org/rfc/rfc8486): Forge validates the
+permitted zeroth- through fourteenth-order channel counts, optional
+non-diegetic stereo, and mixed-order inactive ACNs; it reports the declared
+ACN/SN3D semantics, stream/coupled counts, and complete channel map as bounded
+JSON evidence.
+Family 3 uses a distinct demixing-matrix header and is not misinterpreted as a
+family-2 mapping table. Ogg Vorbis adds Vorbis I identification/comment/setup
+header validation, PCM granules, and strict streaming decode verification.
 
 For ISO-BMFF MP4, M4A, and fragmented MP4 it scans the complete nested box
 structure with bounded memory, validates 32/64-bit box sizes and file roles,
@@ -1319,9 +1325,12 @@ override whose number of channels does not match the input.
 * AAC-LC, ALAC, and Vorbis encoding require the `ffmpeg-encoding` feature and
   `ffmpeg` at runtime. `aac-encoding` remains an alias that enables the shared
   FFmpeg adapter for compatibility.
-* Ogg Opus supports mapping family 0 mono/stereo and mapping family 1 layouts
-  through 7.1. Sequential chained streams must keep a consistent channel
-  layout; multiplexed concurrent Ogg streams are rejected.
+* Ogg Opus encoding, decoding, and normalization support mapping family 0
+  mono/stereo and mapping family 1 layouts through 7.1. Dependency-free
+  structural QC additionally validates RFC 8486 mapping family 2 Ambisonics;
+  it does not claim to decode, render, or measure those Ambisonic channels.
+  Sequential chained streams must keep an identical channel mapping layout;
+  multiplexed concurrent Ogg streams are rejected.
 * By default, the true-peak ceiling is enforced transparently by reducing
   global gain. `--limiter` opts into dynamic look-ahead limiting when reaching
   the loudness target matters more than preserving dynamics unchanged.

@@ -53,6 +53,14 @@ struct ChainInspection {
     #[serde(skip_serializing_if = "Option::is_none")]
     mapping_family: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    stream_count: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coupled_stream_count: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_mapping: Option<Vec<u8>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ambisonics: Option<AmbisonicsInspection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     original_sample_rate_hz: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_gain_q7_8: Option<i16>,
@@ -81,6 +89,10 @@ struct ActiveChain {
     sample_rate: u32,
     pre_skip: Option<u16>,
     mapping_family: Option<u8>,
+    stream_count: Option<u8>,
+    coupled_stream_count: Option<u8>,
+    channel_mapping: Option<Vec<u8>>,
+    ambisonics: Option<AmbisonicsInspection>,
     original_sample_rate: Option<u32>,
     output_gain_q7_8: Option<i16>,
     r128_track_gain_q7_8: Option<i16>,
@@ -101,12 +113,51 @@ struct DecodedAudio {
     channels: usize,
 }
 
+#[derive(Debug, Clone)]
 struct OpusHead {
     channels: u8,
     pre_skip: u16,
     original_sample_rate: u32,
     output_gain_q7_8: i16,
     mapping_family: u8,
+    stream_count: u8,
+    coupled_stream_count: u8,
+    channel_mapping: Option<Vec<u8>>,
+    ambisonics: Option<AmbisonicsInspection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpusChainLayout {
+    channels: u8,
+    mapping_family: u8,
+    stream_count: u8,
+    coupled_stream_count: u8,
+    channel_mapping: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AmbisonicsInspection {
+    highest_order: u8,
+    ambisonic_channels: u16,
+    active_ambisonic_channels: u16,
+    inactive_acns: Vec<u8>,
+    inactive_non_diegetic_channels: Vec<&'static str>,
+    mixed_order: bool,
+    non_diegetic_stereo: bool,
+    channel_order: &'static str,
+    normalization: &'static str,
+}
+
+impl OpusHead {
+    fn chain_layout(&self) -> OpusChainLayout {
+        OpusChainLayout {
+            channels: self.channels,
+            mapping_family: self.mapping_family,
+            stream_count: self.stream_count,
+            coupled_stream_count: self.coupled_stream_count,
+            channel_mapping: self.channel_mapping.clone(),
+        }
+    }
 }
 
 pub(crate) fn audit(path: &Path) -> Result<ContainerAudit, String> {
@@ -188,14 +239,43 @@ pub(crate) fn audit(path: &Path) -> Result<ContainerAudit, String> {
                 Some(json!(&chains)),
             ));
             if codec == Codec::Opus {
+                let ambisonic_chains: Vec<_> = chains
+                    .iter()
+                    .filter_map(|chain| {
+                        chain.ambisonics.as_ref().map(|ambisonics| {
+                            json!({
+                                "chain": chain.index,
+                                "ambisonics": ambisonics
+                            })
+                        })
+                    })
+                    .collect();
+                if !ambisonic_chains.is_empty() {
+                    bitstream.push(check(
+                        "FORGE-OPUS-AMBISONICS",
+                        true,
+                        format!(
+                            "{} RFC 8486 mapping-family-2 Ambisonics chain(s) declare ACN/SN3D semantics",
+                            ambisonic_chains.len()
+                        ),
+                        Some(json!(ambisonic_chains)),
+                    ));
+                }
                 xcheck.push(check(
                     "FORGE-OPUS-CHAIN-LAYOUT",
                     true,
                     format!(
-                        "all chains use the same {}-channel layout",
-                        chains[0].channels
+                        "all chains use the same {}-channel mapping-family-{} layout",
+                        chains[0].channels,
+                        chains[0].mapping_family.unwrap_or_default()
                     ),
-                    Some(json!(chains[0].channels)),
+                    Some(json!({
+                        "channels": chains[0].channels,
+                        "mapping_family": chains[0].mapping_family,
+                        "stream_count": chains[0].stream_count,
+                        "coupled_stream_count": chains[0].coupled_stream_count,
+                        "channel_mapping": chains[0].channel_mapping
+                    })),
                 ));
             }
             (Some(codec), chains)
@@ -452,6 +532,7 @@ fn inspect_packets(path: &Path) -> Result<(Codec, Vec<ChainInspection>), String>
     let mut reader = PacketReader::new(BufReader::new(input));
     let mut codec = None;
     let mut channels = None;
+    let mut opus_layout = None;
     let mut serials = HashSet::new();
     let mut active = None;
     let mut chains = Vec::new();
@@ -480,6 +561,14 @@ fn inspect_packets(path: &Path) -> Result<(Codec, Vec<ChainInspection>), String>
             let (chain_channels, sample_rate, pre_skip, opus_head) = match detected {
                 Codec::Opus => {
                     let head = parse_opus_head(&packet.data)?;
+                    let layout = head.chain_layout();
+                    if opus_layout
+                        .as_ref()
+                        .is_some_and(|expected| expected != &layout)
+                    {
+                        return Err("chained Ogg Opus streams change channel mapping layout".into());
+                    }
+                    opus_layout.get_or_insert(layout);
                     (head.channels, 48_000, Some(head.pre_skip), Some(head))
                 }
                 Codec::Vorbis => {
@@ -503,6 +592,12 @@ fn inspect_packets(path: &Path) -> Result<(Codec, Vec<ChainInspection>), String>
                 sample_rate,
                 pre_skip,
                 mapping_family: opus_head.as_ref().map(|head| head.mapping_family),
+                stream_count: opus_head.as_ref().map(|head| head.stream_count),
+                coupled_stream_count: opus_head.as_ref().map(|head| head.coupled_stream_count),
+                channel_mapping: opus_head
+                    .as_ref()
+                    .and_then(|head| head.channel_mapping.clone()),
+                ambisonics: opus_head.as_ref().and_then(|head| head.ambisonics.clone()),
                 original_sample_rate: opus_head.as_ref().map(|head| head.original_sample_rate),
                 output_gain_q7_8: opus_head.as_ref().map(|head| head.output_gain_q7_8),
                 r128_track_gain_q7_8: None,
@@ -598,11 +693,19 @@ fn parse_opus_head(packet: &[u8]) -> Result<OpusHead, String> {
     let input_rate = u32::from_le_bytes(packet[12..16].try_into().unwrap());
     let output_gain_q7_8 = i16::from_le_bytes(packet[16..18].try_into().unwrap());
     let family = packet[18];
-    if family == 0 {
+    let (stream_count, coupled_stream_count, channel_mapping, ambisonics) = if family == 0 {
         if (packet[8] == 1 && packet.len() != 19) || channels > 2 {
             return Err("Opus mapping family 0 requires a 19-byte mono/stereo header".into());
         }
+        (1, channels - 1, None, None)
     } else {
+        if !matches!(family, 1 | 2 | 255) {
+            return Err(match family {
+                3 => "Opus mapping family 3 uses an unsupported demixing-matrix header",
+                _ => "unrecognized Opus channel mapping family",
+            }
+            .into());
+        }
         let required = 21_usize
             .checked_add(usize::from(channels))
             .ok_or_else(|| "OpusHead mapping size overflow".to_string())?;
@@ -612,26 +715,78 @@ fn parse_opus_head(packet: &[u8]) -> Result<OpusHead, String> {
         if family == 1 && channels > 8 {
             return Err("Opus mapping family 1 supports at most 8 channels".into());
         }
+        let ambisonic_geometry = (family == 2)
+            .then(|| ambisonic_geometry(channels))
+            .transpose()?;
         let streams = packet[19];
         let coupled = packet[20];
         if streams == 0 || coupled > streams || u16::from(streams) + u16::from(coupled) > 255 {
             return Err("OpusHead stream/coupled counts are invalid".into());
         }
         let coded_channels = streams.saturating_add(coupled);
-        if packet[21..]
+        let mapping = packet[21..required].to_vec();
+        if mapping
             .iter()
             .any(|mapping| *mapping != 255 && *mapping >= coded_channels)
         {
             return Err("OpusHead channel mapping index is out of range".into());
         }
-    }
+        let ambisonics =
+            ambisonic_geometry.map(|(highest_order, ambisonic_channels, non_diegetic_stereo)| {
+                let inactive_acns: Vec<u8> = mapping[..usize::from(ambisonic_channels)]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(acn, mapping)| (*mapping == 255).then_some(acn as u8))
+                    .collect();
+                let inactive_non_diegetic_channels = if non_diegetic_stereo {
+                    ["left", "right"]
+                        .into_iter()
+                        .zip(&mapping[usize::from(ambisonic_channels)..])
+                        .filter_map(|(name, mapping)| (*mapping == 255).then_some(name))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                AmbisonicsInspection {
+                    highest_order,
+                    ambisonic_channels,
+                    active_ambisonic_channels: ambisonic_channels - inactive_acns.len() as u16,
+                    mixed_order: !inactive_acns.is_empty(),
+                    inactive_acns,
+                    inactive_non_diegetic_channels,
+                    non_diegetic_stereo,
+                    channel_order: "ACN",
+                    normalization: "SN3D",
+                }
+            });
+        (streams, coupled, Some(mapping), ambisonics)
+    };
     Ok(OpusHead {
         channels,
         pre_skip,
         original_sample_rate: input_rate,
         output_gain_q7_8,
         mapping_family: family,
+        stream_count,
+        coupled_stream_count,
+        channel_mapping,
+        ambisonics,
     })
+}
+
+fn ambisonic_geometry(channels: u8) -> Result<(u8, u16, bool), String> {
+    let channels = u16::from(channels);
+    for order in 0_u8..=14 {
+        let side = u16::from(order) + 1;
+        let ambisonic_channels = side * side;
+        if channels == ambisonic_channels {
+            return Ok((order, ambisonic_channels, false));
+        }
+        if channels == ambisonic_channels + 2 {
+            return Ok((order, ambisonic_channels, true));
+        }
+    }
+    Err("Opus mapping family 2 channel count is not permitted by RFC 8486".into())
 }
 
 pub(crate) fn validate_opus_identification(packet: &[u8]) -> Result<(u8, u16), String> {
@@ -884,6 +1039,10 @@ fn finish_chain(chain: ActiveChain) -> Result<ChainInspection, String> {
         sample_rate_hz: chain.sample_rate,
         audio_packet_count: chain.audio_packets,
         mapping_family: chain.mapping_family,
+        stream_count: chain.stream_count,
+        coupled_stream_count: chain.coupled_stream_count,
+        channel_mapping: chain.channel_mapping,
+        ambisonics: chain.ambisonics,
         original_sample_rate_hz: chain.original_sample_rate,
         output_gain_q7_8: chain.output_gain_q7_8,
         encoded_samples: (chain.codec == Codec::Opus).then_some(chain.encoded_samples),
@@ -967,29 +1126,55 @@ mod tests {
     use ogg::writing::{PacketWriteEndInfo, PacketWriter};
     use std::io::Write;
 
+    fn opus_head(
+        version: u8,
+        channels: u8,
+        family: u8,
+        streams: u8,
+        coupled: u8,
+        mapping: &[u8],
+    ) -> Vec<u8> {
+        let mut head = b"OpusHead".to_vec();
+        head.push(version);
+        head.push(channels);
+        head.extend_from_slice(&0_u16.to_le_bytes());
+        head.extend_from_slice(&48_000_u32.to_le_bytes());
+        head.extend_from_slice(&0_i16.to_le_bytes());
+        head.push(family);
+        if family != 0 {
+            head.push(streams);
+            head.push(coupled);
+            head.extend_from_slice(mapping);
+        }
+        head
+    }
+
+    fn opus_tags() -> Vec<u8> {
+        let mut tags = b"OpusTags".to_vec();
+        tags.extend_from_slice(&4_u32.to_le_bytes());
+        tags.extend_from_slice(b"test");
+        tags.extend_from_slice(&0_u32.to_le_bytes());
+        tags
+    }
+
+    fn write_chain<W: Write>(writer: &mut PacketWriter<'_, W>, serial: u32, head: Vec<u8>) {
+        writer
+            .write_packet(head, serial, PacketWriteEndInfo::EndPage, 0)
+            .unwrap();
+        writer
+            .write_packet(opus_tags(), serial, PacketWriteEndInfo::EndPage, 0)
+            .unwrap();
+        writer
+            .write_packet(vec![0], serial, PacketWriteEndInfo::EndStream, 480)
+            .unwrap();
+    }
+
     fn opus_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fixture.opus");
         let file = std::fs::File::create(&path).unwrap();
         let mut writer = PacketWriter::new(std::io::BufWriter::new(file));
-        let mut head = b"OpusHead\x01\x01".to_vec();
-        head.extend_from_slice(&0_u16.to_le_bytes());
-        head.extend_from_slice(&48_000_u32.to_le_bytes());
-        head.extend_from_slice(&0_i16.to_le_bytes());
-        head.push(0);
-        let mut tags = b"OpusTags".to_vec();
-        tags.extend_from_slice(&4_u32.to_le_bytes());
-        tags.extend_from_slice(b"test");
-        tags.extend_from_slice(&0_u32.to_le_bytes());
-        writer
-            .write_packet(head, 42, PacketWriteEndInfo::EndPage, 0)
-            .unwrap();
-        writer
-            .write_packet(tags, 42, PacketWriteEndInfo::EndPage, 0)
-            .unwrap();
-        writer
-            .write_packet(vec![0], 42, PacketWriteEndInfo::EndStream, 480)
-            .unwrap();
+        write_chain(&mut writer, 42, opus_head(1, 1, 0, 1, 0, &[]));
         writer.into_inner().flush().unwrap();
         (directory, path)
     }
@@ -1018,5 +1203,121 @@ mod tests {
         let audit = crate::container_qc::audit(&path).unwrap();
         assert!(!audit.passed);
         assert!(!audit.layers[0].passed);
+    }
+
+    #[test]
+    fn mapping_family_two_reports_full_order_acn_sn3d() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("first-order.opus");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = PacketWriter::new(std::io::BufWriter::new(file));
+        write_chain(&mut writer, 42, opus_head(1, 4, 2, 2, 2, &[0, 1, 2, 3]));
+        writer.into_inner().flush().unwrap();
+
+        let audit = crate::container_qc::audit(&path).unwrap();
+        assert!(audit.passed, "{audit:#?}");
+        let chain = &audit.properties["chains"][0];
+        assert_eq!(chain["mapping_family"], 2);
+        assert_eq!(chain["stream_count"], 2);
+        assert_eq!(chain["coupled_stream_count"], 2);
+        assert_eq!(chain["channel_mapping"], serde_json::json!([0, 1, 2, 3]));
+        assert_eq!(chain["ambisonics"]["highest_order"], 1);
+        assert_eq!(chain["ambisonics"]["ambisonic_channels"], 4);
+        assert_eq!(chain["ambisonics"]["active_ambisonic_channels"], 4);
+        assert_eq!(chain["ambisonics"]["inactive_acns"], serde_json::json!([]));
+        assert_eq!(chain["ambisonics"]["mixed_order"], false);
+        assert_eq!(chain["ambisonics"]["non_diegetic_stereo"], false);
+        assert_eq!(chain["ambisonics"]["channel_order"], "ACN");
+        assert_eq!(chain["ambisonics"]["normalization"], "SN3D");
+        assert!(audit.layers[1]
+            .checks
+            .iter()
+            .any(|check| check.rule_id == "FORGE-OPUS-AMBISONICS" && check.passed));
+    }
+
+    #[test]
+    fn mapping_family_two_reports_mixed_order_and_non_diegetic_stereo() {
+        let mapping = [0, 1, 255, 2, 3, 4, 5, 6, 7, 8, 9];
+        let head = super::parse_opus_head(&opus_head(1, 11, 2, 10, 0, &mapping)).unwrap();
+        let ambisonics = head.ambisonics.unwrap();
+        assert_eq!(ambisonics.highest_order, 2);
+        assert_eq!(ambisonics.ambisonic_channels, 9);
+        assert_eq!(ambisonics.active_ambisonic_channels, 8);
+        assert_eq!(ambisonics.inactive_acns, vec![2]);
+        assert!(ambisonics.mixed_order);
+        assert!(ambisonics.non_diegetic_stereo);
+    }
+
+    #[test]
+    fn mapping_family_two_rejects_invalid_geometry_and_mapping_index() {
+        let invalid_count = opus_head(1, 2, 2, 2, 0, &[0, 1]);
+        assert!(super::parse_opus_head(&invalid_count)
+            .unwrap_err()
+            .contains("not permitted"));
+
+        let invalid_mapping = opus_head(1, 3, 2, 2, 0, &[0, 1, 2]);
+        assert!(super::parse_opus_head(&invalid_mapping)
+            .unwrap_err()
+            .contains("out of range"));
+    }
+
+    #[test]
+    fn mapping_family_two_reports_silent_non_diegetic_channel() {
+        let head = super::parse_opus_head(&opus_head(1, 3, 2, 2, 0, &[0, 1, 255])).unwrap();
+        let ambisonics = head.ambisonics.unwrap();
+        assert_eq!(ambisonics.inactive_non_diegetic_channels, vec!["right"]);
+    }
+
+    #[test]
+    fn mapping_family_two_accepts_fourteenth_order_boundary() {
+        let mapping: Vec<u8> = (0..227).map(|channel| channel as u8).collect();
+        let head = super::parse_opus_head(&opus_head(1, 227, 2, 227, 0, &mapping)).unwrap();
+        let ambisonics = head.ambisonics.unwrap();
+        assert_eq!(ambisonics.highest_order, 14);
+        assert_eq!(ambisonics.ambisonic_channels, 225);
+        assert!(ambisonics.non_diegetic_stereo);
+
+        let invalid = opus_head(
+            1,
+            228,
+            2,
+            228,
+            0,
+            &(0..228).map(|i| i as u8).collect::<Vec<_>>(),
+        );
+        assert!(super::parse_opus_head(&invalid).is_err());
+    }
+
+    #[test]
+    fn mapping_family_three_is_not_parsed_as_family_two_table() {
+        let family_three = opus_head(1, 4, 3, 2, 2, &[0, 1, 2, 3]);
+        assert!(super::parse_opus_head(&family_three)
+            .unwrap_err()
+            .contains("demixing-matrix"));
+    }
+
+    #[test]
+    fn compatible_future_version_ignores_extension_bytes_after_mapping() {
+        let mut head = opus_head(2, 1, 2, 1, 0, &[0]);
+        head.extend_from_slice(&[255, 255]);
+        assert!(super::parse_opus_head(&head).is_ok());
+    }
+
+    #[test]
+    fn chained_opus_rejects_changed_mapping_with_same_channel_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("changed-layout.opus");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = PacketWriter::new(std::io::BufWriter::new(file));
+        write_chain(&mut writer, 42, opus_head(1, 4, 1, 2, 2, &[0, 1, 2, 3]));
+        write_chain(&mut writer, 43, opus_head(1, 4, 2, 2, 2, &[0, 1, 2, 3]));
+        writer.into_inner().flush().unwrap();
+
+        let audit = crate::container_qc::audit(&path).unwrap();
+        assert!(!audit.passed);
+        assert!(audit.layers[1].checks.iter().any(|check| {
+            check.rule_id == "FORGE-OGG-CODEC"
+                && check.message.contains("change channel mapping layout")
+        }));
     }
 }
