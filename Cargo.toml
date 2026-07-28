@@ -92,6 +92,10 @@ path = "src/bin/forge-rtp-qc.rs"
 name = "forge-nmos-qc"
 path = "src/bin/forge-nmos-qc.rs"
 
+[[bin]]
+name = "forge-st2022-7-qc"
+path = "src/bin/forge-st2022-7-qc.rs"
+
 [dependencies]
 rayon = "1.10"
 clap = { version = "4.5", features = ["derive"] }
