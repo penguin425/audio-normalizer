@@ -822,15 +822,22 @@ fn validate_chna(input: &Path, parsed: &ParsedAdm) -> Result<Vec<AdmProfileRule>
     }
     let num_tracks = u16::from_le_bytes(body[0..2].try_into().unwrap());
     let num_uids = u16::from_le_bytes(body[2..4].try_into().unwrap());
-    let expected_size = 4_usize.saturating_add(usize::from(num_uids).saturating_mul(40));
-    let structure_passed = body.len() == expected_size;
+    let records_bytes = body.len() - 4;
+    let capacity = records_bytes / 40;
+    let used_size = usize::from(num_uids).saturating_mul(40);
+    let structure_passed = records_bytes.is_multiple_of(40)
+        && capacity >= usize::from(num_uids)
+        && body
+            .get(4 + used_size..)
+            .is_some_and(|unused| unused.iter().all(|byte| *byte == 0));
     let mut rules = vec![AdmProfileRule {
         rule_id: "BS2076-3-CHNA-STRUCTURE",
         path: "/chna".into(),
-        requirement: "chna size shall equal its header plus 40 bytes per declared audioID".into(),
+        requirement:
+            "chna shall hold every declared 40-byte audioID and zero-fill unused records".into(),
         observed: format!(
-            "{} byte(s), {num_tracks} track(s), {num_uids} audioID record(s)",
-            body.len()
+            "{} byte(s), {num_tracks} track(s), {num_uids} used audioID(s), {capacity} record slot(s)",
+            body.len(),
         ),
         passed: structure_passed,
     }];
@@ -851,7 +858,7 @@ fn validate_chna(input: &Path, parsed: &ParsedAdm) -> Result<Vec<AdmProfileRule>
 
     let mut track_indices = Vec::with_capacity(usize::from(num_uids));
     let mut chna_uids = Vec::with_capacity(usize::from(num_uids));
-    for entry in body[4..].chunks_exact(40) {
+    for entry in body[4..4 + used_size].chunks_exact(40) {
         track_indices.push(u16::from_le_bytes(entry[..2].try_into().unwrap()));
         chna_uids.push(
             String::from_utf8_lossy(&entry[2..14])
@@ -1038,6 +1045,10 @@ mod tests {
     };
 
     fn write_adm_fixture(path: &Path, axml: &[u8]) {
+        write_adm_fixture_with_unused_records(path, axml, 0);
+    }
+
+    fn write_adm_fixture_with_unused_records(path: &Path, axml: &[u8], unused_records: usize) {
         let buffer = AudioBuffer {
             sample_rate: 48_000,
             channels: 1,
@@ -1054,6 +1065,7 @@ mod tests {
         chna.extend_from_slice(&[0; 14]);
         chna.extend_from_slice(&[0; 11]);
         chna.push(0);
+        chna.resize(chna.len() + unused_records * 40, 0);
         WavWriter::write_with_metadata(
             path,
             &buffer,
@@ -1094,6 +1106,30 @@ mod tests {
         assert_eq!(result.standard, "EBU Tech 3393");
         assert_eq!(result.profile_version, "1.0");
         assert_eq!(result.profile_level, "1");
+    }
+
+    #[test]
+    fn chna_accepts_zero_filled_unused_record_capacity() {
+        let work = tempfile::tempdir().unwrap();
+        let input = work.path().join("reserved-chna-capacity.bw64");
+        write_adm_fixture_with_unused_records(
+            &input,
+            br#"<audioFormatExtended version="ITU-R_BS.2076-3">
+  <profileList>
+    <profile profileName="EBU Production Profile" profileVersion="1.0" profileLevel="1">EBU Tech 3393</profile>
+  </profileList>
+  <audioTrackUID UID="ATU_00000001"/>
+</audioFormatExtended>"#,
+            2,
+        );
+
+        let result = validate_production_profile(&input, ProductionProfileMode::Write).unwrap();
+        assert!(result.passed, "{:#?}", result.rules);
+        assert!(result.rules.iter().any(|rule| {
+            rule.rule_id == "BS2076-3-CHNA-STRUCTURE"
+                && rule.passed
+                && rule.observed.contains("3 record slot(s)")
+        }));
     }
 
     #[test]

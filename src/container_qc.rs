@@ -1,8 +1,11 @@
 //! Wrapper, bitstream, and metadata cross-checks for delivery containers.
 
+use quick_xml::escape::unescape;
+use quick_xml::events::Event;
+use quick_xml::Reader;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -11,6 +14,8 @@ pub const CONTAINER_QC_SCHEMA: &str =
     "https://penguin425.github.io/audio-normalizer/schema/container-qc-v1";
 const MAX_WAVE_CHUNKS: usize = 100_000;
 const MAX_CONTROL_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_IXML_DEPTH: usize = 64;
+const MAX_IXML_ELEMENTS: usize = 100_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ContainerAudit {
@@ -106,7 +111,10 @@ struct WaveState {
     bext_count: usize,
     bext: Option<BextInfo>,
     axml: bool,
-    chna: bool,
+    chna_count: usize,
+    chna: Option<ChnaInfo>,
+    ixml_count: usize,
+    ixml: Option<IxmlInfo>,
     ds64_table: HashMap<[u8; 4], VecDeque<u64>>,
 }
 
@@ -123,6 +131,48 @@ struct BextInfo {
     loudness: Option<Value>,
     coding_history_rows: usize,
     coding_history_bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct IxmlInfo {
+    version: Option<String>,
+    declared_track_count: Option<usize>,
+    tracks: Vec<IxmlTrack>,
+    #[serde(skip)]
+    track_list_count: usize,
+    #[serde(skip)]
+    track_count_field_count: usize,
+    #[serde(skip)]
+    invalid_channel_indices: Vec<String>,
+    #[serde(skip)]
+    invalid_interleave_indices: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct IxmlTrack {
+    channel_index: Option<u32>,
+    interleave_index: Option<u32>,
+    name: Option<String>,
+    function: Option<String>,
+}
+
+#[derive(Debug)]
+struct ChnaInfo {
+    declared_tracks: u16,
+    track_indices: Vec<u16>,
+}
+
+#[derive(Default)]
+struct ParsedIxml {
+    top_level_count: usize,
+    root_count: usize,
+    track_list_count: usize,
+    track_count_values: Vec<String>,
+    version_values: Vec<String>,
+    tracks: Vec<IxmlTrack>,
+    active_track: Option<IxmlTrack>,
+    invalid_channel_indices: Vec<String>,
+    invalid_interleave_indices: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -298,7 +348,26 @@ fn audit_wave(
                 }
             }
             b"axml" => state.axml = true,
-            b"chna" => state.chna = true,
+            b"chna" => {
+                state.chna_count += 1;
+                if state.chna.is_none() {
+                    if let Some(body) =
+                        read_control_chunk(path, file, offset, size, &mut wrapper, "chna")?
+                    {
+                        state.chna = parse_chna(&body);
+                    }
+                }
+            }
+            b"iXML" => {
+                state.ixml_count += 1;
+                if state.ixml.is_none() {
+                    if let Some(body) =
+                        read_control_chunk(path, file, offset, size, &mut wrapper, "iXML")?
+                    {
+                        state.ixml = parse_ixml(&body, &mut xcheck);
+                    }
+                }
+            }
             _ => {}
         }
         offset = end;
@@ -465,17 +534,36 @@ fn audit_wave(
             })),
         ));
     }
-    if state.axml || state.chna {
+    if state.axml || state.chna_count > 0 {
+        let chna_present = state.chna_count > 0;
         xcheck.push(check(
             "FORGE-ADM-CHUNK-PAIR",
-            state.axml && state.chna,
-            if state.axml && state.chna {
+            state.axml && chna_present,
+            if state.axml && chna_present {
                 "axml and chna ADM chunks are both present"
             } else {
                 "ADM requires both axml and chna chunks"
             },
-            Some(json!({"axml": state.axml, "chna": state.chna})),
+            Some(json!({"axml": state.axml, "chna": chna_present})),
         ));
+    }
+    if state.ixml_count > 0 {
+        xcheck.push(check(
+            "FORGE-IXML-UNIQUE",
+            state.ixml_count == 1,
+            if state.ixml_count == 1 {
+                "exactly one iXML chunk is present"
+            } else {
+                "WAVE interoperability requires exactly one iXML chunk"
+            },
+            Some(json!(state.ixml_count)),
+        ));
+    }
+    if let (Some(ixml), Some(fmt)) = (&state.ixml, state.fmt) {
+        validate_ixml_tracks(ixml, fmt.channels, &mut xcheck);
+        if state.chna_count > 0 {
+            cross_check_ixml_chna(ixml, state.chna.as_ref(), fmt.channels, &mut xcheck);
+        }
     }
     let bext_properties = state.bext.as_ref().map(|bext| {
         json!({
@@ -500,7 +588,8 @@ fn audit_wave(
         "sample_rate_hz": state.fmt.map(|fmt| fmt.sample_rate),
         "channels": state.fmt.map(|fmt| fmt.channels),
         "bits_per_sample": state.fmt.map(|fmt| fmt.bits_per_sample),
-        "bext": bext_properties
+        "bext": bext_properties,
+        "ixml": state.ixml
     });
     Ok(finish_audit(
         path, "wave", wrapper, bitstream, xcheck, properties,
@@ -767,6 +856,414 @@ fn hex_bytes(bytes: &[u8]) -> String {
         output.push(HEX[usize::from(byte & 0x0f)] as char);
     }
     output
+}
+
+fn parse_ixml(body: &[u8], checks: &mut Vec<AuditCheck>) -> Option<IxmlInfo> {
+    let parsed = match read_ixml(body) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            checks.push(check(
+                "FORGE-IXML-XML",
+                false,
+                format!("iXML is not safe, well-formed XML: {error}"),
+                Some(json!({"bytes": body.len()})),
+            ));
+            return None;
+        }
+    };
+    checks.push(check(
+        "FORGE-IXML-XML",
+        true,
+        "iXML is well-formed XML within the parser safety limits",
+        Some(json!({"bytes": body.len()})),
+    ));
+
+    let root_valid = parsed.top_level_count == 1 && parsed.root_count == 1;
+    checks.push(check(
+        "FORGE-IXML-ROOT",
+        root_valid,
+        if root_valid {
+            "iXML has one BWFXML document root"
+        } else {
+            "iXML must have exactly one BWFXML document root"
+        },
+        Some(json!({
+            "top_level_elements": parsed.top_level_count,
+            "bwfxml_roots": parsed.root_count
+        })),
+    ));
+
+    let track_list_valid = parsed.track_list_count <= 1;
+    checks.push(check(
+        "FORGE-IXML-TRACK-LIST",
+        track_list_valid,
+        if track_list_valid {
+            "iXML contains at most one TRACK_LIST"
+        } else {
+            "iXML must not contain multiple TRACK_LIST objects"
+        },
+        Some(json!(parsed.track_list_count)),
+    ));
+
+    let declared_track_count = (parsed.track_count_values.len() == 1)
+        .then(|| parsed.track_count_values[0].parse::<usize>().ok())
+        .flatten();
+    Some(IxmlInfo {
+        version: (parsed.version_values.len() == 1).then(|| parsed.version_values[0].clone()),
+        declared_track_count,
+        tracks: parsed.tracks,
+        track_list_count: parsed.track_list_count,
+        track_count_field_count: parsed.track_count_values.len(),
+        invalid_channel_indices: parsed.invalid_channel_indices,
+        invalid_interleave_indices: parsed.invalid_interleave_indices,
+    })
+}
+
+fn read_ixml(body: &[u8]) -> Result<ParsedIxml, String> {
+    let mut reader = Reader::from_reader(body);
+    reader.config_mut().trim_text(true);
+    let mut parsed = ParsedIxml::default();
+    let mut stack = Vec::<String>::new();
+    let mut text_stack = Vec::<String>::new();
+    let mut elements = 0_usize;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                elements += 1;
+                if elements > MAX_IXML_ELEMENTS {
+                    return Err(format!("element count exceeds {MAX_IXML_ELEMENTS}"));
+                }
+                if stack.len() == MAX_IXML_DEPTH {
+                    return Err(format!("nesting depth exceeds {MAX_IXML_DEPTH}"));
+                }
+                let name = xml_local_name(element.name().as_ref());
+                if stack.is_empty() {
+                    parsed.top_level_count += 1;
+                    if name == "BWFXML" {
+                        parsed.root_count += 1;
+                    }
+                }
+                if name == "TRACK_LIST" {
+                    parsed.track_list_count += 1;
+                } else if name == "TRACK"
+                    && stack.last().is_some_and(|parent| parent == "TRACK_LIST")
+                {
+                    if parsed.active_track.is_some() {
+                        return Err("nested TRACK objects are not supported".into());
+                    }
+                    parsed.active_track = Some(IxmlTrack::default());
+                }
+                stack.push(name);
+                text_stack.push(String::new());
+            }
+            Ok(Event::Empty(element)) => {
+                elements += 1;
+                if elements > MAX_IXML_ELEMENTS {
+                    return Err(format!("element count exceeds {MAX_IXML_ELEMENTS}"));
+                }
+                if stack.len() == MAX_IXML_DEPTH {
+                    return Err(format!("nesting depth exceeds {MAX_IXML_DEPTH}"));
+                }
+                let name = xml_local_name(element.name().as_ref());
+                if stack.is_empty() {
+                    parsed.top_level_count += 1;
+                    if name == "BWFXML" {
+                        parsed.root_count += 1;
+                    }
+                }
+                if name == "TRACK_LIST" {
+                    parsed.track_list_count += 1;
+                } else if name == "TRACK"
+                    && stack.last().is_some_and(|parent| parent == "TRACK_LIST")
+                {
+                    parsed.active_track = Some(IxmlTrack::default());
+                }
+                close_ixml_element(&name, "", stack.last().map(String::as_str), &mut parsed)?;
+            }
+            Ok(Event::Text(text)) => {
+                if let Some(value) = text_stack.last_mut() {
+                    let decoded = text
+                        .xml10_content()
+                        .map_err(|error| format!("decode XML text: {error}"))?;
+                    value.push_str(
+                        &unescape(&decoded)
+                            .map_err(|error| format!("decode XML entity: {error}"))?,
+                    );
+                }
+            }
+            Ok(Event::CData(text)) => {
+                if let Some(value) = text_stack.last_mut() {
+                    value.push_str(
+                        &text
+                            .xml10_content()
+                            .map_err(|error| format!("decode XML CDATA: {error}"))?,
+                    );
+                }
+            }
+            Ok(Event::End(element)) => {
+                let expected = stack
+                    .pop()
+                    .ok_or_else(|| "closing element without an open element".to_string())?;
+                let actual = xml_local_name(element.name().as_ref());
+                if actual != expected {
+                    return Err(format!(
+                        "closing element {actual} does not match {expected}"
+                    ));
+                }
+                let value = text_stack.pop().unwrap_or_default();
+                close_ixml_element(
+                    &actual,
+                    value.trim(),
+                    stack.last().map(String::as_str),
+                    &mut parsed,
+                )?;
+            }
+            Ok(Event::DocType(_)) => return Err("DOCTYPE declarations are not allowed".into()),
+            Ok(Event::Eof) => break,
+            Err(error) => {
+                return Err(format!(
+                    "XML error at byte {}: {error}",
+                    reader.error_position()
+                ))
+            }
+            _ => {}
+        }
+    }
+    if !stack.is_empty() {
+        return Err("XML ended with unclosed elements".into());
+    }
+    Ok(parsed)
+}
+
+fn close_ixml_element(
+    name: &str,
+    value: &str,
+    parent: Option<&str>,
+    parsed: &mut ParsedIxml,
+) -> Result<(), String> {
+    match (parent, name) {
+        (Some("BWFXML"), "IXML_VERSION") => parsed.version_values.push(value.to_owned()),
+        (Some("TRACK_LIST"), "TRACK_COUNT") => parsed.track_count_values.push(value.to_owned()),
+        (Some("TRACK"), "CHANNEL_INDEX") => set_ixml_index(
+            &mut parsed.active_track,
+            value,
+            "CHANNEL_INDEX",
+            &mut parsed.invalid_channel_indices,
+            |track| &mut track.channel_index,
+        ),
+        (Some("TRACK"), "INTERLEAVE_INDEX") => set_ixml_index(
+            &mut parsed.active_track,
+            value,
+            "INTERLEAVE_INDEX",
+            &mut parsed.invalid_interleave_indices,
+            |track| &mut track.interleave_index,
+        ),
+        (Some("TRACK"), "NAME") => {
+            if let Some(track) = &mut parsed.active_track {
+                track.name = nonempty(value);
+            }
+        }
+        (Some("TRACK"), "FUNCTION") => {
+            if let Some(track) = &mut parsed.active_track {
+                track.function = nonempty(value);
+            }
+        }
+        (Some("TRACK_LIST"), "TRACK") => {
+            let track = parsed
+                .active_track
+                .take()
+                .ok_or_else(|| "TRACK closed without a matching start".to_string())?;
+            parsed.tracks.push(track);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn set_ixml_index(
+    track: &mut Option<IxmlTrack>,
+    value: &str,
+    field: &str,
+    invalid: &mut Vec<String>,
+    select: impl FnOnce(&mut IxmlTrack) -> &mut Option<u32>,
+) {
+    let Some(track) = track else {
+        return;
+    };
+    let target = select(track);
+    let parsed = value.parse::<u32>().ok().filter(|value| *value > 0);
+    if target.is_some() || parsed.is_none() {
+        invalid.push(format!("TRACK {} {field}", invalid.len() + 1));
+    } else {
+        *target = parsed;
+    }
+}
+
+fn nonempty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn xml_local_name(name: &[u8]) -> String {
+    String::from_utf8_lossy(name.rsplit(|byte| *byte == b':').next().unwrap_or(name)).into_owned()
+}
+
+fn validate_ixml_tracks(ixml: &IxmlInfo, channels: u16, checks: &mut Vec<AuditCheck>) {
+    let track_count_valid = if ixml.track_list_count == 0 {
+        ixml.track_count_field_count == 0 && ixml.tracks.is_empty()
+    } else {
+        (ixml.track_count_field_count == 0
+            || (ixml.track_count_field_count == 1
+                && ixml.declared_track_count == Some(ixml.tracks.len())))
+            && ixml.tracks.len() == usize::from(channels)
+    };
+    checks.push(check(
+        "FORGE-IXML-TRACK-COUNT",
+        track_count_valid,
+        if ixml.track_list_count == 0 {
+            "optional TRACK_LIST is absent"
+        } else if track_count_valid {
+            "TRACK objects match PCM channels and optional TRACK_COUNT is consistent"
+        } else {
+            "TRACK objects must match PCM channels and optional TRACK_COUNT must be consistent"
+        },
+        Some(json!({
+            "fields": ixml.track_count_field_count,
+            "declared": ixml.declared_track_count,
+            "track_objects": ixml.tracks.len(),
+            "pcm_channels": channels
+        })),
+    ));
+
+    let channel_indices = ixml
+        .tracks
+        .iter()
+        .filter_map(|track| track.channel_index)
+        .collect::<Vec<_>>();
+    let channel_valid = ixml.invalid_channel_indices.is_empty();
+    checks.push(check(
+        "FORGE-IXML-CHANNEL-INDEX",
+        channel_valid,
+        if channel_valid {
+            "populated CHANNEL_INDEX values use one-based positive source numbers"
+        } else {
+            "CHANNEL_INDEX values must be one-based positive integers"
+        },
+        Some(json!({
+            "channel_indices": channel_indices,
+            "invalid_fields": ixml.invalid_channel_indices
+        })),
+    ));
+
+    let interleave_indices = ixml
+        .tracks
+        .iter()
+        .filter_map(|track| track.interleave_index)
+        .collect::<Vec<_>>();
+    let provided = interleave_indices.len();
+    let unique = interleave_indices.iter().collect::<HashSet<_>>().len() == provided;
+    let in_range = interleave_indices
+        .iter()
+        .all(|index| *index <= u32::from(channels));
+    let complete = provided == ixml.tracks.len();
+    let coverage = (1..=u32::from(channels)).all(|index| interleave_indices.contains(&index));
+    let interleave_valid = ixml.invalid_interleave_indices.is_empty()
+        && (provided == 0
+            || (complete
+                && unique
+                && in_range
+                && coverage
+                && ixml.tracks.len() == usize::from(channels)));
+    checks.push(check(
+        "FORGE-IXML-INTERLEAVE-INDEX",
+        interleave_valid,
+        if provided == 0 {
+            "optional INTERLEAVE_INDEX values are absent"
+        } else if interleave_valid {
+            "INTERLEAVE_INDEX values map every PCM channel exactly once"
+        } else {
+            "populated INTERLEAVE_INDEX values must uniquely cover every PCM channel"
+        },
+        Some(json!({
+            "interleave_indices": interleave_indices,
+            "invalid_fields": ixml.invalid_interleave_indices,
+            "pcm_channels": channels
+        })),
+    ));
+}
+
+fn parse_chna(body: &[u8]) -> Option<ChnaInfo> {
+    if body.len() < 4 || !(body.len() - 4).is_multiple_of(40) {
+        return None;
+    }
+    let declared_tracks = u16::from_le_bytes(body[..2].try_into().unwrap());
+    let num_uids = usize::from(u16::from_le_bytes(body[2..4].try_into().unwrap()));
+    let required = 4_usize.checked_add(num_uids.checked_mul(40)?)?;
+    if body.len() < required {
+        return None;
+    }
+    if body[required..].iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    Some(ChnaInfo {
+        declared_tracks,
+        track_indices: body[4..required]
+            .chunks_exact(40)
+            .map(|entry| u16::from_le_bytes(entry[..2].try_into().unwrap()))
+            .collect(),
+    })
+}
+
+fn cross_check_ixml_chna(
+    ixml: &IxmlInfo,
+    chna: Option<&ChnaInfo>,
+    channels: u16,
+    checks: &mut Vec<AuditCheck>,
+) {
+    let ixml_indices = ixml
+        .tracks
+        .iter()
+        .filter_map(|track| track.interleave_index)
+        .map(|index| u16::try_from(index).ok())
+        .collect::<Option<Vec<_>>>();
+    let ixml_complete = ixml_indices
+        .as_ref()
+        .is_some_and(|indices| indices.len() == usize::from(channels));
+    let chna_set = chna.map(|info| info.track_indices.iter().copied().collect::<HashSet<_>>());
+    let chna_valid = chna.is_some_and(|info| {
+        info.declared_tracks == channels
+            && chna_set.as_ref().is_some_and(|indices| {
+                indices.len() == usize::from(channels)
+                    && (1..=channels).all(|index| indices.contains(&index))
+            })
+    });
+    let passed = if !chna_valid {
+        false
+    } else if ixml_complete {
+        ixml_indices.as_ref().is_some_and(|indices| {
+            indices.iter().copied().collect::<HashSet<_>>() == *chna_set.as_ref().unwrap()
+        })
+    } else {
+        true
+    };
+    checks.push(check(
+        "FORGE-IXML-CHNA-XCHECK",
+        passed,
+        if !chna_valid {
+            "chna is malformed or does not map every declared PCM track"
+        } else if !ixml_complete {
+            "iXML has no complete INTERLEAVE_INDEX map; optional ADM reconciliation was skipped"
+        } else if passed {
+            "iXML INTERLEAVE_INDEX values match the ADM chna track indexes"
+        } else {
+            "iXML INTERLEAVE_INDEX values do not match ADM chna track indexes"
+        },
+        Some(json!({
+            "ixml_interleave_indices": ixml_indices,
+            "chna_declared_tracks": chna.map(|info| info.declared_tracks),
+            "chna_track_indices": chna.map(|info| &info.track_indices)
+        })),
+    ));
 }
 
 fn read_control_chunk(
@@ -1126,6 +1623,147 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.rule_id == "FORGE-BWF-BEXT-UMID" && !check.passed));
+    }
+
+    fn stereo_audio() -> AudioBuffer {
+        AudioBuffer {
+            sample_rate: 48_000,
+            channels: 2,
+            frames: 10,
+            data: vec![vec![0.0; 10], vec![0.0; 10]],
+            channel_roles: crate::wav::default_channel_roles(2),
+            source_kind: PcmKind::S16,
+        }
+    }
+
+    fn chna(indices: &[u16], declared_tracks: u16, unused_slots: usize) -> Vec<u8> {
+        let mut body = Vec::with_capacity(4 + (indices.len() + unused_slots) * 40);
+        body.extend_from_slice(&declared_tracks.to_le_bytes());
+        body.extend_from_slice(&(indices.len() as u16).to_le_bytes());
+        for (uid, index) in indices.iter().enumerate() {
+            let mut record = [0_u8; 40];
+            record[..2].copy_from_slice(&index.to_le_bytes());
+            record[2..14].copy_from_slice(format!("ATU_{:08X}", uid + 1).as_bytes());
+            body.extend_from_slice(&record);
+        }
+        body.resize(body.len() + unused_slots * 40, 0);
+        body
+    }
+
+    fn write_ixml_fixture(path: &Path, ixml: &[u8], chna_body: Option<Vec<u8>>) {
+        let mut chunks = vec![WaveChunk {
+            id: *b"iXML",
+            body: ixml.to_vec(),
+        }];
+        if let Some(chna_body) = chna_body {
+            chunks.push(WaveChunk {
+                id: *b"axml",
+                body: b"<ebuCoreMain/>".to_vec(),
+            });
+            chunks.push(WaveChunk {
+                id: *b"chna",
+                body: chna_body,
+            });
+        }
+        WavWriter::write_with_metadata(
+            path,
+            &stereo_audio(),
+            PcmKind::S16,
+            false,
+            WavContainer::Riff,
+            &chunks,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn ixml_track_map_is_reported_and_matches_adm_chna() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ixml-adm.wav");
+        let ixml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<BWFXML>
+  <IXML_VERSION>1.52</IXML_VERSION>
+  <TRACK_LIST>
+    <TRACK_COUNT>2</TRACK_COUNT>
+    <TRACK>
+      <CHANNEL_INDEX>6</CHANNEL_INDEX>
+      <INTERLEAVE_INDEX>2</INTERLEAVE_INDEX>
+      <NAME>Side</NAME>
+      <FUNCTION>S-MID_SIDE</FUNCTION>
+    </TRACK>
+    <TRACK>
+      <CHANNEL_INDEX>4</CHANNEL_INDEX>
+      <INTERLEAVE_INDEX>1</INTERLEAVE_INDEX>
+      <NAME>Mid</NAME>
+      <FUNCTION>M-MID_SIDE</FUNCTION>
+    </TRACK>
+  </TRACK_LIST>
+</BWFXML>"#;
+        write_ixml_fixture(&path, ixml, Some(chna(&[1, 2], 2, 1)));
+
+        let result = audit(&path).unwrap();
+        assert!(result.passed, "{result:#?}");
+        assert_eq!(result.properties["ixml"]["version"], "1.52");
+        assert_eq!(result.properties["ixml"]["declared_track_count"], 2);
+        assert_eq!(result.properties["ixml"]["tracks"][0]["channel_index"], 6);
+        assert!(result.layers[2]
+            .checks
+            .iter()
+            .any(|check| check.rule_id == "FORGE-IXML-CHNA-XCHECK" && check.passed));
+    }
+
+    #[test]
+    fn ixml_rejects_bad_counts_indexes_and_chna_mapping() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("invalid-ixml-adm.wav");
+        let ixml = br#"<BWFXML><TRACK_LIST>
+<TRACK_COUNT>1</TRACK_COUNT>
+<TRACK><CHANNEL_INDEX>0</CHANNEL_INDEX><INTERLEAVE_INDEX>1</INTERLEAVE_INDEX></TRACK>
+<TRACK><CHANNEL_INDEX>6</CHANNEL_INDEX><INTERLEAVE_INDEX>1</INTERLEAVE_INDEX></TRACK>
+</TRACK_LIST></BWFXML>"#;
+        write_ixml_fixture(&path, ixml, Some(chna(&[1, 1], 2, 0)));
+
+        let result = audit(&path).unwrap();
+        assert!(!result.passed);
+        let failed = result.layers[2]
+            .checks
+            .iter()
+            .filter(|check| !check.passed)
+            .map(|check| check.rule_id)
+            .collect::<Vec<_>>();
+        for rule in [
+            "FORGE-IXML-TRACK-COUNT",
+            "FORGE-IXML-CHANNEL-INDEX",
+            "FORGE-IXML-INTERLEAVE-INDEX",
+            "FORGE-IXML-CHNA-XCHECK",
+        ] {
+            assert!(failed.contains(&rule), "missing {rule}: {result:#?}");
+        }
+    }
+
+    #[test]
+    fn ixml_rejects_doctype_and_allows_descriptive_only_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let valid_path = directory.path().join("descriptive-ixml.wav");
+        write_ixml_fixture(
+            &valid_path,
+            b"<BWFXML><IXML_VERSION>1.52</IXML_VERSION><PROJECT>Forge</PROJECT></BWFXML>",
+            None,
+        );
+        assert!(audit(&valid_path).unwrap().passed);
+
+        let invalid_path = directory.path().join("doctype-ixml.wav");
+        write_ixml_fixture(
+            &invalid_path,
+            b"<!DOCTYPE BWFXML [<!ENTITY x \"bad\">]><BWFXML><NOTE>&x;</NOTE></BWFXML>",
+            None,
+        );
+        let result = audit(&invalid_path).unwrap();
+        assert!(!result.passed);
+        assert!(result.layers[2]
+            .checks
+            .iter()
+            .any(|check| check.rule_id == "FORGE-IXML-XML" && !check.passed));
     }
 
     #[test]

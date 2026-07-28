@@ -123,6 +123,46 @@ fn container_qc_cli_reports_ebu_bext_metadata_and_failures() {
 }
 
 #[test]
+fn container_qc_cli_reports_ixml_track_mapping() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("ixml.wav");
+    let audio = AudioBuffer {
+        sample_rate: 48_000,
+        channels: 2,
+        frames: 100,
+        data: vec![vec![0.0; 100], vec![0.0; 100]],
+        channel_roles: vec![ChannelRole::Main, ChannelRole::Main],
+        source_kind: PcmKind::S16,
+    };
+    WavWriter::write_with_metadata(
+        &path,
+        &audio,
+        PcmKind::S16,
+        false,
+        WavContainer::Riff,
+        &[WaveChunk {
+            id: *b"iXML",
+            body: br#"<BWFXML><IXML_VERSION>1.52</IXML_VERSION><TRACK_LIST>
+<TRACK_COUNT>2</TRACK_COUNT>
+<TRACK><CHANNEL_INDEX>4</CHANNEL_INDEX><INTERLEAVE_INDEX>1</INTERLEAVE_INDEX><NAME>Mid</NAME></TRACK>
+<TRACK><CHANNEL_INDEX>6</CHANNEL_INDEX><INTERLEAVE_INDEX>2</INTERLEAVE_INDEX><NAME>Side</NAME></TRACK>
+</TRACK_LIST></BWFXML>"#
+                .to_vec(),
+        }],
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(audit["properties"]["ixml"]["declared_track_count"], 2);
+    assert_eq!(audit["properties"]["ixml"]["tracks"][1]["channel_index"], 6);
+}
+
+#[test]
 fn container_qc_cli_reports_malformed_isobmff_as_qc_failure() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("programme.m4a");
