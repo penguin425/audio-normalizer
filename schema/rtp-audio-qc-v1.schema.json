@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/rtp-audio-qc-v1",
+  "title": "Forge RTP audio QC report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "generator", "sdp_path", "profile", "passed", "warning_count", "findings", "properties"],
+  "properties": {
+    "schema": {"const": "https://penguin425.github.io/audio-normalizer/schema/rtp-audio-qc-v1"},
+    "generator": {"const": "forge-rtp-qc"},
+    "sdp_path": {"type": "string"},
+    "capture_path": {"type": "string"},
+    "profile": {"enum": ["rfc3550", "aes67", "smpte2110-30", "smpte2110-31"]},
+    "passed": {"type": "boolean"},
+    "warning_count": {"type": "integer", "minimum": 0},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rule_id", "severity", "passed", "message"],
+        "properties": {
+          "rule_id": {"type": "string", "pattern": "^FORGE-[A-Z0-9-]+$"},
+          "severity": {"enum": ["error", "warning"]},
+          "passed": {"type": "boolean"},
+          "message": {"type": "string"},
+          "observed": true
+        }
+      }
+    },
+    "properties": {"type": "object"}
+  }
+}

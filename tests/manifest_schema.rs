@@ -632,3 +632,38 @@ fn emitted_imf_qc_conforms_to_published_schema() {
         .collect();
     assert!(errors.is_empty(), "schema violations: {errors:#?}");
 }
+
+#[test]
+fn emitted_rtp_audio_qc_conforms_to_published_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("stream.sdp");
+    std::fs::write(
+        &path,
+        "v=0\r\n\
+o=- 1 1 IN IP4 192.0.2.1\r\n\
+s=Schema test\r\n\
+c=IN IP4 239.1.2.3/32\r\n\
+t=0 0\r\n\
+m=audio 5004 RTP/AVP 96\r\n\
+a=rtpmap:96 L24/48000/2\r\n\
+a=ptime:1\r\n\
+a=ts-refclk:ptp=IEEE1588-2008:00-11-22-FF-FE-33-44-55:0\r\n\
+a=mediaclk:direct=0\r\n",
+    )
+    .unwrap();
+    let audit = forge_normalizer::rtp_qc::audit(
+        &path,
+        None,
+        forge_normalizer::rtp_qc::RtpAudioProfile::Aes67,
+    )
+    .unwrap();
+    let instance = serde_json::to_value(audit).unwrap();
+    let schema: Value = serde_json::from_str(include_str!("../schema/rtp-audio-qc-v1.schema.json"))
+        .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
