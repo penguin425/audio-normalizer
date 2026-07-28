@@ -100,6 +100,48 @@ fn streaming_qc_cli_audits_dash_and_selects_profile() {
 }
 
 #[test]
+fn streaming_qc_cli_selects_dash_live_profile() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("live.mpd");
+    std::fs::write(
+        &input,
+        r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic"
+ profiles="http://dashif.org/guidelines/dash-if-uhd#hevc"
+ availabilityStartTime="2026-07-29T00:00:00Z"
+ publishTime="2026-07-29T00:00:20Z"
+ minimumUpdatePeriod="PT2S" minBufferTime="PT1S"
+ timeShiftBufferDepth="PT30S" suggestedPresentationDelay="PT3S">
+ <UTCTiming schemeIdUri="urn:mpeg:dash:utc:direct:2014"
+  value="2026-07-29T00:00:20Z"/>
+ <ServiceDescription id="0"><Latency target="4000"/></ServiceDescription>
+ <BaseURL>https://example.invalid/live/</BaseURL>
+ <Period id="p0" start="PT0S" duration="PT10S">
+  <AdaptationSet id="1" contentType="audio" mimeType="audio/mp4"
+   codecs="opus" lang="en" audioSamplingRate="48000">
+   <SegmentTemplate timescale="48000" duration="96000"
+    initialization="init-$RepresentationID$.mp4"
+    media="$RepresentationID$-$Number$.m4s"/>
+   <Representation id="a1" bandwidth="96000"/>
+  </AdaptationSet>
+ </Period>
+</MPD>"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-streaming-qc"))
+        .arg(&input)
+        .args(["--profile", "dash-live"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(audit["profile"], "dash-live");
+    assert!(audit["findings"].as_array().unwrap().iter().any(|finding| {
+        finding["rule_id"] == "FORGE-DASH-LIVE-UTC-TIMING" && finding["passed"] == true
+    }));
+}
+
+#[test]
 fn streaming_qc_cli_cross_checks_mpegts_segment_boundaries() {
     if !Command::new("ffmpeg")
         .arg("-version")

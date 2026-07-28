@@ -719,6 +719,44 @@ fn emitted_dash_qc_conforms_to_published_schema() {
 }
 
 #[test]
+fn emitted_dash_live_qc_conforms_to_published_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("live.mpd");
+    std::fs::write(
+        &path,
+        r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic"
+ availabilityStartTime="2026-07-29T00:00:00Z"
+ minimumUpdatePeriod="PT2S" minBufferTime="PT1S">
+ <UTCTiming schemeIdUri="urn:mpeg:dash:utc:direct:2014"
+  value="2026-07-29T00:00:10Z"/>
+ <Period id="p0" start="PT0S" duration="PT10S">
+  <AdaptationSet id="1" contentType="audio" mimeType="audio/mp4" codecs="opus">
+   <BaseURL>https://example.invalid/</BaseURL>
+   <SegmentTemplate timescale="48000" duration="96000"
+    initialization="init-$RepresentationID$.mp4"
+    media="$RepresentationID$-$Number$.m4s"/>
+   <Representation id="a1" bandwidth="96000"/>
+  </AdaptationSet>
+ </Period>
+</MPD>"#,
+    )
+    .unwrap();
+
+    let audit =
+        forge_normalizer::dash_qc::audit(&path, forge_normalizer::dash_qc::DashProfile::DashLive)
+            .unwrap();
+    let instance = serde_json::to_value(audit).unwrap();
+    let schema: Value = serde_json::from_str(include_str!("../schema/dash-qc-v1.schema.json"))
+        .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
+
+#[test]
 fn emitted_imf_qc_conforms_to_published_schema() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(

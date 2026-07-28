@@ -19,7 +19,7 @@
     "schema": {"const": "https://penguin425.github.io/audio-normalizer/schema/dash-qc-v1"},
     "generator": {"type": "string"},
     "path": {"type": "string"},
-    "profile": {"enum": ["iso23009", "dash-if-iop"]},
+    "profile": {"enum": ["iso23009", "dash-if-iop", "dash-live"]},
     "kind": {"enum": ["static", "dynamic"]},
     "passed": {"type": "boolean"},
     "warning_count": {"type": "integer", "minimum": 0},
