@@ -30,14 +30,26 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(directory) = tempfile::tempdir() {
         let sdp = directory.path().join("stream.sdp");
         let capture = directory.path().join("capture.pcap");
+        let pcapng_capture = directory.path().join("capture.pcapng");
         let secondary_sdp = directory.path().join("secondary.sdp");
         let secondary_capture = directory.path().join("secondary.pcap");
+        let mut pcapng = vec![
+            0x0a, 0x0d, 0x0d, 0x0a, 28, 0, 0, 0, 0x4d, 0x3c, 0x2b, 0x1a, 1, 0, 0, 0, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 28, 0, 0, 0,
+        ];
+        pcapng.extend_from_slice(data);
         if fs::write(&sdp, SDP).is_ok()
             && fs::write(&capture, data).is_ok()
+            && fs::write(&pcapng_capture, pcapng).is_ok()
             && fs::write(&secondary_sdp, SECONDARY_SDP).is_ok()
             && fs::write(&secondary_capture, data).is_ok()
         {
             let _ = rtp_qc::audit(&sdp, Some(&capture), RtpAudioProfile::Smpte2110_30);
+            let _ = rtp_qc::audit(
+                &sdp,
+                Some(&pcapng_capture),
+                RtpAudioProfile::Smpte2110_30,
+            );
             let _ = rtp_qc::audit_st2022_7(
                 &sdp,
                 &capture,

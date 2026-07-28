@@ -28,12 +28,12 @@ impl From<Profile> for RtpAudioProfile {
 #[command(
     name = "forge-rtp-qc",
     version,
-    about = "Audit an RTP audio SDP and optional offline PCAP capture"
+    about = "Audit an RTP audio SDP and optional offline PCAP/PCAPNG capture"
 )]
 struct Cli {
     /// Session Description Protocol file
     sdp: PathBuf,
-    /// Optional classic PCAP containing the described RTP flow
+    /// Optional PCAP or PCAPNG containing the described RTP flow
     capture: Option<PathBuf>,
     /// RTP audio interoperability profile
     #[arg(long, value_enum, default_value = "aes67")]

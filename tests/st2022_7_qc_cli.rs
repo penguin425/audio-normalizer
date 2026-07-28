@@ -77,6 +77,49 @@ fn write_pcap(
     fs::write(path, bytes).unwrap();
 }
 
+fn push_pcapng_block(output: &mut Vec<u8>, block_type: u32, body: &[u8]) {
+    let length = (12 + body.len()) as u32;
+    output.extend_from_slice(&block_type.to_le_bytes());
+    output.extend_from_slice(&length.to_le_bytes());
+    output.extend_from_slice(body);
+    output.extend_from_slice(&length.to_le_bytes());
+}
+
+fn write_pcapng(
+    path: &Path,
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+    packets: &[(u16, u8)],
+    skew_us: u32,
+) {
+    let mut bytes = Vec::new();
+    let mut section = Vec::new();
+    section.extend_from_slice(&0x1a2b_3c4d_u32.to_le_bytes());
+    section.extend_from_slice(&1_u16.to_le_bytes());
+    section.extend_from_slice(&0_u16.to_le_bytes());
+    section.extend_from_slice(&u64::MAX.to_le_bytes());
+    push_pcapng_block(&mut bytes, 0x0a0d_0d0a, &section);
+    let mut interface = Vec::new();
+    interface.extend_from_slice(&1_u16.to_le_bytes());
+    interface.extend_from_slice(&0_u16.to_le_bytes());
+    interface.extend_from_slice(&65_535_u32.to_le_bytes());
+    push_pcapng_block(&mut bytes, 1, &interface);
+    for (index, (sequence, payload_byte)) in packets.iter().enumerate() {
+        let frame = ethernet_rtp(source, destination, *sequence, *payload_byte);
+        let timestamp = 1_700_000_000_000_000_u64 + index as u64 * 1_000 + u64::from(skew_us);
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&0_u32.to_le_bytes());
+        packet.extend_from_slice(&((timestamp >> 32) as u32).to_le_bytes());
+        packet.extend_from_slice(&(timestamp as u32).to_le_bytes());
+        packet.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        packet.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        packet.extend_from_slice(&frame);
+        packet.resize(packet.len().next_multiple_of(4), 0);
+        push_pcapng_block(&mut bytes, 6, &packet);
+    }
+    fs::write(path, bytes).unwrap();
+}
+
 fn fixture(
     primary_packets: &[(u16, u8)],
     secondary_packets: &[(u16, u8)],
@@ -145,6 +188,38 @@ fn complementary_leg_loss_is_recovered() {
         .map(|error| error.to_string())
         .collect::<Vec<_>>();
     assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
+
+#[test]
+fn pcapng_and_classic_pcap_legs_can_be_compared() {
+    let (directory, arguments) = fixture(
+        &[(100, 0), (101, 0), (102, 0)],
+        &[(100, 0), (101, 0), (102, 0)],
+    );
+    let secondary_source = Ipv4Addr::new(192, 0, 2, 2);
+    let secondary_destination = Ipv4Addr::new(239, 10, 20, 31);
+    let secondary_pcapng = directory.path().join("secondary.pcapng");
+    write_pcapng(
+        &secondary_pcapng,
+        secondary_source,
+        secondary_destination,
+        &[(100, 0), (101, 0), (102, 0)],
+        100,
+    );
+    let mut arguments = arguments;
+    arguments[3] = secondary_pcapng.display().to_string();
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-st2022-7-qc"))
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["passed"], true);
+    assert_eq!(report["properties"]["scope"]["pcapng"], true);
 }
 
 #[test]

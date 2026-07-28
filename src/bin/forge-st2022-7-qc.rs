@@ -33,11 +33,11 @@ impl From<Profile> for RtpAudioProfile {
 struct Cli {
     /// SDP describing the primary RTP leg
     primary_sdp: PathBuf,
-    /// Classic PCAP containing the primary RTP leg
+    /// PCAP or PCAPNG containing the primary RTP leg
     primary_capture: PathBuf,
     /// SDP describing the secondary RTP leg
     secondary_sdp: PathBuf,
-    /// Classic PCAP containing the secondary RTP leg
+    /// PCAP or PCAPNG containing the secondary RTP leg
     secondary_capture: PathBuf,
     /// RTP audio interoperability profile
     #[arg(long, value_enum, default_value = "smpte2110-30")]
