@@ -340,6 +340,18 @@ CRC are validated alongside encoder delay/padding. Forge MP3 output backpatches
 the Info/LAME tag so gapless duration is preserved; mono encoding uses LAME's
 planar API.
 
+Native structural QC also accepts free-format Layer III streams only when a
+unique unpadded frame size no larger than 3,456 bytes is demonstrated by three
+complete, configuration-matching frames. The inferred base size is then used
+to verify every remaining frame once, including per-frame padding, and an
+estimated bitrate is reported as non-signalled evidence. This bounded
+look-ahead follows the pinned
+[mpg123 free-format parser](https://github.com/libsdl-org/mpg123/blob/e36b4a88648ed288932c82e8aab98e1fc08fa409/src/libmpg123/parse.c#L730-L865)
+while requiring an extra matching frame and a unique candidate. Free-format
+decoding and normalization remain unsupported because the bundled Symphonia
+decoder rejects non-indexed bitrates; container QC reports them without
+claiming decode support.
+
 The MPEG frame and protection model follows
 [ISO/IEC 11172-3](https://www.iso.org/standard/22412.html). Xing/LAME extension
 layout and CRC behaviour are recorded against the pinned

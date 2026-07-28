@@ -11,6 +11,7 @@ const MAX_ID3_FRAMES: usize = 100_000;
 const MAX_MP3_FRAMES: usize = 10_000_000;
 const MAX_REPORTED_CRC_MISMATCHES: usize = 64;
 const MAX_VBRI_TOC_ENTRIES: usize = 65_535;
+const MAX_FREE_FORMAT_BASE_BYTES: u32 = 3_456;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MpegVersion {
@@ -42,7 +43,9 @@ struct FrameHeader {
     bitrate_kbps: u16,
     sample_rate: u32,
     channels: u8,
+    channel_mode: u8,
     protected_by_crc: bool,
+    padding: u32,
     frame_size: u32,
 }
 
@@ -54,6 +57,31 @@ impl FrameHeader {
             (_, 1) => 9,
             (_, _) => 17,
         }
+    }
+
+    const fn is_free_format(self) -> bool {
+        self.bitrate_kbps == 0
+    }
+
+    fn with_free_format_base(mut self, base_bytes: u32) -> Option<Self> {
+        if !self.is_free_format() || base_bytes > MAX_FREE_FORMAT_BASE_BYTES {
+            return None;
+        }
+        self.frame_size = base_bytes.checked_add(self.padding)?;
+        (self.frame_size >= self.minimum_frame_size()).then_some(self)
+    }
+
+    fn minimum_frame_size(self) -> u32 {
+        4 + u32::from(self.protected_by_crc) * 2 + u32::try_from(self.side_info_size()).unwrap()
+    }
+
+    fn estimated_free_format_bitrate_kbps(self, base_bytes: u32) -> f64 {
+        let coefficient = if self.version == MpegVersion::One {
+            144_000.0
+        } else {
+            72_000.0
+        };
+        f64::from(base_bytes) * f64::from(self.sample_rate) / coefficient
     }
 }
 
@@ -134,6 +162,9 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
     let mut crc_mismatch_count = 0_usize;
     let mut crc_mismatch_offsets = Vec::new();
     let mut bitrates = BTreeSet::new();
+    let mut free_format_detected = false;
+    let mut free_format_base_bytes = None;
+    let mut free_format_candidate_count = 0_usize;
     let mut first_header: Option<FrameHeader> = None;
     let mut first_frame = Vec::new();
     let mut scan_ok = audio_end >= offset;
@@ -159,7 +190,7 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
             break;
         }
         let bytes = read_at::<4>(path, &mut file, offset)?;
-        let Some(header) = parse_frame_header(bytes) else {
+        let Some(mut header) = parse_frame_header(bytes) else {
             bitstream.push(check(
                 "FORGE-MP3-FRAME-HEADER",
                 false,
@@ -169,6 +200,45 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
             scan_ok = false;
             break;
         };
+        free_format_detected |= header.is_free_format();
+        if let Some(first) = first_header {
+            let consistent = header.version == first.version
+                && header.sample_rate == first.sample_rate
+                && header.channels == first.channels
+                && header.is_free_format() == first.is_free_format();
+            if !consistent {
+                bitstream.push(check(
+                    "FORGE-MP3-STREAM-CONFIG",
+                    false,
+                    format!("stream configuration changes at frame {frame_count}"),
+                    Some(json!({
+                        "offset": offset,
+                        "version": header.version.name(),
+                        "sample_rate": header.sample_rate,
+                        "channels": header.channels,
+                        "free_format": header.is_free_format()
+                    })),
+                ));
+                scan_ok = false;
+                break;
+            }
+        }
+        if header.is_free_format() {
+            if free_format_base_bytes.is_none() {
+                let candidates =
+                    infer_free_format_bases(path, &mut file, offset, audio_end, header)?;
+                free_format_candidate_count = candidates.len();
+                if candidates.len() == 1 {
+                    free_format_base_bytes = candidates.first().copied();
+                } else {
+                    scan_ok = false;
+                    break;
+                }
+            }
+            header = header
+                .with_free_format_base(free_format_base_bytes.unwrap())
+                .expect("validated free-format base");
+        }
         let frame_end = offset.saturating_add(u64::from(header.frame_size));
         if frame_end > audio_end {
             bitstream.push(check(
@@ -180,33 +250,16 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
             scan_ok = false;
             break;
         }
-        if let Some(first) = first_header {
-            let consistent = header.version == first.version
-                && header.sample_rate == first.sample_rate
-                && header.channels == first.channels;
-            if !consistent {
-                bitstream.push(check(
-                    "FORGE-MP3-STREAM-CONFIG",
-                    false,
-                    format!("stream configuration changes at frame {frame_count}"),
-                    Some(json!({
-                        "offset": offset,
-                        "version": header.version.name(),
-                        "sample_rate": header.sample_rate,
-                        "channels": header.channels
-                    })),
-                ));
-                scan_ok = false;
-                break;
-            }
-        } else {
+        if first_header.is_none() {
             first_header = Some(header);
             first_frame.resize(header.frame_size as usize, 0);
             file.seek(SeekFrom::Start(offset))
                 .and_then(|_| file.read_exact(&mut first_frame))
                 .map_err(|error| format!("read first MP3 frame in {}: {error}", path.display()))?;
         }
-        bitrates.insert(header.bitrate_kbps);
+        if !header.is_free_format() {
+            bitrates.insert(header.bitrate_kbps);
+        }
         if header.protected_by_crc {
             crc_frame_count += 1;
             if !validate_frame_crc(path, &mut file, offset, header)? {
@@ -220,6 +273,35 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
         offset = frame_end;
     }
 
+    let estimated_free_format_bitrate_kbps = first_header
+        .zip(free_format_base_bytes)
+        .map(|(header, base)| header.estimated_free_format_bitrate_kbps(base));
+    bitstream.push(check(
+        "FORGE-MP3-FREE-FORMAT",
+        !free_format_detected || free_format_base_bytes.is_some(),
+        if !free_format_detected {
+            "the stream uses indexed MPEG Layer III bitrates".into()
+        } else if let Some(base) = free_format_base_bytes {
+            format!(
+                "free-format geometry has one unique {base}-byte unpadded frame-size candidate"
+            )
+        } else if free_format_candidate_count == 0 {
+            "free-format frame size cannot be established from at least three complete matching frames"
+                .into()
+        } else {
+            format!(
+                "free-format frame-size inference is ambiguous across {free_format_candidate_count} candidates"
+            )
+        },
+        Some(json!({
+            "detected": free_format_detected,
+            "base_frame_bytes": free_format_base_bytes,
+            "candidate_count": free_format_candidate_count,
+            "maximum_base_frame_bytes": MAX_FREE_FORMAT_BASE_BYTES,
+            "estimated_bitrate_kbps": estimated_free_format_bitrate_kbps,
+            "minimum_matching_frames": 3
+        })),
+    ));
     bitstream.push(check(
         "FORGE-MP3-FRAME-CRC",
         crc_mismatch_count == 0,
@@ -306,6 +388,9 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
         "audio_frame_count": coded_frame_count,
         "crc_frame_count": crc_frame_count,
         "bitrates_kbps": bitrates,
+        "free_format": free_format_detected,
+        "free_format_base_frame_bytes": free_format_base_bytes,
+        "free_format_estimated_bitrate_kbps": estimated_free_format_bitrate_kbps,
         "raw_samples": raw_samples,
         "gapless_samples": gapless_samples,
         "duration_seconds": duration_seconds,
@@ -572,7 +657,7 @@ fn parse_frame_header(bytes: [u8; 4]) -> Option<FrameHeader> {
         return None;
     }
     let bitrate_index = ((word >> 12) & 0xf) as usize;
-    if bitrate_index == 0 || bitrate_index == 15 {
+    if bitrate_index == 15 {
         return None;
     }
     const MPEG1_BITRATES: [u16; 16] = [
@@ -602,15 +687,122 @@ fn parse_frame_header(bytes: [u8; 4]) -> Option<FrameHeader> {
     } else {
         72_000
     };
-    let frame_size = coefficient * u32::from(bitrate_kbps) / sample_rate + padding;
+    let frame_size = if bitrate_kbps == 0 {
+        0
+    } else {
+        coefficient * u32::from(bitrate_kbps) / sample_rate + padding
+    };
+    let channel_mode = ((word >> 6) & 0x3) as u8;
     Some(FrameHeader {
         version,
         bitrate_kbps,
         sample_rate,
-        channels: if (word >> 6) & 0x3 == 3 { 1 } else { 2 },
+        channels: if channel_mode == 3 { 1 } else { 2 },
+        channel_mode,
         protected_by_crc: (word >> 16) & 1 == 0,
+        padding,
         frame_size,
     })
+}
+
+fn infer_free_format_bases(
+    path: &Path,
+    file: &mut File,
+    offset: u64,
+    audio_end: u64,
+    reference: FrameHeader,
+) -> Result<Vec<u32>, String> {
+    let remaining = audio_end.saturating_sub(offset);
+    let maximum_distance =
+        u64::from(MAX_FREE_FORMAT_BASE_BYTES + 1).min(remaining.saturating_sub(4));
+    let minimum_distance = u64::from(reference.minimum_frame_size());
+    if minimum_distance > maximum_distance {
+        return Ok(Vec::new());
+    }
+
+    let mut candidates = BTreeSet::new();
+    for distance in minimum_distance..=maximum_distance {
+        let candidate_offset = offset + distance;
+        let bytes = read_at::<4>(path, file, candidate_offset)?;
+        let Some(next) = parse_frame_header(bytes) else {
+            continue;
+        };
+        if !matching_free_format_headers(reference, next) {
+            continue;
+        }
+        let distance = u32::try_from(distance).unwrap();
+        let Some(base_bytes) = distance.checked_sub(reference.padding) else {
+            continue;
+        };
+        if free_format_has_three_complete_frames(
+            path, file, offset, audio_end, reference, base_bytes,
+        )? {
+            candidates.insert(base_bytes);
+        }
+    }
+    Ok(candidates.into_iter().collect())
+}
+
+fn free_format_has_three_complete_frames(
+    path: &Path,
+    file: &mut File,
+    offset: u64,
+    audio_end: u64,
+    reference: FrameHeader,
+    base_bytes: u32,
+) -> Result<bool, String> {
+    let Some(first) = reference.with_free_format_base(base_bytes) else {
+        return Ok(false);
+    };
+    let Some(second_offset) = offset.checked_add(u64::from(first.frame_size)) else {
+        return Ok(false);
+    };
+    if second_offset
+        .checked_add(4)
+        .is_none_or(|header_end| header_end > audio_end)
+    {
+        return Ok(false);
+    }
+    let second_bytes = read_at::<4>(path, file, second_offset)?;
+    let Some(second) = parse_frame_header(second_bytes) else {
+        return Ok(false);
+    };
+    if !matching_free_format_headers(reference, second) {
+        return Ok(false);
+    }
+    let Some(second) = second.with_free_format_base(base_bytes) else {
+        return Ok(false);
+    };
+    let Some(third_offset) = second_offset.checked_add(u64::from(second.frame_size)) else {
+        return Ok(false);
+    };
+    if third_offset
+        .checked_add(4)
+        .is_none_or(|header_end| header_end > audio_end)
+    {
+        return Ok(false);
+    }
+    let third_bytes = read_at::<4>(path, file, third_offset)?;
+    let Some(third) = parse_frame_header(third_bytes) else {
+        return Ok(false);
+    };
+    if !matching_free_format_headers(reference, third) {
+        return Ok(false);
+    }
+    let Some(third) = third.with_free_format_base(base_bytes) else {
+        return Ok(false);
+    };
+    Ok(third_offset
+        .checked_add(u64::from(third.frame_size))
+        .is_some_and(|end| end <= audio_end))
+}
+
+fn matching_free_format_headers(reference: FrameHeader, candidate: FrameHeader) -> bool {
+    reference.is_free_format()
+        && candidate.is_free_format()
+        && reference.version == candidate.version
+        && reference.sample_rate == candidate.sample_rate
+        && reference.channel_mode == candidate.channel_mode
 }
 
 fn parse_xing(frame: &[u8], header: FrameHeader, checks: &mut Vec<AuditCheck>) -> XingInfo {
@@ -1150,8 +1342,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_reserved_and_free_format_headers() {
-        assert!(parse_frame_header(header(0, 0, false)).is_none());
+    fn accepts_free_format_and_rejects_reserved_headers() {
+        let free = parse_frame_header(header(0, 0, false)).unwrap();
+        assert!(free.is_free_format());
+        assert_eq!(free.frame_size, 0);
         let mut reserved = header(9, 0, false);
         reserved[1] &= !(0b11 << 3);
         reserved[1] |= 0b01 << 3;
@@ -1180,6 +1374,103 @@ mod tests {
             bytes.resize(bytes.len() + 413, 0);
         }
         bytes
+    }
+
+    fn fake_free_format_frames(base_bytes: usize, paddings: &[bool], protected: bool) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for padded in paddings {
+            let mut header = if protected {
+                protected_header(0, 0, false)
+            } else {
+                header(0, 0, false)
+            };
+            if *padded {
+                header[2] |= 0x02;
+            }
+            let frame_size = base_bytes + usize::from(*padded);
+            let start = bytes.len();
+            bytes.extend_from_slice(&header);
+            bytes.resize(bytes.len() + frame_size - 4, 0);
+            if protected {
+                let mut protected_bytes = Vec::from(&header[2..]);
+                protected_bytes.extend_from_slice(&bytes[start + 6..start + 38]);
+                let crc = crc16_mpeg(0xffff, &protected_bytes);
+                bytes[start + 4..start + 6].copy_from_slice(&crc.to_be_bytes());
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn audit_infers_unique_free_format_geometry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("free-format.mp3");
+        let mut bytes = fake_free_format_frames(1_306, &[true, false, true], true);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let valid = crate::container_qc::audit(&path).unwrap();
+        assert!(valid.passed);
+        assert_eq!(valid.properties["free_format"], true);
+        assert_eq!(valid.properties["crc_frame_count"], 3);
+        assert_eq!(valid.properties["free_format_base_frame_bytes"], 1_306);
+        let bitrate = valid.properties["free_format_estimated_bitrate_kbps"]
+            .as_f64()
+            .unwrap();
+        assert!((bitrate - 400.0).abs() < 0.1);
+        assert!(valid.layers[1].checks.iter().any(|item| {
+            item.rule_id == "FORGE-MP3-FREE-FORMAT"
+                && item.passed
+                && item.observed.as_ref().unwrap()["candidate_count"] == 1
+        }));
+
+        let third_header = 1_306 + 1_307;
+        bytes[third_header] = 0;
+        std::fs::write(&path, bytes).unwrap();
+        let corrupt = crate::container_qc::audit(&path).unwrap();
+        assert!(!corrupt.passed);
+        assert!(corrupt.layers[1]
+            .checks
+            .iter()
+            .any(|item| item.rule_id == "FORGE-MP3-FREE-FORMAT" && !item.passed));
+    }
+
+    #[test]
+    fn free_format_inference_requires_three_bounded_frames() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("short-free-format.mp3");
+        std::fs::write(&path, fake_free_format_frames(1_306, &[false, true], false)).unwrap();
+        let short = crate::container_qc::audit(&path).unwrap();
+        assert!(!short.passed);
+
+        std::fs::write(
+            &path,
+            fake_free_format_frames(
+                usize::try_from(MAX_FREE_FORMAT_BASE_BYTES).unwrap() + 1,
+                &[false, false, false],
+                false,
+            ),
+        )
+        .unwrap();
+        let oversized = crate::container_qc::audit(&path).unwrap();
+        assert!(!oversized.passed);
+        assert!(oversized.layers[1]
+            .checks
+            .iter()
+            .any(|item| item.rule_id == "FORGE-MP3-FREE-FORMAT" && !item.passed));
+
+        let free_header = header(0, 0, false);
+        let mut ambiguous = vec![0_u8; 450];
+        for offset in [0, 100, 150, 200, 300] {
+            ambiguous[offset..offset + 4].copy_from_slice(&free_header);
+        }
+        std::fs::write(&path, ambiguous).unwrap();
+        let ambiguous = crate::container_qc::audit(&path).unwrap();
+        assert!(!ambiguous.passed);
+        assert!(ambiguous.layers[1].checks.iter().any(|item| {
+            item.rule_id == "FORGE-MP3-FREE-FORMAT"
+                && !item.passed
+                && item.observed.as_ref().unwrap()["candidate_count"] == 2
+        }));
     }
 
     #[test]

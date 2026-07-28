@@ -61,6 +61,9 @@ Forge already provides:
 - MP3 protected-frame CRC-16 validation, Fraunhofer VBRI seek-table and
   stream-count reconciliation, and LAME ReplayGain/tag-CRC validation with
   bounded mismatch evidence.
+- Bounded MP3 free-format structural QC with unique three-frame geometry
+  inference, per-frame padding and full-stream boundary validation, and
+  explicit separation from unsupported decode/normalization paths.
 
 ## P0 — next correctness and interoperability work
 
@@ -90,7 +93,6 @@ generations.
 - DTS core/HD metadata and decoded presentation checks through an optional
   adapter.
 - WavPack, Monkey's Audio, and ALAC native frame/checksum validation.
-- Safe support for documented MP3 free-format streams.
 - Opus projection mapping family 2 and ambisonics validation.
 - IAMF descriptor payload linking, codec-config semantics, profile channel
   limits, parameter/audio-frame timeline reconciliation, ISO-BMFF IAMF
