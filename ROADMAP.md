@@ -58,6 +58,9 @@ Forge already provides:
 - ITU-R BS.2088-2 `axml`/`bxml`/`sxml` QC with bounded UTF-8/gzip parsing,
   EBUCore envelope checks, serial subchunk/alignment/sample validation,
   ADM/S-ADM placement and independence checks, and byte-preserving output.
+- MP3 protected-frame CRC-16 validation, Fraunhofer VBRI seek-table and
+  stream-count reconciliation, and LAME ReplayGain/tag-CRC validation with
+  bounded mismatch evidence.
 
 ## P0 — next correctness and interoperability work
 
@@ -87,8 +90,7 @@ generations.
 - DTS core/HD metadata and decoded presentation checks through an optional
   adapter.
 - WavPack, Monkey's Audio, and ALAC native frame/checksum validation.
-- MP3 protected-frame CRC validation, VBRI parsing, ReplayGain-in-LAME-field
-  validation, and safe support for documented free-format streams.
+- Safe support for documented MP3 free-format streams.
 - Opus projection mapping family 2 and ambisonics validation.
 - IAMF descriptor payload linking, codec-config semantics, profile channel
   limits, parameter/audio-frame timeline reconciliation, ISO-BMFF IAMF
