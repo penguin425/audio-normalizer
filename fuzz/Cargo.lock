@@ -451,6 +451,7 @@ version = "0.0.0"
 dependencies = [
  "forge-normalizer",
  "libfuzzer-sys",
+ "ogg",
  "serde_json",
  "tempfile",
 ]

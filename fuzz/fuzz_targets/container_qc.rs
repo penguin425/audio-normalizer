@@ -2,6 +2,7 @@
 
 use forge_normalizer::container_qc;
 use libfuzzer_sys::fuzz_target;
+use ogg::writing::{PacketWriteEndInfo, PacketWriter};
 use std::io::Write;
 
 fn audit_bytes(bytes: &[u8]) {
@@ -73,9 +74,48 @@ fn mp3_with_frame_payload(data: &[u8]) -> Vec<u8> {
     frame
 }
 
+fn ambisonic_opus(data: &[u8]) -> Vec<u8> {
+    const CHANNEL_COUNTS: [u8; 8] = [1, 3, 4, 6, 9, 11, 16, 18];
+    let channels = CHANNEL_COUNTS
+        [usize::from(data.first().copied().unwrap_or_default()) % CHANNEL_COUNTS.len()];
+    let mut mapping = Vec::with_capacity(usize::from(channels));
+    for channel in 0..channels {
+        let source = data
+            .get(usize::from(channel) + 1)
+            .copied()
+            .unwrap_or(channel);
+        mapping.push(if source & 0x0f == 0x0f {
+            255
+        } else {
+            source % channels
+        });
+    }
+    let mut head = b"OpusHead\x01".to_vec();
+    head.push(channels);
+    head.extend_from_slice(&0_u16.to_le_bytes());
+    head.extend_from_slice(&48_000_u32.to_le_bytes());
+    head.extend_from_slice(&0_i16.to_le_bytes());
+    head.extend_from_slice(&[2, channels, 0]);
+    head.extend_from_slice(&mapping);
+    let mut tags = b"OpusTags".to_vec();
+    tags.extend_from_slice(&4_u32.to_le_bytes());
+    tags.extend_from_slice(b"fuzz");
+    tags.extend_from_slice(&0_u32.to_le_bytes());
+
+    let mut output = Vec::new();
+    {
+        let mut writer = PacketWriter::new(&mut output);
+        let _ = writer.write_packet(head, 42, PacketWriteEndInfo::EndPage, 0);
+        let _ = writer.write_packet(tags, 42, PacketWriteEndInfo::EndPage, 0);
+        let _ = writer.write_packet(vec![0], 42, PacketWriteEndInfo::EndStream, 480);
+    }
+    output
+}
+
 fuzz_target!(|data: &[u8]| {
     audit_bytes(data);
     audit_bytes(&mp3_with_frame_payload(data));
+    audit_bytes(&ambisonic_opus(data));
     let xml_id = match data.first().copied().unwrap_or_default() % 3 {
         0 => b"axml",
         1 => b"bxml",
