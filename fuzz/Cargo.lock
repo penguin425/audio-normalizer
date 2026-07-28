@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "forge-normalizer"
-version = "0.62.0"
+version = "0.63.0"
 dependencies = [
  "audiopus_sys",
  "base64",
