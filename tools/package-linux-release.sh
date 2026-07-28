@@ -31,7 +31,8 @@ for binary in \
   forge-provenance-qc \
   forge-imf-qc \
   forge-rtp-qc \
-  forge-nmos-qc
+  forge-nmos-qc \
+  forge-st2022-7-qc
 do
   cp "target/${target}/release/${binary}" "$staging/"
 done

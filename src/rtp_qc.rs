@@ -7,13 +7,16 @@
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
 
 pub const RTP_QC_SCHEMA: &str =
     "https://penguin425.github.io/audio-normalizer/schema/rtp-audio-qc-v1";
+pub const ST2022_7_QC_SCHEMA: &str =
+    "https://penguin425.github.io/audio-normalizer/schema/st2022-7-qc-v1";
 const MAX_SDP_BYTES: u64 = 1024 * 1024;
 const MAX_SDP_LINES: usize = 16_384;
 const MAX_SDP_LINE_BYTES: usize = 4_096;
@@ -54,6 +57,21 @@ pub struct RtpAudioAudit {
     pub sdp_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture_path: Option<String>,
+    pub profile: RtpAudioProfile,
+    pub passed: bool,
+    pub warning_count: usize,
+    pub findings: Vec<RtpFinding>,
+    pub properties: Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct St2022_7Audit {
+    pub schema: &'static str,
+    pub generator: &'static str,
+    pub primary_sdp_path: String,
+    pub primary_capture_path: String,
+    pub secondary_sdp_path: String,
+    pub secondary_capture_path: String,
     pub profile: RtpAudioProfile,
     pub passed: bool,
     pub warning_count: usize,
@@ -168,6 +186,25 @@ struct PreviousPacket {
     arrival_seconds: f64,
 }
 
+#[derive(Clone)]
+struct ProtectionPacket {
+    arrival_seconds: f64,
+    ssrc: u32,
+    rtp_datagram_sha256: [u8; 32],
+}
+
+#[derive(Default)]
+struct ProtectionLeg {
+    records: usize,
+    matching_udp_packets: usize,
+    malformed_packets: usize,
+    fragmented_packets: usize,
+    wrong_version: usize,
+    wrong_payload_type: usize,
+    duplicate_identities: usize,
+    packets: BTreeMap<(u32, u16), ProtectionPacket>,
+}
+
 pub fn audit(
     sdp_path: &Path,
     capture_path: Option<&Path>,
@@ -229,6 +266,324 @@ pub fn audit(
                 "encrypted_rtp": false
             }
         }),
+    })
+}
+
+pub fn audit_st2022_7(
+    primary_sdp_path: &Path,
+    primary_capture_path: &Path,
+    secondary_sdp_path: &Path,
+    secondary_capture_path: &Path,
+    profile: RtpAudioProfile,
+    max_skew_ms: Option<f64>,
+) -> Result<St2022_7Audit, String> {
+    if primary_sdp_path == secondary_sdp_path || primary_capture_path == secondary_capture_path {
+        return Err("primary and secondary inputs must be distinct paths".into());
+    }
+    let primary_sdp = parse_sdp(&read_sdp(primary_sdp_path)?)?;
+    let secondary_sdp = parse_sdp(&read_sdp(secondary_sdp_path)?)?;
+    let mut findings = Vec::new();
+    let primary_stream = audit_sdp(&primary_sdp, profile, &mut findings)?;
+    let secondary_stream = audit_sdp(&secondary_sdp, profile, &mut findings)?;
+
+    let descriptions_match = primary_stream.payload_type == secondary_stream.payload_type
+        && primary_stream.encoding == secondary_stream.encoding
+        && primary_stream.clock_rate == secondary_stream.clock_rate
+        && primary_stream.channels == secondary_stream.channels
+        && primary_stream.packet_time_ms == secondary_stream.packet_time_ms
+        && primary_stream.channel_order == secondary_stream.channel_order;
+    findings.push(finding(
+        "FORGE-ST2022-7-FORMAT",
+        Severity::Error,
+        descriptions_match,
+        "both legs declare the same RTP payload format, clock, channels, packet time, and channel order",
+        Some(json!({
+            "primary": stream_properties(&primary_stream),
+            "secondary": stream_properties(&secondary_stream)
+        })),
+    ));
+    let endpoints_are_diverse = primary_stream.destination != secondary_stream.destination
+        || primary_stream.port != secondary_stream.port
+        || primary_stream.source != secondary_stream.source;
+    findings.push(finding(
+        "FORGE-ST2022-7-DIVERSE-ENDPOINTS",
+        Severity::Error,
+        endpoints_are_diverse,
+        "the two SDP legs use distinct source, destination, or port addressing",
+        None,
+    ));
+
+    let primary = collect_protection_leg(primary_capture_path, &primary_stream)?;
+    let secondary = collect_protection_leg(secondary_capture_path, &secondary_stream)?;
+    add_protection_leg_findings("PRIMARY", &primary, &mut findings);
+    add_protection_leg_findings("SECONDARY", &secondary, &mut findings);
+
+    let primary_ssrcs = primary
+        .packets
+        .values()
+        .map(|packet| packet.ssrc)
+        .collect::<HashSet<_>>();
+    let secondary_ssrcs = secondary
+        .packets
+        .values()
+        .map(|packet| packet.ssrc)
+        .collect::<HashSet<_>>();
+    let ssrcs_match =
+        primary_ssrcs.len() == 1 && secondary_ssrcs.len() == 1 && primary_ssrcs == secondary_ssrcs;
+    findings.push(finding(
+        "FORGE-ST2022-7-SSRC",
+        Severity::Error,
+        ssrcs_match,
+        "both protection legs carry one identical RTP synchronization source",
+        Some(json!({"primary": primary_ssrcs, "secondary": secondary_ssrcs})),
+    ));
+
+    let mut all_keys = primary
+        .packets
+        .keys()
+        .chain(secondary.packets.keys())
+        .copied()
+        .collect::<Vec<_>>();
+    all_keys.sort_unstable();
+    all_keys.dedup();
+    let shared_keys = primary
+        .packets
+        .keys()
+        .filter(|key| secondary.packets.contains_key(key))
+        .copied()
+        .collect::<Vec<_>>();
+    let primary_only = all_keys
+        .iter()
+        .filter(|key| !secondary.packets.contains_key(key))
+        .count();
+    let secondary_only = all_keys
+        .iter()
+        .filter(|key| !primary.packets.contains_key(key))
+        .count();
+    let payload_mismatches = shared_keys
+        .iter()
+        .filter(|key| {
+            primary.packets[*key].rtp_datagram_sha256 != secondary.packets[*key].rtp_datagram_sha256
+                || primary.packets[*key].ssrc != secondary.packets[*key].ssrc
+        })
+        .count();
+    let primary_timestamps_by_sequence = timestamps_by_sequence(primary.packets.keys().copied());
+    let secondary_timestamps_by_sequence =
+        timestamps_by_sequence(secondary.packets.keys().copied());
+    let identity_mismatches = primary_timestamps_by_sequence
+        .iter()
+        .filter(|(sequence, timestamps)| {
+            secondary_timestamps_by_sequence
+                .get(sequence)
+                .is_some_and(|other| timestamps.is_disjoint(other))
+        })
+        .count();
+    findings.push(finding(
+        "FORGE-ST2022-7-DATAGRAM-EQUIVALENCE",
+        Severity::Error,
+        !shared_keys.is_empty() && payload_mismatches == 0 && identity_mismatches == 0,
+        "matching RTP sequence/timestamp identities and complete RTP datagrams agree on both legs",
+        Some(json!({
+            "shared_packets": shared_keys.len(),
+            "datagram_mismatches": payload_mismatches,
+            "identity_mismatches": identity_mismatches
+        })),
+    ));
+
+    let merged_sequence_gaps = count_merged_sequence_gaps(&all_keys);
+    findings.push(finding(
+        "FORGE-ST2022-7-MERGED-CONTINUITY",
+        Severity::Error,
+        !all_keys.is_empty() && merged_sequence_gaps == 0,
+        "the union of both protection legs has continuous RTP sequence numbers",
+        Some(json!({
+            "merged_packets": all_keys.len(),
+            "missing_after_merge": merged_sequence_gaps,
+            "recovered_from_primary": primary_only,
+            "recovered_from_secondary": secondary_only
+        })),
+    ));
+
+    let mut skews_ms = shared_keys
+        .iter()
+        .map(|key| {
+            (primary.packets[key].arrival_seconds - secondary.packets[key].arrival_seconds).abs()
+                * 1000.0
+        })
+        .collect::<Vec<_>>();
+    skews_ms.sort_by(f64::total_cmp);
+    let max_observed_skew_ms = skews_ms.last().copied();
+    let p95_skew_ms = percentile(&skews_ms, 0.95);
+    if let Some(limit) = max_skew_ms {
+        findings.push(finding(
+            "FORGE-ST2022-7-SKEW",
+            Severity::Error,
+            max_observed_skew_ms.is_some_and(|observed| observed <= limit),
+            "maximum matching-packet arrival skew is within the configured receiver budget",
+            Some(json!({
+                "limit_ms": limit,
+                "maximum_ms": max_observed_skew_ms,
+                "p95_ms": p95_skew_ms
+            })),
+        ));
+    } else {
+        findings.push(finding(
+            "FORGE-ST2022-7-SKEW-BUDGET",
+            Severity::Warning,
+            false,
+            "arrival skew was measured but no receiver skew budget was supplied",
+            Some(json!({
+                "maximum_ms": max_observed_skew_ms,
+                "p95_ms": p95_skew_ms
+            })),
+        ));
+    }
+
+    let passed = findings
+        .iter()
+        .all(|item| item.severity != Severity::Error || item.passed);
+    let warning_count = findings
+        .iter()
+        .filter(|item| item.severity == Severity::Warning && !item.passed)
+        .count();
+    Ok(St2022_7Audit {
+        schema: ST2022_7_QC_SCHEMA,
+        generator: "forge-st2022-7-qc",
+        primary_sdp_path: primary_sdp_path.display().to_string(),
+        primary_capture_path: primary_capture_path.display().to_string(),
+        secondary_sdp_path: secondary_sdp_path.display().to_string(),
+        secondary_capture_path: secondary_capture_path.display().to_string(),
+        profile,
+        passed,
+        warning_count,
+        findings,
+        properties: json!({
+            "primary": protection_leg_properties(&primary),
+            "secondary": protection_leg_properties(&secondary),
+            "comparison": {
+                "merged_packets": all_keys.len(),
+                "shared_packets": shared_keys.len(),
+                "primary_only_packets": primary_only,
+                "secondary_only_packets": secondary_only,
+                "datagram_mismatches": payload_mismatches,
+                "identity_mismatches": identity_mismatches,
+                "missing_after_merge": merged_sequence_gaps,
+                "maximum_arrival_skew_ms": max_observed_skew_ms,
+                "p95_arrival_skew_ms": p95_skew_ms,
+                "configured_maximum_skew_ms": max_skew_ms
+            },
+            "scope": {
+                "offline_only": true,
+                "classic_pcap": true,
+                "seamless_merge_simulation": true,
+                "capture_timestamp_timebase_proof": false,
+                "network_path_disjointness_proof": false,
+                "live_receiver_buffer_validation": false,
+                "ptp_lock_validation": false
+            }
+        }),
+    })
+}
+
+fn stream_properties(stream: &StreamDescription) -> Value {
+    json!({
+        "destination": stream.destination.map(|value| value.to_string()),
+        "source": stream.source.map(|value| value.to_string()),
+        "port": stream.port,
+        "payload_type": stream.payload_type,
+        "encoding": stream.encoding,
+        "clock_rate": stream.clock_rate,
+        "channels": stream.channels,
+        "packet_time_ms": stream.packet_time_ms,
+        "channel_order": stream.channel_order
+    })
+}
+
+fn add_protection_leg_findings(
+    leg_name: &'static str,
+    leg: &ProtectionLeg,
+    findings: &mut Vec<RtpFinding>,
+) {
+    let (parse_rule, match_rule, duplicate_rule) = match leg_name {
+        "PRIMARY" => (
+            "FORGE-ST2022-7-PRIMARY-PARSE",
+            "FORGE-ST2022-7-PRIMARY-MATCH",
+            "FORGE-ST2022-7-PRIMARY-DUPLICATES",
+        ),
+        _ => (
+            "FORGE-ST2022-7-SECONDARY-PARSE",
+            "FORGE-ST2022-7-SECONDARY-MATCH",
+            "FORGE-ST2022-7-SECONDARY-DUPLICATES",
+        ),
+    };
+    findings.push(finding(
+        parse_rule,
+        Severity::Error,
+        leg.malformed_packets == 0
+            && leg.fragmented_packets == 0
+            && leg.wrong_version == 0
+            && leg.wrong_payload_type == 0,
+        format!("{leg_name} leg packet headers are complete and match the selected RTP payload"),
+        Some(json!({
+            "malformed": leg.malformed_packets,
+            "fragmented": leg.fragmented_packets,
+            "wrong_version": leg.wrong_version,
+            "wrong_payload_type": leg.wrong_payload_type
+        })),
+    ));
+    findings.push(finding(
+        match_rule,
+        Severity::Error,
+        !leg.packets.is_empty(),
+        format!("{leg_name} capture contains packets matching its SDP flow"),
+        Some(json!({"packets": leg.packets.len()})),
+    ));
+    findings.push(finding(
+        duplicate_rule,
+        Severity::Error,
+        leg.duplicate_identities == 0,
+        format!("{leg_name} leg has no duplicate RTP timestamp/sequence identities"),
+        Some(json!(leg.duplicate_identities)),
+    ));
+}
+
+fn count_merged_sequence_gaps(keys: &[(u32, u16)]) -> u64 {
+    let mut gaps = 0_u64;
+    for pair in keys.windows(2) {
+        let delta = pair[1].1.wrapping_sub(pair[0].1);
+        if delta > 1 && delta < 0x8000 {
+            gaps += u64::from(delta - 1);
+        }
+    }
+    gaps
+}
+
+fn timestamps_by_sequence(keys: impl Iterator<Item = (u32, u16)>) -> HashMap<u16, HashSet<u32>> {
+    let mut result = HashMap::<u16, HashSet<u32>>::new();
+    for (timestamp, sequence) in keys {
+        result.entry(sequence).or_default().insert(timestamp);
+    }
+    result
+}
+
+fn percentile(sorted: &[f64], percentile: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let index = ((sorted.len() - 1) as f64 * percentile).ceil() as usize;
+    sorted.get(index).copied()
+}
+
+fn protection_leg_properties(leg: &ProtectionLeg) -> Value {
+    json!({
+        "records": leg.records,
+        "matching_udp_packets": leg.matching_udp_packets,
+        "rtp_packets": leg.packets.len(),
+        "malformed_packets": leg.malformed_packets,
+        "fragmented_packets": leg.fragmented_packets,
+        "wrong_version": leg.wrong_version,
+        "wrong_payload_type": leg.wrong_payload_type,
+        "duplicate_identities": leg.duplicate_identities
     })
 }
 
@@ -1058,6 +1413,112 @@ fn audit_capture(
         "capture_duration_ms": capture_duration_ms,
         "rtp_timestamp_duration_ms": rtp_duration_ms
     }))
+}
+
+fn collect_protection_leg(
+    path: &Path,
+    stream: &StreamDescription,
+) -> Result<ProtectionLeg, String> {
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("stat {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular capture file", path.display()));
+    }
+    if metadata.len() > MAX_CAPTURE_BYTES {
+        return Err(format!(
+            "{} exceeds the {MAX_CAPTURE_BYTES}-byte capture safety limit",
+            path.display()
+        ));
+    }
+    let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let (format, mut offset) = parse_pcap_header(&bytes)?;
+    let mut leg = ProtectionLeg::default();
+    while offset < bytes.len() {
+        if leg.records == MAX_CAPTURE_PACKETS {
+            return Err(format!(
+                "capture exceeds the {MAX_CAPTURE_PACKETS}-packet safety limit"
+            ));
+        }
+        let record = bytes
+            .get(offset..offset + 16)
+            .ok_or_else(|| format!("truncated PCAP record header at byte {offset}"))?;
+        let seconds = read_u32(&record[0..4], format.endian);
+        let fraction = read_u32(&record[4..8], format.endian);
+        let captured = read_u32(&record[8..12], format.endian) as usize;
+        let original = read_u32(&record[12..16], format.endian) as usize;
+        if captured > MAX_PACKET_BYTES || captured > format.snaplen as usize || captured > original
+        {
+            return Err(format!(
+                "invalid PCAP record length at packet {}",
+                leg.records + 1
+            ));
+        }
+        let fraction_limit = if format.nanoseconds {
+            1_000_000_000
+        } else {
+            1_000_000
+        };
+        if fraction >= fraction_limit {
+            return Err(format!(
+                "invalid PCAP timestamp fraction at packet {}",
+                leg.records + 1
+            ));
+        }
+        offset += 16;
+        let frame = bytes
+            .get(offset..offset + captured)
+            .ok_or_else(|| format!("truncated PCAP packet at byte {offset}"))?;
+        offset += captured;
+        leg.records += 1;
+        let divisor = if format.nanoseconds { 1e9 } else { 1e6 };
+        let arrival = f64::from(seconds) + f64::from(fraction) / divisor;
+        let udp = match extract_udp(frame, format.link_type, arrival) {
+            Ok(Some(packet)) => packet,
+            Ok(None) => continue,
+            Err(PacketError::Fragmented) => {
+                leg.fragmented_packets += 1;
+                continue;
+            }
+            Err(PacketError::Malformed) => {
+                leg.malformed_packets += 1;
+                continue;
+            }
+        };
+        if udp.destination_port != stream.port
+            || stream
+                .destination
+                .is_some_and(|destination| destination != udp.destination)
+            || stream.source.is_some_and(|source| source != udp.source)
+        {
+            continue;
+        }
+        leg.matching_udp_packets += 1;
+        let rtp = match parse_rtp(udp.payload) {
+            Ok(packet) => packet,
+            Err(RtpError::WrongVersion) => {
+                leg.wrong_version += 1;
+                continue;
+            }
+            Err(RtpError::Malformed) => {
+                leg.malformed_packets += 1;
+                continue;
+            }
+        };
+        if rtp.payload_type != stream.payload_type {
+            leg.wrong_payload_type += 1;
+            continue;
+        }
+        let key = (rtp.timestamp, rtp.sequence);
+        let packet = ProtectionPacket {
+            arrival_seconds: arrival,
+            ssrc: rtp.ssrc,
+            rtp_datagram_sha256: Sha256::digest(udp.payload).into(),
+        };
+        if leg.packets.insert(key, packet).is_some() {
+            leg.duplicate_identities += 1;
+        }
+    }
+    Ok(leg)
 }
 
 fn parse_pcap_header(bytes: &[u8]) -> Result<(CaptureFormat, usize), String> {

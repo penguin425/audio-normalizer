@@ -529,6 +529,41 @@ The profile checks track [RFC 3550](https://www.rfc-editor.org/rfc/rfc3550),
 [SMPTE ST 2110-30](https://pub.smpte.org/doc/st2110-30/20170918-pub/st2110-30-2017.pdf),
 and [SMPTE ST 2110-31:2022](https://pub.smpte.org/pub/st2110-31/st2110-31-2022.pdf).
 
+### SMPTE ST 2022-7 redundant RTP QC
+
+`forge-st2022-7-qc primary.sdp primary.pcap secondary.sdp secondary.pcap`
+audits a redundant RTP audio pair and simulates the packet union available to
+a seamless-protection receiver. It checks:
+
+- equivalent RTP payload type, encoding, clock, channels, packet time, and
+  channel order, with distinct leg addressing;
+- one identical SSRC plus matching sequence/timestamp identities and complete
+  RTP datagram bytes across both legs;
+- malformed, fragmented, wrong-version, wrong-payload, and duplicate packets
+  independently on each leg;
+- packets recoverable from either leg and sequence continuity after merging;
+  and
+- maximum and 95th-percentile inter-leg arrival skew, optionally enforced
+  against a receiver-specific budget.
+
+```sh
+forge-st2022-7-qc red.sdp red.pcap blue.sdp blue.pcap \
+  --profile smpte2110-30 --max-skew-ms 0.15 --output protection-qc.json
+```
+
+The report follows `schema/st2022-7-qc-v1.schema.json`; exit status is 0 for
+pass, 1 for a QC failure, and 2 for malformed input or I/O failure. Omitting
+`--max-skew-ms` reports measured skew with a warning because ST 2022-7 receiver
+classes and deployment budgets differ. The EBU recommends reporting late or
+lost packets on each redundant stream and specifies an ultra-low-skew profile
+for low-latency ST 2110-30 deployments. Skew results assume the two capture
+timestamps share a synchronized timebase.
+
+This bounded, offline analysis cannot prove physical/network path diversity,
+live receiver buffer behavior, PTP lock, or complete device conformance. It
+tracks [SMPTE ST 2022-7 seamless packet redundancy](https://www.smpte.org/past-events/standards-smpte-st-2022)
+and the [EBU Tech 3371 media-node requirements](https://tech.ebu.ch/docs/tech/tech3371.pdf).
+
 ### AMWA NMOS snapshot QC
 
 `forge-nmos-qc snapshot.json` performs a bounded, offline audit of an AMWA
