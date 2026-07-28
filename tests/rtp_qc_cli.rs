@@ -73,6 +73,50 @@ fn write_pcap(path: &Path, sequences: &[u16]) {
     fs::write(path, bytes).unwrap();
 }
 
+fn push_pcapng_block(output: &mut Vec<u8>, block_type: u32, body: &[u8]) {
+    let length = (12 + body.len()) as u32;
+    output.extend_from_slice(&block_type.to_le_bytes());
+    output.extend_from_slice(&length.to_le_bytes());
+    output.extend_from_slice(body);
+    output.extend_from_slice(&length.to_le_bytes());
+}
+
+fn write_pcapng(path: &Path, sequences: &[u16]) {
+    let mut bytes = Vec::new();
+    let mut section = Vec::new();
+    section.extend_from_slice(&0x1a2b_3c4d_u32.to_le_bytes());
+    section.extend_from_slice(&1_u16.to_le_bytes());
+    section.extend_from_slice(&0_u16.to_le_bytes());
+    section.extend_from_slice(&u64::MAX.to_le_bytes());
+    push_pcapng_block(&mut bytes, 0x0a0d_0d0a, &section);
+
+    let mut interface = Vec::new();
+    interface.extend_from_slice(&1_u16.to_le_bytes());
+    interface.extend_from_slice(&0_u16.to_le_bytes());
+    interface.extend_from_slice(&65_535_u32.to_le_bytes());
+    interface.extend_from_slice(&9_u16.to_le_bytes());
+    interface.extend_from_slice(&1_u16.to_le_bytes());
+    interface.extend_from_slice(&[9, 0, 0, 0]);
+    interface.extend_from_slice(&0_u16.to_le_bytes());
+    interface.extend_from_slice(&0_u16.to_le_bytes());
+    push_pcapng_block(&mut bytes, 1, &interface);
+
+    for (index, sequence) in sequences.iter().enumerate() {
+        let frame = ethernet_rtp(*sequence, index as u32 * 48);
+        let timestamp = 1_700_000_000_000_000_000_u64 + index as u64 * 1_000_000;
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&0_u32.to_le_bytes());
+        packet.extend_from_slice(&((timestamp >> 32) as u32).to_le_bytes());
+        packet.extend_from_slice(&(timestamp as u32).to_le_bytes());
+        packet.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        packet.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        packet.extend_from_slice(&frame);
+        packet.resize(packet.len().next_multiple_of(4), 0);
+        push_pcapng_block(&mut bytes, 6, &packet);
+    }
+    fs::write(path, bytes).unwrap();
+}
+
 #[test]
 fn valid_st2110_30_capture_passes() {
     let directory = tempfile::tempdir().unwrap();
@@ -99,6 +143,48 @@ fn valid_st2110_30_capture_passes() {
     assert_eq!(report["passed"], true);
     assert_eq!(report["properties"]["capture"]["rtp_packets"], 4);
     assert_eq!(report["properties"]["stream"]["encoding"], "L24");
+}
+
+#[test]
+fn valid_pcapng_capture_passes_with_nanosecond_timestamps() {
+    let directory = tempfile::tempdir().unwrap();
+    let sdp_path = directory.path().join("stream.sdp");
+    let capture = directory.path().join("stream.pcapng");
+    fs::write(&sdp_path, sdp()).unwrap();
+    write_pcapng(&capture, &[100, 101, 102, 103]);
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-rtp-qc"))
+        .args([
+            sdp_path.to_str().unwrap(),
+            capture.to_str().unwrap(),
+            "--profile",
+            "smpte2110-30",
+            "--compact",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["passed"], true);
+    assert_eq!(report["properties"]["capture"]["format"], "pcapng");
+    assert_eq!(report["properties"]["capture"]["sections"], 1);
+    assert_eq!(report["properties"]["capture"]["interfaces"], 1);
+    assert_eq!(
+        report["properties"]["capture"]["timestamp_resolutions"][0],
+        "10^-9 seconds"
+    );
+    assert_eq!(report["properties"]["scope"]["pcapng"], true);
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/rtp-audio-qc-v1.schema.json")).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let errors = validator
+        .iter_errors(&report)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
 }
 
 #[test]

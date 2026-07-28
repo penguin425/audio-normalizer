@@ -1,14 +1,14 @@
 //! Bounded, offline RTP audio QC for RFC 3550, AES67, and SMPTE ST 2110 audio.
 //!
 //! The auditor validates an SDP description and, when supplied, correlates it
-//! with RTP packets from a classic PCAP file. It does not perform live capture,
+//! with RTP packets from a classic PCAP or PCAPNG file. It does not perform live capture,
 //! decode encrypted RTP, inspect PTP packets, or claim complete device/network
 //! conformance.
 
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
@@ -130,6 +130,31 @@ struct CaptureFormat {
     link_type: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CaptureRecord<'a> {
+    timestamp_seconds: f64,
+    link_type: u32,
+    frame: &'a [u8],
+}
+
+#[derive(Debug)]
+struct CaptureMetadata {
+    format: &'static str,
+    link_types: BTreeSet<u32>,
+    timestamp_resolutions: BTreeSet<String>,
+    sections: usize,
+    interfaces: usize,
+    records: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PcapNgInterface {
+    link_type: u32,
+    snaplen: u32,
+    timestamp_scale: f64,
+    timestamp_offset: i64,
+}
+
 #[derive(Clone, Debug)]
 struct UdpPacket<'a> {
     timestamp_seconds: f64,
@@ -195,6 +220,11 @@ struct ProtectionPacket {
 
 #[derive(Default)]
 struct ProtectionLeg {
+    capture_format: Option<&'static str>,
+    link_types: BTreeSet<u32>,
+    timestamp_resolutions: BTreeSet<String>,
+    sections: usize,
+    interfaces: usize,
     records: usize,
     matching_udp_packets: usize,
     malformed_packets: usize,
@@ -260,7 +290,7 @@ pub fn audit(
             "scope": {
                 "offline_only": true,
                 "classic_pcap": true,
-                "pcapng": false,
+                "pcapng": true,
                 "ptp_packet_validation": false,
                 "rtcp_quality_validation": false,
                 "encrypted_rtp": false
@@ -475,6 +505,7 @@ pub fn audit_st2022_7(
             "scope": {
                 "offline_only": true,
                 "classic_pcap": true,
+                "pcapng": true,
                 "seamless_merge_simulation": true,
                 "capture_timestamp_timebase_proof": false,
                 "network_path_disjointness_proof": false,
@@ -576,6 +607,11 @@ fn percentile(sorted: &[f64], percentile: f64) -> Option<f64> {
 
 fn protection_leg_properties(leg: &ProtectionLeg) -> Value {
     json!({
+        "format": leg.capture_format,
+        "link_types": leg.link_types,
+        "timestamp_resolutions": leg.timestamp_resolutions,
+        "sections": leg.sections,
+        "interfaces": leg.interfaces,
         "records": leg.records,
         "matching_udp_packets": leg.matching_udp_packets,
         "rtp_packets": leg.packets.len(),
@@ -1121,59 +1157,22 @@ fn audit_capture(
         ));
     }
     let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    let (format, mut offset) = parse_pcap_header(&bytes)?;
     let mut stats = CaptureStats::default();
     let mut previous: HashMap<u32, PreviousPacket> = HashMap::new();
     let mut seen = HashSet::new();
-    while offset < bytes.len() {
-        if stats.records == MAX_CAPTURE_PACKETS {
-            return Err(format!(
-                "capture exceeds the {MAX_CAPTURE_PACKETS}-packet safety limit"
-            ));
-        }
-        let record = bytes
-            .get(offset..offset + 16)
-            .ok_or_else(|| format!("truncated PCAP record header at byte {offset}"))?;
-        let seconds = read_u32(&record[0..4], format.endian);
-        let fraction = read_u32(&record[4..8], format.endian);
-        let captured = read_u32(&record[8..12], format.endian) as usize;
-        let original = read_u32(&record[12..16], format.endian) as usize;
-        if captured > MAX_PACKET_BYTES || captured > format.snaplen as usize || captured > original
-        {
-            return Err(format!(
-                "invalid PCAP record length at packet {}",
-                stats.records + 1
-            ));
-        }
-        let fraction_limit = if format.nanoseconds {
-            1_000_000_000
-        } else {
-            1_000_000
-        };
-        if fraction >= fraction_limit {
-            return Err(format!(
-                "invalid PCAP timestamp fraction at packet {}",
-                stats.records + 1
-            ));
-        }
-        offset += 16;
-        let frame = bytes
-            .get(offset..offset + captured)
-            .ok_or_else(|| format!("truncated PCAP packet at byte {offset}"))?;
-        offset += captured;
+    let capture = walk_capture(&bytes, |record| {
         stats.records += 1;
-        let divisor = if format.nanoseconds { 1e9 } else { 1e6 };
-        let arrival = f64::from(seconds) + f64::from(fraction) / divisor;
-        let udp = match extract_udp(frame, format.link_type, arrival) {
+        let arrival = record.timestamp_seconds;
+        let udp = match extract_udp(record.frame, record.link_type, arrival) {
             Ok(Some(value)) => value,
-            Ok(None) => continue,
+            Ok(None) => return Ok(()),
             Err(PacketError::Fragmented) => {
                 stats.fragmented_packets += 1;
-                continue;
+                return Ok(());
             }
             Err(PacketError::Malformed) => {
                 stats.malformed_packets += 1;
-                continue;
+                return Ok(());
             }
         };
         stats.udp_packets += 1;
@@ -1183,7 +1182,7 @@ fn audit_capture(
                 .is_some_and(|destination| destination != udp.destination)
             || stream.source.is_some_and(|source| source != udp.source)
         {
-            continue;
+            return Ok(());
         }
         stats.matching_udp_packets += 1;
         stats.sources.insert((udp.source, udp.source_port));
@@ -1191,16 +1190,16 @@ fn audit_capture(
             Ok(value) => value,
             Err(RtpError::WrongVersion) => {
                 stats.wrong_version += 1;
-                continue;
+                return Ok(());
             }
             Err(RtpError::Malformed) => {
                 stats.malformed_packets += 1;
-                continue;
+                return Ok(());
             }
         };
         if rtp.payload_type != stream.payload_type {
             stats.wrong_payload_type += 1;
-            continue;
+            return Ok(());
         }
         stats.rtp_packets += 1;
         stats.ssrcs.insert(rtp.ssrc);
@@ -1232,7 +1231,7 @@ fn audit_capture(
         let identity = (rtp.ssrc, rtp.sequence, rtp.timestamp);
         if !seen.insert(identity) {
             stats.duplicate_packets += 1;
-            continue;
+            return Ok(());
         }
         let mut advances_sequence = true;
         if let Some(last) = previous.get(&rtp.ssrc).copied() {
@@ -1269,14 +1268,18 @@ fn audit_capture(
         stats.last_arrival = Some(udp.timestamp_seconds);
         stats.first_rtp_timestamp.get_or_insert(rtp.timestamp);
         stats.last_rtp_timestamp = Some(rtp.timestamp);
-    }
+        Ok(())
+    })?;
 
     findings.push(finding(
         "FORGE-RTP-PCAP-LINKTYPE",
         Severity::Error,
-        matches!(format.link_type, 1 | 101 | 113),
-        "PCAP link type is Ethernet, raw IP, or Linux cooked capture",
-        Some(json!(format.link_type)),
+        capture
+            .link_types
+            .iter()
+            .all(|link_type| matches!(link_type, 1 | 101 | 113)),
+        "capture link types are Ethernet, raw IP, or Linux cooked capture",
+        Some(json!(capture.link_types)),
     ));
     findings.push(finding(
         "FORGE-RTP-PCAP-MALFORMED",
@@ -1394,10 +1397,31 @@ fn audit_capture(
         }
         _ => None,
     };
+    let link_type = (capture.link_types.len() == 1)
+        .then(|| capture.link_types.iter().next().copied())
+        .flatten();
+    let timestamp_resolution = if capture.format == "pcap" {
+        Some(
+            if capture.timestamp_resolutions.contains("10^-9 seconds") {
+                "nanoseconds"
+            } else {
+                "microseconds"
+            }
+            .to_string(),
+        )
+    } else if capture.timestamp_resolutions.len() == 1 {
+        capture.timestamp_resolutions.iter().next().cloned()
+    } else {
+        None
+    };
     Ok(json!({
-        "format": "pcap",
-        "link_type": format.link_type,
-        "timestamp_resolution": if format.nanoseconds { "nanoseconds" } else { "microseconds" },
+        "format": capture.format,
+        "link_type": link_type,
+        "link_types": capture.link_types,
+        "timestamp_resolution": timestamp_resolution,
+        "timestamp_resolutions": capture.timestamp_resolutions,
+        "sections": capture.sections,
+        "interfaces": capture.interfaces,
         "records": stats.records,
         "udp_packets": stats.udp_packets,
         "matching_udp_packets": stats.matching_udp_packets,
@@ -1431,10 +1455,84 @@ fn collect_protection_leg(
         ));
     }
     let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    let (format, mut offset) = parse_pcap_header(&bytes)?;
     let mut leg = ProtectionLeg::default();
+    let capture = walk_capture(&bytes, |record| {
+        leg.records += 1;
+        let arrival = record.timestamp_seconds;
+        let udp = match extract_udp(record.frame, record.link_type, arrival) {
+            Ok(Some(packet)) => packet,
+            Ok(None) => return Ok(()),
+            Err(PacketError::Fragmented) => {
+                leg.fragmented_packets += 1;
+                return Ok(());
+            }
+            Err(PacketError::Malformed) => {
+                leg.malformed_packets += 1;
+                return Ok(());
+            }
+        };
+        if udp.destination_port != stream.port
+            || stream
+                .destination
+                .is_some_and(|destination| destination != udp.destination)
+            || stream.source.is_some_and(|source| source != udp.source)
+        {
+            return Ok(());
+        }
+        leg.matching_udp_packets += 1;
+        let rtp = match parse_rtp(udp.payload) {
+            Ok(packet) => packet,
+            Err(RtpError::WrongVersion) => {
+                leg.wrong_version += 1;
+                return Ok(());
+            }
+            Err(RtpError::Malformed) => {
+                leg.malformed_packets += 1;
+                return Ok(());
+            }
+        };
+        if rtp.payload_type != stream.payload_type {
+            leg.wrong_payload_type += 1;
+            return Ok(());
+        }
+        let key = (rtp.timestamp, rtp.sequence);
+        let packet = ProtectionPacket {
+            arrival_seconds: arrival,
+            ssrc: rtp.ssrc,
+            rtp_datagram_sha256: Sha256::digest(udp.payload).into(),
+        };
+        if leg.packets.insert(key, packet).is_some() {
+            leg.duplicate_identities += 1;
+        }
+        Ok(())
+    })?;
+    leg.capture_format = Some(capture.format);
+    leg.link_types = capture.link_types;
+    leg.timestamp_resolutions = capture.timestamp_resolutions;
+    leg.sections = capture.sections;
+    leg.interfaces = capture.interfaces;
+    Ok(leg)
+}
+
+fn walk_capture<'a>(
+    bytes: &'a [u8],
+    visit: impl FnMut(CaptureRecord<'a>) -> Result<(), String>,
+) -> Result<CaptureMetadata, String> {
+    if bytes.starts_with(&[0x0a, 0x0d, 0x0d, 0x0a]) {
+        walk_pcapng(bytes, visit)
+    } else {
+        walk_classic_pcap(bytes, visit)
+    }
+}
+
+fn walk_classic_pcap<'a>(
+    bytes: &'a [u8],
+    mut visit: impl FnMut(CaptureRecord<'a>) -> Result<(), String>,
+) -> Result<CaptureMetadata, String> {
+    let (format, mut offset) = parse_pcap_header(bytes)?;
+    let mut records = 0;
     while offset < bytes.len() {
-        if leg.records == MAX_CAPTURE_PACKETS {
+        if records == MAX_CAPTURE_PACKETS {
             return Err(format!(
                 "capture exceeds the {MAX_CAPTURE_PACKETS}-packet safety limit"
             ));
@@ -1450,7 +1548,7 @@ fn collect_protection_leg(
         {
             return Err(format!(
                 "invalid PCAP record length at packet {}",
-                leg.records + 1
+                records + 1
             ));
         }
         let fraction_limit = if format.nanoseconds {
@@ -1461,7 +1559,7 @@ fn collect_protection_leg(
         if fraction >= fraction_limit {
             return Err(format!(
                 "invalid PCAP timestamp fraction at packet {}",
-                leg.records + 1
+                records + 1
             ));
         }
         offset += 16;
@@ -1469,62 +1567,307 @@ fn collect_protection_leg(
             .get(offset..offset + captured)
             .ok_or_else(|| format!("truncated PCAP packet at byte {offset}"))?;
         offset += captured;
-        leg.records += 1;
+        records += 1;
         let divisor = if format.nanoseconds { 1e9 } else { 1e6 };
-        let arrival = f64::from(seconds) + f64::from(fraction) / divisor;
-        let udp = match extract_udp(frame, format.link_type, arrival) {
-            Ok(Some(packet)) => packet,
-            Ok(None) => continue,
-            Err(PacketError::Fragmented) => {
-                leg.fragmented_packets += 1;
-                continue;
-            }
-            Err(PacketError::Malformed) => {
-                leg.malformed_packets += 1;
-                continue;
-            }
-        };
-        if udp.destination_port != stream.port
-            || stream
-                .destination
-                .is_some_and(|destination| destination != udp.destination)
-            || stream.source.is_some_and(|source| source != udp.source)
-        {
-            continue;
-        }
-        leg.matching_udp_packets += 1;
-        let rtp = match parse_rtp(udp.payload) {
-            Ok(packet) => packet,
-            Err(RtpError::WrongVersion) => {
-                leg.wrong_version += 1;
-                continue;
-            }
-            Err(RtpError::Malformed) => {
-                leg.malformed_packets += 1;
-                continue;
-            }
-        };
-        if rtp.payload_type != stream.payload_type {
-            leg.wrong_payload_type += 1;
-            continue;
-        }
-        let key = (rtp.timestamp, rtp.sequence);
-        let packet = ProtectionPacket {
-            arrival_seconds: arrival,
-            ssrc: rtp.ssrc,
-            rtp_datagram_sha256: Sha256::digest(udp.payload).into(),
-        };
-        if leg.packets.insert(key, packet).is_some() {
-            leg.duplicate_identities += 1;
-        }
+        visit(CaptureRecord {
+            timestamp_seconds: f64::from(seconds) + f64::from(fraction) / divisor,
+            link_type: format.link_type,
+            frame,
+        })?;
     }
-    Ok(leg)
+    Ok(CaptureMetadata {
+        format: "pcap",
+        link_types: BTreeSet::from([format.link_type]),
+        timestamp_resolutions: BTreeSet::from([if format.nanoseconds {
+            "10^-9 seconds".to_string()
+        } else {
+            "10^-6 seconds".to_string()
+        }]),
+        sections: 1,
+        interfaces: 1,
+        records,
+    })
+}
+
+fn walk_pcapng<'a>(
+    bytes: &'a [u8],
+    mut visit: impl FnMut(CaptureRecord<'a>) -> Result<(), String>,
+) -> Result<CaptureMetadata, String> {
+    const SECTION_HEADER: [u8; 4] = [0x0a, 0x0d, 0x0d, 0x0a];
+    const INTERFACE_DESCRIPTION: u32 = 1;
+    const SIMPLE_PACKET: u32 = 3;
+    const ENHANCED_PACKET: u32 = 6;
+
+    let mut offset = 0;
+    let mut endian = None;
+    let mut interfaces = Vec::<PcapNgInterface>::new();
+    let mut metadata = CaptureMetadata {
+        format: "pcapng",
+        link_types: BTreeSet::new(),
+        timestamp_resolutions: BTreeSet::new(),
+        sections: 0,
+        interfaces: 0,
+        records: 0,
+    };
+    while offset < bytes.len() {
+        let header = bytes
+            .get(offset..offset + 12)
+            .ok_or_else(|| format!("truncated PCAPNG block header at byte {offset}"))?;
+        if header[..4] == SECTION_HEADER {
+            let section_endian = match &header[8..12] {
+                [0x4d, 0x3c, 0x2b, 0x1a] => Endian::Little,
+                [0x1a, 0x2b, 0x3c, 0x4d] => Endian::Big,
+                _ => {
+                    return Err(format!(
+                        "invalid PCAPNG byte-order magic at byte {}",
+                        offset + 8
+                    ));
+                }
+            };
+            let block = pcapng_block(bytes, offset, section_endian, 28)?;
+            let major = read_u16(&block[12..14], section_endian);
+            let minor = read_u16(&block[14..16], section_endian);
+            if (major, minor) != (1, 0) {
+                return Err(format!("unsupported PCAPNG version {major}.{minor}"));
+            }
+            validate_pcapng_options(&block[24..block.len() - 4], section_endian, "section")?;
+            offset += block.len();
+            endian = Some(section_endian);
+            interfaces.clear();
+            metadata.sections += 1;
+            continue;
+        }
+
+        let section_endian =
+            endian.ok_or_else(|| "PCAPNG must begin with a Section Header Block".to_string())?;
+        let block_type = read_u32(&header[..4], section_endian);
+        let block = pcapng_block(bytes, offset, section_endian, 12)?;
+        match block_type {
+            INTERFACE_DESCRIPTION => {
+                if block.len() < 20 {
+                    return Err(format!(
+                        "PCAPNG Interface Description Block at byte {offset} is too short"
+                    ));
+                }
+                let link_type = u32::from(read_u16(&block[8..10], section_endian));
+                validate_capture_link_type(link_type, "PCAPNG")?;
+                let snaplen = read_u32(&block[12..16], section_endian);
+                if snaplen as usize > MAX_PACKET_BYTES {
+                    return Err(format!("invalid PCAPNG interface snaplen {snaplen}"));
+                }
+                let mut timestamp_scale = 1e-6;
+                let mut timestamp_resolution = "10^-6 seconds".to_string();
+                let mut timestamp_offset = 0_i64;
+                let mut saw_resolution = false;
+                let mut saw_offset = false;
+                walk_pcapng_options(
+                    &block[16..block.len() - 4],
+                    section_endian,
+                    "interface",
+                    |code, value| {
+                        match code {
+                            9 => {
+                                if saw_resolution || value.len() != 1 {
+                                    return Err(
+                                        "PCAPNG if_tsresol must occur once with length one".into(),
+                                    );
+                                }
+                                saw_resolution = true;
+                                let raw = value[0];
+                                let exponent = i32::from(raw & 0x7f);
+                                if raw & 0x80 == 0 {
+                                    timestamp_scale = 10_f64.powi(-exponent);
+                                    timestamp_resolution = format!("10^-{exponent} seconds");
+                                } else {
+                                    timestamp_scale = 2_f64.powi(-exponent);
+                                    timestamp_resolution = format!("2^-{exponent} seconds");
+                                }
+                            }
+                            14 => {
+                                if saw_offset || value.len() != 8 {
+                                    return Err(
+                                        "PCAPNG if_tsoffset must occur once with length eight"
+                                            .into(),
+                                    );
+                                }
+                                saw_offset = true;
+                                timestamp_offset = read_u64(value, section_endian) as i64;
+                            }
+                            _ => {}
+                        }
+                        Ok(())
+                    },
+                )?;
+                if !timestamp_scale.is_finite() || timestamp_scale <= 0.0 {
+                    return Err("invalid PCAPNG timestamp resolution".into());
+                }
+                interfaces.push(PcapNgInterface {
+                    link_type,
+                    snaplen,
+                    timestamp_scale,
+                    timestamp_offset,
+                });
+                metadata.link_types.insert(link_type);
+                metadata.timestamp_resolutions.insert(timestamp_resolution);
+                metadata.interfaces += 1;
+            }
+            ENHANCED_PACKET => {
+                if block.len() < 32 {
+                    return Err(format!(
+                        "PCAPNG Enhanced Packet Block at byte {offset} is too short"
+                    ));
+                }
+                if metadata.records == MAX_CAPTURE_PACKETS {
+                    return Err(format!(
+                        "capture exceeds the {MAX_CAPTURE_PACKETS}-packet safety limit"
+                    ));
+                }
+                let interface_id = read_u32(&block[8..12], section_endian) as usize;
+                let interface = interfaces.get(interface_id).copied().ok_or_else(|| {
+                    format!(
+                        "PCAPNG packet at byte {offset} references undefined interface {interface_id}"
+                    )
+                })?;
+                let timestamp = u64::from(read_u32(&block[12..16], section_endian)) << 32
+                    | u64::from(read_u32(&block[16..20], section_endian));
+                let captured = read_u32(&block[20..24], section_endian) as usize;
+                let original = read_u32(&block[24..28], section_endian) as usize;
+                if captured > MAX_PACKET_BYTES
+                    || interface.snaplen != 0 && captured > interface.snaplen as usize
+                    || captured > original
+                {
+                    return Err(format!(
+                        "invalid PCAPNG packet length at packet {}",
+                        metadata.records + 1
+                    ));
+                }
+                let padded = captured
+                    .checked_add(3)
+                    .ok_or_else(|| "PCAPNG packet length overflow".to_string())?
+                    & !3;
+                let data_end = 28_usize
+                    .checked_add(padded)
+                    .ok_or_else(|| "PCAPNG packet length overflow".to_string())?;
+                if data_end + 4 > block.len() {
+                    return Err(format!(
+                        "truncated PCAPNG packet data at byte {}",
+                        offset + 28
+                    ));
+                }
+                validate_pcapng_options(
+                    &block[data_end..block.len() - 4],
+                    section_endian,
+                    "packet",
+                )?;
+                let arrival = timestamp as f64 * interface.timestamp_scale
+                    + interface.timestamp_offset as f64;
+                if !arrival.is_finite() {
+                    return Err(format!(
+                        "PCAPNG timestamp at packet {} is not representable",
+                        metadata.records + 1
+                    ));
+                }
+                metadata.records += 1;
+                visit(CaptureRecord {
+                    timestamp_seconds: arrival,
+                    link_type: interface.link_type,
+                    frame: &block[28..28 + captured],
+                })?;
+            }
+            SIMPLE_PACKET => {
+                return Err(
+                    "PCAPNG Simple Packet Blocks have no timestamp; use Enhanced Packet Blocks"
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+        offset += block.len();
+    }
+    if metadata.sections == 0 {
+        return Err("PCAPNG contains no Section Header Block".into());
+    }
+    Ok(metadata)
+}
+
+fn pcapng_block(
+    bytes: &[u8],
+    offset: usize,
+    endian: Endian,
+    minimum_length: usize,
+) -> Result<&[u8], String> {
+    let header = bytes
+        .get(offset..offset + 8)
+        .ok_or_else(|| format!("truncated PCAPNG block header at byte {offset}"))?;
+    let length = read_u32(&header[4..8], endian) as usize;
+    if length < minimum_length || !length.is_multiple_of(4) {
+        return Err(format!(
+            "invalid PCAPNG block length {length} at byte {offset}"
+        ));
+    }
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| "PCAPNG block length overflow".to_string())?;
+    let block = bytes
+        .get(offset..end)
+        .ok_or_else(|| format!("truncated PCAPNG block at byte {offset}"))?;
+    let trailing = read_u32(&block[length - 4..], endian) as usize;
+    if trailing != length {
+        return Err(format!(
+            "PCAPNG block lengths disagree at byte {offset}: {length} != {trailing}"
+        ));
+    }
+    Ok(block)
+}
+
+fn validate_pcapng_options(bytes: &[u8], endian: Endian, context: &str) -> Result<(), String> {
+    walk_pcapng_options(bytes, endian, context, |_, _| Ok(()))
+}
+
+fn walk_pcapng_options(
+    bytes: &[u8],
+    endian: Endian,
+    context: &str,
+    mut visit: impl FnMut(u16, &[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let header = bytes
+            .get(offset..offset + 4)
+            .ok_or_else(|| format!("truncated PCAPNG {context} option header at byte {offset}"))?;
+        let code = read_u16(&header[..2], endian);
+        let length = usize::from(read_u16(&header[2..4], endian));
+        offset += 4;
+        if code == 0 {
+            if length != 0 {
+                return Err(format!("invalid PCAPNG {context} end-of-options marker"));
+            }
+            return Ok(());
+        }
+        let padded = length
+            .checked_add(3)
+            .ok_or_else(|| format!("PCAPNG {context} option length overflow"))?
+            & !3;
+        let option = bytes
+            .get(offset..offset + padded)
+            .ok_or_else(|| format!("truncated PCAPNG {context} option {code}"))?;
+        visit(code, &option[..length])?;
+        offset += padded;
+    }
+    Ok(())
+}
+
+fn validate_capture_link_type(link_type: u32, format: &str) -> Result<(), String> {
+    if matches!(link_type, 1 | 101 | 113) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unsupported {format} link type {link_type}; expected Ethernet (1), raw IP (101), or Linux cooked (113)"
+        ))
+    }
 }
 
 fn parse_pcap_header(bytes: &[u8]) -> Result<(CaptureFormat, usize), String> {
-    if bytes.starts_with(&[0x0a, 0x0d, 0x0d, 0x0a]) {
-        return Err("PCAPNG is not supported; export a classic PCAP file".into());
-    }
     let header = bytes
         .get(..24)
         .ok_or_else(|| "capture is shorter than a classic PCAP global header".to_string())?;
@@ -1545,11 +1888,7 @@ fn parse_pcap_header(bytes: &[u8]) -> Result<(CaptureFormat, usize), String> {
         return Err(format!("invalid PCAP snaplen {snaplen}"));
     }
     let link_type = read_u32(&header[20..24], endian);
-    if !matches!(link_type, 1 | 101 | 113) {
-        return Err(format!(
-            "unsupported PCAP link type {link_type}; expected Ethernet (1), raw IP (101), or Linux cooked (113)"
-        ));
-    }
+    validate_capture_link_type(link_type, "PCAP")?;
     Ok((
         CaptureFormat {
             endian,
@@ -1799,6 +2138,14 @@ fn read_u32(bytes: &[u8], endian: Endian) -> u32 {
     }
 }
 
+fn read_u64(bytes: &[u8], endian: Endian) -> u64 {
+    let value: [u8; 8] = bytes.try_into().expect("eight-byte slice");
+    match endian {
+        Endian::Little => u64::from_le_bytes(value),
+        Endian::Big => u64::from_be_bytes(value),
+    }
+}
+
 fn finding(
     rule_id: &'static str,
     severity: Severity,
@@ -1818,6 +2165,66 @@ fn finding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn append_u16(output: &mut Vec<u8>, value: u16, endian: Endian) {
+        match endian {
+            Endian::Little => output.extend_from_slice(&value.to_le_bytes()),
+            Endian::Big => output.extend_from_slice(&value.to_be_bytes()),
+        }
+    }
+
+    fn append_u32(output: &mut Vec<u8>, value: u32, endian: Endian) {
+        match endian {
+            Endian::Little => output.extend_from_slice(&value.to_le_bytes()),
+            Endian::Big => output.extend_from_slice(&value.to_be_bytes()),
+        }
+    }
+
+    fn append_pcapng_block(output: &mut Vec<u8>, block_type: u32, body: &[u8], endian: Endian) {
+        let length = (12 + body.len()) as u32;
+        append_u32(output, block_type, endian);
+        append_u32(output, length, endian);
+        output.extend_from_slice(body);
+        append_u32(output, length, endian);
+    }
+
+    fn append_pcapng_section(output: &mut Vec<u8>, endian: Endian) {
+        let mut body = Vec::new();
+        append_u32(&mut body, 0x1a2b_3c4d, endian);
+        append_u16(&mut body, 1, endian);
+        append_u16(&mut body, 0, endian);
+        match endian {
+            Endian::Little => body.extend_from_slice(&u64::MAX.to_le_bytes()),
+            Endian::Big => body.extend_from_slice(&u64::MAX.to_be_bytes()),
+        }
+        append_pcapng_block(output, 0x0a0d_0d0a, &body, endian);
+    }
+
+    fn append_pcapng_interface(
+        output: &mut Vec<u8>,
+        endian: Endian,
+        link_type: u16,
+        reserved: u16,
+        snaplen: u32,
+        options: &[u8],
+    ) {
+        let mut body = Vec::new();
+        append_u16(&mut body, link_type, endian);
+        append_u16(&mut body, reserved, endian);
+        append_u32(&mut body, snaplen, endian);
+        body.extend_from_slice(options);
+        append_pcapng_block(output, 1, &body, endian);
+    }
+
+    fn append_empty_pcapng_packet(output: &mut Vec<u8>, endian: Endian, timestamp: u64) {
+        let mut body = Vec::new();
+        append_u32(&mut body, 0, endian);
+        append_u32(&mut body, (timestamp >> 32) as u32, endian);
+        append_u32(&mut body, timestamp as u32, endian);
+        append_u32(&mut body, 0, endian);
+        append_u32(&mut body, 0, endian);
+        append_pcapng_block(output, 6, &body, endian);
+    }
 
     #[test]
     fn parses_st2110_channel_order() {
@@ -1839,9 +2246,57 @@ mod tests {
     }
 
     #[test]
-    fn rejects_pcapng_explicitly() {
-        let bytes = [0x0a, 0x0d, 0x0d, 0x0a];
-        assert!(parse_pcap_header(&bytes).unwrap_err().contains("PCAPNG"));
+    fn parses_multiple_pcapng_sections_and_timestamp_options() {
+        let mut bytes = Vec::new();
+        append_pcapng_section(&mut bytes, Endian::Little);
+        append_pcapng_interface(&mut bytes, Endian::Little, 1, 42, 0, &[]);
+        append_empty_pcapng_packet(&mut bytes, Endian::Little, 1_000_000);
+
+        append_pcapng_section(&mut bytes, Endian::Big);
+        let mut options = Vec::new();
+        append_u16(&mut options, 9, Endian::Big);
+        append_u16(&mut options, 1, Endian::Big);
+        options.extend_from_slice(&[0x8a, 0, 0, 0]);
+        append_u16(&mut options, 14, Endian::Big);
+        append_u16(&mut options, 8, Endian::Big);
+        options.extend_from_slice(&(-2_i64).to_be_bytes());
+        append_u16(&mut options, 0, Endian::Big);
+        append_u16(&mut options, 0, Endian::Big);
+        append_pcapng_interface(&mut bytes, Endian::Big, 101, 0, 65_535, &options);
+        append_empty_pcapng_packet(&mut bytes, Endian::Big, 1024);
+
+        let mut timestamps = Vec::new();
+        let metadata = walk_capture(&bytes, |record| {
+            timestamps.push(record.timestamp_seconds);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(metadata.format, "pcapng");
+        assert_eq!(metadata.sections, 2);
+        assert_eq!(metadata.interfaces, 2);
+        assert_eq!(metadata.records, 2);
+        assert_eq!(metadata.link_types, BTreeSet::from([1, 101]));
+        assert_eq!(timestamps, vec![1.0, -1.0]);
+    }
+
+    #[test]
+    fn rejects_pcapng_simple_packet_without_arrival_time() {
+        let mut bytes = Vec::new();
+        append_pcapng_section(&mut bytes, Endian::Little);
+        append_pcapng_interface(&mut bytes, Endian::Little, 1, 0, 65_535, &[]);
+        append_pcapng_block(&mut bytes, 3, &0_u32.to_le_bytes(), Endian::Little);
+        let error = walk_capture(&bytes, |_| Ok(())).unwrap_err();
+        assert!(error.contains("no timestamp"));
+    }
+
+    #[test]
+    fn rejects_mismatched_pcapng_block_lengths() {
+        let mut bytes = Vec::new();
+        append_pcapng_section(&mut bytes, Endian::Little);
+        let trailing_length = bytes.len() - 4;
+        bytes[trailing_length] = 0;
+        let error = walk_capture(&bytes, |_| Ok(())).unwrap_err();
+        assert!(error.contains("lengths disagree"));
     }
 
     #[test]

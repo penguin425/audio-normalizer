@@ -494,8 +494,9 @@ the [SMPTE IMF SHA-1 advisory](https://www.smpte.org/standards/advisory-note-imf
 
 ### RTP / AES67 / ST 2110 audio QC
 
-`forge-rtp-qc session.sdp [capture.pcap]` audits an RTP audio session
-description and optionally correlates it with a saved classic PCAP:
+`forge-rtp-qc session.sdp [capture.pcap|capture.pcapng]` audits an RTP audio
+session description and optionally correlates it with a saved classic PCAP or
+PCAPNG capture:
 
 - RFC 8866 session/media structure, RTP/AVP payload mappings, destination,
   port, clock rate, channels, packet time, and RFC 7273 clock attributes;
@@ -505,8 +506,11 @@ description and optionally correlates it with a saved classic PCAP:
 - SMPTE ST 2110-31 AM824 dynamic payload, permitted packet times, even
   subframe-sequence counts, reserved AM824 bits, Marker/CSRC constraints, and
   payload geometry; and
-- Ethernet (including VLAN), raw IPv4/IPv6, and Linux cooked PCAP frames;
-  UDP-flow correlation; RTP header bounds; SSRC/source stability; sequence
+- Ethernet (including VLAN), raw IPv4/IPv6, and Linux cooked frames from
+  classic PCAP or PCAPNG Enhanced Packet Blocks, including multiple sections
+  and interfaces, per-section byte order, decimal/binary `if_tsresol`, and
+  signed `if_tsoffset`;
+- UDP-flow correlation; RTP header bounds; SSRC/source stability; sequence
   gaps, reorder and duplicates; timestamp steps; sample counts; and arrival
   jitter evidence.
 
@@ -518,22 +522,25 @@ forge-rtp-qc session.sdp --profile aes67
 
 The report follows `schema/rtp-audio-qc-v1.schema.json`; exit status is 0 for
 pass, 1 for a QC failure, and 2 for malformed input or I/O failure. Inputs are
-bounded and read locally. PCAPNG, live capture, IP fragment reassembly,
-encrypted RTP, RTCP quality analysis, PTP packet/lock verification, and full
-device or managed-network conformance are explicitly outside this audit's
-scope. Clock signaling is checked as evidence, not as proof that the sender
-was locked to the declared reference.
+bounded and read locally. PCAPNG Simple Packet Blocks are rejected because
+they carry no arrival timestamp; obsolete Packet Blocks are ignored. Live
+capture, IP fragment reassembly, encrypted RTP, RTCP quality analysis, PTP
+packet/lock verification, and full device or managed-network conformance are
+explicitly outside this audit's scope. Clock signaling is checked as evidence,
+not as proof that the sender was locked to the declared reference.
 
 The profile checks track [RFC 3550](https://www.rfc-editor.org/rfc/rfc3550),
 [RFC 7273](https://www.rfc-editor.org/rfc/rfc7273),
+[IETF PCAPNG](https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcapng/),
 [SMPTE ST 2110-30](https://pub.smpte.org/doc/st2110-30/20170918-pub/st2110-30-2017.pdf),
 and [SMPTE ST 2110-31:2022](https://pub.smpte.org/pub/st2110-31/st2110-31-2022.pdf).
 
 ### SMPTE ST 2022-7 redundant RTP QC
 
-`forge-st2022-7-qc primary.sdp primary.pcap secondary.sdp secondary.pcap`
-audits a redundant RTP audio pair and simulates the packet union available to
-a seamless-protection receiver. It checks:
+`forge-st2022-7-qc primary.sdp primary.pcap secondary.sdp secondary.pcapng`
+audits a redundant RTP audio pair from classic PCAP and/or PCAPNG inputs and
+simulates the packet union available to a seamless-protection receiver. It
+checks:
 
 - equivalent RTP payload type, encoding, clock, channels, packet time, and
   channel order, with distinct leg addressing;
