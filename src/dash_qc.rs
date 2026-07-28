@@ -1,6 +1,7 @@
 //! ISO/IEC 23009-1 DASH MPD validation with bounded local CMAF checks.
 
 use crate::container_qc;
+use base64::Engine as _;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
 use serde::Serialize;
@@ -19,6 +20,7 @@ const MAX_LOCAL_SEGMENTS: usize = 4_096;
 pub enum DashProfile {
     Iso23009,
     DashIfIop,
+    DashLive,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -58,6 +60,9 @@ struct SegmentTemplate {
     timescale: Option<u64>,
     duration: Option<u64>,
     start_number: Option<u64>,
+    presentation_time_offset: Option<u64>,
+    availability_time_offset: Option<f64>,
+    availability_time_complete: Option<bool>,
     timeline: Vec<TimelineEntry>,
 }
 
@@ -68,28 +73,100 @@ struct TimelineEntry {
     repeat: i64,
 }
 
+#[derive(Clone, Default)]
+struct BaseUrl {
+    value: Option<String>,
+    availability_time_offset: Option<f64>,
+    availability_time_complete: Option<bool>,
+}
+
+#[derive(Clone, Default)]
+struct Descriptor {
+    scheme_id_uri: Option<String>,
+    value: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct ContentProtection {
+    scheme_id_uri: Option<String>,
+    value: Option<String>,
+    default_kid: Option<String>,
+    pssh: Vec<String>,
+}
+
+#[derive(Clone, Default)]
+struct MpdEvent {
+    id: Option<u64>,
+    presentation_time: u64,
+    duration: Option<u64>,
+}
+
+#[derive(Clone, Default)]
+struct EventStream {
+    scheme_id_uri: Option<String>,
+    value: Option<String>,
+    timescale: u64,
+    presentation_time_offset: u64,
+    events: Vec<MpdEvent>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Latency {
+    target: Option<u64>,
+    min: Option<u64>,
+    max: Option<u64>,
+    reference_id: Option<u64>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PlaybackRate {
+    min: Option<f64>,
+    max: Option<f64>,
+}
+
+#[derive(Clone, Default)]
+struct ServiceDescription {
+    id: Option<u64>,
+    latency: Option<Latency>,
+    playback_rate: Option<PlaybackRate>,
+}
+
+#[derive(Clone, Default)]
+struct ProducerReferenceTime {
+    id: Option<u64>,
+    kind: Option<String>,
+    inband: Option<bool>,
+    wall_clock_time: Option<String>,
+    presentation_time: Option<u64>,
+}
+
 #[derive(Default)]
 struct Representation {
     id: Option<String>,
-    base_url: Option<String>,
+    base_url: Option<BaseUrl>,
     bandwidth: Option<u64>,
     mime_type: Option<String>,
     codecs: Option<String>,
     audio_sampling_rate: Option<u64>,
     audio_channel_configuration: Option<(String, String)>,
+    content_protections: Vec<ContentProtection>,
+    producer_reference_times: Vec<ProducerReferenceTime>,
     template: Option<SegmentTemplate>,
 }
 
 #[derive(Default)]
 struct AdaptationSet {
     id: Option<String>,
-    base_url: Option<String>,
+    base_url: Option<BaseUrl>,
     content_type: Option<String>,
     mime_type: Option<String>,
     codecs: Option<String>,
     lang: Option<String>,
     audio_sampling_rate: Option<u64>,
     audio_channel_configuration: Option<(String, String)>,
+    supplemental_properties: Vec<Descriptor>,
+    content_protections: Vec<ContentProtection>,
+    producer_reference_times: Vec<ProducerReferenceTime>,
     template: Option<SegmentTemplate>,
     representations: Vec<Representation>,
 }
@@ -97,9 +174,10 @@ struct AdaptationSet {
 #[derive(Default)]
 struct Period {
     id: Option<String>,
-    base_url: Option<String>,
+    base_url: Option<BaseUrl>,
     start: Option<f64>,
     duration: Option<f64>,
+    event_streams: Vec<EventStream>,
     template: Option<SegmentTemplate>,
     adaptations: Vec<AdaptationSet>,
 }
@@ -108,13 +186,19 @@ struct Period {
 struct Mpd {
     root_count: usize,
     namespace: Option<String>,
-    base_url: Option<String>,
+    base_url: Option<BaseUrl>,
     profiles: Vec<String>,
     kind: String,
     availability_start_time: Option<String>,
+    publish_time: Option<String>,
     media_presentation_duration: Option<f64>,
     min_buffer_time: Option<f64>,
     minimum_update_period: Option<f64>,
+    time_shift_buffer_depth: Option<f64>,
+    suggested_presentation_delay: Option<f64>,
+    max_segment_duration: Option<f64>,
+    utc_timings: Vec<Descriptor>,
+    service_descriptions: Vec<ServiceDescription>,
     periods: Vec<Period>,
     element_count: usize,
 }
@@ -162,12 +246,34 @@ pub fn audit(path: &Path, profile: DashProfile) -> Result<DashAudit, String> {
         findings,
         properties: json!({
             "namespace": mpd.namespace,
-            "base_url": mpd.base_url,
+            "base_url": mpd.base_url.as_ref().and_then(|item| item.value.as_ref()),
             "profiles": mpd.profiles,
             "availability_start_time": mpd.availability_start_time,
+            "publish_time": mpd.publish_time,
             "media_presentation_duration_seconds": mpd.media_presentation_duration,
             "minimum_buffer_time_seconds": mpd.min_buffer_time,
             "minimum_update_period_seconds": mpd.minimum_update_period,
+            "time_shift_buffer_depth_seconds": mpd.time_shift_buffer_depth,
+            "suggested_presentation_delay_seconds": mpd.suggested_presentation_delay,
+            "maximum_segment_duration_seconds": mpd.max_segment_duration,
+            "utc_timing_count": mpd.utc_timings.len(),
+            "service_description_count": mpd.service_descriptions.len(),
+            "producer_reference_time_count": mpd.periods.iter()
+                .flat_map(|period| &period.adaptations)
+                .map(|adaptation| adaptation.producer_reference_times.len()
+                    + adaptation.representations.iter()
+                        .map(|representation| representation.producer_reference_times.len())
+                        .sum::<usize>())
+                .sum::<usize>(),
+            "event_stream_count": mpd.periods.iter()
+                .map(|period| period.event_streams.len()).sum::<usize>(),
+            "content_protection_count": mpd.periods.iter()
+                .flat_map(|period| &period.adaptations)
+                .map(|adaptation| adaptation.content_protections.len()
+                    + adaptation.representations.iter()
+                        .map(|representation| representation.content_protections.len())
+                        .sum::<usize>())
+                .sum::<usize>(),
             "period_count": mpd.periods.len(),
             "adaptation_set_count": adaptation_count,
             "representation_count": representation_count,
@@ -229,16 +335,30 @@ fn parse_mpd(xml: &[u8]) -> Result<Mpd, String> {
                 );
                 stack.pop();
             }
-            Ok(Event::Text(text)) if stack.last().map(String::as_str) == Some("BaseURL") => {
+            Ok(Event::Text(text)) => {
                 let value = String::from_utf8_lossy(text.as_ref()).trim().to_owned();
-                if !value.is_empty() {
-                    set_base_url(
-                        &mut mpd,
-                        active_period,
-                        active_adaptation,
-                        active_representation,
-                        value,
-                    )?;
+                match stack.last().map(String::as_str) {
+                    Some("BaseURL") if !value.is_empty() => {
+                        set_base_url_value(
+                            &mut mpd,
+                            active_period,
+                            active_adaptation,
+                            active_representation,
+                            value,
+                        )?;
+                    }
+                    Some("pssh") if !value.is_empty() => {
+                        let protection = current_content_protection_mut(
+                            &mut mpd,
+                            active_period,
+                            active_adaptation,
+                            active_representation,
+                        )?;
+                        if let Some(pssh) = protection.pssh.last_mut() {
+                            pssh.push_str(&value);
+                        }
+                    }
+                    _ => {}
                 }
             }
             Ok(Event::Eof) => break,
@@ -301,6 +421,7 @@ fn observe_element(
                 .cloned()
                 .unwrap_or_else(|| "static".into());
             mpd.availability_start_time = attributes.get("availabilityStartTime").cloned();
+            mpd.publish_time = attributes.get("publishTime").cloned();
             mpd.media_presentation_duration = attributes
                 .get("mediaPresentationDuration")
                 .map(|value| parse_duration(value))
@@ -311,6 +432,18 @@ fn observe_element(
                 .transpose()?;
             mpd.minimum_update_period = attributes
                 .get("minimumUpdatePeriod")
+                .map(|value| parse_duration(value))
+                .transpose()?;
+            mpd.time_shift_buffer_depth = attributes
+                .get("timeShiftBufferDepth")
+                .map(|value| parse_duration(value))
+                .transpose()?;
+            mpd.suggested_presentation_delay = attributes
+                .get("suggestedPresentationDelay")
+                .map(|value| parse_duration(value))
+                .transpose()?;
+            mpd.max_segment_duration = attributes
+                .get("maxSegmentDuration")
                 .map(|value| parse_duration(value))
                 .transpose()?;
         }
@@ -365,6 +498,18 @@ fn observe_element(
                 timescale: parse_optional_u64(&attributes, "timescale")?,
                 duration: parse_optional_u64(&attributes, "duration")?,
                 start_number: parse_optional_u64(&attributes, "startNumber")?,
+                presentation_time_offset: parse_optional_u64(
+                    &attributes,
+                    "presentationTimeOffset",
+                )?,
+                availability_time_offset: parse_optional_availability_offset(
+                    &attributes,
+                    "availabilityTimeOffset",
+                )?,
+                availability_time_complete: parse_optional_bool(
+                    &attributes,
+                    "availabilityTimeComplete",
+                )?,
                 timeline: Vec::new(),
             };
             if let Some(representation) = *active_representation {
@@ -416,6 +561,165 @@ fn observe_element(
             } else {
                 adaptation.audio_channel_configuration = Some(configuration);
             }
+        }
+        "BaseURL" => {
+            let base_url = BaseUrl {
+                availability_time_offset: parse_optional_availability_offset(
+                    &attributes,
+                    "availabilityTimeOffset",
+                )?,
+                availability_time_complete: parse_optional_bool(
+                    &attributes,
+                    "availabilityTimeComplete",
+                )?,
+                ..BaseUrl::default()
+            };
+            set_base_url(
+                mpd,
+                *active_period,
+                *active_adaptation,
+                *active_representation,
+                base_url,
+            )?;
+        }
+        "UTCTiming" if stack.len() == 2 => {
+            mpd.utc_timings.push(Descriptor {
+                scheme_id_uri: attributes.get("schemeIdUri").cloned(),
+                value: attributes.get("value").cloned(),
+            });
+        }
+        "ServiceDescription" if stack.len() == 2 => {
+            mpd.service_descriptions.push(ServiceDescription {
+                id: parse_optional_u64(&attributes, "id")?,
+                ..ServiceDescription::default()
+            });
+        }
+        "Latency"
+            if stack.iter().rev().nth(1).map(String::as_str) == Some("ServiceDescription") =>
+        {
+            let service = mpd
+                .service_descriptions
+                .last_mut()
+                .ok_or_else(|| "Latency has no enclosing ServiceDescription".to_string())?;
+            service.latency = Some(Latency {
+                target: parse_optional_u64(&attributes, "target")?,
+                min: parse_optional_u64(&attributes, "min")?,
+                max: parse_optional_u64(&attributes, "max")?,
+                reference_id: parse_optional_u64(&attributes, "referenceId")?,
+            });
+        }
+        "PlaybackRate"
+            if stack.iter().rev().nth(1).map(String::as_str) == Some("ServiceDescription") =>
+        {
+            let service = mpd
+                .service_descriptions
+                .last_mut()
+                .ok_or_else(|| "PlaybackRate has no enclosing ServiceDescription".to_string())?;
+            service.playback_rate = Some(PlaybackRate {
+                min: parse_optional_f64(&attributes, "min")?,
+                max: parse_optional_f64(&attributes, "max")?,
+            });
+        }
+        "EventStream" => {
+            let period = current_period_mut(mpd, *active_period)?;
+            period.event_streams.push(EventStream {
+                scheme_id_uri: attributes.get("schemeIdUri").cloned(),
+                value: attributes.get("value").cloned(),
+                timescale: parse_optional_u64(&attributes, "timescale")?.unwrap_or(1),
+                presentation_time_offset: parse_optional_u64(
+                    &attributes,
+                    "presentationTimeOffset",
+                )?
+                .unwrap_or(0),
+                events: Vec::new(),
+            });
+        }
+        "Event" if stack.iter().rev().nth(1).map(String::as_str) == Some("EventStream") => {
+            let period = current_period_mut(mpd, *active_period)?;
+            let stream = period
+                .event_streams
+                .last_mut()
+                .ok_or_else(|| "Event has no enclosing EventStream".to_string())?;
+            stream.events.push(MpdEvent {
+                id: parse_optional_u64(&attributes, "id")?,
+                presentation_time: parse_optional_u64(&attributes, "presentationTime")?
+                    .unwrap_or(0),
+                duration: parse_optional_u64(&attributes, "duration")?,
+            });
+        }
+        "ProducerReferenceTime"
+            if active_adaptation.is_some()
+                && matches!(
+                    stack.iter().rev().nth(1).map(String::as_str),
+                    Some("AdaptationSet" | "Representation")
+                ) =>
+        {
+            let reference = ProducerReferenceTime {
+                id: parse_optional_u64(&attributes, "id")?,
+                kind: attributes.get("type").cloned(),
+                inband: parse_optional_bool(&attributes, "inband")?,
+                wall_clock_time: attributes.get("wallClockTime").cloned(),
+                presentation_time: parse_optional_u64(&attributes, "presentationTime")?,
+            };
+            if let Some(representation) = *active_representation {
+                current_adaptation_mut(mpd, *active_period, *active_adaptation)?.representations
+                    [representation]
+                    .producer_reference_times
+                    .push(reference);
+            } else {
+                current_adaptation_mut(mpd, *active_period, *active_adaptation)?
+                    .producer_reference_times
+                    .push(reference);
+            }
+        }
+        "SupplementalProperty"
+            if active_adaptation.is_some()
+                && active_representation.is_none()
+                && stack.iter().rev().nth(1).map(String::as_str) == Some("AdaptationSet") =>
+        {
+            current_adaptation_mut(mpd, *active_period, *active_adaptation)?
+                .supplemental_properties
+                .push(Descriptor {
+                    scheme_id_uri: attributes.get("schemeIdUri").cloned(),
+                    value: attributes.get("value").cloned(),
+                });
+        }
+        "ContentProtection"
+            if active_adaptation.is_some()
+                && matches!(
+                    stack.iter().rev().nth(1).map(String::as_str),
+                    Some("AdaptationSet" | "Representation")
+                ) =>
+        {
+            let protection = ContentProtection {
+                scheme_id_uri: attributes.get("schemeIdUri").cloned(),
+                value: attributes.get("value").cloned(),
+                default_kid: attributes.get("default_KID").cloned(),
+                pssh: Vec::new(),
+            };
+            if let Some(representation) = *active_representation {
+                current_adaptation_mut(mpd, *active_period, *active_adaptation)?.representations
+                    [representation]
+                    .content_protections
+                    .push(protection);
+            } else {
+                current_adaptation_mut(mpd, *active_period, *active_adaptation)?
+                    .content_protections
+                    .push(protection);
+            }
+        }
+        "pssh"
+            if active_adaptation.is_some()
+                && stack.iter().rev().nth(1).map(String::as_str) == Some("ContentProtection") =>
+        {
+            current_content_protection_mut(
+                mpd,
+                *active_period,
+                *active_adaptation,
+                *active_representation,
+            )?
+            .pssh
+            .push(String::new());
         }
         _ => {}
     }
@@ -521,7 +825,7 @@ fn validate_mpd(path: &Path, mpd: &Mpd, profile: DashProfile, findings: &mut Vec
         "MPD minBufferTime is present and positive",
         mpd.min_buffer_time.map(|value| json!(value)),
     ));
-    if profile == DashProfile::DashIfIop {
+    if matches!(profile, DashProfile::DashIfIop | DashProfile::DashLive) {
         findings.push(finding(
             "FORGE-DASHIF-PROFILE-DECLARATION",
             Severity::Warning,
@@ -531,6 +835,9 @@ fn validate_mpd(path: &Path, mpd: &Mpd, profile: DashProfile, findings: &mut Vec
             "MPD declares a registered DASH-IF interoperability profile",
             Some(json!(mpd.profiles)),
         ));
+    }
+    if profile == DashProfile::DashLive {
+        validate_live_mpd(mpd, findings);
     }
 
     let mut period_ids = HashSet::new();
@@ -571,6 +878,281 @@ fn validate_mpd(path: &Path, mpd: &Mpd, profile: DashProfile, findings: &mut Vec
     }
 }
 
+fn validate_live_mpd(mpd: &Mpd, findings: &mut Vec<DashFinding>) {
+    findings.push(finding(
+        "FORGE-DASH-LIVE-TYPE",
+        Severity::Error,
+        mpd.kind == "dynamic",
+        "DASH live profile uses a dynamic MPD",
+        Some(json!(mpd.kind)),
+    ));
+    findings.push(finding(
+        "FORGE-DASH-LIVE-AVAILABILITY-ANCHOR",
+        Severity::Error,
+        mpd.availability_start_time
+            .as_deref()
+            .is_some_and(|value| looks_like_xs_datetime(value) && has_datetime_zone(value)),
+        "availabilityStartTime is a timezone-qualified XML Schema date-time",
+        mpd.availability_start_time.clone().map(Value::String),
+    ));
+    findings.push(finding(
+        "FORGE-DASH-LIVE-PUBLISH-TIME",
+        Severity::Warning,
+        mpd.publish_time
+            .as_deref()
+            .is_some_and(|value| looks_like_xs_datetime(value) && has_datetime_zone(value)),
+        "dynamic MPD declares a syntactically valid publishTime",
+        mpd.publish_time.clone().map(Value::String),
+    ));
+    findings.push(finding(
+        "FORGE-DASH-LIVE-UPDATE-PERIOD",
+        Severity::Error,
+        mpd.minimum_update_period.is_some_and(|value| value > 0.0),
+        "dynamic MPD minimumUpdatePeriod is positive",
+        mpd.minimum_update_period.map(|value| json!(value)),
+    ));
+    findings.push(finding(
+        "FORGE-DASH-LIVE-BUFFER-DEPTH",
+        Severity::Error,
+        mpd.time_shift_buffer_depth.is_none_or(|value| value > 0.0),
+        "timeShiftBufferDepth is positive when present",
+        mpd.time_shift_buffer_depth.map(|value| json!(value)),
+    ));
+    findings.push(finding(
+        "FORGE-DASHIF-AVAILABILITY-WINDOW",
+        Severity::Warning,
+        mpd.time_shift_buffer_depth.is_some(),
+        "rolling live service declares timeShiftBufferDepth; otherwise the window starts at availabilityStartTime",
+        Some(json!({
+            "availability_start_time": mpd.availability_start_time,
+            "time_shift_buffer_depth_seconds": mpd.time_shift_buffer_depth
+        })),
+    ));
+    let presentation_delay_valid = mpd.suggested_presentation_delay.is_none_or(|delay| {
+        delay > 0.0
+            && mpd
+                .time_shift_buffer_depth
+                .is_none_or(|depth| delay < depth)
+    });
+    findings.push(finding(
+        "FORGE-DASHIF-PRESENTATION-DELAY",
+        Severity::Error,
+        presentation_delay_valid,
+        "suggestedPresentationDelay is positive and leaves a non-empty time-shift buffer",
+        Some(json!({
+            "suggested_presentation_delay_seconds": mpd.suggested_presentation_delay,
+            "time_shift_buffer_depth_seconds": mpd.time_shift_buffer_depth
+        })),
+    ));
+    findings.push(finding(
+        "FORGE-DASHIF-PRESENTATION-DELAY",
+        Severity::Warning,
+        mpd.suggested_presentation_delay.is_some(),
+        "live service declares suggestedPresentationDelay",
+        mpd.suggested_presentation_delay.map(|value| json!(value)),
+    ));
+
+    findings.push(finding(
+        "FORGE-DASH-LIVE-UTC-TIMING",
+        Severity::Error,
+        !mpd.utc_timings.is_empty(),
+        "dynamic MPD declares at least one UTCTiming source",
+        Some(json!(mpd.utc_timings.len())),
+    ));
+    let mut utc_pairs = HashSet::new();
+    for timing in &mpd.utc_timings {
+        let scheme = timing.scheme_id_uri.as_deref().unwrap_or_default();
+        let value = timing.value.as_deref().unwrap_or_default();
+        let allowed = matches!(
+            scheme,
+            "urn:mpeg:dash:utc:http-xsdate:2014"
+                | "urn:mpeg:dash:utc:http-iso:2014"
+                | "urn:mpeg:dash:utc:http-head:2014"
+                | "urn:mpeg:dash:utc:direct:2014"
+        );
+        let value_valid = if scheme == "urn:mpeg:dash:utc:direct:2014" {
+            looks_like_xs_datetime(value) && has_datetime_zone(value)
+        } else {
+            value.starts_with("https://") || value.starts_with("http://")
+        };
+        findings.push(finding(
+            "FORGE-DASH-LIVE-UTC-TIMING",
+            Severity::Error,
+            allowed && value_valid && utc_pairs.insert((scheme.to_owned(), value.to_owned())),
+            "UTCTiming uses a supported unique scheme and a matching value",
+            Some(json!({"scheme_id_uri": scheme, "value": value})),
+        ));
+    }
+
+    let starts = resolved_period_starts(&mpd.periods);
+    findings.push(finding(
+        "FORGE-DASH-LIVE-PERIOD-RESOLUTION",
+        Severity::Error,
+        starts.iter().all(Option::is_some),
+        "every Period start is explicit or derivable from the previous Period duration",
+        Some(json!(starts)),
+    ));
+    let monotonic = starts.windows(2).enumerate().all(|(index, pair)| {
+        matches!(
+            pair,
+            [Some(previous), Some(current)]
+                if mpd.periods[index]
+                    .duration
+                    .is_none_or(|duration| current + 1.0e-9 >= previous + duration)
+        )
+    });
+    findings.push(finding(
+        "FORGE-DASH-LIVE-PERIOD-RESOLUTION",
+        Severity::Error,
+        monotonic,
+        "resolved Period starts are monotonic and do not overlap explicit durations",
+        Some(json!(starts)),
+    ));
+
+    let producer_references = mpd
+        .periods
+        .iter()
+        .flat_map(|period| &period.adaptations)
+        .flat_map(|adaptation| {
+            adaptation.producer_reference_times.iter().chain(
+                adaptation
+                    .representations
+                    .iter()
+                    .flat_map(|representation| &representation.producer_reference_times),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut producer_ids = HashSet::new();
+    for reference in &producer_references {
+        let unique_id = reference.id.is_some_and(|id| producer_ids.insert(id));
+        let kind_valid = reference
+            .kind
+            .as_deref()
+            .is_none_or(|kind| matches!(kind, "encoder" | "captured"));
+        let clock_valid = reference
+            .wall_clock_time
+            .as_deref()
+            .is_none_or(|value| looks_like_xs_datetime(value) && has_datetime_zone(value));
+        let pair_valid =
+            reference.wall_clock_time.is_some() == reference.presentation_time.is_some();
+        let timing_available =
+            reference.inband == Some(true) || reference.wall_clock_time.is_some();
+        findings.push(finding(
+            "FORGE-DASH-LIVE-PRODUCER-REFERENCE-TIME",
+            Severity::Error,
+            unique_id && kind_valid && clock_valid && pair_valid && timing_available,
+            "ProducerReferenceTime has a unique id, valid type, and inband or paired wall-clock/media timing",
+            Some(json!({
+                "id": reference.id,
+                "type": reference.kind,
+                "inband": reference.inband,
+                "wall_clock_time": reference.wall_clock_time,
+                "presentation_time": reference.presentation_time
+            })),
+        ));
+    }
+
+    let mut service_ids = HashSet::new();
+    for service in &mpd.service_descriptions {
+        let unique_id = service.id.is_none_or(|id| service_ids.insert(id));
+        let latency_valid = service.latency.is_none_or(|latency| {
+            latency.target.is_some_and(|target| target > 0)
+                && latency
+                    .min
+                    .is_none_or(|min| latency.target.is_some_and(|target| min <= target))
+                && latency
+                    .max
+                    .is_none_or(|max| latency.target.is_some_and(|target| target <= max))
+                && latency
+                    .reference_id
+                    .is_none_or(|reference| producer_ids.contains(&reference))
+        });
+        let playback_valid = service.playback_rate.is_none_or(|rate| {
+            rate.min.is_none_or(|min| min > 0.0 && min <= 1.0)
+                && rate.max.is_none_or(|max| max >= 1.0)
+                && match (rate.min, rate.max) {
+                    (Some(min), Some(max)) => min <= max,
+                    _ => true,
+                }
+        });
+        findings.push(finding(
+            "FORGE-DASH-LIVE-SERVICE-DESCRIPTION",
+            Severity::Error,
+            unique_id && latency_valid && playback_valid,
+            "ServiceDescription has a unique id and coherent latency/playback ranges",
+            Some(json!({
+                "id": service.id,
+                "latency_target_ms": service.latency.and_then(|value| value.target),
+                "latency_min_ms": service.latency.and_then(|value| value.min),
+                "latency_max_ms": service.latency.and_then(|value| value.max),
+                "latency_reference_id": service.latency.and_then(|value| value.reference_id),
+                "playback_rate_min": service.playback_rate.and_then(|value| value.min),
+                "playback_rate_max": service.playback_rate.and_then(|value| value.max)
+            })),
+        ));
+    }
+
+    let low_latency = mpd_uses_incomplete_segments(mpd);
+    if low_latency {
+        let latency_target = mpd
+            .service_descriptions
+            .iter()
+            .filter_map(|service| service.latency.and_then(|latency| latency.target))
+            .min();
+        findings.push(finding(
+            "FORGE-DASH-LL-SERVICE-DESCRIPTION",
+            Severity::Error,
+            latency_target.is_some_and(|target| target > 0),
+            "incomplete early-available segments declare a positive latency target",
+            latency_target.map(|value| json!(value)),
+        ));
+        findings.push(finding(
+            "FORGE-DASHIF-LL-PRODUCER-REFERENCE-TIME",
+            Severity::Warning,
+            !producer_references.is_empty(),
+            "low-latency service declares ProducerReferenceTime timing evidence",
+            Some(json!(producer_references.len())),
+        ));
+    }
+}
+
+fn resolved_period_starts(periods: &[Period]) -> Vec<Option<f64>> {
+    let mut starts: Vec<Option<f64>> = Vec::with_capacity(periods.len());
+    for (index, period) in periods.iter().enumerate() {
+        let start = period.start.or_else(|| {
+            if index == 0 {
+                Some(0.0)
+            } else {
+                starts[index - 1].and_then(|previous| {
+                    periods[index - 1]
+                        .duration
+                        .map(|duration| previous + duration)
+                })
+            }
+        });
+        starts.push(start);
+    }
+    starts
+}
+
+fn mpd_uses_incomplete_segments(mpd: &Mpd) -> bool {
+    mpd.periods.iter().any(|period| {
+        period.adaptations.iter().any(|adaptation| {
+            adaptation.representations.iter().any(|representation| {
+                resolve_template(
+                    representation.template.as_ref(),
+                    adaptation.template.as_ref(),
+                    period.template.as_ref(),
+                )
+                .is_some_and(|template| {
+                    effective_availability(mpd, period, adaptation, representation, &template).1
+                        == Some(false)
+                })
+            })
+        })
+    })
+}
+
 fn validate_period(
     path: &Path,
     period_index: usize,
@@ -581,7 +1163,11 @@ fn validate_period(
 ) {
     let mut adaptation_ids = HashSet::new();
     let mut representation_ids = HashSet::new();
-    let period_start = period.start.unwrap_or(0.0);
+    let period_start = resolved_period_starts(&mpd.periods)
+        .get(period_index)
+        .copied()
+        .flatten()
+        .unwrap_or(0.0);
     let period_duration = period
         .duration
         .or_else(|| {
@@ -595,6 +1181,9 @@ fn validate_period(
                 .map(|duration| duration - period_start)
         })
         .filter(|duration| *duration >= 0.0);
+    if profile == DashProfile::DashLive {
+        validate_event_streams(period_index, period, period_duration, findings);
+    }
     for (adaptation_index, adaptation) in period.adaptations.iter().enumerate() {
         if let Some(id) = &adaptation.id {
             findings.push(finding(
@@ -604,6 +1193,15 @@ fn validate_period(
                 format!("AdaptationSet id is unique within Period: {id}"),
                 None,
             ));
+        }
+        if profile == DashProfile::DashLive {
+            validate_period_continuity(mpd, period_index, adaptation_index, adaptation, findings);
+            validate_content_protections(
+                &format!("Period {period_index} AdaptationSet {adaptation_index}"),
+                &adaptation.content_protections,
+                true,
+                findings,
+            );
         }
         findings.push(finding(
             "FORGE-DASH-REPRESENTATION",
@@ -619,7 +1217,7 @@ fn validate_period(
                 .mime_type
                 .as_deref()
                 .is_some_and(|value| value.starts_with("audio/"));
-        if profile == DashProfile::DashIfIop && adaptation_audio {
+        if matches!(profile, DashProfile::DashIfIop | DashProfile::DashLive) && adaptation_audio {
             findings.push(finding(
                 "FORGE-DASHIF-AUDIO-LANGUAGE",
                 Severity::Warning,
@@ -637,6 +1235,15 @@ fn validate_period(
             let label = format!(
                 "Period {period_index} AdaptationSet {adaptation_index} Representation {representation_index}"
             );
+            if profile == DashProfile::DashLive {
+                validate_content_protections(
+                    &label,
+                    &representation.content_protections,
+                    false,
+                    findings,
+                );
+                validate_protection_inheritance(&label, adaptation, representation, findings);
+            }
             let has_id = representation
                 .id
                 .as_deref()
@@ -718,6 +1325,17 @@ fn validate_period(
                 Some(template) => {
                     let base_url = resolved_base_url(mpd, period, adaptation, representation);
                     validate_template(&label, &template, period_duration, findings);
+                    if profile == DashProfile::DashLive {
+                        validate_live_template(
+                            &label,
+                            mpd,
+                            period,
+                            adaptation,
+                            representation,
+                            &template,
+                            findings,
+                        );
+                    }
                     if let Ok(timeline) = expand_timeline(&template, period_duration) {
                         timelines.push(timeline);
                     }
@@ -727,6 +1345,9 @@ fn validate_period(
                         &template,
                         base_url.as_deref(),
                         period_duration,
+                        effective_availability(mpd, period, adaptation, representation, &template)
+                            .1
+                            == Some(false),
                         findings,
                     );
                 }
@@ -741,7 +1362,8 @@ fn validate_period(
                 )),
             }
         }
-        if profile == DashProfile::DashIfIop && timelines.len() > 1 {
+        if matches!(profile, DashProfile::DashIfIop | DashProfile::DashLive) && timelines.len() > 1
+        {
             let first = &timelines[0];
             for timeline in &timelines[1..] {
                 findings.push(finding(
@@ -754,6 +1376,463 @@ fn validate_period(
             }
         }
     }
+}
+
+fn validate_event_streams(
+    period_index: usize,
+    period: &Period,
+    period_duration: Option<f64>,
+    findings: &mut Vec<DashFinding>,
+) {
+    for (stream_index, stream) in period.event_streams.iter().enumerate() {
+        let label = format!("Period {period_index} EventStream {stream_index}");
+        findings.push(finding(
+            "FORGE-DASH-EVENT-STREAM",
+            Severity::Error,
+            stream
+                .scheme_id_uri
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                && stream.timescale > 0,
+            format!("{label} declares a scheme and positive timescale"),
+            Some(json!({
+                "scheme_id_uri": stream.scheme_id_uri,
+                "value": stream.value,
+                "timescale": stream.timescale,
+                "presentation_time_offset": stream.presentation_time_offset
+            })),
+        ));
+        let ordered = stream
+            .events
+            .windows(2)
+            .all(|pair| pair[0].presentation_time <= pair[1].presentation_time);
+        findings.push(finding(
+            "FORGE-DASH-EVENT-ORDER",
+            Severity::Error,
+            ordered,
+            format!("{label} events are ordered by presentation time"),
+            Some(json!(stream
+                .events
+                .iter()
+                .map(|event| event.presentation_time)
+                .collect::<Vec<_>>())),
+        ));
+        let mut ids = HashSet::new();
+        for (event_index, event) in stream.events.iter().enumerate() {
+            let unique = event.id.as_ref().is_none_or(|id| ids.insert(id));
+            let no_overflow = event
+                .duration
+                .is_none_or(|duration| event.presentation_time.checked_add(duration).is_some());
+            findings.push(finding(
+                "FORGE-DASH-EVENT-ID",
+                Severity::Error,
+                unique && no_overflow,
+                format!("{label} Event {event_index} has a unique optional id and bounded timing"),
+                Some(json!({
+                    "id": event.id,
+                    "presentation_time": event.presentation_time,
+                    "duration": event.duration
+                })),
+            ));
+            findings.push(finding(
+                "FORGE-DASHIF-EVENT-ID",
+                Severity::Warning,
+                event.id.is_some(),
+                format!("{label} Event {event_index} declares an id for update equivalence"),
+                event.id.map(|value| json!(value)),
+            ));
+            if let (Some(period_duration), Some(duration)) = (period_duration, event.duration) {
+                let end = (event.presentation_time as f64 + duration as f64
+                    - stream.presentation_time_offset as f64)
+                    / stream.timescale.max(1) as f64;
+                findings.push(finding(
+                    "FORGE-DASHIF-EVENT-CONTINUATION",
+                    Severity::Warning,
+                    end <= period_duration || event.id.is_some(),
+                    format!(
+                        "{label} Event {event_index} extending beyond the Period has an id for continuation"
+                    ),
+                    Some(json!({
+                        "event_end_seconds": end,
+                        "period_duration_seconds": period_duration
+                    })),
+                ));
+            }
+        }
+    }
+}
+
+fn validate_period_continuity(
+    mpd: &Mpd,
+    period_index: usize,
+    adaptation_index: usize,
+    adaptation: &AdaptationSet,
+    findings: &mut Vec<DashFinding>,
+) {
+    const CONTINUITY: &str = "urn:mpeg:dash:period-continuity:2015";
+    const CONNECTIVITY: &str = "urn:mpeg:dash:period-connectivity:2015";
+    let descriptors = adaptation
+        .supplemental_properties
+        .iter()
+        .filter(|descriptor| {
+            matches!(
+                descriptor.scheme_id_uri.as_deref(),
+                Some(CONTINUITY | CONNECTIVITY)
+            )
+        })
+        .collect::<Vec<_>>();
+    let has_continuity = descriptors
+        .iter()
+        .any(|descriptor| descriptor.scheme_id_uri.as_deref() == Some(CONTINUITY));
+    let has_connectivity = descriptors
+        .iter()
+        .any(|descriptor| descriptor.scheme_id_uri.as_deref() == Some(CONNECTIVITY));
+    findings.push(finding(
+        "FORGE-DASH-PERIOD-CONTINUITY",
+        Severity::Error,
+        !(has_continuity && has_connectivity),
+        "an AdaptationSet does not signal continuity and connectivity simultaneously",
+        Some(json!({
+            "period": period_index,
+            "adaptation_set": adaptation_index,
+            "continuity": has_continuity,
+            "connectivity": has_connectivity
+        })),
+    ));
+    let starts = resolved_period_starts(&mpd.periods);
+    for descriptor in descriptors {
+        let referenced_id = descriptor.value.as_deref().unwrap_or_default();
+        let referenced = mpd
+            .periods
+            .iter()
+            .enumerate()
+            .take(period_index)
+            .find(|(_, period)| period.id.as_deref() == Some(referenced_id));
+        let target_adaptation = referenced.and_then(|(_, period)| {
+            adaptation.id.as_ref().and_then(|id| {
+                period
+                    .adaptations
+                    .iter()
+                    .find(|candidate| candidate.id.as_ref() == Some(id))
+            })
+        });
+        let reference_valid = !referenced_id.is_empty() && target_adaptation.is_some();
+        findings.push(finding(
+            "FORGE-DASH-PERIOD-CONTINUITY",
+            Severity::Error,
+            reference_valid,
+            "Period continuity/connectivity references an earlier Period with the same AdaptationSet id",
+            Some(json!({
+                "period": period_index,
+                "adaptation_set_id": adaptation.id,
+                "scheme_id_uri": descriptor.scheme_id_uri,
+                "referenced_period_id": referenced_id
+            })),
+        ));
+        if descriptor.scheme_id_uri.as_deref() == Some(CONTINUITY) {
+            let exact_boundary = referenced.is_some_and(|(reference_index, reference)| {
+                let reference_duration = reference.duration.or_else(|| {
+                    starts
+                        .get(reference_index + 1)
+                        .copied()
+                        .flatten()
+                        .zip(starts.get(reference_index).copied().flatten())
+                        .map(|(next, start)| next - start)
+                });
+                match (
+                    starts.get(reference_index).copied().flatten(),
+                    reference_duration,
+                    starts.get(period_index).copied().flatten(),
+                ) {
+                    (Some(start), Some(duration), Some(current)) => {
+                        (start + duration - current).abs() <= 1.0e-9
+                    }
+                    _ => false,
+                }
+            });
+            findings.push(finding(
+                "FORGE-DASH-PERIOD-CONTINUITY",
+                Severity::Error,
+                exact_boundary,
+                "period-continuity reference meets an exact Period boundary",
+                Some(json!({
+                    "period": period_index,
+                    "referenced_period_id": referenced_id
+                })),
+            ));
+        }
+        if let Some(target) = target_adaptation {
+            let compatible = optional_equal(&adaptation.content_type, &target.content_type)
+                && optional_equal(&adaptation.mime_type, &target.mime_type)
+                && optional_equal(&adaptation.codecs, &target.codecs);
+            findings.push(finding(
+                "FORGE-DASH-PERIOD-CONTINUITY",
+                Severity::Error,
+                compatible,
+                "period-continuous/connective AdaptationSets retain compatible media properties",
+                Some(json!({
+                    "content_type": adaptation.content_type,
+                    "mime_type": adaptation.mime_type,
+                    "codecs": adaptation.codecs
+                })),
+            ));
+        }
+    }
+}
+
+fn optional_equal<T: PartialEq>(left: &Option<T>, right: &Option<T>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
+}
+
+fn validate_content_protections(
+    label: &str,
+    protections: &[ContentProtection],
+    adaptation_level: bool,
+    findings: &mut Vec<DashFinding>,
+) {
+    const MP4_PROTECTION: &str = "urn:mpeg:dash:mp4protection:2011";
+    let mut schemes = HashSet::new();
+    let mp4_count = protections
+        .iter()
+        .filter(|item| item.scheme_id_uri.as_deref() == Some(MP4_PROTECTION))
+        .count();
+    let has_drm = protections
+        .iter()
+        .any(|item| item.scheme_id_uri.as_deref().is_some_and(is_uuid_scheme));
+    findings.push(finding(
+        "FORGE-DASH-CONTENT-PROTECTION-SET",
+        Severity::Error,
+        mp4_count <= 1 && (!has_drm || !adaptation_level || mp4_count == 1),
+        format!(
+            "{label} has at most one mp4protection descriptor and pairs DRM descriptors with it"
+        ),
+        Some(json!({
+            "descriptor_count": protections.len(),
+            "mp4protection_count": mp4_count,
+            "has_drm_descriptor": has_drm
+        })),
+    ));
+    for protection in protections {
+        let scheme = protection.scheme_id_uri.as_deref().unwrap_or_default();
+        let scheme_valid = !scheme.trim().is_empty()
+            && scheme.contains(':')
+            && (!scheme.starts_with("urn:uuid:") || is_uuid_scheme(scheme));
+        findings.push(finding(
+            "FORGE-DASH-CONTENT-PROTECTION-SCHEME",
+            Severity::Error,
+            scheme_valid && schemes.insert(scheme.to_ascii_lowercase()),
+            format!("{label} ContentProtection uses a unique valid scheme URI"),
+            Some(json!(scheme)),
+        ));
+        if scheme == MP4_PROTECTION {
+            let value_valid = matches!(
+                protection.value.as_deref(),
+                Some("cenc" | "cens" | "cbc1" | "cbcs")
+            );
+            let kid_valid = protection
+                .default_kid
+                .as_deref()
+                .is_none_or(valid_default_kid_list);
+            findings.push(finding(
+                "FORGE-DASH-CENC-DEFAULT-KID",
+                Severity::Error,
+                value_valid && kid_valid,
+                format!("{label} mp4protection declares a CENC scheme and canonical default KID"),
+                Some(json!({
+                    "value": protection.value,
+                    "default_kid": protection.default_kid
+                })),
+            ));
+            findings.push(finding(
+                "FORGE-DASHIF-CENC-DEFAULT-KID",
+                Severity::Warning,
+                protection.default_kid.is_some(),
+                format!("{label} declares cenc:default_KID unless sample groups rotate every key"),
+                protection.default_kid.clone().map(Value::String),
+            ));
+        } else {
+            findings.push(finding(
+                "FORGE-DASH-CENC-DEFAULT-KID",
+                Severity::Error,
+                protection.default_kid.is_none(),
+                format!("{label} places cenc:default_KID only on mp4protection"),
+                protection.default_kid.clone().map(Value::String),
+            ));
+        }
+        for pssh in &protection.pssh {
+            let compact = pssh
+                .bytes()
+                .filter(|byte| !byte.is_ascii_whitespace())
+                .collect::<Vec<_>>();
+            let decoded = base64::engine::general_purpose::STANDARD.decode(&compact);
+            let valid = decoded.as_ref().is_ok_and(|bytes| {
+                bytes.len() >= 32
+                    && bytes.get(4..8) == Some(b"pssh")
+                    && bytes
+                        .get(0..4)
+                        .and_then(|value| value.try_into().ok())
+                        .map(u32::from_be_bytes)
+                        .is_some_and(|size| size as usize == bytes.len())
+            });
+            findings.push(finding(
+                "FORGE-DASH-CENC-PSSH",
+                Severity::Error,
+                valid,
+                format!("{label} cenc:pssh is a Base64-encoded complete pssh box"),
+                Some(json!({"encoded_bytes": pssh.len()})),
+            ));
+        }
+    }
+}
+
+fn validate_protection_inheritance(
+    label: &str,
+    adaptation: &AdaptationSet,
+    representation: &Representation,
+    findings: &mut Vec<DashFinding>,
+) {
+    const MP4_PROTECTION: &str = "urn:mpeg:dash:mp4protection:2011";
+    let has_drm = representation
+        .content_protections
+        .iter()
+        .any(|item| item.scheme_id_uri.as_deref().is_some_and(is_uuid_scheme));
+    let has_mp4 = representation
+        .content_protections
+        .iter()
+        .chain(&adaptation.content_protections)
+        .any(|item| item.scheme_id_uri.as_deref() == Some(MP4_PROTECTION));
+    findings.push(finding(
+        "FORGE-DASH-CONTENT-PROTECTION-SET",
+        Severity::Error,
+        !has_drm || has_mp4,
+        format!("{label} inherits or declares mp4protection for each DRM descriptor"),
+        Some(json!({"representation_drm": has_drm, "effective_mp4protection": has_mp4})),
+    ));
+}
+
+fn is_uuid_scheme(value: &str) -> bool {
+    value.strip_prefix("urn:uuid:").is_some_and(valid_uuid)
+}
+
+fn valid_default_kid_list(value: &str) -> bool {
+    let values = value.split_ascii_whitespace().collect::<Vec<_>>();
+    !values.is_empty() && values.iter().all(|value| valid_uuid(value))
+}
+
+fn valid_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.char_indices().all(|(index, character)| match index {
+            8 | 13 | 18 | 23 => character == '-',
+            _ => character.is_ascii_hexdigit(),
+        })
+}
+
+fn validate_live_template(
+    label: &str,
+    mpd: &Mpd,
+    period: &Period,
+    adaptation: &AdaptationSet,
+    representation: &Representation,
+    template: &SegmentTemplate,
+    findings: &mut Vec<DashFinding>,
+) {
+    let (offset, complete) =
+        effective_availability(mpd, period, adaptation, representation, template);
+    let offset_valid = offset >= 0.0 && !offset.is_nan();
+    findings.push(finding(
+        "FORGE-DASH-LIVE-AVAILABILITY-OFFSET",
+        Severity::Error,
+        offset_valid,
+        format!("{label} effective availabilityTimeOffset is non-negative"),
+        Some(json!({
+            "effective_offset_seconds": finite_json_number(offset),
+            "infinite": offset.is_infinite(),
+            "availability_time_complete": complete
+        })),
+    ));
+    if complete == Some(false) {
+        let segment_duration = maximum_segment_duration_seconds(template);
+        let latency_target = mpd
+            .service_descriptions
+            .iter()
+            .filter_map(|service| service.latency.and_then(|latency| latency.target))
+            .min()
+            .map(|milliseconds| milliseconds as f64 / 1_000.0);
+        let geometry_valid = offset.is_finite()
+            && offset > 0.0
+            && segment_duration.is_some_and(|duration| offset < duration);
+        findings.push(finding(
+            "FORGE-DASH-LL-AVAILABILITY",
+            Severity::Error,
+            geometry_valid,
+            format!("{label} incomplete segment has finite positive ATO below segment duration"),
+            Some(json!({
+                "effective_offset_seconds": finite_json_number(offset),
+                "maximum_segment_duration_seconds": segment_duration
+            })),
+        ));
+        let media_has_sequence_token = template
+            .media
+            .as_deref()
+            .is_some_and(|media| media.contains("$Number") ^ media.contains("$Time"));
+        findings.push(finding(
+            "FORGE-DASH-LL-MEDIA-TEMPLATE",
+            Severity::Error,
+            media_has_sequence_token,
+            format!("{label} low-latency media template uses exactly one of $Number$ or $Time$"),
+            template.media.clone().map(Value::String),
+        ));
+        let latency_valid = match (segment_duration, latency_target) {
+            (Some(duration), Some(target)) => duration < target && duration - offset < target,
+            _ => false,
+        };
+        findings.push(finding(
+            "FORGE-DASH-LL-LATENCY-GEOMETRY",
+            Severity::Error,
+            latency_valid,
+            format!("{label} segment duration/ATO are coherent with the latency target"),
+            Some(json!({
+                "maximum_segment_duration_seconds": segment_duration,
+                "effective_offset_seconds": finite_json_number(offset),
+                "latency_target_seconds": latency_target
+            })),
+        ));
+        findings.push(finding(
+            "FORGE-DASHIF-LL-SEGMENT-DURATION",
+            Severity::Warning,
+            match (segment_duration, latency_target) {
+                (Some(duration), Some(target)) => duration <= target * 0.5 + 1.0e-9,
+                _ => false,
+            },
+            format!("{label} segment duration is at most half the latency target"),
+            Some(json!({
+                "maximum_segment_duration_seconds": segment_duration,
+                "latency_target_seconds": latency_target
+            })),
+        ));
+        findings.push(finding(
+            "FORGE-DASHIF-LL-SEGMENT-DURATION",
+            Severity::Warning,
+            segment_duration.is_some_and(|duration| duration >= 0.96),
+            format!("{label} nominal low-latency segment duration is at least 960 ms"),
+            segment_duration.map(|value| json!(value)),
+        ));
+    }
+}
+
+fn maximum_segment_duration_seconds(template: &SegmentTemplate) -> Option<f64> {
+    let units = template
+        .duration
+        .or_else(|| template.timeline.iter().map(|entry| entry.duration).max())?;
+    let timescale = effective_timescale(template);
+    (timescale > 0).then_some(units as f64 / timescale as f64)
+}
+
+fn finite_json_number(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
 }
 
 fn validate_template(
@@ -823,6 +1902,7 @@ fn audit_local_resources(
     template: &SegmentTemplate,
     base_url: Option<&str>,
     period_duration: Option<f64>,
+    low_latency: bool,
     findings: &mut Vec<DashFinding>,
 ) {
     let Some(id) = representation.id.as_deref() else {
@@ -902,6 +1982,18 @@ fn audit_local_resources(
                     .flatten()
                     .filter_map(Value::as_u64)
                     .collect::<Vec<_>>();
+                if low_latency {
+                    findings.push(finding(
+                        "FORGE-DASH-LL-CMAF-CHUNKS",
+                        Severity::Error,
+                        sequences.len() > 1,
+                        "locally available incomplete DASH segment contains multiple CMAF chunks",
+                        Some(json!({
+                            "path": path,
+                            "movie_fragment_count": sequences.len()
+                        })),
+                    ));
+                }
                 if let (Some(previous), Some(current)) =
                     (previous_sequence, sequences.first().copied())
                 {
@@ -1096,6 +2188,15 @@ fn resolve_template(
         if layer.start_number.is_some() {
             resolved.start_number = layer.start_number;
         }
+        if layer.presentation_time_offset.is_some() {
+            resolved.presentation_time_offset = layer.presentation_time_offset;
+        }
+        if layer.availability_time_offset.is_some() {
+            resolved.availability_time_offset = layer.availability_time_offset;
+        }
+        if layer.availability_time_complete.is_some() {
+            resolved.availability_time_complete = layer.availability_time_complete;
+        }
         if !layer.timeline.is_empty() {
             resolved.timeline.clone_from(&layer.timeline);
         }
@@ -1116,8 +2217,33 @@ fn set_base_url(
     period: Option<usize>,
     adaptation: Option<usize>,
     representation: Option<usize>,
+    value: BaseUrl,
+) -> Result<(), String> {
+    let slot = base_url_slot_mut(mpd, period, adaptation, representation)?;
+    slot.get_or_insert(value);
+    Ok(())
+}
+
+fn set_base_url_value(
+    mpd: &mut Mpd,
+    period: Option<usize>,
+    adaptation: Option<usize>,
+    representation: Option<usize>,
     value: String,
 ) -> Result<(), String> {
+    let slot = base_url_slot_mut(mpd, period, adaptation, representation)?;
+    slot.get_or_insert_with(BaseUrl::default)
+        .value
+        .get_or_insert(value);
+    Ok(())
+}
+
+fn base_url_slot_mut(
+    mpd: &mut Mpd,
+    period: Option<usize>,
+    adaptation: Option<usize>,
+    representation: Option<usize>,
+) -> Result<&mut Option<BaseUrl>, String> {
     if let Some(period_index) = period {
         let period = mpd
             .periods
@@ -1133,17 +2259,16 @@ fn set_base_url(
                     .representations
                     .get_mut(representation_index)
                     .ok_or_else(|| "invalid active Representation for BaseURL".to_string())?;
-                representation.base_url.get_or_insert(value);
+                Ok(&mut representation.base_url)
             } else {
-                adaptation.base_url.get_or_insert(value);
+                Ok(&mut adaptation.base_url)
             }
         } else {
-            period.base_url.get_or_insert(value);
+            Ok(&mut period.base_url)
         }
     } else {
-        mpd.base_url.get_or_insert(value);
+        Ok(&mut mpd.base_url)
     }
-    Ok(())
 }
 
 fn resolved_base_url(
@@ -1154,17 +2279,48 @@ fn resolved_base_url(
 ) -> Option<String> {
     let mut result = None;
     for layer in [
-        mpd.base_url.as_deref(),
-        period.base_url.as_deref(),
-        adaptation.base_url.as_deref(),
-        representation.base_url.as_deref(),
+        mpd.base_url.as_ref(),
+        period.base_url.as_ref(),
+        adaptation.base_url.as_ref(),
+        representation.base_url.as_ref(),
     ]
     .into_iter()
     .flatten()
+    .filter_map(|base_url| base_url.value.as_deref())
     {
         result = Some(apply_base_url(result.as_deref(), layer));
     }
     result
+}
+
+fn effective_availability(
+    mpd: &Mpd,
+    period: &Period,
+    adaptation: &AdaptationSet,
+    representation: &Representation,
+    template: &SegmentTemplate,
+) -> (f64, Option<bool>) {
+    let mut offset = 0.0;
+    let mut complete = None;
+    for base_url in [
+        mpd.base_url.as_ref(),
+        period.base_url.as_ref(),
+        adaptation.base_url.as_ref(),
+        representation.base_url.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        offset += base_url.availability_time_offset.unwrap_or(0.0);
+        if base_url.availability_time_complete.is_some() {
+            complete = base_url.availability_time_complete;
+        }
+    }
+    offset += template.availability_time_offset.unwrap_or(0.0);
+    if template.availability_time_complete.is_some() {
+        complete = template.availability_time_complete;
+    }
+    (offset, complete)
 }
 
 fn apply_base_url(base: Option<&str>, resource: &str) -> String {
@@ -1287,33 +2443,89 @@ fn parse_duration(value: &str) -> Result<f64, String> {
 }
 
 fn looks_like_xs_datetime(value: &str) -> bool {
-    let Some((date, time)) = value.split_once('T') else {
-        return false;
-    };
-    let date_parts = date.split('-').collect::<Vec<_>>();
-    if date_parts.len() != 3
-        || date_parts[0].len() != 4
-        || date_parts[1].len() != 2
-        || date_parts[2].len() != 2
-        || date_parts
-            .iter()
-            .any(|part| !part.bytes().all(|byte| byte.is_ascii_digit()))
-    {
+    if !value.is_ascii() {
         return false;
     }
-    let time = time
-        .strip_suffix('Z')
-        .or_else(|| time.rsplit_once(['+', '-']).map(|(head, _)| head))
-        .unwrap_or(time);
-    let fields = time.split(':').collect::<Vec<_>>();
-    fields.len() == 3
-        && fields[0].len() == 2
-        && fields[1].len() == 2
-        && fields[0].bytes().all(|byte| byte.is_ascii_digit())
-        && fields[1].bytes().all(|byte| byte.is_ascii_digit())
-        && fields[2]
-            .split('.')
-            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    let Some(separator) = value.find('T') else {
+        return false;
+    };
+    let (date, time_with_separator) = value.split_at(separator);
+    let time = &time_with_separator[1..];
+    let mut date_fields = date.split('-');
+    let (Some(year), Some(month), Some(day), None) = (
+        date_fields.next(),
+        date_fields.next(),
+        date_fields.next(),
+        date_fields.next(),
+    ) else {
+        return false;
+    };
+    if year.len() != 4 || month.len() != 2 || day.len() != 2 {
+        return false;
+    }
+    let (Ok(year), Ok(month), Ok(day)) = (
+        year.parse::<u32>(),
+        month.parse::<u32>(),
+        day.parse::<u32>(),
+    ) else {
+        return false;
+    };
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let maximum_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    if day == 0 || day > maximum_day {
+        return false;
+    }
+    let (clock, zone_valid) = if let Some(clock) = time.strip_suffix('Z') {
+        (clock, true)
+    } else if time.len() >= 6 && matches!(time.as_bytes().get(time.len() - 6), Some(b'+' | b'-')) {
+        let zone_start = time.len() - 6;
+        let (clock, zone) = time.split_at(zone_start);
+        let bytes = zone.as_bytes();
+        let valid = matches!(bytes.first(), Some(b'+' | b'-'))
+            && bytes.get(3) == Some(&b':')
+            && zone[1..3].parse::<u32>().is_ok_and(|hours| hours <= 14)
+            && zone[4..6].parse::<u32>().is_ok_and(|minutes| minutes <= 59)
+            && !(&zone[1..3] == "14" && &zone[4..6] != "00");
+        (clock, valid)
+    } else {
+        (time, true)
+    };
+    if !zone_valid {
+        return false;
+    }
+    let mut clock_fields = clock.split(':');
+    let (Some(hour), Some(minute), Some(second), None) = (
+        clock_fields.next(),
+        clock_fields.next(),
+        clock_fields.next(),
+        clock_fields.next(),
+    ) else {
+        return false;
+    };
+    if hour.len() != 2 || minute.len() != 2 {
+        return false;
+    }
+    let (seconds, fraction) = second.find('.').map_or((second, None), |separator| {
+        (&second[..separator], Some(&second[separator + 1..]))
+    });
+    seconds.len() == 2
+        && hour.parse::<u32>().is_ok_and(|hour| hour <= 23)
+        && minute.parse::<u32>().is_ok_and(|minute| minute <= 59)
+        && seconds.parse::<u32>().is_ok_and(|seconds| seconds <= 59)
+        && fraction.is_none_or(|fraction| {
+            !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn has_datetime_zone(value: &str) -> bool {
+    value.ends_with('Z')
+        || (value.len() >= 6 && matches!(value.as_bytes().get(value.len() - 6), Some(b'+' | b'-')))
 }
 
 fn attributes(
@@ -1365,6 +2577,62 @@ fn parse_optional_u64(
         .transpose()
 }
 
+fn parse_optional_f64(
+    attributes: &HashMap<String, String>,
+    name: &str,
+) -> Result<Option<f64>, String> {
+    attributes
+        .get(name)
+        .map(|value| {
+            let value = value
+                .parse::<f64>()
+                .map_err(|_| format!("invalid decimal @{name}={value}"))?;
+            if value.is_finite() {
+                Ok(value)
+            } else {
+                Err(format!("non-finite decimal @{name}={value}"))
+            }
+        })
+        .transpose()
+}
+
+fn parse_optional_availability_offset(
+    attributes: &HashMap<String, String>,
+    name: &str,
+) -> Result<Option<f64>, String> {
+    attributes
+        .get(name)
+        .map(|value| {
+            if value == "INF" {
+                Ok(f64::INFINITY)
+            } else {
+                let value = value
+                    .parse::<f64>()
+                    .map_err(|_| format!("invalid availability offset @{name}={value}"))?;
+                if value.is_finite() && value >= 0.0 {
+                    Ok(value)
+                } else {
+                    Err(format!("invalid availability offset @{name}={value}"))
+                }
+            }
+        })
+        .transpose()
+}
+
+fn parse_optional_bool(
+    attributes: &HashMap<String, String>,
+    name: &str,
+) -> Result<Option<bool>, String> {
+    attributes
+        .get(name)
+        .map(|value| match value.as_str() {
+            "true" | "1" => Ok(true),
+            "false" | "0" => Ok(false),
+            _ => Err(format!("invalid boolean @{name}={value}")),
+        })
+        .transpose()
+}
+
 fn current_period_mut(mpd: &mut Mpd, period: Option<usize>) -> Result<&mut Period, String> {
     period
         .and_then(|index| mpd.periods.get_mut(index))
@@ -1380,6 +2648,27 @@ fn current_adaptation_mut(
     adaptation
         .and_then(|index| period.adaptations.get_mut(index))
         .ok_or_else(|| "DASH element appears outside AdaptationSet".into())
+}
+
+fn current_content_protection_mut(
+    mpd: &mut Mpd,
+    period: Option<usize>,
+    adaptation: Option<usize>,
+    representation: Option<usize>,
+) -> Result<&mut ContentProtection, String> {
+    let adaptation = current_adaptation_mut(mpd, period, adaptation)?;
+    if let Some(representation) = representation {
+        adaptation
+            .representations
+            .get_mut(representation)
+            .and_then(|item| item.content_protections.last_mut())
+            .ok_or_else(|| "cenc:pssh has no enclosing ContentProtection".into())
+    } else {
+        adaptation
+            .content_protections
+            .last_mut()
+            .ok_or_else(|| "cenc:pssh has no enclosing ContentProtection".into())
+    }
 }
 
 fn current_template_mut(
@@ -1498,6 +2787,185 @@ mod tests {
     }
 
     #[test]
+    fn audits_valid_dynamic_low_latency_mpd() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_mpd(
+            directory.path(),
+            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+ xmlns:cenc="urn:mpeg:cenc:2013"
+ type="dynamic" profiles="urn:mpeg:dash:profile:isoff-live:2011,http://dashif.org/guidelines/dash-if-uhd#hevc"
+ availabilityStartTime="2026-07-29T00:00:00Z"
+ publishTime="2026-07-29T00:00:20Z"
+ minimumUpdatePeriod="PT2S" minBufferTime="PT1S"
+ timeShiftBufferDepth="PT30S" suggestedPresentationDelay="PT3S"
+ maxSegmentDuration="PT2S">
+ <UTCTiming schemeIdUri="urn:mpeg:dash:utc:direct:2014"
+  value="2026-07-29T00:00:20Z"/>
+ <ServiceDescription id="0">
+  <Latency target="4000" min="2000" max="6000" referenceId="0"/>
+  <PlaybackRate min="0.96" max="1.04"/>
+ </ServiceDescription>
+ <BaseURL availabilityTimeOffset="0.25">https://example.invalid/live/</BaseURL>
+ <Period id="p0" start="PT0S" duration="PT10S">
+  <EventStream schemeIdUri="urn:example:event" value="live" timescale="1000">
+   <Event id="1" presentationTime="1000" duration="500"/>
+   <Event id="2" presentationTime="2000" duration="500"/>
+  </EventStream>
+  <AdaptationSet id="1" contentType="audio" mimeType="audio/mp4"
+   codecs="mp4a.40.2" lang="en" audioSamplingRate="48000">
+   <AudioChannelConfiguration
+    schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="2"/>
+   <ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011"
+    value="cbcs" cenc:default_KID="34e5db32-8625-47cd-ba06-68fca0655a72"/>
+   <ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed">
+    <cenc:pssh>AAAAIHBzc2gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</cenc:pssh>
+   </ContentProtection>
+   <ProducerReferenceTime id="0" type="encoder" inband="true"
+    wallClockTime="2026-07-29T00:00:00Z" presentationTime="0"/>
+   <SegmentTemplate timescale="48000" duration="96000" startNumber="1"
+    availabilityTimeOffset="1.25" availabilityTimeComplete="false"
+    initialization="init-$RepresentationID$.mp4"
+    media="$RepresentationID$-$Number$.m4s"/>
+   <Representation id="a1" bandwidth="128000"/>
+  </AdaptationSet>
+ </Period>
+</MPD>"#,
+        );
+        let audit = audit(&path, DashProfile::DashLive).unwrap();
+        assert!(
+            audit.passed,
+            "{:#?}",
+            audit
+                .findings
+                .iter()
+                .filter(|finding| finding.severity == Severity::Error && !finding.passed)
+                .map(|finding| (&finding.rule_id, &finding.message))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(audit.profile, DashProfile::DashLive);
+        assert_eq!(audit.properties["utc_timing_count"], 1);
+        assert_eq!(audit.properties["event_stream_count"], 1);
+        assert!(audit.findings.iter().any(|finding| {
+            finding.rule_id == "FORGE-DASH-LL-LATENCY-GEOMETRY" && finding.passed
+        }));
+    }
+
+    #[test]
+    fn rejects_invalid_dynamic_timing_events_protection_and_low_latency() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_mpd(
+            directory.path(),
+            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+ xmlns:cenc="urn:mpeg:cenc:2013" type="dynamic"
+ availabilityStartTime="2026-07-29T00:00:00"
+ minBufferTime="PT1S" timeShiftBufferDepth="PT2S"
+ suggestedPresentationDelay="PT3S">
+ <ServiceDescription id="0">
+  <Latency target="1000" min="2000" max="500" referenceId="99"/>
+ </ServiceDescription>
+ <BaseURL>https://example.invalid/live/</BaseURL>
+ <Period id="p0" start="PT0S" duration="PT10S">
+  <EventStream schemeIdUri="urn:example:event" timescale="1000">
+   <Event id="1" presentationTime="10"/>
+   <Event id="1" presentationTime="5"/>
+  </EventStream>
+  <AdaptationSet id="1" contentType="audio" mimeType="audio/mp4" codecs="opus"
+   lang="en" audioSamplingRate="48000">
+   <ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011"
+    value="bogus" cenc:default_KID="bad"><cenc:pssh>AAAA</cenc:pssh></ContentProtection>
+   <ProducerReferenceTime id="7" type="bogus" inband="false"
+    wallClockTime="not-a-date"/>
+   <ProducerReferenceTime id="7" type="encoder" inband="true"/>
+   <SegmentTemplate timescale="48000" duration="96000"
+    availabilityTimeOffset="0" availabilityTimeComplete="false"
+    initialization="init-$RepresentationID$.mp4"
+    media="$RepresentationID$-$Number$.m4s"/>
+   <Representation id="a1" bandwidth="64000"/>
+  </AdaptationSet>
+ </Period>
+ <Period id="p1" start="PT5S" duration="PT10S">
+  <AdaptationSet id="1" contentType="audio" mimeType="audio/mp4" codecs="opus"
+   lang="en" audioSamplingRate="48000">
+   <SupplementalProperty schemeIdUri="urn:mpeg:dash:period-continuity:2015"
+    value="p0"/>
+   <SegmentTemplate timescale="48000" duration="96000"
+    initialization="init-$RepresentationID$.mp4"
+    media="$RepresentationID$-$Number$.m4s"/>
+   <Representation id="a2" bandwidth="64000"/>
+  </AdaptationSet>
+ </Period>
+</MPD>"#,
+        );
+        let audit = audit(&path, DashProfile::DashLive).unwrap();
+        assert!(!audit.passed);
+        for rule in [
+            "FORGE-DASH-LIVE-AVAILABILITY-ANCHOR",
+            "FORGE-DASH-LIVE-UPDATE-PERIOD",
+            "FORGE-DASH-LIVE-UTC-TIMING",
+            "FORGE-DASHIF-PRESENTATION-DELAY",
+            "FORGE-DASH-LIVE-SERVICE-DESCRIPTION",
+            "FORGE-DASH-LIVE-PRODUCER-REFERENCE-TIME",
+            "FORGE-DASH-EVENT-ORDER",
+            "FORGE-DASH-EVENT-ID",
+            "FORGE-DASH-CENC-DEFAULT-KID",
+            "FORGE-DASH-CENC-PSSH",
+            "FORGE-DASH-PERIOD-CONTINUITY",
+            "FORGE-DASH-LL-AVAILABILITY",
+            "FORGE-DASH-LL-LATENCY-GEOMETRY",
+        ] {
+            assert!(
+                audit
+                    .findings
+                    .iter()
+                    .any(|finding| finding.rule_id == rule && !finding.passed),
+                "missing failed rule {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolves_implicit_period_duration_for_continuity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_mpd(
+            directory.path(),
+            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic"
+ availabilityStartTime="2026-07-29T00:00:00Z"
+ publishTime="2026-07-29T00:00:20Z"
+ minimumUpdatePeriod="PT2S" minBufferTime="PT1S">
+ <UTCTiming schemeIdUri="urn:mpeg:dash:utc:direct:2014"
+  value="2026-07-29T00:00:20Z"/>
+ <BaseURL>https://example.invalid/</BaseURL>
+ <Period id="p0" start="PT0S">
+  <AdaptationSet id="1" contentType="audio" mimeType="audio/mp4"
+   codecs="opus" lang="en" audioSamplingRate="48000">
+   <SegmentTemplate timescale="48000" duration="96000"
+    initialization="init-$RepresentationID$.mp4"
+    media="$RepresentationID$-$Number$.m4s"/>
+   <Representation id="a0" bandwidth="64000"/>
+  </AdaptationSet>
+ </Period>
+ <Period id="p1" start="PT10S" duration="PT10S">
+  <AdaptationSet id="1" contentType="audio" mimeType="audio/mp4"
+   codecs="opus" lang="en" audioSamplingRate="48000">
+   <SupplementalProperty schemeIdUri="urn:mpeg:dash:period-continuity:2015"
+    value="p0"/>
+   <SegmentTemplate timescale="48000" duration="96000"
+    initialization="init-$RepresentationID$.mp4"
+    media="$RepresentationID$-$Number$.m4s"/>
+   <Representation id="a1" bandwidth="64000"/>
+  </AdaptationSet>
+ </Period>
+</MPD>"#,
+        );
+        let audit = audit(&path, DashProfile::DashLive).unwrap();
+        assert!(audit
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id == "FORGE-DASH-PERIOD-CONTINUITY")
+            .all(|finding| finding.passed));
+    }
+
+    #[test]
     fn parses_iso_durations_and_expands_negative_repeat() {
         assert_eq!(parse_duration("P1DT2H3M4.5S").unwrap(), 93_784.5);
         let template = SegmentTemplate {
@@ -1531,6 +2999,10 @@ mod tests {
             "audio-00012-24-$.m4s"
         );
         assert!(looks_like_xs_datetime("2026-07-27T10:15:30Z"));
+        assert!(looks_like_xs_datetime("2024-02-29T23:59:59.123+09:00"));
+        assert!(!looks_like_xs_datetime("2025-02-29T10:15:30Z"));
+        assert!(!looks_like_xs_datetime("2026-07-27T25:15:30Z"));
+        assert!(!looks_like_xs_datetime("2026-07-27T10:15:30+14:01"));
         assert!(!looks_like_xs_datetime("2026-07-27"));
     }
 }

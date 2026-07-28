@@ -516,11 +516,35 @@ absolute, parent-directory, and unresolved template references are never
 fetched implicitly. Results conform to
 `schema/dash-qc-v1.schema.json`.
 
+Use `--profile dash-live` for dynamic and low-latency `SegmentTemplate`
+presentations. It requires a timezone-qualified availability anchor, a
+positive update cadence, and a supported `UTCTiming` source, then checks the
+time-shift availability window inputs, suggested presentation delay,
+derivable Period starts, Period continuity/connectivity references,
+EventStream ordering and identifiers, CENC protection schemes/default KIDs
+and embedded `pssh` boxes, and ServiceDescription latency/playback ranges.
+ProducerReferenceTime identifiers, timing pairs, and latency references are
+cross-checked. `BaseURL` and `SegmentTemplate` availability offsets are
+combined. When
+`availabilityTimeComplete="false"` is effective, Forge also checks finite ATO
+and segment/target-latency geometry; locally available segments must contain
+multiple CMAF movie fragments. `SegmentBase` and `SegmentList` live-addressing
+geometry is not yet expanded.
+
+This remains a static, local package audit. It does not fetch clock servers or
+remote media, observe the origin/CDN availability window, validate HTTP
+chunked transfer, or prove that MPD updates remain consistent over time.
+
 The profiles track
 [ISO/IEC 23009-1:2026 MPEG-DASH](https://www.iso.org/standard/23009-1), the
 [DASH-IF Conformance Software](https://github.com/Dash-Industry-Forum/DASH-IF-Conformance),
-and ISO/IEC 23000-19:2024 CMAF. DASH-IF recommendations are kept distinct from
-normative ISO failures.
+the DASH-IF [IOP v5 publications](https://dashif.org/guidelines/iop-v5/),
+[current Low-Latency Live change request](https://dashif.org/docs/CR-Low-Latency-Live-r8.pdf),
+[restricted timing model](https://dashif.org/Guidelines-TimingModel/),
+[events guidelines](https://dashif.org/docs/IOP-Guidelines/DASH-IF-IOP-Part10-v5.0.0.pdf),
+and [content-protection guidelines](https://dashif.org/Guidelines-Security/),
+plus ISO/IEC 23000-19:2024 CMAF. DASH-IF recommendations are kept distinct
+from normative ISO failures.
 
 ### IMF package QC
 

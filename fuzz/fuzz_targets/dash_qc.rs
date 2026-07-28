@@ -9,6 +9,7 @@ fuzz_target!(|data: &[u8]| {
         if file.write_all(data).is_ok() {
             let _ = dash_qc::audit(file.path(), DashProfile::Iso23009);
             let _ = dash_qc::audit(file.path(), DashProfile::DashIfIop);
+            let _ = dash_qc::audit(file.path(), DashProfile::DashLive);
         }
     }
 });

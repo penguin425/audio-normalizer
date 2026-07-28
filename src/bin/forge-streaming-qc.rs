@@ -14,6 +14,7 @@ enum Profile {
     LlHls,
     Iso23009,
     DashIfIop,
+    DashLive,
 }
 
 #[derive(Parser)]
@@ -61,18 +62,19 @@ fn run(cli: Cli) -> Result<bool, String> {
                 Profile::Rfc8216 => HlsProfile::Rfc8216,
                 Profile::AppleHls => HlsProfile::AppleHls,
                 Profile::LlHls => HlsProfile::LlHls,
-                Profile::Iso23009 | Profile::DashIfIop => unreachable!(),
+                Profile::Iso23009 | Profile::DashIfIop | Profile::DashLive => unreachable!(),
             };
             let audit = hls_qc::audit(&cli.input, profile)?;
             let passed = audit.passed;
             let warning_count = audit.warning_count;
             (encode(&audit, cli.compact)?, passed, warning_count)
         }
-        Profile::Iso23009 | Profile::DashIfIop => {
-            let profile = if matches!(profile, Profile::Iso23009) {
-                DashProfile::Iso23009
-            } else {
-                DashProfile::DashIfIop
+        Profile::Iso23009 | Profile::DashIfIop | Profile::DashLive => {
+            let profile = match profile {
+                Profile::Iso23009 => DashProfile::Iso23009,
+                Profile::DashIfIop => DashProfile::DashIfIop,
+                Profile::DashLive => DashProfile::DashLive,
+                Profile::Rfc8216 | Profile::AppleHls | Profile::LlHls => unreachable!(),
             };
             let audit = dash_qc::audit(&cli.input, profile)?;
             let passed = audit.passed;
