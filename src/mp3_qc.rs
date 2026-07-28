@@ -9,6 +9,8 @@ use std::path::Path;
 
 const MAX_ID3_FRAMES: usize = 100_000;
 const MAX_MP3_FRAMES: usize = 10_000_000;
+const MAX_REPORTED_CRC_MISMATCHES: usize = 64;
+const MAX_VBRI_TOC_ENTRIES: usize = 65_535;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MpegVersion {
@@ -44,6 +46,17 @@ struct FrameHeader {
     frame_size: u32,
 }
 
+impl FrameHeader {
+    const fn side_info_size(self) -> usize {
+        match (self.version, self.channels) {
+            (MpegVersion::One, 1) => 17,
+            (MpegVersion::One, _) => 32,
+            (_, 1) => 9,
+            (_, _) => 17,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct Id3Info {
     present: bool,
@@ -64,6 +77,28 @@ struct XingInfo {
     encoder: Option<String>,
     encoder_delay: Option<u16>,
     encoder_padding: Option<u16>,
+    replaygain_peak_sample: Option<f64>,
+    replaygain_radio_db: Option<f64>,
+    replaygain_audiophile_db: Option<f64>,
+    replaygain_valid: Option<bool>,
+    tag_crc_expected: Option<u16>,
+    tag_crc_actual: Option<u16>,
+    tag_crc_valid: Option<bool>,
+}
+
+#[derive(Debug, Default)]
+struct VbriInfo {
+    present: bool,
+    version: Option<u16>,
+    delay: Option<u16>,
+    quality: Option<u16>,
+    declared_bytes: Option<u32>,
+    declared_frames: Option<u32>,
+    toc_entries: Option<u16>,
+    toc_scale: Option<u16>,
+    toc_entry_bytes: Option<u16>,
+    toc_frames_per_entry: Option<u16>,
+    toc_total_bytes: Option<u64>,
 }
 
 pub(crate) fn looks_like_mp3(header: &[u8]) -> bool {
@@ -96,6 +131,8 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
     let mut offset = id3.audio_start;
     let mut frame_count = 0_usize;
     let mut crc_frame_count = 0_usize;
+    let mut crc_mismatch_count = 0_usize;
+    let mut crc_mismatch_offsets = Vec::new();
     let mut bitrates = BTreeSet::new();
     let mut first_header: Option<FrameHeader> = None;
     let mut first_frame = Vec::new();
@@ -170,11 +207,36 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
                 .map_err(|error| format!("read first MP3 frame in {}: {error}", path.display()))?;
         }
         bitrates.insert(header.bitrate_kbps);
-        crc_frame_count += usize::from(header.protected_by_crc);
+        if header.protected_by_crc {
+            crc_frame_count += 1;
+            if !validate_frame_crc(path, &mut file, offset, header)? {
+                crc_mismatch_count += 1;
+                if crc_mismatch_offsets.len() < MAX_REPORTED_CRC_MISMATCHES {
+                    crc_mismatch_offsets.push(offset);
+                }
+            }
+        }
         frame_count += 1;
         offset = frame_end;
     }
 
+    bitstream.push(check(
+        "FORGE-MP3-FRAME-CRC",
+        crc_mismatch_count == 0,
+        if crc_frame_count == 0 {
+            "no CRC-protected MPEG Layer III frames are present".into()
+        } else if crc_mismatch_count == 0 {
+            format!("{crc_frame_count} protected frame CRCs match")
+        } else {
+            format!("{crc_mismatch_count} of {crc_frame_count} protected frame CRCs do not match")
+        },
+        Some(json!({
+            "protected_frames": crc_frame_count,
+            "mismatches": crc_mismatch_count,
+            "mismatch_offsets": crc_mismatch_offsets,
+            "reported_mismatch_limit": MAX_REPORTED_CRC_MISMATCHES
+        })),
+    ));
     bitstream.push(check(
         "FORGE-MP3-FRAME-SEQUENCE",
         scan_ok && frame_count > 0 && offset == audio_end,
@@ -193,12 +255,24 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
     } else {
         XingInfo::default()
     };
+    let vbri = if first_header.is_some() {
+        parse_vbri(&first_frame, &mut bitstream)
+    } else {
+        VbriInfo::default()
+    };
     add_xing_cross_checks(
         &xing,
         frame_count,
         audio_end.saturating_sub(id3.audio_start),
         &bitrates,
         first_header.map(|header| header.version.samples_per_frame()),
+        &mut xcheck,
+    );
+    add_vbri_cross_checks(
+        &xing,
+        &vbri,
+        frame_count,
+        audio_end.saturating_sub(id3.audio_start),
         &mut xcheck,
     );
 
@@ -246,7 +320,27 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
         "lame": {
             "encoder": xing.encoder,
             "encoder_delay": xing.encoder_delay,
-            "encoder_padding": xing.encoder_padding
+            "encoder_padding": xing.encoder_padding,
+            "replaygain_peak_sample": xing.replaygain_peak_sample,
+            "replaygain_radio_db": xing.replaygain_radio_db,
+            "replaygain_audiophile_db": xing.replaygain_audiophile_db,
+            "replaygain_valid": xing.replaygain_valid,
+            "tag_crc_expected": xing.tag_crc_expected,
+            "tag_crc_actual": xing.tag_crc_actual,
+            "tag_crc_valid": xing.tag_crc_valid
+        },
+        "vbri": {
+            "present": vbri.present,
+            "version": vbri.version,
+            "delay": vbri.delay,
+            "quality": vbri.quality,
+            "declared_bytes": vbri.declared_bytes,
+            "declared_frames": vbri.declared_frames,
+            "toc_entries": vbri.toc_entries,
+            "toc_scale": vbri.toc_scale,
+            "toc_entry_bytes": vbri.toc_entry_bytes,
+            "toc_frames_per_entry": vbri.toc_frames_per_entry,
+            "toc_total_bytes": vbri.toc_total_bytes
         }
     });
     Ok(finish_audit(
@@ -520,13 +614,10 @@ fn parse_frame_header(bytes: [u8; 4]) -> Option<FrameHeader> {
 }
 
 fn parse_xing(frame: &[u8], header: FrameHeader, checks: &mut Vec<AuditCheck>) -> XingInfo {
-    let side_info = match (header.version, header.channels) {
-        (MpegVersion::One, 1) => 17,
-        (MpegVersion::One, _) => 32,
-        (_, 1) => 9,
-        (_, _) => 17,
-    };
-    let offset = 4 + usize::from(header.protected_by_crc) * 2 + side_info;
+    // Xing deliberately keeps a fixed ancillary-data position even when the
+    // MPEG protection bit is set. LAME subtracts the two CRC bytes from its
+    // normal side-information offset for protected tag frames.
+    let offset = 4 + header.side_info_size();
     let Some(kind) = frame.get(offset..offset + 4) else {
         checks.push(check(
             "FORGE-MP3-XING",
@@ -589,6 +680,46 @@ fn parse_xing(frame: &[u8], header: FrameHeader, checks: &mut Vec<AuditCheck>) -
                     .trim_end_matches('\0')
                     .to_owned(),
             );
+            if let Some(fields) = frame.get(cursor + 11..cursor + 19) {
+                let peak = u32::from_be_bytes(fields[..4].try_into().unwrap());
+                info.replaygain_peak_sample =
+                    (peak != 0).then_some(32_767.0 * f64::from(peak) / 8_388_608.0);
+                let radio = u16::from_be_bytes(fields[4..6].try_into().unwrap());
+                let audiophile = u16::from_be_bytes(fields[6..8].try_into().unwrap());
+                let parsed_radio = parse_lame_replaygain(radio, 1);
+                let parsed_audiophile = parse_lame_replaygain(audiophile, 2);
+                let replaygain_valid = parsed_radio.is_some() && parsed_audiophile.is_some();
+                info.replaygain_radio_db = parsed_radio.flatten();
+                info.replaygain_audiophile_db = parsed_audiophile.flatten();
+                info.replaygain_valid = Some(replaygain_valid);
+                valid &= replaygain_valid;
+                checks.push(check(
+                    "FORGE-MP3-LAME-REPLAYGAIN",
+                    replaygain_valid,
+                    if replaygain_valid {
+                        "LAME peak and ReplayGain fields use valid names, origins, signs, and ranges"
+                    } else {
+                        "LAME ReplayGain fields contain a reserved name/origin or gain magnitude"
+                    },
+                    Some(json!({
+                        "peak_fixed_9_23": peak,
+                        "peak_sample": info.replaygain_peak_sample,
+                        "radio_raw": radio,
+                        "radio_db": info.replaygain_radio_db,
+                        "audiophile_raw": audiophile,
+                        "audiophile_db": info.replaygain_audiophile_db
+                    })),
+                ));
+            } else {
+                info.replaygain_valid = Some(false);
+                valid = false;
+                checks.push(check(
+                    "FORGE-MP3-LAME-REPLAYGAIN",
+                    false,
+                    "truncated LAME peak or ReplayGain fields",
+                    None,
+                ));
+            }
             if let Some(delay_padding) = frame.get(cursor + 21..cursor + 24) {
                 let delay = (u16::from(delay_padding[0]) << 4) | u16::from(delay_padding[1] >> 4);
                 let padding =
@@ -598,6 +729,34 @@ fn parse_xing(frame: &[u8], header: FrameHeader, checks: &mut Vec<AuditCheck>) -
                 valid &= delay <= 3_000 && padding <= 3_000;
             } else {
                 valid = false;
+            }
+            if let Some(stored) = frame.get(cursor + 34..cursor + 36) {
+                let expected = u16::from_be_bytes(stored.try_into().unwrap());
+                let actual = crc16_ansi_reflected(0, &frame[..cursor + 34]);
+                let crc_valid = expected == actual;
+                info.tag_crc_expected = Some(expected);
+                info.tag_crc_actual = Some(actual);
+                info.tag_crc_valid = Some(crc_valid);
+                valid &= crc_valid;
+                checks.push(check(
+                    "FORGE-MP3-LAME-TAG-CRC",
+                    crc_valid,
+                    if crc_valid {
+                        "LAME tag CRC matches the complete tag prefix"
+                    } else {
+                        "LAME tag CRC does not match the complete tag prefix"
+                    },
+                    Some(json!({"expected": expected, "actual": actual})),
+                ));
+            } else {
+                info.tag_crc_valid = Some(false);
+                valid = false;
+                checks.push(check(
+                    "FORGE-MP3-LAME-TAG-CRC",
+                    false,
+                    "truncated LAME extension has no complete tag CRC",
+                    None,
+                ));
             }
         }
     }
@@ -618,6 +777,118 @@ fn parse_xing(frame: &[u8], header: FrameHeader, checks: &mut Vec<AuditCheck>) -
             "declared_frames": info.declared_frames,
             "declared_bytes": info.declared_bytes,
             "toc_monotonic": info.toc_monotonic
+        })),
+    ));
+    info
+}
+
+fn parse_lame_replaygain(value: u16, expected_name: u16) -> Option<Option<f64>> {
+    if value == 0 {
+        return Some(None);
+    }
+    let name = (value >> 13) & 0x7;
+    let originator = (value >> 10) & 0x7;
+    let magnitude = value & 0x1ff;
+    if name != expected_name || originator > 3 || magnitude > 0x1fe {
+        return None;
+    }
+    let gain = f64::from(magnitude) / 10.0;
+    Some(Some(if value & 0x200 != 0 { -gain } else { gain }))
+}
+
+fn parse_vbri(frame: &[u8], checks: &mut Vec<AuditCheck>) -> VbriInfo {
+    const VBRI_OFFSET: usize = 36;
+    let Some(id) = frame.get(VBRI_OFFSET..VBRI_OFFSET + 4) else {
+        checks.push(check(
+            "FORGE-MP3-VBRI",
+            true,
+            "optional Fraunhofer VBRI header is absent",
+            None,
+        ));
+        return VbriInfo::default();
+    };
+    if id != b"VBRI" {
+        checks.push(check(
+            "FORGE-MP3-VBRI",
+            true,
+            "optional Fraunhofer VBRI header is absent",
+            None,
+        ));
+        return VbriInfo::default();
+    }
+
+    let mut info = VbriInfo {
+        present: true,
+        ..VbriInfo::default()
+    };
+    let Some(header) = frame.get(VBRI_OFFSET + 4..VBRI_OFFSET + 26) else {
+        checks.push(check(
+            "FORGE-MP3-VBRI",
+            false,
+            "truncated Fraunhofer VBRI fixed header",
+            None,
+        ));
+        return info;
+    };
+    info.version = Some(u16::from_be_bytes(header[0..2].try_into().unwrap()));
+    info.delay = Some(u16::from_be_bytes(header[2..4].try_into().unwrap()));
+    info.quality = Some(u16::from_be_bytes(header[4..6].try_into().unwrap()));
+    info.declared_bytes = Some(u32::from_be_bytes(header[6..10].try_into().unwrap()));
+    info.declared_frames = Some(u32::from_be_bytes(header[10..14].try_into().unwrap()));
+    info.toc_entries = Some(u16::from_be_bytes(header[14..16].try_into().unwrap()));
+    info.toc_scale = Some(u16::from_be_bytes(header[16..18].try_into().unwrap()));
+    info.toc_entry_bytes = Some(u16::from_be_bytes(header[18..20].try_into().unwrap()));
+    info.toc_frames_per_entry = Some(u16::from_be_bytes(header[20..22].try_into().unwrap()));
+
+    let entries = usize::from(info.toc_entries.unwrap());
+    let entry_bytes = usize::from(info.toc_entry_bytes.unwrap());
+    let table_size = entries.checked_mul(entry_bytes);
+    let table_end = table_size.and_then(|size| (VBRI_OFFSET + 26).checked_add(size));
+    let fixed_valid = info.version == Some(1)
+        && info.declared_bytes.is_some_and(|value| value > 0)
+        && info.declared_frames.is_some_and(|value| value > 0)
+        && entries > 0
+        && entries <= MAX_VBRI_TOC_ENTRIES
+        && info.toc_scale.is_some_and(|value| value > 0)
+        && (1..=4).contains(&entry_bytes)
+        && info.toc_frames_per_entry.is_some_and(|value| value > 0);
+    let table = table_end.and_then(|end| frame.get(VBRI_OFFSET + 26..end));
+    let mut table_valid = fixed_valid && table.is_some();
+    let mut total = 0_u64;
+    if let Some(table) = table.filter(|_| entry_bytes > 0) {
+        for entry in table.chunks_exact(entry_bytes) {
+            let value = entry
+                .iter()
+                .fold(0_u32, |value, byte| (value << 8) | u32::from(*byte));
+            let scaled = u64::from(value).saturating_mul(u64::from(info.toc_scale.unwrap()));
+            table_valid &= value > 0 && scaled != u64::MAX;
+            total = total.saturating_add(scaled);
+            table_valid &= total != u64::MAX;
+        }
+    }
+    info.toc_total_bytes = table.is_some().then_some(total);
+    if let Some(declared_bytes) = info.declared_bytes {
+        table_valid &= total <= u64::from(declared_bytes);
+    }
+    checks.push(check(
+        "FORGE-MP3-VBRI",
+        table_valid,
+        if table_valid {
+            format!("{entries} Fraunhofer VBRI seek entries are structurally valid")
+        } else {
+            "invalid or truncated Fraunhofer VBRI header or seek table".into()
+        },
+        Some(json!({
+            "version": info.version,
+            "delay": info.delay,
+            "quality": info.quality,
+            "declared_bytes": info.declared_bytes,
+            "declared_frames": info.declared_frames,
+            "toc_entries": info.toc_entries,
+            "toc_scale": info.toc_scale,
+            "toc_entry_bytes": info.toc_entry_bytes,
+            "toc_frames_per_entry": info.toc_frames_per_entry,
+            "toc_total_bytes": info.toc_total_bytes
         })),
     ));
     info
@@ -688,6 +959,114 @@ fn add_xing_cross_checks(
     }
 }
 
+fn add_vbri_cross_checks(
+    xing: &XingInfo,
+    vbri: &VbriInfo,
+    frame_count: usize,
+    audio_bytes: u64,
+    checks: &mut Vec<AuditCheck>,
+) {
+    let header_count = usize::from(xing.kind.is_some()) + usize::from(vbri.present);
+    checks.push(check(
+        "FORGE-MP3-VBR-HEADER",
+        header_count <= 1,
+        if header_count <= 1 {
+            "Xing/Info and Fraunhofer VBRI headers are mutually exclusive"
+        } else {
+            "the first frame contains both Xing/Info and Fraunhofer VBRI headers"
+        },
+        Some(json!({
+            "xing_or_info": xing.kind,
+            "vbri": vbri.present
+        })),
+    ));
+    if let Some(declared) = vbri.declared_frames {
+        let matches = u64::from(declared) == u64::try_from(frame_count).unwrap_or(u64::MAX);
+        checks.push(check(
+            "FORGE-MP3-VBRI-FRAMES",
+            matches,
+            if matches {
+                "VBRI frame count matches the scanned bitstream"
+            } else {
+                "VBRI frame count does not match the scanned bitstream"
+            },
+            Some(json!({"declared": declared, "scanned": frame_count})),
+        ));
+    }
+    if let Some(declared) = vbri.declared_bytes {
+        let matches = u64::from(declared) == audio_bytes;
+        checks.push(check(
+            "FORGE-MP3-VBRI-BYTES",
+            matches,
+            if matches {
+                "VBRI byte count matches the MPEG audio region"
+            } else {
+                "VBRI byte count does not match the MPEG audio region"
+            },
+            Some(json!({"declared": declared, "scanned": audio_bytes})),
+        ));
+    }
+}
+
+fn validate_frame_crc(
+    path: &Path,
+    file: &mut File,
+    offset: u64,
+    header: FrameHeader,
+) -> Result<bool, String> {
+    let side_info_size = header.side_info_size();
+    let protected_bytes = 6_u64
+        .checked_add(u64::try_from(side_info_size).unwrap())
+        .ok_or_else(|| "MP3 CRC range overflow".to_owned())?;
+    if protected_bytes > u64::from(header.frame_size) {
+        return Ok(false);
+    }
+    let protected_bytes = usize::try_from(protected_bytes).unwrap();
+    let mut frame_prefix = [0_u8; 38];
+    file.seek(SeekFrom::Start(offset))
+        .and_then(|_| file.read_exact(&mut frame_prefix[..protected_bytes]))
+        .map_err(|error| {
+            format!(
+                "read protected MP3 frame prefix in {} at byte {offset}: {error}",
+                path.display()
+            )
+        })?;
+    let expected = u16::from_be_bytes(frame_prefix[4..6].try_into().unwrap());
+    let crc = crc16_mpeg(
+        crc16_mpeg(0xffff, &frame_prefix[2..4]),
+        &frame_prefix[6..protected_bytes],
+    );
+    Ok(crc == expected)
+}
+
+fn crc16_mpeg(mut crc: u16, bytes: &[u8]) -> u16 {
+    for byte in bytes {
+        crc ^= u16::from(*byte) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x8005
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+fn crc16_ansi_reflected(mut crc: u16, bytes: &[u8]) -> u16 {
+    for byte in bytes {
+        crc ^= u16::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xa001
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
+
 fn take_u32_be(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
     let value = bytes
         .get(*cursor..cursor.checked_add(4)?)
@@ -754,6 +1133,12 @@ mod tests {
         word.to_be_bytes()
     }
 
+    fn protected_header(bitrate_index: u8, sample_index: u8, mono: bool) -> [u8; 4] {
+        let mut bytes = header(bitrate_index, sample_index, mono);
+        bytes[1] &= !1;
+        bytes
+    }
+
     #[test]
     fn parses_mpeg_one_layer_three_frame_geometry() {
         let parsed = parse_frame_header(header(9, 0, false)).unwrap();
@@ -777,6 +1162,14 @@ mod tests {
     fn synchsafe_rejects_high_bits() {
         assert_eq!(synchsafe([0, 0, 2, 1]), Some(257));
         assert_eq!(synchsafe([0x80, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn crc_algorithms_match_independent_check_values() {
+        let mut protected = vec![0x90, 0x00];
+        protected.extend_from_slice(&[0; 32]);
+        assert_eq!(crc16_mpeg(0xffff, &protected), 0xc05c);
+        assert_eq!(crc16_ansi_reflected(0, b"123456789"), 0xbb3d);
     }
 
     fn fake_frames(count: usize) -> Vec<u8> {
@@ -817,5 +1210,144 @@ mod tests {
             .checks
             .iter()
             .any(|item| item.rule_id == "FORGE-MP3-XING-FRAMES" && !item.passed));
+    }
+
+    #[test]
+    fn audit_validates_protected_frame_crc() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("protected.mp3");
+        let header = protected_header(9, 0, false);
+        let mut frame = vec![0_u8; 417];
+        frame[..4].copy_from_slice(&header);
+        let mut protected = Vec::from(&header[2..]);
+        protected.extend_from_slice(&frame[6..38]);
+        let crc = crc16_mpeg(0xffff, &protected);
+        frame[4..6].copy_from_slice(&crc.to_be_bytes());
+        std::fs::write(&path, &frame).unwrap();
+
+        let valid = crate::container_qc::audit(&path).unwrap();
+        assert!(valid.passed);
+        assert_eq!(valid.properties["crc_frame_count"], 1);
+
+        frame[12] = 1;
+        std::fs::write(&path, frame).unwrap();
+        let invalid = crate::container_qc::audit(&path).unwrap();
+        assert!(!invalid.passed);
+        assert!(invalid.layers[1].checks.iter().any(|item| {
+            item.rule_id == "FORGE-MP3-FRAME-CRC"
+                && !item.passed
+                && item.observed.as_ref().unwrap()["mismatch_offsets"][0] == 0
+        }));
+    }
+
+    fn put_vbri(bytes: &mut [u8], declared_frames: u32) {
+        let offset = 36;
+        bytes[offset..offset + 4].copy_from_slice(b"VBRI");
+        bytes[offset + 4..offset + 6].copy_from_slice(&1_u16.to_be_bytes());
+        bytes[offset + 6..offset + 8].copy_from_slice(&576_u16.to_be_bytes());
+        bytes[offset + 8..offset + 10].copy_from_slice(&50_u16.to_be_bytes());
+        bytes[offset + 10..offset + 14].copy_from_slice(&1_251_u32.to_be_bytes());
+        bytes[offset + 14..offset + 18].copy_from_slice(&declared_frames.to_be_bytes());
+        bytes[offset + 18..offset + 20].copy_from_slice(&declared_frames.to_be_bytes()[2..]);
+        bytes[offset + 20..offset + 22].copy_from_slice(&1_u16.to_be_bytes());
+        bytes[offset + 22..offset + 24].copy_from_slice(&2_u16.to_be_bytes());
+        bytes[offset + 24..offset + 26].copy_from_slice(&1_u16.to_be_bytes());
+        let values: &[u16] = if declared_frames == 3 {
+            &[417, 417, 417]
+        } else {
+            &[417, 417, 416, 1]
+        };
+        for (index, value) in values.iter().enumerate() {
+            let start = offset + 26 + index * 2;
+            bytes[start..start + 2].copy_from_slice(&value.to_be_bytes());
+        }
+    }
+
+    #[test]
+    fn audit_parses_vbri_and_cross_checks_counts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vbri.mp3");
+        let mut bytes = fake_frames(3);
+        put_vbri(&mut bytes, 3);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let valid = crate::container_qc::audit(&path).unwrap();
+        assert!(valid.passed);
+        assert_eq!(valid.properties["vbri"]["version"], 1);
+        assert_eq!(valid.properties["vbri"]["toc_total_bytes"], 1_251);
+
+        bytes[58..60].copy_from_slice(&5_u16.to_be_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let malformed = crate::container_qc::audit(&path).unwrap();
+        assert!(!malformed.passed);
+        assert!(malformed.layers[1]
+            .checks
+            .iter()
+            .any(|item| item.rule_id == "FORGE-MP3-VBRI" && !item.passed));
+
+        bytes[58..60].copy_from_slice(&0_u16.to_be_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let zero_width = crate::container_qc::audit(&path).unwrap();
+        assert!(!zero_width.passed);
+        assert!(zero_width.layers[1]
+            .checks
+            .iter()
+            .any(|item| item.rule_id == "FORGE-MP3-VBRI" && !item.passed));
+
+        put_vbri(&mut bytes, 4);
+        std::fs::write(&path, bytes).unwrap();
+        let invalid = crate::container_qc::audit(&path).unwrap();
+        assert!(!invalid.passed);
+        assert!(invalid.layers[2]
+            .checks
+            .iter()
+            .any(|item| { item.rule_id == "FORGE-MP3-VBRI-FRAMES" && !item.passed }));
+    }
+
+    fn put_lame_info(bytes: &mut [u8], radio: u16) {
+        let xing = 36;
+        bytes[xing..xing + 4].copy_from_slice(b"Info");
+        bytes[xing + 4..xing + 8].copy_from_slice(&3_u32.to_be_bytes());
+        bytes[xing + 8..xing + 12].copy_from_slice(&2_u32.to_be_bytes());
+        bytes[xing + 12..xing + 16].copy_from_slice(&1_251_u32.to_be_bytes());
+        let lame = xing + 16;
+        bytes[lame..lame + 9].copy_from_slice(b"LAME3.100");
+        bytes[lame + 15..lame + 17].copy_from_slice(&radio.to_be_bytes());
+        bytes[lame + 21..lame + 24].copy_from_slice(&[0x24, 0, 0]);
+        let crc = crc16_ansi_reflected(0, &bytes[..lame + 34]);
+        bytes[lame + 34..lame + 36].copy_from_slice(&crc.to_be_bytes());
+    }
+
+    #[test]
+    fn audit_validates_lame_replaygain_and_tag_crc() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lame.mp3");
+        let mut bytes = fake_frames(3);
+        put_lame_info(&mut bytes, 0x2c0f);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let valid = crate::container_qc::audit(&path).unwrap();
+        assert!(valid.passed);
+        assert_eq!(valid.properties["lame"]["replaygain_radio_db"], 1.5);
+        assert_eq!(valid.properties["lame"]["tag_crc_valid"], true);
+
+        let tag_crc_offset = 36 + 16 + 34;
+        bytes[tag_crc_offset] ^= 1;
+        std::fs::write(&path, &bytes).unwrap();
+        let bad_crc = crate::container_qc::audit(&path).unwrap();
+        assert!(!bad_crc.passed);
+        assert!(bad_crc.layers[1]
+            .checks
+            .iter()
+            .any(|item| item.rule_id == "FORGE-MP3-LAME-TAG-CRC" && !item.passed));
+
+        put_lame_info(&mut bytes, 0x300f);
+        std::fs::write(&path, bytes).unwrap();
+        let invalid = crate::container_qc::audit(&path).unwrap();
+        assert!(!invalid.passed);
+        assert!(invalid.layers[1]
+            .checks
+            .iter()
+            .any(|item| { item.rule_id == "FORGE-MP3-LAME-REPLAYGAIN" && !item.passed }));
     }
 }

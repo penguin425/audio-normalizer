@@ -1277,6 +1277,8 @@ fn mp3_encode_and_decode_roundtrip() {
     assert!(container.properties["lame"]["encoder_delay"]
         .as_u64()
         .is_some_and(|value| value > 0));
+    assert_eq!(container.properties["lame"]["replaygain_valid"], true);
+    assert_eq!(container.properties["lame"]["tag_crc_valid"], true);
 
     // MP3 -> planar buffer (decode via symphonia) and re-measure.
     let mp3_buf = normalize::load(&mp3_out).unwrap();

@@ -35,19 +35,31 @@ fn wave_with_xml(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
     wave
 }
 
+fn mp3_with_frame_payload(data: &[u8]) -> Vec<u8> {
+    let protected = data.first().is_some_and(|byte| byte & 1 != 0);
+    let mut frame = vec![0_u8; 417];
+    frame[..4].copy_from_slice(if protected {
+        b"\xff\xfa\x90\0"
+    } else {
+        b"\xff\xfb\x90\0"
+    });
+    let payload = data.get(1..).unwrap_or_default();
+    let count = payload.len().min(frame.len() - 4);
+    frame[4..4 + count].copy_from_slice(&payload[..count]);
+    frame
+}
+
 fuzz_target!(|data: &[u8]| {
     audit_bytes(data);
+    audit_bytes(&mp3_with_frame_payload(data));
     let xml_id = match data.first().copied().unwrap_or_default() % 3 {
         0 => b"axml",
         1 => b"bxml",
         _ => b"sxml",
     };
-    audit_bytes(&wave_with_xml(
-        xml_id,
-        data.get(1..).unwrap_or_default(),
-    ));
+    audit_bytes(&wave_with_xml(xml_id, data.get(1..).unwrap_or_default()));
 
-    let mut container = match data.first().copied().unwrap_or_default() % 15 {
+    let mut container = match data.first().copied().unwrap_or_default() % 16 {
         0 => b"RIFF\0\0\0\0WAVE".to_vec(),
         1 => b"RF64\xff\xff\xff\xffWAVE".to_vec(),
         2 => b"BW64\xff\xff\xff\xffWAVE".to_vec(),
@@ -62,7 +74,8 @@ fuzz_target!(|data: &[u8]| {
         11 => b"\xf8\x06iamf\0\0".to_vec(),
         12 => b"\x1a\x45\xdf\xa3".to_vec(),
         13 => b"\x47\x40\x00\x10".to_vec(),
-        _ => b"\x06\x0e\x2b\x34\x02\x05\x01\x01\x0d\x01\x02\x01\x01\x02\x04\x00".to_vec(),
+        14 => b"\x06\x0e\x2b\x34\x02\x05\x01\x01\x0d\x01\x02\x01\x01\x02\x04\x00".to_vec(),
+        _ => b"\xff\xfb\x90\0".to_vec(),
     };
     container.extend_from_slice(data.get(1..).unwrap_or_default());
     audit_bytes(&container);

@@ -331,10 +331,21 @@ Native MP3 audits validate ID3v2.2/2.3/2.4 headers, extended headers, frames,
 padding, optional footer bounds, ID3v1/APEv2 trailing metadata, and every
 MPEG-1/2/2.5 Layer III frame boundary. Stream version, sample rate, channel
 count, CBR/VBR bitrates, and CRC-protected frame counts are exposed without
-requiring LAME. Optional Xing/Info frame and byte counts, seek-table ordering,
-CBR identity, and LAME encoder delay/padding are cross-checked against the
-scanned stream. Forge MP3 output now backpatches the Info/LAME tag so gapless
-duration is preserved; mono encoding uses LAME's planar API.
+requiring LAME. Protected-frame CRC-16 values are recomputed over the MPEG
+header's protected bits and Layer III side information, with bounded mismatch
+evidence. Optional Xing/Info and Fraunhofer VBRI frame/byte counts, seek-table
+geometry, and mutual exclusion are cross-checked against the scanned stream.
+LAME peak/ReplayGain name, origin, sign, and range fields plus the complete tag
+CRC are validated alongside encoder delay/padding. Forge MP3 output backpatches
+the Info/LAME tag so gapless duration is preserved; mono encoding uses LAME's
+planar API.
+
+The MPEG frame and protection model follows
+[ISO/IEC 11172-3](https://www.iso.org/standard/22412.html). Xing/LAME extension
+layout and CRC behaviour are recorded against the pinned
+[LAME VBR tag implementation](https://github.com/lameproject/lame/blob/1f5cc9487284d5950343aa5d4f70de433468070a/libmp3lame/VbrTag.c);
+the non-normative Fraunhofer VBRI layout is cross-checked against the pinned
+[OpenCORE parser](https://android.googlesource.com/platform/external/opencore/+/61bf9af643abf0011dcf82ae8a436aeb7e8aae97/fileformats/mp3/parser/src/mp3parser.cpp).
 
 Dependency-free AAC elementary-stream audits cover ADTS and LOAS/LATM without
 requiring FFmpeg. ADTS checks every fixed and variable header, frame boundary,
