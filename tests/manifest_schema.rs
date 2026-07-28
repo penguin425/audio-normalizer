@@ -2,7 +2,7 @@ mod common;
 
 use forge_normalizer::normalize::Analysis;
 use forge_normalizer::report::{self, AnalysisReport};
-use forge_normalizer::wav::{ChannelRole, PcmKind};
+use forge_normalizer::wav::{ChannelRole, PcmKind, WavContainer, WaveChunk};
 use serde_json::{json, Value};
 use std::process::Command;
 
@@ -49,7 +49,18 @@ fn emitted_delivery_manifest_conforms_to_published_schema() {
         channel_roles: vec![ChannelRole::Main, ChannelRole::Main],
         source_kind: PcmKind::S16,
     };
-    forge_normalizer::wav::WavWriter::write(&path, &audio, PcmKind::S16, false).unwrap();
+    forge_normalizer::wav::WavWriter::write_with_metadata(
+        &path,
+        &audio,
+        PcmKind::S16,
+        false,
+        WavContainer::Riff,
+        &[WaveChunk {
+            id: *b"axml",
+            body: b"<metadata/>".to_vec(),
+        }],
+    )
+    .unwrap();
     let analysis = Analysis {
         sample_rate: 48_000,
         channels: 2,
@@ -122,7 +133,18 @@ fn emitted_container_qc_conforms_to_published_schema() {
         channel_roles: vec![ChannelRole::Main],
         source_kind: PcmKind::S16,
     };
-    forge_normalizer::wav::WavWriter::write(&path, &audio, PcmKind::S16, false).unwrap();
+    forge_normalizer::wav::WavWriter::write_with_metadata(
+        &path,
+        &audio,
+        PcmKind::S16,
+        false,
+        WavContainer::Riff,
+        &[WaveChunk {
+            id: *b"axml",
+            body: b"<metadata/>".to_vec(),
+        }],
+    )
+    .unwrap();
     let instance =
         serde_json::to_value(forge_normalizer::container_qc::audit(&path).unwrap()).unwrap();
     let schema: Value = serde_json::from_str(include_str!("../schema/container-qc-v1.schema.json"))

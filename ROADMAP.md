@@ -55,6 +55,9 @@ Forge already provides:
 - Bounded iXML XML/root/track-list validation, one-based source/interleave
   index checks, PCM channel reconciliation, and ADM `chna` track-map
   cross-checks.
+- ITU-R BS.2088-2 `axml`/`bxml`/`sxml` QC with bounded UTF-8/gzip parsing,
+  EBUCore envelope checks, serial subchunk/alignment/sample validation,
+  ADM/S-ADM placement and independence checks, and byte-preserving output.
 
 ## P0 — next correctness and interoperability work
 
@@ -67,8 +70,6 @@ generations.
 
 ### Broadcast and mastering containers
 
-- BWF XML metadata schema validation beyond the existing bounded `axml`
-  well-formedness and ADM profile checks.
 - AES31/AAF interchange validation where authoritative fixtures are available.
 - DSD/DFF/DSF read-only analysis, with an explicit low-pass/decimation policy
   before BS.1770 measurement.

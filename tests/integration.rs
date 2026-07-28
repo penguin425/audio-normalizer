@@ -405,6 +405,14 @@ fn bw64_output_preserves_bext_and_writes_measured_loudness() {
                 body: b"<ebuCoreMain/>".to_vec(),
             },
             WaveChunk {
+                id: *b"bxml",
+                body: b"\0\0<metadata/>".to_vec(),
+            },
+            WaveChunk {
+                id: *b"sxml",
+                body: b"serial XML metadata".to_vec(),
+            },
+            WaveChunk {
                 id: *b"chna",
                 body: b"ADM channel assignment".to_vec(),
             },
@@ -446,6 +454,18 @@ fn bw64_output_preserves_bext_and_writes_measured_loudness() {
             .unwrap()
             .unwrap(),
         b"ADM channel assignment"
+    );
+    assert_eq!(
+        forge_normalizer::metadata::read_wave_chunk(&output, *b"bxml")
+            .unwrap()
+            .unwrap(),
+        b"\0\0<metadata/>"
+    );
+    assert_eq!(
+        forge_normalizer::metadata::read_wave_chunk(&output, *b"sxml")
+            .unwrap()
+            .unwrap(),
+        b"serial XML metadata"
     );
     assert_eq!(
         u16::from_le_bytes(output_bext[346..348].try_into().unwrap()),

@@ -65,7 +65,7 @@ pub fn prepare_broadcast_chunks(input: &Path) -> Result<Vec<WaveChunk>, String> 
         id: *b"bext",
         body: prepare_bext(input)?,
     }];
-    for id in [*b"axml", *b"chna", *b"iXML"] {
+    for id in [*b"axml", *b"bxml", *b"sxml", *b"chna", *b"iXML"] {
         if let Some(body) = read_wave_chunk(input, id)? {
             chunks.push(WaveChunk { id, body });
         }
