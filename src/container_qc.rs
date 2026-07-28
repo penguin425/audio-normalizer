@@ -103,10 +103,26 @@ struct WaveState {
     ds64_riff_size: Option<u64>,
     ds64_data_size: Option<u64>,
     ds64_sample_count: Option<u64>,
-    bext_size: Option<u64>,
+    bext_count: usize,
+    bext: Option<BextInfo>,
     axml: bool,
     chna: bool,
     ds64_table: HashMap<[u8; 4], VecDeque<u64>>,
+}
+
+#[derive(Debug)]
+struct BextInfo {
+    description: String,
+    originator: String,
+    originator_reference: String,
+    origination_date: String,
+    origination_time: String,
+    time_reference_samples: u64,
+    version: u16,
+    umid: Option<String>,
+    loudness: Option<Value>,
+    coding_history_rows: usize,
+    coding_history_bytes: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -271,7 +287,16 @@ fn audit_wave(
                     state.data_size = Some(size);
                 }
             }
-            b"bext" => state.bext_size = Some(size),
+            b"bext" => {
+                state.bext_count += 1;
+                if state.bext.is_none() {
+                    if let Some(body) =
+                        read_control_chunk(path, file, offset, size, &mut wrapper, "bext")?
+                    {
+                        state.bext = parse_bext(&body, &mut xcheck);
+                    }
+                }
+            }
             b"axml" => state.axml = true,
             b"chna" => state.chna = true,
             _ => {}
@@ -410,16 +435,34 @@ fn audit_wave(
             Some(json!({"ds64": sample_count, "frames": frames})),
         ));
     }
-    if let Some(size) = state.bext_size {
+    if state.bext_count > 0 {
         xcheck.push(check(
-            "FORGE-BWF-BEXT-SIZE",
-            size >= 602,
-            if size >= 602 {
-                "bext fixed fields are complete"
+            "FORGE-BWF-BEXT-UNIQUE",
+            state.bext_count == 1,
+            if state.bext_count == 1 {
+                "exactly one bext chunk is present"
             } else {
-                "bext chunk is shorter than the 602-byte fixed fields"
+                "BWF permits exactly one bext chunk"
             },
-            Some(json!(size)),
+            Some(json!(state.bext_count)),
+        ));
+    }
+    if let (Some(bext), Some(fmt)) = (&state.bext, state.fmt) {
+        let samples_per_day = u64::from(fmt.sample_rate) * 86_400;
+        let valid = bext.time_reference_samples < samples_per_day;
+        xcheck.push(check(
+            "FORGE-BWF-TIME-REFERENCE",
+            valid,
+            if valid {
+                "TimeReference is a sample position within one day"
+            } else {
+                "TimeReference exceeds one day at the declared sample rate"
+            },
+            Some(json!({
+                "samples": bext.time_reference_samples,
+                "sample_rate_hz": fmt.sample_rate,
+                "seconds": bext.time_reference_samples as f64 / f64::from(fmt.sample_rate)
+            })),
         ));
     }
     if state.axml || state.chna {
@@ -434,6 +477,21 @@ fn audit_wave(
             Some(json!({"axml": state.axml, "chna": state.chna})),
         ));
     }
+    let bext_properties = state.bext.as_ref().map(|bext| {
+        json!({
+            "description": bext.description,
+            "originator": bext.originator,
+            "originator_reference": bext.originator_reference,
+            "origination_date": bext.origination_date,
+            "origination_time": bext.origination_time,
+            "time_reference_samples": bext.time_reference_samples,
+            "version": bext.version,
+            "umid": bext.umid,
+            "loudness": bext.loudness,
+            "coding_history_rows": bext.coding_history_rows,
+            "coding_history_bytes": bext.coding_history_bytes
+        })
+    });
     let properties = json!({
         "container": state.container,
         "chunks": state.chunks,
@@ -441,11 +499,274 @@ fn audit_wave(
         "frames": frames,
         "sample_rate_hz": state.fmt.map(|fmt| fmt.sample_rate),
         "channels": state.fmt.map(|fmt| fmt.channels),
-        "bits_per_sample": state.fmt.map(|fmt| fmt.bits_per_sample)
+        "bits_per_sample": state.fmt.map(|fmt| fmt.bits_per_sample),
+        "bext": bext_properties
     });
     Ok(finish_audit(
         path, "wave", wrapper, bitstream, xcheck, properties,
     ))
+}
+
+fn parse_bext(body: &[u8], checks: &mut Vec<AuditCheck>) -> Option<BextInfo> {
+    let complete = body.len() >= 602;
+    checks.push(check(
+        "FORGE-BWF-BEXT-SIZE",
+        complete,
+        if complete {
+            "bext fixed fields are complete"
+        } else {
+            "bext chunk is shorter than the 602-byte fixed fields"
+        },
+        Some(json!(body.len())),
+    ));
+    if !complete {
+        return None;
+    }
+
+    let text_fields = [
+        ("Description", &body[0..256]),
+        ("Originator", &body[256..288]),
+        ("OriginatorReference", &body[288..320]),
+        ("OriginationDate", &body[320..330]),
+        ("OriginationTime", &body[330..338]),
+    ];
+    let malformed_text: Vec<&str> = text_fields
+        .iter()
+        .filter_map(|(name, field)| (!valid_fixed_ascii(field)).then_some(*name))
+        .collect();
+    checks.push(check(
+        "FORGE-BWF-BEXT-TEXT",
+        malformed_text.is_empty(),
+        if malformed_text.is_empty() {
+            "fixed BWF text fields are ASCII and null-terminated when shorter than their field"
+        } else {
+            "one or more fixed BWF text fields are not valid ASCII strings"
+        },
+        Some(json!({"invalid_fields": malformed_text})),
+    ));
+
+    let origination_date = fixed_text(&body[320..330]);
+    let origination_time = fixed_text(&body[330..338]);
+    let date_valid = origination_date.is_empty() || valid_bwf_date(&origination_date);
+    let time_valid = origination_time.is_empty() || valid_bwf_time(&origination_time);
+    checks.push(check(
+        "FORGE-BWF-BEXT-DATETIME",
+        date_valid && time_valid,
+        if date_valid && time_valid {
+            "populated origination date/time fields have valid EBU Tech 3285 values"
+        } else {
+            "origination date/time is outside the EBU Tech 3285 field format or range"
+        },
+        Some(json!({
+            "origination_date": origination_date,
+            "origination_time": origination_time,
+            "date_valid": date_valid,
+            "time_valid": time_valid
+        })),
+    ));
+
+    let time_reference_samples = u64::from_le_bytes(body[338..346].try_into().unwrap());
+    let version = u16::from_le_bytes(body[346..348].try_into().unwrap());
+    let version_valid = version <= 2;
+    checks.push(check(
+        "FORGE-BWF-BEXT-VERSION",
+        version_valid,
+        if version_valid {
+            format!("bext version {version} is defined by EBU Tech 3285 v2")
+        } else {
+            format!("bext version {version} is not defined by EBU Tech 3285 v2")
+        },
+        Some(json!(version)),
+    ));
+
+    let umid_bytes = &body[348..412];
+    let umid_present = umid_bytes.iter().any(|byte| *byte != 0);
+    let umid_valid = version > 0 || !umid_present;
+    checks.push(check(
+        "FORGE-BWF-BEXT-UMID",
+        umid_valid,
+        if umid_valid {
+            "UMID presence is consistent with the bext version"
+        } else {
+            "version 0 reserves the UMID field and requires zero bytes"
+        },
+        Some(json!({"present": umid_present, "version": version})),
+    ));
+
+    let reserved = match version {
+        0 => &body[348..602],
+        1 => &body[412..602],
+        _ => &body[422..602],
+    };
+    let reserved_valid = version_valid && reserved.iter().all(|byte| *byte == 0);
+    checks.push(check(
+        "FORGE-BWF-BEXT-RESERVED",
+        reserved_valid,
+        if reserved_valid {
+            "version-specific reserved bytes are zero"
+        } else {
+            "version-specific reserved bytes must be zero"
+        },
+        Some(json!({
+            "version": version,
+            "nonzero_reserved_bytes": reserved.iter().filter(|byte| **byte != 0).count()
+        })),
+    ));
+
+    let loudness = (version == 2).then(|| {
+        let values: [i16; 5] = std::array::from_fn(|index| {
+            let offset = 412 + index * 2;
+            i16::from_le_bytes(body[offset..offset + 2].try_into().unwrap())
+        });
+        let valid = values.iter().enumerate().all(|(index, value)| {
+            *value == i16::MAX
+                || if index == 1 {
+                    (0..=9_999).contains(value)
+                } else {
+                    (-9_999..=9_999).contains(value)
+                }
+        });
+        checks.push(check(
+            "FORGE-BWF-BEXT-LOUDNESS",
+            valid,
+            if valid {
+                "version 2 loudness fields use valid hundredth-unit values or 0x7fff"
+            } else {
+                "one or more version 2 loudness fields are outside the valid range"
+            },
+            Some(json!({
+                "raw": values,
+                "unavailable_sentinel": i16::MAX
+            })),
+        ));
+        json!({
+            "integrated_lufs": bwf_loudness_value(values[0]),
+            "range_lu": bwf_loudness_value(values[1]),
+            "max_true_peak_dbtp": bwf_loudness_value(values[2]),
+            "max_momentary_lufs": bwf_loudness_value(values[3]),
+            "max_short_term_lufs": bwf_loudness_value(values[4])
+        })
+    });
+
+    let coding_history = &body[602..];
+    let coding_history_valid = valid_coding_history(coding_history);
+    let coding_history_rows = coding_history
+        .windows(2)
+        .filter(|window| *window == b"\r\n")
+        .count();
+    checks.push(check(
+        "FORGE-BWF-BEXT-CODING-HISTORY",
+        coding_history_valid,
+        if coding_history_valid {
+            "CodingHistory is ASCII and every populated row is CR/LF-terminated"
+        } else {
+            "CodingHistory must be ASCII with CR/LF-terminated rows"
+        },
+        Some(json!({
+            "bytes": coding_history.len(),
+            "rows": coding_history_rows
+        })),
+    ));
+
+    Some(BextInfo {
+        description: fixed_text(&body[0..256]),
+        originator: fixed_text(&body[256..288]),
+        originator_reference: fixed_text(&body[288..320]),
+        origination_date,
+        origination_time,
+        time_reference_samples,
+        version,
+        umid: umid_present.then(|| hex_bytes(umid_bytes)),
+        loudness,
+        coding_history_rows,
+        coding_history_bytes: coding_history.len(),
+    })
+}
+
+fn valid_fixed_ascii(field: &[u8]) -> bool {
+    let content = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .map_or(field, |end| &field[..end]);
+    content.is_ascii()
+}
+
+fn fixed_text(field: &[u8]) -> String {
+    let end = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(field.len());
+    String::from_utf8_lossy(&field[..end]).into_owned()
+}
+
+fn valid_bwf_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || !bytes[..4].iter().all(u8::is_ascii_digit)
+        || !bytes[5..7].iter().all(u8::is_ascii_digit)
+        || !bytes[8..].iter().all(u8::is_ascii_digit)
+        || bytes[4].is_ascii_digit()
+        || bytes[7].is_ascii_digit()
+    {
+        return false;
+    }
+    let year = value[..4].parse::<u32>().unwrap();
+    let month = value[5..7].parse::<u32>().unwrap();
+    let day = value[8..].parse::<u32>().unwrap();
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=max_day).contains(&day)
+}
+
+fn valid_bwf_time(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 8
+        || !bytes[..2].iter().all(u8::is_ascii_digit)
+        || !bytes[3..5].iter().all(u8::is_ascii_digit)
+        || !bytes[6..].iter().all(u8::is_ascii_digit)
+        || bytes[2].is_ascii_digit()
+        || bytes[5].is_ascii_digit()
+    {
+        return false;
+    }
+    let hour = value[..2].parse::<u8>().unwrap();
+    let minute = value[3..5].parse::<u8>().unwrap();
+    let second = value[6..].parse::<u8>().unwrap();
+    hour < 24 && minute < 60 && second < 60
+}
+
+fn valid_coding_history(value: &[u8]) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    if !value.is_ascii() || value.contains(&0) || !value.ends_with(b"\r\n") {
+        return false;
+    }
+    value.iter().enumerate().all(|(index, byte)| match byte {
+        b'\r' => value.get(index + 1) == Some(&b'\n'),
+        b'\n' => index > 0 && value[index - 1] == b'\r',
+        _ => true,
+    })
+}
+
+fn bwf_loudness_value(value: i16) -> Option<f64> {
+    (value != i16::MAX).then_some(f64::from(value) / 100.0)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[usize::from(byte >> 4)] as char);
+        output.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    output
 }
 
 fn read_control_chunk(
@@ -610,7 +931,7 @@ pub(crate) fn finish_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wav::{AudioBuffer, PcmKind, WavContainer, WavWriter};
+    use crate::wav::{AudioBuffer, PcmKind, WavContainer, WavWriter, WaveChunk};
     use std::io::{Seek, SeekFrom, Write};
 
     #[test]
@@ -657,6 +978,154 @@ mod tests {
             let audit = audit(&path).unwrap();
             assert!(audit.passed, "{container:?}: {audit:#?}");
         }
+    }
+
+    fn bwf_audio() -> AudioBuffer {
+        AudioBuffer {
+            sample_rate: 48_000,
+            channels: 1,
+            frames: 10,
+            data: vec![vec![0.0; 10]],
+            channel_roles: crate::wav::default_channel_roles(1),
+            source_kind: PcmKind::S16,
+        }
+    }
+
+    fn valid_bext() -> Vec<u8> {
+        let mut body = vec![0_u8; 602];
+        body[..12].copy_from_slice(b"Evening news");
+        body[256..265].copy_from_slice(b"EBU Forge");
+        body[288..300].copy_from_slice(b"EU-FORGE-001");
+        body[320..330].copy_from_slice(b"2026-07-29");
+        body[330..338].copy_from_slice(b"16:45:30");
+        body[338..346].copy_from_slice(&(48_000_u64 * 3_600).to_le_bytes());
+        body[346..348].copy_from_slice(&2_u16.to_le_bytes());
+        body[348..380].copy_from_slice(&[
+            0x06, 0x0a, 0x2b, 0x34, 0x01, 0x01, 0x01, 0x05, 0x01, 0x01, 0x0f, 0x20, 0x13, 0, 0, 0,
+            0x46, 0x4f, 0x52, 0x47, 0x45, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]);
+        for (index, value) in [-2_300_i16, 700, -100, -1_800, -1_900].iter().enumerate() {
+            let offset = 412 + index * 2;
+            body[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        body.extend_from_slice(b"A=PCM,F=48000,W=24,M=mono\r\n");
+        body
+    }
+
+    fn write_bext_fixture(path: &Path, chunks: Vec<WaveChunk>) {
+        WavWriter::write_with_metadata(
+            path,
+            &bwf_audio(),
+            PcmKind::S16,
+            false,
+            WavContainer::Riff,
+            &chunks,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn bwf_bext_v2_fields_are_validated_and_reported() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("valid-bwf.wav");
+        write_bext_fixture(
+            &path,
+            vec![WaveChunk {
+                id: *b"bext",
+                body: valid_bext(),
+            }],
+        );
+
+        let result = audit(&path).unwrap();
+        assert!(result.passed, "{result:#?}");
+        assert_eq!(result.properties["bext"]["version"], 2);
+        assert_eq!(
+            result.properties["bext"]["time_reference_samples"],
+            48_000 * 3_600
+        );
+        assert_eq!(
+            result.properties["bext"]["loudness"]["integrated_lufs"],
+            -23.0
+        );
+        assert_eq!(result.properties["bext"]["coding_history_rows"], 1);
+        assert_eq!(
+            result.properties["bext"]["umid"].as_str().unwrap().len(),
+            128
+        );
+    }
+
+    #[test]
+    fn bwf_bext_rejects_bad_metadata_ranges_and_line_endings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("invalid-bwf.wav");
+        let mut bext = valid_bext();
+        bext[320..330].copy_from_slice(b"2025-02-29");
+        bext[338..346].copy_from_slice(&(48_000_u64 * 86_400).to_le_bytes());
+        bext[414..416].copy_from_slice(&(-1_i16).to_le_bytes());
+        bext[500] = 1;
+        bext.truncate(602);
+        bext.extend_from_slice(b"A=PCM,F=48000,W=24,M=mono\n");
+        write_bext_fixture(
+            &path,
+            vec![WaveChunk {
+                id: *b"bext",
+                body: bext,
+            }],
+        );
+
+        let result = audit(&path).unwrap();
+        assert!(!result.passed);
+        let failed: Vec<_> = result.layers[2]
+            .checks
+            .iter()
+            .filter(|check| !check.passed)
+            .map(|check| check.rule_id)
+            .collect();
+        for expected in [
+            "FORGE-BWF-BEXT-DATETIME",
+            "FORGE-BWF-BEXT-RESERVED",
+            "FORGE-BWF-BEXT-LOUDNESS",
+            "FORGE-BWF-BEXT-CODING-HISTORY",
+            "FORGE-BWF-TIME-REFERENCE",
+        ] {
+            assert!(
+                failed.contains(&expected),
+                "missing {expected}: {result:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bwf_bext_rejects_duplicate_chunks_and_version_zero_umid() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("duplicate-bwf.wav");
+        let mut bext = valid_bext();
+        bext[346..348].copy_from_slice(&0_u16.to_le_bytes());
+        bext[412..602].fill(0);
+        write_bext_fixture(
+            &path,
+            vec![
+                WaveChunk {
+                    id: *b"bext",
+                    body: bext.clone(),
+                },
+                WaveChunk {
+                    id: *b"bext",
+                    body: bext,
+                },
+            ],
+        );
+
+        let result = audit(&path).unwrap();
+        assert!(!result.passed);
+        assert!(result.layers[2]
+            .checks
+            .iter()
+            .any(|check| { check.rule_id == "FORGE-BWF-BEXT-UNIQUE" && !check.passed }));
+        assert!(result.layers[2]
+            .checks
+            .iter()
+            .any(|check| check.rule_id == "FORGE-BWF-BEXT-UMID" && !check.passed));
     }
 
     #[test]
