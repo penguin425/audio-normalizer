@@ -338,8 +338,13 @@ decoded sample timing.
 
 For RIFF/WAVE, RF64, and BW64 it checks declared sizes, chunk bounds and
 alignment, required/unique `fmt` and `data` chunks, `ds64` placement/table/data
-sizes/sample counts, byte rate, block alignment, BWF `bext`, and paired ADM
-`axml`/`chna` metadata. Dependency-free Ogg QC follows
+sizes/sample counts, byte rate, and block alignment. BWF `bext` audits follow
+[EBU Tech 3285 v2](https://tech.ebu.ch/docs/tech/tech3285.pdf): fixed ASCII
+fields and null termination, calendar/time ranges, sample-based `TimeReference`,
+versions 0–2, UMID/version consistency, zeroed reserved bytes, v2 loudness
+ranges and unavailable sentinels, and CR/LF-terminated ASCII
+`CodingHistory`. The parsed production fields are exposed in JSON, and paired
+ADM `axml`/`chna` metadata remains cross-checked. Dependency-free Ogg QC follows
 [RFC 3533](https://www.rfc-editor.org/rfc/rfc3533) for page bounds, CRCs,
 sequences, continuation state, and sequential chains. Ogg Opus adds RFC 7845
 headers/tags, mapping-family tables, packet durations, granules, pre-skip, and

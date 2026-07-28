@@ -1,6 +1,8 @@
 mod common;
 
-use forge_normalizer::wav::{AudioBuffer, ChannelRole, PcmKind, WavWriter};
+use forge_normalizer::wav::{
+    AudioBuffer, ChannelRole, PcmKind, WavContainer, WavWriter, WaveChunk,
+};
 use serde_json::Value;
 use std::fs;
 use std::process::Command;
@@ -38,6 +40,86 @@ fn container_qc_cli_returns_pass_and_fail_status() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("FAIL"));
     let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(audit["passed"], false);
+}
+
+#[test]
+fn container_qc_cli_reports_ebu_bext_metadata_and_failures() {
+    let directory = tempfile::tempdir().unwrap();
+    let audio = AudioBuffer {
+        sample_rate: 48_000,
+        channels: 1,
+        frames: 100,
+        data: vec![vec![0.0; 100]],
+        channel_roles: vec![ChannelRole::Main],
+        source_kind: PcmKind::S16,
+    };
+    let mut bext = vec![0_u8; 602];
+    bext[..12].copy_from_slice(b"Evening news");
+    bext[256..265].copy_from_slice(b"EBU Forge");
+    bext[288..300].copy_from_slice(b"EU-FORGE-001");
+    bext[320..330].copy_from_slice(b"2026-07-29");
+    bext[330..338].copy_from_slice(b"16:45:30");
+    bext[338..346].copy_from_slice(&(48_000_u64 * 3_600).to_le_bytes());
+    bext[346..348].copy_from_slice(&2_u16.to_le_bytes());
+    for (index, value) in [-2_300_i16, 700, -100, -1_800, -1_900].iter().enumerate() {
+        let offset = 412 + index * 2;
+        bext[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    bext.extend_from_slice(b"A=PCM,F=48000,W=16,M=mono\r\n");
+
+    let valid_path = directory.path().join("valid-bwf.wav");
+    WavWriter::write_with_metadata(
+        &valid_path,
+        &audio,
+        PcmKind::S16,
+        false,
+        WavContainer::Riff,
+        &[WaveChunk {
+            id: *b"bext",
+            body: bext.clone(),
+        }],
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&valid_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(audit["passed"], true);
+    assert_eq!(audit["properties"]["bext"]["version"], 2);
+    assert_eq!(
+        audit["properties"]["bext"]["loudness"]["integrated_lufs"],
+        -23.0
+    );
+    assert_eq!(audit["properties"]["bext"]["coding_history_rows"], 1);
+
+    bext[320..330].copy_from_slice(b"2025-02-29");
+    let invalid_path = directory.path().join("invalid-bwf.wav");
+    WavWriter::write_with_metadata(
+        &invalid_path,
+        &audio,
+        PcmKind::S16,
+        false,
+        WavContainer::Riff,
+        &[WaveChunk {
+            id: *b"bext",
+            body: bext,
+        }],
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&invalid_path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(audit["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|layer| layer["checks"].as_array().unwrap())
+        .any(|check| check["rule_id"] == "FORGE-BWF-BEXT-DATETIME" && check["passed"] == false));
 }
 
 #[test]

@@ -14,6 +14,9 @@ Forge already provides:
 - Track and duration-weighted album normalization, codec re-verification,
   limiter, sample-rate conversion, integer PCM dither, ReplayGain, and BWF
   loudness metadata.
+- EBU Tech 3285 v2 BWF `bext` QC for fixed production fields, date/time,
+  sample-based TimeReference, version/UMID/reserved-byte consistency, loudness
+  metadata ranges, and CodingHistory line structure.
 - WAVE/RF64/BW64, AIFF/AIFC, CAF, AU, FLAC, MP3, Ogg Opus/Vorbis, and
   ISO-BMFF/fMP4 structural QC.
 - Bounded RFC 9559 Matroska/WebM QC for EBML structure, tracks, blocks,
@@ -52,20 +55,18 @@ Forge already provides:
 
 ## P0 — next correctness and interoperability work
 
-These are the strongest candidates for the next releases.
-
-### Codec-output verification
-
-- Codec-output true-peak iteration using the final AAC/HE-AAC/xHE-AAC decoder
-  result rather than PCM-only prediction.
+No known P0 correctness item remains open. Codec-output verification already
+re-decodes every completed supported output, measures its final true peak, and
+can iteratively re-render from the original input without compounding lossy
+generations.
 
 ## P1 — professional delivery expansion
 
 ### Broadcast and mastering containers
 
-- BWF MetaEdit-compatible checks for `bext`, UMID, coding history, originator
-  fields, time reference, and XML schemas.
 - iXML track-list/channel-index reconciliation and ADM `chna` cross-checks.
+- BWF XML metadata schema validation beyond the existing bounded `axml`
+  well-formedness and ADM profile checks.
 - AES31/AAF interchange validation where authoritative fixtures are available.
 - DSD/DFF/DSF read-only analysis, with an explicit low-pass/decimation policy
   before BS.1770 measurement.
