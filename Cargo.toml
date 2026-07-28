@@ -84,6 +84,10 @@ path = "src/bin/forge-provenance-qc.rs"
 name = "forge-imf-qc"
 path = "src/bin/forge-imf-qc.rs"
 
+[[bin]]
+name = "forge-rtp-qc"
+path = "src/bin/forge-rtp-qc.rs"
+
 [dependencies]
 rayon = "1.10"
 clap = { version = "4.5", features = ["derive"] }

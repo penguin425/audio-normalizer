@@ -492,6 +492,43 @@ malicious substitution. The implementation tracks the
 [SMPTE ST 2067 standards family](https://www.smpte.org/standards/st2067) and
 the [SMPTE IMF SHA-1 advisory](https://www.smpte.org/standards/advisory-note-imfcontent).
 
+### RTP / AES67 / ST 2110 audio QC
+
+`forge-rtp-qc session.sdp [capture.pcap]` audits an RTP audio session
+description and optionally correlates it with a saved classic PCAP:
+
+- RFC 8866 session/media structure, RTP/AVP payload mappings, destination,
+  port, clock rate, channels, packet time, and RFC 7273 clock attributes;
+- AES67 linear PCM (`L16`/`L24`) and SMPTE ST 2110-30 rate, dynamic payload,
+  receiver-capability, payload-duration, and `SMPTE2110` channel-order
+  evidence;
+- SMPTE ST 2110-31 AM824 dynamic payload, permitted packet times, even
+  subframe-sequence counts, reserved AM824 bits, Marker/CSRC constraints, and
+  payload geometry; and
+- Ethernet (including VLAN), raw IPv4/IPv6, and Linux cooked PCAP frames;
+  UDP-flow correlation; RTP header bounds; SSRC/source stability; sequence
+  gaps, reorder and duplicates; timestamp steps; sample counts; and arrival
+  jitter evidence.
+
+```sh
+forge-rtp-qc programme.sdp capture.pcap --profile smpte2110-30
+forge-rtp-qc aes3.sdp capture.pcap --profile smpte2110-31 --output rtp-qc.json
+forge-rtp-qc session.sdp --profile aes67
+```
+
+The report follows `schema/rtp-audio-qc-v1.schema.json`; exit status is 0 for
+pass, 1 for a QC failure, and 2 for malformed input or I/O failure. Inputs are
+bounded and read locally. PCAPNG, live capture, IP fragment reassembly,
+encrypted RTP, RTCP quality analysis, PTP packet/lock verification, and full
+device or managed-network conformance are explicitly outside this audit's
+scope. Clock signaling is checked as evidence, not as proof that the sender
+was locked to the declared reference.
+
+The profile checks track [RFC 3550](https://www.rfc-editor.org/rfc/rfc3550),
+[RFC 7273](https://www.rfc-editor.org/rfc/rfc7273),
+[SMPTE ST 2110-30](https://pub.smpte.org/doc/st2110-30/20170918-pub/st2110-30-2017.pdf),
+and [SMPTE ST 2110-31:2022](https://pub.smpte.org/pub/st2110-31/st2110-31-2022.pdf).
+
 ### Standards conformance tests
 
 Run the optional conformance suite against the official EBU Loudness Test Set

@@ -61,3 +61,10 @@ path = "fuzz_targets/imf_qc.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "rtp_qc"
+path = "fuzz_targets/rtp_qc.rs"
+test = false
+doc = false
+bench = false

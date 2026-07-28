@@ -51,5 +51,6 @@ pub mod provenance;
 pub mod qc;
 pub mod realtime;
 pub mod report;
+pub mod rtp_qc;
 pub mod sadm;
 pub mod wav;
