@@ -455,6 +455,43 @@ The profiles track
 and ISO/IEC 23000-19:2024 CMAF. DASH-IF recommendations are kept distinct from
 normative ISO failures.
 
+### IMF package QC
+
+`forge-imf-qc /path/to/package` performs a bounded, local-only audit of a
+SMPTE ST 2067 Interoperable Master Format package. It accepts a package
+directory or its `ASSETMAP`/`ASSETMAP.xml`, then verifies:
+
+- AssetMap UUID uniqueness, chunk extents, volume declarations, regular-file
+  status, and canonical containment inside the package root;
+- PKL membership, assembled sizes, and Base64 SHA-1 or SHA-256 hashes over the
+  exact AssetMap chunks;
+- CPL, PKL, AssetMap, EssenceDescriptor, and MXF Track File references;
+- edit-rate conversion, resource bounds/repeats, segment duration alignment,
+  and stable virtual-track identity/type;
+- common application-identification and audio descriptor homogeneity
+  constraints; and
+- auditable MCA channel IDs, tag symbols, label-dictionary ULs, language tags,
+  and soundfield group links.
+
+```sh
+forge-imf-qc ./feature-imf --output imf-qc.json
+forge-imf-qc ./feature-imf/ASSETMAP --compact
+```
+
+Remote assets, absolute paths, parent traversal, symbolic links, DTDs, and
+unbounded XML are rejected. Referenced Track Files must pass Forge's native
+OP1a MXF audit. The report follows
+`schema/imf-qc-v1.schema.json`; exit status is 0 for pass, 1 for a QC failure,
+and 2 for malformed input or I/O failure.
+
+This is an auditable structural/audio subset, not a claim of full XSD, RegXML,
+picture-essence, XML Signature, or individual Application conformance.
+SHA-1 is verified when declared for IMF interoperability, but is explicitly
+reported as accidental-corruption detection rather than protection against a
+malicious substitution. The implementation tracks the
+[SMPTE ST 2067 standards family](https://www.smpte.org/standards/st2067) and
+the [SMPTE IMF SHA-1 advisory](https://www.smpte.org/standards/advisory-note-imfcontent).
+
 ### Standards conformance tests
 
 Run the optional conformance suite against the official EBU Loudness Test Set
@@ -484,15 +521,17 @@ CI runs the EBU and ITU suites as separate required evidence.
 ### Parser hardening
 
 Property tests exercise arbitrary WAVE and delivery-manifest bytes during the
-normal Rust test suite. Four `cargo-fuzz` targets cover the WAVE decoder,
+normal Rust test suite. Dedicated `cargo-fuzz` targets cover the WAVE decoder,
 delivery-container QC including AAC ADTS/LOAS, FLAC, MP3, and Ogg Opus/Vorbis,
-ADM XML profile validation, and delivery-manifest comparison:
+ADM XML, HLS, DASH, IMF XML/package resolution, and delivery-manifest
+comparison:
 
 ```sh
 cargo fuzz run wave_reader
 cargo fuzz run container_qc
 cargo fuzz run adm_profile
 cargo fuzz run manifest_compare
+cargo fuzz run imf_qc
 ```
 
 CI builds and smoke-runs every target on relevant pull requests and `main`;

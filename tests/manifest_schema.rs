@@ -612,3 +612,23 @@ fn emitted_dash_qc_conforms_to_published_schema() {
         .collect();
     assert!(errors.is_empty(), "schema violations: {errors:#?}");
 }
+
+#[test]
+fn emitted_imf_qc_conforms_to_published_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("ASSETMAP"),
+        r#"<AssetMap xmlns="http://www.smpte-ra.org/schemas/429-9/2007/AM"><AssetList/></AssetMap>"#,
+    )
+    .unwrap();
+    let audit = forge_normalizer::imf_qc::audit(directory.path()).unwrap();
+    let instance = serde_json::to_value(audit).unwrap();
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/imf-qc-v1.schema.json")).expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}

@@ -80,6 +80,10 @@ path = "src/bin/forge-dialogue-provider.rs"
 name = "forge-provenance-qc"
 path = "src/bin/forge-provenance-qc.rs"
 
+[[bin]]
+name = "forge-imf-qc"
+path = "src/bin/forge-imf-qc.rs"
+
 [dependencies]
 rayon = "1.10"
 clap = { version = "4.5", features = ["derive"] }
@@ -91,6 +95,9 @@ crc32fast = "1"
 toml = "1.1"
 lofty = "0.24"
 quick-xml = "0.41"
+base64 = "0.23"
+sha1 = "0.11"
+sha2 = "0.11"
 clack-plugin = { version = "0.1", optional = true }
 clack-extensions = { version = "0.1", optional = true, features = ["audio-ports", "params", "state", "render", "latency", "clack-plugin"] }
 flacenc = { version = "0.5.1", default-features = false }

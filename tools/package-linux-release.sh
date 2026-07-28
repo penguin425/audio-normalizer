@@ -28,7 +28,8 @@ for binary in \
   forge-presentation-qc \
   forge-sadm-qc \
   forge-dialogue-provider \
-  forge-provenance-qc
+  forge-provenance-qc \
+  forge-imf-qc
 do
   cp "target/${target}/release/${binary}" "$staging/"
 done

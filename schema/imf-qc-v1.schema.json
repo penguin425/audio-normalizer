@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/imf-qc-v1",
+  "title": "Forge IMF package QC audit",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generator",
+    "path",
+    "passed",
+    "warning_count",
+    "findings",
+    "properties"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/imf-qc-v1"
+    },
+    "generator": {"type": "string"},
+    "path": {"type": "string"},
+    "passed": {"type": "boolean"},
+    "warning_count": {"type": "integer", "minimum": 0},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rule_id", "severity", "passed", "message"],
+        "properties": {
+          "rule_id": {"type": "string", "pattern": "^FORGE-IMF-"},
+          "severity": {"enum": ["error", "warning"]},
+          "passed": {"type": "boolean"},
+          "message": {"type": "string"},
+          "observed": true
+        }
+      }
+    },
+    "properties": {"type": "object"}
+  }
+}
