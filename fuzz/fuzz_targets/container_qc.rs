@@ -37,6 +37,30 @@ fn wave_with_xml(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
 
 fn mp3_with_frame_payload(data: &[u8]) -> Vec<u8> {
     let protected = data.first().is_some_and(|byte| byte & 1 != 0);
+    let free_format = data.first().is_some_and(|byte| byte & 2 != 0);
+    if free_format {
+        let mut stream = Vec::new();
+        let payload = data.get(1..).unwrap_or_default();
+        for (index, padded) in [false, true, false].into_iter().enumerate() {
+            let frame_size = 64 + usize::from(padded);
+            let start = stream.len();
+            stream.resize(start + frame_size, 0);
+            stream[start..start + 4].copy_from_slice(if protected {
+                b"\xff\xfa\0\0"
+            } else {
+                b"\xff\xfb\0\0"
+            });
+            if padded {
+                stream[start + 2] |= 0x02;
+            }
+            if !payload.is_empty() {
+                for (payload_index, byte) in stream[start + 4..].iter_mut().enumerate() {
+                    *byte = payload[(index + payload_index) % payload.len()];
+                }
+            }
+        }
+        return stream;
+    }
     let mut frame = vec![0_u8; 417];
     frame[..4].copy_from_slice(if protected {
         b"\xff\xfa\x90\0"
