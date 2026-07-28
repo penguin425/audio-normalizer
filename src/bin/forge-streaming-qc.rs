@@ -11,6 +11,7 @@ use std::process::ExitCode;
 enum Profile {
     Rfc8216,
     AppleHls,
+    LlHls,
     Iso23009,
     DashIfIop,
 }
@@ -55,11 +56,12 @@ fn run(cli: Cli) -> Result<bool, String> {
         }
     });
     let (mut bytes, passed, warning_count) = match profile {
-        Profile::Rfc8216 | Profile::AppleHls => {
-            let profile = if matches!(profile, Profile::Rfc8216) {
-                HlsProfile::Rfc8216
-            } else {
-                HlsProfile::AppleHls
+        Profile::Rfc8216 | Profile::AppleHls | Profile::LlHls => {
+            let profile = match profile {
+                Profile::Rfc8216 => HlsProfile::Rfc8216,
+                Profile::AppleHls => HlsProfile::AppleHls,
+                Profile::LlHls => HlsProfile::LlHls,
+                Profile::Iso23009 | Profile::DashIfIop => unreachable!(),
             };
             let audit = hls_qc::audit(&cli.input, profile)?;
             let passed = audit.passed;

@@ -19,7 +19,7 @@
     "schema": {"const": "https://penguin425.github.io/audio-normalizer/schema/hls-qc-v1"},
     "generator": {"type": "string"},
     "path": {"type": "string"},
-    "profile": {"enum": ["rfc8216", "apple-hls"]},
+    "profile": {"enum": ["rfc8216", "apple-hls", "ll-hls"]},
     "kind": {"enum": ["media", "multivariant"]},
     "passed": {"type": "boolean"},
     "warning_count": {"type": "integer", "minimum": 0},
@@ -30,7 +30,7 @@
         "additionalProperties": false,
         "required": ["rule_id", "severity", "passed", "message"],
         "properties": {
-          "rule_id": {"type": "string", "pattern": "^FORGE-(HLS|APPLE-HLS)-"},
+          "rule_id": {"type": "string", "pattern": "^FORGE-(HLS|APPLE-HLS|LL-HLS)-"},
           "severity": {"enum": ["error", "warning"]},
           "passed": {"type": "boolean"},
           "message": {"type": "string"},

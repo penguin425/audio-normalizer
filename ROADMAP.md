@@ -40,6 +40,10 @@ Forge already provides:
   structural/audio constraints.
 - HLS MPEG-TS segment audits with discontinuity-aware programme/PID/codec
   stability and cross-segment audio PTS continuity.
+- HLS 2nd Edition draft-22 Low-Latency profile checks for Partial Segments,
+  preload hints, server-control and blocking-reload declarations, delta
+  updates, Rendition Reports, live-edge values, and cross-rendition
+  discontinuity state.
 - HLS, DASH, and CMAF package checks; ISO loudness and MPEG-D DRC metadata.
 - ADM, S-ADM, presentation-aware rendering/QC, C2PA validation, CI comparison,
   real-time processing, LV2, and CLAP integration.
@@ -103,8 +107,6 @@ generations.
 
 ### Streaming and platform delivery
 
-- LL-HLS parts, preload hints, rendition reports, server-control, delta
-  updates, blocking reload, and discontinuity-state validation.
 - DASH dynamic MPDs, availability windows, UTC timing, period continuity,
   event streams, content protection, and low-latency constraints.
 - CMAF switching-set alignment across audio renditions and languages.
