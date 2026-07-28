@@ -529,6 +529,47 @@ The profile checks track [RFC 3550](https://www.rfc-editor.org/rfc/rfc3550),
 [SMPTE ST 2110-30](https://pub.smpte.org/doc/st2110-30/20170918-pub/st2110-30-2017.pdf),
 and [SMPTE ST 2110-31:2022](https://pub.smpte.org/pub/st2110-31/st2110-31-2022.pdf).
 
+### AMWA NMOS snapshot QC
+
+`forge-nmos-qc snapshot.json` performs a bounded, offline audit of an AMWA
+NMOS IS-04/IS-05 snapshot. A bundle JSON contains `nodes`, `devices`,
+`sources`, `flows`, `senders`, and `receivers` arrays, plus optional
+`sender_connections` and `receiver_connections` objects keyed by resource ID.
+Alternatively, pass a directory containing `nodes.json`, `devices.json`,
+`sources.json`, `flows.json`, `senders.json`, `receivers.json`,
+`sender-connections.json`, and `receiver-connections.json`.
+
+The audit checks:
+
+- globally unique UUIDs, NMOS TAI versions, base metadata, and tag structure;
+- Node API versions/endpoints, interfaces, internal/PTP clocks, and HTTP(S)
+  hrefs;
+- the complete Node–Device–Source–Flow–Sender/Receiver reference graph and
+  reciprocal Device membership;
+- audio Source channels and clocks, plus Flow media type, sample rate, bit
+  depth, and source coherence;
+- IS-05 active/staged/activation/constraint structure and RTP transport
+  addresses and ports;
+- reciprocal IS-04 subscriptions and IS-05 active connections; and
+- embedded `application/sdp` sender transport files using Forge's
+  ST 2110-30 or ST 2110-31 RTP audio auditor.
+
+```sh
+forge-nmos-qc ./nmos-snapshot.json --output nmos-qc.json
+forge-nmos-qc ./nmos-snapshot-directory --compact
+```
+
+The report follows `schema/nmos-qc-v1.schema.json`; exit status is 0 for pass,
+1 for a QC failure, and 2 for malformed input or I/O failure. Individual files
+are limited to 32 MiB, the aggregate snapshot to 128 MiB, and resource and
+connection counts to 100,000 each. Directory inputs do not follow symbolic
+links.
+
+This is an offline consistency audit, not a claim of live API, registry,
+DNS-SD, authorization, PTP, or network conformance. The implementation tracks
+[AMWA IS-04 v1.3.3](https://specs.amwa.tv/is-04/) and
+[AMWA IS-05 v1.1.2](https://specs.amwa.tv/is-05/).
+
 ### Standards conformance tests
 
 Run the optional conformance suite against the official EBU Loudness Test Set

@@ -68,3 +68,10 @@ path = "fuzz_targets/rtp_qc.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "nmos_qc"
+path = "fuzz_targets/nmos_qc.rs"
+test = false
+doc = false
+bench = false

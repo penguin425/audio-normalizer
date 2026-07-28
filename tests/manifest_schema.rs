@@ -667,3 +667,20 @@ a=mediaclk:direct=0\r\n",
         .collect();
     assert!(errors.is_empty(), "schema violations: {errors:#?}");
 }
+
+#[test]
+fn emitted_nmos_qc_conforms_to_published_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("snapshot.json");
+    std::fs::write(&path, br#"{"nodes":[],"devices":[]}"#).unwrap();
+    let audit = forge_normalizer::nmos_qc::audit(&path).unwrap();
+    let instance = serde_json::to_value(audit).unwrap();
+    let schema: Value = serde_json::from_str(include_str!("../schema/nmos-qc-v1.schema.json"))
+        .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}

@@ -40,6 +40,7 @@ mod mp3_qc;
 pub mod mp3enc;
 mod mpegts_qc;
 mod mxf_qc;
+pub mod nmos_qc;
 pub mod normalize;
 mod ogg_qc;
 #[cfg(feature = "opus-encoding")]
