@@ -500,15 +500,21 @@ ISO/IEC 23000-19:2024 CMAF.
 `forge-streaming-qc stream.mpd --profile iso23009` performs bounded-memory
 MPEG-DASH MPD checks for the required namespace and timing attributes, Period
 and AdaptationSet structure, unique Representation identifiers, bandwidth,
-inherited content/codec/audio properties, and inherited
-`SegmentTemplate`/`SegmentTimeline` addressing. Static presentations must have
-an explicit duration bound.
+inherited content/codec/audio properties, and inherited `SegmentTemplate`,
+`SegmentList`, or `SegmentBase` addressing. `SegmentTimeline` expansion also
+applies to lists, and static presentations must have an explicit duration
+bound.
 When `--profile` is omitted, `.mpd` inputs select `iso23009` and other inputs
 select `rfc8216`.
 
-Use `--profile dash-if-iop` to additionally check aligned segment boundaries
-across representations and report missing audio language declarations. Local
-initialization and media templates are expanded with a fixed resource cap.
+Use `--profile dash-if-iop` to additionally require one addressing mode across
+an AdaptationSet, check aligned segment boundaries across representations, and
+report missing audio language declarations. Local initialization and media
+templates/lists are expanded with a fixed resource cap. Segment-list URL counts
+and byte ranges are checked.
+For local indexed `SegmentBase` media, the bounded `indexRange` must contain
+exactly one valid `sidx`; its timescale is reconciled with the MPD, and
+initialization/index ranges are checked against the resource size.
 CMAF/fMP4 resources are passed through the ISO-BMFF auditor, including
 zero-duration initialization headers, `mvex` order, movie-fragment-relative
 addressing, sequence continuity, and monotonic `tfdt` decode times. Remote,
@@ -516,20 +522,21 @@ absolute, parent-directory, and unresolved template references are never
 fetched implicitly. Results conform to
 `schema/dash-qc-v1.schema.json`.
 
-Use `--profile dash-live` for dynamic and low-latency `SegmentTemplate`
-presentations. It requires a timezone-qualified availability anchor, a
+Use `--profile dash-live` for dynamic and low-latency presentations. It
+requires a timezone-qualified availability anchor, a
 positive update cadence, and a supported `UTCTiming` source, then checks the
 time-shift availability window inputs, suggested presentation delay,
 derivable Period starts, Period continuity/connectivity references,
 EventStream ordering and identifiers, CENC protection schemes/default KIDs
 and embedded `pssh` boxes, and ServiceDescription latency/playback ranges.
 ProducerReferenceTime identifiers, timing pairs, and latency references are
-cross-checked. `BaseURL` and `SegmentTemplate` availability offsets are
-combined. When
+cross-checked; connected representations must retain their addressing mode.
+`BaseURL` and segment-addressing availability offsets are combined. When
 `availabilityTimeComplete="false"` is effective, Forge also checks finite ATO
-and segment/target-latency geometry; locally available segments must contain
-multiple CMAF movie fragments. `SegmentBase` and `SegmentList` live-addressing
-geometry is not yet expanded.
+and segment/target-latency geometry for templates and lists; locally available
+template segments must contain multiple CMAF movie fragments. Indexed
+`SegmentBase` resources must remain complete, with non-negative effective
+availability offsets.
 
 This remains a static, local package audit. It does not fetch clock servers or
 remote media, observe the origin/CDN availability window, validate HTTP

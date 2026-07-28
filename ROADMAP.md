@@ -47,6 +47,9 @@ Forge already provides:
 - Dynamic and low-latency DASH `SegmentTemplate` QC for availability-window
   inputs, UTC timing, Period continuity/connectivity, MPD events, CENC
   protection, ServiceDescription latency, and local chunked-CMAF evidence.
+- DASH `SegmentList`/`SegmentBase` inheritance, addressing-mode consistency,
+  list timeline/count/range checks, bounded local `sidx` parsing, and dynamic
+  availability-completeness geometry.
 - HLS, DASH, and CMAF package checks; ISO loudness and MPEG-D DRC metadata.
 - ADM, S-ADM, presentation-aware rendering/QC, C2PA validation, CI comparison,
   real-time processing, LV2, and CLAP integration.
@@ -110,8 +113,8 @@ generations.
 
 ### Streaming and platform delivery
 
-- DASH dynamic `SegmentBase`/`SegmentList` availability geometry, successive
-  MPD update/patch consistency, and allowlisted clock/origin observation.
+- DASH successive MPD update/patch consistency and allowlisted clock/origin
+  observation.
 - CMAF switching-set alignment across audio renditions and languages.
 - MPEG-DASH loudness/DRC descriptors and HLS timed-ID3 loudness metadata.
 - Remote-resource auditing only behind explicit allowlists, byte/time limits,
