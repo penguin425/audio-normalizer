@@ -47,6 +47,9 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
   normalization and remapped to the destination container's primary tag type.
 * Broadcast Wave output can preserve `bext`, ADM `axml`/`chna`, and iXML chunks.
   BWF v2 measured loudness fields are updated from the normalized output.
+* Container QC validates bounded iXML documents, reconciles `TRACK_COUNT` and
+  one-based `INTERLEAVE_INDEX` values with PCM channels, preserves non-contiguous
+  recorder `CHANNEL_INDEX` source numbers, and cross-checks ADM `chna` mappings.
 
 By default the output container follows the input where Forge can encode it
 (FLAC → FLAC, MP3 → MP3, Ogg Vorbis → Ogg Vorbis, and M4A → AAC/M4A when

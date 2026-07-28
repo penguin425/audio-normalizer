@@ -52,6 +52,9 @@ Forge already provides:
 - SPDX/CycloneDX release SBOMs, verified SLSA provenance, byte-reproducible
   Linux archives, dependency policy, Rust 1.89 MSRV checks, cargo-binstall
   metadata, and generated Homebrew/Scoop/WinGet manifests.
+- Bounded iXML XML/root/track-list validation, one-based source/interleave
+  index checks, PCM channel reconciliation, and ADM `chna` track-map
+  cross-checks.
 
 ## P0 — next correctness and interoperability work
 
@@ -64,7 +67,6 @@ generations.
 
 ### Broadcast and mastering containers
 
-- iXML track-list/channel-index reconciliation and ADM `chna` cross-checks.
 - BWF XML metadata schema validation beyond the existing bounded `axml`
   well-formedness and ADM profile checks.
 - AES31/AAF interchange validation where authoritative fixtures are available.
