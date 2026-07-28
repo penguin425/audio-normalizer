@@ -88,6 +88,10 @@ path = "src/bin/forge-imf-qc.rs"
 name = "forge-rtp-qc"
 path = "src/bin/forge-rtp-qc.rs"
 
+[[bin]]
+name = "forge-nmos-qc"
+path = "src/bin/forge-nmos-qc.rs"
+
 [dependencies]
 rayon = "1.10"
 clap = { version = "4.5", features = ["derive"] }
