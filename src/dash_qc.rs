@@ -8,10 +8,12 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 pub const DASH_QC_SCHEMA: &str = "https://penguin425.github.io/audio-normalizer/schema/dash-qc-v1";
 const MAX_MPD_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ELEMENTS: usize = 200_000;
 const MAX_LOCAL_SEGMENTS: usize = 4_096;
 
@@ -64,6 +66,69 @@ struct SegmentTemplate {
     availability_time_offset: Option<f64>,
     availability_time_complete: Option<bool>,
     timeline: Vec<TimelineEntry>,
+}
+
+#[derive(Clone, Default)]
+struct SegmentBase {
+    timescale: Option<u64>,
+    presentation_time_offset: Option<u64>,
+    index_range: Option<ByteRange>,
+    index_range_exact: Option<bool>,
+    availability_time_offset: Option<f64>,
+    availability_time_complete: Option<bool>,
+    initialization: Option<Initialization>,
+}
+
+#[derive(Clone, Default)]
+struct SegmentList {
+    base: SegmentBase,
+    duration: Option<u64>,
+    start_number: Option<u64>,
+    timeline: Vec<TimelineEntry>,
+    segment_urls: Vec<SegmentUrl>,
+}
+
+#[derive(Clone, Default)]
+struct Initialization {
+    source_url: Option<String>,
+    range: Option<ByteRange>,
+}
+
+#[derive(Clone, Default)]
+struct SegmentUrl {
+    media: Option<String>,
+    media_range: Option<ByteRange>,
+    index: Option<String>,
+    index_range: Option<ByteRange>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ByteRange {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AddressingKind {
+    Template,
+    List,
+    Base,
+}
+
+impl AddressingKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Template => "SegmentTemplate",
+            Self::List => "SegmentList",
+            Self::Base => "SegmentBase",
+        }
+    }
+}
+
+enum ResolvedAddressing {
+    Template(SegmentTemplate),
+    List(SegmentList),
+    Base(SegmentBase),
 }
 
 #[derive(Clone, Copy)]
@@ -152,6 +217,8 @@ struct Representation {
     content_protections: Vec<ContentProtection>,
     producer_reference_times: Vec<ProducerReferenceTime>,
     template: Option<SegmentTemplate>,
+    segment_base: Option<SegmentBase>,
+    segment_list: Option<SegmentList>,
 }
 
 #[derive(Default)]
@@ -168,6 +235,8 @@ struct AdaptationSet {
     content_protections: Vec<ContentProtection>,
     producer_reference_times: Vec<ProducerReferenceTime>,
     template: Option<SegmentTemplate>,
+    segment_base: Option<SegmentBase>,
+    segment_list: Option<SegmentList>,
     representations: Vec<Representation>,
 }
 
@@ -179,6 +248,8 @@ struct Period {
     duration: Option<f64>,
     event_streams: Vec<EventStream>,
     template: Option<SegmentTemplate>,
+    segment_base: Option<SegmentBase>,
+    segment_list: Option<SegmentList>,
     adaptations: Vec<AdaptationSet>,
 }
 
@@ -235,6 +306,8 @@ pub fn audit(path: &Path, profile: DashProfile) -> Result<DashAudit, String> {
         .flat_map(|period| &period.adaptations)
         .map(|adaptation| adaptation.representations.len())
         .sum::<usize>();
+    let (segment_template_count, segment_list_count, segment_base_count) =
+        addressing_element_counts(&mpd);
     Ok(DashAudit {
         schema: DASH_QC_SCHEMA,
         generator: concat!("forge-normalizer/", env!("CARGO_PKG_VERSION")),
@@ -277,9 +350,34 @@ pub fn audit(path: &Path, profile: DashProfile) -> Result<DashAudit, String> {
             "period_count": mpd.periods.len(),
             "adaptation_set_count": adaptation_count,
             "representation_count": representation_count,
+            "segment_template_count": segment_template_count,
+            "segment_list_count": segment_list_count,
+            "segment_base_count": segment_base_count,
             "element_count": mpd.element_count,
         }),
     })
+}
+
+fn addressing_element_counts(mpd: &Mpd) -> (usize, usize, usize) {
+    let mut templates = 0;
+    let mut lists = 0;
+    let mut bases = 0;
+    for period in &mpd.periods {
+        templates += usize::from(period.template.is_some());
+        lists += usize::from(period.segment_list.is_some());
+        bases += usize::from(period.segment_base.is_some());
+        for adaptation in &period.adaptations {
+            templates += usize::from(adaptation.template.is_some());
+            lists += usize::from(adaptation.segment_list.is_some());
+            bases += usize::from(adaptation.segment_base.is_some());
+            for representation in &adaptation.representations {
+                templates += usize::from(representation.template.is_some());
+                lists += usize::from(representation.segment_list.is_some());
+                bases += usize::from(representation.segment_base.is_some());
+            }
+        }
+    }
+    (templates, lists, bases)
 }
 
 fn parse_mpd(xml: &[u8]) -> Result<Mpd, String> {
@@ -523,6 +621,67 @@ fn observe_element(
                 current_period_mut(mpd, *active_period)?.template = Some(template);
             }
         }
+        "SegmentBase" => {
+            let segment_base = parse_segment_base_attributes(&attributes)?;
+            set_segment_base(
+                mpd,
+                *active_period,
+                *active_adaptation,
+                *active_representation,
+                segment_base,
+            )?;
+        }
+        "SegmentList" => {
+            let segment_list = SegmentList {
+                base: parse_segment_base_attributes(&attributes)?,
+                duration: parse_optional_u64(&attributes, "duration")?,
+                start_number: parse_optional_u64(&attributes, "startNumber")?,
+                ..SegmentList::default()
+            };
+            set_segment_list(
+                mpd,
+                *active_period,
+                *active_adaptation,
+                *active_representation,
+                segment_list,
+            )?;
+        }
+        "Initialization"
+            if matches!(
+                stack.iter().rev().nth(1).map(String::as_str),
+                Some("SegmentBase" | "SegmentList")
+            ) =>
+        {
+            let initialization = Initialization {
+                source_url: attributes.get("sourceURL").cloned(),
+                range: parse_optional_byte_range(&attributes, "range")?,
+            };
+            let base = current_segment_base_like_mut(
+                mpd,
+                *active_period,
+                *active_adaptation,
+                *active_representation,
+                stack.iter().rev().nth(1).map(String::as_str),
+            )?;
+            if base.initialization.replace(initialization).is_some() {
+                return Err("duplicate Initialization in segment addressing element".into());
+            }
+        }
+        "SegmentURL" if stack.iter().rev().nth(1).map(String::as_str) == Some("SegmentList") => {
+            current_segment_list_mut(
+                mpd,
+                *active_period,
+                *active_adaptation,
+                *active_representation,
+            )?
+            .segment_urls
+            .push(SegmentUrl {
+                media: attributes.get("media").cloned(),
+                media_range: parse_optional_byte_range(&attributes, "mediaRange")?,
+                index: attributes.get("index").cloned(),
+                index_range: parse_optional_byte_range(&attributes, "indexRange")?,
+            });
+        }
         "S" if stack.iter().rev().nth(1).map(String::as_str) == Some("SegmentTimeline") => {
             let duration = parse_optional_u64(&attributes, "d")?
                 .ok_or_else(|| "SegmentTimeline S element is missing @d".to_string())?;
@@ -536,13 +695,13 @@ fn observe_element(
                 })
                 .transpose()?
                 .unwrap_or(0);
-            current_template_mut(
+            current_timeline_mut(
                 mpd,
                 *active_period,
                 *active_adaptation,
                 *active_representation,
+                stack.iter().rev().nth(2).map(String::as_str),
             )?
-            .timeline
             .push(TimelineEntry {
                 time,
                 duration,
@@ -1139,13 +1298,18 @@ fn mpd_uses_incomplete_segments(mpd: &Mpd) -> bool {
     mpd.periods.iter().any(|period| {
         period.adaptations.iter().any(|adaptation| {
             adaptation.representations.iter().any(|representation| {
-                resolve_template(
-                    representation.template.as_ref(),
-                    adaptation.template.as_ref(),
-                    period.template.as_ref(),
-                )
-                .is_some_and(|template| {
-                    effective_availability(mpd, period, adaptation, representation, &template).1
+                let (_, addressing) = resolve_addressing(representation, adaptation, period);
+                addressing.is_some_and(|addressing| {
+                    let base = match &addressing {
+                        ResolvedAddressing::Template(template) => SegmentBase {
+                            availability_time_offset: template.availability_time_offset,
+                            availability_time_complete: template.availability_time_complete,
+                            ..SegmentBase::default()
+                        },
+                        ResolvedAddressing::List(list) => list.base.clone(),
+                        ResolvedAddressing::Base(base) => base.clone(),
+                    };
+                    effective_base_availability(mpd, period, adaptation, representation, &base).1
                         == Some(false)
                 })
             })
@@ -1230,6 +1394,7 @@ fn validate_period(
             ));
         }
         let mut timelines = Vec::new();
+        let mut addressing_kinds = Vec::new();
         for (representation_index, representation) in adaptation.representations.iter().enumerate()
         {
             let label = format!(
@@ -1316,14 +1481,25 @@ fn validate_period(
                         .map(|(scheme, value)| json!({"scheme_id_uri": scheme, "value": value})),
                 ));
             }
-            let template = resolve_template(
-                representation.template.as_ref(),
-                adaptation.template.as_ref(),
-                period.template.as_ref(),
-            );
-            match template {
-                Some(template) => {
-                    let base_url = resolved_base_url(mpd, period, adaptation, representation);
+            let (declared_kinds, addressing) =
+                resolve_addressing(representation, adaptation, period);
+            let addressing_valid = declared_kinds.len() == 1 && addressing.is_some();
+            findings.push(finding(
+                "FORGE-DASH-SEGMENT-ADDRESSING",
+                Severity::Error,
+                addressing_valid,
+                format!("{label} uses exactly one effective segment-addressing mode"),
+                Some(json!(declared_kinds
+                    .iter()
+                    .map(|kind| kind.label())
+                    .collect::<Vec<_>>())),
+            ));
+            let base_url = resolved_base_url(mpd, period, adaptation, representation);
+            if let Some(kind) = declared_kinds.first().copied().filter(|_| addressing_valid) {
+                addressing_kinds.push(kind);
+            }
+            match addressing {
+                Some(ResolvedAddressing::Template(template)) => {
                     validate_template(&label, &template, period_duration, findings);
                     if profile == DashProfile::DashLive {
                         validate_live_template(
@@ -1351,16 +1527,73 @@ fn validate_period(
                         findings,
                     );
                 }
-                None => findings.push(finding(
-                    "FORGE-DASH-SEGMENT-ADDRESSING",
-                    Severity::Warning,
-                    false,
-                    format!(
-                        "{label} does not use SegmentTemplate; local segments were not expanded"
-                    ),
-                    None,
-                )),
+                Some(ResolvedAddressing::List(list)) => {
+                    validate_segment_list(&label, &list, period_duration, findings);
+                    if profile == DashProfile::DashLive {
+                        validate_live_segment_list(
+                            &label,
+                            mpd,
+                            period,
+                            adaptation,
+                            representation,
+                            &list,
+                            findings,
+                        );
+                    }
+                    if let Ok(timeline) = expand_segment_list(&list, period_duration) {
+                        timelines.push(timeline);
+                    }
+                    audit_local_segment_list(
+                        path,
+                        &list,
+                        base_url.as_deref(),
+                        period_duration,
+                        findings,
+                    );
+                }
+                Some(ResolvedAddressing::Base(base)) => {
+                    validate_segment_base(
+                        &label,
+                        &base,
+                        profile,
+                        (
+                            effective_base_availability(
+                                mpd,
+                                period,
+                                adaptation,
+                                representation,
+                                &base,
+                            ),
+                            availability_offset_declared(
+                                mpd,
+                                period,
+                                adaptation,
+                                representation,
+                                &base,
+                            ),
+                        ),
+                        findings,
+                    );
+                    audit_local_segment_base(path, &base, base_url.as_deref(), profile, findings);
+                }
+                None => {}
             }
+        }
+        if matches!(profile, DashProfile::DashIfIop | DashProfile::DashLive)
+            && !addressing_kinds.is_empty()
+        {
+            let first = addressing_kinds[0];
+            findings.push(finding(
+                "FORGE-DASHIF-SEGMENT-ADDRESSING",
+                Severity::Error,
+                addressing_kinds.iter().all(|kind| *kind == first)
+                    && addressing_kinds.len() == adaptation.representations.len(),
+                "representations in an AdaptationSet use the same addressing mode",
+                Some(json!(addressing_kinds
+                    .iter()
+                    .map(|kind| kind.label())
+                    .collect::<Vec<_>>())),
+            ));
         }
         if matches!(profile, DashProfile::DashIfIop | DashProfile::DashLive) && timelines.len() > 1
         {
@@ -1576,8 +1809,39 @@ fn validate_period_continuity(
                     "codecs": adaptation.codecs
                 })),
             ));
+            let current_mode =
+                effective_adaptation_addressing(&mpd.periods[period_index], adaptation);
+            let target_mode = referenced
+                .map(|(_, target_period)| effective_adaptation_addressing(target_period, target))
+                .unwrap_or(None);
+            findings.push(finding(
+                "FORGE-DASH-PERIOD-ADDRESSING",
+                Severity::Error,
+                current_mode.is_some() && current_mode == target_mode,
+                "period-continuous/connective AdaptationSets retain the same addressing mode",
+                Some(json!({
+                    "current": current_mode.map(AddressingKind::label),
+                    "referenced": target_mode.map(AddressingKind::label)
+                })),
+            ));
         }
     }
+}
+
+fn effective_adaptation_addressing(
+    period: &Period,
+    adaptation: &AdaptationSet,
+) -> Option<AddressingKind> {
+    let modes = adaptation
+        .representations
+        .iter()
+        .map(|representation| {
+            let (modes, addressing) = resolve_addressing(representation, adaptation, period);
+            (modes.len() == 1 && addressing.is_some()).then_some(modes[0])
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let first = modes.first().copied()?;
+    modes.iter().all(|mode| *mode == first).then_some(first)
 }
 
 fn optional_equal<T: PartialEq>(left: &Option<T>, right: &Option<T>) -> bool {
@@ -1858,7 +2122,8 @@ fn validate_template(
         format!("{label} SegmentTemplate has a media template"),
         template.media.clone().map(Value::String),
     ));
-    let has_addressing = template.duration.is_some() || !template.timeline.is_empty();
+    let has_addressing =
+        template.duration.is_some_and(|duration| duration > 0) || !template.timeline.is_empty();
     findings.push(finding(
         "FORGE-DASH-SEGMENT-DURATION",
         Severity::Error,
@@ -1894,6 +2159,618 @@ fn validate_template(
             },
         ));
     }
+}
+
+fn validate_segment_list(
+    label: &str,
+    list: &SegmentList,
+    period_duration: Option<f64>,
+    findings: &mut Vec<DashFinding>,
+) {
+    let timescale = list.base.timescale.unwrap_or(1);
+    findings.push(finding(
+        "FORGE-DASH-TIMESCALE",
+        Severity::Error,
+        timescale > 0,
+        format!("{label} SegmentList timescale is positive"),
+        Some(json!(timescale)),
+    ));
+    findings.push(finding(
+        "FORGE-DASH-SEGMENT-LIST",
+        Severity::Error,
+        !list.segment_urls.is_empty(),
+        format!("{label} SegmentList contains SegmentURL entries"),
+        Some(json!({"segment_url_count": list.segment_urls.len()})),
+    ));
+    let has_addressing =
+        list.duration.is_some_and(|duration| duration > 0) || !list.timeline.is_empty();
+    findings.push(finding(
+        "FORGE-DASH-SEGMENT-DURATION",
+        Severity::Error,
+        has_addressing,
+        format!("{label} SegmentList provides duration or SegmentTimeline addressing"),
+        Some(json!({
+            "duration": list.duration,
+            "timeline_entries": list.timeline.len()
+        })),
+    ));
+    for entry in &list.timeline {
+        findings.push(finding(
+            "FORGE-DASH-TIMELINE-ENTRY",
+            Severity::Error,
+            entry.duration > 0 && entry.repeat >= -1,
+            format!("{label} SegmentList timeline entry has valid d/r values"),
+            Some(json!({"t": entry.time, "d": entry.duration, "r": entry.repeat})),
+        ));
+    }
+    let expanded = expand_segment_list(list, period_duration);
+    let count_matches = expanded
+        .as_ref()
+        .is_ok_and(|items| items.len() == list.segment_urls.len());
+    findings.push(finding(
+        "FORGE-DASH-SEGMENT-LIST-COUNT",
+        Severity::Error,
+        count_matches,
+        format!("{label} SegmentList timing count matches SegmentURL count"),
+        Some(match expanded {
+            Ok(items) => json!({
+                "timeline_segment_count": items.len(),
+                "segment_url_count": list.segment_urls.len()
+            }),
+            Err(error) => json!({"error": error}),
+        }),
+    ));
+    for (index, segment) in list.segment_urls.iter().enumerate() {
+        findings.push(finding(
+            "FORGE-DASH-SEGMENT-URL",
+            Severity::Error,
+            segment
+                .media
+                .as_deref()
+                .is_some_and(|value| !value.is_empty()),
+            format!("{label} SegmentURL {index} declares media"),
+            segment.media.clone().map(Value::String),
+        ));
+    }
+}
+
+fn expand_segment_list(
+    list: &SegmentList,
+    period_duration: Option<f64>,
+) -> Result<Vec<u64>, String> {
+    if list.timeline.is_empty() {
+        let duration = list
+            .duration
+            .filter(|duration| *duration > 0)
+            .ok_or_else(|| "SegmentList has neither positive duration nor timeline".to_string())?;
+        let count = period_duration
+            .map(|period_duration| {
+                ((period_duration * list.base.timescale.unwrap_or(1) as f64) / duration as f64)
+                    .ceil() as usize
+            })
+            .unwrap_or(list.segment_urls.len());
+        return Ok((0..count.min(MAX_LOCAL_SEGMENTS))
+            .map(|index| index as u64 * duration)
+            .collect());
+    }
+    expand_timeline(
+        &SegmentTemplate {
+            timescale: list.base.timescale,
+            duration: list.duration,
+            start_number: list.start_number,
+            presentation_time_offset: list.base.presentation_time_offset,
+            timeline: list.timeline.clone(),
+            ..SegmentTemplate::default()
+        },
+        period_duration,
+    )
+}
+
+fn validate_live_segment_list(
+    label: &str,
+    mpd: &Mpd,
+    period: &Period,
+    adaptation: &AdaptationSet,
+    representation: &Representation,
+    list: &SegmentList,
+    findings: &mut Vec<DashFinding>,
+) {
+    let (offset, complete) =
+        effective_base_availability(mpd, period, adaptation, representation, &list.base);
+    let maximum_duration = list
+        .duration
+        .or_else(|| list.timeline.iter().map(|entry| entry.duration).max())
+        .filter(|_| list.base.timescale.unwrap_or(1) > 0)
+        .map(|duration| duration as f64 / list.base.timescale.unwrap_or(1) as f64);
+    findings.push(finding(
+        "FORGE-DASH-LIVE-AVAILABILITY-OFFSET",
+        Severity::Error,
+        offset >= 0.0 && !offset.is_nan(),
+        format!("{label} effective availabilityTimeOffset is non-negative"),
+        Some(json!({
+            "effective_offset_seconds": finite_json_number(offset),
+            "infinite": offset.is_infinite(),
+            "availability_time_complete": complete
+        })),
+    ));
+    if complete == Some(false) {
+        let latency_target = mpd
+            .service_descriptions
+            .iter()
+            .filter_map(|service| service.latency.and_then(|latency| latency.target))
+            .min()
+            .map(|milliseconds| milliseconds as f64 / 1_000.0);
+        findings.push(finding(
+            "FORGE-DASH-LL-AVAILABILITY",
+            Severity::Error,
+            offset.is_finite()
+                && offset > 0.0
+                && maximum_duration.is_some_and(|duration| offset < duration),
+            format!(
+                "{label} incomplete SegmentList has finite positive ATO below segment duration"
+            ),
+            Some(json!({
+                "effective_offset_seconds": finite_json_number(offset),
+                "maximum_segment_duration_seconds": maximum_duration
+            })),
+        ));
+        findings.push(finding(
+            "FORGE-DASH-LL-LATENCY-GEOMETRY",
+            Severity::Error,
+            match (maximum_duration, latency_target) {
+                (Some(duration), Some(target)) => duration < target && duration - offset < target,
+                _ => false,
+            },
+            format!("{label} SegmentList duration/ATO are coherent with the latency target"),
+            Some(json!({
+                "maximum_segment_duration_seconds": maximum_duration,
+                "effective_offset_seconds": finite_json_number(offset),
+                "latency_target_seconds": latency_target
+            })),
+        ));
+    }
+}
+
+fn validate_segment_base(
+    label: &str,
+    base: &SegmentBase,
+    profile: DashProfile,
+    availability: ((f64, Option<bool>), bool),
+    findings: &mut Vec<DashFinding>,
+) {
+    let timescale = base.timescale.unwrap_or(1);
+    findings.push(finding(
+        "FORGE-DASH-TIMESCALE",
+        Severity::Error,
+        timescale > 0,
+        format!("{label} SegmentBase timescale is positive"),
+        Some(json!(timescale)),
+    ));
+    let restricted = matches!(profile, DashProfile::DashIfIop | DashProfile::DashLive);
+    findings.push(finding(
+        "FORGE-DASH-SEGMENT-BASE-INDEX",
+        if restricted {
+            Severity::Error
+        } else {
+            Severity::Warning
+        },
+        base.index_range.is_some(),
+        format!("{label} SegmentBase declares an indexRange"),
+        base.index_range
+            .map(|range| json!({"start": range.start, "end": range.end})),
+    ));
+    let initialization = base.initialization.as_ref();
+    findings.push(finding(
+        "FORGE-DASH-SEGMENT-BASE-INITIALIZATION",
+        if restricted {
+            Severity::Error
+        } else {
+            Severity::Warning
+        },
+        initialization.is_some_and(|item| item.range.is_some()),
+        format!("{label} SegmentBase declares an Initialization byte range"),
+        initialization.and_then(|item| {
+            item.range
+                .map(|range| json!({"start": range.start, "end": range.end}))
+        }),
+    ));
+    if restricted {
+        findings.push(finding(
+            "FORGE-DASHIF-SEGMENT-BASE-INITIALIZATION",
+            Severity::Error,
+            initialization.is_none_or(|item| item.source_url.is_none()),
+            format!("{label} indexed addressing keeps Initialization in the media resource"),
+            initialization
+                .and_then(|item| item.source_url.clone())
+                .map(Value::String),
+        ));
+    }
+    if profile == DashProfile::DashLive {
+        let ((offset, complete), offset_declared) = availability;
+        findings.push(finding(
+            "FORGE-DASH-LIVE-SEGMENT-BASE-COMPLETE",
+            Severity::Error,
+            complete.unwrap_or(true),
+            format!("{label} SegmentBase is advertised as a complete resource"),
+            complete.map(Value::Bool),
+        ));
+        findings.push(finding(
+            "FORGE-DASH-LIVE-AVAILABILITY-OFFSET",
+            Severity::Error,
+            offset_declared && offset.is_finite() && offset >= 0.0,
+            format!("{label} SegmentBase has a finite effective availabilityTimeOffset"),
+            Some(json!({
+                "declared": offset_declared,
+                "availability_time_offset_seconds": finite_json_number(offset),
+                "infinite": offset.is_infinite()
+            })),
+        ));
+    }
+}
+
+fn audit_local_segment_list(
+    mpd_path: &Path,
+    list: &SegmentList,
+    base_url: Option<&str>,
+    period_duration: Option<f64>,
+    findings: &mut Vec<DashFinding>,
+) {
+    if let Some(initialization) = &list.base.initialization {
+        let uri = apply_base_url(base_url, initialization.source_url.as_deref().unwrap_or(""));
+        audit_local_range(
+            mpd_path,
+            &uri,
+            initialization.range,
+            "initialization",
+            findings,
+        );
+    }
+    if expand_segment_list(list, period_duration).is_err() {
+        return;
+    }
+    for (index, segment) in list
+        .segment_urls
+        .iter()
+        .take(MAX_LOCAL_SEGMENTS)
+        .enumerate()
+    {
+        let Some(media) = segment.media.as_deref() else {
+            continue;
+        };
+        let uri = apply_base_url(base_url, media);
+        audit_local_range(
+            mpd_path,
+            &uri,
+            segment.media_range,
+            &format!("SegmentURL {index} media"),
+            findings,
+        );
+        if let Some(index_uri) = segment.index.as_deref() {
+            let uri = apply_base_url(base_url, index_uri);
+            audit_local_range(
+                mpd_path,
+                &uri,
+                segment.index_range,
+                &format!("SegmentURL {index} index"),
+                findings,
+            );
+        } else if segment.index_range.is_some() {
+            audit_local_range(
+                mpd_path,
+                &uri,
+                segment.index_range,
+                &format!("SegmentURL {index} index"),
+                findings,
+            );
+        }
+    }
+}
+
+fn audit_local_range(
+    mpd_path: &Path,
+    uri: &str,
+    range: Option<ByteRange>,
+    label: &str,
+    findings: &mut Vec<DashFinding>,
+) {
+    let Some(path) = local_reference(mpd_path, uri) else {
+        findings.push(finding(
+            "FORGE-DASH-REMOTE-REFERENCE",
+            Severity::Warning,
+            false,
+            format!("remote or unresolved {label} resource was not fetched: {uri}"),
+            Some(json!(uri)),
+        ));
+        return;
+    };
+    let length = fs::metadata(&path)
+        .ok()
+        .filter(|item| item.is_file())
+        .map(|item| item.len());
+    findings.push(finding(
+        "FORGE-DASH-LOCAL-RESOURCE",
+        Severity::Error,
+        length.is_some(),
+        format!("{label} resource exists: {}", path.display()),
+        None,
+    ));
+    if let (Some(length), Some(range)) = (length, range) {
+        findings.push(finding(
+            "FORGE-DASH-BYTE-RANGE",
+            Severity::Error,
+            range.end < length,
+            format!("{label} byte range is inside the local resource"),
+            Some(json!({
+                "path": path,
+                "start": range.start,
+                "end": range.end,
+                "resource_bytes": length
+            })),
+        ));
+    }
+}
+
+#[derive(Debug)]
+struct SidxInfo {
+    timescale: u32,
+    earliest_presentation_time: u64,
+    first_offset: u64,
+    reference_count: u16,
+    maximum_subsegment_duration: u32,
+    total_duration: u64,
+    total_referenced_size: u64,
+}
+
+fn audit_local_segment_base(
+    mpd_path: &Path,
+    base: &SegmentBase,
+    base_url: Option<&str>,
+    profile: DashProfile,
+    findings: &mut Vec<DashFinding>,
+) {
+    let uri = base_url.unwrap_or("");
+    let Some(path) = local_reference(mpd_path, uri) else {
+        findings.push(finding(
+            "FORGE-DASH-REMOTE-REFERENCE",
+            Severity::Warning,
+            false,
+            format!("remote or unresolved SegmentBase resource was not fetched: {uri}"),
+            Some(json!(uri)),
+        ));
+        return;
+    };
+    let length = fs::metadata(&path)
+        .ok()
+        .filter(|item| item.is_file())
+        .map(|item| item.len());
+    findings.push(finding(
+        "FORGE-DASH-LOCAL-RESOURCE",
+        Severity::Error,
+        length.is_some(),
+        format!("SegmentBase media resource exists: {}", path.display()),
+        None,
+    ));
+    let Some(length) = length else {
+        return;
+    };
+    if let Some(initialization) = &base.initialization {
+        let initialization_uri = initialization
+            .source_url
+            .as_deref()
+            .map(|source| apply_base_url(base_url, source))
+            .unwrap_or_else(|| uri.to_owned());
+        audit_local_range(
+            mpd_path,
+            &initialization_uri,
+            initialization.range,
+            "SegmentBase initialization",
+            findings,
+        );
+    }
+    let Some(range) = base.index_range else {
+        return;
+    };
+    let in_bounds = range.end < length;
+    findings.push(finding(
+        "FORGE-DASH-BYTE-RANGE",
+        Severity::Error,
+        in_bounds,
+        "SegmentBase indexRange is inside the local media resource",
+        Some(json!({
+            "path": path,
+            "start": range.start,
+            "end": range.end,
+            "resource_bytes": length
+        })),
+    ));
+    if !in_bounds {
+        return;
+    }
+    match parse_sidx(&path, range) {
+        Ok(info) => {
+            let timescale_matches = base
+                .timescale
+                .is_some_and(|timescale| timescale == u64::from(info.timescale));
+            findings.push(finding(
+                "FORGE-DASH-SIDX",
+                Severity::Error,
+                info.timescale > 0 && info.reference_count > 0,
+                "SegmentBase indexRange contains one bounded, valid sidx box",
+                Some(json!({
+                    "timescale": info.timescale,
+                    "earliest_presentation_time": info.earliest_presentation_time,
+                    "first_offset": info.first_offset,
+                    "reference_count": info.reference_count,
+                    "maximum_subsegment_duration": info.maximum_subsegment_duration,
+                    "total_duration": info.total_duration,
+                    "total_referenced_size": info.total_referenced_size
+                })),
+            ));
+            let referenced_end = range
+                .end
+                .checked_add(1)
+                .and_then(|value| value.checked_add(info.first_offset))
+                .and_then(|value| value.checked_add(info.total_referenced_size));
+            findings.push(finding(
+                "FORGE-DASH-SIDX-RANGE",
+                Severity::Error,
+                referenced_end.is_some_and(|end| end <= length),
+                "sidx references remain inside the local media resource",
+                Some(json!({
+                    "resource_bytes": length,
+                    "exclusive_referenced_end": referenced_end
+                })),
+            ));
+            findings.push(finding(
+                "FORGE-DASH-SIDX-TIMESCALE",
+                if matches!(profile, DashProfile::DashIfIop | DashProfile::DashLive) {
+                    Severity::Error
+                } else {
+                    Severity::Warning
+                },
+                timescale_matches,
+                "SegmentBase explicitly declares the sidx timescale",
+                Some(json!({
+                    "segment_base_timescale": base.timescale,
+                    "sidx_timescale": info.timescale
+                })),
+            ));
+        }
+        Err(error) => findings.push(finding(
+            "FORGE-DASH-SIDX",
+            Severity::Error,
+            false,
+            error,
+            Some(json!({"path": path, "start": range.start, "end": range.end})),
+        )),
+    }
+}
+
+fn parse_sidx(path: &Path, range: ByteRange) -> Result<SidxInfo, String> {
+    let length = range
+        .end
+        .checked_sub(range.start)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| "invalid sidx byte range".to_string())?;
+    if length > MAX_INDEX_BYTES {
+        return Err(format!(
+            "sidx range exceeds the {MAX_INDEX_BYTES} byte safety limit"
+        ));
+    }
+    let mut file =
+        fs::File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    file.seek(SeekFrom::Start(range.start))
+        .map_err(|error| format!("seek {}: {error}", path.display()))?;
+    let mut bytes = vec![0_u8; length as usize];
+    file.read_exact(&mut bytes)
+        .map_err(|error| format!("read sidx from {}: {error}", path.display()))?;
+    if bytes.len() < 12 {
+        return Err("sidx range is shorter than a box header".into());
+    }
+    let size32 = be_u32(&bytes, 0)?;
+    if bytes.get(4..8) != Some(b"sidx") {
+        return Err("indexRange does not start with a sidx box".into());
+    }
+    let (box_size, mut cursor) = match size32 {
+        0 => return Err("sidx must use an explicit bounded box size".into()),
+        1 => (be_u64(&bytes, 8)?, 16),
+        value => (u64::from(value), 8),
+    };
+    if box_size != bytes.len() as u64 {
+        return Err("indexRange must exactly cover one sidx box".into());
+    }
+    let version = *bytes
+        .get(cursor)
+        .ok_or_else(|| "truncated sidx full-box header".to_string())?;
+    cursor += 4;
+    let _reference_id = be_u32(&bytes, cursor)?;
+    cursor += 4;
+    let timescale = be_u32(&bytes, cursor)?;
+    cursor += 4;
+    let (earliest_presentation_time, first_offset) = match version {
+        0 => {
+            let earliest = u64::from(be_u32(&bytes, cursor)?);
+            let offset = u64::from(be_u32(&bytes, cursor + 4)?);
+            cursor += 8;
+            (earliest, offset)
+        }
+        1 => {
+            let earliest = be_u64(&bytes, cursor)?;
+            let offset = be_u64(&bytes, cursor + 8)?;
+            cursor += 16;
+            (earliest, offset)
+        }
+        _ => return Err(format!("unsupported sidx version {version}")),
+    };
+    cursor += 2;
+    let reference_count = be_u16(&bytes, cursor)?;
+    cursor += 2;
+    let expected = cursor
+        .checked_add(usize::from(reference_count) * 12)
+        .ok_or_else(|| "sidx reference table size overflow".to_string())?;
+    if expected != bytes.len() {
+        return Err("sidx reference table does not exactly fill indexRange".into());
+    }
+    if timescale == 0 {
+        return Err("sidx timescale is zero".into());
+    }
+    let mut total_duration = 0_u64;
+    let mut total_referenced_size = 0_u64;
+    let mut maximum_subsegment_duration = 0_u32;
+    for _ in 0..reference_count {
+        let reference = be_u32(&bytes, cursor)?;
+        if reference >> 31 != 0 {
+            return Err("hierarchical sidx references are not supported".into());
+        }
+        let referenced_size = reference & 0x7fff_ffff;
+        if referenced_size == 0 {
+            return Err("sidx reference has zero referenced_size".into());
+        }
+        let duration = be_u32(&bytes, cursor + 4)?;
+        if duration == 0 {
+            return Err("sidx reference has zero subsegment_duration".into());
+        }
+        total_referenced_size = total_referenced_size
+            .checked_add(u64::from(referenced_size))
+            .ok_or_else(|| "sidx referenced size overflow".to_string())?;
+        total_duration = total_duration
+            .checked_add(u64::from(duration))
+            .ok_or_else(|| "sidx duration overflow".to_string())?;
+        maximum_subsegment_duration = maximum_subsegment_duration.max(duration);
+        cursor += 12;
+    }
+    Ok(SidxInfo {
+        timescale,
+        earliest_presentation_time,
+        first_offset,
+        reference_count,
+        maximum_subsegment_duration,
+        total_duration,
+        total_referenced_size,
+    })
+}
+
+fn be_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
+    let value = bytes
+        .get(offset..offset + 2)
+        .ok_or_else(|| "truncated sidx".to_string())?;
+    Ok(u16::from_be_bytes([value[0], value[1]]))
+}
+
+fn be_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| "truncated sidx".to_string())?;
+    Ok(u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn be_u64(bytes: &[u8], offset: usize) -> Result<u64, String> {
+    let value = bytes
+        .get(offset..offset + 8)
+        .ok_or_else(|| "truncated sidx".to_string())?;
+    Ok(u64::from_be_bytes([
+        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+    ]))
 }
 
 fn audit_local_resources(
@@ -2111,6 +2988,9 @@ fn expand_timeline(
         let mut result = Vec::new();
         let mut current = 0_u64;
         for (entry_index, entry) in template.timeline.iter().enumerate() {
+            if entry.duration == 0 || entry.repeat < -1 {
+                return Err("SegmentTimeline entry has invalid d/r values".into());
+            }
             if let Some(time) = entry.time {
                 if !result.is_empty() && time < current {
                     return Err("SegmentTimeline start time overlaps or moves backwards".into());
@@ -2152,6 +3032,9 @@ fn expand_timeline(
     let Some(duration) = template.duration else {
         return Err("SegmentTemplate has neither duration nor timeline".into());
     };
+    if duration == 0 {
+        return Err("SegmentTemplate duration is zero".into());
+    }
     let Some(period_duration) = period_duration else {
         return Err("duration-addressed SegmentTemplate has no bounded Period duration".into());
     };
@@ -2199,6 +3082,139 @@ fn resolve_template(
         }
         if !layer.timeline.is_empty() {
             resolved.timeline.clone_from(&layer.timeline);
+        }
+    }
+    Some(resolved)
+}
+
+fn resolve_addressing(
+    representation: &Representation,
+    adaptation: &AdaptationSet,
+    period: &Period,
+) -> (Vec<AddressingKind>, Option<ResolvedAddressing>) {
+    let levels = [
+        (
+            representation.template.as_ref(),
+            representation.segment_list.as_ref(),
+            representation.segment_base.as_ref(),
+        ),
+        (
+            adaptation.template.as_ref(),
+            adaptation.segment_list.as_ref(),
+            adaptation.segment_base.as_ref(),
+        ),
+        (
+            period.template.as_ref(),
+            period.segment_list.as_ref(),
+            period.segment_base.as_ref(),
+        ),
+    ];
+    let modes = levels
+        .iter()
+        .map(|(template, list, base)| {
+            let mut modes = Vec::new();
+            if template.is_some() {
+                modes.push(AddressingKind::Template);
+            }
+            if list.is_some() {
+                modes.push(AddressingKind::List);
+            }
+            if base.is_some() {
+                modes.push(AddressingKind::Base);
+            }
+            modes
+        })
+        .find(|modes| !modes.is_empty())
+        .unwrap_or_default();
+    if modes.len() != 1 {
+        return (modes, None);
+    }
+    let resolved = match modes[0] {
+        AddressingKind::Template => resolve_template(
+            representation.template.as_ref(),
+            adaptation.template.as_ref(),
+            period.template.as_ref(),
+        )
+        .map(ResolvedAddressing::Template),
+        AddressingKind::List => resolve_segment_list(
+            representation.segment_list.as_ref(),
+            adaptation.segment_list.as_ref(),
+            period.segment_list.as_ref(),
+        )
+        .map(ResolvedAddressing::List),
+        AddressingKind::Base => resolve_segment_base(
+            representation.segment_base.as_ref(),
+            adaptation.segment_base.as_ref(),
+            period.segment_base.as_ref(),
+        )
+        .map(ResolvedAddressing::Base),
+    };
+    (modes, resolved)
+}
+
+fn resolve_segment_base(
+    representation: Option<&SegmentBase>,
+    adaptation: Option<&SegmentBase>,
+    period: Option<&SegmentBase>,
+) -> Option<SegmentBase> {
+    let layers = [period, adaptation, representation];
+    if layers.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut resolved = SegmentBase::default();
+    for layer in layers.into_iter().flatten() {
+        inherit_segment_base(&mut resolved, layer);
+    }
+    Some(resolved)
+}
+
+fn inherit_segment_base(resolved: &mut SegmentBase, layer: &SegmentBase) {
+    if layer.timescale.is_some() {
+        resolved.timescale = layer.timescale;
+    }
+    if layer.presentation_time_offset.is_some() {
+        resolved.presentation_time_offset = layer.presentation_time_offset;
+    }
+    if layer.index_range.is_some() {
+        resolved.index_range = layer.index_range;
+    }
+    if layer.index_range_exact.is_some() {
+        resolved.index_range_exact = layer.index_range_exact;
+    }
+    if layer.availability_time_offset.is_some() {
+        resolved.availability_time_offset = layer.availability_time_offset;
+    }
+    if layer.availability_time_complete.is_some() {
+        resolved.availability_time_complete = layer.availability_time_complete;
+    }
+    if layer.initialization.is_some() {
+        resolved.initialization.clone_from(&layer.initialization);
+    }
+}
+
+fn resolve_segment_list(
+    representation: Option<&SegmentList>,
+    adaptation: Option<&SegmentList>,
+    period: Option<&SegmentList>,
+) -> Option<SegmentList> {
+    let layers = [period, adaptation, representation];
+    if layers.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut resolved = SegmentList::default();
+    for layer in layers.into_iter().flatten() {
+        inherit_segment_base(&mut resolved.base, &layer.base);
+        if layer.duration.is_some() {
+            resolved.duration = layer.duration;
+        }
+        if layer.start_number.is_some() {
+            resolved.start_number = layer.start_number;
+        }
+        if !layer.timeline.is_empty() {
+            resolved.timeline.clone_from(&layer.timeline);
+        }
+        if !layer.segment_urls.is_empty() {
+            resolved.segment_urls.clone_from(&layer.segment_urls);
         }
     }
     Some(resolved)
@@ -2300,6 +3316,26 @@ fn effective_availability(
     representation: &Representation,
     template: &SegmentTemplate,
 ) -> (f64, Option<bool>) {
+    effective_base_availability(
+        mpd,
+        period,
+        adaptation,
+        representation,
+        &SegmentBase {
+            availability_time_offset: template.availability_time_offset,
+            availability_time_complete: template.availability_time_complete,
+            ..SegmentBase::default()
+        },
+    )
+}
+
+fn effective_base_availability(
+    mpd: &Mpd,
+    period: &Period,
+    adaptation: &AdaptationSet,
+    representation: &Representation,
+    segment_base: &SegmentBase,
+) -> (f64, Option<bool>) {
     let mut offset = 0.0;
     let mut complete = None;
     for base_url in [
@@ -2316,11 +3352,30 @@ fn effective_availability(
             complete = base_url.availability_time_complete;
         }
     }
-    offset += template.availability_time_offset.unwrap_or(0.0);
-    if template.availability_time_complete.is_some() {
-        complete = template.availability_time_complete;
+    offset += segment_base.availability_time_offset.unwrap_or(0.0);
+    if segment_base.availability_time_complete.is_some() {
+        complete = segment_base.availability_time_complete;
     }
     (offset, complete)
+}
+
+fn availability_offset_declared(
+    mpd: &Mpd,
+    period: &Period,
+    adaptation: &AdaptationSet,
+    representation: &Representation,
+    segment_base: &SegmentBase,
+) -> bool {
+    segment_base.availability_time_offset.is_some()
+        || [
+            mpd.base_url.as_ref(),
+            period.base_url.as_ref(),
+            adaptation.base_url.as_ref(),
+            representation.base_url.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|item| item.availability_time_offset.is_some())
 }
 
 fn apply_base_url(base: Option<&str>, resource: &str) -> String {
@@ -2633,6 +3688,48 @@ fn parse_optional_bool(
         .transpose()
 }
 
+fn parse_optional_byte_range(
+    attributes: &HashMap<String, String>,
+    name: &str,
+) -> Result<Option<ByteRange>, String> {
+    attributes
+        .get(name)
+        .map(|value| {
+            let (start, end) = value
+                .split_once('-')
+                .ok_or_else(|| format!("invalid byte range @{name}={value}"))?;
+            let start = start
+                .parse::<u64>()
+                .map_err(|_| format!("invalid byte range @{name}={value}"))?;
+            let end = end
+                .parse::<u64>()
+                .map_err(|_| format!("invalid byte range @{name}={value}"))?;
+            if start <= end {
+                Ok(ByteRange { start, end })
+            } else {
+                Err(format!("reversed byte range @{name}={value}"))
+            }
+        })
+        .transpose()
+}
+
+fn parse_segment_base_attributes(
+    attributes: &HashMap<String, String>,
+) -> Result<SegmentBase, String> {
+    Ok(SegmentBase {
+        timescale: parse_optional_u64(attributes, "timescale")?,
+        presentation_time_offset: parse_optional_u64(attributes, "presentationTimeOffset")?,
+        index_range: parse_optional_byte_range(attributes, "indexRange")?,
+        index_range_exact: parse_optional_bool(attributes, "indexRangeExact")?,
+        availability_time_offset: parse_optional_availability_offset(
+            attributes,
+            "availabilityTimeOffset",
+        )?,
+        availability_time_complete: parse_optional_bool(attributes, "availabilityTimeComplete")?,
+        initialization: None,
+    })
+}
+
 fn current_period_mut(mpd: &mut Mpd, period: Option<usize>) -> Result<&mut Period, String> {
     period
         .and_then(|index| mpd.periods.get_mut(index))
@@ -2648,6 +3745,133 @@ fn current_adaptation_mut(
     adaptation
         .and_then(|index| period.adaptations.get_mut(index))
         .ok_or_else(|| "DASH element appears outside AdaptationSet".into())
+}
+
+fn set_segment_base(
+    mpd: &mut Mpd,
+    period: Option<usize>,
+    adaptation: Option<usize>,
+    representation: Option<usize>,
+    value: SegmentBase,
+) -> Result<(), String> {
+    let slot = segment_base_slot_mut(mpd, period, adaptation, representation)?;
+    if slot.replace(value).is_some() {
+        return Err("duplicate SegmentBase at the same MPD hierarchy level".into());
+    }
+    Ok(())
+}
+
+fn set_segment_list(
+    mpd: &mut Mpd,
+    period: Option<usize>,
+    adaptation: Option<usize>,
+    representation: Option<usize>,
+    value: SegmentList,
+) -> Result<(), String> {
+    let slot = segment_list_slot_mut(mpd, period, adaptation, representation)?;
+    if slot.replace(value).is_some() {
+        return Err("duplicate SegmentList at the same MPD hierarchy level".into());
+    }
+    Ok(())
+}
+
+fn segment_base_slot_mut(
+    mpd: &mut Mpd,
+    period: Option<usize>,
+    adaptation: Option<usize>,
+    representation: Option<usize>,
+) -> Result<&mut Option<SegmentBase>, String> {
+    let period = current_period_mut(mpd, period)?;
+    if let Some(adaptation_index) = adaptation {
+        let adaptation = period
+            .adaptations
+            .get_mut(adaptation_index)
+            .ok_or_else(|| "invalid active AdaptationSet".to_string())?;
+        if let Some(representation_index) = representation {
+            Ok(&mut adaptation
+                .representations
+                .get_mut(representation_index)
+                .ok_or_else(|| "invalid active Representation".to_string())?
+                .segment_base)
+        } else {
+            Ok(&mut adaptation.segment_base)
+        }
+    } else {
+        Ok(&mut period.segment_base)
+    }
+}
+
+fn segment_list_slot_mut(
+    mpd: &mut Mpd,
+    period: Option<usize>,
+    adaptation: Option<usize>,
+    representation: Option<usize>,
+) -> Result<&mut Option<SegmentList>, String> {
+    let period = current_period_mut(mpd, period)?;
+    if let Some(adaptation_index) = adaptation {
+        let adaptation = period
+            .adaptations
+            .get_mut(adaptation_index)
+            .ok_or_else(|| "invalid active AdaptationSet".to_string())?;
+        if let Some(representation_index) = representation {
+            Ok(&mut adaptation
+                .representations
+                .get_mut(representation_index)
+                .ok_or_else(|| "invalid active Representation".to_string())?
+                .segment_list)
+        } else {
+            Ok(&mut adaptation.segment_list)
+        }
+    } else {
+        Ok(&mut period.segment_list)
+    }
+}
+
+fn current_segment_list_mut(
+    mpd: &mut Mpd,
+    period: Option<usize>,
+    adaptation: Option<usize>,
+    representation: Option<usize>,
+) -> Result<&mut SegmentList, String> {
+    segment_list_slot_mut(mpd, period, adaptation, representation)?
+        .as_mut()
+        .ok_or_else(|| "SegmentList child has no enclosing SegmentList".into())
+}
+
+fn current_segment_base_like_mut<'a>(
+    mpd: &'a mut Mpd,
+    period: Option<usize>,
+    adaptation: Option<usize>,
+    representation: Option<usize>,
+    parent: Option<&str>,
+) -> Result<&'a mut SegmentBase, String> {
+    match parent {
+        Some("SegmentBase") => segment_base_slot_mut(mpd, period, adaptation, representation)?
+            .as_mut()
+            .ok_or_else(|| "Initialization has no enclosing SegmentBase".into()),
+        Some("SegmentList") => {
+            Ok(&mut current_segment_list_mut(mpd, period, adaptation, representation)?.base)
+        }
+        _ => Err("Initialization has no supported segment-addressing parent".into()),
+    }
+}
+
+fn current_timeline_mut<'a>(
+    mpd: &'a mut Mpd,
+    period: Option<usize>,
+    adaptation: Option<usize>,
+    representation: Option<usize>,
+    addressing: Option<&str>,
+) -> Result<&'a mut Vec<TimelineEntry>, String> {
+    match addressing {
+        Some("SegmentTemplate") => {
+            Ok(&mut current_template_mut(mpd, period, adaptation, representation)?.timeline)
+        }
+        Some("SegmentList") => {
+            Ok(&mut current_segment_list_mut(mpd, period, adaptation, representation)?.timeline)
+        }
+        _ => Err("SegmentTimeline has no supported enclosing addressing element".into()),
+    }
 }
 
 fn current_content_protection_mut(
@@ -2731,6 +3955,23 @@ mod tests {
         let path = directory.join("stream.mpd");
         fs::write(&path, body).unwrap();
         path
+    }
+
+    fn sidx_box(timescale: u32, duration: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&44_u32.to_be_bytes());
+        bytes.extend_from_slice(b"sidx");
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.extend_from_slice(&timescale.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u16.to_be_bytes());
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&100_u32.to_be_bytes());
+        bytes.extend_from_slice(&duration.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes
     }
 
     #[test]
@@ -2988,6 +4229,28 @@ mod tests {
             expand_timeline(&template, None).unwrap(),
             vec![0, 10, 20, 30]
         );
+        let list = SegmentList {
+            base: SegmentBase {
+                timescale: Some(10),
+                ..SegmentBase::default()
+            },
+            duration: Some(10),
+            segment_urls: vec![SegmentUrl::default(), SegmentUrl::default()],
+            ..SegmentList::default()
+        };
+        assert_eq!(expand_segment_list(&list, None).unwrap(), vec![0, 10]);
+        assert!(expand_timeline(
+            &SegmentTemplate {
+                timeline: vec![TimelineEntry {
+                    time: None,
+                    duration: 0,
+                    repeat: -1,
+                }],
+                ..SegmentTemplate::default()
+            },
+            Some(1.0),
+        )
+        .is_err());
         assert_eq!(
             substitute_template(
                 "$RepresentationID$-$Number%05d$-$Time$-$$.m4s",
@@ -3004,5 +4267,123 @@ mod tests {
         assert!(!looks_like_xs_datetime("2026-07-27T25:15:30Z"));
         assert!(!looks_like_xs_datetime("2026-07-27T10:15:30+14:01"));
         assert!(!looks_like_xs_datetime("2026-07-27"));
+    }
+
+    #[test]
+    fn audits_segment_list_timing_and_remote_resources() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_mpd(
+            directory.path(),
+            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+ profiles="urn:mpeg:dash:profile:isoff-live:2011"
+ mediaPresentationDuration="PT4S" minBufferTime="PT1S">
+ <BaseURL>https://example.invalid/audio/</BaseURL>
+ <Period><AdaptationSet id="1" contentType="audio" mimeType="audio/mp4"
+  codecs="mp4a.40.2" lang="en" audioSamplingRate="48000">
+  <SegmentList timescale="48000" duration="96000">
+   <Initialization sourceURL="init.mp4"/>
+   <SegmentURL media="one.m4s"/>
+   <SegmentURL media="two.m4s"/>
+  </SegmentList>
+  <Representation id="audio" bandwidth="128000"/>
+ </AdaptationSet></Period>
+</MPD>"#,
+        );
+        let audit = audit(&path, DashProfile::DashIfIop).unwrap();
+        assert!(
+            audit.passed,
+            "{:#?}",
+            audit
+                .findings
+                .iter()
+                .filter(|finding| finding.severity == Severity::Error && !finding.passed)
+                .map(|finding| (&finding.rule_id, &finding.message))
+                .collect::<Vec<_>>()
+        );
+        assert!(audit.findings.iter().any(|finding| {
+            finding.rule_id == "FORGE-DASH-SEGMENT-LIST-COUNT" && finding.passed
+        }));
+    }
+
+    #[test]
+    fn audits_local_segment_base_sidx_and_ranges() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut media = vec![0_u8; 8];
+        media.extend_from_slice(&sidx_box(48_000, 96_000));
+        media.extend_from_slice(&[0_u8; 100]);
+        fs::write(directory.path().join("audio.mp4"), media).unwrap();
+        let path = write_mpd(
+            directory.path(),
+            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+ profiles="urn:mpeg:dash:profile:isoff-on-demand:2011"
+ mediaPresentationDuration="PT2S" minBufferTime="PT1S">
+ <Period><AdaptationSet id="1" contentType="audio" mimeType="audio/mp4"
+  codecs="mp4a.40.2" lang="en" audioSamplingRate="48000">
+  <Representation id="audio" bandwidth="128000">
+   <BaseURL>audio.mp4</BaseURL>
+   <SegmentBase timescale="48000" indexRange="8-51" indexRangeExact="true">
+    <Initialization range="0-7"/>
+   </SegmentBase>
+  </Representation>
+ </AdaptationSet></Period>
+</MPD>"#,
+        );
+        let audit = audit(&path, DashProfile::DashIfIop).unwrap();
+        assert!(
+            audit.passed,
+            "{:#?}",
+            audit
+                .findings
+                .iter()
+                .filter(|finding| finding.severity == Severity::Error && !finding.passed)
+                .map(|finding| (&finding.rule_id, &finding.message))
+                .collect::<Vec<_>>()
+        );
+        assert!(audit
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "FORGE-DASH-SIDX" && finding.passed));
+        let info = parse_sidx(
+            &directory.path().join("audio.mp4"),
+            ByteRange { start: 8, end: 51 },
+        )
+        .unwrap();
+        assert_eq!(info.timescale, 48_000);
+        assert_eq!(info.maximum_subsegment_duration, 96_000);
+    }
+
+    #[test]
+    fn rejects_mixed_addressing_and_segment_list_count_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_mpd(
+            directory.path(),
+            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+ mediaPresentationDuration="PT4S" minBufferTime="PT1S">
+ <BaseURL>https://example.invalid/</BaseURL>
+ <Period><AdaptationSet id="1" contentType="audio" mimeType="audio/mp4"
+  codecs="opus" lang="en" audioSamplingRate="48000">
+  <SegmentTemplate timescale="48000" duration="96000"
+   initialization="init-$RepresentationID$.mp4"
+   media="$RepresentationID$-$Number$.m4s"/>
+  <Representation id="template" bandwidth="64000"/>
+  <Representation id="list" bandwidth="64000">
+   <SegmentList timescale="48000" duration="96000">
+    <SegmentURL media="only-one.m4s"/>
+   </SegmentList>
+  </Representation>
+ </AdaptationSet></Period>
+</MPD>"#,
+        );
+        let audit = audit(&path, DashProfile::DashIfIop).unwrap();
+        assert!(!audit.passed);
+        for rule in [
+            "FORGE-DASHIF-SEGMENT-ADDRESSING",
+            "FORGE-DASH-SEGMENT-LIST-COUNT",
+        ] {
+            assert!(audit
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == rule && !finding.passed));
+        }
     }
 }
