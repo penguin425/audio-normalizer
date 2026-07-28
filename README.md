@@ -238,6 +238,8 @@ forge-container-qc delivery.eac3
 forge-container-qc immersive.iamf
 forge-container-qc broadcast.ts
 forge-container-qc camera.m2ts
+forge-container-qc programme.mxf
+forge-container-qc track.opatom.mxf
 forge-container-qc programme.mka
 forge-container-qc delivery.webm
 ```
@@ -247,6 +249,19 @@ adaptation-field errors, payload continuity gaps, exact retransmissions,
 CRC-protected PAT/PMT programme maps, declared audio codecs, bounded PES
 headers, and monotonic 90 kHz audio PTS values. The report keeps programme,
 PID, language, PCR, and timing evidence without decoding the audio.
+
+MXF audits use a bounded SMPTE ST 377-1 KLV scanner. They verify BER/value
+bounds, run-in limits, Header/Body/Footer Partition Pack fields and links,
+stable OP1a/OP-Atom labels, KAG and SID use, Index Table declarations, Generic
+Container essence, terminal Random Index Pack entries, and sound descriptor
+sampling/channel/quantization geometry. If the registered AS-11 Core Framework
+key is present, Forge additionally applies the auditable AMWA AS-11 UK DPP
+structural/audio subset: one Core Framework, OP1a, closed-complete Header,
+KAG size 1, RIP, index-before-essence, and mono 24-bit/48 kHz PCM descriptors.
+Absence of that explicit marker is reported as “not detected,” never as an
+AS-11 compliance claim. See
+[SMPTE ST 377-1](https://pub.smpte.org/latest/st377-1/st377-1-2019.pdf) and the
+[AMWA AS-11 UK DPP HD rules](https://amwa-tv.github.io/AS-11_UK_DPP_HD/AMWA_AS_11_UK_DPP_HD.html).
 
 AC-3/E-AC-3 elementary-stream audits scan bounded syncframes without FFmpeg.
 They validate frame sizes, sample rates, bitstream IDs, channel mode/LFE,

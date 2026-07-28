@@ -27,6 +27,10 @@ Forge already provides:
   presentation-render loudness, true-peak, duration, and reference checks.
 - Bounded MPEG-TS/M2TS QC for packet layout, continuity, PAT/PMT CRC and
   programme maps, audio PES headers, and PTS continuity.
+- Bounded SMPTE ST 377-1 MXF QC for KLV framing, partitions and links,
+  OP1a/OP-Atom, RIP, index declarations, Generic Container essence, sound
+  descriptors, channel assignment evidence, and detected AS-11/DPP
+  structural/audio constraints.
 - HLS MPEG-TS segment audits with discontinuity-aware programme/PID/codec
   stability and cross-segment audio PTS continuity.
 - HLS, DASH, and CMAF package checks; ISO loudness and MPEG-D DRC metadata.
@@ -55,8 +59,6 @@ These are the strongest candidates for the next releases.
 
 ### Broadcast and mastering containers
 
-- MXF OP1a/OP-Atom KLV bounds, partitions, RIP, index tables, essence
-  containers, descriptors, channel assignment, and AS-11/DPP constraints.
 - IMF CPL/PKL/AssetMap integrity, hash verification, virtual-track timing,
   MCA labels, and Application Profile constraints.
 - BWF MetaEdit-compatible checks for `bext`, UMID, coding history, originator
