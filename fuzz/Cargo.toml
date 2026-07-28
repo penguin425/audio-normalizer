@@ -54,3 +54,10 @@ path = "fuzz_targets/dash_qc.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "imf_qc"
+path = "fuzz_targets/imf_qc.rs"
+test = false
+doc = false
+bench = false

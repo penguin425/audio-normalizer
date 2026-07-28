@@ -29,6 +29,7 @@ mod flac_qc;
 pub mod flacenc;
 pub mod hls_qc;
 mod iamf_qc;
+pub mod imf_qc;
 mod isobmff_qc;
 #[cfg(feature = "lv2-plugin")]
 mod lv2;

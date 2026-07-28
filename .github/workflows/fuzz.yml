@@ -50,6 +50,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for target in wave_reader container_qc adm_profile manifest_compare hls_qc dash_qc; do
+          for target in wave_reader container_qc adm_profile manifest_compare hls_qc dash_qc imf_qc; do
             cargo fuzz run "$target" -- -runs=1000
           done
