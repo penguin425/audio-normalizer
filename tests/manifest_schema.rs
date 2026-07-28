@@ -464,6 +464,58 @@ fn emitted_isobmff_container_qc_conforms_to_published_schema() {
 }
 
 #[test]
+fn emitted_mxf_container_qc_conforms_to_published_schema() {
+    if !Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|result| result.status.success())
+    {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("programme.mxf");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=128x72:rate=25:duration=0.1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=997:sample_rate=48000:duration=0.1",
+            "-c:v",
+            "mpeg2video",
+            "-pix_fmt",
+            "yuv422p",
+            "-c:a",
+            "pcm_s24le",
+            "-f",
+            "mxf",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{generated:#?}");
+
+    let audit = forge_normalizer::container_qc::audit(&path).unwrap();
+    assert_eq!(audit.format, "mxf");
+    assert!(audit.passed, "{audit:#?}");
+    let instance = serde_json::to_value(audit).unwrap();
+    let schema: Value = serde_json::from_str(include_str!("../schema/container-qc-v1.schema.json"))
+        .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
+
+#[test]
 fn emitted_provenance_qc_conforms_to_published_schema() {
     use forge_normalizer::provenance::{
         ProvenanceAudit, ValidationPolicy, VerifierEvidence, PROVENANCE_QC_SCHEMA,

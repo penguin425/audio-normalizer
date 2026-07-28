@@ -11,7 +11,7 @@
     },
     "generator": {"type": "string"},
     "path": {"type": "string"},
-    "format": {"enum": ["wave", "aiff", "aifc", "caf", "au", "flac", "mp3", "aac-adts", "aac-loas", "ac3", "eac3", "iamf", "mpegts", "m2ts", "ogg", "ogg-opus", "ogg-vorbis", "matroska", "webm", "isobmff"]},
+    "format": {"enum": ["wave", "aiff", "aifc", "caf", "au", "flac", "mp3", "aac-adts", "aac-loas", "ac3", "eac3", "iamf", "mpegts", "m2ts", "mxf", "mxf-opatom", "ogg", "ogg-opus", "ogg-vorbis", "matroska", "webm", "isobmff"]},
     "passed": {"type": "boolean"},
     "layers": {
       "type": "array",
