@@ -17,6 +17,7 @@ const MPEG_PTS_MODULUS: u64 = 1_u64 << 33;
 pub enum HlsProfile {
     Rfc8216,
     AppleHls,
+    LlHls,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -66,6 +67,48 @@ struct Playlist {
     media_sequence: Option<u64>,
     discontinuity_sequence: Option<u64>,
     is_fmp4: bool,
+    part_target: Option<f64>,
+    parts: Vec<PartialSegment>,
+    server_control: Option<ServerControl>,
+    skipped_segments: Option<u64>,
+    has_recently_removed_dateranges: bool,
+    preload_hints: Vec<PreloadHint>,
+    rendition_reports: Vec<RenditionReport>,
+    program_date_time_count: usize,
+    has_i_frames_only: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PartialSegment {
+    uri: String,
+    duration: f64,
+    independent: bool,
+    gap: bool,
+    parent: usize,
+    discontinuity_sequence: u64,
+    byterange: Option<(u64, Option<u64>)>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ServerControl {
+    can_skip_until: Option<f64>,
+    can_skip_dateranges: bool,
+    hold_back: Option<f64>,
+    part_hold_back: Option<f64>,
+    can_block_reload: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PreloadHint {
+    kind: String,
+    uri: String,
+}
+
+#[derive(Clone, Debug)]
+struct RenditionReport {
+    uri: String,
+    last_msn: Option<u64>,
+    last_part: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,6 +196,20 @@ pub fn audit(path: &Path, profile: HlsProfile) -> Result<HlsAudit, String> {
             },
             Some(json!(media.len())),
         ));
+        if profile == HlsProfile::LlHls {
+            let expected = root
+                .referenced_playlists
+                .iter()
+                .collect::<HashSet<_>>()
+                .len();
+            findings.push(finding(
+                "FORGE-LL-HLS-LOCAL-RENDITIONS",
+                Severity::Error,
+                media.len() == expected,
+                "every referenced Low-Latency Media Playlist is available for local validation",
+                Some(json!({"expected": expected, "loaded": media.len()})),
+            ));
+        }
     } else {
         media.push(root);
     }
@@ -195,7 +252,14 @@ pub fn audit(path: &Path, profile: HlsProfile) -> Result<HlsAudit, String> {
                 "media_sequence": item.media_sequence,
                 "discontinuity_sequence": item.discontinuity_sequence,
                 "discontinuities": item.segment_discontinuities.iter().filter(|value| **value).count(),
-                "fmp4": item.is_fmp4
+                "fmp4": item.is_fmp4,
+                "part_target": item.part_target,
+                "parts": item.parts.len(),
+                "part_uris": item.parts.iter().map(|part| &part.uri).collect::<Vec<_>>(),
+                "skipped_segments": item.skipped_segments,
+                "preload_hints": item.preload_hints.len(),
+                "rendition_reports": item.rendition_reports.len(),
+                "can_block_reload": item.server_control.as_ref().is_some_and(|control| control.can_block_reload)
             })).collect::<Vec<_>>()
         }),
     })
@@ -254,6 +318,7 @@ fn parse_playlist(
     let mut pending_duration = None;
     let mut pending_discontinuity = false;
     let mut map_count = 0_usize;
+    let mut discontinuity_state = 0_u64;
     for (index, line) in lines.iter().enumerate().skip(1) {
         if line.is_empty() {
             continue;
@@ -283,7 +348,9 @@ fn parse_playlist(
                 parse_sequence_tag("EXT-X-MEDIA-SEQUENCE", value, index, findings);
         } else if let Some(value) = line.strip_prefix("#EXT-X-DISCONTINUITY-SEQUENCE:") {
             singleton_tag(&mut singleton, "EXT-X-DISCONTINUITY-SEQUENCE", findings);
-            let before_segments = playlist.segment_uris.is_empty();
+            let before_segments = playlist.segment_uris.is_empty()
+                && playlist.parts.is_empty()
+                && !pending_discontinuity;
             findings.push(finding(
                 "FORGE-HLS-DISCONTINUITY-SEQUENCE-ORDER",
                 Severity::Error,
@@ -293,9 +360,69 @@ fn parse_playlist(
             ));
             playlist.discontinuity_sequence =
                 parse_sequence_tag("EXT-X-DISCONTINUITY-SEQUENCE", value, index, findings);
+            discontinuity_state = playlist.discontinuity_sequence.unwrap_or(0);
         } else if let Some(value) = line.strip_prefix("#EXT-X-TARGETDURATION:") {
             singleton_tag(&mut singleton, "EXT-X-TARGETDURATION", findings);
             playlist.target_duration = value.parse().ok();
+        } else if let Some(value) = line.strip_prefix("#EXT-X-PART-INF:") {
+            singleton_tag(&mut singleton, "EXT-X-PART-INF", findings);
+            match attributes(value) {
+                Ok(values) => {
+                    playlist.part_target = values
+                        .get("PART-TARGET")
+                        .and_then(|value| positive_float(value));
+                    findings.push(finding(
+                        "FORGE-HLS-PART-INF",
+                        Severity::Error,
+                        playlist.part_target.is_some(),
+                        "EXT-X-PART-INF declares a positive PART-TARGET",
+                        Some(json!(&values)),
+                    ));
+                }
+                Err(error) => attribute_error(index, error, findings),
+            }
+        } else if let Some(value) = line.strip_prefix("#EXT-X-SERVER-CONTROL:") {
+            singleton_tag(&mut singleton, "EXT-X-SERVER-CONTROL", findings);
+            match attributes(value) {
+                Ok(values) => {
+                    let control = ServerControl {
+                        can_skip_until: values
+                            .get("CAN-SKIP-UNTIL")
+                            .and_then(|value| positive_float(value)),
+                        can_skip_dateranges: values
+                            .get("CAN-SKIP-DATERANGES")
+                            .is_some_and(|value| value == "YES"),
+                        hold_back: values
+                            .get("HOLD-BACK")
+                            .and_then(|value| positive_float(value)),
+                        part_hold_back: values
+                            .get("PART-HOLD-BACK")
+                            .and_then(|value| positive_float(value)),
+                        can_block_reload: values
+                            .get("CAN-BLOCK-RELOAD")
+                            .is_some_and(|value| value == "YES"),
+                    };
+                    let enums_valid = ["CAN-SKIP-DATERANGES", "CAN-BLOCK-RELOAD"]
+                        .iter()
+                        .all(|name| values.get(*name).is_none_or(|value| value == "YES"));
+                    let numbers_valid = ["CAN-SKIP-UNTIL", "HOLD-BACK", "PART-HOLD-BACK"]
+                        .iter()
+                        .all(|name| {
+                            values
+                                .get(*name)
+                                .is_none_or(|value| positive_float(value).is_some())
+                        });
+                    findings.push(finding(
+                        "FORGE-HLS-SERVER-CONTROL",
+                        Severity::Error,
+                        enums_valid && numbers_valid,
+                        "EXT-X-SERVER-CONTROL attributes have valid types and values",
+                        Some(json!(&values)),
+                    ));
+                    playlist.server_control = Some(control);
+                }
+                Err(error) => attribute_error(index, error, findings),
+            }
         } else if let Some(value) = line.strip_prefix("#EXT-X-PLAYLIST-TYPE:") {
             singleton_tag(&mut singleton, "EXT-X-PLAYLIST-TYPE", findings);
             playlist.playlist_type = Some(value.into());
@@ -312,7 +439,206 @@ fn parse_playlist(
                 ));
                 pending_duration = None;
             }
+        } else if let Some(value) = line.strip_prefix("#EXT-X-PART:") {
+            let placement_valid = pending_duration.is_none();
+            match attributes(value) {
+                Ok(values) => {
+                    let uri = values.get("URI").filter(|value| !value.is_empty()).cloned();
+                    let duration = values
+                        .get("DURATION")
+                        .and_then(|value| positive_float(value));
+                    let enums_valid = ["INDEPENDENT", "GAP"]
+                        .iter()
+                        .all(|name| values.get(*name).is_none_or(|value| value == "YES"));
+                    let byterange = values.get("BYTERANGE").and_then(|range| {
+                        parse_byterange(range).filter(|_| attribute_is_quoted(value, "BYTERANGE"))
+                    });
+                    let byterange_valid = !values.contains_key("BYTERANGE") || byterange.is_some();
+                    let uri_quoted = attribute_is_quoted(value, "URI");
+                    let implicit_range_valid = match (&uri, byterange) {
+                        (Some(uri), Some((_, None))) => playlist.parts.last().is_some_and(|part| {
+                            part.parent == playlist.segment_durations.len()
+                                && part.uri == *uri
+                                && part.byterange.is_some()
+                        }),
+                        _ => true,
+                    };
+                    let valid = placement_valid
+                        && uri.is_some()
+                        && uri_quoted
+                        && duration.is_some()
+                        && enums_valid
+                        && byterange_valid
+                        && implicit_range_valid;
+                    findings.push(finding(
+                        "FORGE-HLS-PART",
+                        Severity::Error,
+                        valid,
+                        "EXT-X-PART has a URI, positive duration, valid attributes, and precedes its EXTINF",
+                        Some(json!({"line": index + 1, "attributes": &values})),
+                    ));
+                    if valid {
+                        let (Some(uri), Some(duration)) = (uri, duration) else {
+                            unreachable!("valid PART has URI and duration");
+                        };
+                        playlist.parts.push(PartialSegment {
+                            uri,
+                            duration,
+                            independent: values
+                                .get("INDEPENDENT")
+                                .is_some_and(|value| value == "YES"),
+                            gap: values.get("GAP").is_some_and(|value| value == "YES"),
+                            parent: playlist.segment_durations.len(),
+                            discontinuity_sequence: discontinuity_state,
+                            byterange,
+                        });
+                    }
+                }
+                Err(error) => attribute_error(index, error, findings),
+            }
+        } else if let Some(value) = line.strip_prefix("#EXT-X-SKIP:") {
+            singleton_tag(&mut singleton, "EXT-X-SKIP", findings);
+            match attributes(value) {
+                Ok(values) => {
+                    playlist.skipped_segments = values
+                        .get("SKIPPED-SEGMENTS")
+                        .and_then(|value| value.parse().ok());
+                    playlist.has_recently_removed_dateranges =
+                        values.contains_key("RECENTLY-REMOVED-DATERANGES");
+                    let removed_valid = !playlist.has_recently_removed_dateranges
+                        || attribute_is_quoted(value, "RECENTLY-REMOVED-DATERANGES");
+                    findings.push(finding(
+                        "FORGE-HLS-DELTA-UPDATE",
+                        Severity::Error,
+                        playlist.skipped_segments.is_some() && removed_valid,
+                        "EXT-X-SKIP declares a non-negative SKIPPED-SEGMENTS count",
+                        Some(json!(&values)),
+                    ));
+                }
+                Err(error) => attribute_error(index, error, findings),
+            }
+        } else if let Some(value) = line.strip_prefix("#EXT-X-PRELOAD-HINT:") {
+            match attributes(value) {
+                Ok(values) => {
+                    let kind = values
+                        .get("TYPE")
+                        .filter(|value| !value.is_empty())
+                        .cloned();
+                    let uri = values.get("URI").filter(|value| !value.is_empty()).cloned();
+                    let start_valid = values
+                        .get("BYTERANGE-START")
+                        .is_none_or(|value| value.parse::<u64>().is_ok());
+                    let length_valid = values
+                        .get("BYTERANGE-LENGTH")
+                        .is_none_or(|value| value.parse::<u64>().is_ok_and(|length| length > 0));
+                    let valid = kind.is_some()
+                        && uri.is_some()
+                        && attribute_is_quoted(value, "URI")
+                        && start_valid
+                        && length_valid;
+                    findings.push(finding(
+                        "FORGE-HLS-PRELOAD-HINT",
+                        Severity::Error,
+                        valid,
+                        "EXT-X-PRELOAD-HINT declares a PART or MAP URI and a valid byte range",
+                        Some(json!({"line": index + 1, "attributes": &values})),
+                    ));
+                    findings.push(finding(
+                        "FORGE-HLS-PRELOAD-HINT-TYPE",
+                        Severity::Warning,
+                        kind.as_deref()
+                            .is_some_and(|kind| matches!(kind, "PART" | "MAP")),
+                        "preload hint TYPE is recognized as PART or MAP",
+                        kind.clone().map(Value::from),
+                    ));
+                    if valid {
+                        let (Some(kind), Some(uri)) = (kind, uri) else {
+                            unreachable!("valid preload hint has TYPE and URI");
+                        };
+                        playlist.preload_hints.push(PreloadHint { kind, uri });
+                    }
+                }
+                Err(error) => attribute_error(index, error, findings),
+            }
+        } else if let Some(value) = line.strip_prefix("#EXT-X-RENDITION-REPORT:") {
+            match attributes(value) {
+                Ok(values) => {
+                    let uri = values
+                        .get("URI")
+                        .filter(|value| relative_uri(value))
+                        .cloned();
+                    let last_msn = values.get("LAST-MSN").and_then(|value| value.parse().ok());
+                    let last_part = values.get("LAST-PART").and_then(|value| value.parse().ok());
+                    let integers_valid = values
+                        .get("LAST-MSN")
+                        .is_none_or(|value| value.parse::<u64>().is_ok())
+                        && values
+                            .get("LAST-PART")
+                            .is_none_or(|value| value.parse::<u64>().is_ok());
+                    findings.push(finding(
+                        "FORGE-HLS-RENDITION-REPORT",
+                        Severity::Error,
+                        uri.is_some() && attribute_is_quoted(value, "URI") && integers_valid,
+                        "EXT-X-RENDITION-REPORT has a relative URI and valid sequence fields",
+                        Some(json!({"line": index + 1, "attributes": &values})),
+                    ));
+                    if integers_valid && attribute_is_quoted(value, "URI") {
+                        let Some(uri) = uri else {
+                            continue;
+                        };
+                        playlist.rendition_reports.push(RenditionReport {
+                            uri,
+                            last_msn,
+                            last_part,
+                        });
+                    }
+                }
+                Err(error) => attribute_error(index, error, findings),
+            }
+        } else if let Some(value) = line.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
+            let valid = valid_iso8601_datetime(value);
+            findings.push(finding(
+                "FORGE-HLS-PROGRAM-DATE-TIME",
+                Severity::Error,
+                valid,
+                "EXT-X-PROGRAM-DATE-TIME contains an ISO 8601 date-time",
+                Some(json!({"line": index + 1, "value": value})),
+            ));
+            findings.push(finding(
+                "FORGE-HLS-PART-TAG-ORDER",
+                Severity::Error,
+                !current_parent_has_parts(&playlist),
+                "PROGRAM-DATE-TIME precedes the first Partial Segment of its Parent Segment",
+                Some(json!({"line": index + 1})),
+            ));
+            findings.push(finding(
+                "FORGE-HLS-PROGRAM-DATE-TIME-PRECISION",
+                Severity::Warning,
+                has_datetime_precision(value),
+                "program date-time includes a time zone and millisecond precision",
+                Some(json!({"line": index + 1, "value": value})),
+            ));
+            if valid {
+                playlist.program_date_time_count += 1;
+            }
+        } else if *line == "#EXT-X-I-FRAMES-ONLY" {
+            playlist.has_i_frames_only = true;
+        } else if line.starts_with("#EXT-X-KEY:") {
+            findings.push(finding(
+                "FORGE-HLS-PART-TAG-ORDER",
+                Severity::Error,
+                !current_parent_has_parts(&playlist),
+                "EXT-X-KEY precedes the first Partial Segment of its Parent Segment",
+                Some(json!({"line": index + 1})),
+            ));
         } else if let Some(value) = line.strip_prefix("#EXT-X-MAP:") {
+            findings.push(finding(
+                "FORGE-HLS-PART-TAG-ORDER",
+                Severity::Error,
+                !current_parent_has_parts(&playlist),
+                "EXT-X-MAP precedes the first Partial Segment of its Parent Segment",
+                Some(json!({"line": index + 1})),
+            ));
             map_count += 1;
             match attributes(value) {
                 Ok(values) => playlist.map_uri = values.get("URI").cloned(),
@@ -392,7 +718,9 @@ fn parse_playlist(
                 )),
             }
         } else if *line == "#EXT-X-DISCONTINUITY" {
-            let valid = pending_duration.is_none() && !pending_discontinuity;
+            let valid = pending_duration.is_none()
+                && !pending_discontinuity
+                && !current_parent_has_parts(&playlist);
             findings.push(finding(
                 "FORGE-HLS-DISCONTINUITY-PLACEMENT",
                 Severity::Error,
@@ -401,6 +729,7 @@ fn parse_playlist(
                 Some(json!({"line": index + 1})),
             ));
             pending_discontinuity = true;
+            discontinuity_state = discontinuity_state.saturating_add(1);
         } else if *line == "#EXT-X-ENDLIST" {
             singleton_tag(&mut singleton, "EXT-X-ENDLIST", findings);
             playlist.has_endlist = true;
@@ -498,8 +827,201 @@ fn parse_playlist(
                 None,
             ));
         }
+        audit_low_latency_tags(&playlist, profile, findings);
     }
     Ok(playlist)
+}
+
+fn audit_low_latency_tags(
+    playlist: &Playlist,
+    profile: HlsProfile,
+    findings: &mut Vec<HlsFinding>,
+) {
+    let uses_low_latency = !playlist.parts.is_empty()
+        || playlist.part_target.is_some()
+        || playlist.server_control.is_some()
+        || playlist.skipped_segments.is_some()
+        || !playlist.preload_hints.is_empty()
+        || !playlist.rendition_reports.is_empty();
+    if !uses_low_latency && profile != HlsProfile::LlHls {
+        return;
+    }
+
+    findings.push(finding(
+        "FORGE-HLS-PART-INF",
+        Severity::Error,
+        playlist.parts.is_empty() || playlist.part_target.is_some(),
+        "a Playlist containing EXT-X-PART declares EXT-X-PART-INF",
+        Some(json!({
+            "parts": playlist.parts.len(),
+            "part_target": playlist.part_target
+        })),
+    ));
+
+    let durations_valid = playlist.part_target.is_some_and(|target| {
+        playlist.parts.iter().enumerate().all(|(index, part)| {
+            if part.duration > target {
+                return false;
+            }
+            let next = playlist.parts.get(index + 1);
+            let final_for_parent = part.parent < playlist.segment_uris.len()
+                && next.is_none_or(|next| next.parent != part.parent);
+            let before_gap = next.is_some_and(|next| next.parent == part.parent && next.gap);
+            part.duration >= target * 0.85
+                || part.independent
+                || part.gap
+                || before_gap
+                || final_for_parent
+        })
+    });
+    findings.push(finding(
+        "FORGE-HLS-PART-DURATION",
+        Severity::Error,
+        playlist.parts.is_empty() || durations_valid,
+        "Partial Segment durations satisfy the Part Target bounds and exceptions",
+        Some(json!({
+            "part_target": playlist.part_target,
+            "durations": playlist.parts.iter().map(|part| part.duration).collect::<Vec<_>>()
+        })),
+    ));
+
+    let control = playlist.server_control.as_ref();
+    let target = playlist.target_duration.map(|value| value as f64);
+    let skip_valid = control
+        .and_then(|value| value.can_skip_until)
+        .zip(target)
+        .is_none_or(|(skip, target)| skip >= target * 6.0);
+    let dateranges_valid =
+        control.is_none_or(|value| !value.can_skip_dateranges || value.can_skip_until.is_some());
+    let hold_back_valid = control
+        .and_then(|value| value.hold_back)
+        .zip(target)
+        .is_none_or(|(hold_back, target)| hold_back >= target * 3.0);
+    let part_hold_back_valid = playlist.part_target.is_none_or(|part_target| {
+        control
+            .and_then(|value| value.part_hold_back)
+            .is_some_and(|hold_back| hold_back >= part_target * 2.0)
+    });
+    findings.push(finding(
+        "FORGE-HLS-SERVER-CONTROL-RELATIONSHIPS",
+        Severity::Error,
+        skip_valid && dateranges_valid && hold_back_valid && part_hold_back_valid,
+        "server-control skip and hold-back values satisfy HLS duration relationships",
+        Some(json!({
+            "target_duration": playlist.target_duration,
+            "part_target": playlist.part_target,
+            "can_skip_until": control.and_then(|value| value.can_skip_until),
+            "hold_back": control.and_then(|value| value.hold_back),
+            "part_hold_back": control.and_then(|value| value.part_hold_back)
+        })),
+    ));
+
+    let unique_hint_types = playlist
+        .preload_hints
+        .iter()
+        .map(|hint| hint.kind.as_str())
+        .collect::<HashSet<_>>()
+        .len()
+        == playlist.preload_hints.len();
+    findings.push(finding(
+        "FORGE-HLS-PRELOAD-HINT-SET",
+        Severity::Warning,
+        unique_hint_types,
+        "at most one preload hint of each TYPE is present",
+        Some(json!(playlist
+            .preload_hints
+            .iter()
+            .map(|hint| { json!({"type": hint.kind, "uri": hint.uri}) })
+            .collect::<Vec<_>>())),
+    ));
+    findings.push(finding(
+        "FORGE-HLS-PRELOAD-ENDLIST",
+        Severity::Error,
+        !playlist.has_endlist || playlist.preload_hints.is_empty(),
+        "an ended Playlist does not contain EXT-X-PRELOAD-HINT",
+        None,
+    ));
+
+    if playlist.skipped_segments.is_some() {
+        let minimum_version = if playlist.has_recently_removed_dateranges {
+            10
+        } else {
+            9
+        };
+        findings.push(finding(
+            "FORGE-HLS-DELTA-VERSION",
+            Severity::Error,
+            playlist
+                .version
+                .is_some_and(|version| version >= minimum_version),
+            "Playlist Delta Updates declare a compatible protocol version",
+            Some(json!({
+                "version": playlist.version,
+                "minimum": minimum_version
+            })),
+        ));
+    }
+
+    if profile == HlsProfile::LlHls {
+        findings.push(finding(
+            "FORGE-LL-HLS-PARTS",
+            Severity::Error,
+            !playlist.parts.is_empty() && playlist.part_target.is_some(),
+            "the Low-Latency profile contains Partial Segments and a Part Target",
+            Some(json!(playlist.parts.len())),
+        ));
+        let live_with_parts = !playlist.parts.is_empty() && !playlist.has_endlist;
+        let has_part_hint = playlist
+            .preload_hints
+            .iter()
+            .any(|hint| hint.kind == "PART");
+        findings.push(finding(
+            "FORGE-LL-HLS-PRELOAD",
+            Severity::Error,
+            !live_with_parts || has_part_hint,
+            "an active Partial-Segment Playlist hints the next Partial Segment",
+            None,
+        ));
+        findings.push(finding(
+            "FORGE-LL-HLS-PROGRAM-DATE-TIME",
+            Severity::Error,
+            playlist.program_date_time_count > 0,
+            "the Low-Latency profile includes EXT-X-PROGRAM-DATE-TIME",
+            Some(json!(playlist.program_date_time_count)),
+        ));
+        findings.push(finding(
+            "FORGE-LL-HLS-BLOCKING-RELOAD",
+            Severity::Error,
+            control.is_some_and(|value| value.can_block_reload),
+            "the Low-Latency profile advertises blocking playlist reload",
+            None,
+        ));
+        findings.push(finding(
+            "FORGE-LL-HLS-PART-HOLD-BACK",
+            Severity::Warning,
+            playlist.part_target.is_some_and(|part_target| {
+                control
+                    .and_then(|value| value.part_hold_back)
+                    .is_some_and(|hold_back| hold_back >= part_target * 3.0)
+            }),
+            "PART-HOLD-BACK is at least three Part Target Durations",
+            None,
+        ));
+        findings.push(finding(
+            "FORGE-LL-HLS-I-FRAMES",
+            Severity::Warning,
+            !playlist.has_i_frames_only || playlist.parts.is_empty(),
+            "I-frame-only Playlists do not use Partial Segments",
+            None,
+        ));
+    }
+}
+
+fn current_parent_has_parts(playlist: &Playlist) -> bool {
+    playlist
+        .parts
+        .last()
+        .is_some_and(|part| part.parent == playlist.segment_uris.len())
 }
 
 fn audit_media_files(playlist: &Playlist, profile: HlsProfile, findings: &mut Vec<HlsFinding>) {
@@ -876,6 +1398,171 @@ fn cross_check_renditions(media: &[Playlist], profile: HlsProfile, findings: &mu
         "Apple recommends aligned segment boundaries across renditions",
         None,
     ));
+    if profile == HlsProfile::LlHls {
+        let maximum_part_target = media
+            .iter()
+            .filter_map(|playlist| playlist.part_target)
+            .fold(0.0_f64, f64::max);
+        findings.push(finding(
+            "FORGE-LL-HLS-COMMON-PART-HOLD-BACK",
+            Severity::Warning,
+            maximum_part_target > 0.0
+                && media.iter().all(|playlist| {
+                    playlist
+                        .server_control
+                        .as_ref()
+                        .and_then(|control| control.part_hold_back)
+                        .is_some_and(|hold_back| hold_back >= maximum_part_target * 3.0)
+                }),
+            "every Rendition PART-HOLD-BACK covers three times the maximum Part Target",
+            Some(json!({"maximum_part_target": maximum_part_target})),
+        ));
+        cross_check_low_latency_renditions(media, findings);
+    }
+}
+
+fn cross_check_low_latency_renditions(media: &[Playlist], findings: &mut Vec<HlsFinding>) {
+    for source in media {
+        let source_edge = playlist_edge(source);
+        let mut reported = HashSet::new();
+        let mut values_match = true;
+        for report in &source.rendition_reports {
+            let Some(path) = local_reference(&source.path, &report.uri) else {
+                values_match = false;
+                continue;
+            };
+            let Some(target) = media
+                .iter()
+                .find(|playlist| paths_equal(&playlist.path, &path))
+            else {
+                values_match = false;
+                continue;
+            };
+            if target.path == source.path {
+                values_match = false;
+                continue;
+            }
+            reported.insert(target.path.clone());
+            let target_edge = playlist_edge(target);
+            let effective_msn = report.last_msn.or(source_edge.map(|edge| edge.0));
+            let effective_part = report.last_part.or(source_edge.and_then(|edge| edge.1));
+            values_match &= effective_msn == target_edge.map(|edge| edge.0)
+                && effective_part == target_edge.and_then(|edge| edge.1);
+        }
+        let expected = media
+            .iter()
+            .filter(|target| target.path != source.path && !target.has_i_frames_only)
+            .map(|target| target.path.clone())
+            .collect::<HashSet<_>>();
+        findings.push(finding(
+            "FORGE-LL-HLS-RENDITION-REPORT-SET",
+            Severity::Error,
+            reported == expected,
+            "each Low-Latency Media Playlist reports every other non-I-frame Rendition",
+            Some(json!({
+                "playlist": source.path,
+                "expected": expected,
+                "reported": reported
+            })),
+        ));
+        findings.push(finding(
+            "FORGE-LL-HLS-RENDITION-REPORT-EDGE",
+            Severity::Error,
+            values_match,
+            "Rendition Reports identify each referenced Playlist live edge",
+            Some(json!({"playlist": source.path})),
+        ));
+    }
+
+    let discontinuities_match = media.windows(2).all(|pair| {
+        let left = discontinuity_timeline(&pair[0]);
+        let right = discontinuity_timeline(&pair[1])
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let common = left
+            .iter()
+            .filter(|(msn, _)| right.contains_key(msn))
+            .count();
+        common > 0
+            && left
+                .iter()
+                .all(|(msn, state)| right.get(msn).is_none_or(|other| other == state))
+    });
+    findings.push(finding(
+        "FORGE-LL-HLS-DISCONTINUITY-STATE",
+        Severity::Error,
+        discontinuities_match,
+        "Discontinuity Sequence state is aligned across Low-Latency Renditions",
+        Some(json!(media
+            .iter()
+            .map(|playlist| json!({
+                "path": playlist.path,
+                "states": discontinuity_timeline(playlist)
+            }))
+            .collect::<Vec<_>>())),
+    ));
+}
+
+fn playlist_edge(playlist: &Playlist) -> Option<(u64, Option<u64>)> {
+    let first = playlist
+        .media_sequence
+        .unwrap_or(0)
+        .saturating_add(playlist.skipped_segments.unwrap_or(0));
+    if let Some(last_part) = playlist.parts.last() {
+        let part_msn = first.saturating_add(last_part.parent as u64);
+        let segment_msn = (!playlist.segment_uris.is_empty())
+            .then(|| first.saturating_add(playlist.segment_uris.len() as u64 - 1));
+        if segment_msn.is_none_or(|segment_msn| part_msn >= segment_msn) {
+            let part_index = playlist
+                .parts
+                .iter()
+                .rev()
+                .take_while(|part| part.parent == last_part.parent)
+                .count() as u64
+                - 1;
+            return Some((part_msn, Some(part_index)));
+        }
+    }
+    (!playlist.segment_uris.is_empty()).then(|| {
+        (
+            first.saturating_add(playlist.segment_uris.len() as u64 - 1),
+            None,
+        )
+    })
+}
+
+fn discontinuity_timeline(playlist: &Playlist) -> Vec<(u64, u64)> {
+    let mut state = playlist.discontinuity_sequence.unwrap_or(0);
+    let first = playlist
+        .media_sequence
+        .unwrap_or(0)
+        .saturating_add(playlist.skipped_segments.unwrap_or(0));
+    let mut timeline = playlist
+        .segment_discontinuities
+        .iter()
+        .enumerate()
+        .map(|(index, discontinuity)| {
+            if *discontinuity {
+                state = state.saturating_add(1);
+            }
+            (first.saturating_add(index as u64), state)
+        })
+        .collect::<Vec<_>>();
+    for part in &playlist.parts {
+        let msn = first.saturating_add(part.parent as u64);
+        if !timeline.iter().any(|(existing, _)| *existing == msn) {
+            timeline.push((msn, part.discontinuity_sequence));
+        }
+    }
+    timeline
+}
+
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    left == right
+        || fs::canonicalize(left)
+            .ok()
+            .zip(fs::canonicalize(right).ok())
+            .is_some_and(|(left, right)| left == right)
 }
 
 fn cumulative(values: &[f64]) -> Vec<f64> {
@@ -918,6 +1605,162 @@ fn parse_sequence_tag(
         Some(json!({"line": line_index + 1, "value": value})),
     ));
     parsed
+}
+
+fn attribute_error(line_index: usize, error: String, findings: &mut Vec<HlsFinding>) {
+    findings.push(finding(
+        "FORGE-HLS-ATTRIBUTES",
+        Severity::Error,
+        false,
+        format!("line {}: {error}", line_index + 1),
+        None,
+    ));
+}
+
+fn positive_float(value: &str) -> Option<f64> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn parse_byterange(value: &str) -> Option<(u64, Option<u64>)> {
+    let (length, offset) = value
+        .split_once('@')
+        .map_or((value, None), |(length, offset)| (length, Some(offset)));
+    let length = length.parse::<u64>().ok().filter(|length| *length > 0)?;
+    let offset = offset.map(str::parse).transpose().ok()?;
+    Some((length, offset))
+}
+
+fn valid_iso8601_datetime(value: &str) -> bool {
+    if !value.is_ascii() {
+        return false;
+    }
+    let Some(separator) = value.find(['T', 't']) else {
+        return false;
+    };
+    let (date, time_with_separator) = value.split_at(separator);
+    let time = &time_with_separator[1..];
+    let mut date_fields = date.split('-');
+    let (Some(year), Some(month), Some(day), None) = (
+        date_fields.next(),
+        date_fields.next(),
+        date_fields.next(),
+        date_fields.next(),
+    ) else {
+        return false;
+    };
+    if year.len() != 4 || month.len() != 2 || day.len() != 2 {
+        return false;
+    }
+    let (Ok(year), Ok(month), Ok(day)) = (
+        year.parse::<u32>(),
+        month.parse::<u32>(),
+        day.parse::<u32>(),
+    ) else {
+        return false;
+    };
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let maximum_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    if day == 0 || day > maximum_day {
+        return false;
+    }
+
+    let (clock, zone_valid) = if let Some(clock) = time.strip_suffix('Z') {
+        (clock, true)
+    } else if time.len() >= 6 && matches!(time.as_bytes().get(time.len() - 6), Some(b'+' | b'-')) {
+        let zone_start = time.len() - 6;
+        let (clock, zone) = time.split_at(zone_start);
+        let bytes = zone.as_bytes();
+        let valid = matches!(bytes.first(), Some(b'+' | b'-'))
+            && bytes.get(3) == Some(&b':')
+            && zone[1..3].parse::<u32>().is_ok_and(|hours| hours <= 23)
+            && zone[4..6].parse::<u32>().is_ok_and(|minutes| minutes <= 59);
+        (clock, valid)
+    } else {
+        (time, true)
+    };
+    if !zone_valid {
+        return false;
+    }
+    let mut clock_fields = clock.split(':');
+    let (Some(hour), Some(minute), Some(second), None) = (
+        clock_fields.next(),
+        clock_fields.next(),
+        clock_fields.next(),
+        clock_fields.next(),
+    ) else {
+        return false;
+    };
+    if hour.len() != 2 || minute.len() != 2 {
+        return false;
+    }
+    let (seconds, fraction) = second.find(['.', ',']).map_or((second, None), |separator| {
+        (&second[..separator], Some(&second[separator + 1..]))
+    });
+    seconds.len() == 2
+        && hour.parse::<u32>().is_ok_and(|hour| hour <= 23)
+        && minute.parse::<u32>().is_ok_and(|minute| minute <= 59)
+        && seconds.parse::<u32>().is_ok_and(|seconds| seconds <= 60)
+        && fraction.is_none_or(|fraction| {
+            !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn has_datetime_precision(value: &str) -> bool {
+    if !value.is_ascii() {
+        return false;
+    }
+    let Some(separator) = value.find(['T', 't']) else {
+        return false;
+    };
+    let time = &value[separator + 1..];
+    let clock = if let Some(clock) = time.strip_suffix('Z') {
+        clock
+    } else if time.len() >= 6 && matches!(time.as_bytes().get(time.len() - 6), Some(b'+' | b'-')) {
+        &time[..time.len() - 6]
+    } else {
+        return false;
+    };
+    clock.find(['.', ',']).is_some_and(|separator| {
+        let fraction = &clock[separator + 1..];
+        fraction.len() >= 3 && fraction.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn relative_uri(uri: &str) -> bool {
+    !uri.is_empty()
+        && !uri.starts_with("//")
+        && !uri.contains("://")
+        && !uri.to_ascii_lowercase().starts_with("data:")
+}
+
+fn attribute_is_quoted(list: &str, expected_name: &str) -> bool {
+    let bytes = list.as_bytes();
+    let mut start = 0_usize;
+    let mut quoted = false;
+    for index in 0..=bytes.len() {
+        if index < bytes.len() && bytes[index] == b'"' {
+            quoted = !quoted;
+        }
+        if index == bytes.len() || (bytes[index] == b',' && !quoted) {
+            let item = &list[start..index];
+            if let Some((name, raw)) = item.split_once('=') {
+                if name == expected_name {
+                    return raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"');
+                }
+            }
+            start = index + 1;
+        }
+    }
+    false
 }
 
 fn attributes(value: &str) -> Result<HashMap<String, String>, String> {
@@ -1108,6 +1951,80 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unquoted_low_latency_uri_attributes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("broken-parts.m3u8");
+        fs::write(
+            &path,
+            "#EXTM3U\n\
+             #EXT-X-TARGETDURATION:2\n\
+             #EXT-X-PART-INF:PART-TARGET=0.5\n\
+             #EXT-X-PART:DURATION=0.5,URI=part.m4s\n\
+             #EXTINF:0.5,\n\
+             https://example.invalid/segment.ts\n",
+        )
+        .unwrap();
+        let result = audit(&path, HlsProfile::Rfc8216).unwrap();
+        assert!(!result.passed);
+        assert!(result
+            .findings
+            .iter()
+            .any(|item| item.rule_id == "FORGE-HLS-PART" && !item.passed));
+    }
+
+    #[test]
+    fn validates_low_latency_byte_ranges_dates_and_completed_part_edges() {
+        assert!(valid_iso8601_datetime("2024-02-29T23:59:60.123Z"));
+        assert!(valid_iso8601_datetime("2026-07-29T12:34:56"));
+        assert!(valid_iso8601_datetime("2026-07-29T12:34:56,123+09:00"));
+        assert!(!valid_iso8601_datetime("2025-02-29T12:34:56Z"));
+        assert!(!valid_iso8601_datetime("2026-07-29T25:00:00Z"));
+        assert!(has_datetime_precision("2026-07-29T12:34:56.123Z"));
+        assert!(!has_datetime_precision("2026-07-29T12:34:56Z"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ranges.m3u8");
+        let playlist = |first_range: &str| {
+            format!(
+                "#EXTM3U\n\
+                 #EXT-X-TARGETDURATION:2\n\
+                 #EXT-X-PART-INF:PART-TARGET=0.5\n\
+                 #EXT-X-SERVER-CONTROL:PART-HOLD-BACK=1\n\
+                 #EXT-X-PART:DURATION=0.5,URI=\"packed.m4s\",BYTERANGE=\"{first_range}\"\n\
+                 #EXT-X-PART:DURATION=0.5,URI=\"packed.m4s\",BYTERANGE=\"10\"\n\
+                 #EXTINF:1,\n\
+                 https://example.invalid/segment.ts\n"
+            )
+        };
+        fs::write(&path, playlist("10@0")).unwrap();
+        let valid = audit(&path, HlsProfile::Rfc8216).unwrap();
+        assert!(valid.passed, "{valid:#?}");
+        fs::write(&path, playlist("10")).unwrap();
+        let invalid = audit(&path, HlsProfile::Rfc8216).unwrap();
+        assert!(!invalid.passed);
+        assert!(invalid
+            .findings
+            .iter()
+            .any(|item| item.rule_id == "FORGE-HLS-PART" && !item.passed));
+
+        let completed = Playlist {
+            media_sequence: Some(40),
+            segment_uris: vec!["segment.ts".into()],
+            parts: vec![PartialSegment {
+                uri: "part.m4s".into(),
+                duration: 0.5,
+                independent: true,
+                gap: false,
+                parent: 0,
+                discontinuity_sequence: 0,
+                byterange: None,
+            }],
+            ..Playlist::default()
+        };
+        assert_eq!(playlist_edge(&completed), Some((40, Some(0))));
+    }
+
+    #[test]
     fn cross_checks_fragment_sequences_and_decode_times_between_local_segments() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("one.m4s"), media_segment(7, 0)).unwrap();
@@ -1134,5 +2051,128 @@ mod tests {
         assert!(findings
             .iter()
             .any(|item| item.rule_id == "FORGE-HLS-FRAGMENT-SEQUENCE" && !item.passed));
+    }
+
+    #[test]
+    fn accepts_complete_low_latency_manifest_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("live.m3u8");
+        fs::write(
+            &path,
+            "#EXTM3U\n\
+             #EXT-X-VERSION:9\n\
+             #EXT-X-TARGETDURATION:2\n\
+             #EXT-X-MEDIA-SEQUENCE:10\n\
+             #EXT-X-PART-INF:PART-TARGET=0.5\n\
+             #EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,CAN-SKIP-UNTIL=12,HOLD-BACK=6,PART-HOLD-BACK=1.5\n\
+             #EXT-X-PROGRAM-DATE-TIME:2026-07-29T00:00:00Z\n\
+             #EXT-X-PART:DURATION=0.5,INDEPENDENT=YES,URI=\"https://example.invalid/10.0.m4s\"\n\
+             #EXT-X-PART:DURATION=0.5,URI=\"https://example.invalid/10.1.m4s\"\n\
+             #EXTINF:1.0,\n\
+             https://example.invalid/10.ts\n\
+             #EXT-X-PART:DURATION=0.5,INDEPENDENT=YES,URI=\"https://example.invalid/11.0.m4s\"\n\
+             #EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"https://example.invalid/11.1.m4s\"\n",
+        )
+        .unwrap();
+
+        let result = audit(&path, HlsProfile::LlHls).unwrap();
+        assert!(result.passed, "{result:#?}");
+        assert!(result
+            .findings
+            .iter()
+            .any(|item| { item.rule_id == "FORGE-LL-HLS-BLOCKING-RELOAD" && item.passed }));
+        assert_eq!(result.properties["media_playlists"][0]["parts"], 3);
+    }
+
+    #[test]
+    fn rejects_invalid_part_server_control_and_delta_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("broken-live.m3u8");
+        fs::write(
+            &path,
+            "#EXTM3U\n\
+             #EXT-X-VERSION:8\n\
+             #EXT-X-TARGETDURATION:2\n\
+             #EXT-X-PART-INF:PART-TARGET=0.5\n\
+             #EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=2,CAN-SKIP-DATERANGES=YES,HOLD-BACK=2,PART-HOLD-BACK=0.5\n\
+             #EXT-X-PROGRAM-DATE-TIME:2026-07-29T00:00:00Z\n\
+             #EXT-X-SKIP:SKIPPED-SEGMENTS=3\n\
+             #EXT-X-PART:DURATION=0.6,URI=\"part.m4s\"\n\
+             #EXTINF:1.0,\n\
+             https://example.invalid/segment.m4s\n",
+        )
+        .unwrap();
+
+        let result = audit(&path, HlsProfile::LlHls).unwrap();
+        assert!(!result.passed);
+        for rule in [
+            "FORGE-HLS-PART-DURATION",
+            "FORGE-HLS-SERVER-CONTROL-RELATIONSHIPS",
+            "FORGE-HLS-DELTA-VERSION",
+            "FORGE-LL-HLS-PRELOAD",
+            "FORGE-LL-HLS-BLOCKING-RELOAD",
+        ] {
+            assert!(
+                result
+                    .findings
+                    .iter()
+                    .any(|item| item.rule_id == rule && !item.passed),
+                "missing failure for {rule}: {result:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_checks_low_latency_rendition_reports_and_discontinuity_state() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("master.m3u8"),
+            "#EXTM3U\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=64000\n\
+             a.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=128000\n\
+             b.m3u8\n",
+        )
+        .unwrap();
+        let playlist = |other: &str, discontinuity: &str| {
+            format!(
+                "#EXTM3U\n\
+                 #EXT-X-VERSION:9\n\
+                 #EXT-X-TARGETDURATION:2\n\
+                 #EXT-X-MEDIA-SEQUENCE:10\n\
+                 #EXT-X-DISCONTINUITY-SEQUENCE:4\n\
+                 #EXT-X-PART-INF:PART-TARGET=0.5\n\
+                 #EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=1.5\n\
+                 #EXT-X-PROGRAM-DATE-TIME:2026-07-29T00:00:00Z\n\
+                 {discontinuity}\
+                 #EXTINF:1,\n\
+                 https://example.invalid/10.ts\n\
+                 #EXT-X-PART:DURATION=0.5,INDEPENDENT=YES,URI=\"https://example.invalid/11.0.m4s\"\n\
+                 #EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"https://example.invalid/11.1.m4s\"\n\
+                 #EXT-X-RENDITION-REPORT:URI=\"{other}\",LAST-MSN=11,LAST-PART=0\n"
+            )
+        };
+        fs::write(directory.path().join("a.m3u8"), playlist("b.m3u8", "")).unwrap();
+        fs::write(directory.path().join("b.m3u8"), playlist("a.m3u8", "")).unwrap();
+
+        let path = directory.path().join("master.m3u8");
+        let valid = audit(&path, HlsProfile::LlHls).unwrap();
+        assert!(valid.passed, "{valid:#?}");
+        assert!(valid
+            .findings
+            .iter()
+            .any(|item| { item.rule_id == "FORGE-LL-HLS-RENDITION-REPORT-SET" && item.passed }));
+
+        fs::write(
+            directory.path().join("b.m3u8"),
+            playlist("a.m3u8", "#EXT-X-DISCONTINUITY\n"),
+        )
+        .unwrap();
+        let invalid = audit(&path, HlsProfile::LlHls).unwrap();
+        assert!(!invalid.passed);
+        assert!(invalid
+            .findings
+            .iter()
+            .any(|item| { item.rule_id == "FORGE-LL-HLS-DISCONTINUITY-STATE" && !item.passed }));
     }
 }

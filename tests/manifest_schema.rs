@@ -655,6 +655,39 @@ fn emitted_hls_qc_conforms_to_published_schema() {
 }
 
 #[test]
+fn emitted_low_latency_hls_qc_conforms_to_published_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("live.m3u8");
+    std::fs::write(
+        &path,
+        "#EXTM3U\n\
+         #EXT-X-VERSION:9\n\
+         #EXT-X-TARGETDURATION:2\n\
+         #EXT-X-PART-INF:PART-TARGET=0.5\n\
+         #EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=1.5\n\
+         #EXT-X-PROGRAM-DATE-TIME:2026-07-29T00:00:00.000Z\n\
+         #EXT-X-PART:DURATION=0.5,INDEPENDENT=YES,URI=\"https://example.invalid/0.0.m4s\"\n\
+         #EXTINF:0.5,\n\
+         https://example.invalid/0.ts\n\
+         #EXT-X-PART:DURATION=0.5,INDEPENDENT=YES,URI=\"https://example.invalid/1.0.m4s\"\n\
+         #EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"https://example.invalid/1.1.m4s\"\n",
+    )
+    .unwrap();
+
+    let audit = forge_normalizer::hls_qc::audit(&path, forge_normalizer::hls_qc::HlsProfile::LlHls)
+        .unwrap();
+    let instance = serde_json::to_value(audit).unwrap();
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/hls-qc-v1.schema.json")).expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
+
+#[test]
 fn emitted_dash_qc_conforms_to_published_schema() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("audio.mpd");

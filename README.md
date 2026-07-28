@@ -480,9 +480,20 @@ recommendations remain explicit warnings and do not change exit status. Remote
 resources are never fetched implicitly. Results conform to the published
 `schema/hls-qc-v1.schema.json` contract.
 
+Use `--profile ll-hls` for the Low-Latency Server Configuration Profile.
+It validates `EXT-X-PART` geometry and exceptions, `PART-TARGET`, hold-back
+and skip-boundary relationships, delta-update versions, preload-hint types
+and byte ranges, `CAN-BLOCK-RELOAD`, `PROGRAM-DATE-TIME`, and Rendition
+Report live-edge values. For local Multivariant packages it also requires
+the complete Rendition Report set and aligned Discontinuity Sequence state.
+This is a static package audit: it does not claim to test the origin/CDN's
+blocking response, HTTP/2 or HTTP/3 behavior, cache policy, or range support.
+
 The profiles track [RFC 8216](https://www.rfc-editor.org/rfc/rfc8216),
 Apple's current [HLS authoring specification](https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices),
-and the segmented-media model in ISO/IEC 23000-19:2024 CMAF.
+the [HLS 2nd Edition draft-22 dated 2026-05-01](https://datatracker.ietf.org/doc/draft-pantos-hls-rfc8216bis/22/)
+(work in progress, not an RFC), and the segmented-media model in
+ISO/IEC 23000-19:2024 CMAF.
 
 ### DASH and CMAF package QC
 

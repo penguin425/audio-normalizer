@@ -35,6 +35,39 @@ fn streaming_qc_cli_separates_errors_from_apple_warnings() {
 }
 
 #[test]
+fn streaming_qc_cli_selects_low_latency_profile() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("live.m3u8");
+    fs::write(
+        &path,
+        "#EXTM3U\n\
+         #EXT-X-VERSION:9\n\
+         #EXT-X-TARGETDURATION:2\n\
+         #EXT-X-PART-INF:PART-TARGET=0.5\n\
+         #EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=1.5\n\
+         #EXT-X-PROGRAM-DATE-TIME:2026-07-29T00:00:00Z\n\
+         #EXT-X-PART:DURATION=0.5,INDEPENDENT=YES,URI=\"https://example.invalid/0.0.m4s\"\n\
+         #EXTINF:0.5,\n\
+         https://example.invalid/0.ts\n\
+         #EXT-X-PART:DURATION=0.5,INDEPENDENT=YES,URI=\"https://example.invalid/1.0.m4s\"\n\
+         #EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"https://example.invalid/1.1.m4s\"\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-streaming-qc"))
+        .arg(&path)
+        .args(["--profile", "ll-hls"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(audit["profile"], "ll-hls");
+    assert!(audit["findings"].as_array().unwrap().iter().any(|finding| {
+        finding["rule_id"] == "FORGE-LL-HLS-BLOCKING-RELOAD" && finding["passed"] == true
+    }));
+}
+
+#[test]
 fn streaming_qc_cli_audits_dash_and_selects_profile() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("audio.mpd");
