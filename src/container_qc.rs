@@ -110,7 +110,7 @@ struct WaveState {
     ds64_sample_count: Option<u64>,
     bext_count: usize,
     bext: Option<BextInfo>,
-    axml: bool,
+    xml: crate::bwf_xml_qc::BwfXmlState,
     chna_count: usize,
     chna: Option<ChnaInfo>,
     ixml_count: usize,
@@ -347,7 +347,36 @@ fn audit_wave(
                     }
                 }
             }
-            b"axml" => state.axml = true,
+            b"axml" => {
+                state.xml.axml_count += 1;
+                if state.xml.axml.is_none() {
+                    if let Some(body) =
+                        read_control_chunk(path, file, offset, size, &mut wrapper, "axml")?
+                    {
+                        state.xml.axml = crate::bwf_xml_qc::parse_axml(&body, &mut xcheck);
+                    }
+                }
+            }
+            b"bxml" => {
+                state.xml.bxml_count += 1;
+                if state.xml.bxml.is_none() {
+                    if let Some(body) =
+                        read_control_chunk(path, file, offset, size, &mut wrapper, "bxml")?
+                    {
+                        state.xml.bxml = crate::bwf_xml_qc::parse_bxml(&body, &mut xcheck);
+                    }
+                }
+            }
+            b"sxml" => {
+                state.xml.sxml_count += 1;
+                if state.xml.sxml.is_none() {
+                    if let Some(body) =
+                        read_control_chunk(path, file, offset, size, &mut wrapper, "sxml")?
+                    {
+                        state.xml.sxml = crate::bwf_xml_qc::parse_sxml(&body, &mut xcheck);
+                    }
+                }
+            }
             b"chna" => {
                 state.chna_count += 1;
                 if state.chna.is_none() {
@@ -534,18 +563,8 @@ fn audit_wave(
             })),
         ));
     }
-    if state.axml || state.chna_count > 0 {
-        let chna_present = state.chna_count > 0;
-        xcheck.push(check(
-            "FORGE-ADM-CHUNK-PAIR",
-            state.axml && chna_present,
-            if state.axml && chna_present {
-                "axml and chna ADM chunks are both present"
-            } else {
-                "ADM requires both axml and chna chunks"
-            },
-            Some(json!({"axml": state.axml, "chna": chna_present})),
-        ));
+    if state.xml.axml_count > 0 || state.xml.bxml_count > 0 || state.xml.sxml_count > 0 {
+        crate::bwf_xml_qc::validate(&state.xml, state.chna_count > 0, frames, &mut xcheck);
     }
     if state.ixml_count > 0 {
         xcheck.push(check(
@@ -589,7 +608,8 @@ fn audit_wave(
         "channels": state.fmt.map(|fmt| fmt.channels),
         "bits_per_sample": state.fmt.map(|fmt| fmt.bits_per_sample),
         "bext": bext_properties,
-        "ixml": state.ixml
+        "ixml": state.ixml,
+        "xml_metadata": state.xml
     });
     Ok(finish_audit(
         path, "wave", wrapper, bitstream, xcheck, properties,
@@ -1658,7 +1678,7 @@ mod tests {
         if let Some(chna_body) = chna_body {
             chunks.push(WaveChunk {
                 id: *b"axml",
-                body: b"<ebuCoreMain/>".to_vec(),
+                body: b"<metadata/>".to_vec(),
             });
             chunks.push(WaveChunk {
                 id: *b"chna",
@@ -1674,6 +1694,124 @@ mod tests {
             &chunks,
         )
         .unwrap();
+    }
+
+    fn serial_xml_chunk(xml: &[u8], samples: u32) -> Vec<u8> {
+        let table_bytes = 4_u64 + 8 + xml.len() as u64;
+        let mut body = Vec::new();
+        body.extend_from_slice(&0_u16.to_le_bytes());
+        body.extend_from_slice(&(table_bytes as u32).to_le_bytes());
+        body.extend_from_slice(&0_u32.to_le_bytes());
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        body.extend_from_slice(&(xml.len() as u32).to_le_bytes());
+        body.extend_from_slice(&samples.to_le_bytes());
+        body.extend_from_slice(xml);
+        body.extend_from_slice(&0_u32.to_le_bytes());
+        body
+    }
+
+    #[test]
+    fn bs2088_xml_chunks_are_parsed_and_cross_checked() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bs2088-xml.wav");
+        let axml = br#"<eb:ebuCoreMain xmlns:eb="urn:ebu:metadata-schema:ebuCore_2015">
+<eb:coreMetadata><eb:format><audioFormatExtended>
+<audioTrackUID UID="ATU_00000001"/>
+</audioFormatExtended></eb:format></eb:coreMetadata>
+</eb:ebuCoreMain>"#;
+        let mut bxml = 0_u16.to_le_bytes().to_vec();
+        bxml.extend_from_slice(b"<metadata/>");
+        let sxml = serial_xml_chunk(
+            b"<frame><audioFormatExtended><audioTrackUID UID=\"ATU_00000002\"/></audioFormatExtended></frame>",
+            10,
+        );
+        write_bext_fixture(
+            &path,
+            vec![
+                WaveChunk {
+                    id: *b"axml",
+                    body: axml.to_vec(),
+                },
+                WaveChunk {
+                    id: *b"bxml",
+                    body: bxml,
+                },
+                WaveChunk {
+                    id: *b"sxml",
+                    body: sxml,
+                },
+                WaveChunk {
+                    id: *b"chna",
+                    body: chna(&[1], 1, 0),
+                },
+            ],
+        );
+
+        let result = audit(&path).unwrap();
+        assert!(result.passed, "{result:#?}");
+        assert_eq!(
+            result.properties["xml_metadata"]["axml"]["classification"],
+            "adm"
+        );
+        assert_eq!(
+            result.properties["xml_metadata"]["bxml"]["compression"],
+            "none"
+        );
+        assert_eq!(
+            result.properties["xml_metadata"]["sxml"]["subchunks"][0]["document"]["classification"],
+            "s-adm"
+        );
+        for rule in [
+            "FORGE-BS2088-2-AXML-XML",
+            "FORGE-BS2088-2-BXML-XML",
+            "FORGE-BS2088-2-SXML-STRUCTURE",
+            "FORGE-BS2088-2-ADM-PLACEMENT",
+            "FORGE-BS2088-2-ADM-CHNA",
+            "FORGE-BS2088-2-SADM-PLACEMENT",
+            "FORGE-BS2088-2-SXML-SAMPLE-COUNT",
+        ] {
+            assert!(
+                result.layers[2]
+                    .checks
+                    .iter()
+                    .any(|check| check.rule_id == rule && check.passed),
+                "missing {rule}: {result:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bs2088_rejects_duplicate_xml_chunks_and_bad_sxml_duration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bad-bs2088-xml.wav");
+        write_bext_fixture(
+            &path,
+            vec![
+                WaveChunk {
+                    id: *b"axml",
+                    body: b"<metadata/>".to_vec(),
+                },
+                WaveChunk {
+                    id: *b"axml",
+                    body: b"<metadata/>".to_vec(),
+                },
+                WaveChunk {
+                    id: *b"sxml",
+                    body: serial_xml_chunk(b"<frame/>", 11),
+                },
+            ],
+        );
+
+        let result = audit(&path).unwrap();
+        assert!(!result.passed);
+        assert!(result.layers[2]
+            .checks
+            .iter()
+            .any(|check| { check.rule_id == "FORGE-BS2088-2-XML-CHUNK-UNIQUE" && !check.passed }));
+        assert!(result.layers[2]
+            .checks
+            .iter()
+            .any(|check| { check.rule_id == "FORGE-BS2088-2-SXML-SAMPLE-COUNT" && !check.passed }));
     }
 
     #[test]

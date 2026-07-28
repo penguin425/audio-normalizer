@@ -45,11 +45,16 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
   engine consumes.
 * Common metadata fields and embedded artwork are preserved across
   normalization and remapped to the destination container's primary tag type.
-* Broadcast Wave output can preserve `bext`, ADM `axml`/`chna`, and iXML chunks.
-  BWF v2 measured loudness fields are updated from the normalized output.
+* Broadcast Wave output can preserve `bext`, `axml`, `bxml`, `sxml`, `chna`,
+  and iXML chunks. BWF v2 measured loudness fields are updated from the
+  normalized output.
 * Container QC validates bounded iXML documents, reconciles `TRACK_COUNT` and
   one-based `INTERLEAVE_INDEX` values with PCM channels, preserves non-contiguous
   recorder `CHANNEL_INDEX` source numbers, and cross-checks ADM `chna` mappings.
+* ITU-R BS.2088-2 XML QC validates unique `axml`/`bxml`/`sxml` chunks,
+  UTF-8 XML, bounded gzip expansion, serial-XML tables/alignment/sample spans,
+  EBUCore envelopes, ADM/S-ADM placement, required `chna`, and metadata
+  independence.
 
 By default the output container follows the input where Forge can encode it
 (FLAC → FLAC, MP3 → MP3, Ogg Vorbis → Ogg Vorbis, and M4A → AAC/M4A when
@@ -346,13 +351,27 @@ sizes/sample counts, byte rate, and block alignment. BWF `bext` audits follow
 fields and null termination, calendar/time ranges, sample-based `TimeReference`,
 versions 0–2, UMID/version consistency, zeroed reserved bytes, v2 loudness
 ranges and unavailable sentinels, and CR/LF-terminated ASCII
-`CodingHistory`. The parsed production fields are exposed in JSON, and paired
-ADM `axml`/`chna` metadata remains cross-checked. Dependency-free Ogg QC follows
-[RFC 3533](https://www.rfc-editor.org/rfc/rfc3533) for page bounds, CRCs,
-sequences, continuation state, and sequential chains. Ogg Opus adds RFC 7845
-headers/tags, mapping-family tables, packet durations, granules, pre-skip, and
-end-trim checks. Ogg Vorbis adds Vorbis I identification/comment/setup header
-validation, PCM granules, and strict streaming decode verification.
+`CodingHistory`. The parsed production fields are exposed in JSON.
+
+XML metadata follows
+[ITU-R BS.2088-2](https://www.itu.int/rec/R-REC-BS.2088) and
+[EBU Tech 3285 Supplement 5](https://tech.ebu.ch/docs/tech/tech3285s5.pdf).
+Forge validates bounded, well-formed UTF-8 `axml`; uncompressed or gzip `bxml`
+with bounded expansion; and the complete `sxml` subchunk/alignment layout,
+including each subdocument and its sample span. It rejects duplicate XML
+chunks, misplaced ADM/S-ADM, ADM without `chna`, and cross-references between
+co-located ADM and S-ADM. Recognized `ebuCoreMain` documents must declare an
+EBUCore namespace and exactly one direct `coreMetadata` element. The parsed
+classification, sizes, compression, roots, subchunks, alignment count, and
+sample totals are exposed under `properties.xml_metadata`. Normalization
+preserves `axml`, `bxml`, `sxml`, and `chna` byte-for-byte.
+
+Dependency-free Ogg QC follows [RFC 3533](https://www.rfc-editor.org/rfc/rfc3533)
+for page bounds, CRCs, sequences, continuation state, and sequential chains.
+Ogg Opus adds RFC 7845 headers/tags, mapping-family tables, packet durations,
+granules, pre-skip, and end-trim checks. Ogg Vorbis adds Vorbis I
+identification/comment/setup header validation, PCM granules, and strict
+streaming decode verification.
 
 For ISO-BMFF MP4, M4A, and fragmented MP4 it scans the complete nested box
 structure with bounded memory, validates 32/64-bit box sizes and file roles,

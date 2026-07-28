@@ -12,8 +12,40 @@ fn audit_bytes(bytes: &[u8]) {
     }
 }
 
+fn append_wave_chunk(wave: &mut Vec<u8>, id: &[u8; 4], body: &[u8]) {
+    wave.extend_from_slice(id);
+    wave.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    wave.extend_from_slice(body);
+    if body.len() % 2 != 0 {
+        wave.push(0);
+    }
+}
+
+fn wave_with_xml(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut wave = b"RIFF\0\0\0\0WAVE".to_vec();
+    append_wave_chunk(
+        &mut wave,
+        b"fmt ",
+        &[1, 0, 1, 0, 0x80, 0xbb, 0, 0, 0, 0x77, 1, 0, 2, 0, 16, 0],
+    );
+    append_wave_chunk(&mut wave, id, body);
+    append_wave_chunk(&mut wave, b"data", &[]);
+    let riff_size = (wave.len() as u32).saturating_sub(8);
+    wave[4..8].copy_from_slice(&riff_size.to_le_bytes());
+    wave
+}
+
 fuzz_target!(|data: &[u8]| {
     audit_bytes(data);
+    let xml_id = match data.first().copied().unwrap_or_default() % 3 {
+        0 => b"axml",
+        1 => b"bxml",
+        _ => b"sxml",
+    };
+    audit_bytes(&wave_with_xml(
+        xml_id,
+        data.get(1..).unwrap_or_default(),
+    ));
 
     let mut container = match data.first().copied().unwrap_or_default() % 15 {
         0 => b"RIFF\0\0\0\0WAVE".to_vec(),

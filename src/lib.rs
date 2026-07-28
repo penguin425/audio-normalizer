@@ -15,6 +15,7 @@ mod aac_qc;
 mod ac3_qc;
 pub mod adm;
 mod atomic;
+mod bwf_xml_qc;
 #[cfg(feature = "clap-plugin")]
 pub mod clap_plugin;
 pub mod cli;

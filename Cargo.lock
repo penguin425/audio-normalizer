@@ -610,6 +610,7 @@ dependencies = [
  "crc32fast",
  "csv",
  "flacenc",
+ "flate2",
  "jsonschema",
  "lofty",
  "ogg",
