@@ -305,7 +305,8 @@ MetaDictionary, and validate every bounded AAF stored-property stream. They
 also require Header ContentStorage, Dictionary, and Identification objects and
 MetaDictionary class/type definitions.
 
-The `forge-aaf-metadictionary-object-model-edit-protocol-v2` layer
+The `forge-aaf-effect-profiles-metadictionary-object-model-edit-protocol-v3`
+layer
 additionally decodes the stored-property table and strong-reference indexes
 into a bounded ownership graph. It interprets the file's self-describing
 MetaDictionary class inheritance, property definitions, and type-reference
@@ -330,6 +331,16 @@ PhysicalTrackNumber, primary-timecode, common-audio-rate, template/subclip,
 and file-source checks. Protocol-only rules are not imposed on an unlabelled
 general AAF file.
 
+The effect-profile layer covers all 20 operations in the AMWA AS-01 Effects
+Dictionary and the three AS-05 Video Color, Video Title, and Video Opacity
+operations. It checks standard operation metadata, declared and required
+parameters, ParameterDefinition types, ConstantValue and VaryingValue
+Indirect payload types, rational/boolean/integer/string/enumeration ranges,
+and the five permitted interpolation definitions. Reports also expose the
+normative fallback profiles for unsupported effects/parameters,
+interpolation, time variation, and unavailable title fonts; Forge records
+these actions as QC evidence and does not render or modify the AAF.
+
 Entry count, object-path depth, individual property/index streams, aggregate
 property/index bytes, MetaDictionary definitions/depth, fixed-array length,
 and reported failures are capped. Extension stream properties are checked for
@@ -337,12 +348,16 @@ existence without loading their content, indirect/opaque payloads are
 preserved, and locators are never fetched. CI downloads three SHA-256-pinned
 MIT-licensed pyaaf2 files. Its public Avid-origin extension fixture exercises
 79 class definitions, 146 type definitions, 71 extension property
-definitions, and 1,116 interpreted extension values. The scope remains
-bounded object-model and supported Edit Protocol QC rather than certification
-by an AAF SDK or semantic interpretation of every vendor-specific payload.
-The checks follow the
+definitions, 1,116 interpreted extension values, standard-AUID/vendor-
+parameter fallback evidence, and known protocol violations. A pinned,
+essence-free output from the official AAF SDK `ExportAS05Effects` reference
+example independently exercises all three AS-05 profiles and 25 constant
+parameters. This is reference-fixture interoperability evidence, not full AAF
+SDK certification or semantic interpretation of every vendor-specific
+payload. The checks follow the
 [AAF Object Specification](https://aafassociation.org/specs/object_spec.html),
 [AAF Edit Protocol](https://static.amwa.tv/as-01-aaf-edit-protocol-spec.pdf),
+[AAF Effects Protocol](https://static.amwa.tv/as-05-aaf-effects-protocol-spec.pdf),
 [AAF stored/low-level format specifications](https://aafassociation.org/html/techinfo/index.html),
 and [MS-CFB](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-cfb/53989ce4-7b05-4f8d-829b-d08d6148375b).
 

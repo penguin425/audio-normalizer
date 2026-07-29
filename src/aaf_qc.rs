@@ -511,8 +511,8 @@ pub(crate) fn audit(
         bitstream,
         xcheck,
         json!({
-            "method": "forge-aaf-metadictionary-object-model-edit-protocol-v2",
-            "scope": "bounded CFB, stored-property, dynamic MetaDictionary type/class/property interpretation, extension-value validation, core AAF object-model, ownership/reference graph, edit timeline, and supported AAF Edit Protocol QC; opaque payloads are preserved, external resources are never fetched, and this is not an AAF SDK certification",
+            "method": "forge-aaf-effect-profiles-metadictionary-object-model-edit-protocol-v3",
+            "scope": "bounded CFB, stored-property, dynamic MetaDictionary type/class/property interpretation, extension-value validation, core AAF object-model, ownership/reference graph, edit timeline, AMWA AS-01/AS-05 effect profiles, and supported AAF Edit Protocol QC; opaque payloads are preserved, external resources are never fetched, and reference-fixture interoperability is not full AAF SDK certification",
             "file_size_bytes": file_size,
             "cfb": {
                 "version": version.number(),
@@ -718,7 +718,7 @@ mod tests {
         assert_eq!(audit.format, "aaf");
         assert_eq!(
             audit.properties["method"],
-            "forge-aaf-metadictionary-object-model-edit-protocol-v2"
+            "forge-aaf-effect-profiles-metadictionary-object-model-edit-protocol-v3"
         );
         assert_eq!(audit.properties["stored_properties"]["streams"], 2);
         let failures: Vec<_> = audit
