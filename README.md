@@ -305,9 +305,19 @@ MetaDictionary, and validate every bounded AAF stored-property stream. They
 also require Header ContentStorage, Dictionary, and Identification objects and
 MetaDictionary class/type definitions.
 
-The `forge-aaf-object-model-edit-protocol-v1` layer additionally decodes the
-stored-property table and strong-reference indexes into a bounded ownership
-graph. It verifies one-owner object containment, required inherited
+The `forge-aaf-metadictionary-object-model-edit-protocol-v2` layer
+additionally decodes the stored-property table and strong-reference indexes
+into a bounded ownership graph. It interprets the file's self-describing
+MetaDictionary class inheritance, property definitions, and type-reference
+graph, then validates dynamically assigned extension property identifiers and
+values. Supported dynamic types include integers, strong and weak object
+references, enumerations, fixed and variable arrays, sets, strings, streams,
+records, renames, extendible enumerations, indirect and opaque values, and
+character types. Type/class cycles, unresolved references, incompatible
+stored forms, invalid reference targets, malformed values, duplicate IDs, and
+excessive definition counts or graph depths are reported.
+
+The same layer verifies one-owner object containment, required inherited
 properties for the supported standard classes, primitive/AUID/MobID/rational
 shapes, unique Mob and definition identifiers, Mob/Slot mappings, positive
 edit rates, component and Sequence length arithmetic, Transition placement
@@ -321,12 +331,15 @@ and file-source checks. Protocol-only rules are not imposed on an unlabelled
 general AAF file.
 
 Entry count, object-path depth, individual property/index streams, aggregate
-property/index bytes, and reported failures are capped. Unknown extension
-classes are retained as auditable warnings rather than treated as invalid,
-and locators are never fetched. The scope is core object-model and supported
-Edit Protocol QC, not certification by an AAF SDK or semantic interpretation
-of every vendor extension. CI downloads three SHA-256-pinned MIT-licensed
-pyaaf2 files to prove pass/fail interoperability against public AAF fixtures.
+property/index bytes, MetaDictionary definitions/depth, fixed-array length,
+and reported failures are capped. Extension stream properties are checked for
+existence without loading their content, indirect/opaque payloads are
+preserved, and locators are never fetched. CI downloads three SHA-256-pinned
+MIT-licensed pyaaf2 files. Its public Avid-origin extension fixture exercises
+79 class definitions, 146 type definitions, 71 extension property
+definitions, and 1,116 interpreted extension values. The scope remains
+bounded object-model and supported Edit Protocol QC rather than certification
+by an AAF SDK or semantic interpretation of every vendor-specific payload.
 The checks follow the
 [AAF Object Specification](https://aafassociation.org/specs/object_spec.html),
 [AAF Edit Protocol](https://static.amwa.tv/as-01-aaf-edit-protocol-spec.pdf),
@@ -1525,6 +1538,7 @@ src/
   decoder.rs        full-buffer and streaming universal decoders
   dsd.rs            bounded DSF/DSDIFF parser + read-only DSD FIR decimator
   aaf_qc.rs         bounded AAF CFB/stored-property reader and structural QC
+  aaf_meta_qc.rs    dynamic AAF MetaDictionary and extension-value validation
   aaf_object_qc.rs  AAF object graph, timeline, source, and Edit Protocol QC
   aes31_qc.rs       bounded AES31-3 EDML project/reference/timing QC
   flacenc.rs        bounded-memory pure-Rust FLAC encoder

@@ -105,12 +105,13 @@ Forge already provides:
   workflows, including the exact intended pre-codec measurement, bounded gain
   envelope, limiter amount, clipping/ceiling counts, decoded-output endpoints,
   SHA-256 provenance, and codec loudness/peak/duration drift.
-- Bounded AAF stored-format and core object-model/Edit Protocol QC with
-  CFB/file/root identity, property/reference-index decoding, exactly-one-owner
-  object graphs, inherited required properties, unique identifiers,
-  Mob/Slot/SourceClip derivation, Sequence/Transition timing, effects,
-  locators, protocol-labelled material/track constraints, fixed safety
-  limits, and SHA-256-pinned public pyaaf2 interoperability fixtures.
+- Bounded AAF stored-format, dynamic MetaDictionary, and core object-model/Edit
+  Protocol QC with CFB/file/root identity, property/reference-index decoding,
+  dynamically declared class/property/type graphs and extension values,
+  exactly-one-owner object graphs, inherited required properties, unique
+  identifiers, Mob/Slot/SourceClip derivation, Sequence/Transition timing,
+  effects, locators, protocol-labelled material/track constraints, fixed
+  safety limits, and SHA-256-pinned public pyaaf2 interoperability fixtures.
 - Bounded AES31-3 EDML ADL project QC with plain-ASCII and record limits,
   core section/header validation, source and event identity/reference checks,
   channel-map consistency, integer/fractional/drop-frame sample timing,
@@ -127,11 +128,10 @@ generations.
 
 ### Broadcast and mastering containers
 
-- AAF dynamic MetaDictionary extension-type interpretation, the remaining
-  effect-dictionary parameter-specific ranges/fallback profiles, and
-  certification against additional vendor/reference fixtures. Core
-  object-model ownership, editing graph, and protocol-labelled track/material
-  conformance has shipped.
+- AAF effect-dictionary parameter-specific ranges/fallback profiles and
+  certification against additional vendor/reference fixtures. Dynamic
+  MetaDictionary extension types/values, core object-model ownership, editing
+  graph, and protocol-labelled track/material conformance have shipped.
 
 ### Codec-specific QC
 

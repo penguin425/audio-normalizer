@@ -749,13 +749,28 @@ fn container_qc_cli_audits_aaf_stored_format_and_schema() {
         .arg(&path)
         .output()
         .unwrap();
-    assert!(output.status.success(), "{output:#?}");
+    assert!(!output.status.success(), "{output:#?}");
     let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(audit["format"], "aaf");
-    assert_eq!(audit["passed"], true);
+    assert_eq!(audit["passed"], false);
     assert_eq!(
         audit["properties"]["method"],
-        "forge-aaf-object-model-edit-protocol-v1"
+        "forge-aaf-metadictionary-object-model-edit-protocol-v2"
+    );
+    let failures: Vec<_> = audit["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|layer| layer["checks"].as_array().unwrap())
+        .filter(|check| check["passed"] == false)
+        .map(|check| check["rule_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        failures,
+        [
+            "FORGE-AAF-METADICTIONARY-DEFINITIONS",
+            "FORGE-AAF-EXTENSION-PROPERTY-TYPES"
+        ]
     );
 
     let schema: Value =
