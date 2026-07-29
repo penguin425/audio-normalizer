@@ -272,7 +272,14 @@ pub(crate) fn looks_like_iamf(header: &[u8]) -> bool {
 pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<ContainerAudit, String> {
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("seek {}: {error}", path.display()))?;
-    let mut reader = BufReader::new(file);
+    audit_reader(path, BufReader::new(file), file_size)
+}
+
+pub(crate) fn audit_reader(
+    path: &Path,
+    mut reader: impl Read,
+    file_size: u64,
+) -> Result<ContainerAudit, String> {
     let mut state = State {
         bounds_valid: true,
         headers_valid: true,

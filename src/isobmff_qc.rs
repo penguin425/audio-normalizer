@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
 const MAX_BOXES: usize = 200_000;
@@ -47,6 +47,8 @@ struct Track {
     stts_duration: Option<u64>,
     sample_count: Option<u64>,
     sample_bytes: Option<u64>,
+    sample_sizes: Vec<u32>,
+    sample_durations: Vec<u32>,
     chunk_offsets: Vec<u64>,
     sample_to_chunk: Vec<(u32, u32, u32)>,
     chunk_samples: Option<u64>,
@@ -59,6 +61,94 @@ struct Track {
     sample_group_types: Vec<String>,
     roll_distances: Vec<i16>,
     sample_group_samples: Option<u64>,
+    roll_default_group: bool,
+    roll_default_description_index: Option<u32>,
+    roll_sample_runs: Vec<(u64, u32)>,
+    has_sync_sample_box: bool,
+    has_composition_offsets: bool,
+    iamf_entries: Vec<Option<IamfSampleEntry>>,
+}
+
+#[derive(Clone, Default)]
+struct IamfSampleEntry {
+    channel_count: Option<u16>,
+    sample_rate: Option<u32>,
+    configuration_version: Option<u8>,
+    config_obus: Vec<u8>,
+    config_trailing_bytes: usize,
+    configuration_boxes: usize,
+    has_sampling_rate_box: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SampleLocation {
+    offset: u64,
+    size: u64,
+    description_index: u32,
+}
+
+#[derive(Clone, Copy)]
+struct IamfEntryTiming {
+    duration_ticks: u64,
+    roll_distance: Option<i64>,
+}
+
+enum IamfSegment {
+    Memory(Vec<u8>),
+    File { offset: u64, size: u64 },
+}
+
+struct IamfTrackReader<'a> {
+    file: &'a mut File,
+    segments: Vec<IamfSegment>,
+    segment_index: usize,
+    segment_offset: u64,
+}
+
+struct IamfContainerContext<'a> {
+    mdat_ranges: &'a [(u64, u64)],
+    compatible_brands: &'a [String],
+    fragmented: bool,
+    movie_timescale: Option<u32>,
+}
+
+impl Read for IamfTrackReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let Some(segment) = self.segments.get(self.segment_index) else {
+                return Ok(0);
+            };
+            let segment_size = match segment {
+                IamfSegment::Memory(bytes) => bytes.len() as u64,
+                IamfSegment::File { size, .. } => *size,
+            };
+            if self.segment_offset == segment_size {
+                self.segment_index += 1;
+                self.segment_offset = 0;
+                continue;
+            }
+            let remaining = segment_size - self.segment_offset;
+            let amount = usize::try_from(remaining.min(output.len() as u64))
+                .expect("read amount is bounded by the output buffer");
+            match segment {
+                IamfSegment::Memory(bytes) => {
+                    let start = usize::try_from(self.segment_offset)
+                        .expect("memory segment offset fits usize");
+                    output[..amount].copy_from_slice(&bytes[start..start + amount]);
+                }
+                IamfSegment::File { offset, .. } => {
+                    self.file
+                        .seek(SeekFrom::Start(offset + self.segment_offset))?;
+                    self.file.read_exact(&mut output[..amount])?;
+                }
+            }
+            self.segment_offset += amount as u64;
+            return Ok(amount);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -343,12 +433,17 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
             Some(json!(audio_tracks.len())),
         ));
         for (index, track) in audio_tracks.iter().enumerate() {
+            let iamf = track.codecs.iter().any(|codec| codec == "iamf");
             bitstream.push(check(
                 "FORGE-ISOBMFF-AUDIO-DESCRIPTION",
                 !track.codecs.is_empty()
                     && track.timescale.is_some_and(|value| value > 0)
-                    && track.channels.is_none_or(|value| value > 0)
-                    && track.sample_rate.is_none_or(|value| value > 0),
+                    && if iamf {
+                        track.channels == Some(0) && track.sample_rate == Some(0)
+                    } else {
+                        track.channels.is_none_or(|value| value > 0)
+                            && track.sample_rate.is_none_or(|value| value > 0)
+                    },
                 format!("audio track {} has a usable sample description", index + 1),
                 Some(track_json(track)),
             ));
@@ -550,6 +645,18 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
         ));
     }
     let timed_id3_aid3_brand = state.compatible_brands.iter().any(|brand| brand == "aid3");
+    let iamf_tracks = audit_iamf_tracks(
+        path,
+        &mut file,
+        &state.tracks,
+        IamfContainerContext {
+            mdat_ranges: &state.mdat_ranges,
+            compatible_brands: &state.compatible_brands,
+            fragmented: state.has_mvex || has_moof,
+            movie_timescale: state.movie_timescale,
+        },
+        (&mut bitstream, &mut xcheck),
+    );
 
     let properties = json!({
         "file_size_bytes": file_size,
@@ -581,11 +688,554 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
         }).collect::<Vec<_>>(),
         "timed_id3_aid3_compatible_brand": timed_id3_aid3_brand,
         "timed_id3_stored_bytes": state.timed_id3_bytes,
-        "timed_id3_evidence_limit_hit": state.timed_id3_limit_hit
+        "timed_id3_evidence_limit_hit": state.timed_id3_limit_hit,
+        "iamf_tracks": iamf_tracks
     });
     Ok(finish_audit(
         path, "isobmff", wrapper, bitstream, xcheck, properties,
     ))
+}
+
+fn audit_iamf_tracks(
+    path: &Path,
+    file: &mut File,
+    tracks: &[Track],
+    context: IamfContainerContext<'_>,
+    checks: (&mut Vec<AuditCheck>, &mut Vec<AuditCheck>),
+) -> Vec<Value> {
+    let (bitstream, xcheck) = checks;
+    let iamf_track_count = tracks
+        .iter()
+        .filter(|track| track.iamf_entries.iter().any(Option::is_some))
+        .count();
+    if iamf_track_count == 0 {
+        return Vec::new();
+    }
+    bitstream.push(check(
+        "FORGE-ISOBMFF-IAMF-BRAND",
+        context
+            .compatible_brands
+            .iter()
+            .any(|brand| brand == "iamf"),
+        "ISO-BMFF IAMF files declare iamf in the compatible brands array",
+        Some(json!({
+            "compatible_brands": context.compatible_brands,
+            "iamf_tracks": iamf_track_count
+        })),
+    ));
+
+    let mut observations = Vec::new();
+    for track in tracks
+        .iter()
+        .filter(|track| track.iamf_entries.iter().any(Option::is_some))
+    {
+        if context.fragmented {
+            bitstream.push(check(
+                "FORGE-ISOBMFF-IAMF-SAMPLE-DATA",
+                false,
+                "fragmented ISO-BMFF IAMF sample extraction requires the dedicated fMP4 validation path",
+                Some(json!({"track_id": track.id, "fragmented": true})),
+            ));
+            observations.push(json!({
+                "track_id": track.id,
+                "fragmented": true,
+                "validated_samples": 0
+            }));
+            continue;
+        }
+
+        let locations = match sample_locations(track) {
+            Ok(locations) => locations,
+            Err(error) => {
+                bitstream.push(check(
+                    "FORGE-ISOBMFF-IAMF-SAMPLE-DATA",
+                    false,
+                    error,
+                    Some(json!({"track_id": track.id})),
+                ));
+                continue;
+            }
+        };
+        let ranges_valid = locations.iter().all(|sample| {
+            sample.offset.checked_add(sample.size).is_some_and(|end| {
+                context
+                    .mdat_ranges
+                    .iter()
+                    .any(|(start, limit)| sample.offset >= *start && end <= *limit)
+            })
+        });
+        let entries_valid = locations.iter().all(|sample| {
+            usize::try_from(sample.description_index.saturating_sub(1))
+                .ok()
+                .and_then(|index| track.iamf_entries.get(index))
+                .and_then(Option::as_ref)
+                .is_some_and(|entry| !entry.config_obus.is_empty())
+        });
+        let mut sample_obus = 0_u64;
+        let mut sample_audio_frames = 0_u64;
+        let mut sample_parameter_blocks = 0_u64;
+        let mut sample_error = None;
+        for (index, sample) in locations.iter().enumerate() {
+            match scan_iamf_sample(path, file, *sample) {
+                Ok((obus, audio_frames, parameter_blocks)) => {
+                    sample_obus = sample_obus.saturating_add(obus);
+                    sample_audio_frames = sample_audio_frames.saturating_add(audio_frames);
+                    sample_parameter_blocks =
+                        sample_parameter_blocks.saturating_add(parameter_blocks);
+                }
+                Err(error) => {
+                    sample_error = Some(format!("IA Sample {}: {error}", index + 1));
+                    break;
+                }
+            }
+        }
+        let samples_valid =
+            ranges_valid && entries_valid && sample_error.is_none() && !locations.is_empty();
+        bitstream.push(check(
+            "FORGE-ISOBMFF-IAMF-SAMPLE-DATA",
+            samples_valid,
+            sample_error.unwrap_or_else(|| {
+                if samples_valid {
+                    "every IA Sample is a bounded descriptor-free Temporal Unit without a Temporal Delimiter OBU"
+                        .to_string()
+                } else {
+                    "IA Sample tables, MediaDataBox ranges, or sample-entry references are invalid"
+                        .to_string()
+                }
+            }),
+            Some(json!({
+                "track_id": track.id,
+                "samples": locations.len(),
+                "sample_obus": sample_obus,
+                "audio_frame_obus": sample_audio_frames,
+                "parameter_block_obus": sample_parameter_blocks,
+                "ranges_inside_mdat": ranges_valid,
+                "iamf_sample_entries_resolve": entries_valid
+            })),
+        ));
+        if !samples_valid {
+            observations.push(json!({
+                "track_id": track.id,
+                "fragmented": false,
+                "validated_samples": 0
+            }));
+            continue;
+        }
+
+        let mut segments = Vec::new();
+        let mut total_bytes = 0_u64;
+        let mut previous_description = None;
+        for sample in &locations {
+            if previous_description != Some(sample.description_index) {
+                let entry_index = usize::try_from(sample.description_index - 1)
+                    .expect("validated sample-description index fits usize");
+                let config = track.iamf_entries[entry_index]
+                    .as_ref()
+                    .expect("validated IAMF sample entry")
+                    .config_obus
+                    .clone();
+                total_bytes = total_bytes.saturating_add(config.len() as u64);
+                segments.push(IamfSegment::Memory(config));
+                previous_description = Some(sample.description_index);
+            }
+            total_bytes = total_bytes.saturating_add(sample.size);
+            segments.push(IamfSegment::File {
+                offset: sample.offset,
+                size: sample.size,
+            });
+        }
+        let reader = IamfTrackReader {
+            file,
+            segments,
+            segment_index: 0,
+            segment_offset: 0,
+        };
+        match crate::iamf_qc::audit_reader(path, reader, total_bytes) {
+            Ok(audit) => {
+                let codec_configs = audit
+                    .properties
+                    .get("codec_configs")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let temporal_units = audit
+                    .properties
+                    .get("temporal_units")
+                    .and_then(Value::as_u64);
+                let trim_start = audit
+                    .properties
+                    .get("trim_at_start_samples")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let trim_end = audit
+                    .properties
+                    .get("trim_at_end_samples")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let frame_lengths: HashSet<u64> = codec_configs
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|config| config.get("num_samples_per_frame"))
+                    .filter_map(Value::as_u64)
+                    .collect();
+                let sample_rates: HashSet<u64> = codec_configs
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|config| config.get("sample_rate_hz"))
+                    .filter_map(Value::as_u64)
+                    .collect();
+                let entry_timings: Vec<Option<IamfEntryTiming>> = track
+                    .iamf_entries
+                    .iter()
+                    .map(|entry| {
+                        entry.as_ref().and_then(|entry| {
+                            iamf_config_timing(path, &entry.config_obus, track.timescale?)
+                        })
+                    })
+                    .collect();
+                let sample_frame_lengths: Vec<Option<u64>> = locations
+                    .iter()
+                    .map(|sample| {
+                        let index = usize::try_from(sample.description_index - 1).ok()?;
+                        entry_timings
+                            .get(index)
+                            .copied()
+                            .flatten()
+                            .map(|timing| timing.duration_ticks)
+                    })
+                    .collect();
+                let observed_duration = track
+                    .sample_durations
+                    .iter()
+                    .map(|duration| u64::from(*duration))
+                    .sum::<u64>();
+                let nominal_duration = sample_frame_lengths
+                    .iter()
+                    .try_fold(0_u64, |total, frame_length| {
+                        total.checked_add((*frame_length)?)
+                    });
+                let expected_duration =
+                    nominal_duration.and_then(|duration| duration.checked_sub(trim_end));
+                let sample_timing_valid = track.sample_durations.len() == locations.len()
+                    && track
+                        .sample_durations
+                        .iter()
+                        .zip(&sample_frame_lengths)
+                        .all(|(duration, frame_length)| {
+                            *duration > 0
+                                && frame_length.is_some_and(|frame_length| {
+                                    u64::from(*duration) <= frame_length
+                                })
+                        })
+                    && Some(observed_duration) == expected_duration
+                    && temporal_units == Some(locations.len() as u64);
+                xcheck.push(check(
+                    "FORGE-ISOBMFF-IAMF-SAMPLE-TIMING",
+                    sample_timing_valid,
+                    "stts durations equal IAMF frame duration minus end trimming and one IA Sample maps to one Temporal Unit",
+                    Some(json!({
+                        "track_id": track.id,
+                        "sample_durations": track.sample_durations,
+                        "codec_frame_lengths": frame_lengths,
+                        "codec_sample_rates": sample_rates,
+                        "media_timescale": track.timescale,
+                        "sample_decode_durations_in_media_ticks": sample_frame_lengths,
+                        "observed_decode_duration": observed_duration,
+                        "expected_decode_duration": expected_duration,
+                        "trim_at_end_samples": trim_end,
+                        "ia_samples": locations.len(),
+                        "temporal_units": temporal_units
+                    })),
+                ));
+
+                let sample_expected_rolls: Vec<Option<i64>> = locations
+                    .iter()
+                    .map(|sample| {
+                        let index = usize::try_from(sample.description_index - 1).ok()?;
+                        entry_timings
+                            .get(index)
+                            .copied()
+                            .flatten()
+                            .map(|timing| timing.roll_distance)
+                    })
+                    .collect::<Option<_>>()
+                    .unwrap_or_default();
+                let codec_requires_roll = sample_expected_rolls.iter().any(Option::is_some);
+                let expected_rolls: HashSet<i64> =
+                    sample_expected_rolls.iter().flatten().copied().collect();
+                let actual_rolls: HashSet<i64> = track
+                    .roll_distances
+                    .iter()
+                    .map(|value| i64::from(*value))
+                    .collect();
+                let roll_assignments = resolve_roll_assignments(track, locations.len());
+                let roll_valid = sample_expected_rolls.len() == locations.len()
+                    && roll_assignments.as_ref().is_ok_and(|assignments| {
+                        assignments
+                            .iter()
+                            .zip(&sample_expected_rolls)
+                            .all(|(actual, expected)| {
+                                expected.is_none_or(|value| *actual == Some(value))
+                            })
+                    });
+                xcheck.push(check(
+                    "FORGE-ISOBMFF-IAMF-ROLL-GROUP",
+                    roll_valid,
+                    "Opus/mp4a IA Samples use complete roll sample groups matching Codec Config audio_roll_distance",
+                    Some(json!({
+                        "track_id": track.id,
+                        "required": codec_requires_roll,
+                        "expected_roll_distances": expected_rolls,
+                        "observed_roll_distances": actual_rolls,
+                        "grouped_samples": track.sample_group_samples,
+                        "default_group_applies": track.roll_default_group,
+                        "default_description_index": track.roll_default_description_index,
+                        "sample_assignments_resolve": roll_assignments.is_ok(),
+                        "sample_count": track.sample_count
+                    })),
+                ));
+                let expected_presentation_media_ticks = track
+                    .stts_duration
+                    .and_then(|duration| duration.checked_sub(trim_start));
+                let edit_duration_matches = track
+                    .edit_segment_duration
+                    .zip(track.timescale)
+                    .zip(context.movie_timescale)
+                    .zip(expected_presentation_media_ticks)
+                    .is_some_and(
+                        |(((edit_duration, media_timescale), movie_timescale), expected)| {
+                            u128::from(edit_duration) * u128::from(media_timescale)
+                                == u128::from(expected) * u128::from(movie_timescale)
+                        },
+                    );
+                let trim_valid = trim_start == 0 && trim_end == 0
+                    || (track.edit_media_time == i64::try_from(trim_start).ok()
+                        && edit_duration_matches);
+                xcheck.push(check(
+                    "FORGE-ISOBMFF-IAMF-TRIM",
+                    trim_valid,
+                    "IAMF audio-frame trimming is represented by an edit list",
+                    Some(json!({
+                        "track_id": track.id,
+                        "trim_at_start_samples": trim_start,
+                        "trim_at_end_samples": trim_end,
+                        "edit_media_time": track.edit_media_time,
+                        "edit_segment_duration": track.edit_segment_duration,
+                        "movie_timescale": context.movie_timescale,
+                        "expected_presentation_media_ticks": expected_presentation_media_ticks,
+                        "edit_duration_matches": edit_duration_matches
+                    })),
+                ));
+                xcheck.push(check(
+                    "FORGE-ISOBMFF-IAMF-SYNC-CTS",
+                    !track.has_sync_sample_box && !track.has_composition_offsets,
+                    "IAMF omits stss and composition offsets so every IA Sample is sync with CTS equal to DTS",
+                    Some(json!({
+                        "track_id": track.id,
+                        "stss": track.has_sync_sample_box,
+                        "ctts": track.has_composition_offsets
+                    })),
+                ));
+                for layer in audit.layers {
+                    if layer.layer == "x-check" {
+                        xcheck.extend(layer.checks);
+                    } else {
+                        bitstream.extend(layer.checks);
+                    }
+                }
+                observations.push(json!({
+                    "track_id": track.id,
+                    "fragmented": false,
+                    "validated_samples": locations.len(),
+                    "sample_obus": sample_obus,
+                    "configurations": track.iamf_entries.iter().filter(|entry| entry.is_some()).count(),
+                    "codec_configs": codec_configs,
+                    "temporal_units": temporal_units,
+                    "decapsulated_bytes": total_bytes
+                }));
+            }
+            Err(error) => {
+                bitstream.push(check(
+                    "FORGE-ISOBMFF-IAMF-DECAPSULATION",
+                    false,
+                    error,
+                    Some(json!({"track_id": track.id})),
+                ));
+            }
+        }
+    }
+    observations
+}
+
+fn sample_locations(track: &Track) -> Result<Vec<SampleLocation>, String> {
+    if track.sample_sizes.is_empty()
+        || track.chunk_offsets.is_empty()
+        || track.sample_to_chunk.is_empty()
+    {
+        return Err("IAMF track requires complete stsz/stz2, stco/co64, and stsc tables".into());
+    }
+    if track.sample_to_chunk.first().map(|entry| entry.0) != Some(1) {
+        return Err("IAMF stsc first_chunk must start at 1".into());
+    }
+    if expand_chunk_samples(&track.sample_to_chunk, track.chunk_offsets.len())
+        != Some(track.sample_sizes.len() as u64)
+    {
+        return Err(
+            "IAMF stsc mappings must be ordered, bounded by the chunk table, and cover every sample"
+                .into(),
+        );
+    }
+    let mut locations = Vec::with_capacity(track.sample_sizes.len());
+    let mut sample_index = 0_usize;
+    let mut mapping_index = 0_usize;
+    for (chunk_index, chunk_offset) in track.chunk_offsets.iter().copied().enumerate() {
+        let one_based = u32::try_from(chunk_index + 1)
+            .map_err(|_| "IAMF chunk index exceeds uint32".to_string())?;
+        while mapping_index + 1 < track.sample_to_chunk.len()
+            && track.sample_to_chunk[mapping_index + 1].0 <= one_based
+        {
+            mapping_index += 1;
+        }
+        let (_, samples_per_chunk, description_index) = track.sample_to_chunk[mapping_index];
+        let mut offset = chunk_offset;
+        for _ in 0..samples_per_chunk {
+            let size = *track
+                .sample_sizes
+                .get(sample_index)
+                .ok_or_else(|| "stsc expands beyond the IAMF sample-size table".to_string())?;
+            if description_index == 0 {
+                return Err("stsc references sample description index 0".into());
+            }
+            locations.push(SampleLocation {
+                offset,
+                size: u64::from(size),
+                description_index,
+            });
+            offset = offset
+                .checked_add(u64::from(size))
+                .ok_or_else(|| "IAMF sample offset overflows uint64".to_string())?;
+            sample_index += 1;
+        }
+    }
+    if sample_index != track.sample_sizes.len() {
+        return Err(format!(
+            "stsc expands to {sample_index} IAMF samples, expected {}",
+            track.sample_sizes.len()
+        ));
+    }
+    Ok(locations)
+}
+
+fn resolve_roll_assignments(
+    track: &Track,
+    sample_count: usize,
+) -> Result<Vec<Option<i64>>, String> {
+    let resolve = |index: u32| -> Result<Option<i64>, String> {
+        let effective = if index == 0 {
+            track.roll_default_description_index.unwrap_or(0)
+        } else {
+            index
+        };
+        if effective == 0 {
+            return Ok(None);
+        }
+        let offset = usize::try_from(effective - 1)
+            .map_err(|_| "roll group description index does not fit memory".to_string())?;
+        track
+            .roll_distances
+            .get(offset)
+            .map(|distance| Some(i64::from(*distance)))
+            .ok_or_else(|| format!("roll group description index {effective} is undefined"))
+    };
+
+    if track.roll_sample_runs.is_empty() {
+        let value = resolve(0)?;
+        return Ok(std::iter::repeat_n(value, sample_count).collect());
+    }
+    let mut assignments = Vec::with_capacity(sample_count);
+    for &(count, index) in &track.roll_sample_runs {
+        let count = usize::try_from(count)
+            .map_err(|_| "roll sample-group run count does not fit memory".to_string())?;
+        if count > sample_count.saturating_sub(assignments.len()) {
+            return Err("roll sample-group runs exceed the IA Sample count".into());
+        }
+        assignments.extend(std::iter::repeat_n(resolve(index)?, count));
+    }
+    if assignments.len() != sample_count {
+        return Err(format!(
+            "roll sample-group runs cover {} IA Samples, expected {sample_count}",
+            assignments.len()
+        ));
+    }
+    Ok(assignments)
+}
+
+fn scan_iamf_sample(
+    path: &Path,
+    file: &mut File,
+    sample: SampleLocation,
+) -> Result<(u64, u64, u64), String> {
+    let end = sample
+        .offset
+        .checked_add(sample.size)
+        .ok_or_else(|| "sample range overflows uint64".to_string())?;
+    if sample.size == 0 {
+        return Err("sample is empty".into());
+    }
+    let mut offset = sample.offset;
+    let mut obus = 0_u64;
+    let mut audio_frames = 0_u64;
+    let mut parameter_blocks = 0_u64;
+    while offset < end {
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| format!("seek {} to IA Sample OBU: {error}", path.display()))?;
+        let mut header = [0_u8; 1];
+        file.read_exact(&mut header)
+            .map_err(|error| format!("read {} IA Sample OBU: {error}", path.display()))?;
+        let obu_type = header[0] >> 3;
+        let (body_size, leb_bytes) = read_iamf_leb_reader(file)
+            .ok_or_else(|| "OBU size is invalid bounded LEB128".to_string())?;
+        let obu_size = 1_u64
+            .checked_add(leb_bytes as u64)
+            .and_then(|size| size.checked_add(body_size))
+            .ok_or_else(|| "OBU size overflows uint64".to_string())?;
+        if obu_size > 1 << 21 || offset.checked_add(obu_size).is_none_or(|limit| limit > end) {
+            return Err("OBU exceeds the 2 MiB profile limit or IA Sample boundary".into());
+        }
+        if matches!(obu_type, 0..=2 | 31) {
+            return Err(format!(
+                "descriptor OBU type {obu_type} is stored in an IA Sample"
+            ));
+        }
+        if obu_type == 4 {
+            return Err("Temporal Delimiter OBU is stored in an IA Sample".into());
+        }
+        if obu_type == 3 {
+            parameter_blocks += 1;
+        } else if (5..=23).contains(&obu_type) {
+            audio_frames += 1;
+        }
+        obus += 1;
+        offset += obu_size;
+    }
+    if offset != end || audio_frames == 0 {
+        return Err("IA Sample is not one complete Temporal Unit with audio frames".into());
+    }
+    Ok((obus, audio_frames, parameter_blocks))
+}
+
+fn read_iamf_leb_reader(file: &mut File) -> Option<(u64, usize)> {
+    let mut value = 0_u64;
+    for index in 0..8 {
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte).ok()?;
+        value |= u64::from(byte[0] & 0x7f).checked_shl(index * 7)?;
+        if byte[0] & 0x80 == 0 {
+            return Some((value, index as usize + 1));
+        }
+    }
+    None
 }
 
 fn parse_event_message(
@@ -1263,6 +1913,8 @@ fn parse_stbl(
         match &child.kind {
             b"stsd" => parse_stsd(path, file, child, track, bitstream)?,
             b"stts" => parse_stts(path, file, child, track, bitstream)?,
+            b"ctts" => track.has_composition_offsets = true,
+            b"stss" => track.has_sync_sample_box = true,
             b"stsz" => parse_stsz(path, file, child, track, bitstream)?,
             b"stz2" => parse_stz2(path, file, child, track, bitstream)?,
             b"stsc" => parse_stsc(path, file, child, track, bitstream)?,
@@ -1332,6 +1984,7 @@ fn parse_stsd(
             break;
         }
         let codec = fourcc(&body[offset + 4..offset + 8]);
+        let is_iamf = codec == "iamf";
         track.codecs.push(codec);
         if track.handler == Some(*b"soun") && size >= 36 {
             track.channels = Some(u16::from_be_bytes(
@@ -1340,6 +1993,15 @@ fn parse_stsd(
             track.sample_rate = Some(be_u32(&body[offset + 32..offset + 36]) >> 16);
             match sample_entry_child_boxes(&body[offset..offset + size]) {
                 Ok(children) => {
+                    track.iamf_entries.push(if is_iamf {
+                        Some(parse_iamf_sample_entry(
+                            &body[offset..offset + size],
+                            &children,
+                            checks,
+                        ))
+                    } else {
+                        None
+                    });
                     let drc: Vec<_> = children
                         .iter()
                         .filter(|(kind, _)| {
@@ -1384,6 +2046,9 @@ fn parse_stsd(
                     ));
                 }
             }
+        }
+        if track.handler == Some(*b"soun") && track.iamf_entries.len() < track.codecs.len() {
+            track.iamf_entries.push(None);
         }
         offset += size;
     }
@@ -1462,6 +2127,196 @@ fn sample_entry_child_boxes(entry: &[u8]) -> Result<Vec<(String, &[u8])>, ()> {
         offset += size;
     }
     Ok(output)
+}
+
+fn parse_iamf_sample_entry(
+    entry: &[u8],
+    children: &[(String, &[u8])],
+    checks: &mut Vec<AuditCheck>,
+) -> IamfSampleEntry {
+    let channel_count = entry
+        .get(24..26)
+        .map(|value| u16::from_be_bytes(value.try_into().unwrap()));
+    let sample_rate = entry.get(32..36).map(be_u32);
+    let has_sampling_rate_box = children.iter().any(|(kind, _)| kind == "srat");
+    let configurations: Vec<_> = children
+        .iter()
+        .filter(|(kind, _)| kind == "iacb")
+        .map(|(_, payload)| *payload)
+        .collect();
+    let mut result = IamfSampleEntry {
+        channel_count,
+        sample_rate,
+        configuration_boxes: configurations.len(),
+        has_sampling_rate_box,
+        ..IamfSampleEntry::default()
+    };
+    checks.push(check(
+        "FORGE-ISOBMFF-IAMF-SAMPLE-ENTRY",
+        channel_count == Some(0) && sample_rate == Some(0) && !has_sampling_rate_box,
+        "IAMF AudioSampleEntry uses zero channelcount/samplerate fields and no SamplingRateBox",
+        Some(json!({
+            "channel_count": channel_count,
+            "sample_rate_fixed_16_16": sample_rate,
+            "sampling_rate_box": has_sampling_rate_box
+        })),
+    ));
+
+    let mut valid = configurations.len() == 1;
+    let mut error = (configurations.len() != 1).then(|| {
+        format!(
+            "IAMF sample entry contains {} IAConfigurationBox values; exactly one is required",
+            configurations.len()
+        )
+    });
+    if let Some(payload) = configurations.first() {
+        result.configuration_version = payload.first().copied();
+        if result.configuration_version != Some(1) {
+            valid = false;
+            error = Some("IAConfigurationBox configurationVersion must be 1".to_string());
+        } else {
+            match parse_iamf_leb(&payload[1..]) {
+                Some((size, leb_bytes)) => {
+                    let start = 1 + leb_bytes;
+                    match usize::try_from(size)
+                        .ok()
+                        .and_then(|size| start.checked_add(size).map(|end| (size, end)))
+                    {
+                        Some((size, end)) if size > 0 && end <= payload.len() => {
+                            result.config_obus = payload[start..end].to_vec();
+                            result.config_trailing_bytes = payload.len() - end;
+                            if let Err(config_error) =
+                                validate_iamf_config_obus(&result.config_obus)
+                            {
+                                valid = false;
+                                error = Some(config_error);
+                            }
+                        }
+                        _ => {
+                            valid = false;
+                            error = Some(
+                                "IAConfigurationBox configOBUs_size is zero, overflowing, or truncated"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+                None => {
+                    valid = false;
+                    error =
+                        Some("IAConfigurationBox configOBUs_size is invalid LEB128".to_string());
+                }
+            }
+        }
+    }
+    checks.push(check(
+        "FORGE-ISOBMFF-IAMF-CONFIG",
+        valid,
+        error.unwrap_or_else(|| {
+            "IAConfigurationBox v1 contains a bounded non-empty configOBUs sequence".to_string()
+        }),
+        Some(json!({
+            "configuration_boxes": result.configuration_boxes,
+            "configuration_version": result.configuration_version,
+            "config_obus_bytes": result.config_obus.len(),
+            "ignored_trailing_bytes": result.config_trailing_bytes
+        })),
+    ));
+    result
+}
+
+fn validate_iamf_config_obus(bytes: &[u8]) -> Result<(), String> {
+    let mut offset = 0_usize;
+    let mut obus = 0_usize;
+    while offset < bytes.len() {
+        let header = *bytes
+            .get(offset)
+            .ok_or_else(|| "configOBUs has a truncated OBU header".to_string())?;
+        let obu_type = header >> 3;
+        let (body_size, leb_bytes) = parse_iamf_leb(&bytes[offset + 1..])
+            .ok_or_else(|| "configOBUs has an invalid OBU size".to_string())?;
+        let body_size = usize::try_from(body_size)
+            .map_err(|_| "configOBUs OBU size does not fit memory".to_string())?;
+        let size = 1_usize
+            .checked_add(leb_bytes)
+            .and_then(|size| size.checked_add(body_size))
+            .ok_or_else(|| "configOBUs OBU size overflows".to_string())?;
+        if size > 1 << 21 || offset.checked_add(size).is_none_or(|end| end > bytes.len()) {
+            return Err("configOBUs OBU exceeds its bound or the 2 MiB profile limit".into());
+        }
+        if (3..=23).contains(&obu_type) {
+            return Err(format!(
+                "configOBUs contains IA data OBU type {obu_type}; only Descriptors and Reserved OBUs are allowed"
+            ));
+        }
+        obus += 1;
+        offset += size;
+    }
+    if offset != bytes.len() || obus == 0 {
+        return Err("configOBUs is empty or does not end on an OBU boundary".into());
+    }
+    Ok(())
+}
+
+fn iamf_config_timing(
+    path: &Path,
+    config_obus: &[u8],
+    media_timescale: u32,
+) -> Option<IamfEntryTiming> {
+    let audit =
+        crate::iamf_qc::audit_reader(path, Cursor::new(config_obus), config_obus.len() as u64)
+            .ok()?;
+    let configs = audit.properties.get("codec_configs")?.as_array()?;
+    let timings: Vec<(u64, u64)> = configs
+        .iter()
+        .map(|config| {
+            Some((
+                config.get("num_samples_per_frame")?.as_u64()?,
+                config.get("sample_rate_hz")?.as_u64()?,
+            ))
+        })
+        .collect::<Option<_>>()?;
+    let required_rolls: Vec<i64> = configs
+        .iter()
+        .filter(|config| {
+            matches!(
+                config.get("codec_id").and_then(Value::as_str),
+                Some("Opus" | "mp4a")
+            )
+        })
+        .map(|config| config.get("audio_roll_distance")?.as_i64())
+        .collect::<Option<_>>()?;
+    let unique_rolls: HashSet<i64> = required_rolls.iter().copied().collect();
+    if unique_rolls.len() > 1 {
+        return None;
+    }
+    let roll_distance = unique_rolls.into_iter().next();
+    let (reference_samples, reference_rate) = *timings.first()?;
+    if reference_rate == 0
+        || timings.iter().any(|(samples, rate)| {
+            u128::from(*samples) * u128::from(reference_rate)
+                != u128::from(reference_samples) * u128::from(*rate)
+        })
+    {
+        return None;
+    }
+    let scaled = reference_samples.checked_mul(u64::from(media_timescale))?;
+    (scaled % reference_rate == 0).then(|| IamfEntryTiming {
+        duration_ticks: scaled / reference_rate,
+        roll_distance,
+    })
+}
+
+fn parse_iamf_leb(bytes: &[u8]) -> Option<(u64, usize)> {
+    let mut value = 0_u64;
+    for (index, byte) in bytes.iter().copied().take(8).enumerate() {
+        let shift = index * 7;
+        value |= u64::from(byte & 0x7f).checked_shl(shift as u32)?;
+        if byte & 0x80 == 0 {
+            return Some((value, index + 1));
+        }
+    }
+    None
 }
 
 fn decoder_specific_info(esds_body: &[u8]) -> Result<&[u8], ()> {
@@ -1543,6 +2398,14 @@ fn parse_stts(
             let delta = u64::from(be_u32(&entry[4..8]));
             samples = samples.saturating_add(count);
             duration = duration.saturating_add(count.saturating_mul(delta));
+            if samples <= MAX_TABLE_ENTRIES as u64 && delta <= u64::from(u32::MAX) {
+                track
+                    .sample_durations
+                    .extend(std::iter::repeat_n(delta as u32, count as usize));
+            }
+        }
+        if samples > MAX_TABLE_ENTRIES as u64 {
+            track.sample_durations.clear();
         }
         track.stts_samples = Some(samples);
         track.stts_duration = Some(duration);
@@ -1570,20 +2433,21 @@ fn parse_stsz(
         let uniform = u64::from(be_u32(&body[4..8]));
         let count = u64::from(be_u32(&body[8..12]));
         track.sample_count = Some(count);
+        valid &= count <= MAX_TABLE_ENTRIES as u64;
         if uniform == 0 {
             let required = 12_u64.saturating_add(count.saturating_mul(4));
-            valid = required == body.len() as u64;
+            valid &= required == body.len() as u64;
             if valid {
-                track.sample_bytes = Some(
-                    body[12..]
-                        .chunks_exact(4)
-                        .map(|item| u64::from(be_u32(item)))
-                        .sum(),
-                );
+                track.sample_sizes = body[12..].chunks_exact(4).map(be_u32).collect();
+                track.sample_bytes =
+                    Some(track.sample_sizes.iter().map(|item| u64::from(*item)).sum());
             }
         } else {
-            valid = body.len() == 12;
+            valid &= body.len() == 12;
             track.sample_bytes = Some(uniform.saturating_mul(count));
+            if valid {
+                track.sample_sizes = vec![uniform as u32; count as usize];
+            }
         }
     }
     checks.push(check(
@@ -1619,26 +2483,30 @@ fn parse_stz2(
         };
         valid &= payload.len() == required;
         if valid {
-            let bytes = match field_size {
-                4 => payload
-                    .iter()
-                    .enumerate()
-                    .map(|(index, value)| {
-                        let base = u64::from(value >> 4) + u64::from(value & 0x0f);
-                        if index * 2 + 1 < count {
-                            base
+            valid &= count <= MAX_TABLE_ENTRIES;
+            track.sample_sizes = match field_size {
+                4 => (0..count)
+                    .map(|index| {
+                        let value = payload[index / 2];
+                        u32::from(if index % 2 == 0 {
+                            value >> 4
                         } else {
-                            u64::from(value >> 4)
-                        }
+                            value & 0x0f
+                        })
                     })
-                    .sum(),
-                8 => payload.iter().map(|value| u64::from(*value)).sum(),
+                    .collect(),
+                8 => payload.iter().map(|value| u32::from(*value)).collect(),
                 16 => payload
                     .chunks_exact(2)
-                    .map(|value| u64::from(u16::from_be_bytes(value.try_into().unwrap())))
-                    .sum(),
-                _ => 0,
+                    .map(|value| u32::from(u16::from_be_bytes(value.try_into().unwrap())))
+                    .collect(),
+                _ => Vec::new(),
             };
+            let bytes = track
+                .sample_sizes
+                .iter()
+                .map(|value| u64::from(*value))
+                .sum();
             track.sample_count = Some(count as u64);
             track.sample_bytes = Some(bytes);
         }
@@ -1701,6 +2569,11 @@ fn parse_sgpd(
     let body = read_control(path, file, header)?;
     let version = body.first().copied();
     let grouping_type = body.get(4..8).map(fourcc);
+    let default_description_index = if version == Some(2) {
+        body.get(12..16).map(be_u32)
+    } else {
+        None
+    };
     let (mut offset, default_length, entry_count) = match version {
         Some(0) if body.len() >= 12 => (12, None, be_u32(&body[8..12]) as usize),
         Some(1) if body.len() >= 16 => (
@@ -1715,7 +2588,9 @@ fn parse_sgpd(
         ),
         _ => (body.len(), None, 0),
     };
-    let mut valid = grouping_type.is_some() && entry_count <= MAX_TABLE_ENTRIES;
+    let duplicate_roll = grouping_type.as_deref() == Some("roll")
+        && track.sample_group_types.iter().any(|kind| kind == "roll");
+    let mut valid = grouping_type.is_some() && entry_count <= MAX_TABLE_ENTRIES && !duplicate_roll;
     let mut roll_distances = Vec::new();
     for _ in 0..entry_count {
         let length = match default_length {
@@ -1744,13 +2619,22 @@ fn parse_sgpd(
                 valid = false;
                 break;
             }
-            roll_distances.push(i16::from_be_bytes(
-                body[offset..offset + 2].try_into().unwrap(),
-            ));
+            if grouping_type.as_deref() == Some("roll") {
+                roll_distances.push(i16::from_be_bytes(
+                    body[offset..offset + 2].try_into().unwrap(),
+                ));
+            }
         }
         offset += length;
     }
     valid &= offset == body.len();
+    if let Some(default_description_index) = default_description_index {
+        valid &= default_description_index <= entry_count as u32;
+        if grouping_type.as_deref() == Some("roll") {
+            track.roll_default_description_index = Some(default_description_index);
+            track.roll_default_group = default_description_index > 0;
+        }
+    }
     if let Some(grouping_type) = grouping_type {
         track.sample_group_types.push(grouping_type);
     }
@@ -1761,7 +2645,8 @@ fn parse_sgpd(
         "sample-group descriptions are bounded and roll/prol entries have signed distances",
         Some(json!({
             "grouping_types": track.sample_group_types,
-            "roll_distances": track.roll_distances
+            "roll_distances": track.roll_distances,
+            "default_description_index": default_description_index
         })),
     ));
     Ok(())
@@ -1792,16 +2677,23 @@ fn parse_sbgp(
         }
         Some(tail[4..].chunks_exact(8).collect::<Vec<_>>())
     });
+    let duplicate_roll =
+        grouping_type.as_deref() == Some("roll") && !track.roll_sample_runs.is_empty();
     let mut samples = 0_u64;
-    let mut valid = grouping_type.is_some();
+    let mut valid = grouping_type.is_some() && !duplicate_roll;
+    let mut runs = Vec::new();
     if let Some(entries) = entries {
         for entry in entries {
             let count = u64::from(be_u32(&entry[..4]));
             let description_index = be_u32(&entry[4..8]);
             valid &= count > 0 && description_index <= MAX_TABLE_ENTRIES as u32;
             samples = samples.saturating_add(count);
+            runs.push((count, description_index));
         }
-        track.sample_group_samples = Some(samples);
+        if grouping_type.as_deref() == Some("roll") {
+            track.sample_group_samples = Some(samples);
+            track.roll_sample_runs = runs;
+        }
     } else {
         valid = false;
     }
@@ -2104,7 +2996,24 @@ fn track_json(track: &Track) -> Value {
         "edit_segment_duration": track.edit_segment_duration,
         "sample_group_types": track.sample_group_types,
         "roll_distances": track.roll_distances,
-        "sample_group_samples": track.sample_group_samples
+        "sample_group_samples": track.sample_group_samples,
+        "roll_default_group": track.roll_default_group,
+        "roll_default_description_index": track.roll_default_description_index,
+        "roll_sample_runs": track.roll_sample_runs,
+        "sync_sample_box": track.has_sync_sample_box,
+        "composition_offsets": track.has_composition_offsets,
+        "iamf_sample_entries": track.iamf_entries.iter().enumerate().filter_map(|(index, entry)| {
+            entry.as_ref().map(|entry| json!({
+                "sample_description_index": index + 1,
+                "channel_count": entry.channel_count,
+                "sample_rate_fixed_16_16": entry.sample_rate,
+                "configuration_boxes": entry.configuration_boxes,
+                "configuration_version": entry.configuration_version,
+                "config_obus_bytes": entry.config_obus.len(),
+                "ignored_trailing_bytes": entry.config_trailing_bytes,
+                "sampling_rate_box": entry.has_sampling_rate_box
+            }))
+        }).collect::<Vec<_>>()
     })
 }
 
@@ -2181,6 +3090,130 @@ mod tests {
                 .concat(),
             ),
         )
+    }
+
+    fn iamf_obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() < 128);
+        [vec![obu_type << 3, payload.len() as u8], payload.to_vec()].concat()
+    }
+
+    fn minimal_iamf_mix() -> Vec<u8> {
+        vec![
+            0, 0, // Mix ID and no localized labels.
+            1, 1, 0, // One sub-mix with one audio element.
+            0, 0, // Stereo rendering mode and no rendering extension.
+            100, 1, 0x80, 0, 0, // Element mix gain.
+            100, 1, 0x80, 0, 0, // Output mix gain.
+            1, 0x80, // One Sound System A stereo layout.
+            0, 0, 0, 0, 0, // Base loudness fields.
+        ]
+    }
+
+    fn minimal_iamf_mp4(compatible_brand: &[u8; 4], sample: Vec<u8>) -> Vec<u8> {
+        let mut config = iamf_obu(31, b"iamf\x00\x00");
+        config.extend(iamf_obu(
+            0,
+            &[0, b'i', b'p', b'c', b'm', 1, 0, 0, 0, 16, 0, 0, 187, 128],
+        ));
+        config.extend(iamf_obu(1, &[0, 0, 0, 1, 0, 0, 0x20, 0, 1, 0]));
+        config.extend(iamf_obu(2, &minimal_iamf_mix()));
+        let iacb = boxed(
+            b"iacb",
+            [vec![1, u8::try_from(config.len()).unwrap()], config.clone()].concat(),
+        );
+        let mut sample_entry = vec![0_u8; 28];
+        sample_entry[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        sample_entry.extend(iacb);
+        let stsd = boxed(
+            b"stsd",
+            full_box(
+                0,
+                [1_u32.to_be_bytes().to_vec(), boxed(b"iamf", sample_entry)].concat(),
+            ),
+        );
+        let stts = boxed(
+            b"stts",
+            full_box(
+                0,
+                [
+                    1_u32.to_be_bytes(),
+                    1_u32.to_be_bytes(),
+                    1_u32.to_be_bytes(),
+                ]
+                .concat(),
+            ),
+        );
+        let stsz = boxed(
+            b"stsz",
+            full_box(
+                0,
+                [
+                    u32::try_from(sample.len()).unwrap().to_be_bytes(),
+                    1_u32.to_be_bytes(),
+                ]
+                .concat(),
+            ),
+        );
+        let stsc = boxed(
+            b"stsc",
+            full_box(
+                0,
+                [
+                    1_u32.to_be_bytes(),
+                    1_u32.to_be_bytes(),
+                    1_u32.to_be_bytes(),
+                    1_u32.to_be_bytes(),
+                ]
+                .concat(),
+            ),
+        );
+        let ftyp = boxed(
+            b"ftyp",
+            [b"iamf".as_slice(), &[0, 0, 0, 0], compatible_brand, b"iso6"].concat(),
+        );
+        let make_moov = |chunk_offset: u32| {
+            let stco = boxed(
+                b"stco",
+                full_box(
+                    0,
+                    [1_u32.to_be_bytes(), chunk_offset.to_be_bytes()].concat(),
+                ),
+            );
+            let stbl = boxed(
+                b"stbl",
+                [stsd.clone(), stts.clone(), stsz.clone(), stsc.clone(), stco].concat(),
+            );
+            let mdhd = boxed(
+                b"mdhd",
+                full_box(
+                    0,
+                    [
+                        vec![0; 8],
+                        48_000_u32.to_be_bytes().to_vec(),
+                        1_u32.to_be_bytes().to_vec(),
+                        vec![0; 4],
+                    ]
+                    .concat(),
+                ),
+            );
+            let hdlr = boxed(
+                b"hdlr",
+                full_box(0, [vec![0; 4], b"soun".to_vec(), vec![0; 12]].concat()),
+            );
+            let tkhd = boxed(
+                b"tkhd",
+                full_box(
+                    0,
+                    [vec![0; 8], 1_u32.to_be_bytes().to_vec(), vec![0; 68]].concat(),
+                ),
+            );
+            let mdia = boxed(b"mdia", [mdhd, hdlr, boxed(b"minf", stbl)].concat());
+            boxed(b"moov", boxed(b"trak", [tkhd, mdia].concat()))
+        };
+        let placeholder = make_moov(0);
+        let chunk_offset = u32::try_from(ftyp.len() + placeholder.len() + 8).unwrap();
+        let moov = make_moov(chunk_offset);
+        [ftyp, moov, boxed(b"mdat", sample)].concat()
     }
 
     fn minimal_audio_mp4(chunk_offset: u32) -> Vec<u8> {
@@ -2398,6 +3431,125 @@ mod tests {
         assert!(result.passed, "{result:#?}");
         assert_eq!(result.format, "isobmff");
         assert_eq!(result.properties["tracks"][0]["codecs"][0], "mp4a");
+    }
+
+    #[test]
+    fn audits_iso_bmff_iamf_configuration_samples_and_timing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("presentation.mp4");
+        let bytes = minimal_iamf_mp4(b"iamf", iamf_obu(6, &[0]));
+        File::create(&path).unwrap().write_all(&bytes).unwrap();
+        let result = crate::container_qc::audit(&path).unwrap();
+        assert!(result.passed, "{result:#?}");
+        assert_eq!(result.properties["iamf_tracks"][0]["validated_samples"], 1);
+        for rule_id in [
+            "FORGE-ISOBMFF-IAMF-BRAND",
+            "FORGE-ISOBMFF-IAMF-SAMPLE-ENTRY",
+            "FORGE-ISOBMFF-IAMF-CONFIG",
+            "FORGE-ISOBMFF-IAMF-SAMPLE-DATA",
+            "FORGE-ISOBMFF-IAMF-SAMPLE-TIMING",
+            "FORGE-ISOBMFF-IAMF-ROLL-GROUP",
+            "FORGE-ISOBMFF-IAMF-TRIM",
+            "FORGE-ISOBMFF-IAMF-SYNC-CTS",
+            "FORGE-IAMF-TIMELINE",
+        ] {
+            assert!(result
+                .layers
+                .iter()
+                .flat_map(|layer| &layer.checks)
+                .any(|item| item.rule_id == rule_id && item.passed));
+        }
+    }
+
+    #[test]
+    fn rejects_iso_bmff_iamf_missing_brand_and_sample_delimiter() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing_brand = directory.path().join("missing-brand.mp4");
+        let bytes = minimal_iamf_mp4(b"isom", iamf_obu(6, &[0]));
+        File::create(&missing_brand)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        let result = crate::container_qc::audit(&missing_brand).unwrap();
+        assert!(!result.passed);
+        assert!(result
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.checks)
+            .any(|item| item.rule_id == "FORGE-ISOBMFF-IAMF-BRAND" && !item.passed));
+
+        let delimiter = directory.path().join("delimiter.mp4");
+        let sample = [iamf_obu(4, &[]), iamf_obu(6, &[0])].concat();
+        let bytes = minimal_iamf_mp4(b"iamf", sample);
+        File::create(&delimiter).unwrap().write_all(&bytes).unwrap();
+        let result = crate::container_qc::audit(&delimiter).unwrap();
+        assert!(!result.passed);
+        assert!(result
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.checks)
+            .any(|item| item.rule_id == "FORGE-ISOBMFF-IAMF-SAMPLE-DATA" && !item.passed));
+    }
+
+    #[test]
+    fn rejects_invalid_iamf_configuration_boxes_and_stsc_mappings() {
+        assert!(validate_iamf_config_obus(&iamf_obu(4, &[])).is_err());
+        assert!(validate_iamf_config_obus(&[31 << 3, 2, 0]).is_err());
+
+        let config = iamf_obu(31, b"iamf\x00\x00");
+        let invalid_version = [vec![2, config.len() as u8], config.clone()].concat();
+        let children = vec![("iacb".to_string(), invalid_version.as_slice())];
+        let mut checks = Vec::new();
+        let entry = vec![0_u8; 36];
+        parse_iamf_sample_entry(&entry, &children, &mut checks);
+        assert!(checks
+            .iter()
+            .any(|item| item.rule_id == "FORGE-ISOBMFF-IAMF-CONFIG" && !item.passed));
+
+        let valid_configuration = [vec![1, config.len() as u8], config].concat();
+        let duplicate_children = vec![
+            ("iacb".to_string(), valid_configuration.as_slice()),
+            ("iacb".to_string(), valid_configuration.as_slice()),
+        ];
+        let mut checks = Vec::new();
+        parse_iamf_sample_entry(&entry, &duplicate_children, &mut checks);
+        assert!(checks
+            .iter()
+            .any(|item| item.rule_id == "FORGE-ISOBMFF-IAMF-CONFIG" && !item.passed));
+
+        let track = Track {
+            sample_sizes: vec![1],
+            chunk_offsets: vec![0],
+            sample_to_chunk: vec![(1, 1, 1), (2, 1, 1)],
+            ..Track::default()
+        };
+        assert!(sample_locations(&track).is_err());
+
+        let default_roll = Track {
+            roll_distances: vec![-4],
+            roll_default_description_index: Some(1),
+            ..Track::default()
+        };
+        assert_eq!(
+            resolve_roll_assignments(&default_roll, 2).unwrap(),
+            vec![Some(-4), Some(-4)]
+        );
+        let explicit_roll = Track {
+            roll_distances: vec![-4],
+            roll_default_description_index: Some(1),
+            roll_sample_runs: vec![(1, 1), (1, 0)],
+            ..Track::default()
+        };
+        assert_eq!(
+            resolve_roll_assignments(&explicit_roll, 2).unwrap(),
+            vec![Some(-4), Some(-4)]
+        );
+        let undefined_roll = Track {
+            roll_distances: vec![-4],
+            roll_sample_runs: vec![(1, 2)],
+            ..Track::default()
+        };
+        assert!(resolve_roll_assignments(&undefined_roll, 1).is_err());
     }
 
     #[test]
