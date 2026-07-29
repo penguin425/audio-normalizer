@@ -28,8 +28,10 @@ Forge already provides:
   Atmos/JOC Extension Type A signalling, six-block access-unit and
   independent/dependent presentation grouping, plus authoritative external
   E-AC-3 JOC render checks.
-- Bounded standalone AOMedia IAMF v1.1 OBU QC plus external OAR v1.0.0
-  presentation-render loudness, true-peak, duration, and reference checks.
+- Bounded standalone AOMedia IAMF v1.1 OBU QC with supported codec-config
+  4CC/frame/roll/decoder semantics, Audio Element codec/substream ID uniqueness,
+  audio-frame linking, plus external OAR v1.0.0 presentation-render loudness,
+  true-peak, duration, and reference checks.
 - Bounded MPEG-TS/M2TS QC for packet layout, continuity, PAT/PMT CRC and
   programme maps, audio PES headers, and PTS continuity.
 - Bounded SMPTE ST 377-1 MXF QC for KLV framing, partitions and links,
@@ -139,9 +141,10 @@ generations.
 - DTS core/HD metadata and decoded presentation checks through an optional
   adapter.
 - WavPack, Monkey's Audio, and ALAC native frame/checksum validation.
-- IAMF descriptor payload linking, codec-config semantics, profile channel
-  limits, parameter/audio-frame timeline reconciliation, ISO-BMFF IAMF
-  encapsulation, and OAR conformance vectors. Standalone OBU bounds/order and
+- IAMF full Audio Element and Mix Presentation payload semantics, profile
+  channel limits, parameter/audio-frame timeline reconciliation, ISO-BMFF IAMF
+  encapsulation, and broader OAR conformance vectors. Standalone OBU
+  bounds/order, codec/substream linking, supported codec configurations, and
   externally rendered presentation QC have shipped.
 
 ### Streaming and platform delivery
