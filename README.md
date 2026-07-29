@@ -548,9 +548,20 @@ functionally equivalent inherited media properties. Explicit segment
 timelines and lists may drop expired prefixes and append new references, but
 overlapping segment times must retain their duration and resource identity.
 
+Pass an RFC 5261 / MPEG-DASH patch as `--mpd-patch update.mpp`, with the base
+MPD as the positional input, to apply each operation in document order and
+audit the derived MPD as a successive update. Forge checks `mpdId`,
+`originalPublishTime`, and `publishTime`, requires every selector to resolve
+to exactly one node, and supports the common DASH patch forms: element and
+attribute `add`, `replace`, and `remove`; `prepend`, `before`, and `after`;
+one-based position predicates; and attribute, child-value, or string-value
+predicates. Inputs are bounded by the MPD size, element, depth, and operation
+limits. Unsupported RFC 5261 selector/node forms fail closed.
+
 This remains a static, local package audit. It does not fetch clock servers or
 remote media, observe the origin/CDN availability window, validate HTTP
-chunked transfer, apply MPD Patch documents, or observe a live update cadence.
+chunked transfer, implement RFC 5261 comment/processing-instruction/namespace
+node patching, or observe a live update cadence.
 
 The profiles track
 [ISO/IEC 23009-1:2026 MPEG-DASH](https://www.iso.org/standard/23009-1), the
@@ -558,6 +569,8 @@ The profiles track
 the DASH-IF [IOP v5 publications](https://dashif.org/guidelines/iop-v5/),
 [current Low-Latency Live change request](https://dashif.org/docs/CR-Low-Latency-Live-r8.pdf),
 [restricted timing model](https://dashif.org/Guidelines-TimingModel/),
+[MPD Patch guidelines](https://dashif.org/DASH-IF-IOP/mpd-patch/),
+[RFC 5261 XML Patch operations](https://www.rfc-editor.org/rfc/rfc5261),
 [events guidelines](https://dashif.org/docs/IOP-Guidelines/DASH-IF-IOP-Part10-v5.0.0.pdf),
 and [content-protection guidelines](https://dashif.org/Guidelines-Security/),
 plus ISO/IEC 23000-19:2024 CMAF. DASH-IF recommendations are kept distinct

@@ -22,6 +22,7 @@ pub mod cli;
 pub mod codec_qc;
 pub mod compare;
 pub mod container_qc;
+mod dash_patch;
 pub mod dash_qc;
 pub mod decoder;
 pub mod dialogue_provider;

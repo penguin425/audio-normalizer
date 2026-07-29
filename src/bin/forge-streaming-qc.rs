@@ -32,8 +32,11 @@ struct Cli {
     #[arg(long)]
     compact: bool,
     /// Compare this DASH MPD with the preceding full MPD snapshot.
-    #[arg(long, value_name = "MPD")]
+    #[arg(long, value_name = "MPD", conflicts_with = "mpd_patch")]
     previous_mpd: Option<PathBuf>,
+    /// Apply and audit an MPD Patch against the input DASH MPD.
+    #[arg(long, value_name = "MPP", conflicts_with = "previous_mpd")]
+    mpd_patch: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -61,8 +64,10 @@ fn run(cli: Cli) -> Result<bool, String> {
     });
     let (mut bytes, passed, warning_count) = match profile {
         Profile::Rfc8216 | Profile::AppleHls | Profile::LlHls => {
-            if cli.previous_mpd.is_some() {
-                return Err("--previous-mpd is only valid for DASH profiles".into());
+            if cli.previous_mpd.is_some() || cli.mpd_patch.is_some() {
+                return Err(
+                    "--previous-mpd and --mpd-patch are only valid for DASH profiles".into(),
+                );
             }
             let profile = match profile {
                 Profile::Rfc8216 => HlsProfile::Rfc8216,
@@ -82,7 +87,9 @@ fn run(cli: Cli) -> Result<bool, String> {
                 Profile::DashLive => DashProfile::DashLive,
                 Profile::Rfc8216 | Profile::AppleHls | Profile::LlHls => unreachable!(),
             };
-            let audit = if let Some(previous) = &cli.previous_mpd {
+            let audit = if let Some(patch) = &cli.mpd_patch {
+                dash_qc::audit_with_patch(&cli.input, patch, profile)?
+            } else if let Some(previous) = &cli.previous_mpd {
                 dash_qc::audit_with_previous(&cli.input, previous, profile)?
             } else {
                 dash_qc::audit(&cli.input, profile)?

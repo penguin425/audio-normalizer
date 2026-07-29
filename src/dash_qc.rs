@@ -1,6 +1,6 @@
 //! ISO/IEC 23009-1 DASH MPD validation with bounded local CMAF checks.
 
-use crate::container_qc;
+use crate::{container_qc, dash_patch};
 use base64::Engine as _;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
@@ -287,9 +287,76 @@ pub fn audit_with_previous(
 ) -> Result<DashAudit, String> {
     let previous = load_mpd(previous_path)?;
     let current = load_mpd(path)?;
-    let mut audit = audit_mpd(path, &current, profile)?;
+    let audit = audit_mpd(path, &current, profile)?;
+    Ok(complete_update_audit(
+        audit,
+        previous_path,
+        &previous,
+        &current,
+        profile,
+        Vec::new(),
+    ))
+}
+
+pub fn audit_with_patch(
+    base_path: &Path,
+    patch_path: &Path,
+    profile: DashProfile,
+) -> Result<DashAudit, String> {
+    let base_xml = load_bounded_xml(base_path, "MPD")?;
+    let patch_xml = load_bounded_xml(patch_path, "MPD Patch")?;
+    let previous = parse_mpd(&base_xml)?;
+    let applied = dash_patch::apply(&base_xml, &patch_xml)?;
+    if applied.xml.len() as u64 > MAX_MPD_BYTES {
+        return Err(format!(
+            "patched MPD exceeds the {MAX_MPD_BYTES} byte safety limit"
+        ));
+    }
+    let current = parse_mpd(&applied.xml)?;
+    let audit = audit_mpd(base_path, &current, profile)?;
+    let mut patch_findings = Vec::new();
+    validate_patch_envelope(&previous, &current, &applied, &mut patch_findings);
+    let mut audit = complete_update_audit(
+        audit,
+        base_path,
+        &previous,
+        &current,
+        profile,
+        patch_findings,
+    );
+    if let Some(properties) = audit.properties.as_object_mut() {
+        properties.insert(
+            "patch_path".into(),
+            Value::String(patch_path.to_string_lossy().into_owned()),
+        );
+        properties.insert("patch_mpd_id".into(), Value::String(applied.mpd_id));
+        properties.insert(
+            "patch_original_publish_time".into(),
+            Value::String(applied.original_publish_time),
+        );
+        properties.insert(
+            "patch_publish_time".into(),
+            Value::String(applied.publish_time),
+        );
+        properties.insert(
+            "patch_operation_count".into(),
+            Value::from(applied.operation_count as u64),
+        );
+    }
+    Ok(audit)
+}
+
+fn complete_update_audit(
+    mut audit: DashAudit,
+    previous_path: &Path,
+    previous: &Mpd,
+    current: &Mpd,
+    profile: DashProfile,
+    initial_findings: Vec<DashFinding>,
+) -> DashAudit {
+    audit.findings.extend(initial_findings);
     let mut previous_findings = Vec::new();
-    validate_mpd(previous_path, &previous, profile, &mut previous_findings);
+    validate_mpd(previous_path, previous, profile, &mut previous_findings);
     for item in &mut previous_findings {
         item.message = format!("previous snapshot: {}", item.message);
     }
@@ -297,7 +364,7 @@ pub fn audit_with_previous(
         .iter()
         .all(|item| item.severity == Severity::Warning || item.passed);
     audit.findings.extend(previous_findings);
-    validate_mpd_update(&previous, &current, &mut audit.findings);
+    validate_mpd_update(previous, current, &mut audit.findings);
     audit.warning_count = audit
         .findings
         .iter()
@@ -322,21 +389,25 @@ pub fn audit_with_previous(
         );
         properties.insert("previous_passed".into(), Value::Bool(previous_passed));
     }
-    Ok(audit)
+    audit
 }
 
 fn load_mpd(path: &Path) -> Result<Mpd, String> {
+    let xml = load_bounded_xml(path, "MPD")?;
+    parse_mpd(&xml)
+}
+
+fn load_bounded_xml(path: &Path, label: &str) -> Result<Vec<u8>, String> {
     let metadata =
         fs::metadata(path).map_err(|error| format!("stat {}: {error}", path.display()))?;
     if metadata.len() > MAX_MPD_BYTES {
         return Err(format!(
-            "{} exceeds the {} byte MPD safety limit",
+            "{} exceeds the {} byte {label} safety limit",
             path.display(),
             MAX_MPD_BYTES
         ));
     }
-    let xml = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    parse_mpd(&xml)
+    fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))
 }
 
 fn audit_mpd(path: &Path, mpd: &Mpd, profile: DashProfile) -> Result<DashAudit, String> {
@@ -960,6 +1031,69 @@ fn close_element(
         }
         _ => {}
     }
+}
+
+fn validate_patch_envelope(
+    previous: &Mpd,
+    current: &Mpd,
+    patch: &dash_patch::AppliedPatch,
+    findings: &mut Vec<DashFinding>,
+) {
+    findings.push(finding(
+        "FORGE-DASH-PATCH-MPD-ID",
+        Severity::Error,
+        previous.id.as_deref() == Some(patch.mpd_id.as_str()),
+        "Patch mpdId matches the base MPD id",
+        Some(json!({
+            "mpd_id": previous.id,
+            "patch_mpd_id": patch.mpd_id
+        })),
+    ));
+    let original_matches = previous
+        .publish_time
+        .as_deref()
+        .and_then(parse_xs_datetime_seconds)
+        .zip(parse_xs_datetime_seconds(&patch.original_publish_time))
+        .is_some_and(|(mpd, patch)| mpd == patch);
+    findings.push(finding(
+        "FORGE-DASH-PATCH-ORIGINAL-PUBLISH-TIME",
+        Severity::Error,
+        original_matches,
+        "Patch originalPublishTime matches the base MPD publishTime",
+        Some(json!({
+            "mpd_publish_time": previous.publish_time,
+            "patch_original_publish_time": patch.original_publish_time
+        })),
+    ));
+    let patch_time_order = parse_xs_datetime_seconds(&patch.original_publish_time)
+        .zip(parse_xs_datetime_seconds(&patch.publish_time))
+        .is_some_and(|(original, current)| current > original);
+    findings.push(finding(
+        "FORGE-DASH-PATCH-PUBLISH-TIME",
+        Severity::Error,
+        patch_time_order,
+        "Patch publishTime is later than originalPublishTime",
+        Some(json!({
+            "original_publish_time": patch.original_publish_time,
+            "publish_time": patch.publish_time
+        })),
+    ));
+    let result_matches = current
+        .publish_time
+        .as_deref()
+        .and_then(parse_xs_datetime_seconds)
+        .zip(parse_xs_datetime_seconds(&patch.publish_time))
+        .is_some_and(|(mpd, patch)| mpd == patch);
+    findings.push(finding(
+        "FORGE-DASH-PATCH-RESULT-PUBLISH-TIME",
+        Severity::Error,
+        result_matches,
+        "patched MPD publishTime matches Patch publishTime",
+        Some(json!({
+            "mpd_publish_time": current.publish_time,
+            "patch_publish_time": patch.publish_time
+        })),
+    ));
 }
 
 fn validate_mpd_update(previous: &Mpd, current: &Mpd, findings: &mut Vec<DashFinding>) {
