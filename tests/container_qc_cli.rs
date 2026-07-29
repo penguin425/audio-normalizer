@@ -339,6 +339,21 @@ fn container_qc_cli_audits_ac3_and_eac3_syncframes_and_dialnorm() {
         assert_eq!(audit["properties"]["bsid"], expected_bsid);
         assert_eq!(audit["properties"]["dialnorm_db"][0], dialnorm);
         assert!(audit["properties"]["frames"].as_u64().unwrap() > 0);
+        assert_eq!(
+            audit["properties"]["drc_encoded_gain_ranges_db"]["rf_mode_compr"],
+            serde_json::json!([-48.165, 47.889])
+        );
+        if codec == "eac3" {
+            assert_eq!(audit["properties"]["access_units"]["valid"], true);
+            assert!(
+                audit["properties"]["access_units"]["complete"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+            assert_eq!(audit["properties"]["atmos_joc"]["signaled"], false);
+            assert_eq!(audit["properties"]["presentations"][0]["channels"], 1);
+        }
     }
 }
 

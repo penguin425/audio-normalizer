@@ -25,6 +25,7 @@ pub struct PresentationQcSpec {
 #[serde(rename_all = "kebab-case")]
 pub enum ImmersiveCodec {
     Ac4,
+    Eac3Joc,
     Iamf,
     MpegH,
 }
@@ -33,6 +34,7 @@ impl ImmersiveCodec {
     fn standard(self) -> &'static str {
         match self {
             Self::Ac4 => "ETSI TS 103 190",
+            Self::Eac3Joc => "ETSI TS 102 366 / Dolby Digital Plus JOC",
             Self::Iamf => "AOMedia IAMF v1.1 / Open Audio Renderer v1.0.0",
             Self::MpegH => "ISO/IEC 23008-3",
         }
@@ -245,6 +247,24 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(spec.codec, ImmersiveCodec::Iamf));
+    }
+
+    #[test]
+    fn eac3_joc_requires_external_renderer_evidence() {
+        assert_eq!(
+            ImmersiveCodec::Eac3Joc.standard(),
+            "ETSI TS 102 366 / Dolby Digital Plus JOC"
+        );
+        let spec: PresentationQcSpec = serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "codec": "eac3-joc",
+                "renderer": {"name": "licensed-renderer", "version": "1.2.3"},
+                "presentations": [{"id": "5.1.2", "rendered_path": "render.wav"}]
+            }"#,
+        )
+        .unwrap();
+        assert!(matches!(spec.codec, ImmersiveCodec::Eac3Joc));
     }
 
     #[test]

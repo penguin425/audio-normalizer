@@ -39,3 +39,44 @@ fn presentation_qc_cli_writes_auditable_multi_presentation_report() {
     assert_eq!(value["presentation_count"], 2);
     assert_eq!(value["passed"], true);
 }
+
+#[test]
+fn presentation_qc_cli_accepts_eac3_joc_renderer_evidence() {
+    let work = tempfile::tempdir().unwrap();
+    let render = work.path().join("render-5.1.2.wav");
+    let spec = work.path().join("eac3-joc.json");
+    let audio = AudioBuffer {
+        sample_rate: 48_000,
+        channels: 2,
+        frames: 48_000,
+        data: vec![vec![0.01; 48_000], vec![0.01; 48_000]],
+        channel_roles: default_channel_roles(2),
+        source_kind: PcmKind::F32,
+    };
+    WavWriter::write(&render, &audio, PcmKind::F32, false).unwrap();
+    std::fs::write(
+        &spec,
+        r#"{
+          "schema_version": 1,
+          "codec": "eac3-joc",
+          "renderer": {"name": "licensed-joc-renderer", "version": "4.2"},
+          "presentations": [
+            {"id": "5.1.2", "rendered_path": "render-5.1.2.wav"}
+          ]
+        }"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-presentation-qc"))
+        .arg(&spec)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["codec"], "eac3-joc");
+    assert_eq!(
+        value["codec_standard"],
+        "ETSI TS 102 366 / Dolby Digital Plus JOC"
+    );
+    assert_eq!(value["renderer"]["name"], "licensed-joc-renderer");
+    assert_eq!(value["passed"], true);
+}
