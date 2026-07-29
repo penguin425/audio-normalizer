@@ -512,6 +512,97 @@ fn container_qc_cli_audits_standalone_iamf_obu_structure() {
 }
 
 #[test]
+fn container_qc_cli_audits_iamf_parameter_blocks_and_timeline() {
+    fn obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() < 128);
+        let mut bytes = vec![obu_type << 3, payload.len() as u8];
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn stream(parameter_block: &[u8]) -> Vec<u8> {
+        let mix = vec![
+            0, 0, // Mix ID and no localized labels.
+            1, 1, 0, // One sub-mix with one audio element.
+            0, 0, // Stereo rendering mode and no rendering extension.
+            100, 0x80, 0xf7, 0x02, 0x80, 0, 0, // Element gain at 48 kHz.
+            100, 0x80, 0xf7, 0x02, 0x80, 0, 0, // Output gain at 48 kHz.
+            1, 0x80, // One Sound System A stereo layout.
+            0, 0, 0, 0, 0, // Base loudness fields.
+        ];
+        let mut bytes = obu(31, b"iamf\x00\x00");
+        bytes.extend(obu(
+            0,
+            &[0, b'i', b'p', b'c', b'm', 1, 0, 0, 0, 16, 0, 0, 187, 128],
+        ));
+        bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0, 0x20, 0, 1, 0]));
+        bytes.extend(obu(2, &mix));
+        bytes.extend(obu(4, &[]));
+        bytes.extend(obu(3, parameter_block));
+        bytes.extend(obu(6, &[0]));
+        bytes
+    }
+
+    fn check<'a>(audit: &'a Value, rule_id: &str) -> &'a Value {
+        audit["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|layer| layer["checks"].as_array().unwrap())
+            .find(|check| check["rule_id"] == rule_id)
+            .unwrap()
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let valid = directory.path().join("parameter-timeline.iamf");
+    // ID 100, duration 1, one constant subblock, STEP gain of 0 dB.
+    fs::write(&valid, stream(&[100, 1, 1, 0, 0, 0])).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&valid)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(check(&audit, "FORGE-IAMF-PARAMETER-BLOCK")["passed"], true);
+    assert_eq!(check(&audit, "FORGE-IAMF-TIMELINE")["passed"], true);
+    assert_eq!(audit["properties"]["temporal_units"], 1);
+    assert_eq!(audit["properties"]["temporal_delimiters"], 1);
+    assert_eq!(
+        audit["properties"]["parameter_blocks"][0]["animation_types"],
+        serde_json::json!([0])
+    );
+
+    let short_audio = directory.path().join("parameter-overrun.iamf");
+    fs::write(&short_audio, stream(&[100, 2, 2, 0, 0, 0])).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&short_audio)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(check(&audit, "FORGE-IAMF-PARAMETER-BLOCK")["passed"], true);
+    assert_eq!(check(&audit, "FORGE-IAMF-TIMELINE")["passed"], false);
+    assert!(audit["properties"]["payload_errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|error| error
+            .as_str()
+            .unwrap()
+            .contains("does not cover the applicable audio duration")));
+
+    let truncated = directory.path().join("truncated-parameter.iamf");
+    fs::write(&truncated, stream(&[100, 1, 1, 1, 0])).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&truncated)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(check(&audit, "FORGE-IAMF-PARAMETER-BLOCK")["passed"], false);
+}
+
+#[test]
 fn container_qc_cli_rejects_invalid_iamf_audio_element_layouts() {
     fn obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
         let mut bytes = vec![obu_type << 3, payload.len() as u8];

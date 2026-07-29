@@ -415,8 +415,9 @@ sequence headers and profiles, descriptor ordering, data redundancy/trimming
 flags, and complete-file consumption without decoding codec payloads. Stable
 `FORGE-IAMF-CODEC-CONFIG`, `FORGE-IAMF-AUDIO-ELEMENT`,
 `FORGE-IAMF-MIX-PRESENTATION`, `FORGE-IAMF-PROFILE-CONSTRAINTS`,
-`FORGE-IAMF-DESCRIPTOR-LINKS`, and `FORGE-IAMF-AUDIO-FRAME-LINKS` checks parse
-the Codec Config prefix and full Opus, FLAC STREAMINFO, or LPCM decoder
+`FORGE-IAMF-DESCRIPTOR-LINKS`, `FORGE-IAMF-AUDIO-FRAME-LINKS`,
+`FORGE-IAMF-PARAMETER-BLOCK`, and `FORGE-IAMF-TIMELINE` checks parse the Codec
+Config prefix and full Opus, FLAC STREAMINFO, or LPCM decoder
 configuration, enforce AAC-LC frame and roll declarations, and parse complete
 Audio Element and Mix Presentation syntax. The Audio Element check validates
 bounded and unique parameter definitions, parameter/frame timing,
@@ -436,11 +437,20 @@ recognized presentation must conform to the primary profile; alternative
 presentations may instead conform to the declared additional profile.
 Descriptor and frame checks reject duplicate or missing
 codec/element/parameter/substream IDs and require every implicit or explicit
-Audio Frame OBU to resolve to a declared substream. Counts, layouts, channel
-counts, frame lengths, roll distances, sample rates, sample sizes, and bounded
-error evidence remain visible in JSON. Validation is exercised against pinned
-AOMedia `libiamf` v1.1.0 and `iamf-tools` v2.1.0 streams in addition to clean
-and intentionally defective local fixtures.
+Audio Frame OBU to resolve to a declared substream. Parameter Block validation
+covers descriptor- and block-defined timing, constant and explicit subblocks,
+STEP/LINEAR/BEZIER Mix Gain data, reserved Demixing modes, per-layer
+Reconstruction Gain flags, bounded extension data, and the required
+ignore-on-unknown-ID behavior. Exact rational timelines enforce contiguous
+parameter coverage, frame-aligned Demixing/Reconstruction Gain, equal audio
+substream frame counts and trimming, parameter-before-audio ordering at equal
+timestamps, and consistent optional Temporal Delimiters while allowing a Mix
+Gain block to span multiple audio frames. Counts, layouts, channel counts,
+frame lengths, roll distances, sample rates, sample sizes, parameter
+animations, temporal units, and bounded error evidence remain visible in JSON.
+Validation is exercised against pinned AOMedia `libiamf` v1.1.0 and
+`iamf-tools` v2.1.0 streams in addition to clean and intentionally defective
+local fixtures.
 Rendering is deliberately separate: render every Mix Presentation and target
 layout with an
 [Open Audio Renderer v1.0.0](https://aomedia.org/specifications/oar/)

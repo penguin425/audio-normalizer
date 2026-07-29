@@ -40,6 +40,7 @@ struct AudioElement {
     substream_ids: Vec<u64>,
     parameter_ids: Vec<u64>,
     parameter_types: Vec<u64>,
+    parameter_definitions: Vec<ParameterDefinition>,
     config: AudioElementConfig,
     trailing_bytes: usize,
 }
@@ -51,12 +52,63 @@ enum AudioElementConfig {
         highest_layout: String,
         output_channels: u16,
         expanded_layout: bool,
+        recon_gain_present: Vec<bool>,
     },
     SceneBased {
         ambisonics_mode: u8,
         output_channels: u16,
     },
     Reserved,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParameterDefinition {
+    id: u64,
+    parameter_type: u64,
+    rate: u64,
+    mode: u8,
+    duration: Option<u64>,
+    constant_subblock_duration: Option<u64>,
+    subblock_durations: Vec<u64>,
+    audio_element_id: Option<u64>,
+    recon_gain_present: Vec<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParameterBlockObservation {
+    id: u64,
+    parameter_type: Option<u64>,
+    duration: Option<u64>,
+    subblocks: usize,
+    animation_types: Vec<u64>,
+    trailing_bytes: usize,
+    ignored: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrimInfo {
+    present: bool,
+    start: u64,
+    end: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OptionalHeader {
+    payload_offset: usize,
+    trim: TrimInfo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimelineKind {
+    Parameter,
+    Audio,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimelinePoint {
+    ticks: u128,
+    rate: u128,
+    kind: TimelineKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,6 +195,8 @@ struct State {
     profile_constraints_valid: bool,
     descriptor_links_valid: bool,
     audio_frames_valid: bool,
+    parameter_blocks_valid: bool,
+    timeline_valid: bool,
     current_codec_configs_by_id: BTreeMap<u64, CodecConfig>,
     current_audio_elements_by_id: BTreeMap<u64, AudioElement>,
     current_mix_presentations_by_id: BTreeMap<u64, MixPresentation>,
@@ -150,13 +204,32 @@ struct State {
     current_parameter_ids: BTreeSet<u64>,
     current_parameter_types_by_id: BTreeMap<u64, u64>,
     current_mix_gain_definitions: BTreeMap<u64, MixGainDefinition>,
+    current_parameter_definitions_by_id: BTreeMap<u64, ParameterDefinition>,
+    current_audio_element_order: Vec<u64>,
     current_parameter_definitions: usize,
     active_codec_configs: BTreeMap<u64, CodecConfig>,
     active_audio_elements: BTreeMap<u64, AudioElement>,
     active_mix_presentations: BTreeMap<u64, MixPresentation>,
     active_substream_ids: BTreeSet<u64>,
+    active_parameter_definitions_by_id: BTreeMap<u64, ParameterDefinition>,
+    active_substream_order: BTreeMap<u64, usize>,
     pending_substream_ids: BTreeSet<u64>,
     frame_counts: BTreeMap<u64, u64>,
+    audio_ticks: BTreeMap<u64, u128>,
+    audio_rates: BTreeMap<u64, u64>,
+    parameter_block_counts: BTreeMap<u64, u64>,
+    parameter_ticks: BTreeMap<u64, u128>,
+    parameter_block_observations: Vec<ParameterBlockObservation>,
+    ignored_parameter_blocks: u64,
+    temporal_units: u64,
+    temporal_delimiters: u64,
+    delimiter_pending: bool,
+    current_timeline_point: Option<TimelinePoint>,
+    current_audio_order: Option<usize>,
+    trim_by_frame_index: BTreeMap<u64, (TrimInfo, usize)>,
+    last_trim_by_substream: BTreeMap<u64, TrimInfo>,
+    ended_substreams: BTreeSet<u64>,
+    start_trim_prefix_valid: BTreeMap<u64, bool>,
     codec_config_observations: Vec<CodecConfig>,
     audio_element_observations: Vec<AudioElement>,
     mix_presentation_observations: Vec<MixPresentation>,
@@ -212,6 +285,8 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
         profile_constraints_valid: true,
         descriptor_links_valid: true,
         audio_frames_valid: true,
+        parameter_blocks_valid: true,
+        timeline_valid: true,
         ..State::default()
     };
     let mut offset = 0_u64;
@@ -253,12 +328,12 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
                 path.display()
             )
         })?;
-        let Some(payload_offset) = parse_optional_header(&body, trimming, extension, &mut state)
+        let Some(optional_header) = parse_optional_header(&body, trimming, extension, &mut state)
         else {
             state.headers_valid = false;
             break;
         };
-        let payload = &body[payload_offset..];
+        let payload = &body[optional_header.payload_offset..];
 
         validate_header_flags(obu_type, redundant, trimming, payload, &mut state);
         update_order(obu_type, redundant, &mut state);
@@ -267,7 +342,11 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
             CODEC_CONFIG => parse_codec_config(payload, &mut state),
             AUDIO_ELEMENT => parse_audio_element(payload, &mut state),
             MIX_PRESENTATION => parse_mix_presentation(payload, &mut state),
-            AUDIO_FRAME..=23 => parse_audio_frame(obu_type, payload, &mut state),
+            PARAMETER_BLOCK => parse_parameter_block(payload, &mut state),
+            TEMPORAL_DELIMITER => note_temporal_delimiter(&mut state),
+            AUDIO_FRAME..=23 => {
+                parse_audio_frame(obu_type, payload, optional_header.trim, &mut state)
+            }
             _ => {}
         }
 
@@ -278,6 +357,7 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
         offset += total_bytes;
     }
     finish_descriptor_set(&mut state);
+    finish_timeline(&mut state);
     if !state.pending_substream_ids.is_empty() {
         state.audio_frames_valid = false;
         let pending_count = state.pending_substream_ids.len();
@@ -432,6 +512,31 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
             })),
         ),
         check(
+            "FORGE-IAMF-PARAMETER-BLOCK",
+            state.parameter_blocks_valid,
+            "recognized parameter blocks resolve definitions and have bounded timing, subblocks, animation, demixing, and reconstruction-gain syntax",
+            Some(json!({
+                "parameter_blocks": parameter_block_json(&state.parameter_block_observations),
+                "parameter_block_counts": state.parameter_block_counts,
+                "ignored_parameter_blocks": state.ignored_parameter_blocks,
+                "errors": state.payload_errors,
+                "evidence_truncated": state.payload_evidence_truncated,
+            })),
+        ),
+        check(
+            "FORGE-IAMF-TIMELINE",
+            state.timeline_valid,
+            "audio and parameter substreams have aligned, non-overlapping temporal units with complete parameter coverage, matching audio frame counts and trimming, delimiter use, and data ordering",
+            Some(json!({
+                "temporal_units": state.temporal_units,
+                "temporal_delimiters": state.temporal_delimiters,
+                "audio_frame_counts": state.frame_counts,
+                "parameter_block_counts": state.parameter_block_counts,
+                "errors": state.payload_errors,
+                "evidence_truncated": state.payload_evidence_truncated,
+            })),
+        ),
+        check(
             "FORGE-IAMF-OAR-RENDER",
             true,
             "structural QC does not claim rendered loudness; audit every OAR output with forge-presentation-qc",
@@ -465,6 +570,11 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
             "mix_presentations": mix_presentation_json(&state.mix_presentation_observations),
             "mix_profile_support": mix_profile_json(&state.mix_profile_observations),
             "audio_frame_counts": state.frame_counts,
+            "parameter_blocks": parameter_block_json(&state.parameter_block_observations),
+            "parameter_block_counts": state.parameter_block_counts,
+            "ignored_parameter_blocks": state.ignored_parameter_blocks,
+            "temporal_units": state.temporal_units,
+            "temporal_delimiters": state.temporal_delimiters,
             "payload_errors": state.payload_errors,
             "payload_evidence_truncated": state.payload_evidence_truncated,
             "renderer_qc": "external OAR v1.0.0 render required",
@@ -477,8 +587,13 @@ fn parse_optional_header(
     trimming: bool,
     extension: bool,
     state: &mut State,
-) -> Option<usize> {
+) -> Option<OptionalHeader> {
     let mut cursor = 0_usize;
+    let mut trim = TrimInfo {
+        present: false,
+        start: 0,
+        end: 0,
+    };
     if trimming {
         let (trim_end, bytes) = read_leb_slice(body.get(cursor..)?)?;
         cursor = cursor.checked_add(bytes)?;
@@ -487,6 +602,11 @@ fn parse_optional_header(
         state.trimmed_frames += 1;
         state.trim_at_end_samples = state.trim_at_end_samples.saturating_add(trim_end);
         state.trim_at_start_samples = state.trim_at_start_samples.saturating_add(trim_start);
+        trim = TrimInfo {
+            present: true,
+            start: trim_start,
+            end: trim_end,
+        };
     }
     if extension {
         let (size, bytes) = read_leb_slice(body.get(cursor..)?)?;
@@ -498,7 +618,10 @@ fn parse_optional_header(
         }
         state.extension_headers += 1;
     }
-    Some(cursor)
+    Some(OptionalHeader {
+        payload_offset: cursor,
+        trim,
+    })
 }
 
 fn validate_header_flags(
@@ -557,6 +680,8 @@ fn update_order(obu_type: u8, redundant: bool, state: &mut State) {
         state.current_parameter_ids.clear();
         state.current_parameter_types_by_id.clear();
         state.current_mix_gain_definitions.clear();
+        state.current_parameter_definitions_by_id.clear();
+        state.current_audio_element_order.clear();
         state.current_parameter_definitions = 0;
         state.saw_data = false;
         return;
@@ -727,9 +852,43 @@ fn finish_descriptor_set(state: &mut State) {
         state.active_audio_elements = state.current_audio_elements_by_id.clone();
         state.active_mix_presentations = state.current_mix_presentations_by_id.clone();
         state.active_substream_ids = state.current_substream_ids.clone();
+        state.active_parameter_definitions_by_id =
+            state.current_parameter_definitions_by_id.clone();
+        state.active_substream_order.clear();
+        let mut substream_order = 0_usize;
+        for element_id in &state.current_audio_element_order {
+            if let Some(element) = state.current_audio_elements_by_id.get(element_id) {
+                for substream_id in &element.substream_ids {
+                    state
+                        .active_substream_order
+                        .insert(*substream_id, substream_order);
+                    substream_order = substream_order.saturating_add(1);
+                }
+            }
+        }
         state
             .pending_substream_ids
             .extend(state.active_substream_ids.iter().copied());
+        for substream_id in &state.active_substream_ids {
+            state
+                .start_trim_prefix_valid
+                .entry(*substream_id)
+                .or_insert(true);
+        }
+        let audio_timing = state
+            .active_audio_elements
+            .values()
+            .filter_map(|element| {
+                let codec = state.active_codec_configs.get(&element.codec_config_id)?;
+                Some((element.substream_ids.clone(), u64::from(codec.sample_rate?)))
+            })
+            .collect::<Vec<_>>();
+        for (substream_ids, rate) in audio_timing {
+            for substream_id in substream_ids {
+                state.audio_ticks.entry(substream_id).or_insert(0);
+                state.audio_rates.entry(substream_id).or_insert(rate);
+            }
+        }
     }
     state.descriptor_sets += 1;
     state.descriptor_phase = false;
@@ -1052,6 +1211,9 @@ fn parse_audio_element(payload: &[u8], state: &mut State) {
                 .current_audio_elements_by_id
                 .insert(element.id, element.clone())
                 .is_some();
+            if !duplicate_element {
+                state.current_audio_element_order.push(element.id);
+            }
             let mut duplicate_substream = false;
             for substream_id in &element.substream_ids {
                 if !state.current_substream_ids.insert(*substream_id) {
@@ -1059,18 +1221,16 @@ fn parse_audio_element(payload: &[u8], state: &mut State) {
                 }
             }
             let mut duplicate_parameter = false;
-            for (parameter_id, parameter_type) in element.parameter_ids.iter().zip(
-                element
-                    .parameter_types
-                    .iter()
-                    .copied()
-                    .filter(|parameter_type| matches!(parameter_type, 1 | 2)),
-            ) {
-                if !state.current_parameter_ids.insert(*parameter_id)
+            for definition in &element.parameter_definitions {
+                if !state.current_parameter_ids.insert(definition.id)
                     || state
                         .current_parameter_types_by_id
-                        .insert(*parameter_id, parameter_type)
-                        .is_some_and(|existing| existing != parameter_type)
+                        .insert(definition.id, definition.parameter_type)
+                        .is_some_and(|existing| existing != definition.parameter_type)
+                    || state
+                        .current_parameter_definitions_by_id
+                        .insert(definition.id, definition.clone())
+                        .is_some_and(|existing| existing != *definition)
                 {
                     duplicate_parameter = true;
                 }
@@ -1155,6 +1315,7 @@ fn audio_element(payload: &[u8], codec: Option<&CodecConfig>) -> Result<AudioEle
     }
     let mut parameter_ids = Vec::new();
     let mut parameter_types = Vec::new();
+    let mut parameter_definitions = Vec::new();
     let mut seen_parameter_types = BTreeSet::new();
     for _ in 0..num_parameters {
         let parameter_type = take_leb(payload, &mut cursor, "param_definition_type")?;
@@ -1171,12 +1332,10 @@ fn audio_element(payload: &[u8], codec: Option<&CodecConfig>) -> Result<AudioEle
                 );
             }
             1 | 2 => {
-                parameter_ids.push(parse_audio_element_parameter(
-                    payload,
-                    &mut cursor,
-                    parameter_type,
-                    codec,
-                )?);
+                let definition =
+                    parse_audio_element_parameter(payload, &mut cursor, parameter_type, codec)?;
+                parameter_ids.push(definition.id);
+                parameter_definitions.push(definition);
             }
             _ => {
                 let size = take_leb(payload, &mut cursor, "param_definition_size")?;
@@ -1206,6 +1365,18 @@ fn audio_element(payload: &[u8], codec: Option<&CodecConfig>) -> Result<AudioEle
             AudioElementConfig::Reserved
         }
     };
+    let recon_gain_present = match &config {
+        AudioElementConfig::ChannelBased {
+            recon_gain_present, ..
+        } => recon_gain_present.clone(),
+        _ => Vec::new(),
+    };
+    for definition in &mut parameter_definitions {
+        definition.audio_element_id = Some(id);
+        if definition.parameter_type == 2 {
+            definition.recon_gain_present = recon_gain_present.clone();
+        }
+    }
     Ok(AudioElement {
         id,
         element_type,
@@ -1213,6 +1384,7 @@ fn audio_element(payload: &[u8], codec: Option<&CodecConfig>) -> Result<AudioEle
         substream_ids,
         parameter_ids,
         parameter_types,
+        parameter_definitions,
         config,
         trailing_bytes: payload.len().saturating_sub(cursor),
     })
@@ -1223,12 +1395,12 @@ fn parse_audio_element_parameter(
     cursor: &mut usize,
     parameter_type: u64,
     codec: Option<&CodecConfig>,
-) -> Result<u64, String> {
+) -> Result<ParameterDefinition, String> {
     let parameter_id = take_leb(payload, cursor, "parameter_id")?;
     let parameter_rate = take_leb(payload, cursor, "parameter_rate")?;
-    if parameter_rate == 0 {
+    if parameter_rate == 0 || parameter_rate > u64::from(u32::MAX) {
         return Err(format!(
-            "parameter {parameter_id} has a zero parameter_rate"
+            "parameter {parameter_id} rate {parameter_rate} is outside the supported non-zero uint32 range"
         ));
     }
     let flags = take_bytes(payload, cursor, 1, "param_definition_mode")?[0];
@@ -1239,12 +1411,23 @@ fn parse_audio_element_parameter(
         ));
     }
     let duration = take_leb(payload, cursor, "parameter duration")?;
-    if duration == 0 {
-        return Err(format!("parameter {parameter_id} duration is zero"));
+    if duration == 0 || duration > u64::from(u32::MAX) {
+        return Err(format!(
+            "parameter {parameter_id} duration {duration} is outside the supported non-zero uint32 range"
+        ));
     }
     let constant_subblock_duration = take_leb(payload, cursor, "constant_subblock_duration")?;
+    if constant_subblock_duration > duration {
+        return Err(format!(
+            "parameter {parameter_id} constant_subblock_duration exceeds duration"
+        ));
+    }
+    let mut subblock_durations = Vec::new();
     if constant_subblock_duration == 0 {
         let num_subblocks = take_leb(payload, cursor, "num_subblocks")?;
+        if num_subblocks == 0 {
+            return Err(format!("parameter {parameter_id} has zero subblocks"));
+        }
         if num_subblocks > MAX_DESCRIPTOR_IDS as u64 {
             return Err(format!(
                 "parameter {parameter_id} num_subblocks {num_subblocks} exceeds {MAX_DESCRIPTOR_IDS}"
@@ -1261,6 +1444,7 @@ fn parse_audio_element_parameter(
             total = total
                 .checked_add(subblock_duration)
                 .ok_or_else(|| format!("parameter {parameter_id} subblock duration overflow"))?;
+            subblock_durations.push(subblock_duration);
         }
         if total != duration {
             return Err(format!(
@@ -1304,7 +1488,17 @@ fn parse_audio_element_parameter(
             ));
         }
     }
-    Ok(parameter_id)
+    Ok(ParameterDefinition {
+        id: parameter_id,
+        parameter_type,
+        rate: parameter_rate,
+        mode,
+        duration: Some(duration),
+        constant_subblock_duration: Some(constant_subblock_duration),
+        subblock_durations,
+        audio_element_id: None,
+        recon_gain_present: Vec::new(),
+    })
 }
 
 fn parse_channel_audio_config(
@@ -1466,6 +1660,7 @@ fn parse_channel_audio_config(
         highest_layout,
         output_channels: cumulative_channels,
         expanded_layout,
+        recon_gain_present: recon_gain_flags,
     })
 }
 
@@ -1650,6 +1845,24 @@ fn parse_mix_presentation(payload: &[u8], state: &mut State) {
                 {
                     conflicting_parameter = true;
                 }
+                let common = ParameterDefinition {
+                    id: definition.id,
+                    parameter_type: 0,
+                    rate: definition.rate,
+                    mode: definition.mode,
+                    duration: definition.duration,
+                    constant_subblock_duration: definition.constant_subblock_duration,
+                    subblock_durations: definition.subblock_durations.clone(),
+                    audio_element_id: None,
+                    recon_gain_present: Vec::new(),
+                };
+                if state
+                    .current_parameter_definitions_by_id
+                    .insert(definition.id, common.clone())
+                    .is_some_and(|existing| existing != common)
+                {
+                    conflicting_parameter = true;
+                }
             }
             state.current_parameter_definitions =
                 state.current_parameter_definitions.saturating_add(
@@ -1823,9 +2036,9 @@ fn parse_mix_gain_definition(
 ) -> Result<MixGainDefinition, String> {
     let parameter_id = take_leb(payload, cursor, "mix_gain parameter_id")?;
     let parameter_rate = take_leb(payload, cursor, "mix_gain parameter_rate")?;
-    if parameter_rate == 0 {
+    if parameter_rate == 0 || parameter_rate > u64::from(u32::MAX) {
         return Err(format!(
-            "mix gain parameter {parameter_id} has a zero parameter_rate"
+            "mix gain parameter {parameter_id} rate {parameter_rate} is outside the supported non-zero uint32 range"
         ));
     }
     let mode = take_bytes(payload, cursor, 1, "mix_gain param_definition_mode")?[0] >> 7;
@@ -1835,9 +2048,9 @@ fn parse_mix_gain_definition(
     if mode == 0 {
         let parsed_duration = take_leb(payload, cursor, "mix_gain duration")?;
         duration = Some(parsed_duration);
-        if parsed_duration == 0 {
+        if parsed_duration == 0 || parsed_duration > u64::from(u32::MAX) {
             return Err(format!(
-                "mix gain parameter {parameter_id} duration is zero"
+                "mix gain parameter {parameter_id} duration {parsed_duration} is outside the supported non-zero uint32 range"
             ));
         }
         let parsed_constant_subblock_duration =
@@ -1936,7 +2149,365 @@ fn parse_mix_layout(payload: &[u8], cursor: &mut usize) -> Result<MixLayout, Str
     })
 }
 
-fn parse_audio_frame(obu_type: u8, payload: &[u8], state: &mut State) {
+fn parse_parameter_block(payload: &[u8], state: &mut State) {
+    let mut cursor = 0_usize;
+    let parameter_id = match take_leb(payload, &mut cursor, "parameter_id") {
+        Ok(value) => value,
+        Err(error) => {
+            state.parameter_blocks_valid = false;
+            record_payload_error(state, format!("invalid Parameter Block OBU: {error}"));
+            return;
+        }
+    };
+    let Some(definition) = state
+        .active_parameter_definitions_by_id
+        .get(&parameter_id)
+        .cloned()
+    else {
+        state.ignored_parameter_blocks = state.ignored_parameter_blocks.saturating_add(1);
+        push_parameter_observation(
+            state,
+            ParameterBlockObservation {
+                id: parameter_id,
+                parameter_type: None,
+                duration: None,
+                subblocks: 0,
+                animation_types: Vec::new(),
+                trailing_bytes: payload.len().saturating_sub(cursor),
+                ignored: true,
+            },
+        );
+        return;
+    };
+    let start_ticks = state
+        .parameter_ticks
+        .get(&parameter_id)
+        .copied()
+        .unwrap_or(0);
+    let parsed = parameter_block(payload, cursor, &definition);
+    match parsed {
+        Ok(observation) => {
+            let Some(duration) = observation.duration else {
+                state.parameter_blocks_valid = false;
+                record_payload_error(
+                    state,
+                    format!("parameter block {parameter_id} has no duration"),
+                );
+                return;
+            };
+            if !parameter_starts_at_audio_cursor(start_ticks, definition.rate, state) {
+                state.timeline_valid = false;
+                record_payload_error(
+                    state,
+                    format!(
+                        "parameter {parameter_id} does not start at the current audio temporal-unit timestamp"
+                    ),
+                );
+            }
+            if note_timeline_point(
+                TimelinePoint {
+                    ticks: start_ticks,
+                    rate: u128::from(definition.rate),
+                    kind: TimelineKind::Parameter,
+                },
+                None,
+                state,
+            )
+            .is_err()
+            {
+                state.timeline_valid = false;
+            }
+            state.parameter_ticks.insert(
+                parameter_id,
+                start_ticks.saturating_add(u128::from(duration)),
+            );
+            *state
+                .parameter_block_counts
+                .entry(parameter_id)
+                .or_default() += 1;
+            if observation.ignored {
+                state.ignored_parameter_blocks = state.ignored_parameter_blocks.saturating_add(1);
+            }
+            push_parameter_observation(state, observation);
+        }
+        Err(error) => {
+            state.parameter_blocks_valid = false;
+            record_payload_error(
+                state,
+                format!("invalid Parameter Block OBU for parameter {parameter_id}: {error}"),
+            );
+        }
+    }
+}
+
+fn parameter_block(
+    payload: &[u8],
+    mut cursor: usize,
+    definition: &ParameterDefinition,
+) -> Result<ParameterBlockObservation, String> {
+    let (duration, constant_subblock_duration, num_subblocks) = if definition.mode == 0 {
+        let duration = definition
+            .duration
+            .ok_or_else(|| "mode 0 definition has no duration".to_string())?;
+        let constant = definition
+            .constant_subblock_duration
+            .ok_or_else(|| "mode 0 definition has no subblock duration".to_string())?;
+        let count = if constant == 0 {
+            definition.subblock_durations.len()
+        } else {
+            usize::try_from(ceil_div(duration, constant)?)
+                .map_err(|_| "subblock count does not fit in memory")?
+        };
+        (duration, constant, count)
+    } else {
+        let duration = take_leb(payload, &mut cursor, "duration")?;
+        if duration == 0 || duration > u64::from(u32::MAX) {
+            return Err(format!(
+                "duration {duration} is outside the supported non-zero uint32 range"
+            ));
+        }
+        let constant = take_leb(payload, &mut cursor, "constant_subblock_duration")?;
+        if constant > duration {
+            return Err(format!(
+                "constant_subblock_duration {constant} exceeds duration {duration}"
+            ));
+        }
+        let count = if constant == 0 {
+            let count = take_bounded_count(payload, &mut cursor, "num_subblocks")?;
+            if count == 0 {
+                return Err("num_subblocks is zero".into());
+            }
+            count
+        } else {
+            usize::try_from(ceil_div(duration, constant)?)
+                .map_err(|_| "subblock count does not fit in memory")?
+        };
+        (duration, constant, count)
+    };
+    if num_subblocks == 0 || num_subblocks > MAX_DESCRIPTOR_IDS {
+        return Err(format!(
+            "subblock count {num_subblocks} is outside 1..={MAX_DESCRIPTOR_IDS}"
+        ));
+    }
+
+    let mut animation_types = Vec::new();
+    let mut explicit_duration_total = 0_u64;
+    let mut ignored = false;
+    for subblock_index in 0..num_subblocks {
+        if definition.mode == 1 && constant_subblock_duration == 0 {
+            let subblock_duration = take_leb(payload, &mut cursor, "subblock_duration")?;
+            if subblock_duration == 0 {
+                return Err(format!("subblock {subblock_index} has zero duration"));
+            }
+            explicit_duration_total = explicit_duration_total
+                .checked_add(subblock_duration)
+                .ok_or_else(|| "subblock duration total overflows".to_string())?;
+        }
+        match definition.parameter_type {
+            0 => {
+                let animation_type = take_leb(payload, &mut cursor, "animation_type")?;
+                animation_types.push(animation_type);
+                let bytes = match animation_type {
+                    0 => 2,
+                    1 => 4,
+                    2 => 7,
+                    _ => {
+                        ignored = true;
+                        break;
+                    }
+                };
+                take_bytes(payload, &mut cursor, bytes, "animation parameter data")?;
+            }
+            1 => {
+                let value = take_bytes(payload, &mut cursor, 1, "demixing parameter data")?[0];
+                let dmixp_mode = value >> 5;
+                if matches!(dmixp_mode, 3 | 7) {
+                    return Err(format!(
+                        "subblock {subblock_index} uses reserved dmixp_mode {dmixp_mode}"
+                    ));
+                }
+            }
+            2 => {
+                for (layer_index, present) in
+                    definition.recon_gain_present.iter().copied().enumerate()
+                {
+                    if !present {
+                        continue;
+                    }
+                    let flags = take_leb(payload, &mut cursor, "recon_gain_flag")?;
+                    if flags > 0x0fff {
+                        return Err(format!(
+                            "layer {layer_index} recon_gain_flag {flags:#x} exceeds 12 bits"
+                        ));
+                    }
+                    let gain_count = usize::try_from(flags.count_ones())
+                        .map_err(|_| "reconstruction gain count does not fit in memory")?;
+                    take_bytes(
+                        payload,
+                        &mut cursor,
+                        gain_count,
+                        "reconstruction gain values",
+                    )?;
+                }
+            }
+            _ => {
+                let size = take_bounded_count(payload, &mut cursor, "parameter_data_size")?;
+                take_bytes(payload, &mut cursor, size, "parameter_data_bytes")?;
+            }
+        }
+    }
+    if definition.mode == 1
+        && constant_subblock_duration == 0
+        && !ignored
+        && explicit_duration_total != duration
+    {
+        return Err(format!(
+            "subblock durations total {explicit_duration_total}, expected {duration}"
+        ));
+    }
+    Ok(ParameterBlockObservation {
+        id: definition.id,
+        parameter_type: Some(definition.parameter_type),
+        duration: Some(duration),
+        subblocks: num_subblocks,
+        animation_types,
+        trailing_bytes: payload.len().saturating_sub(cursor),
+        ignored,
+    })
+}
+
+fn ceil_div(value: u64, divisor: u64) -> Result<u64, String> {
+    let quotient = value
+        .checked_div(divisor)
+        .ok_or_else(|| "subblock duration divisor is zero".to_string())?;
+    let remainder = value
+        .checked_rem(divisor)
+        .ok_or_else(|| "subblock duration divisor is zero".to_string())?;
+    Ok(quotient + u64::from(remainder != 0))
+}
+
+fn push_parameter_observation(state: &mut State, observation: ParameterBlockObservation) {
+    if state.parameter_block_observations.len() < MAX_DESCRIPTOR_IDS {
+        state.parameter_block_observations.push(observation);
+    } else {
+        state.payload_evidence_truncated = true;
+    }
+}
+
+fn note_temporal_delimiter(state: &mut State) {
+    state.temporal_delimiters = state.temporal_delimiters.saturating_add(1);
+    if state.delimiter_pending {
+        state.timeline_valid = false;
+        record_payload_error(
+            state,
+            "consecutive Temporal Delimiter OBUs do not delimit a temporal unit".into(),
+        );
+    }
+    state.delimiter_pending = true;
+}
+
+fn parameter_starts_at_audio_cursor(start_ticks: u128, rate: u64, state: &State) -> bool {
+    let mut reference: Option<(u128, u64)> = None;
+    for substream_id in &state.active_substream_ids {
+        let (Some(audio_ticks), Some(audio_rate)) = (
+            state.audio_ticks.get(substream_id).copied(),
+            state.audio_rates.get(substream_id).copied(),
+        ) else {
+            return false;
+        };
+        if let Some((reference_ticks, reference_rate)) = reference {
+            if audio_ticks.checked_mul(u128::from(reference_rate))
+                != reference_ticks.checked_mul(u128::from(audio_rate))
+            {
+                return false;
+            }
+        } else {
+            reference = Some((audio_ticks, audio_rate));
+        }
+    }
+    reference.is_some_and(|(audio_ticks, audio_rate)| {
+        start_ticks.checked_mul(u128::from(audio_rate)) == audio_ticks.checked_mul(u128::from(rate))
+    })
+}
+
+fn compare_timeline_points(
+    left: TimelinePoint,
+    right: TimelinePoint,
+) -> Option<std::cmp::Ordering> {
+    left.ticks
+        .checked_mul(right.rate)?
+        .partial_cmp(&right.ticks.checked_mul(left.rate)?)
+}
+
+fn note_timeline_point(
+    point: TimelinePoint,
+    audio_order: Option<usize>,
+    state: &mut State,
+) -> Result<bool, ()> {
+    let mut new_audio_unit = false;
+    if let Some(previous) = state.current_timeline_point {
+        let Some(ordering) = compare_timeline_points(previous, point) else {
+            record_payload_error(state, "timeline comparison overflow".into());
+            return Err(());
+        };
+        if ordering.is_gt()
+            || (ordering.is_eq()
+                && previous.kind == TimelineKind::Audio
+                && point.kind == TimelineKind::Parameter)
+        {
+            record_payload_error(
+                state,
+                "IA data OBUs are not ordered by implied start timestamp with parameter blocks before audio frames".into(),
+            );
+            return Err(());
+        }
+        if point.kind == TimelineKind::Audio {
+            let order = audio_order.ok_or(())?;
+            if ordering.is_lt() || state.current_audio_order.is_none() {
+                if order != 0 {
+                    record_payload_error(
+                        state,
+                        format!(
+                            "audio temporal unit starts with substream order {order}, expected 0"
+                        ),
+                    );
+                    return Err(());
+                }
+                new_audio_unit = true;
+            } else if order
+                != state
+                    .current_audio_order
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(1)
+            {
+                record_payload_error(
+                    state,
+                    format!(
+                        "audio substream order {order} is not consecutive within its temporal unit"
+                    ),
+                );
+                return Err(());
+            }
+            state.current_audio_order = Some(order);
+        } else if ordering.is_lt() {
+            state.current_audio_order = None;
+        }
+    } else if point.kind == TimelineKind::Audio {
+        if audio_order != Some(0) {
+            record_payload_error(
+                state,
+                "first audio temporal unit does not start with substream order 0".into(),
+            );
+            return Err(());
+        }
+        new_audio_unit = true;
+        state.current_audio_order = audio_order;
+    }
+    state.current_timeline_point = Some(point);
+    Ok(new_audio_unit)
+}
+
+fn parse_audio_frame(obu_type: u8, payload: &[u8], trim: TrimInfo, state: &mut State) {
     let parsed = if obu_type == AUDIO_FRAME {
         let mut cursor = 0;
         take_leb(payload, &mut cursor, "explicit_audio_substream_id").and_then(|id| {
@@ -1957,6 +2528,100 @@ fn parse_audio_frame(obu_type: u8, payload: &[u8], state: &mut State) {
     };
     match parsed {
         Ok(substream_id) if state.active_substream_ids.contains(&substream_id) => {
+            let Some((duration, rate, order)) = audio_substream_timing(substream_id, state) else {
+                state.audio_frames_valid = false;
+                state.timeline_valid = false;
+                record_payload_error(
+                    state,
+                    format!("audio substream {substream_id} has no usable codec timing"),
+                );
+                return;
+            };
+            if state.ended_substreams.contains(&substream_id) {
+                state.timeline_valid = false;
+                record_payload_error(
+                    state,
+                    format!("audio substream {substream_id} continues after end trimming"),
+                );
+            }
+            if trim.start.saturating_add(trim.end) > duration {
+                state.timeline_valid = false;
+                record_payload_error(
+                    state,
+                    format!(
+                        "audio substream {substream_id} trims {} samples from a {duration}-sample frame",
+                        trim.start.saturating_add(trim.end)
+                    ),
+                );
+            }
+            let frame_index = state.frame_counts.get(&substream_id).copied().unwrap_or(0);
+            let start_ticks = state.audio_ticks.get(&substream_id).copied().unwrap_or(0);
+            let new_audio_unit = note_timeline_point(
+                TimelinePoint {
+                    ticks: start_ticks,
+                    rate: u128::from(rate),
+                    kind: TimelineKind::Audio,
+                },
+                Some(order),
+                state,
+            )
+            .unwrap_or_else(|()| {
+                state.timeline_valid = false;
+                false
+            });
+            if new_audio_unit {
+                state.temporal_units = state.temporal_units.saturating_add(1);
+                if state.uses_temporal_delimiters && !state.delimiter_pending {
+                    state.timeline_valid = false;
+                    record_payload_error(
+                        state,
+                        "temporal unit is missing its leading Temporal Delimiter OBU".into(),
+                    );
+                }
+                state.delimiter_pending = false;
+            }
+            let mut trim_mismatch = None;
+            match state.trim_by_frame_index.get_mut(&frame_index) {
+                Some((expected, count)) if *expected == trim => {
+                    *count = count.saturating_add(1);
+                }
+                Some((expected, _)) => {
+                    trim_mismatch = Some(*expected);
+                }
+                None => {
+                    state.trim_by_frame_index.insert(frame_index, (trim, 1));
+                }
+            }
+            if let Some(expected) = trim_mismatch {
+                state.timeline_valid = false;
+                record_payload_error(
+                    state,
+                    format!("audio frame {frame_index} trim {trim:?} differs from {expected:?}"),
+                );
+            }
+            let start_prefix = *state
+                .start_trim_prefix_valid
+                .entry(substream_id)
+                .or_insert(true);
+            if trim.start > 0 && !start_prefix {
+                state.timeline_valid = false;
+                record_payload_error(
+                    state,
+                    format!("audio substream {substream_id} has non-prefix start trimming"),
+                );
+            }
+            if trim.start < duration {
+                state.start_trim_prefix_valid.insert(substream_id, false);
+            }
+            if trim.end > 0 {
+                state.ended_substreams.insert(substream_id);
+            }
+            state.last_trim_by_substream.insert(substream_id, trim);
+            state.audio_ticks.insert(
+                substream_id,
+                start_ticks.saturating_add(u128::from(duration)),
+            );
+            state.audio_rates.insert(substream_id, rate);
             *state.frame_counts.entry(substream_id).or_default() += 1;
             state.pending_substream_ids.remove(&substream_id);
         }
@@ -1970,6 +2635,166 @@ fn parse_audio_frame(obu_type: u8, payload: &[u8], state: &mut State) {
         Err(error) => {
             state.audio_frames_valid = false;
             record_payload_error(state, format!("invalid Audio Frame OBU: {error}"));
+        }
+    }
+}
+
+fn audio_substream_timing(substream_id: u64, state: &State) -> Option<(u64, u64, usize)> {
+    let element = state
+        .active_audio_elements
+        .values()
+        .find(|element| element.substream_ids.contains(&substream_id))?;
+    let codec = state.active_codec_configs.get(&element.codec_config_id)?;
+    let rate = u64::from(codec.sample_rate?);
+    let order = *state.active_substream_order.get(&substream_id)?;
+    Some((codec.num_samples_per_frame, rate, order))
+}
+
+fn finish_timeline(state: &mut State) {
+    if state.delimiter_pending {
+        state.timeline_valid = false;
+        record_payload_error(
+            state,
+            "final Temporal Delimiter OBU has no following temporal unit".into(),
+        );
+    }
+    if state.uses_temporal_delimiters && state.temporal_delimiters != state.temporal_units {
+        state.timeline_valid = false;
+        record_payload_error(
+            state,
+            format!(
+                "{} temporal delimiters do not match {} temporal units",
+                state.temporal_delimiters, state.temporal_units
+            ),
+        );
+    }
+    let substream_count = state.active_substream_ids.len();
+    let expected_frames = state.frame_counts.values().next().copied();
+    if state
+        .frame_counts
+        .values()
+        .any(|count| Some(*count) != expected_frames)
+    {
+        state.timeline_valid = false;
+        record_payload_error(state, "audio substreams have different frame counts".into());
+    }
+    if state
+        .trim_by_frame_index
+        .iter()
+        .any(|(_, (_, count))| *count != substream_count)
+    {
+        state.timeline_valid = false;
+        record_payload_error(
+            state,
+            "audio substreams do not have matching trim data for every frame".into(),
+        );
+    }
+    let reference_audio = state
+        .active_substream_order
+        .iter()
+        .min_by_key(|(_, order)| **order)
+        .and_then(|(id, _)| {
+            Some((
+                *state.audio_ticks.get(id)?,
+                *state.audio_rates.get(id)?,
+                *id,
+            ))
+        });
+    if let Some((reference_ticks, reference_rate, _)) = reference_audio {
+        let mismatched_audio = state.audio_ticks.iter().any(|(id, ticks)| {
+            state.audio_rates.get(id).is_none_or(|rate| {
+                ticks.checked_mul(u128::from(reference_rate))
+                    != Some(reference_ticks.saturating_mul(u128::from(*rate)))
+            })
+        });
+        if mismatched_audio {
+            state.timeline_valid = false;
+            record_payload_error(state, "audio substreams end at different timestamps".into());
+        }
+    }
+    let fully_end_trimmed = state.last_trim_by_substream.iter().any(|(id, trim)| {
+        audio_substream_timing(*id, state).is_some_and(|(duration, _, _)| trim.end >= duration)
+    });
+    if fully_end_trimmed {
+        state.timeline_valid = false;
+        record_payload_error(
+            state,
+            "an audio substream ends with a fully end-trimmed frame".into(),
+        );
+    }
+
+    let definitions = state
+        .active_parameter_definitions_by_id
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for definition in definitions {
+        let block_count = state
+            .parameter_block_counts
+            .get(&definition.id)
+            .copied()
+            .unwrap_or(0);
+        if block_count == 0 {
+            continue;
+        }
+        let audio_id = definition
+            .audio_element_id
+            .and_then(|element_id| state.active_audio_elements.get(&element_id))
+            .and_then(|element| element.substream_ids.first())
+            .copied()
+            .or_else(|| reference_audio.map(|(_, _, id)| id));
+        let Some(audio_id) = audio_id else {
+            state.timeline_valid = false;
+            record_payload_error(
+                state,
+                format!(
+                    "parameter {} has no applicable audio timeline",
+                    definition.id
+                ),
+            );
+            continue;
+        };
+        let (Some(parameter_ticks), Some(audio_ticks), Some(audio_rate)) = (
+            state.parameter_ticks.get(&definition.id).copied(),
+            state.audio_ticks.get(&audio_id).copied(),
+            state.audio_rates.get(&audio_id).copied(),
+        ) else {
+            state.timeline_valid = false;
+            record_payload_error(
+                state,
+                format!("parameter {} has incomplete timing evidence", definition.id),
+            );
+            continue;
+        };
+        let coverage_matches = parameter_ticks
+            .checked_mul(u128::from(audio_rate))
+            .is_some_and(|left| {
+                audio_ticks
+                    .checked_mul(u128::from(definition.rate))
+                    .is_some_and(|right| left == right)
+            });
+        if !coverage_matches {
+            state.timeline_valid = false;
+            record_payload_error(
+                state,
+                format!(
+                    "parameter {} does not cover the applicable audio duration",
+                    definition.id
+                ),
+            );
+        }
+        if matches!(definition.parameter_type, 1 | 2)
+            && state.frame_counts.get(&audio_id).copied() != Some(block_count)
+        {
+            state.timeline_valid = false;
+            record_payload_error(
+                state,
+                format!(
+                    "frame-aligned parameter {} has {block_count} blocks but its audio has {} frames",
+                    definition.id,
+                    state.frame_counts.get(&audio_id).copied().unwrap_or(0)
+                ),
+            );
         }
     }
 }
@@ -2174,6 +2999,23 @@ fn mix_profile_json(observations: &[MixProfileObservation]) -> Vec<Value> {
         .collect()
 }
 
+fn parameter_block_json(observations: &[ParameterBlockObservation]) -> Vec<Value> {
+    observations
+        .iter()
+        .map(|observation| {
+            json!({
+                "parameter_id": observation.id,
+                "parameter_definition_type": observation.parameter_type,
+                "duration": observation.duration,
+                "subblocks": observation.subblocks,
+                "animation_types": observation.animation_types,
+                "trailing_extension_bytes": observation.trailing_bytes,
+                "ignored": observation.ignored,
+            })
+        })
+        .collect()
+}
+
 fn declared_substream_ids(elements: &[AudioElement]) -> Vec<u64> {
     elements
         .iter()
@@ -2264,6 +3106,89 @@ mod tests {
     fn leb128_is_bounded() {
         assert_eq!(read_leb_slice(&[0xf2, 0x01]), Some((242, 2)));
         assert_eq!(read_leb_slice(&[0x80; 8]), None);
+    }
+
+    #[test]
+    fn parses_parameter_block_animations_and_explicit_subblocks() {
+        let definition = ParameterDefinition {
+            id: 100,
+            parameter_type: 0,
+            rate: 48_000,
+            mode: 1,
+            duration: None,
+            constant_subblock_duration: None,
+            subblock_durations: Vec::new(),
+            audio_element_id: None,
+            recon_gain_present: Vec::new(),
+        };
+        let payload = [
+            100, // parameter_id
+            6, 0, 3, // duration, explicit subblocks, three subblocks
+            1, 0, 0, 0, // STEP
+            2, 1, 0, 0, 0, 0, // LINEAR
+            3, 2, 0, 0, 0, 0, 0, 0, 128, // BEZIER
+        ];
+        let parsed = parameter_block(&payload, 1, &definition).unwrap();
+        assert_eq!(parsed.duration, Some(6));
+        assert_eq!(parsed.subblocks, 3);
+        assert_eq!(parsed.animation_types, [0, 1, 2]);
+        assert_eq!(parsed.trailing_bytes, 0);
+        assert!(!parsed.ignored);
+    }
+
+    #[test]
+    fn validates_demixing_and_reconstruction_gain_parameter_data() {
+        let demixing = ParameterDefinition {
+            id: 10,
+            parameter_type: 1,
+            rate: 48_000,
+            mode: 0,
+            duration: Some(1),
+            constant_subblock_duration: Some(1),
+            subblock_durations: Vec::new(),
+            audio_element_id: Some(1),
+            recon_gain_present: Vec::new(),
+        };
+        assert!(parameter_block(&[10, 0x40], 1, &demixing).is_ok());
+        let error = parameter_block(&[10, 0x60], 1, &demixing).unwrap_err();
+        assert!(error.contains("reserved dmixp_mode 3"), "{error}");
+
+        let reconstruction = ParameterDefinition {
+            parameter_type: 2,
+            recon_gain_present: vec![false, true],
+            ..demixing
+        };
+        let parsed = parameter_block(&[10, 0x05, 4, 7], 1, &reconstruction).unwrap();
+        assert_eq!(parsed.subblocks, 1);
+        let error = parameter_block(&[10, 0x80, 0x20], 1, &reconstruction).unwrap_err();
+        assert!(error.contains("exceeds 12 bits"), "{error}");
+    }
+
+    #[test]
+    fn enforces_parameter_before_audio_at_equal_timestamps() {
+        let mut state = State::default();
+        assert_eq!(
+            note_timeline_point(
+                TimelinePoint {
+                    ticks: 0,
+                    rate: 48_000,
+                    kind: TimelineKind::Audio,
+                },
+                Some(0),
+                &mut state,
+            ),
+            Ok(true)
+        );
+        assert!(note_timeline_point(
+            TimelinePoint {
+                ticks: 0,
+                rate: 48_000,
+                kind: TimelineKind::Parameter,
+            },
+            None,
+            &mut state,
+        )
+        .is_err());
     }
 
     #[test]
@@ -2416,6 +3341,7 @@ mod tests {
                 highest_layout: "5.1ch".into(),
                 output_channels: 6,
                 expanded_layout: false,
+                recon_gain_present: vec![false, true],
             }
         );
 
@@ -2451,6 +3377,7 @@ mod tests {
                 highest_layout: "9.1.6ch".into(),
                 output_channels: 16,
                 expanded_layout: true,
+                recon_gain_present: vec![false],
             }
         );
     }
@@ -2473,6 +3400,7 @@ mod tests {
                 highest_layout: "Mono".into(),
                 output_channels: 1,
                 expanded_layout: false,
+                recon_gain_present: vec![false],
             }
         );
 
@@ -2664,11 +3592,13 @@ mod tests {
                 substream_ids: vec![0],
                 parameter_ids: vec![],
                 parameter_types: vec![],
+                parameter_definitions: vec![],
                 config: AudioElementConfig::ChannelBased {
                     num_layers: 1,
                     highest_layout: "Stereo".into(),
                     output_channels: 2,
                     expanded_layout: false,
+                    recon_gain_present: vec![false],
                 },
                 trailing_bytes: 0,
             };
