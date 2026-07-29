@@ -8,6 +8,35 @@ use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::process::Command;
 
+fn minimal_iamf_mix(audio_element_id: u8) -> Vec<u8> {
+    vec![
+        0,
+        0, // Mix ID and no localized labels.
+        1,
+        1,
+        audio_element_id, // One sub-mix with one audio element.
+        0,
+        0, // Stereo rendering mode and no rendering extension.
+        100,
+        1,
+        0x80,
+        0,
+        0, // Element mix gain in definition mode 1.
+        100,
+        1,
+        0x80,
+        0,
+        0, // Equivalent shared output mix gain.
+        1,
+        0x80, // One Sound System A stereo layout.
+        0,
+        0,
+        0,
+        0,
+        0, // Base loudness fields.
+    ]
+}
+
 #[test]
 fn container_qc_cli_returns_pass_and_fail_status() {
     let directory = tempfile::tempdir().unwrap();
@@ -425,7 +454,7 @@ fn container_qc_cli_audits_standalone_iamf_obu_structure() {
         &[0, b'i', b'p', b'c', b'm', 1, 0, 0, 0, 16, 0, 0, 187, 128],
     ));
     bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0, 0x20, 0, 1, 0]));
-    bytes.extend(obu(2, &[0]));
+    bytes.extend(obu(2, &minimal_iamf_mix(0)));
     bytes.extend(obu(6, &[0]));
     fs::write(&path, bytes).unwrap();
 
@@ -456,10 +485,20 @@ fn container_qc_cli_audits_standalone_iamf_obu_structure() {
         audit["properties"]["audio_elements"][0]["output_channels"],
         1
     );
+    assert_eq!(
+        audit["properties"]["mix_presentations"][0]["sub_mixes"][0]["audio_element_ids"],
+        serde_json::json!([0])
+    );
+    assert_eq!(
+        audit["properties"]["mix_profile_support"][0]["supported_profiles"],
+        serde_json::json!(["simple", "base", "base-enhanced"])
+    );
     assert_eq!(audit["properties"]["audio_frame_counts"]["0"], 1);
     for rule_id in [
         "FORGE-IAMF-CODEC-CONFIG",
         "FORGE-IAMF-AUDIO-ELEMENT",
+        "FORGE-IAMF-MIX-PRESENTATION",
+        "FORGE-IAMF-PROFILE-CONSTRAINTS",
         "FORGE-IAMF-DESCRIPTOR-LINKS",
         "FORGE-IAMF-AUDIO-FRAME-LINKS",
     ] {
@@ -490,7 +529,7 @@ fn container_qc_cli_rejects_invalid_iamf_audio_element_layouts() {
     // The outer OBU declares one substream, but the Stereo layer needs two
     // mono substreams (or one coupled substream) to reconstruct two channels.
     bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0, 0x20, 0x10, 1, 0]));
-    bytes.extend(obu(2, &[0]));
+    bytes.extend(obu(2, &minimal_iamf_mix(0)));
     bytes.extend(obu(6, &[0]));
     fs::write(&path, bytes).unwrap();
 
@@ -516,6 +555,72 @@ fn container_qc_cli_rejects_invalid_iamf_audio_element_layouts() {
 }
 
 #[test]
+fn container_qc_cli_rejects_invalid_iamf_mix_and_profile_constraints() {
+    fn obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![obu_type << 3, payload.len() as u8];
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn stream(mix: &[u8]) -> Vec<u8> {
+        let mut bytes = obu(31, b"iamf\x00\x00");
+        bytes.extend(obu(
+            0,
+            &[0, b'i', b'p', b'c', b'm', 1, 0, 0, 0, 16, 0, 0, 187, 128],
+        ));
+        bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0, 0x20, 0, 1, 0]));
+        bytes.extend(obu(2, mix));
+        bytes.extend(obu(6, &[0]));
+        bytes
+    }
+
+    fn check<'a>(audit: &'a Value, rule_id: &str) -> &'a Value {
+        audit["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|layer| layer["checks"].as_array().unwrap())
+            .find(|check| check["rule_id"] == rule_id)
+            .unwrap()
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let reserved_mode_path = directory.path().join("reserved-rendering-mode.iamf");
+    let mut reserved_mode = minimal_iamf_mix(0);
+    reserved_mode[5] = 0x80;
+    fs::write(&reserved_mode_path, stream(&reserved_mode)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&reserved_mode_path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(check(&audit, "FORGE-IAMF-MIX-PRESENTATION")["passed"], true);
+    assert_eq!(
+        check(&audit, "FORGE-IAMF-PROFILE-CONSTRAINTS")["passed"],
+        false
+    );
+
+    let zero_submix_path = directory.path().join("zero-submix.iamf");
+    fs::write(&zero_submix_path, stream(&[0, 0, 0])).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&zero_submix_path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        check(&audit, "FORGE-IAMF-MIX-PRESENTATION")["passed"],
+        false
+    );
+    assert!(audit["properties"]["payload_errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|error| error.as_str().unwrap().contains("num_sub_mixes is zero")));
+}
+
+#[test]
 fn container_qc_cli_rejects_oversized_and_misordered_iamf_obus() {
     fn obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
         let mut bytes = vec![obu_type << 3, payload.len() as u8];
@@ -530,7 +635,7 @@ fn container_qc_cli_rejects_oversized_and_misordered_iamf_obus() {
         0,
         &[0, b'i', b'p', b'c', b'm', 1, 0, 0, 0, 16, 0, 0, 187, 128],
     ));
-    bytes.extend(obu(2, &[0]));
+    bytes.extend(obu(2, &minimal_iamf_mix(0)));
     bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0, 0x20, 0, 1, 0]));
     bytes.extend(obu(6, &[0]));
     fs::write(&order_path, bytes).unwrap();
@@ -589,7 +694,7 @@ fn container_qc_cli_rejects_invalid_iamf_codec_and_substream_links() {
         &[0, b'i', b'p', b'c', b'm', 1, 0, 1, 0, 16, 0, 0, 187, 128],
     ));
     bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0, 0x20, 0, 1, 0]));
-    bytes.extend(obu(2, &[0]));
+    bytes.extend(obu(2, &minimal_iamf_mix(0)));
     bytes.extend(obu(6, &[0]));
     fs::write(&bad_codec, bytes).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
@@ -609,7 +714,7 @@ fn container_qc_cli_rejects_invalid_iamf_codec_and_substream_links() {
         &[0, b'i', b'p', b'c', b'm', 1, 0, 0, 0, 16, 0, 0, 187, 128],
     ));
     bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0, 0x20, 0, 1, 0]));
-    bytes.extend(obu(2, &[0]));
+    bytes.extend(obu(2, &minimal_iamf_mix(0)));
     bytes.extend(obu(7, &[0]));
     fs::write(&bad_frame, bytes).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
