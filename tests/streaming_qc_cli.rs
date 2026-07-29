@@ -142,6 +142,59 @@ fn streaming_qc_cli_selects_dash_live_profile() {
 }
 
 #[test]
+fn streaming_qc_cli_compares_successive_dash_snapshots() {
+    let directory = tempfile::tempdir().unwrap();
+    let previous = directory.path().join("previous.mpd");
+    let current = directory.path().join("current.mpd");
+    let snapshot = |publish_time: &str, timeline: &str| {
+        format!(
+            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" id="live"
+ type="dynamic" availabilityStartTime="2026-07-29T00:00:00Z"
+ publishTime="{publish_time}" minimumUpdatePeriod="PT2S" minBufferTime="PT1S">
+ <BaseURL>https://example.invalid/live/</BaseURL>
+ <Period id="p0" start="PT0S">
+  <AdaptationSet id="audio" contentType="audio" mimeType="audio/mp4"
+   codecs="opus" lang="en" audioSamplingRate="48000">
+   <SegmentTemplate timescale="10" initialization="init-$RepresentationID$.mp4"
+    media="$RepresentationID$-$Time$.m4s">
+    <SegmentTimeline>{timeline}</SegmentTimeline>
+   </SegmentTemplate>
+   <Representation id="a1" bandwidth="64000"/>
+  </AdaptationSet>
+ </Period>
+</MPD>"#
+        )
+    };
+    fs::write(
+        &previous,
+        snapshot("2026-07-29T00:00:20Z", r#"<S t="0" d="10" r="2"/>"#),
+    )
+    .unwrap();
+    fs::write(
+        &current,
+        snapshot("2026-07-29T00:00:21Z", r#"<S t="10" d="10" r="2"/>"#),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-streaming-qc"))
+        .arg(&current)
+        .args(["--profile", "iso23009", "--previous-mpd"])
+        .arg(&previous)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        audit["properties"]["previous_path"],
+        previous.to_string_lossy().as_ref()
+    );
+    assert_eq!(audit["properties"]["previous_passed"], true);
+    assert!(audit["findings"].as_array().unwrap().iter().any(|finding| {
+        finding["rule_id"] == "FORGE-DASH-UPDATE-SEGMENT-EQUIVALENCE" && finding["passed"] == true
+    }));
+}
+
+#[test]
 fn streaming_qc_cli_cross_checks_mpegts_segment_boundaries() {
     if !Command::new("ffmpeg")
         .arg("-version")

@@ -31,6 +31,9 @@ struct Cli {
     output: Option<PathBuf>,
     #[arg(long)]
     compact: bool,
+    /// Compare this DASH MPD with the preceding full MPD snapshot.
+    #[arg(long, value_name = "MPD")]
+    previous_mpd: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -58,6 +61,9 @@ fn run(cli: Cli) -> Result<bool, String> {
     });
     let (mut bytes, passed, warning_count) = match profile {
         Profile::Rfc8216 | Profile::AppleHls | Profile::LlHls => {
+            if cli.previous_mpd.is_some() {
+                return Err("--previous-mpd is only valid for DASH profiles".into());
+            }
             let profile = match profile {
                 Profile::Rfc8216 => HlsProfile::Rfc8216,
                 Profile::AppleHls => HlsProfile::AppleHls,
@@ -76,7 +82,11 @@ fn run(cli: Cli) -> Result<bool, String> {
                 Profile::DashLive => DashProfile::DashLive,
                 Profile::Rfc8216 | Profile::AppleHls | Profile::LlHls => unreachable!(),
             };
-            let audit = dash_qc::audit(&cli.input, profile)?;
+            let audit = if let Some(previous) = &cli.previous_mpd {
+                dash_qc::audit_with_previous(&cli.input, previous, profile)?
+            } else {
+                dash_qc::audit(&cli.input, profile)?
+            };
             let passed = audit.passed;
             let warning_count = audit.warning_count;
             (encode(&audit, cli.compact)?, passed, warning_count)

@@ -10,6 +10,11 @@ fuzz_target!(|data: &[u8]| {
             let _ = dash_qc::audit(file.path(), DashProfile::Iso23009);
             let _ = dash_qc::audit(file.path(), DashProfile::DashIfIop);
             let _ = dash_qc::audit(file.path(), DashProfile::DashLive);
+            let _ = dash_qc::audit_with_previous(
+                file.path(),
+                file.path(),
+                DashProfile::Iso23009,
+            );
         }
     }
 });
