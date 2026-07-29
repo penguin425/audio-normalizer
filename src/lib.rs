@@ -28,6 +28,7 @@ mod dash_patch;
 pub mod dash_qc;
 pub mod decoder;
 pub mod dialogue_provider;
+pub mod dsd;
 pub mod dsp;
 mod flac_qc;
 pub mod flacenc;

@@ -97,6 +97,10 @@ Forge already provides:
   channel assignment/permutation and polarity evidence, full-overlap null
   residual/peak, exact-sample ratio, and excerpted one-third-octave spectral
   error, explicitly classified as non-normative engineering QC.
+- Read-only DSF and uncompressed DSDIFF analysis with bounded structural QC,
+  declared bit-order/channel mapping, a versioned cascaded half-band and
+  21 kHz low-pass decimation policy, 88.2/96 kHz BS.1770 measurement, and
+  explicit rejection of DST-compressed payloads.
 
 ## P0 — next correctness and interoperability work
 
@@ -110,8 +114,6 @@ generations.
 ### Broadcast and mastering containers
 
 - AES31/AAF interchange validation where authoritative fixtures are available.
-- DSD/DFF/DSF read-only analysis, with an explicit low-pass/decimation policy
-  before BS.1770 measurement.
 
 ### Codec-specific QC
 

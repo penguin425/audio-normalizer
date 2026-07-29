@@ -57,6 +57,44 @@ pub fn decode_limited(path: &Path, max_decoded_samples: u64) -> Result<AudioBuff
         )?;
         return WavReader::open(path).map_err(|e| format!("{}: {e}", path.display()));
     }
+    if matches!(ext.as_str(), "dsf" | "dff") {
+        let dsd = crate::dsd::probe(path)?;
+        enforce_decoded_sample_limit(
+            path,
+            dsd.output_frames,
+            u64::from(dsd.channels),
+            max_decoded_samples,
+        )?;
+        let mut data = vec![Vec::new(); dsd.channels as usize];
+        let info = crate::dsd::decode_stream(path, |stream_info, planar| {
+            if planar.len() != data.len() {
+                return Err("DSD decoded channel count changed".into());
+            }
+            for (destination, source) in data.iter_mut().zip(planar) {
+                destination.append(source);
+            }
+            if stream_info.channels != dsd.channels {
+                return Err("DSD stream metadata changed".into());
+            }
+            Ok(())
+        })?;
+        let frames = data.first().map_or(0, Vec::len);
+        if frames as u64 != dsd.output_frames {
+            return Err(format!(
+                "{}: decoded DSD frame count {frames} does not match {}",
+                path.display(),
+                dsd.output_frames
+            ));
+        }
+        return Ok(AudioBuffer {
+            sample_rate: info.sample_rate,
+            channels: info.channels,
+            frames,
+            data,
+            channel_roles: info.channel_roles,
+            source_kind: info.source_kind,
+        });
+    }
     if ext == "opus" {
         #[cfg(feature = "opus-encoding")]
         {
@@ -325,6 +363,9 @@ where
         .unwrap_or_default();
     if matches!(extension.as_str(), "wav" | "wave" | "bwf" | "bw64" | "rf64") {
         return decode_wav_stream(path, consume);
+    }
+    if matches!(extension.as_str(), "dsf" | "dff") {
+        return crate::dsd::decode_stream(path, consume);
     }
     if extension == "opus" {
         #[cfg(feature = "opus-encoding")]
