@@ -472,6 +472,12 @@ Outside an explicit `EXT-X-DISCONTINUITY`, programme/PID/codec/language
 configuration must remain stable and audio PTS must advance across segment
 boundaries.
 
+For local fMP4 audio alternatives declared by `EXT-X-MEDIA`, Forge resolves
+each `GROUP-ID` and verifies that every language rendition uses CMAF, covers
+the same duration, exposes aligned segment boundaries, and carries identical
+discontinuity state. Remote renditions remain out of scope unless they are
+made locally available.
+
 Use `--profile apple-hls` to add current Apple authoring requirements:
 six-second target and aligned-boundary recommendations, equal rendition target
 and content durations, playlist-type consistency, the 0.5-second segment ceiling,
@@ -521,6 +527,17 @@ addressing, sequence continuity, and monotonic `tfdt` decode times. Remote,
 absolute, parent-directory, and unresolved template references are never
 fetched implicitly. Results conform to
 `schema/dash-qc-v1.schema.json`.
+
+Adaptation Set Switching descriptors using
+`urn:mpeg:dash:adaptation-set-switching:2016` are resolved within their
+Period. Forge rejects malformed, duplicate, self, dangling, or cross-media
+references and inconsistent `segmentAlignment`/`subsegmentAlignment` claims.
+When template or list timing is bounded, it compares every Representation
+across the referenced sets after exact timescale and
+`presentationTimeOffset` normalization, so equivalent language renditions
+with different MPD timescales compare correctly. A warning records when
+`SegmentBase` or an unbounded timeline does not expose enough MPD-level
+boundary evidence for that comparison.
 
 Use `--profile dash-live` for dynamic and low-latency presentations. It
 requires a timezone-qualified availability anchor, a

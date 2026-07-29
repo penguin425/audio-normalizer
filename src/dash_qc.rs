@@ -16,6 +16,7 @@ const MAX_MPD_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ELEMENTS: usize = 200_000;
 const MAX_LOCAL_SEGMENTS: usize = 4_096;
+const ADAPTATION_SET_SWITCHING_SCHEME: &str = "urn:mpeg:dash:adaptation-set-switching:2016";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -225,6 +226,8 @@ struct Representation {
 struct AdaptationSet {
     id: Option<String>,
     base_url: Option<BaseUrl>,
+    segment_alignment: Option<bool>,
+    subsegment_alignment: Option<bool>,
     content_type: Option<String>,
     mime_type: Option<String>,
     codecs: Option<String>,
@@ -753,6 +756,12 @@ fn audit_mpd(path: &Path, mpd: &Mpd, profile: DashProfile) -> Result<DashAudit, 
                         .map(|representation| representation.content_protections.len())
                         .sum::<usize>())
                 .sum::<usize>(),
+            "adaptation_set_switching_descriptor_count": mpd.periods.iter()
+                .flat_map(|period| &period.adaptations)
+                .flat_map(|adaptation| &adaptation.supplemental_properties)
+                .filter(|descriptor| descriptor.scheme_id_uri.as_deref()
+                    == Some(ADAPTATION_SET_SWITCHING_SCHEME))
+                .count(),
             "period_count": mpd.periods.len(),
             "adaptation_set_count": adaptation_count,
             "representation_count": representation_count,
@@ -974,6 +983,8 @@ fn observe_element(
             let period = current_period_mut(mpd, *active_period)?;
             period.adaptations.push(AdaptationSet {
                 id: attributes.get("id").cloned(),
+                segment_alignment: parse_optional_bool(&attributes, "segmentAlignment")?,
+                subsegment_alignment: parse_optional_bool(&attributes, "subsegmentAlignment")?,
                 content_type: attributes.get("contentType").cloned(),
                 mime_type: attributes.get("mimeType").cloned(),
                 codecs: attributes.get("codecs").cloned(),
@@ -2611,6 +2622,324 @@ fn validate_period(
             }
         }
     }
+    if matches!(profile, DashProfile::DashIfIop | DashProfile::DashLive) {
+        validate_adaptation_set_switching(period_index, period, period_duration, findings);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NormalizedSegment {
+    start_numerator: i128,
+    start_denominator: u64,
+    duration_numerator: u64,
+    duration_denominator: u64,
+}
+
+fn validate_adaptation_set_switching(
+    period_index: usize,
+    period: &Period,
+    period_duration: Option<f64>,
+    findings: &mut Vec<DashFinding>,
+) {
+    let adaptation_by_id = period
+        .adaptations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, adaptation)| adaptation.id.as_deref().map(|id| (id, index)))
+        .collect::<HashMap<_, _>>();
+
+    for (source_index, source) in period.adaptations.iter().enumerate() {
+        for descriptor in source.supplemental_properties.iter().filter(|descriptor| {
+            descriptor.scheme_id_uri.as_deref() == Some(ADAPTATION_SET_SWITCHING_SCHEME)
+        }) {
+            let source_id = source.id.as_deref();
+            let parsed_targets = descriptor.value.as_deref().map(parse_switching_targets);
+            let syntax_valid = source_id.is_some()
+                && parsed_targets.as_ref().is_some_and(|targets| {
+                    targets.as_ref().is_ok_and(|targets| !targets.is_empty())
+                });
+            findings.push(finding(
+                "FORGE-DASHIF-ADAPTATION-SWITCHING-DESCRIPTOR",
+                Severity::Error,
+                syntax_valid,
+                format!(
+                    "Period {period_index} AdaptationSet {source_index} switching descriptor has a source id and a non-empty, unique target-id list"
+                ),
+                Some(json!({
+                    "source_id": source_id,
+                    "value": descriptor.value,
+                    "scheme_id_uri": descriptor.scheme_id_uri
+                })),
+            ));
+            let (Some(source_id), Some(Ok(target_ids))) = (source_id, parsed_targets) else {
+                continue;
+            };
+            for target_id in target_ids {
+                let target_index = adaptation_by_id.get(target_id.as_str()).copied();
+                let reference_valid = target_id != source_id
+                    && target_index.is_some_and(|index| index != source_index);
+                findings.push(finding(
+                    "FORGE-DASHIF-ADAPTATION-SWITCHING-REFERENCE",
+                    Severity::Error,
+                    reference_valid,
+                    format!(
+                        "Period {period_index} AdaptationSet {source_id} references a distinct existing AdaptationSet {target_id}"
+                    ),
+                    Some(json!({"source_id": source_id, "target_id": target_id})),
+                ));
+                let Some(target_index) = target_index.filter(|index| *index != source_index) else {
+                    continue;
+                };
+                let target = &period.adaptations[target_index];
+                validate_switching_pair(
+                    period_index,
+                    period,
+                    source,
+                    target,
+                    period_duration,
+                    findings,
+                );
+            }
+        }
+    }
+}
+
+fn parse_switching_targets(value: &str) -> Result<Vec<String>, ()> {
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+    for raw in value.split(',') {
+        let target = raw.trim();
+        if target.is_empty() || !seen.insert(target) {
+            return Err(());
+        }
+        targets.push(target.to_owned());
+    }
+    if targets.is_empty() {
+        Err(())
+    } else {
+        Ok(targets)
+    }
+}
+
+fn validate_switching_pair(
+    period_index: usize,
+    period: &Period,
+    source: &AdaptationSet,
+    target: &AdaptationSet,
+    period_duration: Option<f64>,
+    findings: &mut Vec<DashFinding>,
+) {
+    let source_id = source
+        .id
+        .as_deref()
+        .expect("validated switching source has an id");
+    let target_id = target
+        .id
+        .as_deref()
+        .expect("resolved switching target has an id");
+    let media_types = (adaptation_media_type(source), adaptation_media_type(target));
+    findings.push(finding(
+        "FORGE-DASHIF-ADAPTATION-SWITCHING-TYPE",
+        Severity::Error,
+        media_types.0.is_some() && media_types.0 == media_types.1,
+        format!(
+            "Period {period_index} switching AdaptationSets {source_id} and {target_id} have the same media type"
+        ),
+        Some(json!({
+            "source_id": source_id,
+            "source_type": media_types.0,
+            "source_language": source.lang,
+            "target_id": target_id,
+            "target_type": media_types.1,
+            "target_language": target.lang
+        })),
+    ));
+
+    for (rule_id, label, source_value, target_value) in [
+        (
+            "FORGE-DASHIF-SWITCHING-SEGMENT-ALIGNMENT",
+            "segmentAlignment",
+            source.segment_alignment,
+            target.segment_alignment,
+        ),
+        (
+            "FORGE-DASHIF-SWITCHING-SUBSEGMENT-ALIGNMENT",
+            "subsegmentAlignment",
+            source.subsegment_alignment,
+            target.subsegment_alignment,
+        ),
+    ] {
+        let aligned = source_value != Some(true) && target_value != Some(true)
+            || source_value == Some(true) && target_value == Some(true);
+        findings.push(finding(
+            rule_id,
+            Severity::Error,
+            aligned,
+            format!(
+                "Period {period_index} switching AdaptationSets {source_id} and {target_id} have a consistent {label} claim"
+            ),
+            Some(json!({
+                "source_id": source_id,
+                "source": source_value,
+                "target_id": target_id,
+                "target": target_value
+            })),
+        ));
+    }
+
+    let source_signatures = switching_alignment_signatures(period, source, period_duration);
+    let target_signatures = switching_alignment_signatures(period, target, period_duration);
+    let evidence_complete = source_signatures.is_ok() && target_signatures.is_ok();
+    findings.push(finding(
+        "FORGE-DASHIF-SWITCHING-ALIGNMENT-EVIDENCE",
+        Severity::Warning,
+        evidence_complete,
+        format!(
+            "Period {period_index} switching AdaptationSets {source_id} and {target_id} expose bounded segment-boundary evidence"
+        ),
+        Some(json!({
+            "source_id": source_id,
+            "source_language": source.lang,
+            "source_representation_count": source_signatures.as_ref().ok().map(|items| items.len()),
+            "source_error": source_signatures.as_ref().err().map(String::as_str),
+            "target_id": target_id,
+            "target_language": target.lang,
+            "target_representation_count": target_signatures.as_ref().ok().map(|items| items.len()),
+            "target_error": target_signatures.as_ref().err().map(String::as_str)
+        })),
+    ));
+    let (Ok(source_signatures), Ok(target_signatures)) = (source_signatures, target_signatures)
+    else {
+        return;
+    };
+    let reference = source_signatures.first();
+    let aligned = reference.is_some()
+        && source_signatures
+            .iter()
+            .chain(&target_signatures)
+            .all(|signature| Some(signature) == reference);
+    findings.push(finding(
+        "FORGE-DASHIF-SWITCHING-BOUNDARY-ALIGNMENT",
+        Severity::Error,
+        aligned,
+        format!(
+            "Period {period_index} switching AdaptationSets {source_id} and {target_id} have identical normalized segment boundaries across all Representations"
+        ),
+        Some(json!({
+            "source_id": source_id,
+            "source_language": source.lang,
+            "source_representation_count": source_signatures.len(),
+            "target_id": target_id,
+            "target_language": target.lang,
+            "target_representation_count": target_signatures.len(),
+            "segment_count": reference.map(Vec::len)
+        })),
+    ));
+}
+
+fn adaptation_media_type(adaptation: &AdaptationSet) -> Option<String> {
+    if let Some(content_type) = &adaptation.content_type {
+        return Some(content_type.clone());
+    }
+    if let Some(mime) = &adaptation.mime_type {
+        return mime.split_once('/').map(|(kind, _)| kind.to_owned());
+    }
+    let mut media_types = adaptation
+        .representations
+        .iter()
+        .filter_map(|representation| {
+            representation
+                .mime_type
+                .as_deref()
+                .and_then(|mime| mime.split_once('/').map(|(kind, _)| kind))
+        });
+    let first = media_types.next()?;
+    media_types
+        .all(|kind| kind == first)
+        .then(|| first.to_owned())
+}
+
+fn switching_alignment_signatures(
+    period: &Period,
+    adaptation: &AdaptationSet,
+    period_duration: Option<f64>,
+) -> Result<Vec<Vec<NormalizedSegment>>, String> {
+    adaptation
+        .representations
+        .iter()
+        .map(|representation| {
+            let (declared, addressing) = resolve_addressing(representation, adaptation, period);
+            if declared.len() != 1 {
+                return Err("Representation does not resolve exactly one addressing mode".into());
+            }
+            match addressing {
+                Some(ResolvedAddressing::Template(template)) => {
+                    let segments = expand_timeline_segments(&template, period_duration)?;
+                    complete_normalized_segments(
+                        segments,
+                        effective_timescale(&template),
+                        template.presentation_time_offset.unwrap_or(0),
+                    )
+                }
+                Some(ResolvedAddressing::List(list)) => {
+                    let segments = expand_segment_list_segments(&list, period_duration)?;
+                    complete_normalized_segments(
+                        segments,
+                        list.base.timescale.unwrap_or(1),
+                        list.base.presentation_time_offset.unwrap_or(0),
+                    )
+                }
+                Some(ResolvedAddressing::Base(_)) => {
+                    Err("SegmentBase has no MPD segment-boundary sequence".into())
+                }
+                None => Err("Representation has no resolved segment addressing".into()),
+            }
+        })
+        .collect()
+}
+
+fn complete_normalized_segments(
+    segments: Vec<(u64, u64)>,
+    timescale: u64,
+    presentation_time_offset: u64,
+) -> Result<Vec<NormalizedSegment>, String> {
+    if timescale == 0 {
+        return Err("segment timescale is zero".into());
+    }
+    if segments.is_empty() || segments.len() == MAX_LOCAL_SEGMENTS {
+        return Err("segment-boundary evidence is empty or truncated by the safety limit".into());
+    }
+    Ok(segments
+        .into_iter()
+        .map(|(start, duration)| {
+            let (start_numerator, start_denominator) = reduce_signed_fraction(
+                i128::from(start) - i128::from(presentation_time_offset),
+                timescale,
+            );
+            let divisor = gcd_u64(duration, timescale);
+            NormalizedSegment {
+                start_numerator,
+                start_denominator,
+                duration_numerator: duration / divisor,
+                duration_denominator: timescale / divisor,
+            }
+        })
+        .collect())
+}
+
+fn reduce_signed_fraction(numerator: i128, denominator: u64) -> (i128, u64) {
+    let magnitude = u64::try_from(numerator.unsigned_abs()).unwrap_or(u64::MAX);
+    let divisor = gcd_u64(magnitude, denominator);
+    (numerator / i128::from(divisor), denominator / divisor)
+}
+
+fn gcd_u64(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left.max(1)
 }
 
 fn validate_event_streams(
@@ -5155,6 +5484,144 @@ mod tests {
             .iter()
             .any(|item| item.rule_id == "FORGE-DASH-LOCAL-RESOURCE" && !item.passed));
         assert_eq!(audit.properties["representation_count"], 1);
+    }
+
+    #[test]
+    fn validates_audio_switching_boundaries_across_languages_and_timescales() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_mpd(
+            directory.path(),
+            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+ profiles="https://dashif.org/guidelines/dash-if-iop"
+ mediaPresentationDuration="PT6S" minBufferTime="PT1S">
+ <BaseURL>https://example.invalid/audio/</BaseURL>
+ <Period id="p0">
+  <AdaptationSet id="1" contentType="audio" mimeType="audio/mp4"
+   codecs="mp4a.40.2" lang="en" segmentAlignment="true">
+   <SupplementalProperty
+    schemeIdUri="urn:mpeg:dash:adaptation-set-switching:2016" value="2"/>
+   <SegmentTemplate timescale="48000" presentationTimeOffset="4800"
+    initialization="en-init.mp4" media="en-$Time$.m4s">
+    <SegmentTimeline><S t="4800" d="96000" r="2"/></SegmentTimeline>
+   </SegmentTemplate>
+   <Representation id="en" bandwidth="128000"/>
+  </AdaptationSet>
+  <AdaptationSet id="2" contentType="audio" mimeType="audio/mp4"
+   codecs="mp4a.40.2" lang="fr" segmentAlignment="true">
+   <SegmentTemplate timescale="1000" presentationTimeOffset="100"
+    initialization="fr-init.mp4" media="fr-$Time$.m4s">
+    <SegmentTimeline><S t="100" d="2000" r="2"/></SegmentTimeline>
+   </SegmentTemplate>
+   <Representation id="fr" bandwidth="128000"/>
+  </AdaptationSet>
+ </Period>
+</MPD>"#,
+        );
+        let audit = audit(&path, DashProfile::DashIfIop).unwrap();
+        assert!(
+            audit.passed,
+            "{:#?}",
+            audit
+                .findings
+                .iter()
+                .filter(|finding| finding.severity == Severity::Error && !finding.passed)
+                .map(|finding| (&finding.rule_id, &finding.message))
+                .collect::<Vec<_>>()
+        );
+        for rule in [
+            "FORGE-DASHIF-ADAPTATION-SWITCHING-DESCRIPTOR",
+            "FORGE-DASHIF-ADAPTATION-SWITCHING-REFERENCE",
+            "FORGE-DASHIF-ADAPTATION-SWITCHING-TYPE",
+            "FORGE-DASHIF-SWITCHING-SEGMENT-ALIGNMENT",
+            "FORGE-DASHIF-SWITCHING-ALIGNMENT-EVIDENCE",
+            "FORGE-DASHIF-SWITCHING-BOUNDARY-ALIGNMENT",
+        ] {
+            assert!(
+                audit
+                    .findings
+                    .iter()
+                    .any(|finding| finding.rule_id == rule && finding.passed),
+                "missing passed rule {rule}"
+            );
+        }
+        assert_eq!(
+            audit.properties["adaptation_set_switching_descriptor_count"],
+            1
+        );
+    }
+
+    #[test]
+    fn rejects_inconsistent_switching_claims_and_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_mpd(
+            directory.path(),
+            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+ mediaPresentationDuration="PT6S" minBufferTime="PT1S">
+ <BaseURL>https://example.invalid/audio/</BaseURL>
+ <Period>
+  <AdaptationSet id="1" contentType="audio" mimeType="audio/mp4"
+   codecs="opus" lang="en" segmentAlignment="true">
+   <SupplementalProperty
+    schemeIdUri="urn:mpeg:dash:adaptation-set-switching:2016" value="2"/>
+   <SegmentTemplate timescale="1000" duration="2000"
+    initialization="en-init.mp4" media="en-$Number$.m4s"/>
+   <Representation id="en" bandwidth="64000"/>
+  </AdaptationSet>
+  <AdaptationSet id="2" contentType="audio" mimeType="audio/mp4"
+   codecs="opus" lang="ja" segmentAlignment="false">
+   <SegmentTemplate timescale="1000" duration="1500"
+    initialization="ja-init.mp4" media="ja-$Number$.m4s"/>
+   <Representation id="ja" bandwidth="64000"/>
+  </AdaptationSet>
+ </Period>
+</MPD>"#,
+        );
+        let audit = audit(&path, DashProfile::DashIfIop).unwrap();
+        assert!(!audit.passed);
+        for rule in [
+            "FORGE-DASHIF-SWITCHING-SEGMENT-ALIGNMENT",
+            "FORGE-DASHIF-SWITCHING-BOUNDARY-ALIGNMENT",
+        ] {
+            assert!(
+                audit
+                    .findings
+                    .iter()
+                    .any(|finding| finding.rule_id == rule && !finding.passed),
+                "missing failed rule {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_or_dangling_switching_targets() {
+        assert!(parse_switching_targets("").is_err());
+        assert!(parse_switching_targets("2,2").is_err());
+        assert_eq!(
+            parse_switching_targets("2, 3").unwrap(),
+            vec!["2".to_owned(), "3".to_owned()]
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_mpd(
+            directory.path(),
+            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+ mediaPresentationDuration="PT2S" minBufferTime="PT1S">
+ <Period><SegmentTemplate timescale="1" duration="2" media="segment.m4s"/>
+  <AdaptationSet id="1" contentType="audio" mimeType="audio/mp4" codecs="opus">
+   <SupplementalProperty
+    schemeIdUri="urn:mpeg:dash:adaptation-set-switching:2016" value="1"/>
+   <SupplementalProperty
+    schemeIdUri="urn:mpeg:dash:adaptation-set-switching:2016" value="missing"/>
+   <Representation id="audio" bandwidth="64000"/>
+  </AdaptationSet>
+ </Period>
+</MPD>"#,
+        );
+        let audit = audit(&path, DashProfile::DashIfIop).unwrap();
+        assert!(!audit.passed);
+        assert!(audit.findings.iter().any(|finding| {
+            finding.rule_id == "FORGE-DASHIF-ADAPTATION-SWITCHING-REFERENCE" && !finding.passed
+        }));
     }
 
     #[test]

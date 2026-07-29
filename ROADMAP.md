@@ -59,6 +59,9 @@ Forge already provides:
 - Explicitly allowlisted DASH clock/origin observation with per-request time
   and byte limits, redirect reauthorization, request caps, clock-offset
   checks, and a redacted fetch manifest.
+- Cross-language CMAF audio alignment for HLS Rendition Groups and
+  DASH Adaptation Set Switching descriptors, including normalized
+  timescale/presentation-offset boundaries and discontinuity state.
 - HLS, DASH, and CMAF package checks; ISO loudness and MPEG-D DRC metadata.
 - ADM, S-ADM, presentation-aware rendering/QC, C2PA validation, CI comparison,
   real-time processing, LV2, and CLAP integration.
@@ -122,7 +125,6 @@ generations.
 
 ### Streaming and platform delivery
 
-- CMAF switching-set alignment across audio renditions and languages.
 - MPEG-DASH loudness/DRC descriptors and HLS timed-ID3 loudness metadata.
 - Remote-resource auditing only behind explicit allowlists, byte/time limits,
   redirect controls, and a recorded fetch manifest.

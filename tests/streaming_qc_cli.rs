@@ -125,6 +125,52 @@ fn streaming_qc_cli_audits_dash_and_selects_profile() {
 }
 
 #[test]
+fn streaming_qc_cli_reports_cross_language_switching_alignment() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("languages.mpd");
+    fs::write(
+        &input,
+        r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+ mediaPresentationDuration="PT4S" minBufferTime="PT1S">
+ <BaseURL>https://example.invalid/audio/</BaseURL>
+ <Period>
+  <AdaptationSet id="1" contentType="audio" mimeType="audio/mp4"
+   codecs="opus" lang="en" segmentAlignment="true">
+   <SupplementalProperty
+    schemeIdUri="urn:mpeg:dash:adaptation-set-switching:2016" value="2"/>
+   <SegmentTemplate timescale="48000" duration="96000"
+    initialization="en.mp4" media="en-$Number$.m4s"/>
+   <Representation id="en" bandwidth="64000"/>
+  </AdaptationSet>
+  <AdaptationSet id="2" contentType="audio" mimeType="audio/mp4"
+   codecs="opus" lang="ja" segmentAlignment="true">
+   <SegmentTemplate timescale="1000" duration="2000"
+    initialization="ja.mp4" media="ja-$Number$.m4s"/>
+   <Representation id="ja" bandwidth="64000"/>
+  </AdaptationSet>
+ </Period>
+</MPD>"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-streaming-qc"))
+        .arg(&input)
+        .args(["--profile", "dash-if-iop"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        audit["properties"]["adaptation_set_switching_descriptor_count"],
+        1
+    );
+    assert!(audit["findings"].as_array().unwrap().iter().any(|finding| {
+        finding["rule_id"] == "FORGE-DASHIF-SWITCHING-BOUNDARY-ALIGNMENT"
+            && finding["passed"] == true
+    }));
+}
+
+#[test]
 fn streaming_qc_cli_selects_dash_live_profile() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("live.mpd");
