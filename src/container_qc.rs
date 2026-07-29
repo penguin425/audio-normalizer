@@ -47,7 +47,7 @@ pub struct AuditCheck {
 pub fn audit(path: &Path) -> Result<ContainerAudit, String> {
     audit_if_supported(path)?.ok_or_else(|| {
         format!(
-            "{}: unsupported container (expected WAVE, AIFF/AIFC, CAF, AU, DSF/DSDIFF, FLAC, MP3, AAC ADTS/LOAS, AC-3/E-AC-3, standalone IAMF, MPEG-TS/M2TS, MXF, Ogg Opus/Vorbis, Matroska/WebM, or ISO-BMFF MP4/M4A/fMP4)",
+            "{}: unsupported container (expected WAVE, AIFF/AIFC, CAF, AU, DSF/DSDIFF, FLAC, MP3, AAC ADTS/LOAS, AC-3/E-AC-3, standalone IAMF, MPEG-TS/M2TS, MXF, AAF, Ogg Opus/Vorbis, Matroska/WebM, or ISO-BMFF MP4/M4A/fMP4)",
             path.display()
         )
     })
@@ -59,7 +59,7 @@ pub fn audit_if_supported(path: &Path) -> Result<Option<ContainerAudit>, String>
         .metadata()
         .map_err(|error| format!("stat {}: {error}", path.display()))?
         .len();
-    let mut header = [0_u8; 16];
+    let mut header = [0_u8; 32];
     let header_size = usize::try_from(file_size.min(header.len() as u64)).unwrap();
     file.read_exact(&mut header[..header_size])
         .map_err(|error| format!("read {} header: {error}", path.display()))?;
@@ -74,6 +74,8 @@ pub fn audit_if_supported(path: &Path) -> Result<Option<ContainerAudit>, String>
         crate::pcm_container_qc::audit_caf(path, file, file_size).map(Some)
     } else if header_size >= 4 && &header[..4] == b".snd" {
         crate::pcm_container_qc::audit_au(path, file, file_size).map(Some)
+    } else if crate::aaf_qc::looks_like_aaf(&header[..header_size]) {
+        crate::aaf_qc::audit(path, file, file_size, &header[..header_size]).map(Some)
     } else if crate::dsd::looks_like_dsd(&header[..header_size]) {
         crate::dsd::audit(path, file, file_size).map(Some)
     } else if header_size >= 4 && &header[..4] == b"fLaC" {
