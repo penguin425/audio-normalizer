@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/aes31-qc-v1",
+  "title": "Forge AES31-3 ADL QC audit",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generator",
+    "path",
+    "passed",
+    "warning_count",
+    "findings",
+    "properties"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/aes31-qc-v1"
+    },
+    "generator": {"const": "forge-aes31-qc"},
+    "path": {"type": "string"},
+    "passed": {"type": "boolean"},
+    "warning_count": {"type": "integer", "minimum": 0},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rule_id", "severity", "passed", "message"],
+        "properties": {
+          "rule_id": {"type": "string", "pattern": "^FORGE-AES31-"},
+          "severity": {"enum": ["error", "warning"]},
+          "passed": {"type": "boolean"},
+          "message": {"type": "string"},
+          "observed": true
+        }
+      }
+    },
+    "properties": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "method",
+        "scope",
+        "document_bytes",
+        "record_count",
+        "section_count",
+        "track_count",
+        "source_count",
+        "event_count",
+        "overlap_count",
+        "overlap_without_crossfade_evidence_count",
+        "automation_record_counts",
+        "limits"
+      ],
+      "properties": {
+        "method": {"const": "forge-aes31-3-edml-structural-v1"},
+        "scope": {"type": "string"},
+        "document_bytes": {"type": "integer", "minimum": 0, "maximum": 16777216},
+        "record_count": {"type": "integer", "minimum": 0, "maximum": 250000},
+        "section_count": {"type": "integer", "minimum": 0, "maximum": 250000},
+        "adl_version": {"type": ["string", "null"]},
+        "creator": {"type": ["string", "null"]},
+        "sample_rate_hz": {"type": ["integer", "null"], "minimum": 8000, "maximum": 768000},
+        "frame_rate": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "drop_frame": {"type": ["boolean", "null"]},
+        "adl_level": {"type": ["integer", "null"], "minimum": 1, "maximum": 3},
+        "track_count": {"type": "integer", "minimum": 0},
+        "source_count": {"type": "integer", "minimum": 0},
+        "event_count": {"type": "integer", "minimum": 0},
+        "overlap_count": {"type": "integer", "minimum": 0},
+        "overlap_without_crossfade_evidence_count": {"type": "integer", "minimum": 0},
+        "destination_extent_samples": {"type": ["number", "null"], "minimum": 0},
+        "automation_record_counts": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "max_document_bytes",
+            "max_tokens",
+            "max_record_value_bytes",
+            "max_reported_details_per_finding"
+          ],
+          "properties": {
+            "max_document_bytes": {"const": 16777216},
+            "max_tokens": {"const": 250000},
+            "max_record_value_bytes": {"const": 65536},
+            "max_reported_details_per_finding": {"const": 100}
+          }
+        }
+      }
+    }
+  }
+}

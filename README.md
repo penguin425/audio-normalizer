@@ -753,6 +753,40 @@ malicious substitution. The implementation tracks the
 [SMPTE ST 2067 standards family](https://www.smpte.org/standards/st2067) and
 the [SMPTE IMF SHA-1 advisory](https://www.smpte.org/standards/advisory-note-imfcontent).
 
+### AES31-3 ADL project QC
+
+`forge-aes31-qc project.adl` audits the plain-ASCII EDML form of an AES31-3
+Audio Decision List. The bounded parser accepts records split across lines or
+packed together, as emitted by different workstations, and verifies:
+
+- the ADL root, balanced and ordered core sections, required project/version
+  fields, and unique singleton fields;
+- sample rate, integer or fractional frame rate, ADL level, destination start,
+  and sample remainders, including 29.97/59.94 drop-frame skipped labels;
+- optional track-list continuity, source/event numbering, URL locator syntax,
+  source references, channel-map widths, and declared destination tracks;
+- positive edit durations and, when source start/duration are supplied, edit
+  containment within those source bounds; and
+- bounded PAN, GAIN, MUTE, and MARK automation timestamps, destination
+  overlaps/crossfade evidence, and producer-specific extension sections.
+
+```sh
+forge-aes31-qc project.adl --output aes31-qc.json
+forge-aes31-qc project.adl --compact
+```
+
+Input is capped at 16 MiB, 250,000 EDML tokens, and 64 KiB per record value.
+Referenced resource URLs are parsed but never fetched or decoded. Reports
+follow `schema/aes31-qc-v1.schema.json`; exit status is 0 for pass, 1 for a QC
+failure, and 2 for an I/O or safety-limit error.
+
+The method identifier is `forge-aes31-3-edml-structural-v1`. Its scope is
+structural/interchange QC, not complete normative certification, and it does
+not validate the separate AES31-4 XML representation. The implementation
+tracks the official [AES31-3-2021 preview](https://www.aes.org/publications/standards/)
+and cross-checks real-world section and timing layouts documented by
+[Sound Directions](https://kennisbank.avanet.nl/wp-content/uploads/2019/05/sound-directions.pdf).
+
 ### RTP / AES67 / ST 2110 audio QC
 
 `forge-rtp-qc session.sdp [capture.pcap|capture.pcapng]` audits an RTP audio
@@ -1470,6 +1504,7 @@ src/
   decoder.rs        full-buffer and streaming universal decoders
   dsd.rs            bounded DSF/DSDIFF parser + read-only DSD FIR decimator
   aaf_qc.rs         bounded AAF CFB/stored-property structural QC
+  aes31_qc.rs       bounded AES31-3 EDML project/reference/timing QC
   flacenc.rs        bounded-memory pure-Rust FLAC encoder
   opus.rs           RFC 7845 mono/stereo and Mapping Family 1 Ogg Opus I/O
   mp3enc.rs         mono/stereo LAME encoder with gapless Info/LAME backpatch
@@ -1493,6 +1528,7 @@ src/
   bin/forge-audio-compare.rs decoded reference/candidate signal comparison
   bin/forge-container-qc.rs wrapper/bitstream/metadata audit CLI
   bin/forge-provenance-qc.rs C2PA integrity and trust-policy audit CLI
+  bin/forge-aes31-qc.rs AES31-3 EDML project audit CLI
   lv2.rs            hard-real-time-capable LV2 stereo plugin ABI
   clap_plugin.rs    CLAP stereo effect, automation, state, and latency ABI
   preset.rs         named playback and broadcast loudness targets

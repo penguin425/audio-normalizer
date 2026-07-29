@@ -109,6 +109,10 @@ Forge already provides:
   allocation and directory validation, required Header/MetaDictionary/root
   streams, stored-property and weak-reference tables, core object presence,
   and fixed entry/path/property-byte/reporting limits.
+- Bounded AES31-3 EDML ADL project QC with plain-ASCII and record limits,
+  core section/header validation, source and event identity/reference checks,
+  channel-map consistency, integer/fractional/drop-frame sample timing,
+  source bounds, automation timing, and explicit extension evidence.
 
 ## P0 — next correctness and interoperability work
 
@@ -121,9 +125,8 @@ generations.
 
 ### Broadcast and mastering containers
 
-- AES31-3 ADL project validation and full AAF object-model/Edit Protocol
-  conformance where authoritative fixtures are available. Bounded AAF
-  stored-format structural QC has shipped.
+- Full AAF object-model/Edit Protocol conformance where authoritative fixtures
+  are available. Bounded AAF stored-format structural QC has shipped.
 
 ### Codec-specific QC
 
