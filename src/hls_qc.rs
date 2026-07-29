@@ -61,6 +61,7 @@ struct Playlist {
     segment_discontinuities: Vec<bool>,
     map_uri: Option<String>,
     referenced_playlists: Vec<String>,
+    media_renditions: Vec<MediaRendition>,
     has_endlist: bool,
     playlist_type: Option<String>,
     version: Option<u64>,
@@ -76,6 +77,15 @@ struct Playlist {
     rendition_reports: Vec<RenditionReport>,
     program_date_time_count: usize,
     has_i_frames_only: bool,
+}
+
+#[derive(Clone, Debug)]
+struct MediaRendition {
+    kind: String,
+    group_id: String,
+    name: String,
+    language: Option<String>,
+    uri: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +147,8 @@ impl TsAudioStream {
 pub fn audit(path: &Path, profile: HlsProfile) -> Result<HlsAudit, String> {
     let mut findings = Vec::new();
     let root = parse_playlist(path, profile, &mut findings)?;
+    let root_path = root.path.clone();
+    let media_renditions = root.media_renditions.clone();
     let mut media = Vec::new();
     if root.kind == "multivariant" {
         let mut seen = HashSet::new();
@@ -218,6 +230,7 @@ pub fn audit(path: &Path, profile: HlsProfile) -> Result<HlsAudit, String> {
         audit_media_files(playlist, profile, &mut findings);
     }
     cross_check_renditions(&media, profile, &mut findings);
+    cross_check_cmaf_audio_renditions(&root_path, &media_renditions, &media, &mut findings);
 
     let passed = findings
         .iter()
@@ -705,6 +718,22 @@ fn parse_playlist(
                         "EXT-X-MEDIA has required attributes and a valid URI/default relationship",
                         Some(json!(&values)),
                     ));
+                    if required && uri_valid && default_valid {
+                        let (Some(kind), Some(group_id), Some(name)) = (
+                            values.get("TYPE"),
+                            values.get("GROUP-ID"),
+                            values.get("NAME"),
+                        ) else {
+                            unreachable!("valid EXT-X-MEDIA has required attributes");
+                        };
+                        playlist.media_renditions.push(MediaRendition {
+                            kind: kind.clone(),
+                            group_id: group_id.clone(),
+                            name: name.clone(),
+                            language: values.get("LANGUAGE").cloned(),
+                            uri: values.get("URI").cloned(),
+                        });
+                    }
                     if let Some(uri) = values.get("URI") {
                         playlist.referenced_playlists.push(uri.clone());
                     }
@@ -1421,6 +1450,133 @@ fn cross_check_renditions(media: &[Playlist], profile: HlsProfile, findings: &mu
     }
 }
 
+fn cross_check_cmaf_audio_renditions(
+    root_path: &Path,
+    renditions: &[MediaRendition],
+    media: &[Playlist],
+    findings: &mut Vec<HlsFinding>,
+) {
+    let mut declared_groups = HashMap::<&str, Vec<&MediaRendition>>::new();
+    for rendition in renditions
+        .iter()
+        .filter(|rendition| rendition.kind == "AUDIO")
+    {
+        declared_groups
+            .entry(rendition.group_id.as_str())
+            .or_default()
+            .push(rendition);
+    }
+
+    for (group_id, declared) in declared_groups
+        .into_iter()
+        .filter(|(_, group)| group.len() > 1)
+    {
+        let group = declared
+            .iter()
+            .filter_map(|rendition| {
+                let path = local_reference(root_path, rendition.uri.as_deref()?)?;
+                media
+                    .iter()
+                    .find(|playlist| paths_equal(&playlist.path, &path))
+                    .map(|playlist| (*rendition, playlist))
+            })
+            .collect::<Vec<_>>();
+        if !group.iter().any(|(_, item)| item.is_fmp4) {
+            continue;
+        }
+        let observed = || {
+            json!({
+                "group_id": group_id,
+                "renditions": group.iter().map(|(rendition, playlist)| json!({
+                    "name": rendition.name,
+                    "language": rendition.language,
+                    "path": playlist.path,
+                    "fmp4": playlist.is_fmp4,
+                    "duration": playlist.total_duration,
+                    "segments": playlist.segment_durations.len(),
+                    "discontinuity_sequence": playlist.discontinuity_sequence
+                })).collect::<Vec<_>>()
+            })
+        };
+        let expected_local = declared
+            .iter()
+            .filter(|rendition| rendition.uri.is_some())
+            .count();
+        findings.push(finding(
+            "FORGE-HLS-CMAF-AUDIO-GROUP-EVIDENCE",
+            Severity::Warning,
+            group.len() == expected_local,
+            format!(
+                "CMAF audio Rendition Group {group_id} has every URI-bearing language rendition available for local alignment checks"
+            ),
+            Some(json!({
+                "group_id": group_id,
+                "expected": expected_local,
+                "loaded": group.len()
+            })),
+        ));
+        if group.len() < 2 {
+            continue;
+        }
+        findings.push(finding(
+            "FORGE-HLS-CMAF-AUDIO-GROUP-FORMAT",
+            Severity::Error,
+            group.iter().all(|(_, playlist)| playlist.is_fmp4),
+            format!(
+                "CMAF audio Rendition Group {group_id} uses fMP4 in every local language rendition"
+            ),
+            Some(observed()),
+        ));
+
+        let reference = &group[0].1;
+        let durations_match = group.iter().skip(1).all(|(_, playlist)| {
+            (playlist.total_duration - reference.total_duration).abs() <= 0.001
+        });
+        findings.push(finding(
+            "FORGE-HLS-CMAF-AUDIO-GROUP-DURATION",
+            Severity::Error,
+            durations_match,
+            format!(
+                "CMAF audio Rendition Group {group_id} covers the same duration in every local language rendition"
+            ),
+            Some(observed()),
+        ));
+
+        let reference_boundaries = cumulative(&reference.segment_durations);
+        let boundaries_match = group.iter().skip(1).all(|(_, playlist)| {
+            let boundaries = cumulative(&playlist.segment_durations);
+            boundaries.len() == reference_boundaries.len()
+                && boundaries
+                    .iter()
+                    .zip(&reference_boundaries)
+                    .all(|(observed, expected)| (observed - expected).abs() <= 0.001)
+        });
+        findings.push(finding(
+            "FORGE-HLS-CMAF-AUDIO-GROUP-ALIGNMENT",
+            Severity::Error,
+            boundaries_match,
+            format!(
+                "CMAF audio Rendition Group {group_id} has aligned segment boundaries across local languages"
+            ),
+            Some(observed()),
+        ));
+
+        let discontinuities_match = group.iter().skip(1).all(|(_, playlist)| {
+            playlist.discontinuity_sequence == reference.discontinuity_sequence
+                && playlist.segment_discontinuities == reference.segment_discontinuities
+        });
+        findings.push(finding(
+            "FORGE-HLS-CMAF-AUDIO-GROUP-DISCONTINUITY",
+            Severity::Error,
+            discontinuities_match,
+            format!(
+                "CMAF audio Rendition Group {group_id} has identical discontinuity state across local languages"
+            ),
+            Some(observed()),
+        ));
+    }
+}
+
 fn cross_check_low_latency_renditions(media: &[Playlist], findings: &mut Vec<HlsFinding>) {
     for source in media {
         let source_edge = playlist_edge(source);
@@ -1930,6 +2086,122 @@ mod tests {
             .findings
             .iter()
             .any(|item| { item.rule_id == "FORGE-APPLE-HLS-COMMON-DURATION" && !item.passed }));
+    }
+
+    #[test]
+    fn validates_cmaf_audio_rendition_alignment_across_languages() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("master.m3u8"),
+            "#EXTM3U\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES,URI=\"en/audio.m3u8\"\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"Japanese\",LANGUAGE=\"ja\",AUTOSELECT=YES,URI=\"ja/audio.m3u8\"\n",
+        )
+        .unwrap();
+        for language in ["en", "ja"] {
+            fs::create_dir(directory.path().join(language)).unwrap();
+            fs::write(
+                directory.path().join(language).join("audio.m3u8"),
+                "#EXTM3U\n\
+                 #EXT-X-VERSION:7\n\
+                 #EXT-X-TARGETDURATION:2\n\
+                 #EXT-X-PLAYLIST-TYPE:VOD\n\
+                 #EXT-X-MAP:URI=\"https://example.invalid/init.mp4\"\n\
+                 #EXTINF:2,\n\
+                 https://example.invalid/one.m4s\n\
+                 #EXTINF:2,\n\
+                 https://example.invalid/two.m4s\n\
+                 #EXT-X-ENDLIST\n",
+            )
+            .unwrap();
+        }
+
+        let audit = audit(&directory.path().join("master.m3u8"), HlsProfile::Rfc8216).unwrap();
+        assert!(
+            audit.passed,
+            "{:#?}",
+            audit
+                .findings
+                .iter()
+                .filter(|finding| finding.severity == Severity::Error && !finding.passed)
+                .map(|finding| (&finding.rule_id, &finding.message))
+                .collect::<Vec<_>>()
+        );
+        for rule in [
+            "FORGE-HLS-CMAF-AUDIO-GROUP-EVIDENCE",
+            "FORGE-HLS-CMAF-AUDIO-GROUP-FORMAT",
+            "FORGE-HLS-CMAF-AUDIO-GROUP-DURATION",
+            "FORGE-HLS-CMAF-AUDIO-GROUP-ALIGNMENT",
+            "FORGE-HLS-CMAF-AUDIO-GROUP-DISCONTINUITY",
+        ] {
+            assert!(
+                audit
+                    .findings
+                    .iter()
+                    .any(|finding| finding.rule_id == rule && finding.passed),
+                "missing passed rule {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_misaligned_cmaf_audio_language_renditions() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("master.m3u8"),
+            "#EXTM3U\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",LANGUAGE=\"en\",URI=\"en.m3u8\"\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"French\",LANGUAGE=\"fr\",URI=\"fr.m3u8\"\n",
+        )
+        .unwrap();
+        let playlist = |durations: &[f64], discontinuity: bool| {
+            format!(
+                "#EXTM3U\n\
+                 #EXT-X-VERSION:7\n\
+                 #EXT-X-TARGETDURATION:3\n\
+                 #EXT-X-DISCONTINUITY-SEQUENCE:{}\n\
+                 #EXT-X-MAP:URI=\"https://example.invalid/init.mp4\"\n\
+                 #EXTINF:{},\n\
+                 https://example.invalid/one.m4s\n\
+                 {}\
+                 #EXTINF:{},\n\
+                 https://example.invalid/two.m4s\n\
+                 #EXT-X-ENDLIST\n",
+                usize::from(discontinuity),
+                durations[0],
+                if discontinuity {
+                    "#EXT-X-DISCONTINUITY\n"
+                } else {
+                    ""
+                },
+                durations[1]
+            )
+        };
+        fs::write(
+            directory.path().join("en.m3u8"),
+            playlist(&[2.0, 2.0], false),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("fr.m3u8"),
+            playlist(&[1.5, 2.5], true),
+        )
+        .unwrap();
+
+        let audit = audit(&directory.path().join("master.m3u8"), HlsProfile::Rfc8216).unwrap();
+        assert!(!audit.passed);
+        for rule in [
+            "FORGE-HLS-CMAF-AUDIO-GROUP-ALIGNMENT",
+            "FORGE-HLS-CMAF-AUDIO-GROUP-DISCONTINUITY",
+        ] {
+            assert!(
+                audit
+                    .findings
+                    .iter()
+                    .any(|finding| finding.rule_id == rule && !finding.passed),
+                "missing failed rule {rule}"
+            );
+        }
     }
 
     #[test]
