@@ -414,15 +414,26 @@ They enforce bounded LEB128 OBU framing, the normative 2 MiB OBU limit,
 sequence headers and profiles, descriptor ordering, data redundancy/trimming
 flags, and complete-file consumption without decoding codec payloads. Stable
 `FORGE-IAMF-CODEC-CONFIG`, `FORGE-IAMF-AUDIO-ELEMENT`,
+`FORGE-IAMF-MIX-PRESENTATION`, `FORGE-IAMF-PROFILE-CONSTRAINTS`,
 `FORGE-IAMF-DESCRIPTOR-LINKS`, and `FORGE-IAMF-AUDIO-FRAME-LINKS` checks parse
 the Codec Config prefix and full Opus, FLAC STREAMINFO, or LPCM decoder
 configuration, enforce AAC-LC frame and roll declarations, and parse complete
-Audio Element syntax. The Audio Element check validates bounded and unique
-parameter definitions, parameter/frame timing, one-to-six-layer scalable
-channel geometry, standard and expanded loudspeaker layouts, output/recon-gain
-signalling, and codec-dependent reconstruction-gain requirements. Scene-based
-elements validate MONO and PROJECTION Ambisonics geometry, complete matrices,
-and [RFC 8486](https://www.rfc-editor.org/rfc/rfc8486.html) channel mappings.
+Audio Element and Mix Presentation syntax. The Audio Element check validates
+bounded and unique parameter definitions, parameter/frame timing,
+one-to-six-layer scalable channel geometry, standard and expanded loudspeaker
+layouts, output/recon-gain signalling, and codec-dependent reconstruction-gain
+requirements. Scene-based elements validate MONO and PROJECTION Ambisonics
+geometry, complete matrices, and
+[RFC 8486](https://www.rfc-editor.org/rfc/rfc8486.html) channel mappings.
+Mix Presentation validation covers bounded BCP 47 annotations, sub-mixes,
+rendering modes and extensions, equivalent shared Mix Gain definitions,
+Sound System and binaural layouts, Q7.8 loudness and peak fields, unique
+anchored-loudness types, bounded layout extensions, and IAMF v1.1 tags.
+Profile filtering resolves referenced elements and enforces the Simple,
+Base, and Base-Enhanced limits of 1/2/28 elements and 16/18/28 input channels,
+including the single-sub-mix and expanded-layout restrictions. At least one
+recognized presentation must conform to the primary profile; alternative
+presentations may instead conform to the declared additional profile.
 Descriptor and frame checks reject duplicate or missing
 codec/element/parameter/substream IDs and require every implicit or explicit
 Audio Frame OBU to resolve to a declared substream. Counts, layouts, channel

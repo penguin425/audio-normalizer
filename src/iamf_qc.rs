@@ -50,12 +50,62 @@ enum AudioElementConfig {
         num_layers: u8,
         highest_layout: String,
         output_channels: u16,
+        expanded_layout: bool,
     },
     SceneBased {
         ambisonics_mode: u8,
         output_channels: u16,
     },
     Reserved,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MixPresentation {
+    id: u64,
+    annotation_languages: Vec<String>,
+    sub_mixes: Vec<MixSubMix>,
+    tags: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MixSubMix {
+    audio_element_ids: Vec<u64>,
+    headphones_rendering_modes: Vec<u8>,
+    rendering_extension_bytes: usize,
+    parameter_definitions: Vec<MixGainDefinition>,
+    layouts: Vec<MixLayout>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MixGainDefinition {
+    id: u64,
+    rate: u64,
+    mode: u8,
+    duration: Option<u64>,
+    constant_subblock_duration: Option<u64>,
+    subblock_durations: Vec<u64>,
+    default_mix_gain: i16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MixLayout {
+    layout_type: u8,
+    sound_system: Option<u8>,
+    output_channels: Option<u8>,
+    info_type: u8,
+    integrated_loudness: i16,
+    digital_peak: i16,
+    true_peak: Option<i16>,
+    anchored_loudness: Vec<(u8, i16)>,
+    extension_bytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MixProfileObservation {
+    id: u64,
+    audio_elements: usize,
+    input_channels: u32,
+    supported_profiles: Vec<u8>,
 }
 
 #[derive(Debug, Default)]
@@ -89,20 +139,28 @@ struct State {
     reserved_obus: u64,
     codec_configs_valid: bool,
     audio_elements_valid: bool,
+    mix_presentations_valid: bool,
+    profile_constraints_valid: bool,
     descriptor_links_valid: bool,
     audio_frames_valid: bool,
     current_codec_configs_by_id: BTreeMap<u64, CodecConfig>,
     current_audio_elements_by_id: BTreeMap<u64, AudioElement>,
+    current_mix_presentations_by_id: BTreeMap<u64, MixPresentation>,
     current_substream_ids: BTreeSet<u64>,
     current_parameter_ids: BTreeSet<u64>,
+    current_parameter_types_by_id: BTreeMap<u64, u64>,
+    current_mix_gain_definitions: BTreeMap<u64, MixGainDefinition>,
     current_parameter_definitions: usize,
     active_codec_configs: BTreeMap<u64, CodecConfig>,
     active_audio_elements: BTreeMap<u64, AudioElement>,
+    active_mix_presentations: BTreeMap<u64, MixPresentation>,
     active_substream_ids: BTreeSet<u64>,
     pending_substream_ids: BTreeSet<u64>,
     frame_counts: BTreeMap<u64, u64>,
     codec_config_observations: Vec<CodecConfig>,
     audio_element_observations: Vec<AudioElement>,
+    mix_presentation_observations: Vec<MixPresentation>,
+    mix_profile_observations: Vec<MixProfileObservation>,
     observed_substream_ids: usize,
     payload_errors: Vec<String>,
     payload_evidence_truncated: bool,
@@ -150,6 +208,8 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
         sequence_headers_valid: true,
         codec_configs_valid: true,
         audio_elements_valid: true,
+        mix_presentations_valid: true,
+        profile_constraints_valid: true,
         descriptor_links_valid: true,
         audio_frames_valid: true,
         ..State::default()
@@ -206,6 +266,7 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
             SEQUENCE_HEADER => parse_sequence_header(payload, redundant, &mut state),
             CODEC_CONFIG => parse_codec_config(payload, &mut state),
             AUDIO_ELEMENT => parse_audio_element(payload, &mut state),
+            MIX_PRESENTATION => parse_mix_presentation(payload, &mut state),
             AUDIO_FRAME..=23 => parse_audio_frame(obu_type, payload, &mut state),
             _ => {}
         }
@@ -313,11 +374,36 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
             })),
         ),
         check(
+            "FORGE-IAMF-MIX-PRESENTATION",
+            state.mix_presentations_valid && !state.mix_presentation_observations.is_empty(),
+            "mix presentations have bounded localized strings, unique element references, consistent parameter definitions, conforming gains, layouts, loudness, anchors, and optional tags",
+            Some(json!({
+                "mix_presentations": mix_presentation_json(&state.mix_presentation_observations),
+                "errors": state.payload_errors,
+                "evidence_truncated": state.payload_evidence_truncated,
+            })),
+        ),
+        check(
+            "FORGE-IAMF-PROFILE-CONSTRAINTS",
+            state.profile_constraints_valid && !state.mix_profile_observations.is_empty(),
+            "at least one recognized mix presentation conforms to the primary profile and each recognized mix conforms to a declared profile",
+            Some(json!({
+                "primary_profile": state.first_profile.map(|value| profile_name(value.0)),
+                "additional_profile": state.first_profile.map(|value| profile_name(value.1)),
+                "mix_presentations": mix_profile_json(&state.mix_profile_observations),
+                "errors": state.payload_errors,
+                "evidence_truncated": state.payload_evidence_truncated,
+            })),
+        ),
+        check(
             "FORGE-IAMF-DESCRIPTOR-LINKS",
-            state.descriptor_links_valid && !state.audio_element_observations.is_empty(),
-            "audio elements have unique IDs and substreams and resolve exactly one codec configuration",
+            state.descriptor_links_valid
+                && !state.audio_element_observations.is_empty()
+                && !state.mix_presentation_observations.is_empty(),
+            "descriptor IDs are unique and every audio element, mix element, codec, substream, and parameter reference resolves",
             Some(json!({
                 "audio_elements": audio_element_json(&state.audio_element_observations),
+                "mix_presentations": mix_presentation_json(&state.mix_presentation_observations),
                 "declared_substream_ids": declared_substream_ids(&state.audio_element_observations),
                 "errors": state.payload_errors,
                 "evidence_truncated": state.payload_evidence_truncated,
@@ -376,6 +462,8 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
             "trim_at_end_samples": state.trim_at_end_samples,
             "codec_configs": codec_config_json(&state.codec_config_observations),
             "audio_elements": audio_element_json(&state.audio_element_observations),
+            "mix_presentations": mix_presentation_json(&state.mix_presentation_observations),
+            "mix_profile_support": mix_profile_json(&state.mix_profile_observations),
             "audio_frame_counts": state.frame_counts,
             "payload_errors": state.payload_errors,
             "payload_evidence_truncated": state.payload_evidence_truncated,
@@ -464,8 +552,11 @@ fn update_order(obu_type: u8, redundant: bool, state: &mut State) {
         state.current_mix_presentations = 0;
         state.current_codec_configs_by_id.clear();
         state.current_audio_elements_by_id.clear();
+        state.current_mix_presentations_by_id.clear();
         state.current_substream_ids.clear();
         state.current_parameter_ids.clear();
+        state.current_parameter_types_by_id.clear();
+        state.current_mix_gain_definitions.clear();
         state.current_parameter_definitions = 0;
         state.saw_data = false;
         return;
@@ -531,9 +622,99 @@ fn finish_descriptor_set(state: &mut State) {
             format!("audio element {element_id} references missing codec config {codec_config_id}"),
         );
     }
+    let mix_presentations = state
+        .current_mix_presentations_by_id
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut primary_profile_supported = false;
+    for mix in mix_presentations {
+        let mut supported_profiles = BTreeSet::from([0_u8, 1, 2]);
+        if mix.sub_mixes.len() != 1 {
+            supported_profiles.clear();
+        }
+        let mut input_channels = 0_u32;
+        let mut audio_elements = 0_usize;
+        for sub_mix in &mix.sub_mixes {
+            if sub_mix
+                .headphones_rendering_modes
+                .iter()
+                .any(|mode| *mode >= 2)
+            {
+                supported_profiles.clear();
+            }
+            audio_elements = audio_elements.saturating_add(sub_mix.audio_element_ids.len());
+            for element_id in &sub_mix.audio_element_ids {
+                let Some(element) = state.current_audio_elements_by_id.get(element_id) else {
+                    state.descriptor_links_valid = false;
+                    supported_profiles.clear();
+                    record_payload_error(
+                        state,
+                        format!(
+                            "mix presentation {} references missing audio element {element_id}",
+                            mix.id
+                        ),
+                    );
+                    continue;
+                };
+                match &element.config {
+                    AudioElementConfig::ChannelBased {
+                        output_channels,
+                        expanded_layout,
+                        ..
+                    } => {
+                        input_channels = input_channels.saturating_add(u32::from(*output_channels));
+                        if *expanded_layout {
+                            supported_profiles.remove(&0);
+                            supported_profiles.remove(&1);
+                        }
+                    }
+                    AudioElementConfig::SceneBased {
+                        output_channels, ..
+                    } => {
+                        input_channels = input_channels.saturating_add(u32::from(*output_channels));
+                    }
+                    AudioElementConfig::Reserved => supported_profiles.clear(),
+                }
+            }
+        }
+        supported_profiles.retain(|profile| match profile {
+            0 => audio_elements <= 1 && input_channels <= 16,
+            1 => audio_elements <= 2 && input_channels <= 18,
+            2 => audio_elements <= 28 && input_channels <= 28,
+            _ => false,
+        });
+        if let Some((primary, additional)) = state.first_profile {
+            primary_profile_supported |= supported_profiles.contains(&primary);
+            if !supported_profiles.contains(&primary) && !supported_profiles.contains(&additional) {
+                state.profile_constraints_valid = false;
+                record_payload_error(
+                    state,
+                    format!(
+                        "mix presentation {} conforms to neither declared profile",
+                        mix.id
+                    ),
+                );
+            }
+        }
+        state.mix_profile_observations.push(MixProfileObservation {
+            id: mix.id,
+            audio_elements,
+            input_channels,
+            supported_profiles: supported_profiles.into_iter().collect(),
+        });
+    }
+    if !primary_profile_supported {
+        state.profile_constraints_valid = false;
+        record_payload_error(
+            state,
+            "no recognized Mix Presentation conforms to the primary profile".into(),
+        );
+    }
     if state.descriptor_sets > 0 && state.descriptor_redundant {
         if state.current_codec_configs_by_id != state.active_codec_configs
             || state.current_audio_elements_by_id != state.active_audio_elements
+            || state.current_mix_presentations_by_id != state.active_mix_presentations
         {
             state.descriptor_links_valid = false;
             record_payload_error(
@@ -544,6 +725,7 @@ fn finish_descriptor_set(state: &mut State) {
     } else {
         state.active_codec_configs = state.current_codec_configs_by_id.clone();
         state.active_audio_elements = state.current_audio_elements_by_id.clone();
+        state.active_mix_presentations = state.current_mix_presentations_by_id.clone();
         state.active_substream_ids = state.current_substream_ids.clone();
         state
             .pending_substream_ids
@@ -877,8 +1059,19 @@ fn parse_audio_element(payload: &[u8], state: &mut State) {
                 }
             }
             let mut duplicate_parameter = false;
-            for parameter_id in &element.parameter_ids {
-                if !state.current_parameter_ids.insert(*parameter_id) {
+            for (parameter_id, parameter_type) in element.parameter_ids.iter().zip(
+                element
+                    .parameter_types
+                    .iter()
+                    .copied()
+                    .filter(|parameter_type| matches!(parameter_type, 1 | 2)),
+            ) {
+                if !state.current_parameter_ids.insert(*parameter_id)
+                    || state
+                        .current_parameter_types_by_id
+                        .insert(*parameter_id, parameter_type)
+                        .is_some_and(|existing| existing != parameter_type)
+                {
                     duplicate_parameter = true;
                 }
             }
@@ -888,7 +1081,7 @@ fn parse_audio_element(payload: &[u8], state: &mut State) {
                 record_payload_error(
                     state,
                     format!(
-                        "audio element {}, one of its substream IDs, or one of its parameter IDs is not unique",
+                        "audio element {}, one of its substream IDs is not unique, or a parameter ID has conflicting types",
                         element.id
                     ),
                 );
@@ -1004,7 +1197,7 @@ fn audio_element(payload: &[u8], codec: Option<&CodecConfig>) -> Result<AudioEle
             &parameter_types,
             codec,
         )?,
-        1 => parse_ambisonics_config(payload, &mut cursor, num_substreams, codec)?,
+        1 => parse_ambisonics_config(payload, &mut cursor, num_substreams)?,
         _ => {
             let size = take_leb(payload, &mut cursor, "audio_element_config_size")?;
             let size = usize::try_from(size)
@@ -1131,6 +1324,7 @@ fn parse_channel_audio_config(
     let mut previous_dimensions: Option<(u8, u8, u8)> = None;
     let mut highest_layout = String::new();
     let mut highest_standard_layout = None;
+    let mut expanded_layout = false;
     let mut recon_gain_flags = Vec::with_capacity(usize::from(num_layers));
     for layer_index in 0..num_layers {
         let flags = take_bytes(payload, cursor, 1, "channel_audio_layer_config")?[0];
@@ -1176,6 +1370,7 @@ fn parse_channel_audio_config(
         }
 
         if loudspeaker_layout == 15 {
+            expanded_layout = true;
             if layer_index != 0 || num_layers != 1 {
                 return Err("expanded loudspeaker layout is not a single first layer".into());
             }
@@ -1270,6 +1465,7 @@ fn parse_channel_audio_config(
         num_layers,
         highest_layout,
         output_channels: cumulative_channels,
+        expanded_layout,
     })
 }
 
@@ -1277,14 +1473,10 @@ fn parse_ambisonics_config(
     payload: &[u8],
     cursor: &mut usize,
     num_substreams: usize,
-    codec: Option<&CodecConfig>,
 ) -> Result<AudioElementConfig, String> {
     let ambisonics_mode = take_leb(payload, cursor, "ambisonics_mode")?;
     if ambisonics_mode > 1 {
         return Err(format!("ambisonics_mode {ambisonics_mode} is reserved"));
-    }
-    if ambisonics_mode == 1 && codec.is_some_and(|codec| codec.codec_id == "ipcm") {
-        return Err("LPCM scene-based audio requires MONO Ambisonics mode".into());
     }
     let output_channels = u16::from(take_bytes(payload, cursor, 1, "output_channel_count")?[0]);
     if !is_ambisonics_channel_count(output_channels) {
@@ -1407,6 +1599,343 @@ fn is_ambisonics_channel_count(channels: u16) -> bool {
     (0_u16..=14).any(|order| (order + 1) * (order + 1) == channels)
 }
 
+fn parse_mix_presentation(payload: &[u8], state: &mut State) {
+    match mix_presentation(payload) {
+        Ok(mix) => {
+            if state.current_mix_presentations_by_id.len() == MAX_DESCRIPTOR_IDS
+                && !state.current_mix_presentations_by_id.contains_key(&mix.id)
+            {
+                state.mix_presentations_valid = false;
+                record_payload_error(
+                    state,
+                    format!("mix presentation count exceeds {MAX_DESCRIPTOR_IDS}"),
+                );
+                return;
+            }
+            let parameter_definitions = mix
+                .sub_mixes
+                .iter()
+                .flat_map(|sub_mix| sub_mix.parameter_definitions.iter())
+                .collect::<Vec<_>>();
+            if state
+                .current_parameter_definitions
+                .saturating_add(parameter_definitions.len())
+                > MAX_DESCRIPTOR_IDS
+            {
+                state.mix_presentations_valid = false;
+                record_payload_error(
+                    state,
+                    format!("parameter definition count exceeds {MAX_DESCRIPTOR_IDS}"),
+                );
+                return;
+            }
+            let duplicate_mix = state
+                .current_mix_presentations_by_id
+                .insert(mix.id, mix.clone())
+                .is_some();
+            let mut conflicting_parameter = false;
+            for definition in parameter_definitions {
+                state.current_parameter_ids.insert(definition.id);
+                if state
+                    .current_parameter_types_by_id
+                    .insert(definition.id, 0)
+                    .is_some_and(|existing| existing != 0)
+                {
+                    conflicting_parameter = true;
+                }
+                if state
+                    .current_mix_gain_definitions
+                    .insert(definition.id, definition.clone())
+                    .is_some_and(|existing| existing != *definition)
+                {
+                    conflicting_parameter = true;
+                }
+            }
+            state.current_parameter_definitions =
+                state.current_parameter_definitions.saturating_add(
+                    mix.sub_mixes
+                        .iter()
+                        .map(|sub_mix| sub_mix.parameter_definitions.len())
+                        .sum::<usize>(),
+                );
+            if duplicate_mix || conflicting_parameter {
+                state.mix_presentations_valid = false;
+                state.descriptor_links_valid = false;
+                record_payload_error(
+                    state,
+                    format!(
+                        "mix presentation {} is duplicated or one of its parameter IDs has inequivalent definitions",
+                        mix.id
+                    ),
+                );
+            }
+            if state.mix_presentation_observations.len() < MAX_DESCRIPTOR_IDS {
+                state.mix_presentation_observations.push(mix);
+            } else {
+                state.payload_evidence_truncated = true;
+            }
+        }
+        Err(error) => {
+            state.mix_presentations_valid = false;
+            record_payload_error(state, format!("invalid Mix Presentation OBU: {error}"));
+        }
+    }
+}
+
+fn mix_presentation(payload: &[u8]) -> Result<MixPresentation, String> {
+    let mut cursor = 0;
+    let id = take_leb(payload, &mut cursor, "mix_presentation_id")?;
+    let count_label = take_bounded_count(payload, &mut cursor, "count_label")?;
+    let mut annotation_languages = Vec::with_capacity(count_label);
+    for _ in 0..count_label {
+        let language = take_iamf_string(payload, &mut cursor, "annotations_language")?;
+        if !is_well_formed_language_tag(&language) {
+            return Err(format!(
+                "annotations_language {language:?} is not a well-formed BCP 47 tag"
+            ));
+        }
+        annotation_languages.push(language);
+    }
+    if annotation_languages.iter().collect::<BTreeSet<_>>().len() != annotation_languages.len() {
+        return Err("annotations_language values are not unique".into());
+    }
+    for _ in 0..count_label {
+        take_iamf_string(payload, &mut cursor, "localized_presentation_annotation")?;
+    }
+    let num_sub_mixes = take_bounded_count(payload, &mut cursor, "num_sub_mixes")?;
+    if num_sub_mixes == 0 {
+        return Err("num_sub_mixes is zero".into());
+    }
+    let mut sub_mixes = Vec::with_capacity(num_sub_mixes);
+    let mut all_audio_element_ids = BTreeSet::new();
+    for sub_mix_index in 0..num_sub_mixes {
+        let num_audio_elements = take_bounded_count(payload, &mut cursor, "num_audio_elements")?;
+        if num_audio_elements == 0 {
+            return Err(format!(
+                "sub-mix {} num_audio_elements is zero",
+                sub_mix_index + 1
+            ));
+        }
+        let mut audio_element_ids = Vec::with_capacity(num_audio_elements);
+        let mut headphones_rendering_modes = Vec::with_capacity(num_audio_elements);
+        let mut rendering_extension_bytes = 0_usize;
+        let mut parameter_definitions = Vec::with_capacity(num_audio_elements + 1);
+        for _ in 0..num_audio_elements {
+            let audio_element_id = take_leb(payload, &mut cursor, "audio_element_id")?;
+            if !all_audio_element_ids.insert(audio_element_id) {
+                return Err(format!(
+                    "audio_element_id {audio_element_id} is repeated across the Mix Presentation"
+                ));
+            }
+            audio_element_ids.push(audio_element_id);
+            for _ in 0..count_label {
+                take_iamf_string(payload, &mut cursor, "localized_element_annotation")?;
+            }
+            let rendering_config = take_bytes(payload, &mut cursor, 1, "rendering_config")?[0];
+            headphones_rendering_modes.push(rendering_config >> 6);
+            let extension_size =
+                take_bounded_count(payload, &mut cursor, "rendering_config_extension_size")?;
+            take_bytes(
+                payload,
+                &mut cursor,
+                extension_size,
+                "rendering_config_extension_bytes",
+            )?;
+            rendering_extension_bytes = rendering_extension_bytes
+                .checked_add(extension_size)
+                .ok_or_else(|| "rendering config extension size overflow".to_string())?;
+            parameter_definitions.push(parse_mix_gain_definition(payload, &mut cursor)?);
+        }
+        parameter_definitions.push(parse_mix_gain_definition(payload, &mut cursor)?);
+        let num_layouts = take_bounded_count(payload, &mut cursor, "num_layouts")?;
+        if num_layouts == 0 {
+            return Err(format!("sub-mix {} num_layouts is zero", sub_mix_index + 1));
+        }
+        let mut layouts = Vec::with_capacity(num_layouts);
+        let mut has_stereo_layout = false;
+        for _ in 0..num_layouts {
+            let layout = parse_mix_layout(payload, &mut cursor)?;
+            has_stereo_layout |= layout.layout_type == 2 && layout.sound_system == Some(0);
+            layouts.push(layout);
+        }
+        if !has_stereo_layout {
+            return Err(format!(
+                "sub-mix {} has no Sound System A stereo layout",
+                sub_mix_index + 1
+            ));
+        }
+        sub_mixes.push(MixSubMix {
+            audio_element_ids,
+            headphones_rendering_modes,
+            rendering_extension_bytes,
+            parameter_definitions,
+            layouts,
+        });
+    }
+    let mut tags = Vec::new();
+    if cursor < payload.len() {
+        let num_tags = usize::from(take_bytes(payload, &mut cursor, 1, "num_tags")?[0]);
+        tags.reserve(num_tags);
+        for _ in 0..num_tags {
+            let name = take_iamf_string(payload, &mut cursor, "tag_name")?;
+            let value = take_iamf_string(payload, &mut cursor, "tag_value")?;
+            if name == "content_language"
+                && (value.len() != 3 || !value.bytes().all(|byte| byte.is_ascii_alphabetic()))
+            {
+                return Err(format!(
+                    "content_language {value:?} is not a three-letter ISO 639-2 code"
+                ));
+            }
+            tags.push((name, value));
+        }
+    }
+    if cursor != payload.len() {
+        return Err(format!(
+            "{} bytes remain after Mix Presentation tags",
+            payload.len() - cursor
+        ));
+    }
+    Ok(MixPresentation {
+        id,
+        annotation_languages,
+        sub_mixes,
+        tags,
+    })
+}
+
+fn is_well_formed_language_tag(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 127
+        && value.split('-').all(|subtag| {
+            !subtag.is_empty()
+                && subtag.len() <= 8
+                && subtag.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+        && value
+            .split('-')
+            .next()
+            .is_some_and(|primary| primary.bytes().all(|byte| byte.is_ascii_alphabetic()))
+}
+
+fn parse_mix_gain_definition(
+    payload: &[u8],
+    cursor: &mut usize,
+) -> Result<MixGainDefinition, String> {
+    let parameter_id = take_leb(payload, cursor, "mix_gain parameter_id")?;
+    let parameter_rate = take_leb(payload, cursor, "mix_gain parameter_rate")?;
+    if parameter_rate == 0 {
+        return Err(format!(
+            "mix gain parameter {parameter_id} has a zero parameter_rate"
+        ));
+    }
+    let mode = take_bytes(payload, cursor, 1, "mix_gain param_definition_mode")?[0] >> 7;
+    let mut duration = None;
+    let mut constant_subblock_duration = None;
+    let mut subblock_durations = Vec::new();
+    if mode == 0 {
+        let parsed_duration = take_leb(payload, cursor, "mix_gain duration")?;
+        duration = Some(parsed_duration);
+        if parsed_duration == 0 {
+            return Err(format!(
+                "mix gain parameter {parameter_id} duration is zero"
+            ));
+        }
+        let parsed_constant_subblock_duration =
+            take_leb(payload, cursor, "mix_gain constant_subblock_duration")?;
+        constant_subblock_duration = Some(parsed_constant_subblock_duration);
+        if parsed_constant_subblock_duration > parsed_duration {
+            return Err(format!(
+                "mix gain parameter {parameter_id} constant_subblock_duration exceeds duration"
+            ));
+        }
+        if parsed_constant_subblock_duration == 0 {
+            let num_subblocks = take_bounded_count(payload, cursor, "mix_gain num_subblocks")?;
+            let mut total = 0_u64;
+            for _ in 0..num_subblocks {
+                let subblock_duration = take_leb(payload, cursor, "mix_gain subblock_duration")?;
+                if subblock_duration == 0 {
+                    return Err(format!(
+                        "mix gain parameter {parameter_id} has a zero subblock_duration"
+                    ));
+                }
+                total = total.checked_add(subblock_duration).ok_or_else(|| {
+                    format!("mix gain parameter {parameter_id} subblock duration overflow")
+                })?;
+                subblock_durations.push(subblock_duration);
+            }
+            if total != parsed_duration {
+                return Err(format!(
+                    "mix gain parameter {parameter_id} subblock durations total {total}, expected {parsed_duration}"
+                ));
+            }
+        }
+    }
+    let default_mix_gain = take_i16(payload, cursor, "default_mix_gain")?;
+    Ok(MixGainDefinition {
+        id: parameter_id,
+        rate: parameter_rate,
+        mode,
+        duration,
+        constant_subblock_duration,
+        subblock_durations,
+        default_mix_gain,
+    })
+}
+
+fn parse_mix_layout(payload: &[u8], cursor: &mut usize) -> Result<MixLayout, String> {
+    let layout = take_bytes(payload, cursor, 1, "loudness_layout")?[0];
+    let layout_type = layout >> 6;
+    let sound_system = (layout_type == 2).then_some((layout >> 2) & 0x0f);
+    let output_channels = match (layout_type, sound_system) {
+        (3, _) => Some(2),
+        (2, Some(sound_system @ 0..=13)) => {
+            Some([2_u8, 6, 8, 10, 11, 12, 14, 24, 8, 12, 10, 6, 1, 16][usize::from(sound_system)])
+        }
+        _ => None,
+    };
+    let info_type = take_bytes(payload, cursor, 1, "loudness info_type")?[0];
+    let integrated_loudness = take_i16(payload, cursor, "integrated_loudness")?;
+    let digital_peak = take_i16(payload, cursor, "digital_peak")?;
+    let true_peak = if info_type & 0x01 != 0 {
+        Some(take_i16(payload, cursor, "true_peak")?)
+    } else {
+        None
+    };
+    let mut anchored_loudness = Vec::new();
+    if info_type & 0x02 != 0 {
+        let count = usize::from(take_bytes(payload, cursor, 1, "num_anchored_loudness")?[0]);
+        anchored_loudness.reserve(count);
+        let mut anchor_types = BTreeSet::new();
+        for _ in 0..count {
+            let anchor_type = take_bytes(payload, cursor, 1, "anchor_element")?[0];
+            if !anchor_types.insert(anchor_type) {
+                return Err(format!(
+                    "anchored loudness repeats anchor_element {anchor_type}"
+                ));
+            }
+            anchored_loudness.push((anchor_type, take_i16(payload, cursor, "anchored_loudness")?));
+        }
+    }
+    let extension_bytes = if info_type & 0xfc != 0 {
+        let size = take_bounded_count(payload, cursor, "info_type_size")?;
+        take_bytes(payload, cursor, size, "info_type_bytes")?;
+        size
+    } else {
+        0
+    };
+    Ok(MixLayout {
+        layout_type,
+        sound_system,
+        output_channels,
+        info_type,
+        integrated_loudness,
+        digital_peak,
+        true_peak,
+        anchored_loudness,
+        extension_bytes,
+    })
+}
+
 fn parse_audio_frame(obu_type: u8, payload: &[u8], state: &mut State) {
     let parsed = if obu_type == AUDIO_FRAME {
         let mut cursor = 0;
@@ -1458,6 +1987,38 @@ fn take_leb(bytes: &[u8], cursor: &mut usize, name: &str) -> Result<u64, String>
     Ok(value)
 }
 
+fn take_bounded_count(bytes: &[u8], cursor: &mut usize, name: &str) -> Result<usize, String> {
+    let value = take_leb(bytes, cursor, name)?;
+    let value = usize::try_from(value).map_err(|_| format!("{name} does not fit in memory"))?;
+    if value > MAX_DESCRIPTOR_IDS {
+        return Err(format!("{name} {value} exceeds {MAX_DESCRIPTOR_IDS}"));
+    }
+    Ok(value)
+}
+
+fn take_iamf_string(bytes: &[u8], cursor: &mut usize, name: &str) -> Result<String, String> {
+    let remaining = bytes
+        .get(*cursor..)
+        .ok_or_else(|| format!("{name} is truncated"))?;
+    let terminator = remaining
+        .iter()
+        .take(128)
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| format!("{name} has no null terminator within 128 bytes"))?;
+    let value = std::str::from_utf8(&remaining[..terminator])
+        .map_err(|_| format!("{name} is not UTF-8"))?
+        .to_owned();
+    *cursor = cursor
+        .checked_add(terminator + 1)
+        .ok_or_else(|| format!("{name} cursor overflow"))?;
+    Ok(value)
+}
+
+fn take_i16(bytes: &[u8], cursor: &mut usize, name: &str) -> Result<i16, String> {
+    let value = take_bytes(bytes, cursor, 2, name)?;
+    Ok(i16::from_be_bytes([value[0], value[1]]))
+}
+
 fn take_bytes<'a>(
     bytes: &'a [u8],
     cursor: &mut usize,
@@ -1507,6 +2068,7 @@ fn audio_element_json(elements: &[AudioElement]) -> Vec<Value> {
                     num_layers,
                     highest_layout,
                     output_channels,
+                    ..
                 } => (
                     Some(*num_layers),
                     Some(highest_layout.as_str()),
@@ -1544,6 +2106,69 @@ fn audio_element_json(elements: &[AudioElement]) -> Vec<Value> {
                 "output_channels": output_channels,
                 "ambisonics_mode": ambisonics_mode,
                 "trailing_extension_bytes": element.trailing_bytes,
+            })
+        })
+        .collect()
+}
+
+fn mix_presentation_json(mixes: &[MixPresentation]) -> Vec<Value> {
+    mixes
+        .iter()
+        .map(|mix| {
+            json!({
+                "mix_presentation_id": mix.id,
+                "annotation_languages": mix.annotation_languages,
+                "sub_mixes": mix.sub_mixes.iter().map(|sub_mix| {
+                    json!({
+                        "audio_element_ids": sub_mix.audio_element_ids,
+                        "headphones_rendering_modes": sub_mix.headphones_rendering_modes.iter().map(|mode| match mode {
+                            0 => "stereo",
+                            1 => "binaural",
+                            _ => "reserved",
+                        }).collect::<Vec<_>>(),
+                        "rendering_extension_bytes": sub_mix.rendering_extension_bytes,
+                        "mix_gain_parameter_ids": sub_mix.parameter_definitions.iter().map(|definition| definition.id).collect::<Vec<_>>(),
+                        "layouts": sub_mix.layouts.iter().map(|layout| {
+                            json!({
+                                "layout_type": match layout.layout_type {
+                                    2 => "loudspeakers-ss-convention",
+                                    3 => "binaural",
+                                    _ => "reserved",
+                                },
+                                "sound_system": layout.sound_system,
+                                "output_channels": layout.output_channels,
+                                "info_type": layout.info_type,
+                                "integrated_loudness_lufs": f64::from(layout.integrated_loudness) / 256.0,
+                                "digital_peak_dbfs": f64::from(layout.digital_peak) / 256.0,
+                                "true_peak_dbtp": layout.true_peak.map(|value| f64::from(value) / 256.0),
+                                "anchored_loudness": layout.anchored_loudness.iter().map(|(anchor, value)| {
+                                    json!({
+                                        "anchor_element": anchor,
+                                        "loudness_lufs": f64::from(*value) / 256.0,
+                                    })
+                                }).collect::<Vec<_>>(),
+                                "extension_bytes": layout.extension_bytes,
+                            })
+                        }).collect::<Vec<_>>(),
+                    })
+                }).collect::<Vec<_>>(),
+                "tags": mix.tags.iter().map(|(name, value)| {
+                    json!({"name": name, "value": value})
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
+fn mix_profile_json(observations: &[MixProfileObservation]) -> Vec<Value> {
+    observations
+        .iter()
+        .map(|observation| {
+            json!({
+                "mix_presentation_id": observation.id,
+                "audio_elements": observation.audio_elements,
+                "input_channels": observation.input_channels,
+                "supported_profiles": observation.supported_profiles.iter().map(|profile| profile_name(*profile)).collect::<Vec<_>>(),
             })
         })
         .collect()
@@ -1790,6 +2415,7 @@ mod tests {
                 num_layers: 2,
                 highest_layout: "5.1ch".into(),
                 output_channels: 6,
+                expanded_layout: false,
             }
         );
 
@@ -1824,6 +2450,7 @@ mod tests {
                 num_layers: 1,
                 highest_layout: "9.1.6ch".into(),
                 output_channels: 16,
+                expanded_layout: true,
             }
         );
     }
@@ -1845,6 +2472,7 @@ mod tests {
                 num_layers: 1,
                 highest_layout: "Mono".into(),
                 output_channels: 1,
+                expanded_layout: false,
             }
         );
 
@@ -1892,6 +2520,17 @@ mod tests {
             oversized_projection.contains("exceeding output_channel_count"),
             "{oversized_projection}"
         );
+
+        let mut lpcm_projection = vec![9, 0x20, 3, 2, 0, 1, 0, 1, 4, 2, 2];
+        lpcm_projection.extend_from_slice(&[0; 32]);
+        let projection = audio_element(&lpcm_projection, Some(&test_codec("ipcm"))).unwrap();
+        assert_eq!(
+            projection.config,
+            AudioElementConfig::SceneBased {
+                ambisonics_mode: 1,
+                output_channels: 4,
+            }
+        );
     }
 
     #[test]
@@ -1908,5 +2547,151 @@ mod tests {
         let reserved_layout =
             audio_element(&[9, 0, 3, 1, 0, 0, 0x20, 0xa0, 1, 0], None).unwrap_err();
         assert!(reserved_layout.contains("reserved"), "{reserved_layout}");
+    }
+
+    fn complete_mix_payload(rendering_mode: u8) -> Vec<u8> {
+        let mut payload = vec![42, 1];
+        payload.extend_from_slice(b"en-us\0Mix\0");
+        payload.extend_from_slice(&[
+            1, // One sub-mix.
+            1, // One audio element.
+            172, 2, // audio_element_id = 300.
+        ]);
+        payload.extend_from_slice(b"Element\0");
+        payload.extend_from_slice(&[
+            rendering_mode << 6,
+            2,
+            0xaa,
+            0xbb, // Rendering config and extension.
+            100,
+            1,
+            0x80,
+            0,
+            0, // Element mix gain, mode 1.
+            100,
+            1,
+            0x80,
+            0,
+            0,    // Equivalent shared output mix gain.
+            1,    // One layout.
+            0x80, // Loudspeaker SS convention, Sound System A.
+            0x07, // True peak, anchors, and a bounded extension.
+            0xe8,
+            0x00, // -24 LUFS.
+            0xff,
+            0x00, // -1 dBFS digital peak.
+            0xff,
+            0x00, // -1 dBTP true peak.
+            2,
+            1,
+            0xe8,
+            0x00,
+            2,
+            0xe7,
+            0x00, // Dialogue and album anchors.
+            1,
+            0xcc, // Loudness extension.
+            1,    // One tag.
+        ]);
+        payload.extend_from_slice(b"content_language\0eng\0");
+        payload
+    }
+
+    #[test]
+    fn parses_complete_mix_presentation_semantics() {
+        let mix = mix_presentation(&complete_mix_payload(0)).unwrap();
+        assert_eq!(mix.id, 42);
+        assert_eq!(mix.annotation_languages, ["en-us"]);
+        assert_eq!(mix.tags, [("content_language".into(), "eng".into())]);
+        assert_eq!(mix.sub_mixes[0].audio_element_ids, [300]);
+        assert_eq!(mix.sub_mixes[0].rendering_extension_bytes, 2);
+        assert_eq!(mix.sub_mixes[0].parameter_definitions.len(), 2);
+        assert_eq!(
+            mix.sub_mixes[0].parameter_definitions[0],
+            mix.sub_mixes[0].parameter_definitions[1]
+        );
+        let layout = &mix.sub_mixes[0].layouts[0];
+        assert_eq!(layout.output_channels, Some(2));
+        assert_eq!(layout.integrated_loudness, -6_144);
+        assert_eq!(layout.true_peak, Some(-256));
+        assert_eq!(layout.anchored_loudness, [(1, -6_144), (2, -6_400)]);
+        assert_eq!(layout.extension_bytes, 1);
+    }
+
+    #[test]
+    fn rejects_mix_without_stereo_and_duplicate_annotations_or_anchors() {
+        let mut no_stereo = complete_mix_payload(0);
+        let layout = no_stereo
+            .iter()
+            .position(|byte| *byte == 0x80)
+            .expect("mode byte");
+        let layout = no_stereo[layout + 1..]
+            .iter()
+            .position(|byte| *byte == 0x80)
+            .map(|offset| layout + 1 + offset)
+            .expect("second gain mode");
+        let layout = no_stereo[layout + 1..]
+            .iter()
+            .position(|byte| *byte == 0x80)
+            .map(|offset| layout + 1 + offset)
+            .expect("layout");
+        no_stereo[layout] = 0xc0;
+        let error = mix_presentation(&no_stereo).unwrap_err();
+        assert!(error.contains("no Sound System A"), "{error}");
+
+        let duplicate_languages = [42, 2, b'e', b'n', 0, b'e', b'n', 0, b'A', 0, b'B', 0, 0];
+        let error = mix_presentation(&duplicate_languages).unwrap_err();
+        assert!(error.contains("not unique"), "{error}");
+
+        let mut duplicate_anchor = complete_mix_payload(0);
+        let album_anchor = duplicate_anchor
+            .windows(4)
+            .position(|window| window == [2, 0xe7, 0x00, 1])
+            .expect("album anchor");
+        duplicate_anchor[album_anchor] = 1;
+        let error = mix_presentation(&duplicate_anchor).unwrap_err();
+        assert!(error.contains("repeats anchor_element"), "{error}");
+    }
+
+    #[test]
+    fn validates_primary_profile_and_reserved_rendering_modes() {
+        for (rendering_mode, expected) in [(0, true), (2, false)] {
+            let mix = mix_presentation(&complete_mix_payload(rendering_mode)).unwrap();
+            let element = AudioElement {
+                id: 300,
+                element_type: 0,
+                codec_config_id: 3,
+                substream_ids: vec![0],
+                parameter_ids: vec![],
+                parameter_types: vec![],
+                config: AudioElementConfig::ChannelBased {
+                    num_layers: 1,
+                    highest_layout: "Stereo".into(),
+                    output_channels: 2,
+                    expanded_layout: false,
+                },
+                trailing_bytes: 0,
+            };
+            let mut state = State {
+                descriptor_phase: true,
+                current_codec_configs: 1,
+                current_audio_elements: 1,
+                current_mix_presentations: 1,
+                first_profile: Some((0, 0)),
+                profile_constraints_valid: true,
+                descriptor_links_valid: true,
+                ..State::default()
+            };
+            state.current_audio_elements_by_id.insert(300, element);
+            state.current_mix_presentations_by_id.insert(42, mix);
+            finish_descriptor_set(&mut state);
+            assert_eq!(state.profile_constraints_valid, expected);
+            assert_eq!(
+                state.mix_profile_observations[0]
+                    .supported_profiles
+                    .contains(&0),
+                expected
+            );
+        }
     }
 }

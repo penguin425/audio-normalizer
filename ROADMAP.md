@@ -142,10 +142,10 @@ generations.
 - DTS core/HD metadata and decoded presentation checks through an optional
   adapter.
 - WavPack, Monkey's Audio, and ALAC native frame/checksum validation.
-- IAMF full Mix Presentation payload semantics, profile element/channel limits,
-  parameter/audio-frame timeline reconciliation, ISO-BMFF IAMF encapsulation,
-  and broader OAR conformance vectors. Standalone OBU bounds/order, supported
-  codec configurations, full Audio Element semantics, descriptor/substream
+- IAMF parameter/audio-frame timeline reconciliation, ISO-BMFF IAMF
+  encapsulation, and broader OAR conformance vectors. Standalone OBU
+  bounds/order, supported codec configurations, full Audio Element and Mix
+  Presentation semantics, profile element/channel limits, descriptor/substream
   linking, and externally rendered presentation QC have shipped.
 
 ### Streaming and platform delivery

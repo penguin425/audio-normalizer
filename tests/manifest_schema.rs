@@ -361,7 +361,12 @@ fn emitted_iamf_container_qc_conforms_to_published_schema() {
         &[0, b'i', b'p', b'c', b'm', 1, 0, 0, 0, 16, 0, 0, 187, 128],
     ));
     bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0, 0x20, 0, 1, 0]));
-    bytes.extend(obu(2, &[0]));
+    bytes.extend(obu(
+        2,
+        &[
+            0, 0, 1, 1, 0, 0, 0, 100, 1, 0x80, 0, 0, 100, 1, 0x80, 0, 0, 1, 0x80, 0, 0, 0, 0, 0,
+        ],
+    ));
     bytes.extend(obu(6, &[0]));
     std::fs::write(&path, bytes).unwrap();
 
