@@ -122,6 +122,43 @@ fn emitted_comparison_conforms_to_published_schema() {
 }
 
 #[test]
+fn emitted_audio_comparison_conforms_to_published_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference = directory.path().join("reference.wav");
+    let candidate = directory.path().join("candidate.wav");
+    let audio = forge_normalizer::wav::AudioBuffer {
+        sample_rate: 48_000,
+        channels: 1,
+        frames: 8_000,
+        data: vec![(0..8_000)
+            .map(|frame| {
+                (0.2 * (std::f64::consts::TAU * 997.0 * frame as f64 / 48_000.0).sin()) as f32
+            })
+            .collect()],
+        channel_roles: vec![ChannelRole::Main],
+        source_kind: PcmKind::F32,
+    };
+    forge_normalizer::wav::WavWriter::write(&reference, &audio, PcmKind::F32, false).unwrap();
+    forge_normalizer::wav::WavWriter::write(&candidate, &audio, PcmKind::F32, false).unwrap();
+    let comparison = forge_normalizer::audio_compare::compare_paths(
+        &reference,
+        &candidate,
+        &forge_normalizer::audio_compare::AudioCompareOptions::default(),
+    )
+    .unwrap();
+    let instance = serde_json::to_value(comparison).unwrap();
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/audio-comparison-v1.schema.json"))
+            .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
+
+#[test]
 fn emitted_container_qc_conforms_to_published_schema() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("programme.wav");

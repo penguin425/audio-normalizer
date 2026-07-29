@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/audio-comparison-v1.schema.json",
+  "title": "Forge decoded-audio comparison",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generator",
+    "passed",
+    "reference",
+    "candidate",
+    "options",
+    "method",
+    "channels",
+    "error_count",
+    "findings"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/audio-comparison-v1"
+    },
+    "generator": { "type": "string", "minLength": 1 },
+    "passed": { "type": "boolean" },
+    "reference": { "$ref": "#/$defs/input" },
+    "candidate": { "$ref": "#/$defs/input" },
+    "options": { "$ref": "#/$defs/options" },
+    "method": { "$ref": "#/$defs/method" },
+    "alignment": { "$ref": "#/$defs/alignment" },
+    "channels": {
+      "type": "array",
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/channel" }
+    },
+    "aggregate": { "$ref": "#/$defs/aggregate" },
+    "error_count": { "type": "integer", "minimum": 0 },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finding" }
+    }
+  },
+  "$defs": {
+    "finiteNumber": { "type": "number" },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "bytes",
+        "sha256",
+        "sample_rate_hz",
+        "channels",
+        "frames",
+        "duration_seconds",
+        "non_finite_samples"
+      ],
+      "properties": {
+        "path": { "type": "string" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "sample_rate_hz": { "type": "integer", "minimum": 1 },
+        "channels": { "type": "integer", "minimum": 1, "maximum": 32 },
+        "frames": { "type": "integer", "minimum": 1 },
+        "duration_seconds": { "$ref": "#/$defs/finiteNumber" },
+        "non_finite_samples": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "options": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_input_bytes",
+        "max_decoded_samples",
+        "alignment_search_ms",
+        "max_offset_samples",
+        "duration_tolerance_samples",
+        "min_alignment_correlation",
+        "min_channel_correlation",
+        "min_null_depth_db",
+        "max_residual_peak_dbfs",
+        "max_spectral_error_db",
+        "allow_channel_permutation",
+        "allow_polarity_inversion"
+      ],
+      "properties": {
+        "max_input_bytes": { "type": "integer", "minimum": 1 },
+        "max_decoded_samples": { "type": "integer", "minimum": 1 },
+        "alignment_search_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "max_offset_samples": { "type": "integer", "minimum": 0 },
+        "duration_tolerance_samples": { "type": "integer", "minimum": 0 },
+        "min_alignment_correlation": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "min_channel_correlation": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "min_null_depth_db": { "type": "number", "minimum": 0 },
+        "max_residual_peak_dbfs": { "$ref": "#/$defs/finiteNumber" },
+        "max_spectral_error_db": { "type": "number", "minimum": 0 },
+        "allow_channel_permutation": { "type": "boolean" },
+        "allow_polarity_inversion": { "type": "boolean" }
+      }
+    },
+    "method": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "classification",
+        "source",
+        "synchronization",
+        "channel_assignment",
+        "residual",
+        "spectral_error",
+        "alignment_block_frames",
+        "alignment_probe_seconds",
+        "mapping_point_limit",
+        "spectral_windows",
+        "spectral_window_frames"
+      ],
+      "properties": {
+        "classification": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "format": "uri" },
+        "synchronization": { "type": "string", "minLength": 1 },
+        "channel_assignment": { "type": "string", "minLength": 1 },
+        "residual": { "type": "string", "minLength": 1 },
+        "spectral_error": { "type": "string", "minLength": 1 },
+        "alignment_block_frames": { "type": "integer", "minimum": 1 },
+        "alignment_probe_seconds": { "type": "integer", "minimum": 1 },
+        "mapping_point_limit": { "type": "integer", "minimum": 1 },
+        "spectral_windows": { "type": "integer", "minimum": 1 },
+        "spectral_window_frames": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "alignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "offset_samples",
+        "offset_seconds",
+        "correlation",
+        "search_limit_samples",
+        "minimum_overlap_frames",
+        "reference_start_frame",
+        "candidate_start_frame",
+        "compared_frames"
+      ],
+      "properties": {
+        "offset_samples": { "type": "integer" },
+        "offset_seconds": { "$ref": "#/$defs/finiteNumber" },
+        "correlation": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "search_limit_samples": { "type": "integer", "minimum": 0 },
+        "minimum_overlap_frames": { "type": "integer", "minimum": 1 },
+        "reference_start_frame": { "type": "integer", "minimum": 0 },
+        "candidate_start_frame": { "type": "integer", "minimum": 0 },
+        "compared_frames": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "channel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reference_channel",
+        "candidate_channel",
+        "correlation",
+        "polarity_inverted",
+        "reference_rms_dbfs",
+        "residual_rms_dbfs",
+        "corrected_residual_rms_dbfs",
+        "residual_peak_dbfs",
+        "corrected_residual_peak_dbfs",
+        "null_depth_db",
+        "corrected_null_depth_db",
+        "spectral_error_db",
+        "exact_sample_match_ratio"
+      ],
+      "properties": {
+        "reference_channel": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32
+        },
+        "candidate_channel": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32
+        },
+        "correlation": {
+          "type": "number",
+          "minimum": -1,
+          "maximum": 1
+        },
+        "polarity_inverted": { "type": "boolean" },
+        "reference_rms_dbfs": { "$ref": "#/$defs/finiteNumber" },
+        "residual_rms_dbfs": { "$ref": "#/$defs/finiteNumber" },
+        "corrected_residual_rms_dbfs": { "$ref": "#/$defs/finiteNumber" },
+        "residual_peak_dbfs": { "$ref": "#/$defs/finiteNumber" },
+        "corrected_residual_peak_dbfs": { "$ref": "#/$defs/finiteNumber" },
+        "null_depth_db": { "$ref": "#/$defs/finiteNumber" },
+        "corrected_null_depth_db": { "$ref": "#/$defs/finiteNumber" },
+        "spectral_error_db": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 300
+        },
+        "exact_sample_match_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "aggregate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "aligned_identity_null_depth_db",
+        "mapped_null_depth_db",
+        "polarity_corrected_null_depth_db",
+        "mapped_residual_peak_dbfs",
+        "polarity_corrected_residual_peak_dbfs",
+        "maximum_spectral_error_db",
+        "minimum_absolute_channel_correlation"
+      ],
+      "properties": {
+        "aligned_identity_null_depth_db": { "$ref": "#/$defs/finiteNumber" },
+        "mapped_null_depth_db": { "$ref": "#/$defs/finiteNumber" },
+        "polarity_corrected_null_depth_db": { "$ref": "#/$defs/finiteNumber" },
+        "mapped_residual_peak_dbfs": { "$ref": "#/$defs/finiteNumber" },
+        "polarity_corrected_residual_peak_dbfs": {
+          "$ref": "#/$defs/finiteNumber"
+        },
+        "maximum_spectral_error_db": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 300
+        },
+        "minimum_absolute_channel_correlation": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "rule_id", "message"],
+      "properties": {
+        "level": { "enum": ["error", "note"] },
+        "rule_id": {
+          "type": "string",
+          "pattern": "^FORGE-AUDIO-COMPARE-[A-Z0-9-]+$"
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "evidence": {}
+      }
+    }
+  }
+}

@@ -68,13 +68,17 @@ cat >"${dist_dir}/forge-scoop.json" <<EOF
     "forge.exe",
     "forge-live.exe",
     "forge-compare.exe",
+    "forge-audio-compare.exe",
     "forge-container-qc.exe",
     "forge-streaming-qc.exe",
     "forge-presentation-qc.exe",
     "forge-sadm-qc.exe",
     "forge-dialogue-provider.exe",
     "forge-provenance-qc.exe",
-    "forge-imf-qc.exe"
+    "forge-imf-qc.exe",
+    "forge-rtp-qc.exe",
+    "forge-nmos-qc.exe",
+    "forge-st2022-7-qc.exe"
   ]
 }
 EOF

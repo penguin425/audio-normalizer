@@ -228,6 +228,39 @@ machine-readable CI evidence. Tolerances can also be stored in a JSON or TOML
 file passed with `--config`; findings have stable `FORGE-COMPARE-*` rule IDs
 and deterministic asset/rule/metric ordering.
 
+### Reference audio comparison
+
+`forge-audio-compare` decodes, aligns, and directly compares a candidate audio
+file with a reference. It reports the signed sample offset, optimal one-to-one
+channel assignment, polarity inversions, full-overlap null residual and peak,
+exact-sample ratio, channel correlation, and an excerpted one-third-octave
+spectral error:
+
+```sh
+forge-audio-compare master.wav delivery.flac \
+  --alignment-search-ms 1000 \
+  --max-offset-samples 0 \
+  --min-null-depth-db 60 \
+  --output audio-comparison.json
+```
+
+Exit codes are 0 for a passing gate, 1 for measured differences outside the
+configured tolerances, and 2 for an input/configuration error. JSON or TOML
+configuration can be supplied with `--config`. Channel permutation and
+polarity correction affect pass/fail only when explicitly enabled with
+`--allow-channel-permutation` and `--allow-polarity-inversion`; the original
+mapping, polarity, and uncorrected residual remain visible.
+
+This is deterministic, non-normative engineering QC—not a PEAQ conformance
+implementation. [ITU-R BS.1387-2](https://www.itu.int/rec/R-REC-BS.1387-2-202305-I/en)
+requires reference/test time alignment but leaves synchronization to the
+implementation. Forge records its bounded block-energy/sample-correlation
+method in every report. Inputs default to 4 GiB each, decoded audio to 400
+million samples, 32 channels, and a 10-second hard maximum alignment search.
+The output follows
+[`audio-comparison-v1.schema.json`](schema/audio-comparison-v1.schema.json)
+and uses stable `FORGE-AUDIO-COMPARE-*` rule identifiers.
+
 ### Container quality control
 
 `forge-container-qc` audits the original delivery bytes without decoding them:
@@ -1382,6 +1415,7 @@ src/
   realtime.rs       allocation-free live M/S meter + smoothed gain processor
   bin/forge-live.rs raw f32le real-time pipeline and NDJSON meter
   bin/forge-compare.rs delivery-manifest regression gate for CI
+  bin/forge-audio-compare.rs decoded reference/candidate signal comparison
   bin/forge-container-qc.rs wrapper/bitstream/metadata audit CLI
   bin/forge-provenance-qc.rs C2PA integrity and trust-policy audit CLI
   lv2.rs            hard-real-time-capable LV2 stereo plugin ABI

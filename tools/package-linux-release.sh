@@ -23,6 +23,7 @@ for binary in \
   forge \
   forge-live \
   forge-compare \
+  forge-audio-compare \
   forge-container-qc \
   forge-streaming-qc \
   forge-presentation-qc \
