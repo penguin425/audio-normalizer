@@ -382,17 +382,31 @@ AS-11 compliance claim. See
 
 AC-3/E-AC-3 elementary-stream audits scan bounded syncframes without FFmpeg.
 They validate frame sizes, sample rates, bitstream IDs, channel mode/LFE,
-`dialnorm`, compression-control words, and stable codec configuration.
-E-AC-3 reports independent/dependent substreams and channel maps and rejects a
-dependent substream without a compatible preceding independent substream.
+`dialnorm`, complete bitstream-information syntax, and stable codec
+configuration. The normative `compr` word is interpreted as its RF-mode
+decoder gain in dB; Forge also reports the encoded gain ranges for `dynrng`
+line mode and `compr` RF mode without inventing an authoring-preset name.
+E-AC-3 groups syncframes into six-block access units, reports every independent
+presentation and combined dependent-substream channel map, and enforces stable
+presentation membership, sequential substream IDs, compatible block geometry,
+and complete-mix compression-word placement. A legacy AC-3 independent core
+followed by E-AC-3 dependent substreams is grouped as one E-AC-3 access unit,
+with core and extension bitstream IDs validated independently.
+
+Dolby Digital Plus
+[JOC](https://professionalsupport.dolby.com/s/article/What-is-Dolby-Digital-Plus-JOC-Joint-Object-Coding)
+is asserted only when the two-byte Extension Type A `addbsi` payload has zero
+reserved bits and a complexity index from 1 through 16, appears consistently
+on independent substream I0, and the core stream is 48 kHz 5.1. A malformed or
+intermittent JOC claim fails a stable
+`FORGE-EAC3-ATMOS-JOC` check. Object rendering remains deliberately external:
+render every delivered presentation with an authoritative JOC decoder and
+audit the WAVE outputs with `forge-presentation-qc` using
+`"codec": "eac3-joc"`; the report retains renderer name/version evidence.
 Syntax follows
 [ATSC A/52:2018](https://www.atsc.org/wp-content/uploads/2021/04/A52-2018.pdf)
 and
 [ETSI TS 102 366 V1.4.1](https://www.etsi.org/deliver/etsi_ts/102300_102399/102366/01.04.01_60/ts_102366v010401p.pdf).
-The `compr` field is reported as an encoded control word rather than
-mislabelled as a decoded DRC profile. Atmos/JOC is likewise not inferred from
-the core syncframe fields; use codec/presentation QC with an authoritative
-decoder for that claim.
 
 Standalone IAMF audits follow
 [AOMedia IAMF v1.1](https://aomediacodec.github.io/iamf/v1.1.0.html).
@@ -1381,8 +1395,8 @@ final-page end trimming are reported without decoding the audio payload. Ogg
 Vorbis QC validates the three mandatory Vorbis I headers, comments, page
 boundaries, monotonic PCM granules, and a strict packet-by-packet decode.
 
-AC-4, IAMF/OAR, and MPEG-H workflows can audit every externally rendered
-Presentation
+AC-4, E-AC-3 JOC, IAMF/OAR, and MPEG-H workflows can audit every externally
+rendered presentation
 without claiming that Forge is a normative immersive renderer:
 
 ```bash

@@ -8,7 +8,7 @@ use std::process::ExitCode;
 #[command(
     name = "forge-presentation-qc",
     version,
-    about = "Audit externally rendered AC-4, IAMF/OAR, and MPEG-H presentations"
+    about = "Audit externally rendered AC-4, E-AC-3 JOC, IAMF/OAR, and MPEG-H presentations"
 )]
 struct Cli {
     spec: PathBuf,

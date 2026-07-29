@@ -24,8 +24,10 @@ Forge already provides:
 - Dependency-free ADTS and LOAS/LATM AAC QC, including ASC SBR/PS signalling,
   decoded timing, and ISO-BMFF edit-list/sample-group gapless reconciliation.
 - Dependency-free AC-3/E-AC-3 elementary-stream QC for bounded syncframes,
-  `dialnorm`, compression-control words, channel mode, and dependent-substream
-  ordering.
+  complete BSI, `dialnorm`, interpreted DRC gain words, channel mode, strict
+  Atmos/JOC Extension Type A signalling, six-block access-unit and
+  independent/dependent presentation grouping, plus authoritative external
+  E-AC-3 JOC render checks.
 - Bounded standalone AOMedia IAMF v1.1 OBU QC plus external OAR v1.0.0
   presentation-render loudness, true-peak, duration, and reference checks.
 - Bounded MPEG-TS/M2TS QC for packet layout, continuity, PAT/PMT CRC and
@@ -130,10 +132,6 @@ generations.
 
 ### Codec-specific QC
 
-- AC-3/E-AC-3 interpreted DRC profiles, strict Atmos/JOC `addbsi` signalling,
-  access-unit grouping, and decoded-presentation checks. Core syncframe,
-  `dialnorm`, compression-control-word, channel-mode, and dependent-substream
-  validation has shipped.
 - AC-4 presentation and loudness metadata through a licensed/reference
   decoder adapter.
 - MPEG-H MHAS packets, scene metadata, profile/level, loudness, and
