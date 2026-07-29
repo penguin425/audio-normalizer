@@ -3,12 +3,13 @@
 //! AAF uses the Microsoft Compound File Binary (Structured Storage) wrapper.
 //! This module validates that wrapper with bounded structural checks, checks
 //! the AAF file and root class identifiers, audits the required root objects,
-//! and validates the stored-property streams.  It intentionally does not claim
-//! full AAF object-model or edit-protocol conformance.
+//! and decodes bounded stored-property/reference-index streams for the core
+//! object-model and Edit Protocol layer in `aaf_object_qc`.
 
+use crate::aaf_object_qc::{StoredObject, StoredProperty};
 use crate::container_qc::{check, finish_audit, AuditCheck, ContainerAudit};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,7 @@ const MAX_ENTRIES: usize = 250_000;
 const MAX_PATH_DEPTH: usize = 64;
 const MAX_PROPERTY_STREAM_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TOTAL_PROPERTY_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_TOTAL_INDEX_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_REPORTED_PATHS: usize = 100;
 const PROPERTY_VERSION: u8 = 32;
 const PROPERTY_FORMATS: &[u16] = &[
@@ -190,6 +192,7 @@ pub(crate) fn audit(
             stream: entry.is_stream(),
             storage: entry.is_storage(),
             len: entry.len(),
+            clsid: entry.is_storage().then(|| entry.clsid().to_string()),
         })
         .collect();
     let entry_limit_ok = entries.len() <= MAX_ENTRIES;
@@ -305,6 +308,7 @@ pub(crate) fn audit(
 
     let mut malformed_properties = Vec::new();
     let mut property_entries = 0_u64;
+    let mut parsed_properties = HashMap::<PathBuf, Vec<StoredProperty>>::new();
     if entry_limit_ok && total_property_ok {
         for entry in &property_streams {
             if entry.len > MAX_PROPERTY_STREAM_BYTES {
@@ -319,9 +323,14 @@ pub(crate) fn audit(
                 continue;
             }
             match read_stream(&mut compound, &entry.path, entry.len)
-                .and_then(|bytes| validate_property_stream(&bytes))
+                .and_then(|bytes| parse_property_stream(&bytes))
             {
-                Ok(count) => property_entries += u64::from(count),
+                Ok(properties) => {
+                    property_entries += properties.len() as u64;
+                    if let Some(parent) = entry.path.parent() {
+                        parsed_properties.insert(parent.to_path_buf(), properties);
+                    }
+                }
                 Err(error) => push_bounded(
                     &mut malformed_properties,
                     format!("{}: {error}", entry.path.display()),
@@ -414,6 +423,78 @@ pub(crate) fn audit(
         "MetaDictionary type definitions",
     ));
 
+    let index_entries: Vec<&EntryInfo> = entries
+        .iter()
+        .filter(|entry| entry.stream && entry.name.ends_with(" index"))
+        .collect();
+    let total_index_bytes = index_entries
+        .iter()
+        .try_fold(0_u64, |total, entry| total.checked_add(entry.len));
+    let index_limit_ok = total_index_bytes.is_some_and(|total| total <= MAX_TOTAL_INDEX_BYTES)
+        && index_entries
+            .iter()
+            .all(|entry| entry.len <= MAX_PROPERTY_STREAM_BYTES);
+    let mut index_streams = HashMap::new();
+    let mut index_errors = Vec::new();
+    if index_limit_ok && entry_limit_ok {
+        for entry in &index_entries {
+            match read_stream(&mut compound, &entry.path, entry.len) {
+                Ok(bytes) => {
+                    index_streams.insert(entry.path.clone(), bytes);
+                }
+                Err(error) => push_bounded(
+                    &mut index_errors,
+                    format!("{}: {error}", entry.path.display()),
+                ),
+            }
+        }
+    } else {
+        index_errors.push("strong/weak-reference indexes exceed safety limits".to_owned());
+    }
+    bitstream.push(check(
+        "FORGE-AAF-INDEX-BYTE-LIMIT",
+        index_limit_ok && index_errors.is_empty(),
+        if index_limit_ok && index_errors.is_empty() {
+            format!(
+                "{} reference index streams are within bounded read limits",
+                index_entries.len()
+            )
+        } else {
+            "one or more reference index streams exceed limits or cannot be read".to_owned()
+        },
+        (!index_errors.is_empty()).then(|| json!(index_errors)),
+    ));
+
+    let object_audit = if malformed_properties.is_empty()
+        && index_errors.is_empty()
+        && entry_limit_ok
+        && total_property_ok
+    {
+        let mut objects = Vec::with_capacity(parsed_properties.len());
+        for (path, properties) in parsed_properties {
+            let class_id = if path == Path::new("/") {
+                AAF_ROOT_CLSID.to_owned()
+            } else {
+                entries
+                    .iter()
+                    .find(|entry| entry.storage && entry.path == path)
+                    .and_then(|entry| entry.clsid.clone())
+                    .unwrap_or_default()
+            };
+            objects.push(StoredObject {
+                path,
+                class_id,
+                properties,
+            });
+        }
+        Some(crate::aaf_object_qc::audit(&objects, &index_streams))
+    } else {
+        None
+    };
+    if let Some(audit) = &object_audit {
+        xcheck.extend(audit.checks.clone());
+    }
+
     Ok(finish_audit(
         path,
         "aaf",
@@ -421,8 +502,8 @@ pub(crate) fn audit(
         bitstream,
         xcheck,
         json!({
-            "method": "forge-aaf-structural-v1",
-            "scope": "bounded CFB and AAF stored-format structural QC; not full object-model or edit-protocol conformance",
+            "method": "forge-aaf-object-model-edit-protocol-v1",
+            "scope": "bounded CFB, stored-property, core AAF object-model, ownership/reference graph, edit timeline, and supported AAF Edit Protocol QC; extension classes are preserved and reported, external resources are never fetched, and this is not an AAF SDK certification",
             "file_size_bytes": file_size,
             "cfb": {
                 "version": version.number(),
@@ -435,7 +516,12 @@ pub(crate) fn audit(
                 "streams": property_streams.len(),
                 "entries": property_entries,
                 "total_bytes": total_property_bytes
-            }
+            },
+            "reference_indexes": {
+                "streams": index_entries.len(),
+                "total_bytes": total_index_bytes
+            },
+            "object_model": object_audit.map(|audit| audit.properties)
         }),
     ))
 }
@@ -447,6 +533,7 @@ struct EntryInfo {
     stream: bool,
     storage: bool,
     len: u64,
+    clsid: Option<String>,
 }
 
 fn presence_check(rule_id: &'static str, passed: bool, description: &'static str) -> AuditCheck {
@@ -484,7 +571,7 @@ fn read_stream(
     Ok(bytes)
 }
 
-fn validate_property_stream(bytes: &[u8]) -> Result<u16, String> {
+fn parse_property_stream(bytes: &[u8]) -> Result<Vec<StoredProperty>, String> {
     if bytes.len() < 4 {
         return Err("truncated stored-property header".to_owned());
     }
@@ -507,6 +594,7 @@ fn validate_property_stream(bytes: &[u8]) -> Result<u16, String> {
     }
     let mut data_bytes = 0_usize;
     let mut pids = HashSet::new();
+    let mut entries = Vec::with_capacity(usize::from(count));
     for index in 0..usize::from(count) {
         let offset = 4 + index * 6;
         let pid = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
@@ -521,6 +609,7 @@ fn validate_property_stream(bytes: &[u8]) -> Result<u16, String> {
         data_bytes = data_bytes
             .checked_add(usize::from(size))
             .ok_or_else(|| "stored-property payload length overflow".to_owned())?;
+        entries.push((pid, format, usize::from(size)));
     }
     if table_bytes.checked_add(data_bytes) != Some(bytes.len()) {
         return Err(format!(
@@ -528,7 +617,18 @@ fn validate_property_stream(bytes: &[u8]) -> Result<u16, String> {
             bytes.len().saturating_sub(table_bytes)
         ));
     }
-    Ok(count)
+    let mut payload_offset = table_bytes;
+    let mut properties = Vec::with_capacity(entries.len());
+    for (pid, format, size) in entries {
+        let end = payload_offset + size;
+        properties.push(StoredProperty {
+            pid,
+            format,
+            data: bytes[payload_offset..end].to_vec(),
+        });
+        payload_offset = end;
+    }
+    Ok(properties)
 }
 
 fn validate_reference_properties(bytes: &[u8]) -> Result<(u16, u32), String> {
@@ -585,7 +685,7 @@ mod tests {
         let bytes = [
             0x4c, 32, 2, 0, 1, 0, 0x82, 0, 1, 0, 1, 0, 0x82, 0, 1, 0, 7, 8,
         ];
-        assert!(validate_property_stream(&bytes)
+        assert!(parse_property_stream(&bytes)
             .unwrap_err()
             .contains("duplicate property PID"));
     }
@@ -607,7 +707,10 @@ mod tests {
         let audit = crate::container_qc::audit(&path).unwrap();
         assert!(audit.passed, "{audit:#?}");
         assert_eq!(audit.format, "aaf");
-        assert_eq!(audit.properties["method"], "forge-aaf-structural-v1");
+        assert_eq!(
+            audit.properties["method"],
+            "forge-aaf-object-model-edit-protocol-v1"
+        );
         assert_eq!(audit.properties["stored_properties"]["streams"], 2);
     }
 
@@ -672,7 +775,15 @@ mod tests {
                 if malformed {
                     stream.write_all(&[0x4c, PROPERTY_VERSION, 1, 0]).unwrap();
                 } else {
-                    stream.write_all(&[0x4c, PROPERTY_VERSION, 0, 0]).unwrap();
+                    let name: Vec<u8> = "MetaDictionary-1"
+                        .encode_utf16()
+                        .chain([0])
+                        .flat_map(u16::to_le_bytes)
+                        .collect();
+                    let mut properties = vec![0x4c, PROPERTY_VERSION, 1, 0, 1, 0, 0x22, 0];
+                    properties.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                    properties.extend_from_slice(&name);
+                    stream.write_all(&properties).unwrap();
                 }
             }
             {

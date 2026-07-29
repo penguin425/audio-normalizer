@@ -303,12 +303,33 @@ and root CLSIDs, validate the CFB allocation/directory structure, require the
 root property and weak-reference streams plus exactly one Header and
 MetaDictionary, and validate every bounded AAF stored-property stream. They
 also require Header ContentStorage, Dictionary, and Identification objects and
-MetaDictionary class/type definitions. Entry count, object-path depth,
-individual property streams, aggregate property bytes, and reported failures
-are capped. The method identifier is `forge-aaf-structural-v1`; this is
-stored-format structural QC, not a claim of complete AAF object-model or Edit
-Protocol conformance. The checks follow the
+MetaDictionary class/type definitions.
+
+The `forge-aaf-object-model-edit-protocol-v1` layer additionally decodes the
+stored-property table and strong-reference indexes into a bounded ownership
+graph. It verifies one-owner object containment, required inherited
+properties for the supported standard classes, primitive/AUID/MobID/rational
+shapes, unique Mob and definition identifiers, Mob/Slot mappings, positive
+edit rates, component and Sequence length arithmetic, Transition placement
+and cut points, SourceClip derivation references and cycles, OperationGroup
+definition/data/input consistency, unique parameters, ordered VaryingValue
+control points, NestedScope geometry, and local-only NetworkLocator URI
+syntax. Files labelled with `Header::OperationalPattern=OpEditProtocol` also
+receive the supported normative material-role, track-name,
+PhysicalTrackNumber, primary-timecode, common-audio-rate, template/subclip,
+and file-source checks. Protocol-only rules are not imposed on an unlabelled
+general AAF file.
+
+Entry count, object-path depth, individual property/index streams, aggregate
+property/index bytes, and reported failures are capped. Unknown extension
+classes are retained as auditable warnings rather than treated as invalid,
+and locators are never fetched. The scope is core object-model and supported
+Edit Protocol QC, not certification by an AAF SDK or semantic interpretation
+of every vendor extension. CI downloads three SHA-256-pinned MIT-licensed
+pyaaf2 files to prove pass/fail interoperability against public AAF fixtures.
+The checks follow the
 [AAF Object Specification](https://aafassociation.org/specs/object_spec.html),
+[AAF Edit Protocol](https://static.amwa.tv/as-01-aaf-edit-protocol-spec.pdf),
 [AAF stored/low-level format specifications](https://aafassociation.org/html/techinfo/index.html),
 and [MS-CFB](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-cfb/53989ce4-7b05-4f8d-829b-d08d6148375b).
 
@@ -1503,7 +1524,8 @@ src/
   adm.rs            optional EBU BS.2127 renderer + BS.2168 validation adapter
   decoder.rs        full-buffer and streaming universal decoders
   dsd.rs            bounded DSF/DSDIFF parser + read-only DSD FIR decimator
-  aaf_qc.rs         bounded AAF CFB/stored-property structural QC
+  aaf_qc.rs         bounded AAF CFB/stored-property reader and structural QC
+  aaf_object_qc.rs  AAF object graph, timeline, source, and Edit Protocol QC
   aes31_qc.rs       bounded AES31-3 EDML project/reference/timing QC
   flacenc.rs        bounded-memory pure-Rust FLAC encoder
   opus.rs           RFC 7845 mono/stereo and Mapping Family 1 Ogg Opus I/O

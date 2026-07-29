@@ -711,13 +711,24 @@ fn container_qc_cli_audits_aaf_stored_format_and_schema() {
         ] {
             compound.create_storage(storage).unwrap();
         }
-        for stream_path in ["/properties", "/MetaDictionary-1/properties"] {
-            compound
-                .create_stream(stream_path)
-                .unwrap()
-                .write_all(&[0x4c, 32, 0, 0])
-                .unwrap();
-        }
+        let name: Vec<u8> = "MetaDictionary-1"
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let mut root_properties = vec![0x4c, 32, 1, 0, 1, 0, 0x22, 0];
+        root_properties.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        root_properties.extend_from_slice(&name);
+        compound
+            .create_stream("/properties")
+            .unwrap()
+            .write_all(&root_properties)
+            .unwrap();
+        compound
+            .create_stream("/MetaDictionary-1/properties")
+            .unwrap()
+            .write_all(&[0x4c, 32, 0, 0])
+            .unwrap();
         compound
             .create_stream("/referenced properties")
             .unwrap()
@@ -742,7 +753,10 @@ fn container_qc_cli_audits_aaf_stored_format_and_schema() {
     let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(audit["format"], "aaf");
     assert_eq!(audit["passed"], true);
-    assert_eq!(audit["properties"]["method"], "forge-aaf-structural-v1");
+    assert_eq!(
+        audit["properties"]["method"],
+        "forge-aaf-object-model-edit-protocol-v1"
+    );
 
     let schema: Value =
         serde_json::from_str(include_str!("../schema/container-qc-v1.schema.json")).unwrap();
