@@ -1,7 +1,8 @@
 //! Bounded MPEG-2 Transport Stream structural, PSI, audio, and timing QC.
 
 use crate::container_qc::{check, finish_audit, ContainerAudit};
-use serde_json::json;
+use serde::Serialize;
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -11,6 +12,11 @@ const TS_PACKET_BYTES: usize = 188;
 const M2TS_PACKET_BYTES: usize = 192;
 const MAX_PACKETS: u64 = 50_000_000;
 const MAX_PSI_SECTION_BYTES: usize = 1_024;
+const MAX_METADATA_PES_BYTES: usize = 16 * 1024 * 1024;
+const MAX_METADATA_PES_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_METADATA_ERRORS: usize = 256;
+const MAX_TIMED_ID3_EVENTS: usize = 4_096;
+const MAX_TIMED_ID3_STORED_BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) fn looks_like_mpegts(header: &[u8]) -> bool {
     header.first() == Some(&0x47) || header.get(4) == Some(&0x47)
@@ -93,6 +99,28 @@ struct AudioStream {
     language: Option<String>,
 }
 
+#[derive(Clone, Serialize)]
+struct TimedId3Descriptor {
+    metadata_service_id: u8,
+}
+
+#[derive(Clone)]
+struct MetadataStream {
+    program: u16,
+    pid: u16,
+    stream_type: u8,
+    id3_descriptor: Option<TimedId3Descriptor>,
+    descriptor_error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TimedId3 {
+    program: u16,
+    pid: u16,
+    pts_90khz: Option<u64>,
+    tag: crate::id3_qc::Id3Tag,
+}
+
 #[derive(Default)]
 struct State {
     packets: u64,
@@ -113,6 +141,14 @@ struct State {
     programs: BTreeMap<u16, u16>,
     pcr_pids: HashSet<u16>,
     audio_streams: BTreeMap<u16, AudioStream>,
+    metadata_streams: BTreeMap<u16, MetadataStream>,
+    metadata_pes: HashMap<u16, Vec<u8>>,
+    metadata_pes_bytes: usize,
+    timed_id3: Vec<TimedId3>,
+    timed_id3_bytes: usize,
+    timed_id3_limit_hit: bool,
+    metadata_errors: Vec<String>,
+    metadata_error_count: u64,
     assemblers: HashMap<u16, PsiAssembler>,
     continuity: HashMap<u16, u8>,
     last_packet: HashMap<u16, [u8; TS_PACKET_BYTES]>,
@@ -157,6 +193,7 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
         parse_packet(packet, &mut state);
         state.packets += 1;
     }
+    flush_metadata_pes(&mut state);
 
     let limit_hit = state.packets == MAX_PACKETS && file_size > state.packets * packet_size as u64;
     let mut wrapper = vec![
@@ -246,6 +283,33 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
             })),
         ),
     ];
+    if !state.metadata_streams.is_empty() {
+        let descriptor_errors = state
+            .metadata_streams
+            .values()
+            .filter_map(|stream| {
+                stream
+                    .descriptor_error
+                    .as_ref()
+                    .map(|error| format!("PID {}: {error}", stream.pid))
+            })
+            .collect::<Vec<_>>();
+        bitstream.push(check(
+            "FORGE-MPEGTS-TIMED-ID3",
+            descriptor_errors.is_empty() && state.metadata_error_count == 0,
+            "stream_type 0x15 timed-ID3 streams have canonical ID3 metadata descriptors, bounded PES headers, and complete ID3v2 tags",
+            Some(json!({
+                "streams": state.metadata_streams.len(),
+                "tags": state.timed_id3.len(),
+                "descriptor_errors": descriptor_errors,
+                "payload_error_count": state.metadata_error_count,
+                "payload_errors": state.metadata_errors,
+                "payload_errors_truncated":
+                    state.metadata_error_count > state.metadata_errors.len() as u64,
+                "evidence_limit_hit": state.timed_id3_limit_hit
+            })),
+        ));
+    }
     let declared_pmt_pids: HashSet<_> = state.programs.values().copied().collect();
     let assembled_pmt_pids: HashSet<_> = state
         .audio_streams
@@ -293,6 +357,20 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
         "programs": state.programs,
         "pcr_pids": state.pcr_pids,
         "audio_streams": audio_streams,
+        "timed_id3_streams": state.metadata_streams.values().map(|stream| json!({
+            "program": stream.program,
+            "pid": stream.pid,
+            "stream_type": stream.stream_type,
+            "id3_descriptor": stream.id3_descriptor,
+            "descriptor_error": stream.descriptor_error
+        })).collect::<Vec<_>>(),
+        "timed_id3": state.timed_id3.iter().map(|item| {
+            serde_json::to_value(item).unwrap_or(Value::Null)
+        }).collect::<Vec<_>>(),
+        "timed_id3_errors": state.metadata_errors,
+        "timed_id3_error_count": state.metadata_error_count,
+        "timed_id3_stored_bytes": state.timed_id3_bytes,
+        "timed_id3_evidence_limit_hit": state.timed_id3_limit_hit,
         "audio_pts_spans_seconds": durations,
         "scrambled_packets": state.scrambled_packets,
         "exact_duplicate_packets": state.duplicate_packets
@@ -423,6 +501,8 @@ fn parse_packet(packet: &[u8; TS_PACKET_BYTES], state: &mut State) {
                 _ => state.psi_syntax_errors += 1,
             }
         }
+    } else if state.metadata_streams.contains_key(&pid) {
+        push_metadata_pes(pid, payload, start, state);
     } else if start && state.audio_streams.contains_key(&pid) {
         parse_audio_pes(pid, payload, state);
     }
@@ -492,10 +572,150 @@ fn parse_pmt(section: &[u8], state: &mut State) {
                     language: iso639_language(descriptors),
                 },
             );
+        } else if stream_type == 0x15 {
+            let (id3_descriptor, descriptor_error) = match timed_id3_descriptor(descriptors) {
+                Ok(descriptor) => (Some(descriptor), None),
+                Err(error) => (None, Some(error)),
+            };
+            state.metadata_streams.insert(
+                pid,
+                MetadataStream {
+                    program,
+                    pid,
+                    stream_type,
+                    id3_descriptor,
+                    descriptor_error,
+                },
+            );
         }
         offset += info_length;
     }
     state.pmt_sections += 1;
+}
+
+fn push_metadata_pes(pid: u16, payload: &[u8], start: bool, state: &mut State) {
+    if start {
+        if let Some(previous) = state.metadata_pes.remove(&pid) {
+            state.metadata_pes_bytes = state.metadata_pes_bytes.saturating_sub(previous.len());
+            parse_metadata_pes(pid, &previous, state);
+        }
+        state.metadata_pes.insert(pid, Vec::new());
+    }
+    let Some(current_length) = state.metadata_pes.get(&pid).map(Vec::len) else {
+        return;
+    };
+    if current_length.saturating_add(payload.len()) > MAX_METADATA_PES_BYTES
+        || state.metadata_pes_bytes.saturating_add(payload.len()) > MAX_METADATA_PES_TOTAL_BYTES
+    {
+        if let Some(discarded) = state.metadata_pes.remove(&pid) {
+            state.metadata_pes_bytes = state.metadata_pes_bytes.saturating_sub(discarded.len());
+        }
+        record_metadata_error(
+            state,
+            format!(
+            "PID {pid} timed metadata PES exceeds an individual or aggregate assembly safety limit"
+        ),
+        );
+        return;
+    }
+    let pes = state
+        .metadata_pes
+        .get_mut(&pid)
+        .expect("metadata PES exists after its length was read");
+    pes.extend_from_slice(payload);
+    state.metadata_pes_bytes += payload.len();
+    let expected = pes
+        .get(4..6)
+        .map(|bytes| usize::from(u16::from_be_bytes([bytes[0], bytes[1]])))
+        .filter(|length| *length > 0)
+        .map(|length| length + 6);
+    if expected.is_some_and(|length| pes.len() >= length) {
+        let complete = state
+            .metadata_pes
+            .remove(&pid)
+            .expect("metadata PES exists while being assembled");
+        state.metadata_pes_bytes = state.metadata_pes_bytes.saturating_sub(complete.len());
+        parse_metadata_pes(
+            pid,
+            &complete[..expected.expect("checked expected length")],
+            state,
+        );
+    }
+}
+
+fn flush_metadata_pes(state: &mut State) {
+    let pending = std::mem::take(&mut state.metadata_pes);
+    state.metadata_pes_bytes = 0;
+    for (pid, pes) in pending {
+        parse_metadata_pes(pid, &pes, state);
+    }
+}
+
+fn parse_metadata_pes(pid: u16, pes: &[u8], state: &mut State) {
+    let result = (|| -> Result<TimedId3, String> {
+        if pes.len() < 9 || pes[..3] != [0, 0, 1] || pes[3] != 0xbd {
+            return Err("invalid private_stream_1 PES header".into());
+        }
+        let header_length = usize::from(pes[8]);
+        let data_start = 9_usize
+            .checked_add(header_length)
+            .filter(|offset| *offset <= pes.len())
+            .ok_or_else(|| "timed metadata PES header exceeds the packet".to_string())?;
+        let pts = if pes[7] >> 6 & 2 != 0 {
+            if header_length < 5 {
+                return Err("timed metadata PES declares a truncated PTS".into());
+            }
+            Some(
+                decode_pts(&pes[9..14])
+                    .ok_or_else(|| "timed metadata PES has an invalid PTS".to_string())?,
+            )
+        } else {
+            None
+        };
+        let (tag, consumed) = crate::id3_qc::parse_prefix(&pes[data_start..], false)?;
+        if pes[data_start + consumed..]
+            .iter()
+            .any(|byte| !matches!(*byte, 0x00 | 0xff))
+        {
+            return Err("timed metadata PES has non-padding bytes after the ID3 tag".into());
+        }
+        let stream = state
+            .metadata_streams
+            .get(&pid)
+            .ok_or_else(|| "timed metadata PID is absent from the PMT".to_string())?;
+        Ok(TimedId3 {
+            program: stream.program,
+            pid,
+            pts_90khz: pts,
+            tag,
+        })
+    })();
+    match result {
+        Ok(tag) => {
+            let size = tag.tag.size_bytes;
+            if !state.timed_id3_limit_hit
+                && state.timed_id3.len() < MAX_TIMED_ID3_EVENTS
+                && state.timed_id3_bytes.saturating_add(size) <= MAX_TIMED_ID3_STORED_BYTES
+            {
+                state.timed_id3_bytes += size;
+                state.timed_id3.push(tag);
+            } else if !state.timed_id3_limit_hit {
+                state.timed_id3_limit_hit = true;
+                record_metadata_error(
+                    state,
+                    "timed ID3 evidence exceeds the event-count or stored-byte safety limit".into(),
+                );
+            }
+        }
+        Err(error) => record_metadata_error(state, format!("PID {pid} timed ID3: {error}")),
+    }
+}
+
+fn record_metadata_error(state: &mut State, error: String) {
+    state.metadata_error_count = state.metadata_error_count.saturating_add(1);
+    if state.metadata_errors.len() < MAX_METADATA_ERRORS {
+        state.metadata_errors.push(error);
+    }
 }
 
 fn audio_codec(stream_type: u8, descriptors: &[u8]) -> Option<&'static str> {
@@ -534,6 +754,52 @@ fn has_descriptor(bytes: &[u8], wanted: u8) -> bool {
 
 fn has_registration(bytes: &[u8], wanted: &[u8; 4]) -> bool {
     walk_descriptors(bytes, |tag, body| tag == 0x05 && body.starts_with(wanted))
+}
+
+fn timed_id3_descriptor(bytes: &[u8]) -> Result<TimedId3Descriptor, String> {
+    let mut input = bytes;
+    let mut found = None;
+    while !input.is_empty() {
+        if input.len() < 2 {
+            return Err("PMT descriptor loop has a truncated header".into());
+        }
+        let tag = input[0];
+        let length = usize::from(input[1]);
+        if input.len() < 2 + length {
+            return Err("PMT descriptor loop has a truncated descriptor".into());
+        }
+        let body = &input[2..2 + length];
+        if tag == 0x26 {
+            if found.is_some() {
+                return Err("PMT has more than one metadata descriptor".into());
+            }
+            if body.len() != 13 {
+                return Err(format!(
+                    "ID3 metadata descriptor has length {}, expected 13",
+                    body.len()
+                ));
+            }
+            if body[..2] != [0xff, 0xff] || body[2..6] != *b"ID3 " {
+                return Err(
+                    "metadata descriptor does not identify the ID3 metadata application".into(),
+                );
+            }
+            if body[6] != 0xff || body[7..11] != *b"ID3 " {
+                return Err("metadata descriptor does not identify the ID3 metadata format".into());
+            }
+            if body[12] != 0x0f {
+                return Err(format!(
+                    "ID3 metadata descriptor has unsupported decoder/configuration flags 0x{:02x}",
+                    body[12]
+                ));
+            }
+            found = Some(TimedId3Descriptor {
+                metadata_service_id: body[11],
+            });
+        }
+        input = &input[2 + length..];
+    }
+    found.ok_or_else(|| "stream_type 0x15 is missing the ID3 metadata descriptor".into())
 }
 
 fn iso639_language(bytes: &[u8]) -> Option<String> {
@@ -624,6 +890,33 @@ fn mpeg_crc32(bytes: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
+    fn timed_id3_tag() -> Vec<u8> {
+        let payload = [b"track".as_slice(), &[0, 1, 0xfe, 0x00, 0]].concat();
+        let frame = [
+            b"RVA2".as_slice(),
+            &[0, 0, 0, payload.len() as u8, 0, 0],
+            &payload,
+        ]
+        .concat();
+        [
+            b"ID3\x04\x00\x00".as_slice(),
+            &[0, 0, 0, frame.len() as u8],
+            &frame,
+        ]
+        .concat()
+    }
+
+    fn timed_id3_descriptor_bytes() -> Vec<u8> {
+        [
+            &[0x26, 13, 0xff, 0xff][..],
+            b"ID3 ",
+            &[0xff],
+            b"ID3 ",
+            &[0, 0x0f],
+        ]
+        .concat()
+    }
+
     #[test]
     fn crc_accepts_known_pat() {
         let pat = [
@@ -637,5 +930,74 @@ mod tests {
     fn decodes_pts_and_wrap_delta() {
         assert_eq!(decode_pts(&[0x21, 0x00, 0x01, 0x00, 0x01]), Some(0));
         assert_eq!(pts_forward_delta((1 << 33) - 10, 5), 15);
+    }
+
+    #[test]
+    fn identifies_canonical_timed_id3_metadata_descriptor() {
+        let descriptor = timed_id3_descriptor(&timed_id3_descriptor_bytes()).unwrap();
+        assert_eq!(descriptor.metadata_service_id, 0);
+    }
+
+    #[test]
+    fn rejects_missing_or_malformed_timed_id3_metadata_descriptor() {
+        assert!(timed_id3_descriptor(&[]).is_err());
+
+        let mut wrong_format = timed_id3_descriptor_bytes();
+        wrong_format[11] = b'X';
+        assert!(timed_id3_descriptor(&wrong_format).is_err());
+
+        assert!(timed_id3_descriptor(&[0x26, 13, 0xff]).is_err());
+    }
+
+    #[test]
+    fn bounds_aggregate_timed_metadata_pes_assembly() {
+        let mut state = State {
+            metadata_pes_bytes: MAX_METADATA_PES_TOTAL_BYTES,
+            ..State::default()
+        };
+        state.metadata_pes.insert(0x101, vec![0]);
+        push_metadata_pes(0x101, &[1], false, &mut state);
+        assert!(!state.metadata_pes.contains_key(&0x101));
+        assert_eq!(state.metadata_error_count, 1);
+    }
+
+    #[test]
+    fn parses_timed_id3_private_pes_and_rva2() {
+        let tag = timed_id3_tag();
+        let packet_length = 3 + 5 + tag.len();
+        let pes = [
+            &[
+                0,
+                0,
+                1,
+                0xbd,
+                (packet_length >> 8) as u8,
+                packet_length as u8,
+            ][..],
+            &[0x80, 0x80, 5][..],
+            &[0x21, 0, 1, 0, 1][..],
+            tag.as_slice(),
+        ]
+        .concat();
+        let mut state = State::default();
+        state.metadata_streams.insert(
+            0x101,
+            MetadataStream {
+                program: 1,
+                pid: 0x101,
+                stream_type: 0x15,
+                id3_descriptor: Some(timed_id3_descriptor(&timed_id3_descriptor_bytes()).unwrap()),
+                descriptor_error: None,
+            },
+        );
+        parse_metadata_pes(0x101, &pes, &mut state);
+        assert!(
+            state.metadata_errors.is_empty(),
+            "{:?}",
+            state.metadata_errors
+        );
+        assert_eq!(state.timed_id3.len(), 1);
+        assert_eq!(state.timed_id3[0].pts_90khz, Some(0));
+        assert_eq!(state.timed_id3[0].tag.relative_volume_adjustments.len(), 1);
     }
 }

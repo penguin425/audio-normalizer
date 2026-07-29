@@ -63,6 +63,10 @@ Forge already provides:
   DASH Adaptation Set Switching descriptors, including normalized
   timescale/presentation-offset boundaries and discontinuity state.
 - HLS, DASH, and CMAF package checks; ISO loudness and MPEG-D DRC metadata.
+- DASH CICP ProgramLoudness/AnchorLoudness descriptor syntax, inheritance,
+  and local ISO-BMFF measurement reconciliation; optional paired MPEG-D DRC
+  container evidence; and HLS timed-ID3 validation for MPEG-TS PES and CMAF
+  `emsg`/`aid3`, including bounded ID3v2/RVA2 and timestamp checks.
 - ADM, S-ADM, presentation-aware rendering/QC, C2PA validation, CI comparison,
   real-time processing, LV2, and CLAP integration.
 - EBU QC Items for channel count, clipping, duration, dropouts, loudness,
@@ -125,7 +129,6 @@ generations.
 
 ### Streaming and platform delivery
 
-- MPEG-DASH loudness/DRC descriptors and HLS timed-ID3 loudness metadata.
 - Remote-resource auditing only behind explicit allowlists, byte/time limits,
   redirect controls, and a recorded fetch manifest.
 - Apple Sound Check metadata read/write and round-trip checks.
