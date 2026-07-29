@@ -110,8 +110,10 @@ Forge already provides:
   dynamically declared class/property/type graphs and extension values,
   exactly-one-owner object graphs, inherited required properties, unique
   identifiers, Mob/Slot/SourceClip derivation, Sequence/Transition timing,
-  effects, locators, protocol-labelled material/track constraints, fixed
-  safety limits, and SHA-256-pinned public pyaaf2 interoperability fixtures.
+  effects, locators, protocol-labelled material/track constraints, all 20
+  AS-01 and three AS-05 effect-dictionary profiles, scalar parameter type and
+  range checks, documented import fallbacks, fixed safety limits, and pinned
+  pyaaf2/Avid plus AAF SDK reference interoperability fixtures.
 - Bounded AES31-3 EDML ADL project QC with plain-ASCII and record limits,
   core section/header validation, source and event identity/reference checks,
   channel-map consistency, integer/fractional/drop-frame sample timing,
@@ -125,13 +127,6 @@ can iteratively re-render from the original input without compounding lossy
 generations.
 
 ## P1 — professional delivery expansion
-
-### Broadcast and mastering containers
-
-- AAF effect-dictionary parameter-specific ranges/fallback profiles and
-  certification against additional vendor/reference fixtures. Dynamic
-  MetaDictionary extension types/values, core object-model ownership, editing
-  graph, and protocol-labelled track/material conformance have shipped.
 
 ### Codec-specific QC
 

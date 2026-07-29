@@ -755,7 +755,7 @@ fn container_qc_cli_audits_aaf_stored_format_and_schema() {
     assert_eq!(audit["passed"], false);
     assert_eq!(
         audit["properties"]["method"],
-        "forge-aaf-metadictionary-object-model-edit-protocol-v2"
+        "forge-aaf-effect-profiles-metadictionary-object-model-edit-protocol-v3"
     );
     let failures: Vec<_> = audit["layers"]
         .as_array()

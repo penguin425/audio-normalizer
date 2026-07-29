@@ -83,7 +83,7 @@ jobs:
         run: tools/test-itu-conformance.sh
 
   aaf-interoperability:
-    name: AAF MetaDictionary interoperability
+    name: AAF effect and MetaDictionary interoperability
     runs-on: ubuntu-latest
 
     steps:
@@ -96,7 +96,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/forge-normalizer/aaf-08dcc3dfe823ea5781db1cb657d9c2606557fcdc
-          key: aaf-pyaaf2-08dcc3dfe823ea5781db1cb657d9c2606557fcdc-v2
+          key: aaf-pyaaf2-08dcc3dfe823ea5781db1cb657d9c2606557fcdc-v3
 
-      - name: Run AAF MetaDictionary, object-model, and Edit Protocol checks
+      - name: Run AAF effect, MetaDictionary, object-model, and Edit Protocol checks
         run: tools/test-aaf-fixtures.sh

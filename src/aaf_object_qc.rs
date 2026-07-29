@@ -230,6 +230,8 @@ pub(crate) fn audit(
         "operation inputs, parameters, nested scopes, and varying values are coherent",
         "one or more effect-model constraints fail",
     ));
+    let effect_profile_audit = crate::aaf_effect_qc::audit(objects, streams, &references);
+    checks.push(effect_profile_audit.check);
 
     let mut protocol = Findings::default();
     validate_edit_protocol(objects, &references, &summary, &mut protocol, &mut warnings);
@@ -259,6 +261,7 @@ pub(crate) fn audit(
             "components": summary.component_count,
             "extension_classes": extension_classes.len(),
             "meta_dictionary": meta_audit.properties,
+            "effect_profiles": effect_profile_audit.properties,
             "warning_count": warnings.total,
             "warnings": warnings.values
         }),
