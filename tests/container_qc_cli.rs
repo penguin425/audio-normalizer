@@ -420,8 +420,11 @@ fn container_qc_cli_audits_standalone_iamf_obu_structure() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("presentation.iamf");
     let mut bytes = obu(31, b"iamf\x00\x00");
-    bytes.extend(obu(0, &[0]));
-    bytes.extend(obu(1, &[0]));
+    bytes.extend(obu(
+        0,
+        &[0, b'i', b'p', b'c', b'm', 1, 0, 0, 0, 16, 0, 0, 187, 128],
+    ));
+    bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0]));
     bytes.extend(obu(2, &[0]));
     bytes.extend(obu(6, &[0]));
     fs::write(&path, bytes).unwrap();
@@ -436,6 +439,28 @@ fn container_qc_cli_audits_standalone_iamf_obu_structure() {
     assert_eq!(audit["passed"], true);
     assert_eq!(audit["properties"]["primary_profile"], "simple");
     assert_eq!(audit["properties"]["obu_counts"]["audio-frame-id0"], 1);
+    assert_eq!(audit["properties"]["codec_configs"][0]["codec_id"], "ipcm");
+    assert_eq!(
+        audit["properties"]["codec_configs"][0]["sample_rate_hz"],
+        48_000
+    );
+    assert_eq!(
+        audit["properties"]["audio_elements"][0]["audio_substream_ids"],
+        serde_json::json!([0])
+    );
+    assert_eq!(audit["properties"]["audio_frame_counts"]["0"], 1);
+    for rule_id in [
+        "FORGE-IAMF-CODEC-CONFIG",
+        "FORGE-IAMF-DESCRIPTOR-LINKS",
+        "FORGE-IAMF-AUDIO-FRAME-LINKS",
+    ] {
+        assert!(audit["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|layer| layer["checks"].as_array().unwrap())
+            .any(|check| check["rule_id"] == rule_id && check["passed"] == true));
+    }
 }
 
 #[test]
@@ -449,9 +474,12 @@ fn container_qc_cli_rejects_oversized_and_misordered_iamf_obus() {
     let directory = tempfile::tempdir().unwrap();
     let order_path = directory.path().join("misordered.iamf");
     let mut bytes = obu(31, b"iamf\x00\x00");
-    bytes.extend(obu(0, &[0]));
+    bytes.extend(obu(
+        0,
+        &[0, b'i', b'p', b'c', b'm', 1, 0, 0, 0, 16, 0, 0, 187, 128],
+    ));
     bytes.extend(obu(2, &[0]));
-    bytes.extend(obu(1, &[0]));
+    bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0]));
     bytes.extend(obu(6, &[0]));
     fs::write(&order_path, bytes).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
@@ -483,6 +511,69 @@ fn container_qc_cli_rejects_oversized_and_misordered_iamf_obus() {
         .iter()
         .flat_map(|layer| layer["checks"].as_array().unwrap())
         .any(|check| check["rule_id"] == "FORGE-IAMF-OBU-BOUNDS" && check["passed"] == false));
+}
+
+#[test]
+fn container_qc_cli_rejects_invalid_iamf_codec_and_substream_links() {
+    fn obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![obu_type << 3, payload.len() as u8];
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn checks(audit: &Value) -> impl Iterator<Item = &Value> {
+        audit["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|layer| layer["checks"].as_array().unwrap())
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let bad_codec = directory.path().join("bad-codec.iamf");
+    let mut bytes = obu(31, b"iamf\x00\x00");
+    bytes.extend(obu(
+        0,
+        &[0, b'i', b'p', b'c', b'm', 1, 0, 1, 0, 16, 0, 0, 187, 128],
+    ));
+    bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0]));
+    bytes.extend(obu(2, &[0]));
+    bytes.extend(obu(6, &[0]));
+    fs::write(&bad_codec, bytes).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&bad_codec)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(checks(&audit).any(|check| {
+        check["rule_id"] == "FORGE-IAMF-CODEC-CONFIG" && check["passed"] == false
+    }));
+
+    let bad_frame = directory.path().join("bad-frame-link.iamf");
+    let mut bytes = obu(31, b"iamf\x00\x00");
+    bytes.extend(obu(
+        0,
+        &[0, b'i', b'p', b'c', b'm', 1, 0, 0, 0, 16, 0, 0, 187, 128],
+    ));
+    bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0]));
+    bytes.extend(obu(2, &[0]));
+    bytes.extend(obu(7, &[0]));
+    fs::write(&bad_frame, bytes).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&bad_frame)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(checks(&audit).any(|check| {
+        check["rule_id"] == "FORGE-IAMF-AUDIO-FRAME-LINKS" && check["passed"] == false
+    }));
+    assert!(audit["properties"]["payload_errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|error| error.as_str().unwrap().contains("undeclared substream 1")));
 }
 
 #[test]

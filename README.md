@@ -412,7 +412,16 @@ Standalone IAMF audits follow
 [AOMedia IAMF v1.1](https://aomediacodec.github.io/iamf/v1.1.0.html).
 They enforce bounded LEB128 OBU framing, the normative 2 MiB OBU limit,
 sequence headers and profiles, descriptor ordering, data redundancy/trimming
-flags, and complete-file consumption without decoding codec payloads.
+flags, and complete-file consumption without decoding codec payloads. Stable
+`FORGE-IAMF-CODEC-CONFIG`, `FORGE-IAMF-DESCRIPTOR-LINKS`, and
+`FORGE-IAMF-AUDIO-FRAME-LINKS` checks parse the Codec Config prefix and full
+Opus, FLAC STREAMINFO, or LPCM decoder configuration, enforce AAC-LC frame and
+roll declarations, reject duplicate or missing codec/element/substream IDs,
+and require every implicit or explicit Audio Frame OBU to resolve to a declared
+substream. Counts, frame lengths, roll distances, sample rates, sample sizes,
+and bounded error evidence remain visible in JSON. Validation is exercised
+against the pinned AOMedia `libiamf` v1.1.0 conformance streams in addition to
+clean and intentionally defective local fixtures.
 Rendering is deliberately separate: render every Mix Presentation and target
 layout with an
 [Open Audio Renderer v1.0.0](https://aomedia.org/specifications/oar/)
