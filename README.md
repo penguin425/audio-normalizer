@@ -451,6 +451,20 @@ animations, temporal units, and bounded error evidence remain visible in JSON.
 Validation is exercised against pinned AOMedia `libiamf` v1.1.0 and
 `iamf-tools` v2.1.0 streams in addition to clean and intentionally defective
 local fixtures.
+
+Unfragmented ISO-BMFF IAMF files reuse the same OBU validator after bounded,
+streaming decapsulation. The container audit requires the `iamf` compatible
+brand, zero-valued IAMF `AudioSampleEntry` channel-count/sample-rate fields,
+exactly one version-1 `iacb` box, descriptor-only `configOBUs`, and complete
+`stsc`/`stsz`/`stz2`/`stco`/`co64` sample addressing inside `mdat`. Every IA
+Sample must contain one descriptor-free Temporal Unit without a Temporal
+Delimiter OBU. Stable `FORGE-ISOBMFF-IAMF-*` checks reconcile `stts` duration
+with codec frame lengths and end trimming, require `roll` groups matching
+Opus/AAC `audio_roll_distance`, reject `stss`/`ctts`, and verify that start/end
+trim is represented exactly by `edts`/`elst`. Fragmented and encrypted IAMF
+carriage is reported as not yet validated rather than inheriting a false
+standalone-conformance claim.
+
 Rendering is deliberately separate: render every Mix Presentation and target
 layout with an
 [Open Audio Renderer v1.0.0](https://aomedia.org/specifications/oar/)
