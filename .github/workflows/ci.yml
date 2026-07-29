@@ -81,3 +81,22 @@ jobs:
 
       - name: Run official ITU-R BS.2217-2 conformance tests
         run: tools/test-itu-conformance.sh
+
+  aaf-interoperability:
+    name: AAF object-model interoperability
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache pinned public AAF fixtures
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/forge-normalizer/aaf-08dcc3dfe823ea5781db1cb657d9c2606557fcdc
+          key: aaf-pyaaf2-08dcc3dfe823ea5781db1cb657d9c2606557fcdc-v1
+
+      - name: Run AAF object-model and Edit Protocol interoperability checks
+        run: tools/test-aaf-fixtures.sh
