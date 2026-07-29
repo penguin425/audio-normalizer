@@ -538,9 +538,19 @@ template segments must contain multiple CMAF movie fragments. Indexed
 `SegmentBase` resources must remain complete, with non-negative effective
 availability offsets.
 
+Pass the preceding full snapshot as
+`--previous-mpd previous.mpd` to audit a successive MPD update. Forge requires
+both snapshots to pass the selected profile, stable MPD identity and
+`availabilityStartTime`, strictly increasing
+timezone-qualified `publishTime`, stable relative Period/AdaptationSet order,
+an unchanged Representation ID set/order in retained AdaptationSets, and
+functionally equivalent inherited media properties. Explicit segment
+timelines and lists may drop expired prefixes and append new references, but
+overlapping segment times must retain their duration and resource identity.
+
 This remains a static, local package audit. It does not fetch clock servers or
 remote media, observe the origin/CDN availability window, validate HTTP
-chunked transfer, or prove that MPD updates remain consistent over time.
+chunked transfer, apply MPD Patch documents, or observe a live update cadence.
 
 The profiles track
 [ISO/IEC 23009-1:2026 MPEG-DASH](https://www.iso.org/standard/23009-1), the

@@ -131,7 +131,7 @@ enum ResolvedAddressing {
     Base(SegmentBase),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct TimelineEntry {
     time: Option<u64>,
     duration: u64,
@@ -256,6 +256,7 @@ struct Period {
 #[derive(Default)]
 struct Mpd {
     root_count: usize,
+    id: Option<String>,
     namespace: Option<String>,
     base_url: Option<BaseUrl>,
     profiles: Vec<String>,
@@ -275,6 +276,56 @@ struct Mpd {
 }
 
 pub fn audit(path: &Path, profile: DashProfile) -> Result<DashAudit, String> {
+    let mpd = load_mpd(path)?;
+    audit_mpd(path, &mpd, profile)
+}
+
+pub fn audit_with_previous(
+    path: &Path,
+    previous_path: &Path,
+    profile: DashProfile,
+) -> Result<DashAudit, String> {
+    let previous = load_mpd(previous_path)?;
+    let current = load_mpd(path)?;
+    let mut audit = audit_mpd(path, &current, profile)?;
+    let mut previous_findings = Vec::new();
+    validate_mpd(previous_path, &previous, profile, &mut previous_findings);
+    for item in &mut previous_findings {
+        item.message = format!("previous snapshot: {}", item.message);
+    }
+    let previous_passed = previous_findings
+        .iter()
+        .all(|item| item.severity == Severity::Warning || item.passed);
+    audit.findings.extend(previous_findings);
+    validate_mpd_update(&previous, &current, &mut audit.findings);
+    audit.warning_count = audit
+        .findings
+        .iter()
+        .filter(|item| item.severity == Severity::Warning && !item.passed)
+        .count();
+    audit.passed = audit
+        .findings
+        .iter()
+        .all(|item| item.severity == Severity::Warning || item.passed);
+    if let Some(properties) = audit.properties.as_object_mut() {
+        properties.insert(
+            "previous_path".into(),
+            Value::String(previous_path.to_string_lossy().into_owned()),
+        );
+        properties.insert(
+            "previous_publish_time".into(),
+            previous
+                .publish_time
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        properties.insert("previous_passed".into(), Value::Bool(previous_passed));
+    }
+    Ok(audit)
+}
+
+fn load_mpd(path: &Path) -> Result<Mpd, String> {
     let metadata =
         fs::metadata(path).map_err(|error| format!("stat {}: {error}", path.display()))?;
     if metadata.len() > MAX_MPD_BYTES {
@@ -285,9 +336,12 @@ pub fn audit(path: &Path, profile: DashProfile) -> Result<DashAudit, String> {
         ));
     }
     let xml = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    let mpd = parse_mpd(&xml)?;
+    parse_mpd(&xml)
+}
+
+fn audit_mpd(path: &Path, mpd: &Mpd, profile: DashProfile) -> Result<DashAudit, String> {
     let mut findings = Vec::new();
-    validate_mpd(path, &mpd, profile, &mut findings);
+    validate_mpd(path, mpd, profile, &mut findings);
     let warning_count = findings
         .iter()
         .filter(|item| item.severity == Severity::Warning && !item.passed)
@@ -307,7 +361,7 @@ pub fn audit(path: &Path, profile: DashProfile) -> Result<DashAudit, String> {
         .map(|adaptation| adaptation.representations.len())
         .sum::<usize>();
     let (segment_template_count, segment_list_count, segment_base_count) =
-        addressing_element_counts(&mpd);
+        addressing_element_counts(mpd);
     Ok(DashAudit {
         schema: DASH_QC_SCHEMA,
         generator: concat!("forge-normalizer/", env!("CARGO_PKG_VERSION")),
@@ -318,6 +372,7 @@ pub fn audit(path: &Path, profile: DashProfile) -> Result<DashAudit, String> {
         warning_count,
         findings,
         properties: json!({
+            "mpd_id": mpd.id,
             "namespace": mpd.namespace,
             "base_url": mpd.base_url.as_ref().and_then(|item| item.value.as_ref()),
             "profiles": mpd.profiles,
@@ -499,6 +554,7 @@ fn observe_element(
     match name {
         "MPD" if stack.len() == 1 => {
             mpd.root_count += 1;
+            mpd.id = attributes.get("id").cloned();
             mpd.namespace = attributes
                 .get("xmlns")
                 .cloned()
@@ -904,6 +960,538 @@ fn close_element(
         }
         _ => {}
     }
+}
+
+fn validate_mpd_update(previous: &Mpd, current: &Mpd, findings: &mut Vec<DashFinding>) {
+    findings.push(finding(
+        "FORGE-DASH-UPDATE-TYPE",
+        Severity::Error,
+        previous.kind == "dynamic" && matches!(current.kind.as_str(), "dynamic" | "static"),
+        "successive MPD audit starts with a dynamic MPD and remains dynamic or finalizes as static",
+        Some(json!({"previous": previous.kind, "current": current.kind})),
+    ));
+    findings.push(finding(
+        "FORGE-DASH-UPDATE-ID",
+        Severity::Error,
+        previous
+            .id
+            .as_ref()
+            .is_none_or(|id| current.id.as_ref() == Some(id)),
+        "MPD id remains stable across the update",
+        Some(json!({"previous": previous.id, "current": current.id})),
+    ));
+    findings.push(finding(
+        "FORGE-DASH-UPDATE-AVAILABILITY-START",
+        Severity::Error,
+        previous.availability_start_time == current.availability_start_time,
+        "availabilityStartTime remains stable across the update",
+        Some(json!({
+            "previous": previous.availability_start_time,
+            "current": current.availability_start_time
+        })),
+    ));
+    let publish_order = previous
+        .publish_time
+        .as_deref()
+        .and_then(parse_xs_datetime_seconds)
+        .zip(
+            current
+                .publish_time
+                .as_deref()
+                .and_then(parse_xs_datetime_seconds),
+        )
+        .is_some_and(|(previous, current)| current > previous);
+    findings.push(finding(
+        "FORGE-DASH-UPDATE-PUBLISH-TIME",
+        Severity::Error,
+        publish_order,
+        "publishTime strictly increases across the update",
+        Some(json!({
+            "previous": previous.publish_time,
+            "current": current.publish_time
+        })),
+    ));
+
+    let previous_period_ids = stable_ids(
+        previous.periods.iter().map(|period| period.id.as_deref()),
+        "Period",
+        "previous",
+        findings,
+    );
+    let current_period_ids = stable_ids(
+        current.periods.iter().map(|period| period.id.as_deref()),
+        "Period",
+        "current",
+        findings,
+    );
+    findings.push(finding(
+        "FORGE-DASH-UPDATE-PERIOD-ORDER",
+        Severity::Error,
+        common_order_is_stable(&previous_period_ids, &current_period_ids),
+        "Periods retained across the update keep their relative order",
+        Some(json!({
+            "previous": previous_period_ids,
+            "current": current_period_ids
+        })),
+    ));
+
+    let previous_starts = resolved_period_starts(&previous.periods);
+    let current_starts = resolved_period_starts(&current.periods);
+    let previous_by_id = previous
+        .periods
+        .iter()
+        .enumerate()
+        .filter_map(|(index, period)| period.id.as_deref().map(|id| (id, (index, period))))
+        .collect::<HashMap<_, _>>();
+    for (current_index, current_period) in current.periods.iter().enumerate() {
+        let Some(id) = current_period.id.as_deref() else {
+            continue;
+        };
+        let Some((previous_index, previous_period)) = previous_by_id.get(id).copied() else {
+            continue;
+        };
+        findings.push(finding(
+            "FORGE-DASH-UPDATE-PERIOD-TIMING",
+            Severity::Error,
+            previous_starts.get(previous_index) == current_starts.get(current_index),
+            format!("retained Period {id} keeps its resolved start"),
+            Some(json!({
+                "previous_start_seconds": previous_starts.get(previous_index).copied().flatten(),
+                "current_start_seconds": current_starts.get(current_index).copied().flatten()
+            })),
+        ));
+        validate_adaptation_update(previous_period, current_period, id, findings);
+    }
+}
+
+fn stable_ids<'a>(
+    ids: impl Iterator<Item = Option<&'a str>>,
+    element: &str,
+    snapshot: &str,
+    findings: &mut Vec<DashFinding>,
+) -> Vec<String> {
+    let ids = ids.collect::<Vec<_>>();
+    let mut unique = HashSet::new();
+    let valid = ids
+        .iter()
+        .all(|id| id.is_some_and(|id| !id.is_empty() && unique.insert(id.to_owned())));
+    findings.push(finding(
+        "FORGE-DASH-UPDATE-IDENTITY",
+        Severity::Error,
+        valid,
+        format!("{snapshot} MPD gives every {element} a unique non-empty id"),
+        Some(json!({
+            "snapshot": snapshot,
+            "element": element,
+            "ids": ids
+        })),
+    ));
+    ids.into_iter().flatten().map(str::to_owned).collect()
+}
+
+fn common_order_is_stable(previous: &[String], current: &[String]) -> bool {
+    let previous_set = previous.iter().map(String::as_str).collect::<HashSet<_>>();
+    let current_set = current.iter().map(String::as_str).collect::<HashSet<_>>();
+    previous
+        .iter()
+        .filter(|id| current_set.contains(id.as_str()))
+        .eq(current
+            .iter()
+            .filter(|id| previous_set.contains(id.as_str())))
+}
+
+fn validate_adaptation_update(
+    previous_period: &Period,
+    current_period: &Period,
+    period_id: &str,
+    findings: &mut Vec<DashFinding>,
+) {
+    let previous_ids = stable_ids(
+        previous_period
+            .adaptations
+            .iter()
+            .map(|adaptation| adaptation.id.as_deref()),
+        "AdaptationSet",
+        "previous",
+        findings,
+    );
+    let current_ids = stable_ids(
+        current_period
+            .adaptations
+            .iter()
+            .map(|adaptation| adaptation.id.as_deref()),
+        "AdaptationSet",
+        "current",
+        findings,
+    );
+    findings.push(finding(
+        "FORGE-DASH-UPDATE-ADAPTATION-ORDER",
+        Severity::Error,
+        common_order_is_stable(&previous_ids, &current_ids),
+        format!("retained AdaptationSets in Period {period_id} keep their relative order"),
+        Some(json!({"previous": previous_ids, "current": current_ids})),
+    ));
+    let previous_by_id = previous_period
+        .adaptations
+        .iter()
+        .filter_map(|adaptation| adaptation.id.as_deref().map(|id| (id, adaptation)))
+        .collect::<HashMap<_, _>>();
+    for current_adaptation in &current_period.adaptations {
+        let Some(id) = current_adaptation.id.as_deref() else {
+            continue;
+        };
+        let Some(previous_adaptation) = previous_by_id.get(id).copied() else {
+            continue;
+        };
+        validate_representation_update(
+            previous_period,
+            current_period,
+            previous_adaptation,
+            current_adaptation,
+            period_id,
+            id,
+            findings,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_representation_update(
+    previous_period: &Period,
+    current_period: &Period,
+    previous_adaptation: &AdaptationSet,
+    current_adaptation: &AdaptationSet,
+    period_id: &str,
+    adaptation_id: &str,
+    findings: &mut Vec<DashFinding>,
+) {
+    let previous_ids = stable_ids(
+        previous_adaptation
+            .representations
+            .iter()
+            .map(|representation| representation.id.as_deref()),
+        "Representation",
+        "previous",
+        findings,
+    );
+    let current_ids = stable_ids(
+        current_adaptation
+            .representations
+            .iter()
+            .map(|representation| representation.id.as_deref()),
+        "Representation",
+        "current",
+        findings,
+    );
+    findings.push(finding(
+        "FORGE-DASH-UPDATE-REPRESENTATION-SET",
+        Severity::Error,
+        previous_ids == current_ids,
+        format!(
+            "retained AdaptationSet {adaptation_id} in Period {period_id} keeps its Representation id set and order"
+        ),
+        Some(json!({"previous": previous_ids, "current": current_ids})),
+    ));
+    let adaptation_compatible = previous_adaptation.content_type == current_adaptation.content_type
+        && previous_adaptation.lang == current_adaptation.lang;
+    findings.push(finding(
+        "FORGE-DASH-UPDATE-FUNCTIONAL-EQUIVALENCE",
+        Severity::Error,
+        adaptation_compatible,
+        format!(
+            "retained AdaptationSet {adaptation_id} keeps functional audio and codec properties"
+        ),
+        None,
+    ));
+    let previous_by_id = previous_adaptation
+        .representations
+        .iter()
+        .filter_map(|representation| representation.id.as_deref().map(|id| (id, representation)))
+        .collect::<HashMap<_, _>>();
+    for current_representation in &current_adaptation.representations {
+        let Some(id) = current_representation.id.as_deref() else {
+            continue;
+        };
+        let Some(previous_representation) = previous_by_id.get(id).copied() else {
+            continue;
+        };
+        let properties_compatible = previous_representation.bandwidth
+            == current_representation.bandwidth
+            && previous_representation
+                .mime_type
+                .as_ref()
+                .or(previous_adaptation.mime_type.as_ref())
+                == current_representation
+                    .mime_type
+                    .as_ref()
+                    .or(current_adaptation.mime_type.as_ref())
+            && previous_representation
+                .codecs
+                .as_ref()
+                .or(previous_adaptation.codecs.as_ref())
+                == current_representation
+                    .codecs
+                    .as_ref()
+                    .or(current_adaptation.codecs.as_ref())
+            && previous_representation
+                .audio_sampling_rate
+                .or(previous_adaptation.audio_sampling_rate)
+                == current_representation
+                    .audio_sampling_rate
+                    .or(current_adaptation.audio_sampling_rate)
+            && previous_representation
+                .audio_channel_configuration
+                .as_ref()
+                .or(previous_adaptation.audio_channel_configuration.as_ref())
+                == current_representation
+                    .audio_channel_configuration
+                    .as_ref()
+                    .or(current_adaptation.audio_channel_configuration.as_ref())
+            && effective_content_protections(previous_adaptation, previous_representation)
+                == effective_content_protections(current_adaptation, current_representation);
+        findings.push(finding(
+            "FORGE-DASH-UPDATE-FUNCTIONAL-EQUIVALENCE",
+            Severity::Error,
+            properties_compatible,
+            format!("retained Representation {id} keeps functional media properties"),
+            None,
+        ));
+        let (_, previous_addressing) = resolve_addressing(
+            previous_representation,
+            previous_adaptation,
+            previous_period,
+        );
+        let (_, current_addressing) =
+            resolve_addressing(current_representation, current_adaptation, current_period);
+        let compatible = addressing_update_compatible(
+            previous_addressing,
+            current_addressing,
+            previous_period,
+            current_period,
+        );
+        findings.push(finding(
+            "FORGE-DASH-UPDATE-SEGMENT-EQUIVALENCE",
+            Severity::Error,
+            compatible,
+            format!("retained Representation {id} keeps equivalent segment references"),
+            None,
+        ));
+    }
+}
+
+type EffectiveContentProtection<'a> = (
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+    &'a [String],
+);
+
+fn effective_content_protections<'a>(
+    adaptation: &'a AdaptationSet,
+    representation: &'a Representation,
+) -> Vec<EffectiveContentProtection<'a>> {
+    adaptation
+        .content_protections
+        .iter()
+        .chain(&representation.content_protections)
+        .map(|protection| {
+            (
+                protection.scheme_id_uri.as_deref(),
+                protection.value.as_deref(),
+                protection.default_kid.as_deref(),
+                protection.pssh.as_slice(),
+            )
+        })
+        .collect()
+}
+
+fn addressing_update_compatible(
+    previous: Option<ResolvedAddressing>,
+    current: Option<ResolvedAddressing>,
+    previous_period: &Period,
+    current_period: &Period,
+) -> bool {
+    match (previous, current) {
+        (
+            Some(ResolvedAddressing::Template(previous)),
+            Some(ResolvedAddressing::Template(current)),
+        ) => {
+            effective_timescale(&previous) == effective_timescale(&current)
+                && previous.initialization == current.initialization
+                && previous.media == current.media
+                && previous.duration == current.duration
+                && previous.presentation_time_offset == current.presentation_time_offset
+                && previous.start_number.unwrap_or(1) <= current.start_number.unwrap_or(1)
+                && segment_timelines_compatible(
+                    &previous,
+                    previous_period.duration,
+                    &current,
+                    current_period.duration,
+                )
+        }
+        (Some(ResolvedAddressing::List(previous)), Some(ResolvedAddressing::List(current))) => {
+            segment_lists_compatible(
+                &previous,
+                previous_period.duration,
+                &current,
+                current_period.duration,
+            )
+        }
+        (Some(ResolvedAddressing::Base(previous)), Some(ResolvedAddressing::Base(current))) => {
+            previous.timescale.unwrap_or(1) == current.timescale.unwrap_or(1)
+                && previous.presentation_time_offset == current.presentation_time_offset
+        }
+        _ => false,
+    }
+}
+
+fn segment_timelines_compatible(
+    previous: &SegmentTemplate,
+    previous_duration: Option<f64>,
+    current: &SegmentTemplate,
+    current_duration: Option<f64>,
+) -> bool {
+    if previous.timeline == current.timeline {
+        return true;
+    }
+    if previous.timeline.is_empty() && current.timeline.is_empty() {
+        return true;
+    }
+    if previous.timeline.is_empty() || current.timeline.is_empty() {
+        return false;
+    }
+    let Ok(previous) = expand_timeline_segments(previous, previous_duration) else {
+        return false;
+    };
+    let Ok(current) = expand_timeline_segments(current, current_duration) else {
+        return false;
+    };
+    if previous.len() == MAX_LOCAL_SEGMENTS || current.len() == MAX_LOCAL_SEGMENTS {
+        return false;
+    }
+    overlapping_segments_match(&previous, &current)
+}
+
+fn segment_lists_compatible(
+    previous: &SegmentList,
+    previous_duration: Option<f64>,
+    current: &SegmentList,
+    current_duration: Option<f64>,
+) -> bool {
+    if previous.base.timescale.unwrap_or(1) != current.base.timescale.unwrap_or(1)
+        || previous.base.presentation_time_offset != current.base.presentation_time_offset
+        || previous
+            .base
+            .initialization
+            .as_ref()
+            .map(initialization_key)
+            != current.base.initialization.as_ref().map(initialization_key)
+        || previous.duration != current.duration
+        || previous.start_number.unwrap_or(1) > current.start_number.unwrap_or(1)
+    {
+        return false;
+    }
+    let Ok(previous_times) = expand_segment_list_segments(previous, previous_duration) else {
+        return false;
+    };
+    let Ok(current_times) = expand_segment_list_segments(current, current_duration) else {
+        return false;
+    };
+    if previous_times.len() == MAX_LOCAL_SEGMENTS || current_times.len() == MAX_LOCAL_SEGMENTS {
+        return false;
+    }
+    let previous = previous_times
+        .into_iter()
+        .zip(&previous.segment_urls)
+        .map(|((time, duration), url)| (time, duration, segment_url_key(url)))
+        .collect::<Vec<_>>();
+    let current = current_times
+        .into_iter()
+        .zip(&current.segment_urls)
+        .map(|((time, duration), url)| (time, duration, segment_url_key(url)))
+        .collect::<Vec<_>>();
+    overlapping_valued_segments_match(&previous, &current)
+}
+
+fn initialization_key(initialization: &Initialization) -> (Option<&str>, Option<ByteRange>) {
+    (initialization.source_url.as_deref(), initialization.range)
+}
+
+fn segment_url_key(
+    url: &SegmentUrl,
+) -> (
+    Option<&str>,
+    Option<ByteRange>,
+    Option<&str>,
+    Option<ByteRange>,
+) {
+    (
+        url.media.as_deref(),
+        url.media_range,
+        url.index.as_deref(),
+        url.index_range,
+    )
+}
+
+fn overlapping_segments_match(previous: &[(u64, u64)], current: &[(u64, u64)]) -> bool {
+    overlapping_valued_segments_match(
+        &previous
+            .iter()
+            .map(|(start, duration)| (*start, *duration, ()))
+            .collect::<Vec<_>>(),
+        &current
+            .iter()
+            .map(|(start, duration)| (*start, *duration, ()))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn overlapping_valued_segments_match<T: PartialEq>(
+    previous: &[(u64, u64, T)],
+    current: &[(u64, u64, T)],
+) -> bool {
+    if previous.is_empty() {
+        return true;
+    }
+    if current.is_empty()
+        || current[0].0 < previous[0].0
+        || current
+            .last()
+            .and_then(|(start, duration, _)| start.checked_add(*duration))
+            .is_none_or(|end| end <= previous[0].0)
+    {
+        return false;
+    }
+    let mut previous_index = 0;
+    let mut current_index = 0;
+    while previous_index < previous.len() && current_index < current.len() {
+        let (previous_start, previous_duration, previous_value) = &previous[previous_index];
+        let (current_start, current_duration, current_value) = &current[current_index];
+        if previous_start == current_start {
+            if previous_duration != current_duration || previous_value != current_value {
+                return false;
+            }
+            previous_index += 1;
+            current_index += 1;
+        } else if previous_start < current_start {
+            if previous_start
+                .checked_add(*previous_duration)
+                .is_none_or(|end| end > *current_start)
+            {
+                return false;
+            }
+            previous_index += 1;
+        } else {
+            if current_start
+                .checked_add(*current_duration)
+                .is_none_or(|end| end > *previous_start)
+            {
+                return false;
+            }
+            current_index += 1;
+        }
+    }
+    true
 }
 
 fn validate_mpd(path: &Path, mpd: &Mpd, profile: DashProfile, findings: &mut Vec<DashFinding>) {
@@ -2238,6 +2826,18 @@ fn expand_segment_list(
     list: &SegmentList,
     period_duration: Option<f64>,
 ) -> Result<Vec<u64>, String> {
+    expand_segment_list_segments(list, period_duration).map(|segments| {
+        segments
+            .into_iter()
+            .map(|(start, _duration)| start)
+            .collect()
+    })
+}
+
+fn expand_segment_list_segments(
+    list: &SegmentList,
+    period_duration: Option<f64>,
+) -> Result<Vec<(u64, u64)>, String> {
     if list.timeline.is_empty() {
         let duration = list
             .duration
@@ -2250,10 +2850,10 @@ fn expand_segment_list(
             })
             .unwrap_or(list.segment_urls.len());
         return Ok((0..count.min(MAX_LOCAL_SEGMENTS))
-            .map(|index| index as u64 * duration)
+            .map(|index| (index as u64 * duration, duration))
             .collect());
     }
-    expand_timeline(
+    expand_timeline_segments(
         &SegmentTemplate {
             timescale: list.base.timescale,
             duration: list.duration,
@@ -2984,6 +3584,18 @@ fn expand_timeline(
     template: &SegmentTemplate,
     period_duration: Option<f64>,
 ) -> Result<Vec<u64>, String> {
+    expand_timeline_segments(template, period_duration).map(|segments| {
+        segments
+            .into_iter()
+            .map(|(start, _duration)| start)
+            .collect()
+    })
+}
+
+fn expand_timeline_segments(
+    template: &SegmentTemplate,
+    period_duration: Option<f64>,
+) -> Result<Vec<(u64, u64)>, String> {
     if !template.timeline.is_empty() {
         let mut result = Vec::new();
         let mut current = 0_u64;
@@ -3023,7 +3635,7 @@ fn expand_timeline(
                 if result.len() == MAX_LOCAL_SEGMENTS {
                     return Ok(result);
                 }
-                result.push(current);
+                result.push((current, entry.duration));
                 current = current.saturating_add(entry.duration);
             }
         }
@@ -3041,7 +3653,7 @@ fn expand_timeline(
     let count = ((period_duration * effective_timescale(template) as f64) / duration as f64).ceil()
         as usize;
     Ok((0..count.min(MAX_LOCAL_SEGMENTS))
-        .map(|index| index as u64 * duration)
+        .map(|index| (index as u64 * duration, duration))
         .collect())
 }
 
@@ -3578,6 +4190,57 @@ fn looks_like_xs_datetime(value: &str) -> bool {
         })
 }
 
+fn parse_xs_datetime_seconds(value: &str) -> Option<f64> {
+    if !looks_like_xs_datetime(value) || !has_datetime_zone(value) {
+        return None;
+    }
+    let (date, time) = value.split_once('T')?;
+    let mut date_fields = date.split('-');
+    let year = date_fields.next()?.parse::<i64>().ok()?;
+    let month = date_fields.next()?.parse::<u32>().ok()?;
+    let day = date_fields.next()?.parse::<u32>().ok()?;
+    if date_fields.next().is_some() {
+        return None;
+    }
+    let (clock, offset_seconds) = if let Some(clock) = time.strip_suffix('Z') {
+        (clock, 0_i64)
+    } else {
+        let split = time.len().checked_sub(6)?;
+        let (clock, zone) = time.split_at(split);
+        let sign = match zone.as_bytes().first()? {
+            b'+' => 1_i64,
+            b'-' => -1_i64,
+            _ => return None,
+        };
+        let hours = zone.get(1..3)?.parse::<i64>().ok()?;
+        let minutes = zone.get(4..6)?.parse::<i64>().ok()?;
+        (clock, sign * (hours * 3_600 + minutes * 60))
+    };
+    let mut clock_fields = clock.split(':');
+    let hours = clock_fields.next()?.parse::<i64>().ok()?;
+    let minutes = clock_fields.next()?.parse::<i64>().ok()?;
+    let seconds = clock_fields.next()?.parse::<f64>().ok()?;
+    if clock_fields.next().is_some() {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    Some(
+        days as f64 * 86_400.0 + hours as f64 * 3_600.0 + minutes as f64 * 60.0 + seconds
+            - offset_seconds as f64,
+    )
+}
+
+fn days_from_civil(mut year: i64, month: u32, day: u32) -> i64 {
+    year -= i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = i64::from(month);
+    let adjusted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * adjusted_month + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 fn has_datetime_zone(value: &str) -> bool {
     value.ends_with('Z')
         || (value.len() >= 6 && matches!(value.as_bytes().get(value.len() - 6), Some(b'+' | b'-')))
@@ -3974,6 +4637,26 @@ mod tests {
         bytes
     }
 
+    fn update_mpd(publish_time: &str, timeline: &str, representation_id: &str) -> String {
+        format!(
+            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" id="live"
+ type="dynamic" availabilityStartTime="2026-07-29T00:00:00Z"
+ publishTime="{publish_time}" minimumUpdatePeriod="PT2S" minBufferTime="PT1S">
+ <BaseURL>https://example.invalid/live/</BaseURL>
+ <Period id="p0" start="PT0S">
+  <AdaptationSet id="audio" contentType="audio" mimeType="audio/mp4"
+   codecs="opus" lang="en" audioSamplingRate="48000">
+   <SegmentTemplate timescale="10" initialization="init-$RepresentationID$.mp4"
+    media="$RepresentationID$-$Time$.m4s">
+    <SegmentTimeline>{timeline}</SegmentTimeline>
+   </SegmentTemplate>
+   <Representation id="{representation_id}" bandwidth="64000"/>
+  </AdaptationSet>
+ </Period>
+</MPD>"#
+        )
+    }
+
     #[test]
     fn audits_static_audio_segment_template() {
         let directory = tempfile::tempdir().unwrap();
@@ -4267,6 +4950,34 @@ mod tests {
         assert!(!looks_like_xs_datetime("2026-07-27T25:15:30Z"));
         assert!(!looks_like_xs_datetime("2026-07-27T10:15:30+14:01"));
         assert!(!looks_like_xs_datetime("2026-07-27"));
+        assert_eq!(
+            parse_xs_datetime_seconds("2026-07-29T09:00:00+09:00"),
+            parse_xs_datetime_seconds("2026-07-29T00:00:00Z")
+        );
+        assert!(
+            parse_xs_datetime_seconds("2026-07-29T00:00:00.5Z")
+                > parse_xs_datetime_seconds("2026-07-29T00:00:00Z")
+        );
+        assert!(common_order_is_stable(
+            &["old".into(), "keep".into(), "tail".into()],
+            &["keep".into(), "tail".into(), "new".into()]
+        ));
+        assert!(!common_order_is_stable(
+            &["first".into(), "second".into()],
+            &["second".into(), "first".into()]
+        ));
+        assert!(overlapping_valued_segments_match(
+            &[(10, 10, "old")],
+            &[(20, 10, "new")]
+        ));
+        assert!(!overlapping_valued_segments_match(
+            &[(10, 10, "old")],
+            &[(11, 10, "changed-boundary")]
+        ));
+        assert!(!overlapping_valued_segments_match(
+            &[(10, 10, "old")],
+            &[(0, 10, "regressive")]
+        ));
     }
 
     #[test]
@@ -4385,5 +5096,85 @@ mod tests {
                 .iter()
                 .any(|finding| finding.rule_id == rule && !finding.passed));
         }
+    }
+
+    #[test]
+    fn audits_successive_dynamic_mpd_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let previous = directory.path().join("previous.mpd");
+        let current = directory.path().join("current.mpd");
+        fs::write(
+            &previous,
+            update_mpd("2026-07-29T00:00:20Z", r#"<S t="0" d="10" r="2"/>"#, "a1"),
+        )
+        .unwrap();
+        fs::write(
+            &current,
+            update_mpd(
+                "2026-07-29T09:00:21+09:00",
+                r#"<S t="10" d="10" r="2"/>"#,
+                "a1",
+            ),
+        )
+        .unwrap();
+        let audit = audit_with_previous(&current, &previous, DashProfile::Iso23009).unwrap();
+        assert!(
+            audit.passed,
+            "{:#?}",
+            audit
+                .findings
+                .iter()
+                .filter(|finding| finding.severity == Severity::Error && !finding.passed)
+                .map(|finding| (&finding.rule_id, &finding.message))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            audit.properties["previous_path"],
+            previous.to_string_lossy().as_ref()
+        );
+        assert!(audit.findings.iter().any(|finding| {
+            finding.rule_id == "FORGE-DASH-UPDATE-SEGMENT-EQUIVALENCE" && finding.passed
+        }));
+    }
+
+    #[test]
+    fn rejects_regressive_or_functionally_changed_mpd_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let previous = directory.path().join("previous.mpd");
+        let current = directory.path().join("current.mpd");
+        fs::write(
+            &previous,
+            update_mpd("2026-07-29T00:00:20Z", r#"<S t="0" d="10" r="2"/>"#, "a1"),
+        )
+        .unwrap();
+        fs::write(
+            &current,
+            update_mpd(
+                "2026-07-29T00:00:19Z",
+                r#"<S t="10" d="11" r="2"/>"#,
+                "replacement",
+            ),
+        )
+        .unwrap();
+        let audit = audit_with_previous(&current, &previous, DashProfile::Iso23009).unwrap();
+        assert!(!audit.passed);
+        for rule in [
+            "FORGE-DASH-UPDATE-PUBLISH-TIME",
+            "FORGE-DASH-UPDATE-REPRESENTATION-SET",
+        ] {
+            assert!(audit
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == rule && !finding.passed));
+        }
+        fs::write(
+            &current,
+            update_mpd("2026-07-29T00:00:21Z", r#"<S t="10" d="11" r="2"/>"#, "a1"),
+        )
+        .unwrap();
+        let audit = audit_with_previous(&current, &previous, DashProfile::Iso23009).unwrap();
+        assert!(audit.findings.iter().any(|finding| {
+            finding.rule_id == "FORGE-DASH-UPDATE-SEGMENT-EQUIVALENCE" && !finding.passed
+        }));
     }
 }

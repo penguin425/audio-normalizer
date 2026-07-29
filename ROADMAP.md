@@ -50,6 +50,9 @@ Forge already provides:
 - DASH `SegmentList`/`SegmentBase` inheritance, addressing-mode consistency,
   list timeline/count/range checks, bounded local `sidx` parsing, and dynamic
   availability-completeness geometry.
+- Successive full-MPD update QC for identity, publish-time monotonicity,
+  Period/AdaptationSet ordering, fixed Representation sets, inherited
+  functional properties, and overlapping segment-reference equivalence.
 - HLS, DASH, and CMAF package checks; ISO loudness and MPEG-D DRC metadata.
 - ADM, S-ADM, presentation-aware rendering/QC, C2PA validation, CI comparison,
   real-time processing, LV2, and CLAP integration.
@@ -113,7 +116,7 @@ generations.
 
 ### Streaming and platform delivery
 
-- DASH successive MPD update/patch consistency and allowlisted clock/origin
+- DASH MPD Patch application/consistency and allowlisted clock/origin
   observation.
 - CMAF switching-set alignment across audio renditions and languages.
 - MPEG-DASH loudness/DRC descriptors and HLS timed-ID3 loudness metadata.
