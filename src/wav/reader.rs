@@ -170,18 +170,23 @@ impl WavReader {
             let declared_size = u32::from_le_bytes(header[4..8].try_into().unwrap());
             let body_offset = file.stream_position()?;
             if &header[..4] == b"fmt " {
+                if declared_size > 65_536 {
+                    return Err(WavReadError::BadFormat(
+                        "fmt chunk exceeds 64 KiB safety limit",
+                    ));
+                }
                 let mut body = vec![0; declared_size as usize];
                 file.read_exact(&mut body)?;
                 let parsed = parse_fmt(&body)?;
                 let kind = pick_kind(parsed.wave_format, parsed.real_tag, parsed.bits)?;
                 parsed_format = Some((parsed, kind));
             } else if &header[..4] == b"ds64" {
-                let mut body = vec![0; declared_size as usize];
-                file.read_exact(&mut body)?;
-                if body.len() < 16 {
+                if declared_size < 16 {
                     return Err(WavReadError::BadFormat("ds64 chunk too short"));
                 }
-                ds64_data_size = Some(u64::from_le_bytes(body[8..16].try_into().unwrap()));
+                let mut prefix = [0u8; 16];
+                file.read_exact(&mut prefix)?;
+                ds64_data_size = Some(u64::from_le_bytes(prefix[8..16].try_into().unwrap()));
             } else if &header[..4] == b"data" {
                 let data_size = if declared_size == u32::MAX {
                     ds64_data_size.ok_or(WavReadError::BadFormat(
@@ -389,6 +394,21 @@ mod tests {
         assert_eq!(roles[5], ChannelRole::positioned(135, 0));
         assert_eq!(roles[6], ChannelRole::positioned(-90, 0));
         assert_eq!(roles[7], ChannelRole::positioned(90, 0));
+    }
+
+    #[test]
+    fn probe_rejects_oversized_format_chunk_before_allocating_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized.wav");
+        let mut bytes = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
+        bytes.extend_from_slice(&65_537_u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            WavReader::probe(path),
+            Err(WavReadError::BadFormat(
+                "fmt chunk exceeds 64 KiB safety limit"
+            ))
+        ));
     }
 
     proptest! {

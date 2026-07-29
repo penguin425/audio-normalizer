@@ -57,6 +57,10 @@ name = "forge-compare"
 path = "src/bin/forge-compare.rs"
 
 [[bin]]
+name = "forge-audio-compare"
+path = "src/bin/forge-audio-compare.rs"
+
+[[bin]]
 name = "forge-container-qc"
 path = "src/bin/forge-container-qc.rs"
 

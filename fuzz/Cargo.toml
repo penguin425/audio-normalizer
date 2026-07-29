@@ -43,6 +43,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "audio_compare"
+path = "fuzz_targets/audio_compare.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "hls_qc"
 path = "fuzz_targets/hls_qc.rs"
 test = false

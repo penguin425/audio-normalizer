@@ -23,6 +23,17 @@ pub struct StreamInfo {
 
 /// Decode any supported audio file into a planar-f32 [`AudioBuffer`].
 pub fn decode(path: &Path) -> Result<AudioBuffer, String> {
+    decode_limited(path, u64::MAX)
+}
+
+/// Decode supported audio while bounding frames multiplied by channels.
+///
+/// WAVE inputs are rejected from their headers before the fast path allocates
+/// its planar buffer. Compressed inputs are checked after every decoded packet.
+pub fn decode_limited(path: &Path, max_decoded_samples: u64) -> Result<AudioBuffer, String> {
+    if max_decoded_samples == 0 {
+        return Err("decoded sample limit must be greater than zero".into());
+    }
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -31,6 +42,19 @@ pub fn decode(path: &Path) -> Result<AudioBuffer, String> {
 
     // Fast path: Forge's own WAV demuxer (parallel, SIMD-friendly).
     if matches!(ext.as_str(), "wav" | "wave" | "bwf" | "bw64" | "rf64") {
+        let info = WavReader::probe(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let bytes_per_frame = (info.kind.bytes_per_sample() as u64)
+            .checked_mul(u64::from(info.channels))
+            .ok_or_else(|| format!("{}: WAVE frame size overflow", path.display()))?;
+        if bytes_per_frame == 0 {
+            return Err(format!("{}: WAVE frame size is zero", path.display()));
+        }
+        enforce_decoded_sample_limit(
+            path,
+            info.data_size / bytes_per_frame,
+            u64::from(info.channels),
+            max_decoded_samples,
+        )?;
         return WavReader::open(path).map_err(|e| format!("{}: {e}", path.display()));
     }
     if ext == "opus" {
@@ -38,6 +62,14 @@ pub fn decode(path: &Path) -> Result<AudioBuffer, String> {
         {
             let mut data: Vec<Vec<f32>> = Vec::new();
             let info = crate::opus::decode_stream(path, |info, planar| {
+                let existing_frames = data.first().map_or(0, Vec::len) as u64;
+                let packet_frames = planar.first().map_or(0, |samples| samples.len()) as u64;
+                enforce_decoded_sample_limit(
+                    path,
+                    existing_frames.saturating_add(packet_frames),
+                    u64::from(info.channels),
+                    max_decoded_samples,
+                )?;
                 if data.is_empty() {
                     data = vec![Vec::new(); info.channels as usize];
                 }
@@ -65,10 +97,14 @@ pub fn decode(path: &Path) -> Result<AudioBuffer, String> {
     }
 
     // Everything else via symphonia.
-    decode_symphonia(path, &ext)
+    decode_symphonia(path, &ext, max_decoded_samples)
 }
 
-fn decode_symphonia(path: &Path, ext: &str) -> Result<AudioBuffer, String> {
+fn decode_symphonia(
+    path: &Path,
+    ext: &str,
+    max_decoded_samples: u64,
+) -> Result<AudioBuffer, String> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::codecs::DecoderOptions;
     use symphonia::core::errors::Error;
@@ -147,11 +183,27 @@ fn decode_symphonia(path: &Path, ext: &str) -> Result<AudioBuffer, String> {
         if channels == 0 {
             channels = ch as u16;
             planar = (0..ch).map(|_| Vec::new()).collect();
+        } else if channels as usize != ch {
+            return Err(format!(
+                "{}: decoded channel count changed from {channels} to {ch}",
+                path.display()
+            ));
         }
         let frames = decoded.frames();
         if frames == 0 {
             continue;
         }
+        let total_frames = planar
+            .first()
+            .map_or(0, Vec::len)
+            .checked_add(frames)
+            .ok_or_else(|| format!("{}: decoded frame count overflow", path.display()))?;
+        enforce_decoded_sample_limit(
+            path,
+            total_frames as u64,
+            channels as u64,
+            max_decoded_samples,
+        )?;
         let need = frames * ch;
         if sample_buf.as_ref().is_none_or(|b| b.len() < need) {
             // `Duration` is a u64 frame count; the buffer stores frames*ch samples.
@@ -190,6 +242,24 @@ fn decode_symphonia(path: &Path, ext: &str) -> Result<AudioBuffer, String> {
         // is also the default WAV output kind for these files.
         source_kind: PcmKind::F32,
     })
+}
+
+fn enforce_decoded_sample_limit(
+    path: &Path,
+    frames: u64,
+    channels: u64,
+    max_decoded_samples: u64,
+) -> Result<(), String> {
+    let samples = frames
+        .checked_mul(channels)
+        .ok_or_else(|| format!("{}: decoded sample count overflow", path.display()))?;
+    if samples > max_decoded_samples {
+        return Err(format!(
+            "{}: decoded sample count {samples} exceeds safety limit {max_decoded_samples}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn roles_from_symphonia(channels: symphonia::core::audio::Channels) -> Vec<ChannelRole> {

@@ -6,8 +6,10 @@ on:
       - ".github/workflows/fuzz.yml"
       - "fuzz/**"
       - "src/adm.rs"
+      - "src/audio_compare.rs"
       - "src/compare.rs"
       - "src/container_qc.rs"
+      - "src/decoder.rs"
       - "src/dash_patch.rs"
       - "src/dash_observe.rs"
       - "src/dash_qc.rs"
@@ -22,8 +24,10 @@ on:
       - ".github/workflows/fuzz.yml"
       - "fuzz/**"
       - "src/adm.rs"
+      - "src/audio_compare.rs"
       - "src/compare.rs"
       - "src/container_qc.rs"
+      - "src/decoder.rs"
       - "src/dash_patch.rs"
       - "src/dash_observe.rs"
       - "src/dash_qc.rs"
@@ -58,6 +62,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for target in wave_reader container_qc adm_profile manifest_compare hls_qc dash_qc imf_qc rtp_qc nmos_qc; do
+          for target in wave_reader container_qc adm_profile manifest_compare audio_compare hls_qc dash_qc imf_qc rtp_qc nmos_qc; do
             cargo fuzz run "$target" -- -runs=1000
           done

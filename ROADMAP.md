@@ -93,6 +93,10 @@ Forge already provides:
 - RFC 8486 Ogg Opus mapping-family-2 Ambisonics QC for allowed order/channel
   geometry, ACN/SN3D declarations, optional non-diegetic stereo, mixed-order
   inactive ACNs, and consistent chained layouts.
+- Bounded decoded reference-audio comparison with sample alignment, optimal
+  channel assignment/permutation and polarity evidence, full-overlap null
+  residual/peak, exact-sample ratio, and excerpted one-third-octave spectral
+  error, explicitly classified as non-normative engineering QC.
 
 ## P0 — next correctness and interoperability work
 
@@ -148,8 +152,6 @@ generations.
   widely honoured gain mechanism.
 - Before/after audible-difference report with gain envelope, limiting amount,
   clipped-sample count, and codec drift.
-- Reference comparison with sample alignment, null residual, spectral error,
-  and channel permutation detection.
 
 ### Immersive, personalized, and accessible audio
 
