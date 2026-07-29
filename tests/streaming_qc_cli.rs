@@ -205,6 +205,7 @@ fn streaming_qc_cli_applies_and_audits_dash_mpd_patch() {
  type="dynamic" availabilityStartTime="2026-07-29T00:00:00Z"
  publishTime="2026-07-29T00:00:20Z" minimumUpdatePeriod="PT2S"
  minBufferTime="PT1S">
+ <!--base snapshot--><?audit base?>
  <BaseURL>https://example.invalid/live/</BaseURL>
  <PatchLocation ttl="60">update.mpp</PatchLocation>
  <Period id="p0" start="PT0S">
@@ -226,9 +227,13 @@ fn streaming_qc_cli_applies_and_audits_dash_mpd_patch() {
  mpdId="live" originalPublishTime="2026-07-29T00:00:20Z"
  publishTime="2026-07-29T00:00:22Z">
  <replace sel="/MPD/@publishTime">2026-07-29T00:00:22Z</replace>
+ <replace sel="/MPD/comment()[1]"><!--patched snapshot--></replace>
+ <replace sel="/MPD/processing-instruction('audit')"><?audit patched?></replace>
  <replace sel="/MPD/PatchLocation[1]"><PatchLocation ttl="60">next.mpp</PatchLocation></replace>
  <remove sel="/MPD/Period[@id='p0']/AdaptationSet[@id='audio']/SegmentTemplate/SegmentTimeline/S[1]"/>
  <add sel="/MPD/Period[@id='p0']/AdaptationSet[@id='audio']/SegmentTemplate/SegmentTimeline/S[2]" pos="after"><S t="30" d="10"/></add>
+ <add sel="/MPD" type="namespace::temporary">urn:forge:temporary</add>
+ <remove sel="/MPD/namespace::temporary"/>
 </Patch>"#,
     )
     .unwrap();
@@ -245,7 +250,7 @@ fn streaming_qc_cli_applies_and_audits_dash_mpd_patch() {
         audit["properties"]["patch_path"],
         patch.to_string_lossy().as_ref()
     );
-    assert_eq!(audit["properties"]["patch_operation_count"], 4);
+    assert_eq!(audit["properties"]["patch_operation_count"], 8);
     assert_eq!(audit["properties"]["publish_time"], "2026-07-29T00:00:22Z");
     assert!(audit["findings"].as_array().unwrap().iter().any(|finding| {
         finding["rule_id"] == "FORGE-DASH-PATCH-RESULT-PUBLISH-TIME" && finding["passed"] == true
