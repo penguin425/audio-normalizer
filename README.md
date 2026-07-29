@@ -413,15 +413,23 @@ Standalone IAMF audits follow
 They enforce bounded LEB128 OBU framing, the normative 2 MiB OBU limit,
 sequence headers and profiles, descriptor ordering, data redundancy/trimming
 flags, and complete-file consumption without decoding codec payloads. Stable
-`FORGE-IAMF-CODEC-CONFIG`, `FORGE-IAMF-DESCRIPTOR-LINKS`, and
-`FORGE-IAMF-AUDIO-FRAME-LINKS` checks parse the Codec Config prefix and full
-Opus, FLAC STREAMINFO, or LPCM decoder configuration, enforce AAC-LC frame and
-roll declarations, reject duplicate or missing codec/element/substream IDs,
-and require every implicit or explicit Audio Frame OBU to resolve to a declared
-substream. Counts, frame lengths, roll distances, sample rates, sample sizes,
-and bounded error evidence remain visible in JSON. Validation is exercised
-against the pinned AOMedia `libiamf` v1.1.0 conformance streams in addition to
-clean and intentionally defective local fixtures.
+`FORGE-IAMF-CODEC-CONFIG`, `FORGE-IAMF-AUDIO-ELEMENT`,
+`FORGE-IAMF-DESCRIPTOR-LINKS`, and `FORGE-IAMF-AUDIO-FRAME-LINKS` checks parse
+the Codec Config prefix and full Opus, FLAC STREAMINFO, or LPCM decoder
+configuration, enforce AAC-LC frame and roll declarations, and parse complete
+Audio Element syntax. The Audio Element check validates bounded and unique
+parameter definitions, parameter/frame timing, one-to-six-layer scalable
+channel geometry, standard and expanded loudspeaker layouts, output/recon-gain
+signalling, and codec-dependent reconstruction-gain requirements. Scene-based
+elements validate MONO and PROJECTION Ambisonics geometry, complete matrices,
+and [RFC 8486](https://www.rfc-editor.org/rfc/rfc8486.html) channel mappings.
+Descriptor and frame checks reject duplicate or missing
+codec/element/parameter/substream IDs and require every implicit or explicit
+Audio Frame OBU to resolve to a declared substream. Counts, layouts, channel
+counts, frame lengths, roll distances, sample rates, sample sizes, and bounded
+error evidence remain visible in JSON. Validation is exercised against pinned
+AOMedia `libiamf` v1.1.0 and `iamf-tools` v2.1.0 streams in addition to clean
+and intentionally defective local fixtures.
 Rendering is deliberately separate: render every Mix Presentation and target
 layout with an
 [Open Audio Renderer v1.0.0](https://aomedia.org/specifications/oar/)

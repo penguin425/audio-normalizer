@@ -38,6 +38,24 @@ struct AudioElement {
     element_type: u8,
     codec_config_id: u64,
     substream_ids: Vec<u64>,
+    parameter_ids: Vec<u64>,
+    parameter_types: Vec<u64>,
+    config: AudioElementConfig,
+    trailing_bytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AudioElementConfig {
+    ChannelBased {
+        num_layers: u8,
+        highest_layout: String,
+        output_channels: u16,
+    },
+    SceneBased {
+        ambisonics_mode: u8,
+        output_channels: u16,
+    },
+    Reserved,
 }
 
 #[derive(Debug, Default)]
@@ -70,11 +88,14 @@ struct State {
     trim_at_end_samples: u64,
     reserved_obus: u64,
     codec_configs_valid: bool,
+    audio_elements_valid: bool,
     descriptor_links_valid: bool,
     audio_frames_valid: bool,
     current_codec_configs_by_id: BTreeMap<u64, CodecConfig>,
     current_audio_elements_by_id: BTreeMap<u64, AudioElement>,
     current_substream_ids: BTreeSet<u64>,
+    current_parameter_ids: BTreeSet<u64>,
+    current_parameter_definitions: usize,
     active_codec_configs: BTreeMap<u64, CodecConfig>,
     active_audio_elements: BTreeMap<u64, AudioElement>,
     active_substream_ids: BTreeSet<u64>,
@@ -128,6 +149,7 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
         profiles_valid: true,
         sequence_headers_valid: true,
         codec_configs_valid: true,
+        audio_elements_valid: true,
         descriptor_links_valid: true,
         audio_frames_valid: true,
         ..State::default()
@@ -276,6 +298,16 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
             "codec configurations have unique IDs, supported 4CC semantics, frame lengths, roll distances, and bounded decoder configs",
             Some(json!({
                 "codec_configs": codec_config_json(&state.codec_config_observations),
+                "errors": state.payload_errors,
+                "evidence_truncated": state.payload_evidence_truncated,
+            })),
+        ),
+        check(
+            "FORGE-IAMF-AUDIO-ELEMENT",
+            state.audio_elements_valid && !state.audio_element_observations.is_empty(),
+            "audio elements have bounded parameter definitions and conforming channel or Ambisonics configuration",
+            Some(json!({
+                "audio_elements": audio_element_json(&state.audio_element_observations),
                 "errors": state.payload_errors,
                 "evidence_truncated": state.payload_evidence_truncated,
             })),
@@ -433,6 +465,8 @@ fn update_order(obu_type: u8, redundant: bool, state: &mut State) {
         state.current_codec_configs_by_id.clear();
         state.current_audio_elements_by_id.clear();
         state.current_substream_ids.clear();
+        state.current_parameter_ids.clear();
+        state.current_parameter_definitions = 0;
         state.saw_data = false;
         return;
     }
@@ -768,7 +802,11 @@ fn validate_ipcm_decoder_config(bytes: &[u8]) -> Result<(u32, u8), String> {
 }
 
 fn parse_audio_element(payload: &[u8], state: &mut State) {
-    match audio_element(payload) {
+    let codec_config_id = audio_element_codec_config_id(payload);
+    let codec = codec_config_id
+        .and_then(|id| state.current_codec_configs_by_id.get(&id))
+        .cloned();
+    match audio_element(payload, codec.as_ref()) {
         Ok(element) => {
             if state.current_audio_elements_by_id.len() == MAX_DESCRIPTOR_IDS
                 && !state.current_audio_elements_by_id.contains_key(&element.id)
@@ -798,6 +836,36 @@ fn parse_audio_element(payload: &[u8], state: &mut State) {
                 );
                 return;
             }
+            let new_parameters = element
+                .parameter_ids
+                .iter()
+                .filter(|id| !state.current_parameter_ids.contains(id))
+                .count();
+            if state
+                .current_parameter_ids
+                .len()
+                .saturating_add(new_parameters)
+                > MAX_DESCRIPTOR_IDS
+            {
+                state.audio_elements_valid = false;
+                record_payload_error(
+                    state,
+                    format!("parameter substream count exceeds {MAX_DESCRIPTOR_IDS}"),
+                );
+                return;
+            }
+            if state
+                .current_parameter_definitions
+                .saturating_add(element.parameter_types.len())
+                > MAX_DESCRIPTOR_IDS
+            {
+                state.audio_elements_valid = false;
+                record_payload_error(
+                    state,
+                    format!("parameter definition count exceeds {MAX_DESCRIPTOR_IDS}"),
+                );
+                return;
+            }
             let duplicate_element = state
                 .current_audio_elements_by_id
                 .insert(element.id, element.clone())
@@ -808,12 +876,19 @@ fn parse_audio_element(payload: &[u8], state: &mut State) {
                     duplicate_substream = true;
                 }
             }
-            if duplicate_element || duplicate_substream {
+            let mut duplicate_parameter = false;
+            for parameter_id in &element.parameter_ids {
+                if !state.current_parameter_ids.insert(*parameter_id) {
+                    duplicate_parameter = true;
+                }
+            }
+            state.current_parameter_definitions += element.parameter_types.len();
+            if duplicate_element || duplicate_substream || duplicate_parameter {
                 state.descriptor_links_valid = false;
                 record_payload_error(
                     state,
                     format!(
-                        "audio element {} or one of its substream IDs is not unique",
+                        "audio element {}, one of its substream IDs, or one of its parameter IDs is not unique",
                         element.id
                     ),
                 );
@@ -830,22 +905,26 @@ fn parse_audio_element(payload: &[u8], state: &mut State) {
             }
         }
         Err(error) => {
-            state.descriptor_links_valid = false;
+            state.audio_elements_valid = false;
             record_payload_error(state, format!("invalid Audio Element OBU: {error}"));
         }
     }
 }
 
-fn audio_element(payload: &[u8]) -> Result<AudioElement, String> {
+fn audio_element_codec_config_id(payload: &[u8]) -> Option<u64> {
+    let mut cursor = 0;
+    take_leb(payload, &mut cursor, "audio_element_id").ok()?;
+    take_bytes(payload, &mut cursor, 1, "audio_element_type").ok()?;
+    take_leb(payload, &mut cursor, "codec_config_id").ok()
+}
+
+fn audio_element(payload: &[u8], codec: Option<&CodecConfig>) -> Result<AudioElement, String> {
     let mut cursor = 0;
     let id = take_leb(payload, &mut cursor, "audio_element_id")?;
     let flags = *take_bytes(payload, &mut cursor, 1, "audio_element_type")?
         .first()
         .ok_or_else(|| "audio_element_type is missing".to_string())?;
     let element_type = flags >> 5;
-    if flags & 0x1f != 0 {
-        return Err("audio element reserved_for_future_use bits are non-zero".into());
-    }
     let codec_config_id = take_leb(payload, &mut cursor, "codec_config_id")?;
     let num_substreams = take_leb(payload, &mut cursor, "num_substreams")?;
     if num_substreams == 0 {
@@ -868,15 +947,464 @@ fn audio_element(payload: &[u8]) -> Result<AudioElement, String> {
             "num_parameters {num_parameters} exceeds {MAX_DESCRIPTOR_IDS}"
         ));
     }
+    if element_type == 0 && num_parameters > 2 {
+        return Err(format!(
+            "channel-based num_parameters is {num_parameters}, expected 0, 1, or 2"
+        ));
+    }
+    if element_type == 1 && num_parameters != 0 {
+        return Err(format!(
+            "scene-based num_parameters is {num_parameters}, expected 0"
+        ));
+    }
     if substream_ids.iter().copied().collect::<BTreeSet<_>>().len() != substream_ids.len() {
         return Err("audio element repeats an audio_substream_id".into());
     }
+    let mut parameter_ids = Vec::new();
+    let mut parameter_types = Vec::new();
+    let mut seen_parameter_types = BTreeSet::new();
+    for _ in 0..num_parameters {
+        let parameter_type = take_leb(payload, &mut cursor, "param_definition_type")?;
+        if !seen_parameter_types.insert(parameter_type) {
+            return Err(format!(
+                "param_definition_type {parameter_type} is duplicated"
+            ));
+        }
+        parameter_types.push(parameter_type);
+        match parameter_type {
+            0 => {
+                return Err(
+                    "PARAMETER_DEFINITION_MIX_GAIN is forbidden in an Audio Element OBU".into(),
+                );
+            }
+            1 | 2 => {
+                parameter_ids.push(parse_audio_element_parameter(
+                    payload,
+                    &mut cursor,
+                    parameter_type,
+                    codec,
+                )?);
+            }
+            _ => {
+                let size = take_leb(payload, &mut cursor, "param_definition_size")?;
+                let size = usize::try_from(size)
+                    .map_err(|_| "param_definition_size does not fit in memory")?;
+                take_bytes(payload, &mut cursor, size, "param_definition_bytes")?;
+            }
+        }
+    }
+    if parameter_ids.iter().copied().collect::<BTreeSet<_>>().len() != parameter_ids.len() {
+        return Err("audio element repeats a parameter_id".into());
+    }
+    let config = match element_type {
+        0 => parse_channel_audio_config(
+            payload,
+            &mut cursor,
+            num_substreams,
+            &parameter_types,
+            codec,
+        )?,
+        1 => parse_ambisonics_config(payload, &mut cursor, num_substreams, codec)?,
+        _ => {
+            let size = take_leb(payload, &mut cursor, "audio_element_config_size")?;
+            let size = usize::try_from(size)
+                .map_err(|_| "audio_element_config_size does not fit in memory")?;
+            take_bytes(payload, &mut cursor, size, "audio_element_config_bytes")?;
+            AudioElementConfig::Reserved
+        }
+    };
     Ok(AudioElement {
         id,
         element_type,
         codec_config_id,
         substream_ids,
+        parameter_ids,
+        parameter_types,
+        config,
+        trailing_bytes: payload.len().saturating_sub(cursor),
     })
+}
+
+fn parse_audio_element_parameter(
+    payload: &[u8],
+    cursor: &mut usize,
+    parameter_type: u64,
+    codec: Option<&CodecConfig>,
+) -> Result<u64, String> {
+    let parameter_id = take_leb(payload, cursor, "parameter_id")?;
+    let parameter_rate = take_leb(payload, cursor, "parameter_rate")?;
+    if parameter_rate == 0 {
+        return Err(format!(
+            "parameter {parameter_id} has a zero parameter_rate"
+        ));
+    }
+    let flags = take_bytes(payload, cursor, 1, "param_definition_mode")?[0];
+    let mode = flags >> 7;
+    if mode != 0 {
+        return Err(format!(
+            "Audio Element parameter {parameter_id} param_definition_mode is {mode}, expected 0"
+        ));
+    }
+    let duration = take_leb(payload, cursor, "parameter duration")?;
+    if duration == 0 {
+        return Err(format!("parameter {parameter_id} duration is zero"));
+    }
+    let constant_subblock_duration = take_leb(payload, cursor, "constant_subblock_duration")?;
+    if constant_subblock_duration == 0 {
+        let num_subblocks = take_leb(payload, cursor, "num_subblocks")?;
+        if num_subblocks > MAX_DESCRIPTOR_IDS as u64 {
+            return Err(format!(
+                "parameter {parameter_id} num_subblocks {num_subblocks} exceeds {MAX_DESCRIPTOR_IDS}"
+            ));
+        }
+        let mut total = 0_u64;
+        for _ in 0..num_subblocks {
+            let subblock_duration = take_leb(payload, cursor, "subblock_duration")?;
+            if subblock_duration == 0 {
+                return Err(format!(
+                    "parameter {parameter_id} has a zero subblock_duration"
+                ));
+            }
+            total = total
+                .checked_add(subblock_duration)
+                .ok_or_else(|| format!("parameter {parameter_id} subblock duration overflow"))?;
+        }
+        if total != duration {
+            return Err(format!(
+                "parameter {parameter_id} subblock durations total {total}, expected {duration}"
+            ));
+        }
+    }
+    if let Some(codec) = codec {
+        if duration != codec.num_samples_per_frame {
+            return Err(format!(
+                "parameter {parameter_id} duration is {duration}, expected codec frame length {}",
+                codec.num_samples_per_frame
+            ));
+        }
+        if constant_subblock_duration != duration {
+            return Err(format!(
+                "parameter {parameter_id} constant_subblock_duration is {constant_subblock_duration}, expected {duration}"
+            ));
+        }
+        if let Some(sample_rate) = codec.sample_rate {
+            if parameter_rate != u64::from(sample_rate) {
+                return Err(format!(
+                    "parameter {parameter_id} rate is {parameter_rate}, expected {sample_rate}"
+                ));
+            }
+        }
+    }
+    if parameter_type == 1 {
+        let demixing_flags = take_bytes(payload, cursor, 1, "default dmixp_mode")?[0];
+        let dmixp_mode = demixing_flags >> 5;
+        if matches!(dmixp_mode, 3 | 7) {
+            return Err(format!(
+                "parameter {parameter_id} uses reserved dmixp_mode {dmixp_mode}"
+            ));
+        }
+        let weight_flags = take_bytes(payload, cursor, 1, "default_w")?[0];
+        let default_w = weight_flags >> 4;
+        if default_w > 10 {
+            return Err(format!(
+                "parameter {parameter_id} uses reserved default_w {default_w}"
+            ));
+        }
+    }
+    Ok(parameter_id)
+}
+
+fn parse_channel_audio_config(
+    payload: &[u8],
+    cursor: &mut usize,
+    num_substreams: usize,
+    parameter_types: &[u64],
+    codec: Option<&CodecConfig>,
+) -> Result<AudioElementConfig, String> {
+    let header = take_bytes(payload, cursor, 1, "num_layers")?[0];
+    let num_layers = header >> 5;
+    if num_layers == 0 || num_layers > 6 {
+        return Err(format!("num_layers is {num_layers}, expected 1 through 6"));
+    }
+    let mut declared_substreams = 0_usize;
+    let mut cumulative_channels = 0_u16;
+    let mut previous_dimensions: Option<(u8, u8, u8)> = None;
+    let mut highest_layout = String::new();
+    let mut highest_standard_layout = None;
+    let mut recon_gain_flags = Vec::with_capacity(usize::from(num_layers));
+    for layer_index in 0..num_layers {
+        let flags = take_bytes(payload, cursor, 1, "channel_audio_layer_config")?[0];
+        let loudspeaker_layout = flags >> 4;
+        let output_gain_present = flags & 0x08 != 0;
+        let recon_gain_present = flags & 0x04 != 0;
+        let substream_count = usize::from(take_bytes(payload, cursor, 1, "substream_count")?[0]);
+        let coupled_substream_count =
+            usize::from(take_bytes(payload, cursor, 1, "coupled_substream_count")?[0]);
+        if substream_count == 0 {
+            return Err(format!(
+                "channel layer {} has zero substreams",
+                layer_index + 1
+            ));
+        }
+        if coupled_substream_count > substream_count {
+            return Err(format!(
+                "channel layer {} coupled_substream_count {coupled_substream_count} exceeds substream_count {substream_count}",
+                layer_index + 1
+            ));
+        }
+        declared_substreams = declared_substreams
+            .checked_add(substream_count)
+            .ok_or_else(|| "channel layer substream count overflow".to_string())?;
+        let layer_channels = substream_count
+            .checked_add(coupled_substream_count)
+            .ok_or_else(|| "channel layer channel count overflow".to_string())?;
+        cumulative_channels = cumulative_channels
+            .checked_add(
+                u16::try_from(layer_channels)
+                    .map_err(|_| "channel layer channel count does not fit")?,
+            )
+            .ok_or_else(|| "channel layout channel count overflow".to_string())?;
+        if output_gain_present {
+            take_bytes(payload, cursor, 1, "output_gain_flags")?;
+            take_bytes(payload, cursor, 2, "output_gain")?;
+        }
+        recon_gain_flags.push(recon_gain_present);
+        if num_layers == 1 && (output_gain_present || recon_gain_present) {
+            return Err(
+                "single-layer channel audio has output or reconstruction gain flags set".into(),
+            );
+        }
+
+        if loudspeaker_layout == 15 {
+            if layer_index != 0 || num_layers != 1 {
+                return Err("expanded loudspeaker layout is not a single first layer".into());
+            }
+            let expanded = take_bytes(payload, cursor, 1, "expanded_loudspeaker_layout")?[0];
+            let (name, channels) = expanded_layout_info(expanded)
+                .ok_or_else(|| format!("expanded_loudspeaker_layout {expanded} is reserved"))?;
+            if cumulative_channels != channels {
+                return Err(format!(
+                    "expanded layout {name} declares {cumulative_channels} channels from substreams, expected {channels}"
+                ));
+            }
+            highest_layout = name.into();
+        } else {
+            let (name, channels, dimensions) = standard_layout_info(loudspeaker_layout)
+                .ok_or_else(|| format!("loudspeaker_layout {loudspeaker_layout} is reserved"))?;
+            if loudspeaker_layout == 9 && num_layers != 1 {
+                return Err("Binaural loudspeaker layout requires exactly one layer".into());
+            }
+            if cumulative_channels != channels {
+                return Err(format!(
+                    "channel layer {} layout {name} declares {cumulative_channels} cumulative channels from substreams, expected {channels}",
+                    layer_index + 1
+                ));
+            }
+            if let (Some(previous), Some(current)) = (previous_dimensions, dimensions) {
+                if current.0 < previous.0
+                    || current.1 < previous.1
+                    || current.2 < previous.2
+                    || current == previous
+                {
+                    return Err(format!(
+                        "channel layer {} layout {name} is not a strictly scalable successor",
+                        layer_index + 1
+                    ));
+                }
+            }
+            previous_dimensions = dimensions;
+            highest_standard_layout = Some(loudspeaker_layout);
+            highest_layout = name.into();
+        }
+    }
+    if declared_substreams != num_substreams {
+        return Err(format!(
+            "channel layers declare {declared_substreams} substreams, expected {num_substreams}"
+        ));
+    }
+    let has_demixing = parameter_types.contains(&1);
+    let has_recon_gain = parameter_types.contains(&2);
+    if let Some(codec) = codec {
+        let lossless = matches!(codec.codec_id.as_str(), "fLaC" | "ipcm");
+        for (layer_index, present) in recon_gain_flags.iter().copied().enumerate() {
+            let expected = !lossless && layer_index > 0;
+            if present != expected {
+                return Err(format!(
+                    "channel layer {} recon_gain_is_present_flag is {}, expected {} for {}",
+                    layer_index + 1,
+                    u8::from(present),
+                    u8::from(expected),
+                    codec.codec_id
+                ));
+            }
+        }
+        let recon_gain_required = !lossless && num_layers > 1;
+        if has_recon_gain != recon_gain_required {
+            return Err(format!(
+                "reconstruction gain definition is {}, expected {} for {} with {num_layers} layer(s)",
+                if has_recon_gain { "present" } else { "absent" },
+                if recon_gain_required {
+                    "present"
+                } else {
+                    "absent"
+                },
+                codec.codec_id
+            ));
+        }
+    } else if recon_gain_flags.iter().any(|present| *present) && !has_recon_gain {
+        return Err("channel layer signals reconstruction gain without its definition".into());
+    }
+    if num_layers == 1
+        && (highest_standard_layout.is_none() || matches!(highest_standard_layout, Some(0 | 1 | 8)))
+        && has_demixing
+    {
+        return Err("this single-layer channel layout forbids demixing parameters".into());
+    }
+    if num_layers > 1
+        && highest_standard_layout.is_some_and(demixing_required_for_layout)
+        && !has_demixing
+    {
+        return Err("this multi-layer channel layout requires a demixing definition".into());
+    }
+    Ok(AudioElementConfig::ChannelBased {
+        num_layers,
+        highest_layout,
+        output_channels: cumulative_channels,
+    })
+}
+
+fn parse_ambisonics_config(
+    payload: &[u8],
+    cursor: &mut usize,
+    num_substreams: usize,
+    codec: Option<&CodecConfig>,
+) -> Result<AudioElementConfig, String> {
+    let ambisonics_mode = take_leb(payload, cursor, "ambisonics_mode")?;
+    if ambisonics_mode > 1 {
+        return Err(format!("ambisonics_mode {ambisonics_mode} is reserved"));
+    }
+    if ambisonics_mode == 1 && codec.is_some_and(|codec| codec.codec_id == "ipcm") {
+        return Err("LPCM scene-based audio requires MONO Ambisonics mode".into());
+    }
+    let output_channels = u16::from(take_bytes(payload, cursor, 1, "output_channel_count")?[0]);
+    if !is_ambisonics_channel_count(output_channels) {
+        return Err(format!(
+            "Ambisonics output_channel_count {output_channels} is not (1 + n)^2 for n=0..14"
+        ));
+    }
+    let substream_count = usize::from(take_bytes(payload, cursor, 1, "substream_count")?[0]);
+    if substream_count != num_substreams {
+        return Err(format!(
+            "Ambisonics substream_count is {substream_count}, expected {num_substreams}"
+        ));
+    }
+    if ambisonics_mode == 0 {
+        if substream_count > usize::from(output_channels) {
+            return Err(format!(
+                "Ambisonics substream_count {substream_count} exceeds output_channel_count {output_channels}"
+            ));
+        }
+        let mapping = take_bytes(
+            payload,
+            cursor,
+            usize::from(output_channels),
+            "channel_mapping",
+        )?;
+        if let Some(value) = mapping
+            .iter()
+            .copied()
+            .find(|value| *value != u8::MAX && usize::from(*value) >= substream_count)
+        {
+            return Err(format!(
+                "Ambisonics channel_mapping value {value} is neither a substream channel nor 255"
+            ));
+        }
+        let mapped_substreams = mapping
+            .iter()
+            .copied()
+            .filter(|value| *value != u8::MAX)
+            .collect::<BTreeSet<_>>();
+        if mapped_substreams.len() != substream_count {
+            return Err(format!(
+                "Ambisonics channel_mapping covers {} unique substreams, expected {substream_count}",
+                mapped_substreams.len()
+            ));
+        }
+    } else {
+        let coupled_substream_count =
+            usize::from(take_bytes(payload, cursor, 1, "coupled_substream_count")?[0]);
+        if coupled_substream_count > substream_count {
+            return Err(format!(
+                "Ambisonics coupled_substream_count {coupled_substream_count} exceeds substream_count {substream_count}"
+            ));
+        }
+        let decoded_channels = substream_count
+            .checked_add(coupled_substream_count)
+            .ok_or_else(|| "Ambisonics decoded channel count overflow".to_string())?;
+        if decoded_channels > usize::from(output_channels) {
+            return Err(format!(
+                "Ambisonics projection decodes {decoded_channels} channels, exceeding output_channel_count {output_channels}"
+            ));
+        }
+        let coefficients = decoded_channels
+            .checked_mul(usize::from(output_channels))
+            .ok_or_else(|| "Ambisonics matrix coefficient count overflow".to_string())?;
+        let matrix_bytes = coefficients
+            .checked_mul(2)
+            .ok_or_else(|| "Ambisonics matrix byte count overflow".to_string())?;
+        take_bytes(payload, cursor, matrix_bytes, "demixing_matrix")?;
+    }
+    Ok(AudioElementConfig::SceneBased {
+        ambisonics_mode: u8::try_from(ambisonics_mode)
+            .map_err(|_| "ambisonics_mode does not fit")?,
+        output_channels,
+    })
+}
+
+type ChannelDimensions = (u8, u8, u8);
+type StandardLayoutInfo = (&'static str, u16, Option<ChannelDimensions>);
+
+fn standard_layout_info(layout: u8) -> Option<StandardLayoutInfo> {
+    match layout {
+        0 => Some(("Mono", 1, Some((1, 0, 0)))),
+        1 => Some(("Stereo", 2, Some((2, 0, 0)))),
+        2 => Some(("5.1ch", 6, Some((5, 1, 0)))),
+        3 => Some(("5.1.2ch", 8, Some((5, 1, 2)))),
+        4 => Some(("5.1.4ch", 10, Some((5, 1, 4)))),
+        5 => Some(("7.1ch", 8, Some((7, 1, 0)))),
+        6 => Some(("7.1.2ch", 10, Some((7, 1, 2)))),
+        7 => Some(("7.1.4ch", 12, Some((7, 1, 4)))),
+        8 => Some(("3.1.2ch", 6, Some((3, 1, 2)))),
+        9 => Some(("Binaural", 2, None)),
+        _ => None,
+    }
+}
+
+fn expanded_layout_info(layout: u8) -> Option<(&'static str, u16)> {
+    match layout {
+        0 => Some(("LFE", 1)),
+        1 => Some(("Stereo-S", 2)),
+        2 => Some(("Stereo-SS", 2)),
+        3 => Some(("Stereo-RS", 2)),
+        4 => Some(("Stereo-TF", 2)),
+        5 => Some(("Stereo-TB", 2)),
+        6 => Some(("Top-4ch", 4)),
+        7 => Some(("3.0ch", 3)),
+        8 => Some(("9.1.6ch", 16)),
+        9 => Some(("Stereo-F", 2)),
+        10 => Some(("Stereo-Si", 2)),
+        11 => Some(("Stereo-TpSi", 2)),
+        12 => Some(("Top-6ch", 6)),
+        _ => None,
+    }
+}
+
+fn demixing_required_for_layout(layout: u8) -> bool {
+    matches!(layout, 2..=7)
+}
+
+fn is_ambisonics_channel_count(channels: u16) -> bool {
+    (0_u16..=14).any(|order| (order + 1) * (order + 1) == channels)
 }
 
 fn parse_audio_frame(obu_type: u8, payload: &[u8], state: &mut State) {
@@ -974,6 +1502,32 @@ fn audio_element_json(elements: &[AudioElement]) -> Vec<Value> {
     elements
         .iter()
         .map(|element| {
+            let (num_layers, layout, output_channels, ambisonics_mode) = match &element.config {
+                AudioElementConfig::ChannelBased {
+                    num_layers,
+                    highest_layout,
+                    output_channels,
+                } => (
+                    Some(*num_layers),
+                    Some(highest_layout.as_str()),
+                    Some(*output_channels),
+                    None,
+                ),
+                AudioElementConfig::SceneBased {
+                    ambisonics_mode,
+                    output_channels,
+                } => (
+                    None,
+                    None,
+                    Some(*output_channels),
+                    Some(match ambisonics_mode {
+                        0 => "mono",
+                        1 => "projection",
+                        _ => "reserved",
+                    }),
+                ),
+                AudioElementConfig::Reserved => (None, None, None, None),
+            };
             json!({
                 "audio_element_id": element.id,
                 "audio_element_type": match element.element_type {
@@ -983,6 +1537,13 @@ fn audio_element_json(elements: &[AudioElement]) -> Vec<Value> {
                 },
                 "codec_config_id": element.codec_config_id,
                 "audio_substream_ids": element.substream_ids,
+                "parameter_ids": element.parameter_ids,
+                "parameter_definition_types": element.parameter_types,
+                "num_layers": num_layers,
+                "highest_layout": layout,
+                "output_channels": output_channels,
+                "ambisonics_mode": ambisonics_mode,
+                "trailing_extension_bytes": element.trailing_bytes,
             })
         })
         .collect()
@@ -1163,13 +1724,189 @@ mod tests {
     }
 
     #[test]
-    fn parses_audio_element_link_prefix_and_rejects_duplicate_substreams() {
-        let element = audio_element(&[9, 0, 3, 2, 0, 18, 0]).unwrap();
+    fn parses_complete_audio_element_and_rejects_duplicate_substreams() {
+        let element = audio_element(&[9, 0, 3, 2, 0, 18, 0, 0x20, 0x10, 2, 0], None).unwrap();
         assert_eq!(element.id, 9);
         assert_eq!(element.codec_config_id, 3);
         assert_eq!(element.substream_ids, [0, 18]);
 
-        let error = audio_element(&[9, 0, 3, 2, 7, 7, 0]).unwrap_err();
+        let error = audio_element(&[9, 0, 3, 2, 7, 7, 0], None).unwrap_err();
         assert!(error.contains("repeats"), "{error}");
+    }
+
+    fn test_codec(codec_id: &str) -> CodecConfig {
+        CodecConfig {
+            id: 3,
+            codec_id: codec_id.into(),
+            num_samples_per_frame: 4,
+            audio_roll_distance: 0,
+            sample_rate: None,
+            sample_size: None,
+        }
+    }
+
+    fn two_layer_element(recon_definition: bool, recon_layer_flag: bool) -> Vec<u8> {
+        let mut payload = vec![
+            9,
+            0,
+            3,
+            4,
+            0,
+            1,
+            2,
+            3, // Common fields and four substream IDs.
+            u8::from(recon_definition) + 1,
+            1,
+            10,
+            1,
+            0,
+            4,
+            4,
+            0,
+            0, // Demixing definition.
+        ];
+        if recon_definition {
+            payload.extend_from_slice(&[2, 11, 1, 0, 4, 4]);
+        }
+        payload.extend_from_slice(&[
+            0x40, // Two layers.
+            0x10,
+            1,
+            1, // Stereo: one coupled substream.
+            0x20 | if recon_layer_flag { 0x04 } else { 0 },
+            3,
+            1, // 5.1: four new channels in three substreams.
+        ]);
+        payload
+    }
+
+    #[test]
+    fn validates_scalable_channel_layout_and_codec_recon_gain_policy() {
+        let opus = test_codec("Opus");
+        let element = audio_element(&two_layer_element(true, true), Some(&opus)).unwrap();
+        assert_eq!(
+            element.config,
+            AudioElementConfig::ChannelBased {
+                num_layers: 2,
+                highest_layout: "5.1ch".into(),
+                output_channels: 6,
+            }
+        );
+
+        let missing = audio_element(&two_layer_element(false, true), Some(&opus)).unwrap_err();
+        assert!(
+            missing.contains("reconstruction gain definition"),
+            "{missing}"
+        );
+
+        let lpcm = test_codec("ipcm");
+        let lossless = audio_element(&two_layer_element(false, false), Some(&lpcm)).unwrap();
+        assert!(matches!(
+            lossless.config,
+            AudioElementConfig::ChannelBased { num_layers: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn validates_expanded_channel_layout_and_preserves_extension_length() {
+        let mut payload = vec![9, 0, 3, 8];
+        payload.extend(0_u8..8);
+        payload.extend_from_slice(&[
+            0, // No parameters.
+            0x20, 0xf0, 8, 8, 8, // One expanded 9.1.6 layer.
+            0xaa, 0xbb, // Permitted bytes past recognized OBU syntax.
+        ]);
+        let element = audio_element(&payload, None).unwrap();
+        assert_eq!(element.trailing_bytes, 2);
+        assert_eq!(
+            element.config,
+            AudioElementConfig::ChannelBased {
+                num_layers: 1,
+                highest_layout: "9.1.6ch".into(),
+                output_channels: 16,
+            }
+        );
+    }
+
+    #[test]
+    fn ignores_reserved_bits_and_skips_bounded_unknown_extensions() {
+        let channel = audio_element(
+            &[
+                9, 0x1f, 3, 1, 0, 0,    // Reserved Audio Element bits are ignored.
+                0x3f, // One layer plus reserved bits.
+                0x03, 1, 0, // Mono plus reserved layer bits.
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            channel.config,
+            AudioElementConfig::ChannelBased {
+                num_layers: 1,
+                highest_layout: "Mono".into(),
+                output_channels: 1,
+            }
+        );
+
+        let reserved = audio_element(
+            &[
+                9, 0x5f, 3, 1, 0, // Reserved element type and one substream.
+                1, 3, 2, 0xaa, 0xbb, // Bounded unknown parameter definition.
+                3, 0xcc, 0xdd, 0xee, // Bounded reserved element configuration.
+                0xff, // Permitted bytes past recognized OBU syntax.
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(reserved.config, AudioElementConfig::Reserved);
+        assert_eq!(reserved.parameter_types, [3]);
+        assert_eq!(reserved.trailing_bytes, 1);
+    }
+
+    #[test]
+    fn validates_ambisonics_mapping_and_projection_geometry() {
+        let mono = audio_element(&[9, 0x20, 3, 2, 0, 1, 0, 0, 4, 2, 255, 1, 0, 255], None).unwrap();
+        assert_eq!(
+            mono.config,
+            AudioElementConfig::SceneBased {
+                ambisonics_mode: 0,
+                output_channels: 4,
+            }
+        );
+
+        let limbo =
+            audio_element(&[9, 0x20, 3, 2, 0, 1, 0, 0, 4, 2, 0, 0, 0, 0], None).unwrap_err();
+        assert!(limbo.contains("covers 1 unique substreams"), "{limbo}");
+
+        let oversized_projection = audio_element(
+            &[
+                9, 0x20, 3, 3, 0, 1, 2, 0, 1, 4, 3,
+                2, // Five decoded
+                  // channels cannot project to four output channels. Matrix parsing is
+                  // intentionally never reached.
+            ],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            oversized_projection.contains("exceeding output_channel_count"),
+            "{oversized_projection}"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_audio_element_parameter_timing_and_reserved_values() {
+        let codec = test_codec("Opus");
+        let bad_duration = [
+            9, 0, 3, 1, 0, 1, // Common fields and one parameter.
+            1, 10, 1, 0, 3, 3, 0, 0, // Demixing duration is three, not four.
+            0x20, 0x20, 3, 3, // 5.1 in three coupled substreams.
+        ];
+        let error = audio_element(&bad_duration, Some(&codec)).unwrap_err();
+        assert!(error.contains("expected codec frame length 4"), "{error}");
+
+        let reserved_layout =
+            audio_element(&[9, 0, 3, 1, 0, 0, 0x20, 0xa0, 1, 0], None).unwrap_err();
+        assert!(reserved_layout.contains("reserved"), "{reserved_layout}");
     }
 }
