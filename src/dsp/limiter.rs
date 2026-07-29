@@ -1,7 +1,26 @@
 //! Streaming look-ahead true-peak limiter.
 
 use super::truepeak::TruePeakMeter;
+use serde::Serialize;
 use std::collections::VecDeque;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LimiterEnvelopePoint {
+    pub start_frame: usize,
+    pub end_frame: usize,
+    pub mean_reduction_db: f64,
+    pub maximum_reduction_db: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LimiterStatistics {
+    pub processed_frames: usize,
+    pub limited_frames: usize,
+    pub maximum_reduction_db: f64,
+    pub mean_reduction_db: f64,
+    pub envelope_interval_frames: usize,
+    pub envelope: Vec<LimiterEnvelopePoint>,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct LimiterConfig {
@@ -28,6 +47,16 @@ pub struct TruePeakLimiter {
     hold_frames: usize,
     last_samples: Vec<f32>,
     max_reduction_db: f64,
+    emitted_frames: usize,
+    limited_frames: usize,
+    reduction_sum_db: f64,
+    statistics_enabled: bool,
+    statistics_interval_frames: usize,
+    interval_start_frame: usize,
+    interval_frames: usize,
+    interval_reduction_sum_db: f64,
+    interval_max_reduction_db: f64,
+    statistics_envelope: Vec<LimiterEnvelopePoint>,
 }
 
 impl TruePeakLimiter {
@@ -62,7 +91,26 @@ impl TruePeakLimiter {
             hold_frames: 0,
             last_samples: vec![0.0; channels as usize],
             max_reduction_db: 0.0,
+            emitted_frames: 0,
+            limited_frames: 0,
+            reduction_sum_db: 0.0,
+            statistics_enabled: false,
+            statistics_interval_frames: (sample_rate as usize / 10).max(1),
+            interval_start_frame: 0,
+            interval_frames: 0,
+            interval_reduction_sum_db: 0.0,
+            interval_max_reduction_db: 0.0,
+            statistics_envelope: Vec::new(),
         })
+    }
+
+    /// Select the evidence interval used by [`LimiterStatistics`].
+    ///
+    /// Rendering is unaffected. Callers can increase the interval for long
+    /// programmes to keep the serialized gain envelope bounded.
+    pub fn set_statistics_interval_frames(&mut self, frames: usize) {
+        self.statistics_enabled = true;
+        self.statistics_interval_frames = frames.max(1);
     }
 
     pub fn process(&mut self, planar: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, String> {
@@ -93,7 +141,11 @@ impl TruePeakLimiter {
         Ok(output)
     }
 
-    pub fn finish(mut self) -> Vec<Vec<f32>> {
+    pub fn finish(self) -> Vec<Vec<f32>> {
+        self.finish_with_statistics().0
+    }
+
+    pub fn finish_with_statistics(mut self) -> (Vec<Vec<f32>>, LimiterStatistics) {
         let mut output = (0..self.delay.len())
             .map(|_| Vec::with_capacity(self.delay[0].len()))
             .collect::<Vec<_>>();
@@ -106,7 +158,22 @@ impl TruePeakLimiter {
             self.update_envelope(detected);
             self.emit_one(&mut output);
         }
-        output
+        if self.statistics_enabled {
+            self.finish_statistics_interval();
+        }
+        let statistics = LimiterStatistics {
+            processed_frames: self.emitted_frames,
+            limited_frames: self.limited_frames,
+            maximum_reduction_db: self.max_reduction_db,
+            mean_reduction_db: if self.emitted_frames == 0 {
+                0.0
+            } else {
+                self.reduction_sum_db / self.emitted_frames as f64
+            },
+            envelope_interval_frames: self.statistics_interval_frames,
+            envelope: self.statistics_envelope,
+        };
+        (output, statistics)
     }
 
     pub fn max_reduction_db(&self) -> f64 {
@@ -135,11 +202,46 @@ impl TruePeakLimiter {
     }
 
     fn emit_one(&mut self, output: &mut [Vec<f32>]) {
+        if self.statistics_enabled {
+            let reduction_db = if self.envelope > 0.0 {
+                -20.0 * (self.envelope as f64).log10()
+            } else {
+                f64::INFINITY
+            };
+            if reduction_db > 1e-6 {
+                self.limited_frames += 1;
+            }
+            self.emitted_frames += 1;
+            self.reduction_sum_db += reduction_db;
+            self.interval_frames += 1;
+            self.interval_reduction_sum_db += reduction_db;
+            self.interval_max_reduction_db = self.interval_max_reduction_db.max(reduction_db);
+        }
         for (channel, queue) in self.delay.iter_mut().enumerate() {
             if let Some(sample) = queue.pop_front() {
                 output[channel].push(sample * self.envelope);
             }
         }
+        if self.statistics_enabled && self.interval_frames == self.statistics_interval_frames {
+            self.finish_statistics_interval();
+        }
+    }
+
+    fn finish_statistics_interval(&mut self) {
+        if self.interval_frames == 0 {
+            return;
+        }
+        let end_frame = self.interval_start_frame + self.interval_frames;
+        self.statistics_envelope.push(LimiterEnvelopePoint {
+            start_frame: self.interval_start_frame,
+            end_frame,
+            mean_reduction_db: self.interval_reduction_sum_db / self.interval_frames as f64,
+            maximum_reduction_db: self.interval_max_reduction_db,
+        });
+        self.interval_start_frame = end_frame;
+        self.interval_frames = 0;
+        self.interval_reduction_sum_db = 0.0;
+        self.interval_max_reduction_db = 0.0;
     }
 }
 
@@ -174,5 +276,22 @@ mod tests {
             meter.peak(),
             ceiling
         );
+    }
+
+    #[test]
+    fn limiter_reports_bounded_gain_reduction_envelope() {
+        let mut limiter = TruePeakLimiter::new(48_000, 1, -6.0, LimiterConfig::default()).unwrap();
+        limiter.set_statistics_interval_frames(1_000);
+        let input = vec![vec![1.0; 4_800]];
+        let mut output = limiter.process(&input).unwrap();
+        let (tail, statistics) = limiter.finish_with_statistics();
+        output[0].extend(tail[0].iter().copied());
+
+        assert_eq!(statistics.processed_frames, input[0].len());
+        assert!(statistics.limited_frames > 0);
+        assert!(statistics.maximum_reduction_db > 5.9);
+        assert_eq!(statistics.envelope.len(), 5);
+        assert_eq!(statistics.envelope.last().unwrap().end_frame, 4_800);
+        assert_eq!(output[0].len(), input[0].len());
     }
 }

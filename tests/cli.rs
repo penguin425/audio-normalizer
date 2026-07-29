@@ -710,6 +710,251 @@ fn toml_job_config_is_relative_and_cli_options_override_it() {
     let timeline = std::fs::read_to_string(directory.path().join("configured.ndjson")).unwrap();
     assert_eq!(timeline.lines().count(), 3);
 }
+
+#[test]
+fn normalization_difference_report_is_versioned_bounded_and_schema_valid() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("source.wav");
+    let output = directory.path().join("normalized.wav");
+    let report_path = directory.path().join("difference.json");
+    let sample_rate = 48_000;
+    let samples = (0..sample_rate * 2)
+        .map(|index| {
+            (0.5 * (index as f64 * std::f64::consts::TAU * 997.0 / sample_rate as f64).sin()) as f32
+        })
+        .collect::<Vec<_>>();
+    let audio = AudioBuffer {
+        sample_rate,
+        channels: 1,
+        frames: samples.len(),
+        data: vec![samples],
+        channel_roles: default_channel_roles(1),
+        source_kind: PcmKind::F32,
+    };
+    WavWriter::write(&input, &audio, PcmKind::F32, false).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            input.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--target=-3",
+            "--ceiling=-6",
+            "--limiter",
+            "--bits=16",
+            "--verify",
+            "--difference-report",
+            report_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let instance: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../schema/normalization-difference-v1.schema.json"
+    ))
+    .unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let errors = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+
+    assert_eq!(
+        instance["schema"],
+        forge_normalizer::normalization_diff::RESULT_SCHEMA
+    );
+    assert_eq!(instance["assets"].as_array().unwrap().len(), 1);
+    let asset = &instance["assets"][0];
+    assert_eq!(
+        asset["protection"]["mode"],
+        "linked-lookahead-true-peak-limiter"
+    );
+    assert!(
+        asset["protection"]["maximum_limiter_reduction_db"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert!(
+        asset["clipping"]["pre_protection_ceiling_exceeding_samples"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        asset["clipping"]["protected_full_scale_exceeding_samples"],
+        0
+    );
+    assert!(asset["gain_envelope"].as_array().unwrap().len() <= 10_000);
+    assert_eq!(asset["input"]["sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(asset["output"]["sha256"].as_str().unwrap().len(), 64);
+}
+
+#[test]
+fn difference_report_rejects_analysis_dry_run_and_stdout() {
+    assert!(Cli::try_parse_from([
+        "forge",
+        "track.wav",
+        "--analyze",
+        "--difference-report",
+        "difference.json"
+    ])
+    .is_err());
+    assert!(Cli::try_parse_from([
+        "forge",
+        "track.wav",
+        "--dry-run",
+        "--difference-report",
+        "difference.json"
+    ])
+    .is_err());
+}
+
+#[test]
+fn album_difference_report_contains_every_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let output_directory = directory.path().join("normalized");
+    std::fs::create_dir(&output_directory).unwrap();
+    let report_path = directory.path().join("album-difference.json");
+    let sample_rate = 48_000;
+    let samples = (0..sample_rate)
+        .map(|index| {
+            (0.1 * (index as f64 * std::f64::consts::TAU * 440.0 / sample_rate as f64).sin()) as f32
+        })
+        .collect::<Vec<_>>();
+    let audio = AudioBuffer {
+        sample_rate,
+        channels: 1,
+        frames: samples.len(),
+        data: vec![samples],
+        channel_roles: default_channel_roles(1),
+        source_kind: PcmKind::F32,
+    };
+    let first = directory.path().join("first.wav");
+    let second = directory.path().join("second.wav");
+    WavWriter::write(&first, &audio, PcmKind::F32, false).unwrap();
+    WavWriter::write(&second, &audio, PcmKind::F32, false).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            first.to_str().unwrap(),
+            second.to_str().unwrap(),
+            "--album",
+            "--output",
+            output_directory.to_str().unwrap(),
+            "--difference-report",
+            report_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+    assert_eq!(report["assets"].as_array().unwrap().len(), 2);
+    assert!(report["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|asset| asset["gain_envelope"].as_array().unwrap().len() == 1));
+}
+
+#[test]
+fn configured_difference_report_path_is_relative_to_config() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("programme.wav");
+    let output = directory.path().join("programme-normalized.wav");
+    let config = directory.path().join("forge.toml");
+    std::fs::write(&input, wav_fixture_bytes()).unwrap();
+    std::fs::write(
+        &config,
+        r#"
+            [output]
+            difference_report = "reports/difference.json"
+        "#,
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            input.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report_path = directory.path().join("reports/difference.json");
+    assert!(report_path.is_file());
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+    assert_eq!(report["assets"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn difference_report_represents_silence_without_non_finite_json() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("silence.wav");
+    let output = directory.path().join("normalized.wav");
+    let report_path = directory.path().join("difference.json");
+    let audio = AudioBuffer {
+        sample_rate: 48_000,
+        channels: 1,
+        frames: 48_000,
+        data: vec![vec![0.0; 48_000]],
+        channel_roles: default_channel_roles(1),
+        source_kind: PcmKind::F32,
+    };
+    WavWriter::write(&input, &audio, PcmKind::F32, false).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            input.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--difference-report",
+            report_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let instance: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+    assert_eq!(instance["assets"][0]["static_gain_db"], 0.0);
+    assert!(instance["assets"][0]["source"]["integrated_lufs"].is_null());
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../schema/normalization-difference-v1.schema.json"
+    ))
+    .unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let errors = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
+
 use clap::Parser;
 use forge_normalizer::cli::Cli;
 

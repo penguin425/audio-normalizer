@@ -643,6 +643,15 @@ pub struct Cli {
     )]
     pub verify_retries: u8,
 
+    /// Write a versioned JSON report of gain envelope, limiting, clipping,
+    /// and decoded codec drift for all normalized outputs.
+    #[arg(
+        long = "difference-report",
+        value_name = "PATH",
+        conflicts_with_all = ["analyze_only", "gain_only", "write_tags", "dry_run"]
+    )]
+    pub difference_report: Option<PathBuf>,
+
     /// Use a streaming look-ahead true-peak limiter instead of reducing global gain.
     #[arg(long)]
     pub limiter: bool,
@@ -729,6 +738,7 @@ struct OutputConfig {
     verify: Option<bool>,
     verify_tolerance: Option<f64>,
     verify_retries: Option<u8>,
+    difference_report: Option<PathBuf>,
     wav_container: Option<String>,
     bwf: Option<bool>,
 }
@@ -904,6 +914,14 @@ impl Cli {
             &mut self.verify_retries,
             output.verify_retries,
         );
+        set_option_if_implicit(
+            matches,
+            "difference_report",
+            &mut self.difference_report,
+            output
+                .difference_report
+                .map(|path| resolve_path(config_path, path)),
+        );
         set_if_implicit(
             matches,
             "wav_container",
@@ -932,6 +950,14 @@ impl Cli {
         }
         if self.verify_retries > 0 && !self.verify {
             return Err("output.verify_retries requires `verify = true`".into());
+        }
+        if self.difference_report.is_some()
+            && (self.analyze_only || self.gain_only || self.write_tags || self.dry_run)
+        {
+            return Err(
+                "output.difference_report conflicts with analysis, gain-only, tags, and dry-run"
+                    .into(),
+            );
         }
         self.validate_config_values()
     }
