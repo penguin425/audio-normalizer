@@ -1,6 +1,7 @@
 //! Bounded-memory ISO Base Media File Format structural and audio-track QC.
 
 use crate::container_qc::{check, finish_audit, AuditCheck, ContainerAudit};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -11,6 +12,8 @@ const MAX_BOXES: usize = 200_000;
 const MAX_CONTROL_BOX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TRACKS: usize = 4_096;
 const MAX_TABLE_ENTRIES: usize = 10_000_000;
+const MAX_TIMED_ID3_EVENTS: usize = 4_096;
+const MAX_TIMED_ID3_STORED_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 struct BoxHeader {
@@ -89,6 +92,18 @@ struct Fragment {
     movie_relative: Option<bool>,
 }
 
+#[derive(Serialize)]
+struct TimedId3Event {
+    version: u8,
+    timescale: u32,
+    presentation_time: u64,
+    event_duration: u32,
+    id: u32,
+    scheme_id_uri: String,
+    value: String,
+    tag: crate::id3_qc::Id3Tag,
+}
+
 #[derive(Default)]
 struct State {
     box_count: usize,
@@ -103,6 +118,9 @@ struct State {
     has_mvex: bool,
     tracks: Vec<Track>,
     fragments: Vec<Fragment>,
+    timed_id3: Vec<TimedId3Event>,
+    timed_id3_bytes: usize,
+    timed_id3_limit_hit: bool,
 }
 
 pub(crate) fn looks_like_isobmff(header: &[u8], file_size: u64) -> bool {
@@ -199,6 +217,46 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
                     error,
                     None,
                 )),
+            },
+            b"emsg" => match parse_event_message(path, &mut file, *header) {
+                Ok(Some(event)) => {
+                    let size = event.tag.size_bytes;
+                    if !state.timed_id3_limit_hit
+                        && state.timed_id3.len() < MAX_TIMED_ID3_EVENTS
+                        && state.timed_id3_bytes.saturating_add(size) <= MAX_TIMED_ID3_STORED_BYTES
+                    {
+                        bitstream.push(check(
+                            "FORGE-ISOBMFF-TIMED-ID3",
+                            true,
+                            "CMAF EventMessageBox carries a complete ID3v2.4 tag",
+                            Some(json!({
+                                "timescale": event.timescale,
+                                "presentation_time": event.presentation_time,
+                                "id": event.id,
+                                "frames": event.tag.frame_count,
+                                "relative_volume_adjustments":
+                                    event.tag.relative_volume_adjustments.len()
+                            })),
+                        ));
+                        state.timed_id3_bytes += size;
+                        state.timed_id3.push(event);
+                    } else if !state.timed_id3_limit_hit {
+                        state.timed_id3_limit_hit = true;
+                        bitstream.push(check(
+                            "FORGE-ISOBMFF-TIMED-ID3-LIMIT",
+                            false,
+                            "CMAF timed-ID3 evidence exceeds the event-count or stored-byte safety limit",
+                            Some(json!({
+                                "event_limit": MAX_TIMED_ID3_EVENTS,
+                                "stored_byte_limit": MAX_TIMED_ID3_STORED_BYTES
+                            })),
+                        ));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    bitstream.push(check("FORGE-ISOBMFF-EVENT-MESSAGE", false, error, None))
+                }
             },
             _ => {}
         }
@@ -491,6 +549,7 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
                 .collect::<Vec<_>>())),
         ));
     }
+    let timed_id3_aid3_brand = state.compatible_brands.iter().any(|brand| brand == "aid3");
 
     let properties = json!({
         "file_size_bytes": file_size,
@@ -516,11 +575,129 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
             .collect::<Vec<_>>(),
         "mvex_after_tracks": state.mvex_after_tracks,
         "media_data_boxes": state.mdat_ranges.len(),
-        "tracks": state.tracks.iter().map(track_json).collect::<Vec<_>>()
+        "tracks": state.tracks.iter().map(track_json).collect::<Vec<_>>(),
+        "timed_id3": state.timed_id3.iter().map(|event| {
+            serde_json::to_value(event).unwrap_or(Value::Null)
+        }).collect::<Vec<_>>(),
+        "timed_id3_aid3_compatible_brand": timed_id3_aid3_brand,
+        "timed_id3_stored_bytes": state.timed_id3_bytes,
+        "timed_id3_evidence_limit_hit": state.timed_id3_limit_hit
     });
     Ok(finish_audit(
         path, "isobmff", wrapper, bitstream, xcheck, properties,
     ))
+}
+
+fn parse_event_message(
+    path: &Path,
+    file: &mut File,
+    header: BoxHeader,
+) -> Result<Option<TimedId3Event>, String> {
+    let body = read_control(path, file, header)?;
+    if body.len() < 4 {
+        return Err("EventMessageBox is missing its FullBox header".into());
+    }
+    let version = body[0];
+    let flags = u32::from_be_bytes([0, body[1], body[2], body[3]]);
+    if flags != 0 || version > 1 {
+        return Err(format!(
+            "EventMessageBox has unsupported version {version} or non-zero flags {flags:#x}"
+        ));
+    }
+    let (timescale, presentation_time, event_duration, id, scheme, value, message) = if version == 1
+    {
+        if body.len() < 24 {
+            return Err("version 1 EventMessageBox fixed fields are truncated".into());
+        }
+        let timescale = u32::from_be_bytes(body[4..8].try_into().expect("four-byte slice"));
+        let presentation_time =
+            u64::from_be_bytes(body[8..16].try_into().expect("eight-byte slice"));
+        let event_duration = u32::from_be_bytes(body[16..20].try_into().expect("four-byte slice"));
+        let id = u32::from_be_bytes(body[20..24].try_into().expect("four-byte slice"));
+        let (scheme, offset) = nul_string(&body, 24, "scheme_id_uri")?;
+        let (value, offset) = nul_string(&body, offset, "value")?;
+        (
+            timescale,
+            presentation_time,
+            event_duration,
+            id,
+            scheme,
+            value,
+            &body[offset..],
+        )
+    } else {
+        let (scheme, offset) = nul_string(&body, 4, "scheme_id_uri")?;
+        let (value, offset) = nul_string(&body, offset, "value")?;
+        if body.len().saturating_sub(offset) < 16 {
+            return Err("version 0 EventMessageBox fixed fields are truncated".into());
+        }
+        let timescale = u32::from_be_bytes(
+            body[offset..offset + 4]
+                .try_into()
+                .expect("four-byte slice"),
+        );
+        let presentation_delta = u32::from_be_bytes(
+            body[offset + 4..offset + 8]
+                .try_into()
+                .expect("four-byte slice"),
+        );
+        let event_duration = u32::from_be_bytes(
+            body[offset + 8..offset + 12]
+                .try_into()
+                .expect("four-byte slice"),
+        );
+        let id = u32::from_be_bytes(
+            body[offset + 12..offset + 16]
+                .try_into()
+                .expect("four-byte slice"),
+        );
+        (
+            timescale,
+            u64::from(presentation_delta),
+            event_duration,
+            id,
+            scheme,
+            value,
+            &body[offset + 16..],
+        )
+    };
+    if scheme != "https://aomedia.org/emsg/ID3" {
+        return Ok(None);
+    }
+    if version != 1 {
+        return Err("AOMedia CMAF timed-ID3 requires EventMessageBox version 1".into());
+    }
+    if timescale == 0 {
+        return Err("CMAF timed-ID3 EventMessageBox has a zero timescale".into());
+    }
+    let (tag, consumed) = crate::id3_qc::parse_prefix(message, true)?;
+    if consumed != message.len() {
+        return Err("CMAF timed-ID3 message_data contains bytes after the ID3v2.4 tag".into());
+    }
+    Ok(Some(TimedId3Event {
+        version,
+        timescale,
+        presentation_time,
+        event_duration,
+        id,
+        scheme_id_uri: scheme,
+        value,
+        tag,
+    }))
+}
+
+fn nul_string(bytes: &[u8], offset: usize, field: &str) -> Result<(String, usize), String> {
+    let relative = bytes
+        .get(offset..)
+        .ok_or_else(|| format!("EventMessageBox {field} starts outside the box"))?
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| format!("EventMessageBox {field} is not NUL-terminated"))?;
+    let end = offset + relative;
+    let value = std::str::from_utf8(&bytes[offset..end])
+        .map_err(|_| format!("EventMessageBox {field} is not UTF-8"))?
+        .to_owned();
+    Ok((value, end + 1))
 }
 
 fn parse_file_type(
@@ -1945,6 +2122,8 @@ fn loudness_json(entry: &LoudnessEntry) -> Value {
         "measurements": entry.measurements.iter().map(|measurement| json!({
             "method_definition": measurement.method_definition,
             "method_value": measurement.method_value,
+            "value_lkfs": matches!(measurement.method_definition, 0..=5)
+                .then(|| -57.75 + f64::from(measurement.method_value) * 0.25),
             "measurement_system": measurement.measurement_system,
             "reliability": measurement.reliability
         })).collect::<Vec<_>>()
@@ -2151,6 +2330,56 @@ mod tests {
         output
     }
 
+    fn timed_id3_emsg(version: u8) -> Vec<u8> {
+        let rva2_payload = [b"track".as_slice(), &[0, 1, 0xfe, 0x00, 0]].concat();
+        let rva2 = [
+            b"RVA2".as_slice(),
+            &[0, 0, 0, rva2_payload.len() as u8, 0, 0],
+            &rva2_payload,
+        ]
+        .concat();
+        let id3 = [
+            b"ID3\x04\x00\x00".as_slice(),
+            &[0, 0, 0, rva2.len() as u8],
+            &rva2,
+        ]
+        .concat();
+        let body = if version == 1 {
+            [
+                full_box(
+                    1,
+                    [
+                        1_000_u32.to_be_bytes().as_slice(),
+                        500_u64.to_be_bytes().as_slice(),
+                        u32::MAX.to_be_bytes().as_slice(),
+                        7_u32.to_be_bytes().as_slice(),
+                    ]
+                    .concat(),
+                ),
+                b"https://aomedia.org/emsg/ID3\0".to_vec(),
+                b"urn:example:loudness\0".to_vec(),
+                id3,
+            ]
+            .concat()
+        } else {
+            [
+                full_box(0, Vec::new()),
+                b"https://aomedia.org/emsg/ID3\0".to_vec(),
+                b"urn:example:loudness\0".to_vec(),
+                [
+                    1_000_u32.to_be_bytes().as_slice(),
+                    500_u32.to_be_bytes().as_slice(),
+                    u32::MAX.to_be_bytes().as_slice(),
+                    7_u32.to_be_bytes().as_slice(),
+                ]
+                .concat(),
+                id3,
+            ]
+            .concat()
+        };
+        boxed(b"emsg", body)
+    }
+
     #[test]
     fn audits_complete_audio_mp4_without_reading_media_payload() {
         let directory = tempfile::tempdir().unwrap();
@@ -2169,6 +2398,73 @@ mod tests {
         assert!(result.passed, "{result:#?}");
         assert_eq!(result.format, "isobmff");
         assert_eq!(result.properties["tracks"][0]["codecs"][0], "mp4a");
+    }
+
+    #[test]
+    fn parses_cmaf_timed_id3_rva2_and_aid3_brand() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("timed-id3.m4s");
+        let bytes = [
+            boxed(
+                b"styp",
+                [b"msdh".as_slice(), &[0; 4], b"msdh", b"aid3"].concat(),
+            ),
+            timed_id3_emsg(1),
+            media_fragment(1, 0),
+            boxed(b"mdat", vec![1, 2, 3, 4]),
+        ]
+        .concat();
+        File::create(&path).unwrap().write_all(&bytes).unwrap();
+        let result = crate::container_qc::audit(&path).unwrap();
+        assert!(result.passed, "{result:#?}");
+        assert_eq!(result.properties["timed_id3_aid3_compatible_brand"], true);
+        assert_eq!(result.properties["timed_id3"][0]["version"], 1);
+        assert_eq!(
+            result.properties["timed_id3"][0]["tag"]["relative_volume_adjustments"][0]
+                ["identification"],
+            "track"
+        );
+    }
+
+    #[test]
+    fn treats_missing_recommended_aid3_brand_as_non_fatal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("timed-id3-no-brand.m4s");
+        let bytes = [
+            boxed(b"styp", [b"msdh".as_slice(), &[0; 4], b"msdh"].concat()),
+            timed_id3_emsg(1),
+            media_fragment(1, 0),
+            boxed(b"mdat", vec![1, 2, 3, 4]),
+        ]
+        .concat();
+        File::create(&path).unwrap().write_all(&bytes).unwrap();
+        let result = crate::container_qc::audit(&path).unwrap();
+        assert!(result.passed, "{result:#?}");
+        assert_eq!(result.properties["timed_id3_aid3_compatible_brand"], false);
+    }
+
+    #[test]
+    fn rejects_version_zero_cmaf_timed_id3() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bad-timed-id3.m4s");
+        let bytes = [
+            boxed(
+                b"styp",
+                [b"msdh".as_slice(), &[0; 4], b"msdh", b"aid3"].concat(),
+            ),
+            timed_id3_emsg(0),
+            media_fragment(1, 0),
+            boxed(b"mdat", vec![1, 2, 3, 4]),
+        ]
+        .concat();
+        File::create(&path).unwrap().write_all(&bytes).unwrap();
+        let result = crate::container_qc::audit(&path).unwrap();
+        assert!(!result.passed);
+        assert!(result
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.checks)
+            .any(|check| check.rule_id == "FORGE-ISOBMFF-EVENT-MESSAGE" && !check.passed));
     }
 
     #[test]

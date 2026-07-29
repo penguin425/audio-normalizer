@@ -1072,6 +1072,8 @@ fn audit_media_files(playlist: &Playlist, profile: HlsProfile, findings: &mut Ve
     let mut previous_sequences = None;
     let mut last_decode: HashMap<u64, u64> = HashMap::new();
     let mut previous_ts_streams: Option<Vec<TsAudioStream>> = None;
+    let mut last_timed_id3_pts: HashMap<u64, u64> = HashMap::new();
+    let mut last_emsg_time = None;
     for (segment_index, uri) in playlist.segment_uris.iter().enumerate() {
         let discontinuity = playlist
             .segment_discontinuities
@@ -1082,6 +1084,8 @@ fn audit_media_files(playlist: &Playlist, profile: HlsProfile, findings: &mut Ve
             previous_sequences = None;
             last_decode.clear();
             previous_ts_streams = None;
+            last_timed_id3_pts.clear();
+            last_emsg_time = None;
         }
         let Some(path) = local_reference(&playlist.path, uri) else {
             findings.push(finding(
@@ -1110,6 +1114,7 @@ fn audit_media_files(playlist: &Playlist, profile: HlsProfile, findings: &mut Ve
                 segment_index,
                 &path,
                 &mut previous_ts_streams,
+                &mut last_timed_id3_pts,
                 findings,
             );
             continue;
@@ -1168,6 +1173,12 @@ fn audit_media_files(playlist: &Playlist, profile: HlsProfile, findings: &mut Ve
                         ));
                     }
                 }
+                audit_cmaf_timed_id3(
+                    segment_index,
+                    &audit.properties,
+                    &mut last_emsg_time,
+                    findings,
+                );
             }
             Err(error) => findings.push(finding(
                 "FORGE-HLS-SEGMENT-READ",
@@ -1185,6 +1196,7 @@ fn audit_transport_segment(
     segment_index: usize,
     path: &Path,
     previous_streams: &mut Option<Vec<TsAudioStream>>,
+    last_timed_id3_pts: &mut HashMap<u64, u64>,
     findings: &mut Vec<HlsFinding>,
 ) {
     let expected_transport = path.extension().is_some_and(|extension| {
@@ -1234,6 +1246,12 @@ fn audit_transport_segment(
     if !transport {
         return;
     }
+    audit_ts_timed_id3(
+        segment_index,
+        &audit.properties,
+        last_timed_id3_pts,
+        findings,
+    );
     let streams = transport_streams(&audit.properties);
     findings.push(finding(
         "FORGE-HLS-TS-AUDIO-STREAMS",
@@ -1291,6 +1309,159 @@ fn audit_transport_segment(
         }
     }
     *previous_streams = Some(streams);
+}
+
+fn audit_ts_timed_id3(
+    segment_index: usize,
+    properties: &Value,
+    last_pts: &mut HashMap<u64, u64>,
+    findings: &mut Vec<HlsFinding>,
+) {
+    let streams = properties["timed_id3_streams"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let stream_count = streams.len();
+    if stream_count == 0 {
+        return;
+    }
+    let descriptor_errors = streams
+        .iter()
+        .filter(|stream| {
+            !stream["descriptor_error"].is_null() || !stream["id3_descriptor"].is_object()
+        })
+        .count();
+    let errors = properties["timed_id3_error_count"]
+        .as_u64()
+        .unwrap_or_else(|| {
+            properties["timed_id3_errors"]
+                .as_array()
+                .map_or(0, |items| items.len() as u64)
+        });
+    let tags = properties["timed_id3"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    findings.push(finding(
+        "FORGE-HLS-TIMED-ID3",
+        Severity::Error,
+        errors == 0 && descriptor_errors == 0,
+        "MPEG-TS timed metadata streams have ID3 PMT descriptors and carry structurally valid ID3v2 tags",
+        Some(json!({
+            "segment": segment_index,
+            "streams": stream_count,
+            "tags": tags.len(),
+            "descriptor_errors": descriptor_errors,
+            "payload_errors": errors
+        })),
+    ));
+    let mut monotonic = true;
+    let mut timed = 0_usize;
+    let mut relative_volume = 0_usize;
+    for item in &tags {
+        relative_volume += item["tag"]["relative_volume_adjustments"]
+            .as_array()
+            .map_or(0, Vec::len);
+        let (Some(pid), Some(pts)) = (item["pid"].as_u64(), item["pts_90khz"].as_u64()) else {
+            continue;
+        };
+        timed += 1;
+        if let Some(previous) = last_pts.insert(pid, pts) {
+            let delta = pts_forward_delta(previous, pts);
+            monotonic &= delta < MPEG_PTS_MODULUS / 2;
+        }
+    }
+    findings.push(finding(
+        "FORGE-HLS-TIMED-ID3-PTS",
+        Severity::Error,
+        tags.is_empty() || (timed == tags.len() && monotonic),
+        "timed-ID3 PES packets have present, monotonic 90 kHz presentation timestamps",
+        Some(json!({
+            "segment": segment_index,
+            "tags": tags.len(),
+            "timestamped": timed
+        })),
+    ));
+    if relative_volume > 0 {
+        findings.push(finding(
+            "FORGE-HLS-TIMED-ID3-LOUDNESS",
+            Severity::Error,
+            true,
+            "timed ID3v2.4 RVA2 relative-volume metadata is structurally valid",
+            Some(json!({
+                "segment": segment_index,
+                "relative_volume_adjustments": relative_volume
+            })),
+        ));
+    }
+}
+
+fn audit_cmaf_timed_id3(
+    segment_index: usize,
+    properties: &Value,
+    last_time: &mut Option<(u64, u64)>,
+    findings: &mut Vec<HlsFinding>,
+) {
+    let events = properties["timed_id3"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if events.is_empty() {
+        return;
+    }
+    let mut monotonic = true;
+    let mut relative_volume = 0_usize;
+    for event in &events {
+        relative_volume += event["tag"]["relative_volume_adjustments"]
+            .as_array()
+            .map_or(0, Vec::len);
+        let (Some(timescale), Some(presentation)) = (
+            event["timescale"].as_u64(),
+            event["presentation_time"].as_u64(),
+        ) else {
+            monotonic = false;
+            continue;
+        };
+        if timescale == 0 {
+            monotonic = false;
+            continue;
+        }
+        monotonic &= last_time.is_none_or(|(previous_time, previous_scale)| {
+            u128::from(presentation) * u128::from(previous_scale)
+                >= u128::from(previous_time) * u128::from(timescale)
+        });
+        *last_time = Some((presentation, timescale));
+    }
+    findings.push(finding(
+        "FORGE-HLS-CMAF-TIMED-ID3",
+        Severity::Error,
+        monotonic,
+        "CMAF aid3 EventMessageBox metadata uses version 1, complete ID3v2.4, and monotonic presentation times",
+        Some(json!({
+            "segment": segment_index,
+            "events": events.len(),
+            "relative_volume_adjustments": relative_volume
+        })),
+    ));
+    findings.push(finding(
+        "FORGE-HLS-CMAF-TIMED-ID3-BRAND",
+        Severity::Warning,
+        properties["timed_id3_aid3_compatible_brand"] == true,
+        "CMAF timed-ID3 media lists the recommended aid3 compatible brand",
+        properties.get("timed_id3_aid3_compatible_brand").cloned(),
+    ));
+    if relative_volume > 0 {
+        findings.push(finding(
+            "FORGE-HLS-TIMED-ID3-LOUDNESS",
+            Severity::Error,
+            true,
+            "CMAF timed ID3v2.4 RVA2 relative-volume metadata is structurally valid",
+            Some(json!({
+                "segment": segment_index,
+                "relative_volume_adjustments": relative_volume
+            })),
+        ));
+    }
 }
 
 fn transport_streams(properties: &Value) -> Vec<TsAudioStream> {
@@ -2022,6 +2193,49 @@ mod tests {
             [mfhd, boxed(b"traf", [tfhd, tfdt, trun].concat())].concat(),
         );
         [styp, moof, boxed(b"mdat", vec![1, 2, 3, 4])].concat()
+    }
+
+    #[test]
+    fn reports_ts_and_cmaf_timed_id3_loudness_timing() {
+        let ts = json!({
+            "timed_id3_streams": [{
+                "program": 1,
+                "pid": 257,
+                "stream_type": 21,
+                "id3_descriptor": {"metadata_service_id": 0},
+                "descriptor_error": null
+            }],
+            "timed_id3_errors": [],
+            "timed_id3": [{
+                "pid": 257,
+                "pts_90khz": 90000,
+                "tag": {"relative_volume_adjustments": [{"identification": "track"}]}
+            }]
+        });
+        let mut findings = Vec::new();
+        let mut pts = HashMap::new();
+        audit_ts_timed_id3(0, &ts, &mut pts, &mut findings);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == "FORGE-HLS-TIMED-ID3" && finding.passed));
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == "FORGE-HLS-TIMED-ID3-LOUDNESS" && finding.passed
+        }));
+
+        let cmaf = json!({
+            "timed_id3_aid3_compatible_brand": true,
+            "timed_id3": [{
+                "timescale": 1000,
+                "presentation_time": 1500,
+                "tag": {"relative_volume_adjustments": [{"identification": "track"}]}
+            }]
+        });
+        let mut last = None;
+        audit_cmaf_timed_id3(0, &cmaf, &mut last, &mut findings);
+        assert!(findings
+            .iter()
+            .any(|finding| { finding.rule_id == "FORGE-HLS-CMAF-TIMED-ID3" && finding.passed }));
+        assert_eq!(last, Some((1500, 1000)));
     }
 
     #[test]

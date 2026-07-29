@@ -422,6 +422,10 @@ and `udc2`/`udi2` sample-entry boxes are structurally checked and required to
 occur as coefficient/instruction pairs when present. This supplies the
 container evidence needed by later Apple HLS and xHE-AAC delivery profiles
 without treating optional metadata as mandatory for every MP4 file.
+Top-level CMAF `emsg` boxes using `https://aomedia.org/emsg/ID3` are also
+validated as version 1 event messages with a positive timescale and one
+complete ID3v2.4 tag. ID3 frame bounds and `RVA2` channel adjustments are
+checked, and the recommended `aid3` compatible brand is reported.
 
 Results use versioned JSON with stable `FORGE-*` rule IDs and separate
 `wrapper`, `bitstream`, and `x-check` layers. Exit status is 0 for pass, 1 for a
@@ -471,6 +475,13 @@ segments receive bounded packet, continuity, PAT/PMT, PES, and PTS audits.
 Outside an explicit `EXT-X-DISCONTINUITY`, programme/PID/codec/language
 configuration must remain stable and audio PTS must advance across segment
 boundaries.
+Timed metadata elementary streams (`stream_type` `0x15`) are assembled across
+TS packets with bounded PES sizes; their ID3v2 tags, `RVA2` relative-volume
+entries, and 90 kHz presentation timestamps are validated. For CMAF, Forge
+recognizes the AOMedia timed-ID3 `emsg` scheme, requires ID3v2.4, warns when
+the recommended `aid3` brand is absent, and checks event-time ordering across
+local segments. `RVA2` expresses a relative playback adjustment rather than
+an absolute LUFS measurement, and the report preserves that distinction.
 
 For local fMP4 audio alternatives declared by `EXT-X-MEDIA`, Forge resolves
 each `GROUP-ID` and verifies that every language rendition uses CMAF, covers
@@ -527,6 +538,15 @@ addressing, sequence continuity, and monotonic `tfdt` decode times. Remote,
 absolute, parent-directory, and unresolved template references are never
 fetched implicitly. Results conform to
 `schema/dash-qc-v1.schema.json`.
+
+Registered CICP `ProgramLoudness` and `AnchorLoudness` Essential/Supplemental
+Properties are accepted at AdaptationSet or Representation scope. Values must
+use an explicit `LKFS` or `LUFS` unit and remain consistent through
+inheritance. When initialization media is local, Forge compares each claim
+with the corresponding ISO-BMFF `ludt` MPEG-D loudness measurement. When local
+`udc1`/`udi1` or `udc2`/`udi2` MPEG-D DRC boxes are present, Forge reports
+their paired container evidence. It does not invent an MPD-only DRC value or
+treat those optional boxes as a substitute for codec-specific in-stream DRC.
 
 Adaptation Set Switching descriptors using
 `urn:mpeg:dash:adaptation-set-switching:2016` are resolved within their
@@ -616,7 +636,9 @@ the DASH-IF [IOP v5 publications](https://dashif.org/guidelines/iop-v5/),
 [MPD Patch guidelines](https://dashif.org/DASH-IF-IOP/mpd-patch/),
 [RFC 5261 XML Patch operations](https://www.rfc-editor.org/rfc/rfc5261),
 [events guidelines](https://dashif.org/docs/IOP-Guidelines/DASH-IF-IOP-Part10-v5.0.0.pdf),
-and [content-protection guidelines](https://dashif.org/Guidelines-Security/),
+[content-protection guidelines](https://dashif.org/Guidelines-Security/),
+the DASH-IF [audio-source metadata registry](https://dashif.org/identifiers/audio_source_metadata/),
+and the AOMedia [ID3 timed-metadata carriage specification](https://storage.googleapis.com/downloads.aomedia.org/assets/pdf/CarriageOfID3TimedMetadataCMAF.pdf),
 plus ISO/IEC 23000-19:2024 CMAF. DASH-IF recommendations are kept distinct
 from normative ISO failures.
 

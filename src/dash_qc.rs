@@ -17,6 +17,8 @@ const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ELEMENTS: usize = 200_000;
 const MAX_LOCAL_SEGMENTS: usize = 4_096;
 const ADAPTATION_SET_SWITCHING_SCHEME: &str = "urn:mpeg:dash:adaptation-set-switching:2016";
+const PROGRAM_LOUDNESS_SCHEME: &str = "urn:mpeg:mpegB:cicp:ProgramLoudness";
+const ANCHOR_LOUDNESS_SCHEME: &str = "urn:mpeg:mpegB:cicp:AnchorLoudness";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -215,6 +217,8 @@ struct Representation {
     codecs: Option<String>,
     audio_sampling_rate: Option<u64>,
     audio_channel_configuration: Option<(String, String)>,
+    essential_properties: Vec<Descriptor>,
+    supplemental_properties: Vec<Descriptor>,
     content_protections: Vec<ContentProtection>,
     producer_reference_times: Vec<ProducerReferenceTime>,
     template: Option<SegmentTemplate>,
@@ -234,6 +238,7 @@ struct AdaptationSet {
     lang: Option<String>,
     audio_sampling_rate: Option<u64>,
     audio_channel_configuration: Option<(String, String)>,
+    essential_properties: Vec<Descriptor>,
     supplemental_properties: Vec<Descriptor>,
     content_protections: Vec<ContentProtection>,
     producer_reference_times: Vec<ProducerReferenceTime>,
@@ -762,6 +767,21 @@ fn audit_mpd(path: &Path, mpd: &Mpd, profile: DashProfile) -> Result<DashAudit, 
                 .filter(|descriptor| descriptor.scheme_id_uri.as_deref()
                     == Some(ADAPTATION_SET_SWITCHING_SCHEME))
                 .count(),
+            "audio_loudness_descriptor_count": mpd.periods.iter()
+                .flat_map(|period| &period.adaptations)
+                .map(|adaptation| adaptation.essential_properties.iter()
+                    .chain(&adaptation.supplemental_properties)
+                    .filter(|descriptor| is_loudness_scheme(
+                        descriptor.scheme_id_uri.as_deref()))
+                    .count()
+                    + adaptation.representations.iter().map(|representation| {
+                        representation.essential_properties.iter()
+                            .chain(&representation.supplemental_properties)
+                            .filter(|descriptor| is_loudness_scheme(
+                                descriptor.scheme_id_uri.as_deref()))
+                            .count()
+                    }).sum::<usize>())
+                .sum::<usize>(),
             "period_count": mpd.periods.len(),
             "adaptation_set_count": adaptation_count,
             "representation_count": representation_count,
@@ -1249,17 +1269,30 @@ fn observe_element(
                     .push(reference);
             }
         }
-        "SupplementalProperty"
+        "EssentialProperty" | "SupplementalProperty"
             if active_adaptation.is_some()
-                && active_representation.is_none()
-                && stack.iter().rev().nth(1).map(String::as_str) == Some("AdaptationSet") =>
+                && matches!(
+                    stack.iter().rev().nth(1).map(String::as_str),
+                    Some("AdaptationSet" | "Representation")
+                ) =>
         {
-            current_adaptation_mut(mpd, *active_period, *active_adaptation)?
-                .supplemental_properties
-                .push(Descriptor {
-                    scheme_id_uri: attributes.get("schemeIdUri").cloned(),
-                    value: attributes.get("value").cloned(),
-                });
+            let descriptor = Descriptor {
+                scheme_id_uri: attributes.get("schemeIdUri").cloned(),
+                value: attributes.get("value").cloned(),
+            };
+            let adaptation = current_adaptation_mut(mpd, *active_period, *active_adaptation)?;
+            let target = if let Some(representation) = *active_representation {
+                if name == "EssentialProperty" {
+                    &mut adaptation.representations[representation].essential_properties
+                } else {
+                    &mut adaptation.representations[representation].supplemental_properties
+                }
+            } else if name == "EssentialProperty" {
+                &mut adaptation.essential_properties
+            } else {
+                &mut adaptation.supplemental_properties
+            };
+            target.push(descriptor);
         }
         "ContentProtection"
             if active_adaptation.is_some()
@@ -1673,7 +1706,9 @@ fn validate_representation_update(
                     .as_ref()
                     .or(current_adaptation.audio_channel_configuration.as_ref())
             && effective_content_protections(previous_adaptation, previous_representation)
-                == effective_content_protections(current_adaptation, current_representation);
+                == effective_content_protections(current_adaptation, current_representation)
+            && effective_loudness_descriptors(previous_adaptation, previous_representation)
+                == effective_loudness_descriptors(current_adaptation, current_representation);
         findings.push(finding(
             "FORGE-DASH-UPDATE-FUNCTIONAL-EQUIVALENCE",
             Severity::Error,
@@ -1725,6 +1760,26 @@ fn effective_content_protections<'a>(
                 protection.value.as_deref(),
                 protection.default_kid.as_deref(),
                 protection.pssh.as_slice(),
+            )
+        })
+        .collect()
+}
+
+fn effective_loudness_descriptors<'a>(
+    adaptation: &'a AdaptationSet,
+    representation: &'a Representation,
+) -> Vec<(Option<&'a str>, Option<&'a str>)> {
+    adaptation
+        .essential_properties
+        .iter()
+        .chain(&adaptation.supplemental_properties)
+        .chain(&representation.essential_properties)
+        .chain(&representation.supplemental_properties)
+        .filter(|descriptor| is_loudness_scheme(descriptor.scheme_id_uri.as_deref()))
+        .map(|descriptor| {
+            (
+                descriptor.scheme_id_uri.as_deref(),
+                descriptor.value.as_deref(),
             )
         })
         .collect()
@@ -2494,6 +2549,20 @@ fn validate_period(
                         .map(|(scheme, value)| json!({"scheme_id_uri": scheme, "value": value})),
                 ));
             }
+            let loudness_descriptors = adaptation
+                .essential_properties
+                .iter()
+                .chain(&adaptation.supplemental_properties)
+                .chain(&representation.essential_properties)
+                .chain(&representation.supplemental_properties)
+                .filter(|descriptor| is_loudness_scheme(descriptor.scheme_id_uri.as_deref()))
+                .collect::<Vec<_>>();
+            validate_loudness_descriptors(
+                &label,
+                adaptation_audio || mime.is_some_and(|value| value.starts_with("audio/")),
+                &loudness_descriptors,
+                findings,
+            );
             let (declared_kinds, addressing) =
                 resolve_addressing(representation, adaptation, period);
             let addressing_valid = declared_kinds.len() == 1 && addressing.is_some();
@@ -2533,10 +2602,18 @@ fn validate_period(
                         representation,
                         &template,
                         base_url.as_deref(),
-                        period_duration,
-                        effective_availability(mpd, period, adaptation, representation, &template)
-                            .1
-                            == Some(false),
+                        (
+                            period_duration,
+                            effective_availability(
+                                mpd,
+                                period,
+                                adaptation,
+                                representation,
+                                &template,
+                            )
+                            .1 == Some(false),
+                        ),
+                        &loudness_descriptors,
                         findings,
                     );
                 }
@@ -2561,6 +2638,7 @@ fn validate_period(
                         &list,
                         base_url.as_deref(),
                         period_duration,
+                        &loudness_descriptors,
                         findings,
                     );
                 }
@@ -2587,7 +2665,14 @@ fn validate_period(
                         ),
                         findings,
                     );
-                    audit_local_segment_base(path, &base, base_url.as_deref(), profile, findings);
+                    audit_local_segment_base(
+                        path,
+                        &base,
+                        base_url.as_deref(),
+                        profile,
+                        &loudness_descriptors,
+                        findings,
+                    );
                 }
                 None => {}
             }
@@ -2624,6 +2709,55 @@ fn validate_period(
     }
     if matches!(profile, DashProfile::DashIfIop | DashProfile::DashLive) {
         validate_adaptation_set_switching(period_index, period, period_duration, findings);
+    }
+}
+
+fn is_loudness_scheme(scheme: Option<&str>) -> bool {
+    matches!(
+        scheme,
+        Some(PROGRAM_LOUDNESS_SCHEME | ANCHOR_LOUDNESS_SCHEME)
+    )
+}
+
+fn parse_loudness_descriptor_value(value: &str) -> Option<f64> {
+    let mut fields = value.split_ascii_whitespace();
+    let loudness = fields.next()?.parse::<f64>().ok()?;
+    let unit = fields.next()?;
+    (fields.next().is_none() && matches!(unit, "LKFS" | "LUFS") && loudness.is_finite())
+        .then_some(loudness)
+}
+
+fn validate_loudness_descriptors(
+    label: &str,
+    audio: bool,
+    descriptors: &[&Descriptor],
+    findings: &mut Vec<DashFinding>,
+) {
+    let mut values = HashMap::<&str, f64>::new();
+    for descriptor in descriptors {
+        let scheme = descriptor.scheme_id_uri.as_deref().unwrap_or_default();
+        let parsed = descriptor
+            .value
+            .as_deref()
+            .and_then(parse_loudness_descriptor_value);
+        let consistent = parsed.is_some_and(|value| {
+            values
+                .insert(scheme, value)
+                .is_none_or(|previous| (previous - value).abs() <= f64::EPSILON)
+        });
+        findings.push(finding(
+            "FORGE-DASH-AUDIO-LOUDNESS-DESCRIPTOR",
+            Severity::Error,
+            audio && consistent,
+            format!(
+                "{label} {scheme} is attached to audio, uses '<number> LKFS|LUFS', and is consistent across inheritance"
+            ),
+            Some(json!({
+                "scheme_id_uri": descriptor.scheme_id_uri,
+                "value": descriptor.value,
+                "parsed_lkfs": parsed
+            })),
+        ));
     }
 }
 
@@ -3756,6 +3890,7 @@ fn audit_local_segment_list(
     list: &SegmentList,
     base_url: Option<&str>,
     period_duration: Option<f64>,
+    loudness_descriptors: &[&Descriptor],
     findings: &mut Vec<DashFinding>,
 ) {
     if let Some(initialization) = &list.base.initialization {
@@ -3767,6 +3902,7 @@ fn audit_local_segment_list(
             "initialization",
             findings,
         );
+        audit_local_metadata_resource(mpd_path, &uri, loudness_descriptors, findings);
     }
     if expand_segment_list(list, period_duration).is_err() {
         return;
@@ -3869,6 +4005,7 @@ fn audit_local_segment_base(
     base: &SegmentBase,
     base_url: Option<&str>,
     profile: DashProfile,
+    loudness_descriptors: &[&Descriptor],
     findings: &mut Vec<DashFinding>,
 ) {
     let uri = base_url.unwrap_or("");
@@ -3909,6 +4046,14 @@ fn audit_local_segment_base(
             "SegmentBase initialization",
             findings,
         );
+        audit_local_metadata_resource(
+            mpd_path,
+            &initialization_uri,
+            loudness_descriptors,
+            findings,
+        );
+    } else {
+        audit_local_metadata_resource(mpd_path, uri, loudness_descriptors, findings);
     }
     let Some(range) = base.index_range else {
         return;
@@ -4121,10 +4266,11 @@ fn audit_local_resources(
     representation: &Representation,
     template: &SegmentTemplate,
     base_url: Option<&str>,
-    period_duration: Option<f64>,
-    low_latency: bool,
+    delivery: (Option<f64>, bool),
+    loudness_descriptors: &[&Descriptor],
     findings: &mut Vec<DashFinding>,
 ) {
+    let (period_duration, low_latency) = delivery;
     let Some(id) = representation.id.as_deref() else {
         return;
     };
@@ -4137,7 +4283,7 @@ fn audit_local_resources(
             0,
         );
         let uri = apply_base_url(base_url, &uri);
-        audit_local_isobmff(mpd_path, &uri, true, findings);
+        audit_local_isobmff(mpd_path, &uri, true, loudness_descriptors, findings);
     } else {
         findings.push(finding(
             "FORGE-DASH-CMAF-INITIALIZATION",
@@ -4263,6 +4409,7 @@ fn audit_local_isobmff(
     mpd_path: &Path,
     uri: &str,
     initialization: bool,
+    loudness_descriptors: &[&Descriptor],
     findings: &mut Vec<DashFinding>,
 ) {
     let Some(path) = local_reference(mpd_path, uri) else {
@@ -4312,6 +4459,7 @@ fn audit_local_isobmff(
                     "mvex_after_tracks": audit.properties["mvex_after_tracks"]
                 })),
             ));
+            validate_local_audio_metadata(&path, &audit.properties, loudness_descriptors, findings);
         }
         Err(error) => findings.push(finding(
             "FORGE-DASH-CMAF-INITIALIZATION",
@@ -4320,6 +4468,120 @@ fn audit_local_isobmff(
             error,
             Some(json!(path)),
         )),
+    }
+}
+
+fn audit_local_metadata_resource(
+    mpd_path: &Path,
+    uri: &str,
+    loudness_descriptors: &[&Descriptor],
+    findings: &mut Vec<DashFinding>,
+) {
+    let Some(path) = local_reference(mpd_path, uri).filter(|path| path.is_file()) else {
+        return;
+    };
+    match container_qc::audit(&path) {
+        Ok(audit) if audit.format == "isobmff" => {
+            validate_local_audio_metadata(&path, &audit.properties, loudness_descriptors, findings)
+        }
+        Ok(audit) if !loudness_descriptors.is_empty() => findings.push(finding(
+            "FORGE-DASH-AUDIO-METADATA-CONTAINER",
+            Severity::Error,
+            false,
+            "local loudness evidence resource is not ISO-BMFF",
+            Some(json!({"path": path, "format": audit.format})),
+        )),
+        Err(error) if !loudness_descriptors.is_empty() => findings.push(finding(
+            "FORGE-DASH-AUDIO-METADATA-CONTAINER",
+            Severity::Error,
+            false,
+            error,
+            Some(json!(path)),
+        )),
+        Ok(_) | Err(_) => {}
+    }
+}
+
+fn validate_local_audio_metadata(
+    path: &Path,
+    properties: &Value,
+    loudness_descriptors: &[&Descriptor],
+    findings: &mut Vec<DashFinding>,
+) {
+    let audio_tracks = properties["tracks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|track| track["handler"].as_str() == Some("soun"))
+        .collect::<Vec<_>>();
+    if !loudness_descriptors.is_empty() {
+        let matched = loudness_descriptors.iter().all(|descriptor| {
+            let method = match descriptor.scheme_id_uri.as_deref() {
+                Some(PROGRAM_LOUDNESS_SCHEME) => 1,
+                Some(ANCHOR_LOUDNESS_SCHEME) => 2,
+                _ => return false,
+            };
+            let Some(declared) = descriptor
+                .value
+                .as_deref()
+                .and_then(parse_loudness_descriptor_value)
+            else {
+                return false;
+            };
+            audio_tracks.iter().any(|track| {
+                track["loudness"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|entry| entry["measurements"].as_array().into_iter().flatten())
+                    .any(|measurement| {
+                        measurement["method_definition"].as_u64() == Some(method)
+                            && measurement["value_lkfs"]
+                                .as_f64()
+                                .is_some_and(|value| (value - declared).abs() <= 0.125)
+                    })
+            })
+        });
+        findings.push(finding(
+            "FORGE-DASH-AUDIO-LOUDNESS-EVIDENCE",
+            Severity::Error,
+            matched,
+            "MPD program/anchor loudness descriptors match local ISO-BMFF loudness measurements",
+            Some(json!({
+                "path": path,
+                "descriptors": loudness_descriptors.iter().map(|descriptor| json!({
+                    "scheme_id_uri": descriptor.scheme_id_uri,
+                    "value": descriptor.value
+                })).collect::<Vec<_>>()
+            })),
+        ));
+    }
+    let has_drc = audio_tracks.iter().any(|track| {
+        track["mpeg_d_drc_boxes"]
+            .as_array()
+            .is_some_and(|boxes| !boxes.is_empty())
+    });
+    if has_drc {
+        let evidence = audio_tracks.iter().any(|track| {
+            let boxes = track["mpeg_d_drc_boxes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<HashSet<_>>();
+            (boxes.contains("udc1") && boxes.contains("udi1"))
+                || (boxes.contains("udc2") && boxes.contains("udi2"))
+        });
+        findings.push(finding(
+            "FORGE-DASH-AUDIO-DRC-EVIDENCE",
+            Severity::Error,
+            evidence,
+            "local ISO-BMFF audio metadata carries paired MPEG-D DRC coefficient and instruction boxes",
+            Some(json!({
+                "path": path,
+                "paired_mpeg_d_drc": evidence
+            })),
+        ));
     }
 }
 
@@ -5953,6 +6215,135 @@ mod tests {
         );
         assert!(audit.findings.iter().any(|finding| {
             finding.rule_id == "FORGE-DASH-SEGMENT-LIST-COUNT" && finding.passed
+        }));
+    }
+
+    #[test]
+    fn validates_inherited_program_and_anchor_loudness_descriptors() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_mpd(
+            directory.path(),
+            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+ mediaPresentationDuration="PT2S" minBufferTime="PT1S">
+ <BaseURL>https://example.invalid/audio/</BaseURL>
+ <Period><AdaptationSet id="1" contentType="audio" mimeType="audio/mp4"
+  codecs="mp4a.40.2" lang="en" audioSamplingRate="48000">
+  <EssentialProperty schemeIdUri="urn:mpeg:mpegB:cicp:ProgramLoudness"
+   value="-23.0 LUFS"/>
+  <SegmentTemplate timescale="48000" duration="96000"
+   initialization="init-$RepresentationID$.mp4"
+   media="$RepresentationID$-$Number$.m4s"/>
+  <Representation id="audio" bandwidth="128000">
+   <SupplementalProperty schemeIdUri="urn:mpeg:mpegB:cicp:AnchorLoudness"
+    value="-24.0 LKFS"/>
+  </Representation>
+ </AdaptationSet></Period>
+</MPD>"#,
+        );
+        let audit = audit(&path, DashProfile::DashIfIop).unwrap();
+        assert!(
+            audit.passed,
+            "{:#?}",
+            audit
+                .findings
+                .iter()
+                .filter(|finding| finding.severity == Severity::Error && !finding.passed)
+                .map(|finding| (&finding.rule_id, &finding.message))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            audit
+                .findings
+                .iter()
+                .filter(|finding| {
+                    finding.rule_id == "FORGE-DASH-AUDIO-LOUDNESS-DESCRIPTOR" && finding.passed
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_or_unitless_loudness_descriptors() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_mpd(
+            directory.path(),
+            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+ mediaPresentationDuration="PT2S" minBufferTime="PT1S">
+ <BaseURL>https://example.invalid/audio/</BaseURL>
+ <Period><AdaptationSet id="1" contentType="audio" mimeType="audio/mp4"
+  codecs="mp4a.40.2" lang="en" audioSamplingRate="48000">
+  <SupplementalProperty schemeIdUri="urn:mpeg:mpegB:cicp:ProgramLoudness"
+   value="-23.0 LUFS"/>
+  <SegmentTemplate timescale="48000" duration="96000"
+   initialization="init-$RepresentationID$.mp4"
+   media="$RepresentationID$-$Number$.m4s"/>
+  <Representation id="audio" bandwidth="128000">
+   <SupplementalProperty schemeIdUri="urn:mpeg:mpegB:cicp:ProgramLoudness"
+    value="-20.0"/>
+  </Representation>
+ </AdaptationSet></Period>
+</MPD>"#,
+        );
+        let audit = audit(&path, DashProfile::DashIfIop).unwrap();
+        assert!(!audit.passed);
+        assert!(audit.findings.iter().any(|finding| {
+            finding.rule_id == "FORGE-DASH-AUDIO-LOUDNESS-DESCRIPTOR" && !finding.passed
+        }));
+    }
+
+    #[test]
+    fn reconciles_local_loudness_and_reports_drc_evidence() {
+        let program = Descriptor {
+            scheme_id_uri: Some(PROGRAM_LOUDNESS_SCHEME.into()),
+            value: Some("-23.0 LUFS".into()),
+        };
+        let anchor = Descriptor {
+            scheme_id_uri: Some(ANCHOR_LOUDNESS_SCHEME.into()),
+            value: Some("-24.0 LKFS".into()),
+        };
+        let properties = json!({
+            "tracks": [{
+                "handler": "soun",
+                "loudness_box_count": 1,
+                "mpeg_d_drc_boxes": ["udc1", "udi1"],
+                "loudness": [{
+                    "measurements": [
+                        {"method_definition": 1, "value_lkfs": -23.0},
+                        {"method_definition": 2, "value_lkfs": -24.0}
+                    ]
+                }]
+            }]
+        });
+        let mut findings = Vec::new();
+        validate_local_audio_metadata(
+            Path::new("init.mp4"),
+            &properties,
+            &[&program, &anchor],
+            &mut findings,
+        );
+        for rule in [
+            "FORGE-DASH-AUDIO-LOUDNESS-EVIDENCE",
+            "FORGE-DASH-AUDIO-DRC-EVIDENCE",
+        ] {
+            assert!(findings
+                .iter()
+                .any(|finding| finding.rule_id == rule && finding.passed));
+        }
+
+        let mismatch = Descriptor {
+            scheme_id_uri: Some(PROGRAM_LOUDNESS_SCHEME.into()),
+            value: Some("-18.0 LUFS".into()),
+        };
+        let mut findings = Vec::new();
+        validate_local_audio_metadata(
+            Path::new("init.mp4"),
+            &properties,
+            &[&mismatch],
+            &mut findings,
+        );
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == "FORGE-DASH-AUDIO-LOUDNESS-EVIDENCE" && !finding.passed
         }));
     }
 
