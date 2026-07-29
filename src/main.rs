@@ -1296,6 +1296,8 @@ fn is_supported_input(path: &Path) -> bool {
                 | "bwf"
                 | "bw64"
                 | "rf64"
+                | "dsf"
+                | "dff"
                 | "mp3"
                 | "flac"
                 | "aac"

@@ -16,6 +16,20 @@ use crate::wav::WaveChunk;
 /// Remapping discards only fields that the destination tag format cannot
 /// represent.
 pub fn copy_metadata(input: &Path, output: &Path) -> Result<(), String> {
+    if matches!(
+        input
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("dsf" | "dff")
+    ) {
+        // DSF ID3 and DSDIFF DIIN/COMT metadata have no lossless, standardized
+        // mapping to Forge's PCM output containers. Keep DSD handling
+        // read-only instead of silently translating or dropping fields into a
+        // partially equivalent tag model.
+        return Ok(());
+    }
     let source = lofty::read_from_path(input)
         .map_err(|error| format!("read metadata {}: {error}", input.display()))?;
     let Some(mut tag) = source.primary_tag().or_else(|| source.first_tag()).cloned() else {

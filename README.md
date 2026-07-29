@@ -17,6 +17,7 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
 | | Read (decode) | Write (encode) |
 |---|---|---|
 | **WAV / RF64 / BW64** (PCM 8/16/24/32-bit, float 32/64-bit) | Forge's own fast parallel demuxer | Forge's own muxer |
+| **DSF / DSDIFF** (uncompressed 1-bit DSD, read-only) | Forge's bounded parser + FIR decimator | — |
 | **MP3** | symphonia (pure Rust) | LAME via FFI |
 | **FLAC** (16/24-bit, up to 8 channels) | symphonia (pure Rust) | flacenc (pure Rust) |
 | **Ogg Opus** (1–8 channels, through 7.1) | libopus + pure-Rust Ogg | libopus + pure-Rust Ogg |
@@ -43,8 +44,17 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
 * WAV stays on the fast hand-written path; other inputs transparently route
   through the universal decoder and produce the same planar-f32 buffer the DSP
   engine consumes.
+* DSF and uncompressed DSDIFF inputs use their specified bit order and channel
+  layout. Forge maps 1-bit samples to ±1, applies cascaded 31-tap
+  Blackman-windowed half-band filters to 88.2/96 kHz, then a 127-tap
+  Blackman-sinc low-pass with a 21 kHz cutoff before BS.1770 measurement.
+  `forge-dsd-pcm-v1` is an explicit, non-normative engineering policy; it is
+  recorded in container and delivery-manifest evidence. DST-compressed DSDIFF
+  is rejected rather than decoded approximately.
 * Common metadata fields and embedded artwork are preserved across
   normalization and remapped to the destination container's primary tag type.
+  DSF ID3 and DSDIFF DIIN/COMT are left read-only because no lossless,
+  standardized mapping exists for every PCM destination.
 * Broadcast Wave output can preserve `bext`, `axml`, `bxml`, `sxml`, `chna`,
   and iXML chunks. BWF v2 measured loudness fields are updated from the
   normalized output.
@@ -270,6 +280,8 @@ forge-container-qc master.bw64 --output container-qc.json
 forge-container-qc programme.opus
 forge-container-qc archive.aiff
 forge-container-qc capture.caf
+forge-container-qc archive.dsf
+forge-container-qc master.dff
 forge-container-qc master.flac
 forge-container-qc delivery.mp3
 forge-container-qc broadcast.aac
@@ -334,6 +346,20 @@ name/version evidence.
 WAVE/RF64/BW64 chunk tables are scanned with bounded memory: audio payloads are
 seeked over rather than loaded, including files larger than 4 GiB. Oversized
 control chunks and pathological chunk counts fail closed with stable rule IDs.
+
+DSF audits follow Sony's
+[DSF File Format Specification 1.01](https://dsd-guide.com/sites/default/files/white-papers/DSFFileFormatSpec_E.pdf):
+fixed DSD/fmt/data order and sizes, little-endian fields, channel type/count,
+declared file and metadata offsets, sample/data/block geometry, bit order, and
+zero-filled unused block data are checked before decoding. DSDIFF audits follow
+Philips'
+[DSDIFF 1.5](https://dsd-guide.com/sites/default/files/white-papers/DSDIFF_1.5_Spec.pdf):
+64-bit big-endian chunk bounds and padding, required FVER/PROP/FS/CHNL/CMPR
+ordering, channel identifiers, and interleaved DSD sound geometry are checked
+with fixed chunk, channel, rate, and allocation limits. Read-only PCM analysis
+accepts only uncompressed `DSD ` coding. Conversion output then feeds the same
+[ITU-R BS.1770-5](https://www.itu.int/rec/R-REC-BS.1770-5-202311-I/en)
+measurement path as PCM and codec inputs.
 
 Matroska/WebM audits use a bounded RFC 9559 EBML parser. They validate element
 sizes/depth/counts, Header/Segment/Info/Tracks/Cluster ordering, track identity
@@ -862,15 +888,16 @@ CI runs the EBU and ITU suites as separate required evidence.
 
 Property tests exercise arbitrary WAVE and delivery-manifest bytes during the
 normal Rust test suite. Dedicated `cargo-fuzz` targets cover the WAVE decoder,
-delivery-container QC including AAC ADTS/LOAS, FLAC, MP3, and Ogg Opus/Vorbis,
-ADM XML, HLS, DASH, IMF XML/package resolution, and delivery-manifest
-comparison:
+delivery-container QC including DSF/DSDIFF, AAC ADTS/LOAS, FLAC, MP3, and Ogg
+Opus/Vorbis, ADM XML, HLS, DASH, IMF XML/package resolution, and
+delivery-manifest comparison:
 
 ```sh
 cargo fuzz run wave_reader
 cargo fuzz run container_qc
 cargo fuzz run adm_profile
 cargo fuzz run manifest_compare
+cargo fuzz run dsd
 cargo fuzz run imf_qc
 ```
 
@@ -1395,6 +1422,7 @@ src/
   cli.rs            clap definition
   adm.rs            optional EBU BS.2127 renderer + BS.2168 validation adapter
   decoder.rs        full-buffer and streaming universal decoders
+  dsd.rs            bounded DSF/DSDIFF parser + read-only DSD FIR decimator
   flacenc.rs        bounded-memory pure-Rust FLAC encoder
   opus.rs           RFC 7845 mono/stereo and Mapping Family 1 Ogg Opus I/O
   mp3enc.rs         mono/stereo LAME encoder with gapless Info/LAME backpatch

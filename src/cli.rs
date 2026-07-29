@@ -24,10 +24,12 @@ pub struct Cli {
     #[arg(required = true)]
     pub inputs: Vec<PathBuf>,
 
-    /// Container hint for stdin (`-`): wav, flac, mp3, opus, aac, m4a, mp4, or ogg.
+    /// Container hint for stdin (`-`): wav, dsf, dff, flac, mp3, opus, aac, m4a, mp4, or ogg.
     #[arg(
         long = "input-format",
-        value_parser = ["wav", "flac", "mp3", "opus", "aac", "m4a", "mp4", "ogg"]
+        value_parser = [
+            "wav", "dsf", "dff", "flac", "mp3", "opus", "aac", "m4a", "mp4", "ogg"
+        ]
     )]
     pub input_format: Option<String>,
 

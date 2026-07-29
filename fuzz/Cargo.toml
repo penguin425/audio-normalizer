@@ -50,6 +50,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "dsd"
+path = "fuzz_targets/dsd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "hls_qc"
 path = "fuzz_targets/hls_qc.rs"
 test = false
