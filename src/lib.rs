@@ -12,6 +12,7 @@
 #[cfg(feature = "ffmpeg-encoding")]
 pub mod aac;
 mod aac_qc;
+mod aaf_qc;
 mod ac3_qc;
 pub mod adm;
 mod atomic;

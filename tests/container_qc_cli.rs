@@ -5,6 +5,7 @@ use forge_normalizer::wav::{
 };
 use serde_json::Value;
 use std::fs;
+use std::io::{Seek, SeekFrom, Write};
 use std::process::Command;
 
 #[test]
@@ -682,5 +683,73 @@ fn container_qc_cli_audits_real_matroska_and_webm_files() {
     assert_eq!(
         audit["properties"]["audio_tracks"][0]["seek_preroll_ns"],
         80_000_000
+    );
+}
+
+#[test]
+fn container_qc_cli_audits_aaf_stored_format_and_schema() {
+    const AAF_ROOT_CLSID: &str = "b3b398a5-1c90-11d4-8053-080036210804";
+    const AAF_V4_HEADER_CLSID_LE: [u8; 16] = [
+        0x01, 0x02, 0x01, 0x0d, 0x00, 0x02, 0x00, 0x00, 0x06, 0x0e, 0x2b, 0x34, 0x03, 0x02, 0x01,
+        0x01,
+    ];
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("project.aaf");
+    {
+        let mut compound = cfb::create(&path).unwrap();
+        compound
+            .set_storage_clsid("/", uuid::Uuid::parse_str(AAF_ROOT_CLSID).unwrap())
+            .unwrap();
+        for storage in [
+            "/MetaDictionary-1",
+            "/MetaDictionary-1/ClassDefinitions-3{0}",
+            "/MetaDictionary-1/TypeDefinitions-4{0}",
+            "/Header-2",
+            "/Header-2/Content-3b03",
+            "/Header-2/Dictionary-3b04",
+            "/Header-2/Identifi-ionList-3b06{0}",
+        ] {
+            compound.create_storage(storage).unwrap();
+        }
+        for stream_path in ["/properties", "/MetaDictionary-1/properties"] {
+            compound
+                .create_stream(stream_path)
+                .unwrap()
+                .write_all(&[0x4c, 32, 0, 0])
+                .unwrap();
+        }
+        compound
+            .create_stream("/referenced properties")
+            .unwrap()
+            .write_all(&[0x4c, 0, 0, 0, 0, 0, 0])
+            .unwrap();
+        compound.flush().unwrap();
+    }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    file.seek(SeekFrom::Start(8)).unwrap();
+    file.write_all(&AAF_V4_HEADER_CLSID_LE).unwrap();
+    drop(file);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(audit["format"], "aaf");
+    assert_eq!(audit["passed"], true);
+    assert_eq!(audit["properties"]["method"], "forge-aaf-structural-v1");
+
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/container-qc-v1.schema.json")).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    assert!(
+        validator.is_valid(&audit),
+        "{:?}",
+        validator.validate(&audit)
     );
 }

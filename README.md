@@ -293,9 +293,24 @@ forge-container-qc broadcast.ts
 forge-container-qc camera.m2ts
 forge-container-qc programme.mxf
 forge-container-qc track.opatom.mxf
+forge-container-qc edit-project.aaf
 forge-container-qc programme.mka
 forge-container-qc delivery.webm
 ```
+
+AAF audits identify the AMWA stored format by its Compound File Binary header
+and root CLSIDs, validate the CFB allocation/directory structure, require the
+root property and weak-reference streams plus exactly one Header and
+MetaDictionary, and validate every bounded AAF stored-property stream. They
+also require Header ContentStorage, Dictionary, and Identification objects and
+MetaDictionary class/type definitions. Entry count, object-path depth,
+individual property streams, aggregate property bytes, and reported failures
+are capped. The method identifier is `forge-aaf-structural-v1`; this is
+stored-format structural QC, not a claim of complete AAF object-model or Edit
+Protocol conformance. The checks follow the
+[AAF Object Specification](https://aafassociation.org/specs/object_spec.html),
+[AAF stored/low-level format specifications](https://aafassociation.org/html/techinfo/index.html),
+and [MS-CFB](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-cfb/53989ce4-7b05-4f8d-829b-d08d6148375b).
 
 MPEG-TS/M2TS audits detect 188/192-byte packet layout, transport and
 adaptation-field errors, payload continuity gaps, exact retransmissions,
@@ -1454,6 +1469,7 @@ src/
   adm.rs            optional EBU BS.2127 renderer + BS.2168 validation adapter
   decoder.rs        full-buffer and streaming universal decoders
   dsd.rs            bounded DSF/DSDIFF parser + read-only DSD FIR decimator
+  aaf_qc.rs         bounded AAF CFB/stored-property structural QC
   flacenc.rs        bounded-memory pure-Rust FLAC encoder
   opus.rs           RFC 7845 mono/stereo and Mapping Family 1 Ogg Opus I/O
   mp3enc.rs         mono/stereo LAME encoder with gapless Info/LAME backpatch

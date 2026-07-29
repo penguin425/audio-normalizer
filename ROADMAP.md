@@ -105,6 +105,10 @@ Forge already provides:
   workflows, including the exact intended pre-codec measurement, bounded gain
   envelope, limiter amount, clipping/ceiling counts, decoded-output endpoints,
   SHA-256 provenance, and codec loudness/peak/duration drift.
+- Bounded AAF stored-format structural QC with CFB/file/root identity,
+  allocation and directory validation, required Header/MetaDictionary/root
+  streams, stored-property and weak-reference tables, core object presence,
+  and fixed entry/path/property-byte/reporting limits.
 
 ## P0 — next correctness and interoperability work
 
@@ -117,7 +121,9 @@ generations.
 
 ### Broadcast and mastering containers
 
-- AES31/AAF interchange validation where authoritative fixtures are available.
+- AES31-3 ADL project validation and full AAF object-model/Edit Protocol
+  conformance where authoritative fixtures are available. Bounded AAF
+  stored-format structural QC has shipped.
 
 ### Codec-specific QC
 
