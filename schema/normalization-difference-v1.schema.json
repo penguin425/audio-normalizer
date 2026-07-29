@@ -1,0 +1,232 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/normalization-difference-v1.schema.json",
+  "title": "Forge normalization difference report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "generator", "method", "assets"],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/normalization-difference-v1"
+    },
+    "generator": { "type": "string", "minLength": 1 },
+    "method": { "$ref": "#/$defs/method" },
+    "assets": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/asset" }
+    }
+  },
+  "$defs": {
+    "optionalNumber": {
+      "type": ["number", "null"]
+    },
+    "method": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "classification",
+        "intended_signal",
+        "gain_envelope",
+        "clipping",
+        "codec_drift",
+        "maximum_gain_envelope_points_per_asset"
+      ],
+      "properties": {
+        "id": { "const": "forge-normalization-difference-v1" },
+        "classification": { "type": "string", "minLength": 1 },
+        "intended_signal": { "type": "string", "minLength": 1 },
+        "gain_envelope": { "type": "string", "minLength": 1 },
+        "clipping": { "type": "string", "minLength": 1 },
+        "codec_drift": { "type": "string", "minLength": 1 },
+        "maximum_gain_envelope_points_per_asset": {
+          "type": "integer",
+          "const": 10000
+        }
+      }
+    },
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input",
+        "output",
+        "output_format",
+        "source",
+        "intended_pre_codec",
+        "decoded_output",
+        "static_gain_db",
+        "gain_envelope",
+        "protection",
+        "clipping",
+        "codec_drift"
+      ],
+      "properties": {
+        "input": { "$ref": "#/$defs/file" },
+        "output": { "$ref": "#/$defs/file" },
+        "output_format": {
+          "enum": ["wav", "flac", "mp3", "opus", "m4a", "alac", "vorbis"]
+        },
+        "source": { "$ref": "#/$defs/measurement" },
+        "intended_pre_codec": { "$ref": "#/$defs/measurement" },
+        "decoded_output": { "$ref": "#/$defs/measurement" },
+        "static_gain_db": { "type": "number" },
+        "gain_envelope": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": { "$ref": "#/$defs/envelopePoint" }
+        },
+        "protection": { "$ref": "#/$defs/protection" },
+        "clipping": { "$ref": "#/$defs/clipping" },
+        "codec_drift": { "$ref": "#/$defs/codecDrift" }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sample_rate_hz",
+        "channels",
+        "frames",
+        "duration_seconds",
+        "integrated_lufs",
+        "loudness_range_lu",
+        "rms_dbfs",
+        "sample_peak_dbfs",
+        "true_peak_dbtp"
+      ],
+      "properties": {
+        "sample_rate_hz": { "type": "integer", "minimum": 1 },
+        "channels": { "type": "integer", "minimum": 1, "maximum": 32 },
+        "frames": { "type": "integer", "minimum": 0 },
+        "duration_seconds": { "type": "number", "minimum": 0 },
+        "integrated_lufs": { "$ref": "#/$defs/optionalNumber" },
+        "loudness_range_lu": { "$ref": "#/$defs/optionalNumber" },
+        "rms_dbfs": { "$ref": "#/$defs/optionalNumber" },
+        "sample_peak_dbfs": { "$ref": "#/$defs/optionalNumber" },
+        "true_peak_dbtp": { "$ref": "#/$defs/optionalNumber" }
+      }
+    },
+    "envelopePoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start_seconds",
+        "end_seconds",
+        "mean_limiter_reduction_db",
+        "maximum_limiter_reduction_db",
+        "mean_effective_gain_db",
+        "minimum_effective_gain_db"
+      ],
+      "properties": {
+        "start_seconds": { "type": "number", "minimum": 0 },
+        "end_seconds": { "type": "number", "minimum": 0 },
+        "mean_limiter_reduction_db": { "type": "number", "minimum": 0 },
+        "maximum_limiter_reduction_db": { "type": "number", "minimum": 0 },
+        "mean_effective_gain_db": { "type": "number" },
+        "minimum_effective_gain_db": { "type": "number" }
+      }
+    },
+    "protection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "ceiling_dbtp",
+        "limiter_lookahead_ms",
+        "limiter_release_ms",
+        "limited_frames",
+        "mean_limiter_reduction_db",
+        "maximum_limiter_reduction_db"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "linked-lookahead-true-peak-limiter",
+            "hard-ceiling-safety-clip"
+          ]
+        },
+        "ceiling_dbtp": { "type": "number" },
+        "limiter_lookahead_ms": { "$ref": "#/$defs/optionalNumber" },
+        "limiter_release_ms": { "$ref": "#/$defs/optionalNumber" },
+        "limited_frames": { "type": "integer", "minimum": 0 },
+        "mean_limiter_reduction_db": { "type": "number", "minimum": 0 },
+        "maximum_limiter_reduction_db": { "type": "number", "minimum": 0 }
+      }
+    },
+    "clipping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_full_scale_exceeding_samples",
+        "post_gain_full_scale_exceeding_samples",
+        "pre_protection_ceiling_exceeding_samples",
+        "hard_clipped_samples",
+        "protected_full_scale_exceeding_samples",
+        "decoded_output_full_scale_samples"
+      ],
+      "properties": {
+        "input_full_scale_exceeding_samples": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "post_gain_full_scale_exceeding_samples": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pre_protection_ceiling_exceeding_samples": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "hard_clipped_samples": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "protected_full_scale_exceeding_samples": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "decoded_output_full_scale_samples": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "codecDrift": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "integrated_loudness_lu",
+        "loudness_range_lu",
+        "rms_db",
+        "sample_peak_db",
+        "true_peak_db",
+        "duration_seconds",
+        "frames"
+      ],
+      "properties": {
+        "integrated_loudness_lu": { "$ref": "#/$defs/optionalNumber" },
+        "loudness_range_lu": { "$ref": "#/$defs/optionalNumber" },
+        "rms_db": { "$ref": "#/$defs/optionalNumber" },
+        "sample_peak_db": { "$ref": "#/$defs/optionalNumber" },
+        "true_peak_db": { "$ref": "#/$defs/optionalNumber" },
+        "duration_seconds": { "type": "number" },
+        "frames": { "type": "integer" }
+      }
+    }
+  }
+}

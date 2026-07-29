@@ -1009,6 +1009,12 @@ forge track.wav -o track.mp3 --verify --verify-retries 2
 # Reach the loudness target through isolated peaks with a true-peak limiter
 forge track.wav -o track.flac --limiter --verify
 
+# Preserve auditable before/after evidence for one file or an entire album
+forge track.wav -o track.m4a --limiter \
+  --difference-report reports/track-normalization.json
+forge --album album/*.wav -o normalized/ \
+  --difference-report reports/album-normalization.json
+
 # Use a named playback or broadcast target
 forge song.wav -o song.flac --preset spotify --verify
 forge programme.wav -o programme.wav --preset ebu-r128
@@ -1019,6 +1025,29 @@ forge --gain-only track.wav --target=-14
 # Re-encode 16-bit input as 24-bit WAV with dither
 forge in.wav -o out.wav --bits=24 --dither
 ```
+
+### Normalization difference evidence
+
+`--difference-report PATH` writes one
+[`normalization-difference-v1`](schema/normalization-difference-v1.schema.json)
+JSON document containing every output from the job. Each asset records:
+
+- SHA-256 and byte size for the source and completed output;
+- source, intended pre-codec, and re-decoded output loudness/peak measurements;
+- static gain and a time-resolved effective-gain envelope;
+- limiter duration, mean reduction, maximum reduction, and configuration;
+- full-scale and ceiling-exceeding sample counts before and after protection;
+- decoded-output full-scale endpoint count; and
+- loudness, LRA, RMS, sample-peak, true-peak, frame, and duration codec drift.
+
+The intended signal is measured from the exact protected planar-f32 stream
+passed to the encoder, so codec drift is separated from normalization and
+limiting. Limiter evidence is sampled at 100 ms or a coarser interval when
+needed and is bounded to 10,000 points per asset. The report is deterministic
+engineering evidence, not a perceptual quality score or PEAQ conformance
+claim. It is available for track, recursive/batch, album, verified, and
+automatically corrected renders; it cannot be combined with analysis-only,
+gain-only, tag-only, or dry-run modes.
 
 ### Options
 
@@ -1102,6 +1131,7 @@ forge in.wav -o out.wav --bits=24 --dither
 | `--verify` | off | Re-decode output and verify achieved level and true peak |
 | `--verify-tolerance` | `0.5` | Allowed post-encode deviation in LU/dB |
 | `--verify-retries` | `0` | Automatically correct gain and re-encode up to N times |
+| `--difference-report` | none | Versioned JSON gain/limiting/clipping/codec-drift evidence |
 | `--limiter` | off | Look-ahead 4× oversampled true-peak limiter |
 | `--limiter-lookahead` | `5` | Limiter look-ahead in milliseconds |
 | `--limiter-release` | `100` | Limiter release time in milliseconds |
@@ -1161,6 +1191,7 @@ bits = "24"
 verify = true
 verify_tolerance = 0.5
 verify_retries = 2
+difference_report = "reports/programme-normalization.json"
 ```
 
 ### Presets

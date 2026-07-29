@@ -5,6 +5,9 @@ use forge_normalizer::cli;
 use forge_normalizer::codec_qc;
 use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::dsp::resample::ResampleQuality;
+use forge_normalizer::normalization_diff::{
+    self, NormalizationDifferenceAsset, NormalizationDifferenceReport,
+};
 use forge_normalizer::normalize::{
     self, DialogueSource, DialogueStandard, Mode, OutputFormat, Plan,
 };
@@ -147,6 +150,36 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
     }
 
     let (outputs, formats) = resolve_outputs_and_formats(&cli, &relative_paths)?;
+    if let Some(path) = &cli.difference_report {
+        if path == Path::new("-") {
+            return Err("--difference-report requires a file path; stdout is not supported".into());
+        }
+        if outputs.iter().any(|output| output == path) {
+            return Err("--difference-report must not overwrite an audio output".into());
+        }
+        if cli.inputs.iter().any(|input| input == path) {
+            return Err("--difference-report must not overwrite an input".into());
+        }
+        if path.exists() && !cli.overwrite {
+            return Err(format!(
+                "{} already exists (use --overwrite to replace it)",
+                path.display()
+            ));
+        }
+    }
+    let mut difference_inputs = if cli.difference_report.is_some() {
+        cli.inputs
+            .iter()
+            .map(|input| normalization_diff::inspect_file(input))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+    if stdin_requested {
+        if let Some(input) = difference_inputs.first_mut() {
+            input.path = "-".into();
+        }
+    }
     if cli.bits.is_some()
         && formats.contains(&OutputFormat::Flac)
         && !matches!(cli.bits.as_deref(), Some("16" | "24"))
@@ -843,6 +876,7 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
     if !cli.gain_only {
         validate_outputs(&cli.inputs, &outputs, cli.overwrite)?;
     }
+    let mut difference_assets = Vec::new();
 
     if cli.album {
         if cli.dry_run {
@@ -915,19 +949,52 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
             if !album_ok {
                 return Err("post-encode album verification failed".into());
             }
+            if let Some(path) = &cli.difference_report {
+                for index in 0..cli.inputs.len() {
+                    difference_assets.push(normalization_diff::build_asset(
+                        &difference_inputs[index],
+                        &outputs[index],
+                        formats[index],
+                        &plan,
+                        normalization_diff::AssetMeasurements {
+                            source: &corrected.sources[index],
+                            output: &corrected.verifications[index].output,
+                            gain: corrected.gain,
+                            render: &corrected.renders[index],
+                        },
+                    )?);
+                }
+                write_difference_report(path, difference_assets)?;
+            }
             return Ok(());
         }
-        let results = normalize::normalize_album_with_roles(
-            &cli.inputs,
-            &outputs,
-            &plan,
-            &formats,
-            channel_roles_override.as_deref(),
-        )?;
-        let analyses: Vec<_> = results.iter().map(|(a, _)| a.clone()).collect();
+        let results = if cli.difference_report.is_some() {
+            normalize::normalize_album_audited_with_roles(
+                &cli.inputs,
+                &outputs,
+                &plan,
+                &formats,
+                channel_roles_override.as_deref(),
+            )?
+            .into_iter()
+            .map(|(analysis, gain, render)| (analysis, gain, Some(render)))
+            .collect::<Vec<_>>()
+        } else {
+            normalize::normalize_album_with_roles(
+                &cli.inputs,
+                &outputs,
+                &plan,
+                &formats,
+                channel_roles_override.as_deref(),
+            )?
+            .into_iter()
+            .map(|(analysis, gain)| (analysis, gain, None))
+            .collect()
+        };
+        let analyses: Vec<_> = results.iter().map(|(a, _, _)| a.clone()).collect();
         let album_l = normalize::album_lufs(&analyses);
         let gain = results.first().map(|r| r.1).unwrap_or(1.0);
-        for (i, (an, g)) in results.iter().enumerate() {
+        for (i, (an, g, _)) in results.iter().enumerate() {
             print_analysis(&cli.inputs[i], an, Some(*g));
         }
         eprintln!(
@@ -935,10 +1002,39 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
             album_l,
             20.0 * (gain as f64).log10()
         );
+        if let Some(path) = &cli.difference_report {
+            for (index, (source, asset_gain, render)) in results.iter().enumerate() {
+                let output_analysis = normalize::analyze_file_with_roles(
+                    &outputs[index],
+                    channel_roles_override.as_deref(),
+                )?;
+                difference_assets.push(normalization_diff::build_asset(
+                    &difference_inputs[index],
+                    &outputs[index],
+                    formats[index],
+                    &plan,
+                    normalization_diff::AssetMeasurements {
+                        source,
+                        output: &output_analysis,
+                        gain: *asset_gain,
+                        render: render
+                            .as_ref()
+                            .expect("difference reports capture render statistics"),
+                    },
+                )?);
+            }
+            write_difference_report(path, difference_assets)?;
+        }
         return Ok(());
     }
 
-    for ((input, output), fmt) in cli.inputs.iter().zip(outputs.iter()).zip(formats.iter()) {
+    for (index, ((input, output), fmt)) in cli
+        .inputs
+        .iter()
+        .zip(outputs.iter())
+        .zip(formats.iter())
+        .enumerate()
+    {
         if cli.gain_only || cli.dry_run {
             let an =
                 normalize::analyze_file_for_plan(input, channel_roles_override.as_deref(), &plan)?;
@@ -973,19 +1069,70 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                         corrected.attempts - 1
                     );
                 }
+                if cli.difference_report.is_some() {
+                    difference_assets.push(normalization_diff::build_asset(
+                        &difference_inputs[index],
+                        output,
+                        *fmt,
+                        &plan,
+                        normalization_diff::AssetMeasurements {
+                            source: &corrected.source,
+                            output: &corrected.verification.output,
+                            gain: corrected.gain,
+                            render: &corrected.render,
+                        },
+                    )?);
+                }
             } else {
-                let (an, gain) = normalize::normalize_one_with_roles(
-                    input,
-                    output,
-                    &plan,
-                    *fmt,
-                    channel_roles_override.as_deref(),
-                )?;
-                print_analysis(input, &an, Some(gain));
+                if cli.difference_report.is_some() {
+                    let (an, gain, render) = normalize::normalize_one_audited_with_roles(
+                        input,
+                        output,
+                        &plan,
+                        *fmt,
+                        channel_roles_override.as_deref(),
+                    )?;
+                    print_analysis(input, &an, Some(gain));
+                    let output_analysis = normalize::analyze_file_with_roles(
+                        output,
+                        channel_roles_override.as_deref(),
+                    )?;
+                    difference_assets.push(normalization_diff::build_asset(
+                        &difference_inputs[index],
+                        output,
+                        *fmt,
+                        &plan,
+                        normalization_diff::AssetMeasurements {
+                            source: &an,
+                            output: &output_analysis,
+                            gain,
+                            render: &render,
+                        },
+                    )?);
+                } else {
+                    let (an, gain) = normalize::normalize_one_with_roles(
+                        input,
+                        output,
+                        &plan,
+                        *fmt,
+                        channel_roles_override.as_deref(),
+                    )?;
+                    print_analysis(input, &an, Some(gain));
+                }
             }
         }
     }
+    if let Some(path) = &cli.difference_report {
+        write_difference_report(path, difference_assets)?;
+    }
     Ok(())
+}
+
+fn write_difference_report(
+    path: &Path,
+    assets: Vec<NormalizationDifferenceAsset>,
+) -> Result<(), String> {
+    normalization_diff::write_report(path, &NormalizationDifferenceReport::new(assets))
 }
 
 fn write_timeline(path: &Path, reports: &[TimelineReport]) -> Result<(), String> {

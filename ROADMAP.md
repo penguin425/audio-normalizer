@@ -101,6 +101,10 @@ Forge already provides:
   declared bit-order/channel mapping, a versioned cascaded half-band and
   21 kHz low-pass decimation policy, 88.2/96 kHz BS.1770 measurement, and
   explicit rejection of DST-compressed payloads.
+- Versioned before/after normalization evidence for track, batch, and album
+  workflows, including the exact intended pre-codec measurement, bounded gain
+  envelope, limiter amount, clipping/ceiling counts, decoded-output endpoints,
+  SHA-256 provenance, and codec loudness/peak/duration drift.
 
 ## P0 — next correctness and interoperability work
 
@@ -152,9 +156,6 @@ generations.
   for large streaming catalogues.
 - Metadata-only normalization for every container that has a standardized,
   widely honoured gain mechanism.
-- Before/after audible-difference report with gain envelope, limiting amount,
-  clipped-sample count, and codec drift.
-
 ### Immersive, personalized, and accessible audio
 
 - Validate every ADM programme/content/object presentation, not only the

@@ -11,7 +11,7 @@
 
 use crate::atomic::AtomicOutput;
 use crate::decoder;
-use crate::dsp::limiter::{LimiterConfig, TruePeakLimiter};
+use crate::dsp::limiter::{LimiterConfig, LimiterStatistics, TruePeakLimiter};
 use crate::dsp::resample::{ResampleQuality, SampleRateConverter};
 use crate::dsp::{lufs, simd, truepeak};
 use crate::flacenc::FlacStreamWriter;
@@ -90,6 +90,21 @@ pub struct Analysis {
     /// Complete 400 ms block energies used to recompute album gating.
     #[doc(hidden)]
     pub loudness_blocks: Vec<f64>,
+}
+
+/// Measurements captured from the exact float signal passed to an encoder.
+///
+/// These values intentionally describe the signal before PCM quantization or
+/// lossy encoding, allowing a decoded output to be compared with the render
+/// that the normalization engine actually intended.
+#[derive(Debug, Clone)]
+pub struct RenderStatistics {
+    pub intended: Analysis,
+    pub input_full_scale_exceeding_samples: u64,
+    pub post_gain_full_scale_exceeding_samples: u64,
+    pub post_gain_ceiling_exceeding_samples: u64,
+    pub protected_full_scale_exceeding_samples: u64,
+    pub limiter: Option<LimiterStatistics>,
 }
 
 #[derive(Debug, Clone)]
@@ -237,6 +252,7 @@ pub struct CorrectedNormalization {
     pub source: Analysis,
     pub gain: f32,
     pub verification: Verification,
+    pub render: RenderStatistics,
     /// Number of encoding passes, including the initial pass.
     pub attempts: usize,
 }
@@ -246,6 +262,7 @@ pub struct CorrectedAlbumNormalization {
     pub sources: Vec<Analysis>,
     pub gain: f32,
     pub verifications: Vec<Verification>,
+    pub renders: Vec<RenderStatistics>,
     pub expected_album_lufs: f64,
     pub actual_album_lufs: f64,
     /// Number of complete album encoding passes, including the initial pass.
@@ -753,6 +770,11 @@ fn clamp_gain(mut lin: f64, true_peak: f64, plan: &Plan) -> f32 {
         if lin > max_lin {
             lin = max_lin;
         }
+    }
+    // Digital silence has no finite gain that can reach a level target.
+    // Preserve it at unity instead of allowing 0.0 * infinity to create NaNs.
+    if !lin.is_finite() || lin <= 0.0 {
+        lin = 1.0;
     }
     lin as f32
 }
@@ -1372,10 +1394,50 @@ pub fn normalize_one_with_roles<P: AsRef<Path>>(
     format: OutputFormat,
     channel_roles: Option<&[ChannelRole]>,
 ) -> Result<(Analysis, f32), String> {
+    let (analysis, gain, _) =
+        normalize_one_with_roles_impl(input, output, plan, format, channel_roles, false)?;
+    Ok((analysis, gain))
+}
+
+pub fn normalize_one_audited_with_roles<P: AsRef<Path>>(
+    input: P,
+    output: P,
+    plan: &Plan,
+    format: OutputFormat,
+    channel_roles: Option<&[ChannelRole]>,
+) -> Result<(Analysis, f32, RenderStatistics), String> {
+    let (analysis, gain, render) =
+        normalize_one_with_roles_impl(input, output, plan, format, channel_roles, true)?;
+    Ok((
+        analysis,
+        gain,
+        render.expect("audited normalization captures render statistics"),
+    ))
+}
+
+fn normalize_one_with_roles_impl<P: AsRef<Path>>(
+    input: P,
+    output: P,
+    plan: &Plan,
+    format: OutputFormat,
+    channel_roles: Option<&[ChannelRole]>,
+    capture_statistics: bool,
+) -> Result<(Analysis, f32, Option<RenderStatistics>), String> {
     let an = analyze_file_for_plan(input.as_ref(), channel_roles, plan)?;
     let gain = compute_gain(&an, plan);
     let staged = AtomicOutput::new(output.as_ref())?;
-    normalize_stream(input.as_ref(), staged.path(), &an, gain, plan, format, None)?;
+    let render = normalize_stream(
+        input.as_ref(),
+        staged.path(),
+        &an,
+        gain,
+        plan,
+        format,
+        StreamRenderOptions {
+            opus_album_lufs: None,
+            capture_statistics,
+        },
+    )?;
     finalize_metadata(
         input.as_ref(),
         staged.path(),
@@ -1385,7 +1447,7 @@ pub fn normalize_one_with_roles<P: AsRef<Path>>(
         plan,
     )?;
     staged.commit()?;
-    Ok((an, gain))
+    Ok((an, gain, render))
 }
 
 /// Normalize, re-decode, and automatically compensate for post-encode level
@@ -1418,11 +1480,25 @@ pub fn normalize_one_corrected_with_roles<P: AsRef<Path>>(
     let output = output.as_ref();
     let source = analyze_file_for_plan(input, channel_roles, plan)?;
     let mut gain = compute_gain(&source, plan);
-    let expected_level = analysis_level(&source, plan.mode) + gain_db(gain);
+    let mut intended_level = None;
     let staged = AtomicOutput::new(output)?;
 
     for attempt in 0..=max_retries {
-        normalize_stream(input, staged.path(), &source, gain, plan, format, None)?;
+        let render = normalize_stream(
+            input,
+            staged.path(),
+            &source,
+            gain,
+            plan,
+            format,
+            StreamRenderOptions {
+                opus_album_lufs: None,
+                capture_statistics: true,
+            },
+        )?
+        .expect("corrected normalization captures render statistics");
+        let expected_level =
+            *intended_level.get_or_insert_with(|| analysis_level(&render.intended, plan.mode));
         let verification = verify_file_at_level_with_roles(
             staged.path(),
             expected_level,
@@ -1444,6 +1520,7 @@ pub fn normalize_one_corrected_with_roles<P: AsRef<Path>>(
                 source,
                 gain,
                 verification,
+                render,
                 attempts: attempt + 1,
             });
         }
@@ -1496,6 +1573,43 @@ pub fn normalize_album_with_roles(
     formats: &[OutputFormat],
     channel_roles: Option<&[ChannelRole]>,
 ) -> Result<Vec<(Analysis, f32)>, String> {
+    Ok(
+        normalize_album_with_roles_impl(inputs, outputs, plan, formats, channel_roles, false)?
+            .into_iter()
+            .map(|(analysis, gain, _)| (analysis, gain))
+            .collect(),
+    )
+}
+
+pub fn normalize_album_audited_with_roles(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    channel_roles: Option<&[ChannelRole]>,
+) -> Result<Vec<(Analysis, f32, RenderStatistics)>, String> {
+    Ok(
+        normalize_album_with_roles_impl(inputs, outputs, plan, formats, channel_roles, true)?
+            .into_iter()
+            .map(|(analysis, gain, render)| {
+                (
+                    analysis,
+                    gain,
+                    render.expect("audited album normalization captures render statistics"),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn normalize_album_with_roles_impl(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    channel_roles: Option<&[ChannelRole]>,
+    capture_statistics: bool,
+) -> Result<Vec<(Analysis, f32, Option<RenderStatistics>)>, String> {
     let analyses: Vec<Analysis> = inputs
         .iter()
         .map(|path| analyze_file_for_plan(path, channel_roles, plan))
@@ -1509,14 +1623,17 @@ pub fn normalize_album_with_roles(
     let mut results = Vec::with_capacity(inputs.len());
     for (i, (input, output)) in inputs.iter().zip(staged.iter()).enumerate() {
         let fmt = formats.get(i).copied().unwrap_or(OutputFormat::Wav);
-        normalize_stream(
+        let render = normalize_stream(
             input,
             output.path(),
             &analyses[i],
             gain,
             plan,
             fmt,
-            Some(album_output_lufs),
+            StreamRenderOptions {
+                opus_album_lufs: Some(album_output_lufs),
+                capture_statistics,
+            },
         )?;
         finalize_metadata(
             input,
@@ -1526,7 +1643,7 @@ pub fn normalize_album_with_roles(
             Some(album_output_lufs),
             plan,
         )?;
-        results.push((analyses[i].clone(), gain));
+        results.push((analyses[i].clone(), gain, render));
     }
     for output in staged {
         output.commit()?;
@@ -1579,11 +1696,8 @@ pub fn normalize_album_corrected_with_roles(
         .map(|path| analyze_file_for_plan(path, channel_roles, plan))
         .collect::<Result<_, _>>()?;
     let mut gain = album_gain(&sources, plan);
-    let expected_album_lufs = album_lufs(&sources) + gain_db(gain);
-    let expected_track_levels: Vec<f64> = sources
-        .iter()
-        .map(|source| analysis_level(source, plan.mode) + gain_db(gain))
-        .collect();
+    let mut intended_album_lufs = None;
+    let mut intended_track_levels = None;
     let staged: Vec<AtomicOutput> = outputs
         .iter()
         .map(|output| AtomicOutput::new(output))
@@ -1594,18 +1708,39 @@ pub fn normalize_album_corrected_with_roles(
         .collect();
 
     for attempt in 0..=max_retries {
+        let mut renders = Vec::with_capacity(inputs.len());
         for (index, (input, output)) in inputs.iter().zip(&staged_paths).enumerate() {
             let format = formats.get(index).copied().unwrap_or(OutputFormat::Wav);
-            normalize_stream(
-                input,
-                output,
-                &sources[index],
-                gain,
-                plan,
-                format,
-                Some(album_lufs(&sources) + gain_db(gain)),
-            )?;
+            renders.push(
+                normalize_stream(
+                    input,
+                    output,
+                    &sources[index],
+                    gain,
+                    plan,
+                    format,
+                    StreamRenderOptions {
+                        opus_album_lufs: Some(album_lufs(&sources) + gain_db(gain)),
+                        capture_statistics: true,
+                    },
+                )?
+                .expect("corrected album normalization captures render statistics"),
+            );
         }
+        let expected_album_lufs = *intended_album_lufs.get_or_insert_with(|| {
+            album_lufs(
+                &renders
+                    .iter()
+                    .map(|render| render.intended.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let expected_track_levels = intended_track_levels.get_or_insert_with(|| {
+            renders
+                .iter()
+                .map(|render| analysis_level(&render.intended, plan.mode))
+                .collect::<Vec<_>>()
+        });
         let decoded: Vec<Analysis> = staged_paths
             .iter()
             .map(|path| analyze_file_with_roles(path, channel_roles))
@@ -1613,7 +1748,7 @@ pub fn normalize_album_corrected_with_roles(
         let actual_album_lufs = album_lufs(&decoded);
         let verifications: Vec<Verification> = decoded
             .iter()
-            .zip(&expected_track_levels)
+            .zip(expected_track_levels.iter())
             .map(|(output, expected)| verify_analysis_at_level(output, *expected, plan, tolerance))
             .collect();
         let album_deviation = level_deviation(expected_album_lufs, actual_album_lufs);
@@ -1643,6 +1778,7 @@ pub fn normalize_album_corrected_with_roles(
                 sources,
                 gain,
                 verifications,
+                renders,
                 expected_album_lufs,
                 actual_album_lufs,
                 attempts: attempt + 1,
@@ -1741,6 +1877,12 @@ fn corrected_gain(
     Ok(corrected as f32)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StreamRenderOptions {
+    opus_album_lufs: Option<f64>,
+    capture_statistics: bool,
+}
+
 fn normalize_stream(
     input: &Path,
     output: &Path,
@@ -1748,8 +1890,12 @@ fn normalize_stream(
     gain: f32,
     plan: &Plan,
     format: OutputFormat,
-    _opus_album_lufs: Option<f64>,
-) -> Result<(), String> {
+    options: StreamRenderOptions,
+) -> Result<Option<RenderStatistics>, String> {
+    let StreamRenderOptions {
+        opus_album_lufs: _opus_album_lufs,
+        capture_statistics,
+    } = options;
     let ceiling = 10.0_f64.powf(plan.ceiling_db / 20.0) as f32;
     match format {
         OutputFormat::Wav => {
@@ -1771,14 +1917,23 @@ fn normalize_stream(
                 &metadata_chunks,
             )
             .map_err(|error| format!("write {}: {error}", output.display()))?;
-            process_normalized_stream(input, analysis, gain, ceiling, plan, |planar| {
-                writer
-                    .write_chunk(planar)
-                    .map_err(|error| format!("write {}: {error}", output.display()))
-            })?;
+            let statistics = process_normalized_stream(
+                input,
+                analysis,
+                gain,
+                ceiling,
+                plan,
+                capture_statistics,
+                |planar| {
+                    writer
+                        .write_chunk(planar)
+                        .map_err(|error| format!("write {}: {error}", output.display()))
+                },
+            )?;
             writer
                 .finish()
-                .map_err(|error| format!("write {}: {error}", output.display()))
+                .map_err(|error| format!("write {}: {error}", output.display()))?;
+            Ok(statistics)
         }
         OutputFormat::Flac => {
             let bits = flac_bits(plan.output_kind.unwrap_or(analysis.kind))?;
@@ -1789,10 +1944,17 @@ fn normalize_stream(
                 bits,
                 plan.dither,
             )?;
-            process_normalized_stream(input, analysis, gain, ceiling, plan, |planar| {
-                writer.write_chunk(planar)
-            })?;
-            writer.finish()
+            let statistics = process_normalized_stream(
+                input,
+                analysis,
+                gain,
+                ceiling,
+                plan,
+                capture_statistics,
+                |planar| writer.write_chunk(planar),
+            )?;
+            writer.finish()?;
+            Ok(statistics)
         }
         OutputFormat::Mp3 => {
             #[cfg(feature = "mp3-encoding")]
@@ -1804,10 +1966,17 @@ fn normalize_stream(
                     plan.mp3_bitrate,
                     plan.mp3_quality,
                 )?;
-                process_normalized_stream(input, analysis, gain, ceiling, plan, |planar| {
-                    writer.write_chunk(planar)
-                })?;
-                writer.finish()
+                let statistics = process_normalized_stream(
+                    input,
+                    analysis,
+                    gain,
+                    ceiling,
+                    plan,
+                    capture_statistics,
+                    |planar| writer.write_chunk(planar),
+                )?;
+                writer.finish()?;
+                Ok(statistics)
             }
             #[cfg(not(feature = "mp3-encoding"))]
             {
@@ -1829,10 +1998,17 @@ fn normalize_stream(
                     output_lufs,
                     _opus_album_lufs,
                 )?;
-                process_normalized_stream(input, analysis, gain, ceiling, plan, |planar| {
-                    writer.write_chunk(planar)
-                })?;
-                writer.finish()
+                let statistics = process_normalized_stream(
+                    input,
+                    analysis,
+                    gain,
+                    ceiling,
+                    plan,
+                    capture_statistics,
+                    |planar| writer.write_chunk(planar),
+                )?;
+                writer.finish()?;
+                Ok(statistics)
             }
             #[cfg(not(feature = "opus-encoding"))]
             {
@@ -1859,10 +2035,17 @@ fn normalize_stream(
                     plan.mp3_bitrate,
                     codec,
                 )?;
-                process_normalized_stream(input, analysis, gain, ceiling, plan, |planar| {
-                    writer.write_chunk(planar)
-                })?;
-                writer.finish()
+                let statistics = process_normalized_stream(
+                    input,
+                    analysis,
+                    gain,
+                    ceiling,
+                    plan,
+                    capture_statistics,
+                    |planar| writer.write_chunk(planar),
+                )?;
+                writer.finish()?;
+                Ok(statistics)
             }
             #[cfg(not(feature = "ffmpeg-encoding"))]
             {
@@ -1882,8 +2065,9 @@ fn process_normalized_stream(
     gain: f32,
     ceiling: f32,
     plan: &Plan,
+    capture_statistics: bool,
     mut write: impl FnMut(&[Vec<f32>]) -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<Option<RenderStatistics>, String> {
     let mut limiter = plan
         .limiter
         .map(|config| {
@@ -1895,10 +2079,26 @@ fn process_normalized_stream(
             )
         })
         .transpose()?;
+    if capture_statistics {
+        const MAX_ENVELOPE_POINTS: usize = 10_000;
+        let minimum_interval = (analysis.sample_rate as usize / 10).max(1);
+        let bounded_interval = analysis.frames.div_ceil(MAX_ENVELOPE_POINTS).max(1);
+        if let Some(limiter) = limiter.as_mut() {
+            limiter.set_statistics_interval_frames(minimum_interval.max(bounded_interval));
+        }
+    }
+    let mut statistics = capture_statistics.then(|| RenderStatisticsBuilder::new(analysis));
     let mut converter: Option<SampleRateConverter> = None;
     decoder::decode_stream(input, |info, planar| {
         if info.sample_rate == analysis.sample_rate {
-            return process_normalized_chunk(planar, gain, ceiling, &mut limiter, &mut write);
+            return process_normalized_chunk(
+                planar,
+                gain,
+                ceiling,
+                &mut limiter,
+                &mut statistics,
+                &mut write,
+            );
         }
         if converter.is_none() {
             converter = Some(SampleRateConverter::new_with_expected_output(
@@ -1910,21 +2110,46 @@ fn process_normalized_stream(
             )?);
         }
         converter.as_mut().unwrap().process(planar, |output| {
-            process_normalized_chunk(output, gain, ceiling, &mut limiter, &mut write)
+            process_normalized_chunk(
+                output,
+                gain,
+                ceiling,
+                &mut limiter,
+                &mut statistics,
+                &mut write,
+            )
         })
     })?;
     if let Some(converter) = converter.as_mut() {
         converter.finish(|output| {
-            process_normalized_chunk(output, gain, ceiling, &mut limiter, &mut write)
+            process_normalized_chunk(
+                output,
+                gain,
+                ceiling,
+                &mut limiter,
+                &mut statistics,
+                &mut write,
+            )
         })?;
     }
-    if let Some(limiter) = limiter {
-        let tail = limiter.finish();
+    let limiter_statistics = if let Some(limiter) = limiter {
+        let (tail, limiter_statistics) = if capture_statistics {
+            let (tail, statistics) = limiter.finish_with_statistics();
+            (tail, Some(statistics))
+        } else {
+            (limiter.finish(), None)
+        };
         if tail.first().is_some_and(|channel| !channel.is_empty()) {
+            if let Some(statistics) = statistics.as_mut() {
+                statistics.observe_protected(&tail)?;
+            }
             write(&tail)?;
         }
-    }
-    Ok(())
+        limiter_statistics
+    } else {
+        None
+    };
+    Ok(statistics.map(|statistics| statistics.finish(limiter_statistics)))
 }
 
 fn process_normalized_chunk(
@@ -1932,19 +2157,113 @@ fn process_normalized_chunk(
     gain: f32,
     ceiling: f32,
     limiter: &mut Option<TruePeakLimiter>,
+    statistics: &mut Option<RenderStatisticsBuilder>,
     write: &mut impl FnMut(&[Vec<f32>]) -> Result<(), String>,
 ) -> Result<(), String> {
+    if let Some(statistics) = statistics.as_mut() {
+        statistics.observe_input(planar);
+    }
+    apply_gain(planar, gain);
+    if let Some(statistics) = statistics.as_mut() {
+        statistics.observe_post_gain(planar, ceiling);
+    }
     if let Some(limiter) = limiter.as_mut() {
-        apply_gain(planar, gain);
         let output = limiter.process(planar)?;
         if output.first().is_some_and(|channel| !channel.is_empty()) {
+            if let Some(statistics) = statistics.as_mut() {
+                statistics.observe_protected(&output)?;
+            }
             write(&output)?;
         }
     } else {
-        gain_chunk(planar, gain, ceiling);
+        for channel in planar.iter_mut() {
+            simd::hard_clip(channel, ceiling);
+        }
+        if let Some(statistics) = statistics.as_mut() {
+            statistics.observe_protected(planar)?;
+        }
         write(planar)?;
     }
     Ok(())
+}
+
+struct RenderStatisticsBuilder {
+    analyzer: lufs::StreamingAnalyzer,
+    sample_rate: u32,
+    kind: PcmKind,
+    channels: u16,
+    channel_roles: Vec<ChannelRole>,
+    input_full_scale_exceeding_samples: u64,
+    post_gain_full_scale_exceeding_samples: u64,
+    post_gain_ceiling_exceeding_samples: u64,
+    protected_full_scale_exceeding_samples: u64,
+}
+
+impl RenderStatisticsBuilder {
+    fn new(analysis: &Analysis) -> Self {
+        Self {
+            analyzer: lufs::StreamingAnalyzer::new(
+                analysis.sample_rate,
+                analysis.channel_roles.clone(),
+            ),
+            sample_rate: analysis.sample_rate,
+            kind: analysis.kind,
+            channels: analysis.channels,
+            channel_roles: analysis.channel_roles.clone(),
+            input_full_scale_exceeding_samples: 0,
+            post_gain_full_scale_exceeding_samples: 0,
+            post_gain_ceiling_exceeding_samples: 0,
+            protected_full_scale_exceeding_samples: 0,
+        }
+    }
+
+    fn observe_input(&mut self, planar: &[Vec<f32>]) {
+        self.input_full_scale_exceeding_samples += count_exceeding(planar, 1.0);
+    }
+
+    fn observe_post_gain(&mut self, planar: &[Vec<f32>], ceiling: f32) {
+        self.post_gain_full_scale_exceeding_samples += count_exceeding(planar, 1.0);
+        self.post_gain_ceiling_exceeding_samples += count_exceeding(planar, ceiling);
+    }
+
+    fn observe_protected(&mut self, planar: &[Vec<f32>]) -> Result<(), String> {
+        self.protected_full_scale_exceeding_samples += count_exceeding(planar, 1.0);
+        self.analyzer.process(planar)
+    }
+
+    fn finish(self, limiter: Option<LimiterStatistics>) -> RenderStatistics {
+        let measured = self.analyzer.finish();
+        RenderStatistics {
+            intended: Analysis {
+                sample_rate: self.sample_rate,
+                channels: self.channels,
+                channel_roles: self.channel_roles,
+                frames: measured.frames,
+                kind: self.kind,
+                lufs: measured.ebu.integrated_lufs,
+                max_momentary_lufs: measured.ebu.max_momentary_lufs,
+                max_short_term_lufs: measured.ebu.max_short_term_lufs,
+                loudness_range_lu: measured.ebu.loudness_range_lu,
+                rms_db: measured.rms_db,
+                sample_peak: measured.sample_peak,
+                true_peak: measured.true_peak,
+                loudness_blocks: measured.ebu.gating_blocks,
+            },
+            input_full_scale_exceeding_samples: self.input_full_scale_exceeding_samples,
+            post_gain_full_scale_exceeding_samples: self.post_gain_full_scale_exceeding_samples,
+            post_gain_ceiling_exceeding_samples: self.post_gain_ceiling_exceeding_samples,
+            protected_full_scale_exceeding_samples: self.protected_full_scale_exceeding_samples,
+            limiter,
+        }
+    }
+}
+
+fn count_exceeding(planar: &[Vec<f32>], threshold: f32) -> u64 {
+    planar
+        .iter()
+        .flat_map(|channel| channel.iter())
+        .filter(|sample| sample.abs() > threshold)
+        .count() as u64
 }
 
 fn flac_bits(kind: PcmKind) -> Result<u16, String> {
@@ -1957,13 +2276,6 @@ fn flac_bits(kind: PcmKind) -> Result<u16, String> {
 fn apply_gain(planar: &mut [Vec<f32>], gain: f32) {
     for channel in planar {
         simd::apply_gain(channel, gain);
-    }
-}
-
-fn gain_chunk(planar: &mut [Vec<f32>], gain: f32, ceiling: f32) {
-    for channel in planar {
-        simd::apply_gain(channel, gain);
-        simd::hard_clip(channel, ceiling);
     }
 }
 
@@ -2026,6 +2338,22 @@ mod tests {
         let corrected = corrected_gain(1.0, &verification, &plan()).unwrap();
 
         assert!((gain_db(corrected) - (-0.8)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn digital_silence_uses_finite_unity_gain() {
+        let silence = Analysis {
+            lufs: f64::NEG_INFINITY,
+            rms_db: f64::NEG_INFINITY,
+            sample_peak: 0.0,
+            true_peak: 0.0,
+            ..analysis(-16.0, -120.0)
+        };
+        for mode in [Mode::Lufs, Mode::Peak, Mode::Rms] {
+            let mut plan = plan();
+            plan.mode = mode;
+            assert_eq!(compute_gain(&silence, &plan), 1.0);
+        }
     }
 
     #[test]
