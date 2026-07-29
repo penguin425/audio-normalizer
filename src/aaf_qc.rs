@@ -195,6 +195,11 @@ pub(crate) fn audit(
             clsid: entry.is_storage().then(|| entry.clsid().to_string()),
         })
         .collect();
+    let stream_paths: HashSet<PathBuf> = entries
+        .iter()
+        .filter(|entry| entry.stream)
+        .map(|entry| entry.path.clone())
+        .collect();
     let entry_limit_ok = entries.len() <= MAX_ENTRIES;
     wrapper.push(check(
         "FORGE-AAF-ENTRY-LIMIT",
@@ -487,7 +492,11 @@ pub(crate) fn audit(
                 properties,
             });
         }
-        Some(crate::aaf_object_qc::audit(&objects, &index_streams))
+        Some(crate::aaf_object_qc::audit(
+            &objects,
+            &index_streams,
+            &stream_paths,
+        ))
     } else {
         None
     };
@@ -502,8 +511,8 @@ pub(crate) fn audit(
         bitstream,
         xcheck,
         json!({
-            "method": "forge-aaf-object-model-edit-protocol-v1",
-            "scope": "bounded CFB, stored-property, core AAF object-model, ownership/reference graph, edit timeline, and supported AAF Edit Protocol QC; extension classes are preserved and reported, external resources are never fetched, and this is not an AAF SDK certification",
+            "method": "forge-aaf-metadictionary-object-model-edit-protocol-v2",
+            "scope": "bounded CFB, stored-property, dynamic MetaDictionary type/class/property interpretation, extension-value validation, core AAF object-model, ownership/reference graph, edit timeline, and supported AAF Edit Protocol QC; opaque payloads are preserved, external resources are never fetched, and this is not an AAF SDK certification",
             "file_size_bytes": file_size,
             "cfb": {
                 "version": version.number(),
@@ -699,19 +708,33 @@ mod tests {
     }
 
     #[test]
-    fn bounded_aaf_fixture_passes_and_reports_structure() {
+    fn bounded_aaf_fixture_reports_missing_meta_dictionary_definitions() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("minimal.aaf");
         write_aaf_fixture(&path, false);
 
         let audit = crate::container_qc::audit(&path).unwrap();
-        assert!(audit.passed, "{audit:#?}");
+        assert!(!audit.passed, "{audit:#?}");
         assert_eq!(audit.format, "aaf");
         assert_eq!(
             audit.properties["method"],
-            "forge-aaf-object-model-edit-protocol-v1"
+            "forge-aaf-metadictionary-object-model-edit-protocol-v2"
         );
         assert_eq!(audit.properties["stored_properties"]["streams"], 2);
+        let failures: Vec<_> = audit
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.checks)
+            .filter(|check| !check.passed)
+            .map(|check| check.rule_id)
+            .collect();
+        assert_eq!(
+            failures,
+            [
+                "FORGE-AAF-METADICTIONARY-DEFINITIONS",
+                "FORGE-AAF-EXTENSION-PROPERTY-TYPES"
+            ]
+        );
     }
 
     #[test]

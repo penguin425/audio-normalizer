@@ -33,7 +33,7 @@ for name in empty.aaf sector_size_512.aaf; do
     target/debug/forge-container-qc "${CACHE_DIR}/${name}" > "${report}"
     jq --exit-status '
         .passed == true
-        and .properties.method == "forge-aaf-object-model-edit-protocol-v1"
+        and .properties.method == "forge-aaf-metadictionary-object-model-edit-protocol-v2"
         and ([.layers[].checks[] | select(.passed == false)] | length) == 0
         and .properties.object_model.objects > 0
         and .properties.object_model.strong_references
@@ -61,6 +61,16 @@ jq --exit-status '
     and ([.layers[].checks[]
         | select(.rule_id == "FORGE-AAF-STRONG-REFERENCES")
         | .passed] == [true])
+    and ([.layers[].checks[]
+        | select(.rule_id == "FORGE-AAF-METADICTIONARY-DEFINITIONS")
+        | .passed] == [true])
+    and ([.layers[].checks[]
+        | select(.rule_id == "FORGE-AAF-EXTENSION-PROPERTY-TYPES")
+        | .passed] == [true])
+    and .properties.object_model.meta_dictionary.class_definitions == 79
+    and .properties.object_model.meta_dictionary.type_definitions == 146
+    and .properties.object_model.meta_dictionary.extension_property_definitions == 71
+    and .properties.object_model.meta_dictionary.interpreted_extension_values == 1116
 ' "${nonconformant_report}" > /dev/null
 
 echo "AAF public-fixture interoperability checks passed"

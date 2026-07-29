@@ -103,7 +103,11 @@ impl Findings {
     }
 }
 
-pub(crate) fn audit(objects: &[StoredObject], streams: &HashMap<PathBuf, Vec<u8>>) -> ObjectAudit {
+pub(crate) fn audit(
+    objects: &[StoredObject],
+    streams: &HashMap<PathBuf, Vec<u8>>,
+    stream_paths: &HashSet<PathBuf>,
+) -> ObjectAudit {
     let by_path: HashMap<&Path, &StoredObject> = objects
         .iter()
         .map(|object| (object.path.as_path(), object))
@@ -145,6 +149,9 @@ pub(crate) fn audit(objects: &[StoredObject], streams: &HashMap<PathBuf, Vec<u8>
         "strong-reference names, indexes, and owned objects are consistent",
         "one or more strong-reference names or indexes are inconsistent",
     ));
+
+    let meta_audit = crate::aaf_meta_qc::audit(objects, streams, stream_paths, &references);
+    checks.extend(meta_audit.checks);
 
     let weak_reference_errors = validate_weak_references(objects, streams);
     checks.push(finding_check(
@@ -251,6 +258,7 @@ pub(crate) fn audit(objects: &[StoredObject], streams: &HashMap<PathBuf, Vec<u8>
             "slots": summary.slot_count,
             "components": summary.component_count,
             "extension_classes": extension_classes.len(),
+            "meta_dictionary": meta_audit.properties,
             "warning_count": warnings.total,
             "warnings": warnings.values
         }),
@@ -2117,7 +2125,7 @@ mod tests {
                 properties: Vec::new(),
             },
         ];
-        let audit = audit(&objects, &HashMap::new());
+        let audit = audit(&objects, &HashMap::new(), &HashSet::new());
         let required = audit
             .checks
             .iter()
