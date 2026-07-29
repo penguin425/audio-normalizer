@@ -1,6 +1,6 @@
 //! ISO/IEC 23009-1 DASH MPD validation with bounded local CMAF checks.
 
-use crate::{container_qc, dash_patch};
+use crate::{container_qc, dash_observe, dash_patch};
 use base64::Engine as _;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
@@ -344,6 +344,286 @@ pub fn audit_with_patch(
         );
     }
     Ok(audit)
+}
+
+pub fn observation_targets(
+    path: &Path,
+) -> Result<Vec<dash_observe::DashObservationTarget>, String> {
+    let mpd = load_mpd(path)?;
+    Ok(observation_targets_for_mpd(&mpd))
+}
+
+pub fn observation_targets_with_patch(
+    base_path: &Path,
+    patch_path: &Path,
+) -> Result<Vec<dash_observe::DashObservationTarget>, String> {
+    let base_xml = load_bounded_xml(base_path, "MPD")?;
+    let patch_xml = load_bounded_xml(patch_path, "MPD Patch")?;
+    let applied = dash_patch::apply(&base_xml, &patch_xml)?;
+    let mpd = parse_mpd(&applied.xml)?;
+    Ok(observation_targets_for_mpd(&mpd))
+}
+
+pub fn attach_observation_report(
+    audit: &mut DashAudit,
+    report: dash_observe::DashObservationReport,
+) -> Result<(), String> {
+    for entry in &report.entries {
+        let (rule_id, noun) = match entry.kind {
+            dash_observe::DashObservationKind::UtcHttpXsdate
+            | dash_observe::DashObservationKind::UtcHttpIso
+            | dash_observe::DashObservationKind::UtcHttpHead => {
+                ("FORGE-DASH-REMOTE-CLOCK", "clock")
+            }
+            dash_observe::DashObservationKind::OriginResource => {
+                ("FORGE-DASH-REMOTE-ORIGIN", "origin resource")
+            }
+        };
+        audit.findings.push(finding(
+            rule_id,
+            Severity::Error,
+            entry.passed,
+            format!("bounded {noun} observation passed: {}", entry.label),
+            Some(
+                serde_json::to_value(entry)
+                    .map_err(|error| format!("serialize DASH observation entry: {error}"))?,
+            ),
+        ));
+    }
+    audit.findings.push(finding(
+        "FORGE-DASH-REMOTE-OBSERVATION",
+        Severity::Error,
+        report.passed && !report.entries.is_empty(),
+        "every planned DASH clock and origin observation completed within policy",
+        Some(json!({
+            "target_count": report.target_count,
+            "request_count": report.request_count
+        })),
+    ));
+    audit.warning_count = audit
+        .findings
+        .iter()
+        .filter(|item| item.severity == Severity::Warning && !item.passed)
+        .count();
+    audit.passed = audit
+        .findings
+        .iter()
+        .all(|item| item.severity == Severity::Warning || item.passed);
+    audit
+        .properties
+        .as_object_mut()
+        .ok_or_else(|| "DASH audit properties are not an object".to_string())?
+        .insert(
+            "remote_observation".into(),
+            serde_json::to_value(report)
+                .map_err(|error| format!("serialize DASH observation report: {error}"))?,
+        );
+    Ok(())
+}
+
+fn observation_targets_for_mpd(mpd: &Mpd) -> Vec<dash_observe::DashObservationTarget> {
+    let mut targets = Vec::new();
+    let mut unique = HashSet::new();
+    for timing in &mpd.utc_timings {
+        let (Some(scheme), Some(uri)) = (timing.scheme_id_uri.as_deref(), timing.value.as_deref())
+        else {
+            continue;
+        };
+        let kind = match scheme {
+            "urn:mpeg:dash:utc:http-xsdate:2014" => {
+                dash_observe::DashObservationKind::UtcHttpXsdate
+            }
+            "urn:mpeg:dash:utc:http-iso:2014" => dash_observe::DashObservationKind::UtcHttpIso,
+            "urn:mpeg:dash:utc:http-head:2014" => dash_observe::DashObservationKind::UtcHttpHead,
+            _ => continue,
+        };
+        push_observation_target(
+            &mut targets,
+            &mut unique,
+            kind,
+            uri.to_owned(),
+            format!("UTCTiming {scheme}"),
+        );
+    }
+
+    let period_starts = resolved_period_starts(&mpd.periods);
+    for (period_index, period) in mpd.periods.iter().enumerate() {
+        let period_start = period_starts
+            .get(period_index)
+            .copied()
+            .flatten()
+            .unwrap_or(0.0);
+        let period_duration = period
+            .duration
+            .or_else(|| {
+                period_starts
+                    .get(period_index + 1)
+                    .copied()
+                    .flatten()
+                    .map(|next| next - period_start)
+            })
+            .or_else(|| {
+                mpd.media_presentation_duration
+                    .map(|duration| duration - period_start)
+            })
+            .filter(|duration| *duration >= 0.0);
+        for (adaptation_index, adaptation) in period.adaptations.iter().enumerate() {
+            for (representation_index, representation) in
+                adaptation.representations.iter().enumerate()
+            {
+                let Some(base_url) =
+                    resolved_observation_base_url(mpd, period, adaptation, representation)
+                else {
+                    continue;
+                };
+                let (_, addressing) = resolve_addressing(representation, adaptation, period);
+                let resource = addressing.and_then(|addressing| match addressing {
+                    ResolvedAddressing::Template(template) => observation_template_resource(
+                        representation,
+                        &template,
+                        &base_url,
+                        period_duration,
+                    ),
+                    ResolvedAddressing::List(list) => list
+                        .segment_urls
+                        .last()
+                        .and_then(|segment| segment.media.as_deref())
+                        .and_then(|media| resolve_observation_uri(&base_url, media))
+                        .or_else(|| {
+                            list.base
+                                .initialization
+                                .as_ref()
+                                .and_then(|initialization| {
+                                    resolve_observation_uri(
+                                        &base_url,
+                                        initialization.source_url.as_deref().unwrap_or(""),
+                                    )
+                                })
+                        }),
+                    ResolvedAddressing::Base(_) => Some(base_url.clone()),
+                });
+                let Some(uri) = resource.filter(|uri| is_remote_http_uri(uri)) else {
+                    continue;
+                };
+                let representation_label = representation
+                    .id
+                    .as_deref()
+                    .map_or_else(|| representation_index.to_string(), str::to_owned);
+                push_observation_target(
+                    &mut targets,
+                    &mut unique,
+                    dash_observe::DashObservationKind::OriginResource,
+                    uri,
+                    format!(
+                        "Period {period_index} AdaptationSet {adaptation_index} Representation {representation_label}"
+                    ),
+                );
+            }
+        }
+    }
+    if !targets
+        .iter()
+        .any(|target| target.kind == dash_observe::DashObservationKind::OriginResource)
+    {
+        if let Some(uri) = mpd
+            .base_url
+            .as_ref()
+            .and_then(|base| base.value.as_ref())
+            .filter(|uri| is_remote_http_uri(uri))
+        {
+            push_observation_target(
+                &mut targets,
+                &mut unique,
+                dash_observe::DashObservationKind::OriginResource,
+                uri.clone(),
+                "MPD BaseURL".into(),
+            );
+        }
+    }
+    targets
+}
+
+fn observation_template_resource(
+    representation: &Representation,
+    template: &SegmentTemplate,
+    base_url: &str,
+    period_duration: Option<f64>,
+) -> Option<String> {
+    let id = representation.id.as_deref().unwrap_or("");
+    if let (Some(media), Ok(segments)) = (
+        template.media.as_deref(),
+        expand_timeline(template, period_duration),
+    ) {
+        if let Some((index, time)) = segments.into_iter().enumerate().next_back() {
+            let number = effective_start_number(template).saturating_add(index as u64);
+            let resource = substitute_template(media, id, representation.bandwidth, number, time);
+            if !resource.contains('$') {
+                return resolve_observation_uri(base_url, &resource);
+            }
+        }
+    }
+    let resource = substitute_template(
+        template.initialization.as_deref()?,
+        id,
+        representation.bandwidth,
+        effective_start_number(template),
+        0,
+    );
+    (!resource.contains('$'))
+        .then(|| resolve_observation_uri(base_url, &resource))
+        .flatten()
+}
+
+fn push_observation_target(
+    targets: &mut Vec<dash_observe::DashObservationTarget>,
+    unique: &mut HashSet<(dash_observe::DashObservationKind, String)>,
+    kind: dash_observe::DashObservationKind,
+    uri: String,
+    label: String,
+) {
+    if unique.insert((kind, uri.clone())) {
+        targets.push(dash_observe::DashObservationTarget { kind, uri, label });
+    }
+}
+
+fn is_remote_http_uri(value: &str) -> bool {
+    url::Url::parse(value)
+        .ok()
+        .is_some_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+}
+
+fn resolved_observation_base_url(
+    mpd: &Mpd,
+    period: &Period,
+    adaptation: &AdaptationSet,
+    representation: &Representation,
+) -> Option<String> {
+    let mut result: Option<url::Url> = None;
+    for layer in [
+        mpd.base_url.as_ref(),
+        period.base_url.as_ref(),
+        adaptation.base_url.as_ref(),
+        representation.base_url.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|base_url| base_url.value.as_deref())
+    {
+        result = Some(match result {
+            Some(base) => base.join(layer).ok()?,
+            None => url::Url::parse(layer).ok()?,
+        });
+    }
+    result
+        .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+        .map(Into::into)
+}
+
+fn resolve_observation_uri(base_url: &str, resource: &str) -> Option<String> {
+    let base = url::Url::parse(base_url).ok()?;
+    let resolved = base.join(resource).ok()?;
+    (matches!(resolved.scheme(), "http" | "https") && resolved.host_str().is_some())
+        .then(|| resolved.into())
 }
 
 fn complete_update_audit(
@@ -4324,7 +4604,7 @@ fn looks_like_xs_datetime(value: &str) -> bool {
         })
 }
 
-fn parse_xs_datetime_seconds(value: &str) -> Option<f64> {
+pub(crate) fn parse_xs_datetime_seconds(value: &str) -> Option<f64> {
     if !looks_like_xs_datetime(value) || !has_datetime_zone(value) {
         return None;
     }
@@ -4789,6 +5069,65 @@ mod tests {
  </Period>
 </MPD>"#
         )
+    }
+
+    #[test]
+    fn plans_remote_clock_and_latest_advertised_origin_resource() {
+        let mpd = parse_mpd(
+            br#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic"
+ availabilityStartTime="2026-07-29T00:00:00Z" publishTime="2026-07-29T00:00:20Z"
+ minimumUpdatePeriod="PT2S" minBufferTime="PT1S">
+ <UTCTiming schemeIdUri="urn:mpeg:dash:utc:http-head:2014"
+  value="https://clock.example.test/time"/>
+ <BaseURL>https://media.example.test/live/</BaseURL>
+ <Period start="PT0S"><AdaptationSet contentType="audio" mimeType="audio/mp4">
+  <SegmentTemplate timescale="10" initialization="init-$RepresentationID$.mp4"
+   media="$RepresentationID$-$Time$.m4s">
+   <SegmentTimeline><S t="0" d="10" r="2"/></SegmentTimeline>
+  </SegmentTemplate>
+  <Representation id="audio" bandwidth="64000"/>
+ </AdaptationSet></Period>
+</MPD>"#,
+        )
+        .unwrap();
+        let targets = observation_targets_for_mpd(&mpd);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(
+            targets[0].kind,
+            dash_observe::DashObservationKind::UtcHttpHead
+        );
+        assert_eq!(targets[0].uri, "https://clock.example.test/time");
+        assert_eq!(
+            targets[1].kind,
+            dash_observe::DashObservationKind::OriginResource
+        );
+        assert_eq!(
+            targets[1].uri,
+            "https://media.example.test/live/audio-20.m4s"
+        );
+    }
+
+    #[test]
+    fn resolves_layered_remote_base_urls_and_templates_without_representation_ids() {
+        let mpd = parse_mpd(
+            br#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+ mediaPresentationDuration="PT2S" minBufferTime="PT1S">
+ <BaseURL>https://media.example.test/root/manifest.mpd</BaseURL>
+ <Period><BaseURL>/live/</BaseURL>
+  <AdaptationSet contentType="audio"><BaseURL>audio/</BaseURL>
+   <SegmentTemplate timescale="1" duration="2" media="$Bandwidth$-$Number$.m4s"/>
+   <Representation bandwidth="64000"><BaseURL>primary/</BaseURL></Representation>
+  </AdaptationSet>
+ </Period>
+</MPD>"#,
+        )
+        .unwrap();
+        let targets = observation_targets_for_mpd(&mpd);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].uri,
+            "https://media.example.test/live/audio/primary/64000-1.m4s"
+        );
     }
 
     #[test]

@@ -1,6 +1,31 @@
 use serde_json::Value;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::process::Command;
+use std::thread;
+use std::time::SystemTime;
+
+fn serve_http(responses: Vec<String>) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        for response in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    (format!("http://{address}"), handle)
+}
 
 #[test]
 fn streaming_qc_cli_separates_errors_from_apple_warnings() {
@@ -138,6 +163,64 @@ fn streaming_qc_cli_selects_dash_live_profile() {
     assert_eq!(audit["profile"], "dash-live");
     assert!(audit["findings"].as_array().unwrap().iter().any(|finding| {
         finding["rule_id"] == "FORGE-DASH-LIVE-UTC-TIMING" && finding["passed"] == true
+    }));
+}
+
+#[test]
+fn streaming_qc_cli_observes_allowlisted_dash_clock_and_origin() {
+    let date = httpdate::fmt_http_date(SystemTime::now());
+    let (origin, server) = serve_http(vec![
+        format!(
+            "HTTP/1.1 200 OK\r\nDate: {date}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ),
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/8\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\nx".into(),
+    ]);
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("observed.mpd");
+    fs::write(
+        &input,
+        format!(
+            r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+ mediaPresentationDuration="PT2S" minBufferTime="PT1S">
+ <UTCTiming schemeIdUri="urn:mpeg:dash:utc:http-head:2014"
+  value="{origin}/clock"/>
+ <BaseURL>{origin}/live/</BaseURL>
+ <Period><AdaptationSet contentType="audio" mimeType="audio/mp4" codecs="opus">
+  <SegmentTemplate timescale="1" duration="2"
+   initialization="init-$RepresentationID$.mp4" media="$RepresentationID$-$Number$.m4s"/>
+  <Representation id="a1" bandwidth="96000"/>
+ </AdaptationSet></Period>
+</MPD>"#
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-streaming-qc"))
+        .arg(&input)
+        .args([
+            "--profile",
+            "iso23009",
+            "--observe-remote",
+            "--allow-origin",
+            &origin,
+            "--observation-max-clock-offset-ms",
+            "2000",
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(audit["properties"]["remote_observation"]["passed"], true);
+    assert_eq!(
+        audit["properties"]["remote_observation"]["request_count"],
+        2
+    );
+    assert!(audit["findings"].as_array().unwrap().iter().any(|finding| {
+        finding["rule_id"] == "FORGE-DASH-REMOTE-CLOCK" && finding["passed"] == true
+    }));
+    assert!(audit["findings"].as_array().unwrap().iter().any(|finding| {
+        finding["rule_id"] == "FORGE-DASH-REMOTE-ORIGIN" && finding["passed"] == true
     }));
 }
 
