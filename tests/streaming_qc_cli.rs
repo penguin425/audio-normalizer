@@ -195,6 +195,80 @@ fn streaming_qc_cli_compares_successive_dash_snapshots() {
 }
 
 #[test]
+fn streaming_qc_cli_applies_and_audits_dash_mpd_patch() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = directory.path().join("base.mpd");
+    let patch = directory.path().join("update.mpp");
+    fs::write(
+        &base,
+        r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" id="live"
+ type="dynamic" availabilityStartTime="2026-07-29T00:00:00Z"
+ publishTime="2026-07-29T00:00:20Z" minimumUpdatePeriod="PT2S"
+ minBufferTime="PT1S">
+ <BaseURL>https://example.invalid/live/</BaseURL>
+ <PatchLocation ttl="60">update.mpp</PatchLocation>
+ <Period id="p0" start="PT0S">
+  <AdaptationSet id="audio" contentType="audio" mimeType="audio/mp4"
+   codecs="opus" lang="en" audioSamplingRate="48000">
+   <SegmentTemplate timescale="10" initialization="init-$RepresentationID$.mp4"
+    media="$RepresentationID$-$Time$.m4s">
+    <SegmentTimeline><S t="0" d="10"/><S t="10" d="10"/><S t="20" d="10"/></SegmentTimeline>
+   </SegmentTemplate>
+   <Representation id="a1" bandwidth="64000"/>
+  </AdaptationSet>
+ </Period>
+</MPD>"#,
+    )
+    .unwrap();
+    fs::write(
+        &patch,
+        r#"<Patch xmlns="urn:mpeg:dash:schema:mpd-patch:2020"
+ mpdId="live" originalPublishTime="2026-07-29T00:00:20Z"
+ publishTime="2026-07-29T00:00:22Z">
+ <replace sel="/MPD/@publishTime">2026-07-29T00:00:22Z</replace>
+ <replace sel="/MPD/PatchLocation[1]"><PatchLocation ttl="60">next.mpp</PatchLocation></replace>
+ <remove sel="/MPD/Period[@id='p0']/AdaptationSet[@id='audio']/SegmentTemplate/SegmentTimeline/S[1]"/>
+ <add sel="/MPD/Period[@id='p0']/AdaptationSet[@id='audio']/SegmentTemplate/SegmentTimeline/S[2]" pos="after"><S t="30" d="10"/></add>
+</Patch>"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-streaming-qc"))
+        .arg(&base)
+        .args(["--profile", "iso23009", "--mpd-patch"])
+        .arg(&patch)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        audit["properties"]["patch_path"],
+        patch.to_string_lossy().as_ref()
+    );
+    assert_eq!(audit["properties"]["patch_operation_count"], 4);
+    assert_eq!(audit["properties"]["publish_time"], "2026-07-29T00:00:22Z");
+    assert!(audit["findings"].as_array().unwrap().iter().any(|finding| {
+        finding["rule_id"] == "FORGE-DASH-PATCH-RESULT-PUBLISH-TIME" && finding["passed"] == true
+    }));
+
+    let mismatched = fs::read_to_string(&patch)
+        .unwrap()
+        .replace(r#"mpdId="live""#, r#"mpdId="different""#);
+    fs::write(&patch, mismatched).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-streaming-qc"))
+        .arg(&base)
+        .args(["--profile", "iso23009", "--mpd-patch"])
+        .arg(&patch)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:#?}");
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(audit["findings"].as_array().unwrap().iter().any(|finding| {
+        finding["rule_id"] == "FORGE-DASH-PATCH-MPD-ID" && finding["passed"] == false
+    }));
+}
+
+#[test]
 fn streaming_qc_cli_cross_checks_mpegts_segment_boundaries() {
     if !Command::new("ffmpeg")
         .arg("-version")
