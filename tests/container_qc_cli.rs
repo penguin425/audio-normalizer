@@ -424,7 +424,7 @@ fn container_qc_cli_audits_standalone_iamf_obu_structure() {
         0,
         &[0, b'i', b'p', b'c', b'm', 1, 0, 0, 0, 16, 0, 0, 187, 128],
     ));
-    bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0]));
+    bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0, 0x20, 0, 1, 0]));
     bytes.extend(obu(2, &[0]));
     bytes.extend(obu(6, &[0]));
     fs::write(&path, bytes).unwrap();
@@ -448,9 +448,18 @@ fn container_qc_cli_audits_standalone_iamf_obu_structure() {
         audit["properties"]["audio_elements"][0]["audio_substream_ids"],
         serde_json::json!([0])
     );
+    assert_eq!(
+        audit["properties"]["audio_elements"][0]["highest_layout"],
+        "Mono"
+    );
+    assert_eq!(
+        audit["properties"]["audio_elements"][0]["output_channels"],
+        1
+    );
     assert_eq!(audit["properties"]["audio_frame_counts"]["0"], 1);
     for rule_id in [
         "FORGE-IAMF-CODEC-CONFIG",
+        "FORGE-IAMF-AUDIO-ELEMENT",
         "FORGE-IAMF-DESCRIPTOR-LINKS",
         "FORGE-IAMF-AUDIO-FRAME-LINKS",
     ] {
@@ -461,6 +470,49 @@ fn container_qc_cli_audits_standalone_iamf_obu_structure() {
             .flat_map(|layer| layer["checks"].as_array().unwrap())
             .any(|check| check["rule_id"] == rule_id && check["passed"] == true));
     }
+}
+
+#[test]
+fn container_qc_cli_rejects_invalid_iamf_audio_element_layouts() {
+    fn obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![obu_type << 3, payload.len() as u8];
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("bad-audio-element.iamf");
+    let mut bytes = obu(31, b"iamf\x00\x00");
+    bytes.extend(obu(
+        0,
+        &[0, b'i', b'p', b'c', b'm', 1, 0, 0, 0, 16, 0, 0, 187, 128],
+    ));
+    // The outer OBU declares one substream, but the Stereo layer needs two
+    // mono substreams (or one coupled substream) to reconstruct two channels.
+    bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0, 0x20, 0x10, 1, 0]));
+    bytes.extend(obu(2, &[0]));
+    bytes.extend(obu(6, &[0]));
+    fs::write(&path, bytes).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let audit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(audit["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|layer| layer["checks"].as_array().unwrap())
+        .any(|check| {
+            check["rule_id"] == "FORGE-IAMF-AUDIO-ELEMENT" && check["passed"] == false
+        }));
+    assert!(audit["properties"]["payload_errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|error| error.as_str().unwrap().contains("expected 2")));
 }
 
 #[test]
@@ -479,7 +531,7 @@ fn container_qc_cli_rejects_oversized_and_misordered_iamf_obus() {
         &[0, b'i', b'p', b'c', b'm', 1, 0, 0, 0, 16, 0, 0, 187, 128],
     ));
     bytes.extend(obu(2, &[0]));
-    bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0]));
+    bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0, 0x20, 0, 1, 0]));
     bytes.extend(obu(6, &[0]));
     fs::write(&order_path, bytes).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
@@ -536,7 +588,7 @@ fn container_qc_cli_rejects_invalid_iamf_codec_and_substream_links() {
         0,
         &[0, b'i', b'p', b'c', b'm', 1, 0, 1, 0, 16, 0, 0, 187, 128],
     ));
-    bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0]));
+    bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0, 0x20, 0, 1, 0]));
     bytes.extend(obu(2, &[0]));
     bytes.extend(obu(6, &[0]));
     fs::write(&bad_codec, bytes).unwrap();
@@ -556,7 +608,7 @@ fn container_qc_cli_rejects_invalid_iamf_codec_and_substream_links() {
         0,
         &[0, b'i', b'p', b'c', b'm', 1, 0, 0, 0, 16, 0, 0, 187, 128],
     ));
-    bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0]));
+    bytes.extend(obu(1, &[0, 0, 0, 1, 0, 0, 0x20, 0, 1, 0]));
     bytes.extend(obu(2, &[0]));
     bytes.extend(obu(7, &[0]));
     fs::write(&bad_frame, bytes).unwrap();
