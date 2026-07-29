@@ -552,16 +552,17 @@ Pass an RFC 5261 / MPEG-DASH patch as `--mpd-patch update.mpp`, with the base
 MPD as the positional input, to apply each operation in document order and
 audit the derived MPD as a successive update. Forge checks `mpdId`,
 `originalPublishTime`, and `publishTime`, requires every selector to resolve
-to exactly one node, and supports the common DASH patch forms: element and
-attribute `add`, `replace`, and `remove`; `prepend`, `before`, and `after`;
-one-based position predicates; and attribute, child-value, or string-value
-predicates. Inputs are bounded by the MPD size, element, depth, and operation
-limits. Unsupported RFC 5261 selector/node forms fail closed.
+to exactly one node, and supports namespace-URI-aware element and attribute
+QNames; text, comment, and processing-instruction node tests; prefixed
+namespace-axis selection; element, attribute, namespace, and mixed-node
+`add`, `replace`, and `remove`; `prepend`, `before`, and `after`; one-based
+position predicates; and attribute, child-value, or string-value predicates.
+Inputs are bounded by the MPD size, element, depth, and operation limits.
+Unsupported selector functions such as XPath `id()` fail closed.
 
 This remains a static, local package audit. It does not fetch clock servers or
 remote media, observe the origin/CDN availability window, validate HTTP
-chunked transfer, implement RFC 5261 comment/processing-instruction/namespace
-node patching, or observe a live update cadence.
+chunked transfer, or observe a live update cadence.
 
 The profiles track
 [ISO/IEC 23009-1:2026 MPEG-DASH](https://www.iso.org/standard/23009-1), the
