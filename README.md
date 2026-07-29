@@ -560,9 +560,35 @@ position predicates; and attribute, child-value, or string-value predicates.
 Inputs are bounded by the MPD size, element, depth, and operation limits.
 Unsupported selector functions such as XPath `id()` fail closed.
 
-This remains a static, local package audit. It does not fetch clock servers or
-remote media, observe the origin/CDN availability window, validate HTTP
-chunked transfer, or observe a live update cadence.
+Remote access remains disabled by default. Add `--observe-remote` and repeat
+`--allow-origin` for every exact HTTP(S) scheme/host/port that Forge may
+contact:
+
+```bash
+forge-streaming-qc live.mpd --profile dash-live \
+  --observe-remote \
+  --allow-origin https://time.example.net \
+  --allow-origin https://cdn.example.net
+```
+
+Forge then performs a bounded, one-shot observation of supported remote
+`UTCTiming` sources and up to one advertised media, initialization, or indexed
+resource per Representation (with duplicate URIs collapsed). Origin resources
+use a `bytes=0-0` range GET;
+HTTP HEAD clock sources use the response `Date`, and xsdate/ISO clock sources
+use their bounded response body. Every initial and redirected URI must match
+an explicit origin allowlist entry. Environment proxy settings are ignored,
+credentials and URL fragments are rejected, and query values are redacted
+from the report. The defaults are a 5-second timeout per HTTP transaction,
+64-KiB response limit, two redirects per target, 32 total transactions, and a
+5-second maximum absolute clock offset. The corresponding
+`--observation-*` options can adjust these values only within hard safety
+ceilings.
+
+`properties.remote_observation` records the policy, selected response
+headers, redirect chains, status, elapsed time, retained byte count, and clock
+offset for every target. This is not a sustained availability-window or live
+cadence test, and it does not claim to validate HTTP chunk delivery.
 
 The profiles track
 [ISO/IEC 23009-1:2026 MPEG-DASH](https://www.iso.org/standard/23009-1), the

@@ -56,6 +56,9 @@ Forge already provides:
 - Bounded MPD Patch application and successive-update QC with namespace-aware
   RFC 5261 element, attribute, text, comment, processing-instruction, and
   namespace selectors plus add/replace/remove positioning.
+- Explicitly allowlisted DASH clock/origin observation with per-request time
+  and byte limits, redirect reauthorization, request caps, clock-offset
+  checks, and a redacted fetch manifest.
 - HLS, DASH, and CMAF package checks; ISO loudness and MPEG-D DRC metadata.
 - ADM, S-ADM, presentation-aware rendering/QC, C2PA validation, CI comparison,
   real-time processing, LV2, and CLAP integration.
@@ -119,7 +122,6 @@ generations.
 
 ### Streaming and platform delivery
 
-- Allowlisted DASH clock/origin observation.
 - CMAF switching-set alignment across audio renditions and languages.
 - MPEG-DASH loudness/DRC descriptors and HLS timed-ID3 loudness metadata.
 - Remote-resource auditing only behind explicit allowlists, byte/time limits,
