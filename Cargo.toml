@@ -89,6 +89,10 @@ name = "forge-imf-qc"
 path = "src/bin/forge-imf-qc.rs"
 
 [[bin]]
+name = "forge-aes31-qc"
+path = "src/bin/forge-aes31-qc.rs"
+
+[[bin]]
 name = "forge-rtp-qc"
 path = "src/bin/forge-rtp-qc.rs"
 

@@ -814,6 +814,23 @@ fn emitted_imf_qc_conforms_to_published_schema() {
 }
 
 #[test]
+fn emitted_aes31_qc_conforms_to_published_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("project.adl");
+    std::fs::write(&path, "<ADL></ADL>").unwrap();
+    let audit = forge_normalizer::aes31_qc::audit(&path).unwrap();
+    let instance = serde_json::to_value(audit).unwrap();
+    let schema: Value = serde_json::from_str(include_str!("../schema/aes31-qc-v1.schema.json"))
+        .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
+
+#[test]
 fn emitted_rtp_audio_qc_conforms_to_published_schema() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("stream.sdp");

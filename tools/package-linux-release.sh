@@ -31,6 +31,7 @@ for binary in \
   forge-dialogue-provider \
   forge-provenance-qc \
   forge-imf-qc \
+  forge-aes31-qc \
   forge-rtp-qc \
   forge-nmos-qc \
   forge-st2022-7-qc
