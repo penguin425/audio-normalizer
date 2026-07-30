@@ -1582,6 +1582,30 @@ Use `--manifest delivery.json` with batch analysis to write a versioned,
 per-asset delivery record containing measurements, metadata checks, compliance
 rules, and pass/fail totals.
 
+`forge-report` upgrades older delivery manifests and turns failed compliance
+rules into actionable, auditable explanations:
+
+```sh
+# Exit 1 when migration is needed, without changing the file
+forge-report migrate delivery.json --check
+
+# Preserve asset evidence while migrating v1/v2 to v3 atomically
+forge-report migrate delivery.json --in-place
+
+# Show source, measured boundary, requirement, and remediation for each failure
+forge-report explain delivery.json
+forge-report explain delivery.json --format json -o explanations.json
+```
+
+Migration validates the declared asset/pass/fail counts, rejects unknown
+manifest or embedded QC schemas, converts legacy flat
+`ebu_qc_results_json` evidence into the v3 `qc` envelope, and is idempotent.
+Inputs are bounded to 64 MiB, 100,000 assets, 10,000 QC results per asset, and
+1,000 compliance rules per asset.
+The machine-readable explanation format is versioned as
+`rule-explanations-v1`; custom profiles remain identified by profile and
+standard fields rather than being presented as normative first-party sources.
+
 Versioned EBU profiles also record `compliance_standard` and
 `compliance_standard_version` in reports and manifests. The s2 adapted and
 low-PLR profiles are conditional alternatives, not replacements for the

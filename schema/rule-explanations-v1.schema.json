@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/rule-explanations-v1",
+  "title": "Forge failed compliance rule explanations v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generator",
+    "source_schema",
+    "asset_count",
+    "failed_rule_count",
+    "explanations"
+  ],
+  "properties": {
+    "schema": {"const": "https://penguin425.github.io/audio-normalizer/schema/rule-explanations-v1"},
+    "generator": {"type": "string"},
+    "source_schema": {"type": ["string", "null"]},
+    "asset_count": {"type": "integer", "minimum": 0},
+    "failed_rule_count": {"type": "integer", "minimum": 0},
+    "explanations": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/explanation"}
+    }
+  },
+  "$defs": {
+    "nullableNumber": {"type": ["number", "null"]},
+    "nullableBoolean": {"type": ["boolean", "null"]},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile"],
+      "properties": {
+        "profile": {"type": "string"},
+        "standard": {"type": "string"},
+        "standard_version": {"type": "string"},
+        "url": {"type": "string", "format": "uri"}
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "measured",
+        "unit",
+        "minimum",
+        "maximum",
+        "minimum_inclusive",
+        "maximum_inclusive"
+      ],
+      "properties": {
+        "measured": {"type": "number"},
+        "unit": {"type": "string"},
+        "minimum": {"$ref": "#/$defs/nullableNumber"},
+        "maximum": {"$ref": "#/$defs/nullableNumber"},
+        "minimum_inclusive": {"$ref": "#/$defs/nullableBoolean"},
+        "maximum_inclusive": {"$ref": "#/$defs/nullableBoolean"}
+      }
+    },
+    "explanation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "asset",
+        "metric",
+        "source",
+        "observation",
+        "requirement",
+        "remediation"
+      ],
+      "properties": {
+        "rule_id": {"type": "string", "pattern": "^FORGE-COMPLIANCE-"},
+        "asset": {"type": "string"},
+        "metric": {"type": "string"},
+        "source": {"$ref": "#/$defs/source"},
+        "observation": {"$ref": "#/$defs/observation"},
+        "requirement": {"type": "string"},
+        "remediation": {"type": "string"}
+      }
+    }
+  }
+}
