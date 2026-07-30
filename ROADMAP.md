@@ -28,7 +28,8 @@ Forge already provides:
   Atmos/JOC Extension Type A signalling, six-block access-unit and
   independent/dependent presentation grouping, plus authoritative external
   E-AC-3 JOC render checks.
-- Bounded standalone, unfragmented, and fragmented ISO-BMFF AOMedia IAMF v1.1
+- Bounded standalone, unfragmented, fragmented, and CENC-protected ISO-BMFF
+  AOMedia IAMF v1.1
   QC with
   `iamf` brand/sample-entry/`iacb` configuration validation, streaming sample
   table or `moof`/`traf`/`trun` decapsulation, supported codec-config
@@ -38,7 +39,10 @@ Forge already provides:
   presentation-render loudness, true-peak, duration, and reference checks.
   Fragmented carriage resolves `trex`/`tfhd` defaults, signed data offsets,
   sample-description changes, decode-time continuity, fragment sample groups,
-  sync/CTS constraints, and pinned AOMedia interoperability vectors.
+  sync/CTS constraints, and pinned AOMedia interoperability vectors. Encrypted
+  carriage validates `enca`/`sinf`/`frma`/`schm`/`schi`/`tenc`,
+  `cenc`/`cbcs` full-sample policy, IV geometry, and `senc` or paired
+  `saiz`/`saio` sample coverage without accepting keys or parsing ciphertext.
 - Bounded MPEG-TS/M2TS QC for packet layout, continuity, PAT/PMT CRC and
   programme maps, audio PES headers, and PTS continuity.
 - Bounded SMPTE ST 377-1 MXF QC for KLV framing, partitions and links,
@@ -148,14 +152,15 @@ generations.
 - DTS core/HD metadata and decoded presentation checks through an optional
   adapter.
 - WavPack, Monkey's Audio, and ALAC native frame/checksum validation.
-- CENC ISO-BMFF IAMF encapsulation and broader OAR conformance vectors.
-  Standalone
+- CENC `seig` key rotation/sample-group overrides and broader OAR conformance
+  vectors. Standalone
   OBU bounds/order, supported codec configurations, full Audio Element and Mix
   Presentation semantics, profile element/channel limits, descriptor/substream
   linking, Parameter Block syntax, exact parameter/audio-frame timeline
   reconciliation, trimming/delimiter validation, unfragmented and fragmented
-  `iamf` sample entry/configuration/sample-table decapsulation, and externally
-  rendered presentation QC have shipped.
+  `iamf`/`enca` sample entry, configuration, sample-table/fragment
+  decapsulation and CENC signaling, and externally rendered presentation QC
+  have shipped.
 
 ### Streaming and platform delivery
 
