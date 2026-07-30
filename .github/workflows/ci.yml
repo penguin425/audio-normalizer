@@ -110,8 +110,6 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Check Rust and C header contracts
-        env:
-          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace
         run: cargo test --locked --target ${{ matrix.target }} --test c_api --test c_header
 
       - name: Link and run a C consumer
