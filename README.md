@@ -1821,6 +1821,29 @@ Installation, supported wheel tags, the full result schema, exception and
 library-resolution contracts, concurrency behaviour, and supply-chain
 verification are documented in [PYTHON-API.md](PYTHON-API.md).
 
+## Browser WebAssembly API
+
+GitHub Releases include `forge-vVERSION-wasm-web.tar.gz`, a dependency-free ES
+module for local browser analysis. It measures decoded interleaved Float32 PCM
+or in-memory PCM/IEEE-float WAVE, RF64, and BW64 without network, filesystem,
+normalization, or encoding capabilities.
+
+```js
+import init, { analyzeWav } from "./index.js";
+
+await init();
+const result = analyzeWav(new Uint8Array(await file.arrayBuffer()));
+console.log(result.integratedLufs, result.truePeakDbtp);
+```
+
+The result contains integrated, maximum momentary, maximum short-term, LRA,
+RMS, sample-peak, true-peak, and PLR measurements. Non-finite measurements for
+silence or insufficient duration are represented as `null`. Fixed limits of
+128 MiB input, 24 million decoded samples, 32 channels, and 768 kHz are
+enforced before DSP; `limits()` returns the same machine-readable contract.
+Use `analyzeInterleaved` with Web Audio decoding for formats outside the WAVE
+reader.
+
 ## Real-time DSP API
 
 Release archives include `forge-live`, a streaming CLI for shells, OBS/FFmpeg

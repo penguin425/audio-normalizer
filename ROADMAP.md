@@ -104,6 +104,10 @@ Forge already provides:
   results, explicit decoded-sample bounds, deterministic native-library
   selection, concurrent-call coverage, and self-contained platform wheels for
   Linux x86-64, macOS ARM64/x86-64, and Windows x86-64.
+- Dependency-free browser WebAssembly analysis over the shared Rust DSP core,
+  with WAVE and interleaved Float32 entry points, TypeScript declarations,
+  fixed resource limits, and no filesystem, network, normalization, or encoder
+  capabilities.
 - EBU QC Items for channel count, clipping, duration, dropouts, loudness,
   phase reversal, test tones, clicks, minimum average level, silence, true
   peak, hum/buzz, band-limited noise, cross-talk, panning, LFE/centre
@@ -258,8 +262,6 @@ failure behaviour are documented.
 
 ## Product and developer experience
 
-- WASM analysis build for local browser use; encoding and filesystem features
-  remain capability-gated.
 - Resumable batch jobs, content-addressed analysis cache, watch folders, and
   machine-readable progress.
 - SQLite catalogue with source/output hashes, measurement standard/version,

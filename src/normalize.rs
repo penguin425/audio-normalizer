@@ -9,11 +9,12 @@
 //! *inter-sample* true peak does not exceed the ceiling, which is how
 //! professional loudness normalizers avoid clipping without a dynamic limiter.
 
+pub use crate::analysis::{analyze, Analysis};
 use crate::atomic::AtomicOutput;
 use crate::decoder;
 use crate::dsp::limiter::{LimiterConfig, LimiterStatistics, TruePeakLimiter};
 use crate::dsp::resample::{ResampleQuality, SampleRateConverter};
-use crate::dsp::{lufs, simd, truepeak};
+use crate::dsp::{lufs, simd};
 use crate::flacenc::FlacStreamWriter;
 use crate::metadata;
 #[cfg(feature = "mp3-encoding")]
@@ -70,26 +71,6 @@ pub struct Plan {
     /// Output-domain sample rate and converter quality.
     pub output_sample_rate: Option<u32>,
     pub resample_quality: ResampleQuality,
-}
-
-/// Loudness/peak analysis of a single file.
-#[derive(Debug, Clone)]
-pub struct Analysis {
-    pub sample_rate: u32,
-    pub channels: u16,
-    pub channel_roles: Vec<ChannelRole>,
-    pub frames: usize,
-    pub kind: PcmKind,
-    pub lufs: f64,
-    pub max_momentary_lufs: f64,
-    pub max_short_term_lufs: f64,
-    pub loudness_range_lu: f64,
-    pub rms_db: f64,
-    pub sample_peak: f32, // 0..1
-    pub true_peak: f32,   // 0..1
-    /// Complete 400 ms block energies used to recompute album gating.
-    #[doc(hidden)]
-    pub loudness_blocks: Vec<f64>,
 }
 
 /// Measurements captured from the exact float signal passed to an encoder.
@@ -272,59 +253,6 @@ pub struct CorrectedAlbumNormalization {
 impl Verification {
     pub fn passed(&self) -> bool {
         self.level_ok && self.true_peak_ok
-    }
-}
-
-impl Analysis {
-    /// EBU Tech 3341 warns that LRA is not stable during the first minute.
-    pub const LRA_STABLE_AFTER_SECONDS: f64 = 60.0;
-
-    pub fn duration_secs(&self) -> f64 {
-        self.frames as f64 / self.sample_rate as f64
-    }
-    pub fn loudness_range_stable(&self) -> bool {
-        self.duration_secs() >= Self::LRA_STABLE_AFTER_SECONDS
-    }
-    pub fn sample_peak_db(&self) -> f64 {
-        to_db(self.sample_peak as f64)
-    }
-    pub fn true_peak_db(&self) -> f64 {
-        to_db(self.true_peak as f64)
-    }
-    /// Peak-to-Loudness Ratio (PLR), expressed in LU.
-    pub fn peak_to_loudness_ratio_lu(&self) -> f64 {
-        self.true_peak_db() - self.lufs
-    }
-}
-
-#[inline]
-fn to_db(x: f64) -> f64 {
-    if x > 0.0 {
-        20.0 * x.log10()
-    } else {
-        f64::NEG_INFINITY
-    }
-}
-
-/// Analyze an already-decoded buffer.
-pub fn analyze(buf: &AudioBuffer) -> Analysis {
-    let ebu = lufs::measure_ebu(buf);
-    let (rms_db, sample_peak) = lufs::measure_rms_peak(buf);
-    let true_peak = truepeak::measure_true_peak(buf);
-    Analysis {
-        sample_rate: buf.sample_rate,
-        channels: buf.channels,
-        channel_roles: buf.channel_roles.clone(),
-        frames: buf.frames,
-        kind: buf.source_kind,
-        lufs: ebu.integrated_lufs,
-        max_momentary_lufs: ebu.max_momentary_lufs,
-        max_short_term_lufs: ebu.max_short_term_lufs,
-        loudness_range_lu: ebu.loudness_range_lu,
-        rms_db,
-        sample_peak,
-        true_peak,
-        loudness_blocks: ebu.gating_blocks,
     }
 }
 

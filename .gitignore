@@ -21,3 +21,10 @@ __pycache__/
 python/build/
 python/dist/
 python/*.egg-info/
+
+# WebAssembly build and generated bindings
+/wasm/target/
+/wasm/package/forge_normalizer_wasm.js
+/wasm/package/forge_normalizer_wasm.d.ts
+/wasm/package/forge_normalizer_wasm_bg.wasm
+/wasm/package/forge_normalizer_wasm_bg.wasm.d.ts

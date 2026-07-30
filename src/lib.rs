@@ -26,6 +26,7 @@ mod aaf_qc;
 mod ac3_qc;
 pub mod adm;
 pub mod aes31_qc;
+pub mod analysis;
 mod atomic;
 pub mod audio_compare;
 mod bwf_xml_qc;
