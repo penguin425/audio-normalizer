@@ -64,6 +64,10 @@ struct Track {
     roll_default_group: bool,
     roll_default_description_index: Option<u32>,
     roll_sample_runs: Vec<(u64, u32)>,
+    cenc_group_entries: Vec<CencSampleGroupEntry>,
+    cenc_default_description_index: Option<u32>,
+    cenc_sample_runs: Vec<(u64, u32)>,
+    cenc_sbgp_seen: bool,
     has_sync_sample_box: bool,
     has_composition_offsets: bool,
     iamf_entries: Vec<Option<IamfSampleEntry>>,
@@ -96,6 +100,27 @@ struct CencProtection {
     skip_byte_block: Option<u8>,
     constant_iv_size: Option<u8>,
     valid: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CencSampleGroupEntry {
+    is_protected: u8,
+    per_sample_iv_size: u8,
+    kid: String,
+    crypt_byte_block: u8,
+    skip_byte_block: u8,
+    constant_iv_size: Option<u8>,
+    valid: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EffectiveCencProtection {
+    per_sample_iv_size: u8,
+    kid: String,
+    crypt_byte_block: u8,
+    skip_byte_block: u8,
+    constant_iv_size: Option<u8>,
+    sample_group_override: bool,
 }
 
 #[derive(Clone, Default)]
@@ -154,8 +179,11 @@ struct TrackFragment {
     roll_distances: Vec<i16>,
     roll_default_description_index: Option<u32>,
     roll_sample_runs: Vec<(u64, u32)>,
+    cenc_group_entries: Vec<CencSampleGroupEntry>,
+    cenc_default_description_index: Option<u32>,
+    cenc_sample_runs: Vec<(u64, u32)>,
+    cenc_sbgp_seen: bool,
     has_composition_offsets: bool,
-    has_cenc_sample_groups: bool,
     cenc_auxiliary: CencAuxiliary,
 }
 
@@ -1040,6 +1068,7 @@ fn audit_iamf_tracks(
                     .and_then(|item| item.scheme.clone()),
                 "validated_samples": locations.len(),
                 "ciphertext_obu_validation": "requires_keys",
+                "cenc": cenc_result.as_ref().ok(),
                 "configurations": iamf_entries.len()
             }));
             continue;
@@ -1313,13 +1342,6 @@ fn cenc_auxiliary_for_iamf(
     fragmented: bool,
     locations: &[SampleLocation],
 ) -> Result<Value, String> {
-    if track.sample_group_types.iter().any(|kind| kind == "seig") {
-        return Err(
-            "CENC seig sample-group overrides require key-rotation validation and are not yet supported"
-                .into(),
-        );
-    }
-    let expected_iv_sizes = cenc_expected_iv_sizes(track, locations)?;
     let schemes: HashSet<_> = locations
         .iter()
         .filter_map(|sample| {
@@ -1339,8 +1361,18 @@ fn cenc_auxiliary_for_iamf(
     }
     let scheme = schemes.iter().next().expect("one scheme");
     if !fragmented {
-        let evidence = validate_cenc_auxiliary(&track.cenc_auxiliary, &expected_iv_sizes, scheme)?;
-        return Ok(json!({"scope": "sample_table", "auxiliary": evidence}));
+        let groups = resolve_cenc_group_assignments(track, locations.len())?;
+        let policies = cenc_effective_protections(track, locations, &groups)?;
+        let evidence = validate_cenc_auxiliary(
+            &track.cenc_auxiliary,
+            &cenc_policy_iv_sizes(&policies),
+            scheme,
+        )?;
+        return Ok(json!({
+            "scope": "sample_table",
+            "protection": cenc_policy_evidence(&policies),
+            "auxiliary": evidence
+        }));
     }
 
     let track_id = track
@@ -1348,23 +1380,54 @@ fn cenc_auxiliary_for_iamf(
         .ok_or_else(|| "fragmented encrypted IAMF track has no track_ID".to_string())?;
     let mut fragment_evidence = Vec::new();
     let mut observed_samples = 0_usize;
+    let has_fragment_groups =
+        fragments
+            .iter()
+            .flat_map(|fragment| &fragment.tracks)
+            .any(|track_fragment| {
+                track_fragment.track_id == Some(track_id)
+                    && (track_fragment.cenc_sbgp_seen
+                        || !track_fragment.cenc_group_entries.is_empty()
+                        || track_fragment.cenc_default_description_index.is_some())
+            });
+    if has_fragment_groups && !track.cenc_sample_runs.is_empty() {
+        return Err(
+            "CENC seig mappings cannot mix track-level and fragment-level sbgp scopes".into(),
+        );
+    }
+    let global_groups = if !track.cenc_sample_runs.is_empty() {
+        Some(resolve_cenc_group_assignments(track, locations.len())?)
+    } else {
+        None
+    };
     for fragment in fragments {
         for track_fragment in &fragment.tracks {
             if track_fragment.track_id != Some(track_id) {
                 continue;
             }
-            if track_fragment.has_cenc_sample_groups {
-                return Err(
-                    "fragment-local CENC seig sample-group overrides are not yet supported".into(),
-                );
-            }
-            let sizes = cenc_expected_iv_sizes(track, &track_fragment.samples)?;
+            let start = observed_samples;
+            let end = start
+                .checked_add(track_fragment.samples.len())
+                .ok_or_else(|| "encrypted fragment sample count overflows memory".to_string())?;
+            let groups = if let Some(global) = &global_groups {
+                global
+                    .get(start..end)
+                    .ok_or_else(|| {
+                        "track-level CENC seig mapping is shorter than fragment samples".to_string()
+                    })?
+                    .to_vec()
+            } else {
+                resolve_fragment_cenc_group_assignments(track, track_fragment)?
+            };
+            let policies = cenc_effective_protections(track, &track_fragment.samples, &groups)?;
+            let sizes = cenc_policy_iv_sizes(&policies);
             observed_samples = observed_samples
                 .checked_add(sizes.len())
                 .ok_or_else(|| "encrypted fragment sample count overflows memory".to_string())?;
             fragment_evidence.push(json!({
                 "fragment_offset": fragment.start,
                 "samples": sizes.len(),
+                "protection": cenc_policy_evidence(&policies),
                 "auxiliary": validate_cenc_auxiliary(
                     &track_fragment.cenc_auxiliary,
                     &sizes,
@@ -1373,19 +1436,27 @@ fn cenc_auxiliary_for_iamf(
             }));
         }
     }
-    if observed_samples != expected_iv_sizes.len() {
+    if observed_samples != locations.len() {
         return Err(format!(
             "CENC fragment auxiliary data covers {observed_samples} samples, expected {}",
-            expected_iv_sizes.len()
+            locations.len()
         ));
     }
     Ok(json!({"scope": "track_fragments", "fragments": fragment_evidence}))
 }
 
-fn cenc_expected_iv_sizes(track: &Track, locations: &[SampleLocation]) -> Result<Vec<u8>, String> {
+fn cenc_effective_protections(
+    track: &Track,
+    locations: &[SampleLocation],
+    groups: &[Option<CencSampleGroupEntry>],
+) -> Result<Vec<EffectiveCencProtection>, String> {
+    if groups.len() != locations.len() {
+        return Err("CENC seig assignments do not cover every encrypted IAMF sample".into());
+    }
     locations
         .iter()
-        .map(|sample| {
+        .zip(groups)
+        .map(|(sample, group)| {
             let index = usize::try_from(
                 sample
                     .description_index
@@ -1406,9 +1477,78 @@ fn cenc_expected_iv_sizes(track: &Track, locations: &[SampleLocation]) -> Result
             if !protection.valid {
                 return Err("IAMF encrypted sample entry has invalid CENC signaling".into());
             }
-            Ok(protection.per_sample_iv_size.unwrap_or(0))
+            let effective = if let Some(group) = group {
+                if !group.valid {
+                    return Err("CENC seig entry has invalid field geometry".into());
+                }
+                if group.is_protected != 1 {
+                    return Err(
+                        "IAMF encrypted samples cannot be made clear by a CENC seig entry".into(),
+                    );
+                }
+                EffectiveCencProtection {
+                    per_sample_iv_size: group.per_sample_iv_size,
+                    kid: group.kid.clone(),
+                    crypt_byte_block: group.crypt_byte_block,
+                    skip_byte_block: group.skip_byte_block,
+                    constant_iv_size: group.constant_iv_size,
+                    sample_group_override: true,
+                }
+            } else {
+                EffectiveCencProtection {
+                    per_sample_iv_size: protection.per_sample_iv_size.unwrap_or(0),
+                    kid: protection
+                        .default_kid
+                        .clone()
+                        .ok_or_else(|| "CENC tenc default_KID is missing".to_string())?,
+                    crypt_byte_block: protection.crypt_byte_block.unwrap_or(0),
+                    skip_byte_block: protection.skip_byte_block.unwrap_or(0),
+                    constant_iv_size: protection.constant_iv_size,
+                    sample_group_override: false,
+                }
+            };
+            if effective.crypt_byte_block != 0 || effective.skip_byte_block != 0 {
+                return Err(
+                    "IAMF CENC seig/tenc policies must use full-sample encryption without pattern skipping"
+                        .into(),
+                );
+            }
+            if !matches!(effective.per_sample_iv_size, 0 | 8 | 16)
+                || effective.per_sample_iv_size == 0
+                    && !matches!(effective.constant_iv_size, Some(8 | 16))
+            {
+                return Err(
+                    "IAMF CENC seig/tenc policy requires an 8/16-byte per-sample or constant IV"
+                        .into(),
+                );
+            }
+            Ok(effective)
         })
         .collect()
+}
+
+fn cenc_policy_iv_sizes(policies: &[EffectiveCencProtection]) -> Vec<u8> {
+    policies
+        .iter()
+        .map(|policy| policy.per_sample_iv_size)
+        .collect()
+}
+
+fn cenc_policy_evidence(policies: &[EffectiveCencProtection]) -> Value {
+    let mut key_ids = policies
+        .iter()
+        .map(|policy| policy.kid.clone())
+        .collect::<Vec<_>>();
+    key_ids.sort();
+    key_ids.dedup();
+    json!({
+        "key_ids": key_ids,
+        "key_rotation": key_ids.len() > 1,
+        "sample_group_overrides": policies.iter()
+            .filter(|policy| policy.sample_group_override)
+            .count(),
+        "per_sample_iv_bytes": cenc_policy_iv_sizes(policies)
+    })
 }
 
 fn validate_cenc_auxiliary(
@@ -1437,6 +1577,12 @@ fn validate_cenc_auxiliary(
 
     let mut senc_valid = false;
     if let Some(senc) = auxiliary.senc.first() {
+        if senc.flags & 0x000001 != 0 {
+            return Err(
+                "IAMF CENC key selection must use tenc/seig; senc track-encryption overrides are not allowed"
+                    .into(),
+            );
+        }
         if senc.flags & 0x000002 != 0 {
             return Err("IAMF CENC forbids subsample encryption; senc flag 0x000002 is set".into());
         }
@@ -1689,6 +1835,74 @@ fn resolve_fragment_roll_assignments(
     Ok(assignments)
 }
 
+fn resolve_fragment_cenc_group_assignments(
+    track: &Track,
+    fragment: &TrackFragment,
+) -> Result<Vec<Option<CencSampleGroupEntry>>, String> {
+    let resolve = |index: u32| -> Result<Option<CencSampleGroupEntry>, String> {
+        let effective = if index == 0 {
+            fragment
+                .cenc_default_description_index
+                .or(track.cenc_default_description_index)
+                .unwrap_or(0)
+        } else {
+            index
+        };
+        if effective == 0 {
+            return Ok(None);
+        }
+        if effective >= 0x1_0000 {
+            let local = effective - 0x1_0000;
+            if local == 0 {
+                return Err(
+                    "fragment-local CENC seig description index 0x10000 is reserved".into(),
+                );
+            }
+            let index = usize::try_from(local - 1)
+                .map_err(|_| "fragment CENC seig index does not fit memory".to_string())?;
+            return fragment
+                .cenc_group_entries
+                .get(index)
+                .cloned()
+                .map(Some)
+                .ok_or_else(|| {
+                    format!(
+                        "fragment-local CENC seig description index {effective:#x} is undefined"
+                    )
+                });
+        }
+        let index = usize::try_from(effective - 1)
+            .map_err(|_| "track CENC seig index does not fit memory".to_string())?;
+        track
+            .cenc_group_entries
+            .get(index)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| format!("track CENC seig description index {effective} is undefined"))
+    };
+    if fragment.cenc_sample_runs.is_empty() {
+        let value = resolve(0)?;
+        return Ok(std::iter::repeat_n(value, fragment.samples.len()).collect());
+    }
+    let mut assignments = Vec::with_capacity(fragment.samples.len());
+    for &(count, index) in &fragment.cenc_sample_runs {
+        let count = usize::try_from(count)
+            .map_err(|_| "fragment CENC seig run count does not fit memory".to_string())?;
+        if count > fragment.samples.len().saturating_sub(assignments.len()) {
+            return Err("fragment CENC seig runs exceed the IAMF sample count".into());
+        }
+        assignments.extend(std::iter::repeat_n(resolve(index)?, count));
+    }
+    if assignments.len() != fragment.samples.len() {
+        return Err(format!(
+            "fragment CENC seig runs cover {} IAMF samples, expected {}",
+            assignments.len(),
+            fragment.samples.len()
+        ));
+    }
+    Ok(assignments)
+}
+
 fn sample_locations(track: &Track) -> Result<Vec<SampleLocation>, String> {
     if track.sample_sizes.is_empty()
         || track.chunk_offsets.is_empty()
@@ -1786,6 +2000,50 @@ fn resolve_roll_assignments(
     if assignments.len() != sample_count {
         return Err(format!(
             "roll sample-group runs cover {} IA Samples, expected {sample_count}",
+            assignments.len()
+        ));
+    }
+    Ok(assignments)
+}
+
+fn resolve_cenc_group_assignments(
+    track: &Track,
+    sample_count: usize,
+) -> Result<Vec<Option<CencSampleGroupEntry>>, String> {
+    let resolve = |index: u32| -> Result<Option<CencSampleGroupEntry>, String> {
+        let effective = if index == 0 {
+            track.cenc_default_description_index.unwrap_or(0)
+        } else {
+            index
+        };
+        if effective == 0 {
+            return Ok(None);
+        }
+        let offset = usize::try_from(effective - 1)
+            .map_err(|_| "CENC seig description index does not fit memory".to_string())?;
+        track
+            .cenc_group_entries
+            .get(offset)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| format!("CENC seig description index {effective} is undefined"))
+    };
+    if track.cenc_sample_runs.is_empty() {
+        let value = resolve(0)?;
+        return Ok(std::iter::repeat_n(value, sample_count).collect());
+    }
+    let mut assignments = Vec::with_capacity(sample_count);
+    for &(count, index) in &track.cenc_sample_runs {
+        let count = usize::try_from(count)
+            .map_err(|_| "CENC seig run count does not fit memory".to_string())?;
+        if count > sample_count.saturating_sub(assignments.len()) {
+            return Err("CENC seig runs exceed the IAMF sample count".into());
+        }
+        assignments.extend(std::iter::repeat_n(resolve(index)?, count));
+    }
+    if assignments.len() != sample_count {
+        return Err(format!(
+            "CENC seig runs cover {} IAMF samples, expected {sample_count}",
             assignments.len()
         ));
     }
@@ -3521,8 +3779,15 @@ fn parse_sgpd(
     };
     let duplicate_roll = grouping_type.as_deref() == Some("roll")
         && track.sample_group_types.iter().any(|kind| kind == "roll");
-    let mut valid = grouping_type.is_some() && entry_count <= MAX_TABLE_ENTRIES && !duplicate_roll;
+    let duplicate_cenc = grouping_type.as_deref() == Some("seig")
+        && track.sample_group_types.iter().any(|kind| kind == "seig");
+    let mut valid = grouping_type.is_some()
+        && entry_count <= MAX_TABLE_ENTRIES
+        && !duplicate_roll
+        && !duplicate_cenc
+        && (grouping_type.as_deref() != Some("seig") || matches!(version, Some(1 | 2)));
     let mut roll_distances = Vec::new();
+    let mut cenc_entries = Vec::new();
     for _ in 0..entry_count {
         let length = match default_length {
             Some(0) => {
@@ -3555,6 +3820,11 @@ fn parse_sgpd(
                     body[offset..offset + 2].try_into().unwrap(),
                 ));
             }
+        } else if grouping_type.as_deref() == Some("seig") {
+            match parse_cenc_sample_group_entry(&body[offset..offset + length]) {
+                Ok(entry) => cenc_entries.push(entry),
+                Err(()) => valid = false,
+            }
         }
         offset += length;
     }
@@ -3564,23 +3834,70 @@ fn parse_sgpd(
         if grouping_type.as_deref() == Some("roll") {
             track.roll_default_description_index = Some(default_description_index);
             track.roll_default_group = default_description_index > 0;
+        } else if grouping_type.as_deref() == Some("seig") {
+            track.cenc_default_description_index = Some(default_description_index);
         }
     }
     if let Some(grouping_type) = grouping_type {
         track.sample_group_types.push(grouping_type);
     }
     track.roll_distances.extend(roll_distances);
+    track.cenc_group_entries.extend(cenc_entries);
     checks.push(check(
         "FORGE-ISOBMFF-SAMPLE-GROUP-DESCRIPTION",
         valid,
-        "sample-group descriptions are bounded and roll/prol entries have signed distances",
+        "sample-group descriptions are bounded; roll/prol distances and CENC seig entries have valid field geometry",
         Some(json!({
             "grouping_types": track.sample_group_types,
             "roll_distances": track.roll_distances,
+            "cenc_key_ids": track.cenc_group_entries.iter()
+                .map(|entry| &entry.kid)
+                .collect::<Vec<_>>(),
             "default_description_index": default_description_index
         })),
     ));
     Ok(())
+}
+
+fn parse_cenc_sample_group_entry(body: &[u8]) -> Result<CencSampleGroupEntry, ()> {
+    if body.len() < 20 {
+        return Err(());
+    }
+    let reserved = body[0];
+    let pattern = body[1];
+    let is_protected = body[2];
+    let per_sample_iv_size = body[3];
+    let kid = hex_bytes(&body[4..20]);
+    let crypt_byte_block = pattern >> 4;
+    let skip_byte_block = pattern & 0x0f;
+    let mut offset = 20_usize;
+    let constant_iv_size = if is_protected == 1 && per_sample_iv_size == 0 {
+        let size = *body.get(offset).ok_or(())?;
+        offset += 1;
+        let end = offset.checked_add(usize::from(size)).ok_or(())?;
+        if body.get(offset..end).is_none() {
+            return Err(());
+        }
+        offset = end;
+        Some(size)
+    } else {
+        None
+    };
+    let valid = reserved == 0
+        && matches!(is_protected, 0 | 1)
+        && (is_protected == 1 || per_sample_iv_size == 0)
+        && matches!(per_sample_iv_size, 0 | 8 | 16)
+        && constant_iv_size.is_none_or(|size| matches!(size, 8 | 16))
+        && offset == body.len();
+    Ok(CencSampleGroupEntry {
+        is_protected,
+        per_sample_iv_size,
+        kid,
+        crypt_byte_block,
+        skip_byte_block,
+        constant_iv_size,
+        valid,
+    })
 }
 
 fn parse_sbgp(
@@ -3610,20 +3927,32 @@ fn parse_sbgp(
     });
     let duplicate_roll =
         grouping_type.as_deref() == Some("roll") && !track.roll_sample_runs.is_empty();
+    let duplicate_cenc = grouping_type.as_deref() == Some("seig") && track.cenc_sbgp_seen;
     let mut samples = 0_u64;
-    let mut valid = grouping_type.is_some() && !duplicate_roll;
+    let grouping_parameter_valid = version != Some(1)
+        || grouping_type.as_deref() != Some("seig")
+        || body.get(8..12).is_some_and(|value| be_u32(value) == 0);
+    let mut valid =
+        grouping_type.is_some() && !duplicate_roll && !duplicate_cenc && grouping_parameter_valid;
     let mut runs = Vec::new();
     if let Some(entries) = entries {
         for entry in entries {
             let count = u64::from(be_u32(&entry[..4]));
             let description_index = be_u32(&entry[4..8]);
-            valid &= count > 0 && description_index <= MAX_TABLE_ENTRIES as u32;
+            let local_index = description_index.checked_sub(0x1_0000);
+            let index_bounded = description_index == 0
+                || description_index <= MAX_TABLE_ENTRIES as u32
+                || local_index.is_some_and(|index| index > 0 && index <= MAX_TABLE_ENTRIES as u32);
+            valid &= count > 0 && index_bounded;
             samples = samples.saturating_add(count);
             runs.push((count, description_index));
         }
         if grouping_type.as_deref() == Some("roll") {
             track.sample_group_samples = Some(samples);
             track.roll_sample_runs = runs;
+        } else if grouping_type.as_deref() == Some("seig") {
+            track.cenc_sample_runs = runs;
+            track.cenc_sbgp_seen = true;
         }
     } else {
         valid = false;
@@ -3883,7 +4212,10 @@ fn parse_traf(
         roll_distances: groups.roll_distances,
         roll_default_description_index: groups.roll_default_description_index,
         roll_sample_runs: groups.roll_sample_runs,
-        has_cenc_sample_groups: groups.sample_group_types.iter().any(|kind| kind == "seig"),
+        cenc_group_entries: groups.cenc_group_entries,
+        cenc_default_description_index: groups.cenc_default_description_index,
+        cenc_sample_runs: groups.cenc_sample_runs,
+        cenc_sbgp_seen: groups.cenc_sbgp_seen,
         cenc_auxiliary: groups.cenc_auxiliary,
         ..TrackFragment::default()
     };
@@ -4359,6 +4691,19 @@ fn track_json(track: &Track) -> Value {
         "roll_default_group": track.roll_default_group,
         "roll_default_description_index": track.roll_default_description_index,
         "roll_sample_runs": track.roll_sample_runs,
+        "cenc_sample_groups": {
+            "default_description_index": track.cenc_default_description_index,
+            "entries": track.cenc_group_entries.iter().map(|entry| json!({
+                "is_protected": entry.is_protected,
+                "per_sample_iv_size": entry.per_sample_iv_size,
+                "kid": entry.kid,
+                "crypt_byte_block": entry.crypt_byte_block,
+                "skip_byte_block": entry.skip_byte_block,
+                "constant_iv_size": entry.constant_iv_size,
+                "valid": entry.valid
+            })).collect::<Vec<_>>(),
+            "sample_runs": track.cenc_sample_runs
+        },
         "sync_sample_box": track.has_sync_sample_box,
         "composition_offsets": track.has_composition_offsets,
         "cenc_auxiliary": cenc_auxiliary_json(&track.cenc_auxiliary),
@@ -4532,6 +4877,124 @@ mod tests {
         [senc, saiz, saio].concat()
     }
 
+    fn test_seig_entry(kid_byte: u8, iv_size: u8) -> Vec<u8> {
+        let mut entry = vec![0, 0, 1, iv_size];
+        entry.extend(vec![kid_byte; 16]);
+        if iv_size == 0 {
+            entry.push(16);
+            entry.extend(vec![0x77; 16]);
+        }
+        entry
+    }
+
+    fn test_cenc_key_rotation_groups() -> Vec<u8> {
+        let entries = [test_seig_entry(0x44, 8), test_seig_entry(0x55, 8)];
+        let descriptions = entries
+            .into_iter()
+            .flat_map(|entry| {
+                [
+                    u32::try_from(entry.len()).unwrap().to_be_bytes().to_vec(),
+                    entry,
+                ]
+                .concat()
+            })
+            .collect::<Vec<_>>();
+        let sgpd = boxed(
+            b"sgpd",
+            full_box(
+                1,
+                [
+                    b"seig".to_vec(),
+                    0_u32.to_be_bytes().to_vec(),
+                    2_u32.to_be_bytes().to_vec(),
+                    descriptions,
+                ]
+                .concat(),
+            ),
+        );
+        let sbgp = boxed(
+            b"sbgp",
+            full_box(
+                0,
+                [
+                    b"seig".to_vec(),
+                    2_u32.to_be_bytes().to_vec(),
+                    1_u32.to_be_bytes().to_vec(),
+                    1_u32.to_be_bytes().to_vec(),
+                    1_u32.to_be_bytes().to_vec(),
+                    2_u32.to_be_bytes().to_vec(),
+                ]
+                .concat(),
+            ),
+        );
+        [sgpd, sbgp].concat()
+    }
+
+    fn test_fragment_cenc_group(kid_byte: u8) -> Vec<u8> {
+        let entry = test_seig_entry(kid_byte, 8);
+        let sgpd = boxed(
+            b"sgpd",
+            full_box(
+                1,
+                [
+                    b"seig".to_vec(),
+                    u32::try_from(entry.len()).unwrap().to_be_bytes().to_vec(),
+                    1_u32.to_be_bytes().to_vec(),
+                    entry,
+                ]
+                .concat(),
+            ),
+        );
+        let sbgp = boxed(
+            b"sbgp",
+            full_box(
+                0,
+                [
+                    b"seig".to_vec(),
+                    1_u32.to_be_bytes().to_vec(),
+                    1_u32.to_be_bytes().to_vec(),
+                    0x1_0001_u32.to_be_bytes().to_vec(),
+                ]
+                .concat(),
+            ),
+        );
+        [sgpd, sbgp].concat()
+    }
+
+    fn test_default_cenc_group(kid_byte: u8) -> Vec<u8> {
+        let entry = test_seig_entry(kid_byte, 8);
+        boxed(
+            b"sgpd",
+            full_box(
+                2,
+                [
+                    b"seig".to_vec(),
+                    u32::try_from(entry.len()).unwrap().to_be_bytes().to_vec(),
+                    1_u32.to_be_bytes().to_vec(),
+                    1_u32.to_be_bytes().to_vec(),
+                    entry,
+                ]
+                .concat(),
+            ),
+        )
+    }
+
+    fn test_two_sample_cenc_auxiliary() -> Vec<u8> {
+        let senc = boxed(
+            b"senc",
+            full_box(0, [2_u32.to_be_bytes().to_vec(), vec![0x33; 16]].concat()),
+        );
+        let saiz = boxed(
+            b"saiz",
+            full_box(0, [vec![8], 2_u32.to_be_bytes().to_vec()].concat()),
+        );
+        let saio = boxed(
+            b"saio",
+            full_box(0, [1_u32.to_be_bytes(), 1_u32.to_be_bytes()].concat()),
+        );
+        [senc, saiz, saio].concat()
+    }
+
     fn aac_esds() -> Vec<u8> {
         let decoder_config = [vec![0x40, 0x15], vec![0; 11], vec![0x05, 0x02, 0x11, 0x90]].concat();
         let es_descriptor = [
@@ -4580,6 +5043,23 @@ mod tests {
         sample: Vec<u8>,
         protection: Option<TestCenc>,
     ) -> Vec<u8> {
+        minimal_iamf_mp4_protected_with_groups(
+            compatible_brand,
+            vec![sample],
+            protection,
+            Vec::new(),
+            None,
+        )
+    }
+
+    fn minimal_iamf_mp4_protected_with_groups(
+        compatible_brand: &[u8; 4],
+        samples: Vec<Vec<u8>>,
+        protection: Option<TestCenc>,
+        sample_groups: Vec<u8>,
+        cenc_auxiliary: Option<Vec<u8>>,
+    ) -> Vec<u8> {
+        assert!(!samples.is_empty());
         let mut config = iamf_obu(31, b"iamf\x00\x00");
         config.extend(iamf_obu(
             0,
@@ -4621,19 +5101,27 @@ mod tests {
                 0,
                 [
                     1_u32.to_be_bytes(),
-                    1_u32.to_be_bytes(),
+                    u32::try_from(samples.len()).unwrap().to_be_bytes(),
                     1_u32.to_be_bytes(),
                 ]
                 .concat(),
             ),
         );
+        let sample_sizes = samples
+            .iter()
+            .map(|sample| u32::try_from(sample.len()).unwrap())
+            .collect::<Vec<_>>();
         let stsz = boxed(
             b"stsz",
             full_box(
                 0,
                 [
-                    u32::try_from(sample.len()).unwrap().to_be_bytes(),
-                    1_u32.to_be_bytes(),
+                    0_u32.to_be_bytes().to_vec(),
+                    u32::try_from(samples.len()).unwrap().to_be_bytes().to_vec(),
+                    sample_sizes
+                        .iter()
+                        .flat_map(|size| size.to_be_bytes())
+                        .collect::<Vec<_>>(),
                 ]
                 .concat(),
             ),
@@ -4645,7 +5133,7 @@ mod tests {
                 [
                     1_u32.to_be_bytes(),
                     1_u32.to_be_bytes(),
-                    1_u32.to_be_bytes(),
+                    u32::try_from(samples.len()).unwrap().to_be_bytes(),
                     1_u32.to_be_bytes(),
                 ]
                 .concat(),
@@ -4671,7 +5159,10 @@ mod tests {
                     stsz.clone(),
                     stsc.clone(),
                     stco,
-                    protection.map(test_cenc_auxiliary).unwrap_or_default(),
+                    sample_groups.clone(),
+                    cenc_auxiliary
+                        .clone()
+                        .unwrap_or_else(|| protection.map(test_cenc_auxiliary).unwrap_or_default()),
                 ]
                 .concat(),
             );
@@ -4682,7 +5173,7 @@ mod tests {
                     [
                         vec![0; 8],
                         48_000_u32.to_be_bytes().to_vec(),
-                        1_u32.to_be_bytes().to_vec(),
+                        u32::try_from(samples.len()).unwrap().to_be_bytes().to_vec(),
                         vec![0; 4],
                     ]
                     .concat(),
@@ -4705,7 +5196,12 @@ mod tests {
         let placeholder = make_moov(0);
         let chunk_offset = u32::try_from(ftyp.len() + placeholder.len() + 8).unwrap();
         let moov = make_moov(chunk_offset);
-        [ftyp, moov, boxed(b"mdat", sample)].concat()
+        [
+            ftyp,
+            moov,
+            boxed(b"mdat", samples.into_iter().flatten().collect()),
+        ]
+        .concat()
     }
 
     fn minimal_fragmented_iamf(
@@ -4729,6 +5225,26 @@ mod tests {
         composition_offset: bool,
         initialization_only: bool,
         protection: Option<TestCenc>,
+    ) -> Vec<u8> {
+        minimal_fragmented_iamf_protected_with_groups(
+            sample,
+            data_offset_adjustment,
+            composition_offset,
+            initialization_only,
+            protection,
+            Vec::new(),
+            None,
+        )
+    }
+
+    fn minimal_fragmented_iamf_protected_with_groups(
+        sample: Vec<u8>,
+        data_offset_adjustment: i32,
+        composition_offset: bool,
+        initialization_only: bool,
+        protection: Option<TestCenc>,
+        sample_groups: Vec<u8>,
+        cenc_auxiliary: Option<Vec<u8>>,
     ) -> Vec<u8> {
         let mut config = iamf_obu(31, b"iamf\x00\x00");
         config.extend(iamf_obu(
@@ -4897,7 +5413,10 @@ mod tests {
                             tfhd,
                             tfdt,
                             trun,
-                            protection.map(test_cenc_auxiliary).unwrap_or_default(),
+                            sample_groups.clone(),
+                            cenc_auxiliary.clone().unwrap_or_else(|| {
+                                protection.map(test_cenc_auxiliary).unwrap_or_default()
+                            }),
                         ]
                         .concat(),
                     ),
@@ -5378,12 +5897,185 @@ mod tests {
         assert!(validate_cenc_auxiliary(&external, &[8, 8], "cenc").is_ok());
         assert!(validate_cenc_auxiliary(&external, &[16, 16], "cenc").is_err());
         assert!(validate_cenc_auxiliary(&CencAuxiliary::default(), &[0], "cbcs").is_ok());
+    }
 
-        let key_rotation = Track {
-            sample_group_types: vec!["seig".to_string()],
+    #[test]
+    fn parses_and_resolves_cenc_seig_key_rotation() {
+        let first = parse_cenc_sample_group_entry(&test_seig_entry(0x44, 8)).unwrap();
+        let second = parse_cenc_sample_group_entry(&test_seig_entry(0x55, 0)).unwrap();
+        assert_eq!(first.kid, "44".repeat(16));
+        assert_eq!(first.per_sample_iv_size, 8);
+        assert_eq!(second.constant_iv_size, Some(16));
+
+        let track = Track {
+            cenc_group_entries: vec![first.clone(), second.clone()],
+            cenc_sample_runs: vec![(1, 1), (1, 2)],
+            cenc_sbgp_seen: true,
             ..Track::default()
         };
-        assert!(cenc_auxiliary_for_iamf(&key_rotation, &[], false, &[]).is_err());
+        assert_eq!(
+            resolve_cenc_group_assignments(&track, 2).unwrap(),
+            vec![Some(first), Some(second)]
+        );
+        assert!(resolve_cenc_group_assignments(&track, 1).is_err());
+        let underfilled = Track {
+            cenc_group_entries: track.cenc_group_entries.clone(),
+            cenc_sample_runs: vec![(1, 1)],
+            cenc_sbgp_seen: true,
+            ..Track::default()
+        };
+        assert!(resolve_cenc_group_assignments(&underfilled, 2).is_err());
+
+        let local = parse_cenc_sample_group_entry(&test_seig_entry(0x66, 8)).unwrap();
+        let fragment = TrackFragment {
+            samples: vec![SampleLocation {
+                offset: 0,
+                size: 1,
+                description_index: 1,
+            }],
+            cenc_group_entries: vec![local],
+            cenc_sample_runs: vec![(1, 0x1_0001)],
+            cenc_sbgp_seen: true,
+            ..TrackFragment::default()
+        };
+        assert_eq!(
+            resolve_fragment_cenc_group_assignments(&track, &fragment).unwrap()[0]
+                .as_ref()
+                .unwrap()
+                .kid,
+            "66".repeat(16)
+        );
+        let undefined_fragment = TrackFragment {
+            samples: fragment.samples.clone(),
+            cenc_sample_runs: vec![(1, 0x1_0002)],
+            cenc_sbgp_seen: true,
+            ..TrackFragment::default()
+        };
+        assert!(resolve_fragment_cenc_group_assignments(&track, &undefined_fragment).is_err());
+
+        let default_group = Track {
+            cenc_group_entries: vec![
+                parse_cenc_sample_group_entry(&test_seig_entry(0x77, 8)).unwrap()
+            ],
+            cenc_default_description_index: Some(1),
+            ..Track::default()
+        };
+        assert_eq!(
+            resolve_cenc_group_assignments(&default_group, 2)
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.is_some())
+                .count(),
+            2
+        );
+        assert!(parse_cenc_sample_group_entry(&[0; 19]).is_err());
+        let mut malformed_constant_iv = test_seig_entry(0x77, 0);
+        malformed_constant_iv.pop();
+        assert!(parse_cenc_sample_group_entry(&malformed_constant_iv).is_err());
+    }
+
+    #[test]
+    fn accepts_iso_bmff_iamf_cenc_seig_key_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("key-rotation.mp4");
+        let protection = TestCenc {
+            scheme: *b"cenc",
+            pattern: 0,
+            iv_size: 8,
+            subsample: false,
+        };
+        let bytes = minimal_iamf_mp4_protected_with_groups(
+            b"iamf",
+            vec![vec![0xdd; 32], vec![0xee; 32]],
+            Some(protection),
+            test_cenc_key_rotation_groups(),
+            Some(test_two_sample_cenc_auxiliary()),
+        );
+        File::create(&path).unwrap().write_all(&bytes).unwrap();
+        let result = crate::container_qc::audit(&path).unwrap();
+        assert!(result.passed, "{result:#?}");
+        let evidence = &result.properties["iamf_tracks"][0]["cenc"]["protection"];
+        assert_eq!(evidence["key_rotation"], true);
+        assert_eq!(evidence["sample_group_overrides"], 2);
+        assert_eq!(evidence["key_ids"].as_array().unwrap().len(), 2);
+
+        let invalid_path = directory.path().join("pattern-key-rotation.mp4");
+        let mut groups = test_cenc_key_rotation_groups();
+        let entry = groups
+            .windows(5)
+            .position(|window| window == [0, 0, 1, 8, 0x44])
+            .unwrap();
+        groups[entry + 1] = 0x11;
+        let bytes = minimal_iamf_mp4_protected_with_groups(
+            b"iamf",
+            vec![vec![0xdd; 32], vec![0xee; 32]],
+            Some(protection),
+            groups,
+            Some(test_two_sample_cenc_auxiliary()),
+        );
+        File::create(&invalid_path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        let result = crate::container_qc::audit(&invalid_path).unwrap();
+        assert!(!result.passed);
+        assert!(result
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.checks)
+            .any(|check| check.rule_id == "FORGE-ISOBMFF-IAMF-CENC" && !check.passed));
+    }
+
+    #[test]
+    fn accepts_fragment_local_cenc_seig_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fragment-key-rotation.mp4");
+        let protection = TestCenc {
+            scheme: *b"cenc",
+            pattern: 0,
+            iv_size: 8,
+            subsample: false,
+        };
+        let bytes = minimal_fragmented_iamf_protected_with_groups(
+            vec![0xdd; 32],
+            0,
+            false,
+            false,
+            Some(protection),
+            test_fragment_cenc_group(0x66),
+            None,
+        );
+        File::create(&path).unwrap().write_all(&bytes).unwrap();
+        let result = crate::container_qc::audit(&path).unwrap();
+        assert!(result.passed, "{result:#?}");
+        let protection = &result.properties["iamf_tracks"][0]["cenc"]["fragments"][0]["protection"];
+        assert_eq!(protection["sample_group_overrides"], 1);
+        assert_eq!(protection["key_ids"][0], "66".repeat(16));
+    }
+
+    #[test]
+    fn accepts_version_two_default_cenc_seig_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("default-key-group.mp4");
+        let protection = TestCenc {
+            scheme: *b"cenc",
+            pattern: 0,
+            iv_size: 8,
+            subsample: false,
+        };
+        let bytes = minimal_iamf_mp4_protected_with_groups(
+            b"iamf",
+            vec![vec![0xdd; 32], vec![0xee; 32]],
+            Some(protection),
+            test_default_cenc_group(0x77),
+            Some(test_two_sample_cenc_auxiliary()),
+        );
+        File::create(&path).unwrap().write_all(&bytes).unwrap();
+        let result = crate::container_qc::audit(&path).unwrap();
+        assert!(result.passed, "{result:#?}");
+        let protection = &result.properties["iamf_tracks"][0]["cenc"]["protection"];
+        assert_eq!(protection["sample_group_overrides"], 2);
+        assert_eq!(protection["key_ids"][0], "77".repeat(16));
     }
 
     #[test]

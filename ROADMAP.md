@@ -152,8 +152,8 @@ generations.
 - DTS core/HD metadata and decoded presentation checks through an optional
   adapter.
 - WavPack, Monkey's Audio, and ALAC native frame/checksum validation.
-- CENC `seig` key rotation/sample-group overrides and broader OAR conformance
-  vectors. Standalone
+- Broader OAR conformance vectors. CENC `seig` key rotation/sample-group
+  overrides and standalone
   OBU bounds/order, supported codec configurations, full Audio Element and Mix
   Presentation semantics, profile element/channel limits, descriptor/substream
   linking, Parameter Block syntax, exact parameter/audio-frame timeline
