@@ -36,6 +36,7 @@ struct Instance {
     output_left: *mut f32,
     output_right: *mut f32,
     gain_db: *const f32,
+    latency_frames: *mut f32,
 }
 
 unsafe extern "C" fn instantiate(
@@ -59,6 +60,7 @@ unsafe extern "C" fn instantiate(
         output_left: ptr::null_mut(),
         output_right: ptr::null_mut(),
         gain_db: ptr::null(),
+        latency_frames: ptr::null_mut(),
     }))
     .cast()
 }
@@ -75,6 +77,7 @@ unsafe extern "C" fn connect_port(instance: *mut c_void, port: u32, data: *mut c
         2 => instance.output_left = data.cast(),
         3 => instance.output_right = data.cast(),
         4 => instance.gain_db = data.cast_const().cast(),
+        5 => instance.latency_frames = data.cast(),
         _ => {}
     }
 }
@@ -85,6 +88,12 @@ unsafe extern "C" fn run(instance: *mut c_void, sample_count: u32) {
     }
     // SAFETY: LV2 guarantees the instance and connected buffers remain valid for run.
     let instance = unsafe { &mut *instance.cast::<Instance>() };
+    if !instance.latency_frames.is_null() {
+        // SAFETY: output control ports contain one writable f32 for the duration of run.
+        unsafe {
+            *instance.latency_frames = instance.processor.latency_frames() as f32;
+        }
+    }
     if instance.input_left.is_null()
         || instance.input_right.is_null()
         || instance.output_left.is_null()
@@ -155,29 +164,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn descriptor_processes_connected_stereo_buffers() {
+    fn plugin_parity_lv2_output_and_latency_match_realtime_processor() {
         let descriptor = lv2_descriptor(0);
         assert!(!descriptor.is_null());
+        let frames = 1_024;
+        let left = (0..frames)
+            .map(|frame| {
+                let carrier = (frame as f32 * 0.071).sin();
+                let envelope = if (256..640).contains(&frame) {
+                    1.35
+                } else {
+                    0.23
+                };
+                carrier * envelope
+            })
+            .collect::<Vec<_>>();
+        let right = left
+            .iter()
+            .enumerate()
+            .map(|(frame, sample)| {
+                if frame.is_multiple_of(5) {
+                    -*sample * 0.71
+                } else {
+                    *sample * 0.43
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut expected = left
+            .iter()
+            .zip(&right)
+            .flat_map(|(left, right)| [*left, *right])
+            .collect::<Vec<_>>();
+        let mut reference =
+            RealtimeGainProcessor::new(48_000, 2, RealtimeGainConfig::default()).unwrap();
+        reference.set_target_gain_db(-6.0).unwrap();
+        reference.process_interleaved(&mut expected).unwrap();
+
         // SAFETY: this test follows the LV2 host lifecycle and buffer contract.
         unsafe {
             let descriptor = &*descriptor;
             let instance =
                 descriptor.instantiate.unwrap()(descriptor, 48_000.0, ptr::null(), ptr::null());
             assert!(!instance.is_null());
-            let left = [0.25_f32; 512];
-            let right = [-0.25_f32; 512];
-            let mut out_left = [0.0_f32; 512];
-            let mut out_right = [0.0_f32; 512];
-            let mut gain = 0.0_f32;
+            let mut out_left = vec![0.0_f32; frames];
+            let mut out_right = vec![0.0_f32; frames];
+            let mut gain = -6.0_f32;
+            let mut latency = -1.0_f32;
             let connect = descriptor.connect_port.unwrap();
+            connect(instance, 4, (&mut gain as *mut f32).cast());
+            connect(instance, 5, (&mut latency as *mut f32).cast());
             connect(instance, 0, left.as_ptr().cast_mut().cast());
             connect(instance, 1, right.as_ptr().cast_mut().cast());
             connect(instance, 2, out_left.as_mut_ptr().cast());
             connect(instance, 3, out_right.as_mut_ptr().cast());
-            connect(instance, 4, (&mut gain as *mut f32).cast());
-            descriptor.run.unwrap()(instance, 512);
-            assert!(out_left.iter().skip(256).any(|sample| *sample > 0.0));
-            assert!(out_right.iter().skip(256).any(|sample| *sample < 0.0));
+            descriptor.run.unwrap()(instance, 0);
+            assert_eq!(latency, reference.latency_frames() as f32);
+            for (start, sample_count) in [(0, 137), (137, 389), (526, frames - 526)] {
+                connect(instance, 0, left.as_ptr().add(start).cast_mut().cast());
+                connect(instance, 1, right.as_ptr().add(start).cast_mut().cast());
+                connect(instance, 2, out_left.as_mut_ptr().add(start).cast());
+                connect(instance, 3, out_right.as_mut_ptr().add(start).cast());
+                descriptor.run.unwrap()(instance, sample_count as u32);
+            }
+            let actual = out_left
+                .iter()
+                .zip(&out_right)
+                .flat_map(|(left, right)| [*left, *right])
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+            assert_eq!(latency, reference.latency_frames() as f32);
+            assert_eq!(latency, 240.0);
             descriptor.cleanup.unwrap()(instance);
         }
         assert!(lv2_descriptor(1).is_null());

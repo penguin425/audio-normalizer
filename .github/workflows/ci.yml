@@ -44,6 +44,35 @@ jobs:
       - name: Run tests with MP3 encoding
         run: cargo test --features mp3-encoding
 
+  plugin-parity:
+    name: Plugin parity (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Compare CLI, CLAP, and LV2 output with the live processor
+        env:
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace
+        run: |
+          cargo test --locked --target ${{ matrix.target }} --features clap-plugin,lv2-plugin --lib plugin_parity
+          cargo test --locked --target ${{ matrix.target }} --features clap-plugin,lv2-plugin --test live_cli plugin_parity
+
   ebu-conformance:
     name: EBU conformance
     runs-on: ubuntu-latest

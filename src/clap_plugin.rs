@@ -500,7 +500,7 @@ mod tests {
     use clack_plugin::entry::SinglePluginEntry;
 
     #[test]
-    fn host_loads_automates_and_processes_forge_clap() {
+    fn plugin_parity_clap_host_output_matches_realtime_processor() {
         let info = HostInfo::new("forge-test", "", "", "").unwrap();
         let entry =
             PluginEntry::load_from_clack::<SinglePluginEntry<ForgeClapPlugin>>(c"").unwrap();
@@ -540,7 +540,38 @@ mod tests {
             -6.0,
             Cookie::empty(),
         ));
-        let mut inputs = [vec![0.25_f32; 512], vec![-0.25_f32; 512]];
+        let left = (0..512)
+            .map(|frame| {
+                let carrier = (frame as f32 * 0.071).sin();
+                let envelope = if (128..384).contains(&frame) {
+                    1.35
+                } else {
+                    0.23
+                };
+                carrier * envelope
+            })
+            .collect::<Vec<_>>();
+        let right = left
+            .iter()
+            .enumerate()
+            .map(|(frame, sample)| {
+                if frame.is_multiple_of(5) {
+                    -*sample * 0.71
+                } else {
+                    *sample * 0.43
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut expected = left
+            .iter()
+            .zip(&right)
+            .flat_map(|(left, right)| [*left, *right])
+            .collect::<Vec<_>>();
+        let mut reference =
+            RealtimeGainProcessor::new(48_000, 2, RealtimeGainConfig::default()).unwrap();
+        reference.set_target_gain_db(-6.0).unwrap();
+        reference.process_interleaved(&mut expected).unwrap();
+        let mut inputs = [left, right];
         let mut outputs = [vec![0.0_f32; 512], vec![0.0_f32; 512]];
         let mut processor = processor.start_processing().unwrap();
         let mut input_ports = AudioPorts::with_capacity(2, 1);
@@ -567,9 +598,12 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(outputs[0].iter().skip(300).any(|sample| *sample > 0.0));
-        assert!(outputs[0][511] < 0.25);
-        assert!(outputs[1][511] > -0.25);
+        let actual = outputs[0]
+            .iter()
+            .zip(&outputs[1])
+            .flat_map(|(left, right)| [*left, *right])
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
         plugin.deactivate(processor.stop_processing());
     }
 
