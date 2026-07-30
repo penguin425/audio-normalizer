@@ -29,6 +29,7 @@ pub mod aes31_qc;
 mod atomic;
 pub mod audio_compare;
 mod bwf_xml_qc;
+pub mod c_api;
 #[cfg(feature = "clap-plugin")]
 pub mod clap_plugin;
 pub mod cli;

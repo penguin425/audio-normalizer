@@ -63,3 +63,6 @@ An intentional breaking change requires all of the following:
 
 Suppressing a semver lint solely to make a pull request pass is not an
 acceptable migration.
+
+The separately versioned Forge C ABI is governed by
+[`C-API.md`](C-API.md), not by Rust source compatibility.

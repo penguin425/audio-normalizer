@@ -96,6 +96,10 @@ Forge already provides:
 - Rust source compatibility from the v0.94.0 baseline, with an explicit
   pre-1.0 stability contract, all-feature `cargo-semver-checks` gating against
   the latest release tag, and a downstream-style public API contract test.
+- Versioned C ABI v1 for bounded local-file analysis with a fixed
+  caller-owned result layout, UTF-8 error contract, decoded-sample limit,
+  packaged header/shared libraries, and real C consumer tests on Linux,
+  macOS, and Windows.
 - EBU QC Items for channel count, clipping, duration, dropouts, loudness,
   phase reversal, test tones, clicks, minimum average level, silence, true
   peak, hum/buzz, band-limited noise, cross-talk, panning, LFE/centre
@@ -250,7 +254,7 @@ failure behaviour are documented.
 
 ## Product and developer experience
 
-- Versioned C ABI and Python bindings over the stable Rust library API.
+- Python bindings over the versioned C ABI.
 - WASM analysis build for local browser use; encoding and filesystem features
   remain capability-gated.
 - Resumable batch jobs, content-addressed analysis cache, watch folders, and

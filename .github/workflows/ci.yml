@@ -87,6 +87,43 @@ jobs:
           feature-group: all-features
           release-type: patch
 
+  c-api:
+    name: C ABI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Check Rust and C header contracts
+        env:
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace
+        run: cargo test --locked --target ${{ matrix.target }} --test c_api --test c_header
+
+      - name: Link and run a C consumer
+        if: runner.os != 'Windows'
+        shell: bash
+        run: tools/test-c-api.sh "${{ matrix.target }}"
+
+      - name: Link and run a C consumer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: tools/test-c-api.ps1 -Target "${{ matrix.target }}"
+
   plugin-parity:
     name: Plugin parity (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

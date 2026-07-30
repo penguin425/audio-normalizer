@@ -1795,6 +1795,19 @@ review remains required. The exact guarantees, exclusions, MSRV policy, and
 intentional-breaking-change process are recorded in
 [API-STABILITY.md](API-STABILITY.md).
 
+## C API
+
+Release archives contain the versioned Forge C ABI v1 shared library and
+`include/forge_normalizer.h`. It provides bounded local-file analysis without
+passing Rust-owned memory across the language boundary. The caller supplies a
+fixed 80-byte result, an optional error buffer, and an explicit maximum number
+of decoded samples.
+
+The ABI version, status values, field layout, units, ownership rules, compile
+example, and compatibility policy are documented in [C-API.md](C-API.md).
+CI compiles the header as strict C11, links a real C consumer to the generated
+shared library, and runs it on Linux, macOS ARM, and Windows x86-64.
+
 ## Real-time DSP API
 
 Release archives include `forge-live`, a streaming CLI for shells, OBS/FFmpeg
