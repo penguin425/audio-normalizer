@@ -75,6 +75,16 @@ impl WavReader {
 
     /// Decode a WAV file already held in memory.
     pub fn read_bytes(bytes: &[u8]) -> Result<AudioBuffer, WavReadError> {
+        Self::read_bytes_with_limits(bytes, u16::MAX, usize::MAX)
+    }
+
+    /// Decode an in-memory WAV file while bounding allocation from untrusted
+    /// channel and sample counts.
+    pub fn read_bytes_with_limits(
+        bytes: &[u8],
+        max_channels: u16,
+        max_decoded_samples: usize,
+    ) -> Result<AudioBuffer, WavReadError> {
         let mut cur = 0usize;
         let container = take(bytes, &mut cur, 4).ok_or(WavReadError::Truncated)?;
         if !matches!(container, b"RIFF" | b"RF64" | b"BW64") {
@@ -134,10 +144,21 @@ impl WavReader {
         if channels == 0 {
             return Err(WavReadError::ZeroChannels);
         }
+        if channels > max_channels {
+            return Err(WavReadError::BadFormat("channel count exceeds limit"));
+        }
         let kind = pick_kind(wave_format, real_tag, bits)?;
         let data = data.ok_or(WavReadError::NoDataChunk)?;
         let bpp = kind.bytes_per_sample();
         let frames = data.len() / (bpp * channels as usize);
+        let decoded_samples = frames
+            .checked_mul(channels as usize)
+            .ok_or(WavReadError::BadFormat("decoded sample count overflow"))?;
+        if decoded_samples > max_decoded_samples {
+            return Err(WavReadError::BadFormat(
+                "decoded sample count exceeds limit",
+            ));
+        }
 
         let planar = convert::decode_planar(data, kind, channels as usize);
         let channel_roles = channel_mask
@@ -409,6 +430,35 @@ mod tests {
                 "fmt chunk exceeds 64 KiB safety limit"
             ))
         ));
+    }
+
+    #[test]
+    fn in_memory_limits_are_checked_before_pcm_allocation() {
+        let mut wave = b"RIFF\x28\0\0\0WAVEfmt \x10\0\0\0".to_vec();
+        wave.extend_from_slice(&1_u16.to_le_bytes());
+        wave.extend_from_slice(&1_u16.to_le_bytes());
+        wave.extend_from_slice(&48_000_u32.to_le_bytes());
+        wave.extend_from_slice(&96_000_u32.to_le_bytes());
+        wave.extend_from_slice(&2_u16.to_le_bytes());
+        wave.extend_from_slice(&16_u16.to_le_bytes());
+        wave.extend_from_slice(b"data\x08\0\0\0\0\0\0\0\0\0\0\0");
+
+        assert!(matches!(
+            WavReader::read_bytes_with_limits(&wave, 0, usize::MAX),
+            Err(WavReadError::BadFormat("channel count exceeds limit"))
+        ));
+        assert!(matches!(
+            WavReader::read_bytes_with_limits(&wave, 1, 3),
+            Err(WavReadError::BadFormat(
+                "decoded sample count exceeds limit"
+            ))
+        ));
+        assert_eq!(
+            WavReader::read_bytes_with_limits(&wave, 1, 4)
+                .unwrap()
+                .frames,
+            4
+        );
     }
 
     proptest! {

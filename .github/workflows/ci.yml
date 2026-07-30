@@ -44,6 +44,37 @@ jobs:
       - name: Run tests with MP3 encoding
         run: cargo test --features mp3-encoding
 
+  wasm:
+    name: Browser WASM analysis
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install Rust 1.97.0 and the WebAssembly target
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+
+      - name: Install pinned wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+
+      - name: Check WASM formatting and lints
+        run: |
+          cargo fmt --manifest-path wasm/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Build the browser package
+        env:
+          SOURCE_DATE_EPOCH: "0"
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          tools/build-wasm-package.sh "$version" dist
+
+      - name: Run the generated ES module in Node.js
+        run: node wasm/test/smoke.mjs
+
   rust-api:
     name: Rust API compatibility
     runs-on: ubuntu-24.04

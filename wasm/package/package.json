@@ -1,0 +1,24 @@
+{
+  "name": "@forge-normalizer/wasm",
+  "version": "0.97.0",
+  "description": "Local browser loudness analysis with Forge",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "forge_normalizer_wasm.js",
+    "forge_normalizer_wasm_bg.wasm",
+    "forge_normalizer_wasm_bg.wasm.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/penguin425/audio-normalizer.git"
+  },
+  "private": true
+}

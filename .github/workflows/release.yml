@@ -9,10 +9,12 @@ on:
       - ".github/workflows/release.yml"
       - "include/forge_normalizer.h"
       - "python/**"
+      - "wasm/**"
       - "src/c_api.rs"
       - "src/lib.rs"
       - "PYTHON-API.md"
       - "tools/build-python-wheel.py"
+      - "tools/build-wasm-package.sh"
       - "tools/package-linux-release.sh"
       - "tools/generate-package-metadata.sh"
       - "Cargo.toml"
@@ -48,6 +50,14 @@ jobs:
           )"
           if [[ "$python_version" != "$version" ]]; then
             echo "::error::Python package version ${python_version} does not match Cargo.toml version ${version}"
+            exit 1
+          fi
+          wasm_version="$(
+            cargo metadata --manifest-path wasm/Cargo.toml --no-deps --format-version 1 |
+              jq -r '.packages[0].version'
+          )"
+          if [[ "$wasm_version" != "$version" ]]; then
+            echo "::error::WASM package version ${wasm_version} does not match Cargo.toml version ${version}"
             exit 1
           fi
           if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" != "v${version}" ]]; then
@@ -260,9 +270,45 @@ jobs:
             "actual/forge_normalizer-${{ needs.validate.outputs.version }}-py3-none-manylinux_2_34_x86_64.whl" \
             "reproduced/forge_normalizer-${{ needs.validate.outputs.version }}-py3-none-manylinux_2_34_x86_64.whl"
 
+  wasm:
+    name: Build browser WASM package
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install Rust 1.97.0 and the WebAssembly target
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install pinned wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+
+      - name: Build and test the browser package
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
+        run: |
+          mkdir first second
+          tools/build-wasm-package.sh "${{ needs.validate.outputs.version }}" first
+          node wasm/test/smoke.mjs
+          tools/build-wasm-package.sh "${{ needs.validate.outputs.version }}" second
+          cmp \
+            "first/forge-v${{ needs.validate.outputs.version }}-wasm-web.tar.gz" \
+            "second/forge-v${{ needs.validate.outputs.version }}-wasm-web.tar.gz"
+          mv "first/forge-v${{ needs.validate.outputs.version }}-wasm-web.tar.gz" .
+
+      - name: Upload browser package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: forge-wasm-web
+          path: forge-v${{ needs.validate.outputs.version }}-wasm-web.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish GitHub Release
-    needs: [validate, build, reproducible-linux]
+    needs: [validate, build, reproducible-linux, wasm]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     permissions:
