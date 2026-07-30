@@ -32,8 +32,10 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
 * Optional Ogg Opus input/output uses statically linked libopus, bounded-memory
   sinc resampling to 48 kHz, and a pure-Rust Ogg container. Release binaries
   include it; source builds enable it with the `opus-encoding` feature.
-* Opus output writes RFC 7845 `R128_TRACK_GAIN` and, in album mode,
-  `R128_ALBUM_GAIN` comments in signed Q7.8 dB units.
+* Opus output and metadata-only updates follow
+  [RFC 7845 section 5.2](https://www.rfc-editor.org/rfc/rfc7845#section-5.2):
+  `R128_TRACK_GAIN` and, in album mode, `R128_ALBUM_GAIN` are written in
+  signed Q7.8 dB units relative to −23 LUFS and read back exactly.
 * AAC-LC, ALAC, and Vorbis output use the optional FFmpeg runtime. MP4 gapless
   timing is preserved and Forge writes ReplayGain loudness/peak metadata after
   measuring the encoded result.
@@ -1200,8 +1202,10 @@ forge --analyze programme.wav --compliance station-qc.toml --csv qc.csv
 # Produce a BW64 Broadcast Wave master while preserving ADM/iXML metadata
 forge programme.wav -o delivery.wav --format wav --bwf --wav-container bw64
 
-# Write ReplayGain 2.0 track tags without changing encoded audio
+# Write container-native loudness metadata without changing encoded audio.
+# FLAC uses ReplayGain 2.0; Ogg Opus uses RFC 7845 R128_GAIN.
 forge song.flac --write-tags
+forge speech.opus --write-tags
 
 # Add shared album tags to every track (audio remains untouched)
 forge album/*.flac --album --write-tags
@@ -1350,7 +1354,7 @@ gain-only, tag-only, or dry-run modes.
 | `--timeline` | none | Time-resolved QC report (`.json`, `.ndjson`, `.jsonl`, or `.csv`) |
 | `--timeline-interval` | `100` | Timeline interval in milliseconds |
 | `--gain-only` | off | Print the gain; write nothing |
-| `--write-tags` | off | Write ReplayGain 2.0 metadata without changing audio |
+| `--write-tags` | off | Write and re-read container-native loudness metadata without changing audio (RFC 7845 R128_GAIN for Opus; ReplayGain 2.0 otherwise) |
 | `--sound-check` | off | With `--write-tags`, write and exactly re-read non-normative Apple `iTunNORM` compatibility metadata |
 | `--verify` | off | Re-decode output and verify achieved level and true peak |
 | `--verify-tolerance` | `0.5` | Allowed post-encode deviation in LU/dB |

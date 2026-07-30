@@ -607,6 +607,51 @@ fn opus_resamples_roundtrips_and_writes_r128_track_gain() {
 
 #[cfg(feature = "opus-encoding")]
 #[test]
+fn metadata_only_opus_uses_rfc7845_without_changing_audio() {
+    let output = tmp_path("forge_it_opus_metadata_only.opus");
+    let buffer = synth_sine(48_000, 1.0, 0.1, 997.0, 2);
+    let plan = Plan {
+        mode: Mode::Lufs,
+        target_lufs: -18.0,
+        target_peak_db: -1.0,
+        target_rms_db: -18.0,
+        ceiling_db: -1.0,
+        max_gain_db: None,
+        dither: false,
+        output_kind: None,
+        mp3_bitrate: 128,
+        mp3_quality: 2,
+        limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
+    };
+    normalize::write(&buffer, &output, &plan, OutputFormat::Opus).unwrap();
+    let before = decoder::decode(&output).unwrap();
+    let scheme = forge_normalizer::metadata::write_loudness_metadata(
+        &output,
+        -16.0,
+        0.1,
+        Some((-18.0, 0.1)),
+    )
+    .unwrap();
+    assert_eq!(
+        scheme,
+        forge_normalizer::metadata::LoudnessMetadataScheme::Rfc7845R128
+    );
+    assert_eq!(
+        forge_normalizer::opus_tags::read_r128_tags(&output).unwrap(),
+        (Some(-7 * 256), Some(-5 * 256))
+    );
+    let after = decoder::decode(&output).unwrap();
+    assert_eq!(before.frames, after.frames);
+    assert_eq!(before.data, after.data);
+    let _ = std::fs::remove_file(output);
+}
+
+#[cfg(feature = "opus-encoding")]
+#[test]
 fn chained_opus_preserves_each_pre_skip_and_end_trim() {
     let first = tmp_path("forge_it_opus_chain_first.opus");
     let second = tmp_path("forge_it_opus_chain_second.opus");
@@ -840,13 +885,17 @@ fn replaygain_tags_leave_decoded_audio_unchanged() {
     normalize::write(&buf, &input, &plan, OutputFormat::Flac).unwrap();
     let before = decoder::decode(&input).unwrap();
     let analysis = normalize::analyze(&before);
-    forge_normalizer::metadata::write_replaygain(
+    let scheme = forge_normalizer::metadata::write_loudness_metadata(
         &input,
         analysis.lufs,
         analysis.sample_peak,
         Some((analysis.lufs - 1.0, analysis.sample_peak)),
     )
     .unwrap();
+    assert_eq!(
+        scheme,
+        forge_normalizer::metadata::LoudnessMetadataScheme::ReplayGain2
+    );
 
     let tags = lofty::read_from_path(&input).unwrap();
     let tag = tags.primary_tag().unwrap();

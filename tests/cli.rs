@@ -137,6 +137,58 @@ fn sound_check_m4a_write_is_read_back_exactly() {
     );
 }
 
+#[cfg(feature = "opus-encoding")]
+#[test]
+fn metadata_only_opus_cli_uses_rfc7845_and_preserves_audio() {
+    if !Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("speech.opus");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=700:sample_rate=48000:duration=1",
+            "-c:a",
+            "libopus",
+            input.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(generated.success());
+    let before = forge_normalizer::decoder::decode(&input).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([input.to_str().unwrap(), "--write-tags"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stderr)
+        .contains("wrote and verified RFC 7845 R128_GAIN metadata"));
+    let (track, album) = forge_normalizer::opus_tags::read_r128_tags(&input).unwrap();
+    assert!(track.is_some());
+    assert_eq!(album, None);
+    let after = forge_normalizer::decoder::decode(&input).unwrap();
+    assert_eq!(before.frames, after.frames);
+    assert_eq!(before.data, after.data);
+}
+
 #[test]
 fn sound_check_metadata_api_round_trips_every_supported_container() {
     if !Command::new("ffmpeg")

@@ -57,6 +57,7 @@ pub mod normalize;
 mod ogg_qc;
 #[cfg(feature = "opus-encoding")]
 pub mod opus;
+pub mod opus_tags;
 mod pcm_container_qc;
 pub mod presentation_qc;
 pub mod preset;

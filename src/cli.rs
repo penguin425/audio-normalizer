@@ -618,7 +618,9 @@ pub struct Cli {
     #[arg(long = "gain-only")]
     pub gain_only: bool,
 
-    /// Measure without changing audio and write ReplayGain 2.0 metadata to the inputs.
+    /// Measure without changing audio and write container-native loudness metadata.
+    ///
+    /// Ogg Opus uses RFC 7845 R128_GAIN; other supported inputs use ReplayGain 2.0.
     #[arg(
         long = "write-tags",
         conflicts_with_all = ["analyze_only", "gain_only", "output"]

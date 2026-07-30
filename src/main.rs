@@ -1369,16 +1369,17 @@ fn write_loudness_tags(
     };
     for (input, analysis) in cli.inputs.iter().zip(&analyses) {
         print_analysis(input, analysis, None);
+        let scheme = forge_normalizer::metadata::loudness_metadata_scheme(input)?;
         if cli.dry_run {
-            eprintln!("  would write ReplayGain tags");
+            eprintln!("  would write {} metadata", scheme.label());
         } else {
-            forge_normalizer::metadata::write_replaygain(
+            let written = forge_normalizer::metadata::write_loudness_metadata(
                 input,
                 analysis.lufs,
                 analysis.true_peak,
                 album,
             )?;
-            eprintln!("  wrote ReplayGain tags");
+            eprintln!("  wrote and verified {} metadata", written.label());
         }
         if cli.sound_check {
             let sound_check = forge_normalizer::metadata::SoundCheck::from_r128(
