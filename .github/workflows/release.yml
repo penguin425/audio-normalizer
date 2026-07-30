@@ -58,21 +58,25 @@ jobs:
             asset: linux-x86_64
             archive: tar
             library: libforge_normalizer.so
+            rustflags: ""
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
             asset: windows-x86_64
             archive: zip
             library: forge_normalizer.dll
+            rustflags: ""
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             asset: macos-x86_64
             archive: tar
             library: libforge_normalizer.dylib
+            rustflags: ""
           - runner: macos-latest
             target: aarch64-apple-darwin
             asset: macos-aarch64
             archive: tar
             library: libforge_normalizer.dylib
+            rustflags: -Ctarget-feature=+neon,+aes,+sha2
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
@@ -85,7 +89,7 @@ jobs:
       - name: Build release binary
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace ${{ matrix.rustflags }}
         run: cargo build --locked --release --target ${{ matrix.target }} --features opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin
 
       - name: Package reproducible Linux binary

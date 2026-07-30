@@ -96,10 +96,13 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            rustflags: ""
           - os: macos-latest
             target: aarch64-apple-darwin
+            rustflags: -Ctarget-feature=+neon,+aes,+sha2
           - os: windows-2025
             target: x86_64-pc-windows-msvc
+            rustflags: ""
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
@@ -114,16 +117,22 @@ jobs:
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
 
       - name: Check Rust and C header contracts
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo test --locked --target ${{ matrix.target }} --test c_api --test c_header
 
       - name: Link and run a C consumer
         if: runner.os != 'Windows'
         shell: bash
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: tools/test-c-api.sh "${{ matrix.target }}"
 
       - name: Link and run a C consumer
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: tools/test-c-api.ps1 -Target "${{ matrix.target }}"
 
   plugin-parity:
