@@ -123,21 +123,21 @@ jobs:
           --library target/${{ matrix.target }}/release/${{ matrix.library }}
           --library-name ${{ matrix.library }}
           --platform ${{ matrix.wheel-platform }}
-          --outdir python-dist
+          --outdir .
           --version ${{ needs.validate.outputs.version }}
 
       - name: Check Linux wheel policy
         if: matrix.asset == 'linux-x86_64'
         run: |
           python -m pip install --disable-pip-version-check auditwheel==6.7.0
-          python -m auditwheel show python-dist/*.whl
+          python -m auditwheel show forge_normalizer-*.whl
 
       - name: Install and smoke-test the platform wheel
         shell: bash
         run: |
           set -euo pipefail
           unset FORGE_NORMALIZER_LIBRARY
-          python -m pip install python-dist/*.whl
+          python -m pip install forge_normalizer-*.whl
           python -m pip check
           python python/tests/wheel_smoke.py
 
@@ -201,7 +201,7 @@ jobs:
           name: forge-${{ matrix.asset }}
           path: |
             forge-v${{ needs.validate.outputs.version }}-${{ matrix.asset }}.*
-            python-dist/*.whl
+            forge_normalizer-${{ needs.validate.outputs.version }}-*.whl
           if-no-files-found: error
           retention-days: 7
 
