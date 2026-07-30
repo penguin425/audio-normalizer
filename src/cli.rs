@@ -625,6 +625,11 @@ pub struct Cli {
     )]
     pub write_tags: bool,
 
+    /// Also write Apple Sound Check compatibility metadata and verify its
+    /// exact write/read round trip. The iTunNORM mapping is non-normative.
+    #[arg(long = "sound-check", requires = "write_tags")]
+    pub sound_check: bool,
+
     /// Decode and measure each completed output to verify level and true peak.
     #[arg(
         long,
