@@ -468,9 +468,21 @@ require `roll` groups matching Opus/AAC `audio_roll_distance`, reject
 `stss`/`ctts`, fragment composition offsets, and non-sync sample flags, and
 verify that start/end trim is represented exactly by `edts`/`elst`. The
 fragmented path is continuously exercised against checksum-pinned AOMedia
-`libiamf` v1.1.0 positive and negative vectors. Encrypted IAMF remains
-explicitly outside this decapsulation claim until CENC signalling and
-full-sample protection can be verified.
+`libiamf` v1.1.0 positive and negative vectors.
+
+Encrypted IA tracks recognize an `enca` sample entry only when `sinf/frma`
+recovers the original `iamf` format. `FORGE-ISOBMFF-IAMF-CENC-SIGNALING`
+validates one `schm`/`schi`/`tenc` chain, scheme version 1, a protected default
+KID, 8/16-byte per-sample or constant IVs, and the IAMF-permitted `cenc` or
+`cbcs` scheme without pattern skipping. `FORGE-ISOBMFF-IAMF-CENC` reconciles
+`senc` or paired `saiz`/`saio` sample counts and IV sizes for both sample
+tables and track fragments, and rejects subsample encryption. Ciphertext
+ranges must remain bounded and disjoint inside `mdat`, but Forge deliberately
+does not accept keys or claim OBU, trim, or decoded-audio validation for
+encrypted payloads; JSON reports this boundary as
+`ciphertext_obu_validation = "requires_keys"`. CENC `seig` sample-group
+overrides are rejected rather than silently applying the wrong default key;
+key-rotation validation remains a separate roadmap item.
 
 Rendering is deliberately separate: render every Mix Presentation and target
 layout with an

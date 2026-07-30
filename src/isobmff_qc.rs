@@ -67,10 +67,12 @@ struct Track {
     has_sync_sample_box: bool,
     has_composition_offsets: bool,
     iamf_entries: Vec<Option<IamfSampleEntry>>,
+    cenc_auxiliary: CencAuxiliary,
 }
 
 #[derive(Clone, Default)]
 struct IamfSampleEntry {
+    sample_entry_type: String,
     channel_count: Option<u16>,
     sample_rate: Option<u32>,
     configuration_version: Option<u8>,
@@ -78,6 +80,51 @@ struct IamfSampleEntry {
     config_trailing_bytes: usize,
     configuration_boxes: usize,
     has_sampling_rate_box: bool,
+    protection: Option<CencProtection>,
+}
+
+#[derive(Clone, Default)]
+struct CencProtection {
+    original_format: Option<String>,
+    scheme: Option<String>,
+    scheme_version: Option<u32>,
+    tenc_version: Option<u8>,
+    default_is_protected: Option<u8>,
+    per_sample_iv_size: Option<u8>,
+    default_kid: Option<String>,
+    crypt_byte_block: Option<u8>,
+    skip_byte_block: Option<u8>,
+    constant_iv_size: Option<u8>,
+    valid: bool,
+}
+
+#[derive(Clone, Default)]
+struct CencAuxiliary {
+    senc: Vec<CencSampleEncryption>,
+    saiz: Vec<CencSampleAuxiliarySizes>,
+    saio: Vec<CencSampleAuxiliaryOffsets>,
+}
+
+#[derive(Clone)]
+struct CencSampleEncryption {
+    flags: u32,
+    sample_count: u32,
+    iv_size_override: Option<u8>,
+    entry_bytes: usize,
+}
+
+#[derive(Clone)]
+struct CencSampleAuxiliarySizes {
+    auxiliary_type: Option<String>,
+    default_size: u8,
+    sample_count: u32,
+    sizes: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct CencSampleAuxiliaryOffsets {
+    auxiliary_type: Option<String>,
+    offsets: Vec<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -108,6 +155,8 @@ struct TrackFragment {
     roll_default_description_index: Option<u32>,
     roll_sample_runs: Vec<(u64, u32)>,
     has_composition_offsets: bool,
+    has_cenc_sample_groups: bool,
+    cenc_auxiliary: CencAuxiliary,
 }
 
 #[derive(Clone, Copy)]
@@ -750,15 +799,32 @@ fn audit_iamf_tracks(
         .iter()
         .filter(|track| track.iamf_entries.iter().any(Option::is_some))
         .count();
+    let iamf_brand = context
+        .compatible_brands
+        .iter()
+        .any(|brand| brand == "iamf");
+    if iamf_brand || iamf_track_count > 0 {
+        bitstream.push(check(
+            "FORGE-ISOBMFF-IAMF-TRACK",
+            iamf_track_count > 0,
+            if iamf_track_count > 0 {
+                format!("{iamf_track_count} IAMF track(s) resolve through iamf or enca/frma")
+            } else {
+                "the iamf compatible brand requires an iamf or enca/frma=iamf sample entry"
+                    .to_string()
+            },
+            Some(json!({
+                "iamf_brand": iamf_brand,
+                "iamf_tracks": iamf_track_count
+            })),
+        ));
+    }
     if iamf_track_count == 0 {
         return Vec::new();
     }
     bitstream.push(check(
         "FORGE-ISOBMFF-IAMF-BRAND",
-        context
-            .compatible_brands
-            .iter()
-            .any(|brand| brand == "iamf"),
+        iamf_brand,
         "ISO-BMFF IAMF files declare iamf in the compatible brands array",
         Some(json!({
             "compatible_brands": context.compatible_brands,
@@ -771,17 +837,45 @@ fn audit_iamf_tracks(
         .iter()
         .filter(|track| track.iamf_entries.iter().any(Option::is_some))
     {
+        let iamf_entries: Vec<_> = track.iamf_entries.iter().flatten().collect();
+        let encrypted_entries = iamf_entries
+            .iter()
+            .filter(|entry| entry.protection.is_some())
+            .count();
+        let encrypted = encrypted_entries > 0;
+        let protection_declarations_valid = !encrypted
+            || encrypted_entries == iamf_entries.len()
+                && iamf_entries
+                    .iter()
+                    .all(|entry| entry.protection.as_ref().is_some_and(|item| item.valid));
         if context.fragmented && context.fragments.is_empty() {
+            if encrypted {
+                bitstream.push(check(
+                    "FORGE-ISOBMFF-IAMF-CENC",
+                    protection_declarations_valid,
+                    "encrypted IAMF initialization segment declares one valid cenc/cbcs full-sample policy for every sample entry",
+                    Some(json!({
+                        "track_id": track.id,
+                        "sample_entries": iamf_entries.len(),
+                        "encrypted_sample_entries": encrypted_entries
+                    })),
+                ));
+            }
             bitstream.push(check(
                 "FORGE-ISOBMFF-IAMF-SAMPLE-DATA",
-                true,
-                "IAMF initialization segment intentionally contains no IA Samples",
+                protection_declarations_valid,
+                if encrypted {
+                    "encrypted IAMF initialization segment intentionally contains no IA Samples"
+                } else {
+                    "IAMF initialization segment intentionally contains no IA Samples"
+                },
                 Some(json!({"track_id": track.id, "initialization_segment": true})),
             ));
             observations.push(json!({
                 "track_id": track.id,
                 "fragmented": true,
                 "initialization_segment": true,
+                "encrypted": encrypted,
                 "validated_samples": 0
             }));
             continue;
@@ -827,34 +921,64 @@ fn audit_iamf_tracks(
                 .and_then(Option::as_ref)
                 .is_some_and(|entry| !entry.config_obus.is_empty())
         });
+        let cenc_result = if encrypted {
+            cenc_auxiliary_for_iamf(track, context.fragments, context.fragmented, locations)
+        } else {
+            Ok(Value::Null)
+        };
+        let cenc_valid = protection_declarations_valid && cenc_result.is_ok();
+        if encrypted {
+            let cenc_error = cenc_result.as_ref().err().cloned();
+            bitstream.push(check(
+                "FORGE-ISOBMFF-IAMF-CENC",
+                cenc_valid,
+                cenc_error.unwrap_or_else(|| {
+                    "IAMF samples use bounded cenc/cbcs full-sample encryption with matching IV auxiliary data"
+                        .to_string()
+                }),
+                Some(json!({
+                    "track_id": track.id,
+                    "sample_entries": iamf_entries.len(),
+                    "encrypted_sample_entries": encrypted_entries,
+                    "samples": locations.len(),
+                    "auxiliary": cenc_result.as_ref().ok()
+                })),
+            ));
+        }
         let mut sample_obus = 0_u64;
         let mut sample_audio_frames = 0_u64;
         let mut sample_parameter_blocks = 0_u64;
         let mut sample_error = None;
-        for (index, sample) in locations.iter().enumerate() {
-            match scan_iamf_sample(path, file, *sample) {
-                Ok((obus, audio_frames, parameter_blocks)) => {
-                    sample_obus = sample_obus.saturating_add(obus);
-                    sample_audio_frames = sample_audio_frames.saturating_add(audio_frames);
-                    sample_parameter_blocks =
-                        sample_parameter_blocks.saturating_add(parameter_blocks);
-                }
-                Err(error) => {
-                    sample_error = Some(format!("IA Sample {}: {error}", index + 1));
-                    break;
+        if !encrypted {
+            for (index, sample) in locations.iter().enumerate() {
+                match scan_iamf_sample(path, file, *sample) {
+                    Ok((obus, audio_frames, parameter_blocks)) => {
+                        sample_obus = sample_obus.saturating_add(obus);
+                        sample_audio_frames = sample_audio_frames.saturating_add(audio_frames);
+                        sample_parameter_blocks =
+                            sample_parameter_blocks.saturating_add(parameter_blocks);
+                    }
+                    Err(error) => {
+                        sample_error = Some(format!("IA Sample {}: {error}", index + 1));
+                        break;
+                    }
                 }
             }
         }
         let samples_valid = ranges_valid
             && ranges_disjoint
             && entries_valid
+            && cenc_valid
             && sample_error.is_none()
             && !locations.is_empty();
         bitstream.push(check(
             "FORGE-ISOBMFF-IAMF-SAMPLE-DATA",
             samples_valid,
             sample_error.unwrap_or_else(|| {
-                if samples_valid {
+                if samples_valid && encrypted {
+                    "every encrypted IA Sample is bounded inside MediaDataBox with complete full-sample CENC auxiliary signaling; ciphertext OBU validation requires keys"
+                        .to_string()
+                } else if samples_valid {
                     "every IA Sample is a bounded descriptor-free Temporal Unit without a Temporal Delimiter OBU"
                         .to_string()
                 } else {
@@ -869,6 +993,8 @@ fn audit_iamf_tracks(
                 "sample_obus": sample_obus,
                 "audio_frame_obus": sample_audio_frames,
                 "parameter_block_obus": sample_parameter_blocks,
+                "encrypted": encrypted,
+                "ciphertext_obu_validation": if encrypted { "requires_keys" } else { "complete" },
                 "ranges_inside_mdat": ranges_valid,
                 "sample_ranges_disjoint": ranges_disjoint,
                 "iamf_sample_entries_resolve": entries_valid
@@ -879,6 +1005,42 @@ fn audit_iamf_tracks(
                 "track_id": track.id,
                 "fragmented": context.fragmented,
                 "validated_samples": 0
+            }));
+            continue;
+        }
+
+        if encrypted {
+            let fragment_non_sync_samples = samples
+                .sample_flags
+                .iter()
+                .filter(|flags| **flags & 0x0001_0000 != 0)
+                .count();
+            xcheck.push(check(
+                "FORGE-ISOBMFF-IAMF-SYNC-CTS",
+                !track.has_sync_sample_box
+                    && !track.has_composition_offsets
+                    && !samples.has_composition_offsets
+                    && fragment_non_sync_samples == 0,
+                "encrypted IAMF omits stss and composition offsets so every IA Sample is sync with CTS equal to DTS",
+                Some(json!({
+                    "track_id": track.id,
+                    "stss": track.has_sync_sample_box,
+                    "ctts": track.has_composition_offsets,
+                    "fragment_composition_offsets": samples.has_composition_offsets,
+                    "fragment_non_sync_samples": fragment_non_sync_samples
+                })),
+            ));
+            observations.push(json!({
+                "track_id": track.id,
+                "fragmented": context.fragmented,
+                "fragments": samples.fragment_count,
+                "encrypted": true,
+                "protection_scheme": iamf_entries.first()
+                    .and_then(|entry| entry.protection.as_ref())
+                    .and_then(|item| item.scheme.clone()),
+                "validated_samples": locations.len(),
+                "ciphertext_obu_validation": "requires_keys",
+                "configurations": iamf_entries.len()
             }));
             continue;
         }
@@ -1143,6 +1305,209 @@ struct IamfSampleSet {
     fragment_decode_times: Vec<u64>,
     decode_timeline_contiguous: bool,
     fragment_count: usize,
+}
+
+fn cenc_auxiliary_for_iamf(
+    track: &Track,
+    fragments: &[Fragment],
+    fragmented: bool,
+    locations: &[SampleLocation],
+) -> Result<Value, String> {
+    if track.sample_group_types.iter().any(|kind| kind == "seig") {
+        return Err(
+            "CENC seig sample-group overrides require key-rotation validation and are not yet supported"
+                .into(),
+        );
+    }
+    let expected_iv_sizes = cenc_expected_iv_sizes(track, locations)?;
+    let schemes: HashSet<_> = locations
+        .iter()
+        .filter_map(|sample| {
+            let index = usize::try_from(sample.description_index.checked_sub(1)?).ok()?;
+            track
+                .iamf_entries
+                .get(index)?
+                .as_ref()?
+                .protection
+                .as_ref()?
+                .scheme
+                .clone()
+        })
+        .collect();
+    if schemes.len() != 1 {
+        return Err("encrypted IAMF samples must resolve to one CENC protection scheme".into());
+    }
+    let scheme = schemes.iter().next().expect("one scheme");
+    if !fragmented {
+        let evidence = validate_cenc_auxiliary(&track.cenc_auxiliary, &expected_iv_sizes, scheme)?;
+        return Ok(json!({"scope": "sample_table", "auxiliary": evidence}));
+    }
+
+    let track_id = track
+        .id
+        .ok_or_else(|| "fragmented encrypted IAMF track has no track_ID".to_string())?;
+    let mut fragment_evidence = Vec::new();
+    let mut observed_samples = 0_usize;
+    for fragment in fragments {
+        for track_fragment in &fragment.tracks {
+            if track_fragment.track_id != Some(track_id) {
+                continue;
+            }
+            if track_fragment.has_cenc_sample_groups {
+                return Err(
+                    "fragment-local CENC seig sample-group overrides are not yet supported".into(),
+                );
+            }
+            let sizes = cenc_expected_iv_sizes(track, &track_fragment.samples)?;
+            observed_samples = observed_samples
+                .checked_add(sizes.len())
+                .ok_or_else(|| "encrypted fragment sample count overflows memory".to_string())?;
+            fragment_evidence.push(json!({
+                "fragment_offset": fragment.start,
+                "samples": sizes.len(),
+                "auxiliary": validate_cenc_auxiliary(
+                    &track_fragment.cenc_auxiliary,
+                    &sizes,
+                    scheme,
+                )?
+            }));
+        }
+    }
+    if observed_samples != expected_iv_sizes.len() {
+        return Err(format!(
+            "CENC fragment auxiliary data covers {observed_samples} samples, expected {}",
+            expected_iv_sizes.len()
+        ));
+    }
+    Ok(json!({"scope": "track_fragments", "fragments": fragment_evidence}))
+}
+
+fn cenc_expected_iv_sizes(track: &Track, locations: &[SampleLocation]) -> Result<Vec<u8>, String> {
+    locations
+        .iter()
+        .map(|sample| {
+            let index = usize::try_from(
+                sample
+                    .description_index
+                    .checked_sub(1)
+                    .ok_or_else(|| "CENC sample description index is zero".to_string())?,
+            )
+            .map_err(|_| "CENC sample description index does not fit memory".to_string())?;
+            let entry = track
+                .iamf_entries
+                .get(index)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| {
+                    "CENC sample does not resolve to an IAMF sample entry".to_string()
+                })?;
+            let protection = entry.protection.as_ref().ok_or_else(|| {
+                "IAMF track mixes clear and encrypted sample descriptions".to_string()
+            })?;
+            if !protection.valid {
+                return Err("IAMF encrypted sample entry has invalid CENC signaling".into());
+            }
+            Ok(protection.per_sample_iv_size.unwrap_or(0))
+        })
+        .collect()
+}
+
+fn validate_cenc_auxiliary(
+    auxiliary: &CencAuxiliary,
+    expected_iv_sizes: &[u8],
+    scheme: &str,
+) -> Result<Value, String> {
+    if auxiliary.senc.len() > 1 || auxiliary.saiz.len() > 1 || auxiliary.saio.len() > 1 {
+        return Err("CENC sample scope contains duplicate senc, saiz, or saio boxes".into());
+    }
+    if auxiliary.saiz.is_empty() != auxiliary.saio.is_empty() {
+        return Err("CENC saiz and saio boxes must be present as a pair".into());
+    }
+    let type_valid = |kind: &Option<String>| kind.as_deref().is_none_or(|value| value == scheme);
+    if auxiliary
+        .saiz
+        .iter()
+        .any(|item| !type_valid(&item.auxiliary_type))
+        || auxiliary
+            .saio
+            .iter()
+            .any(|item| !type_valid(&item.auxiliary_type))
+    {
+        return Err("CENC auxiliary_info_type does not match the IAMF protection scheme".into());
+    }
+
+    let mut senc_valid = false;
+    if let Some(senc) = auxiliary.senc.first() {
+        if senc.flags & 0x000002 != 0 {
+            return Err("IAMF CENC forbids subsample encryption; senc flag 0x000002 is set".into());
+        }
+        if usize::try_from(senc.sample_count).ok() != Some(expected_iv_sizes.len()) {
+            return Err(format!(
+                "senc covers {} samples, expected {}",
+                senc.sample_count,
+                expected_iv_sizes.len()
+            ));
+        }
+        let entry_bytes = if let Some(override_size) = senc.iv_size_override {
+            if !matches!(override_size, 8 | 16) {
+                return Err("senc IV_size override must be 8 or 16 bytes".into());
+            }
+            expected_iv_sizes
+                .len()
+                .checked_mul(usize::from(override_size))
+        } else {
+            expected_iv_sizes
+                .iter()
+                .try_fold(0_usize, |total, size| total.checked_add(usize::from(*size)))
+        }
+        .ok_or_else(|| "senc entry byte count overflows memory".to_string())?;
+        if senc.entry_bytes != entry_bytes {
+            return Err(format!(
+                "senc contains {} entry bytes, expected {entry_bytes} full-sample IV bytes",
+                senc.entry_bytes
+            ));
+        }
+        senc_valid = true;
+    }
+
+    let mut external_valid = false;
+    if let (Some(saiz), Some(saio)) = (auxiliary.saiz.first(), auxiliary.saio.first()) {
+        if usize::try_from(saiz.sample_count).ok() != Some(expected_iv_sizes.len()) {
+            return Err(format!(
+                "saiz covers {} samples, expected {}",
+                saiz.sample_count,
+                expected_iv_sizes.len()
+            ));
+        }
+        let observed_sizes = if saiz.default_size == 0 {
+            saiz.sizes.clone()
+        } else {
+            vec![saiz.default_size; expected_iv_sizes.len()]
+        };
+        if observed_sizes != expected_iv_sizes {
+            return Err(
+                "saiz sizes include data beyond each full-sample IV or omit required IV bytes"
+                    .into(),
+            );
+        }
+        if saio.offsets.is_empty() {
+            return Err("saio contains no auxiliary-data offset".into());
+        }
+        external_valid = true;
+    }
+
+    let needs_per_sample_iv = expected_iv_sizes.iter().any(|size| *size != 0);
+    if needs_per_sample_iv && !senc_valid && !external_valid {
+        return Err(
+            "per-sample CENC IVs require a bounded senc box or paired saiz/saio boxes".into(),
+        );
+    }
+    Ok(json!({
+        "samples": expected_iv_sizes.len(),
+        "per_sample_iv_bytes": expected_iv_sizes,
+        "senc": senc_valid,
+        "saiz_saio": external_valid,
+        "constant_iv": !needs_per_sample_iv
+    }))
 }
 
 fn iamf_sample_set(
@@ -2226,6 +2591,18 @@ fn parse_stbl(
             b"stsc" => parse_stsc(path, file, child, track, bitstream)?,
             b"sgpd" => parse_sgpd(path, file, child, track, bitstream)?,
             b"sbgp" => parse_sbgp(path, file, child, track, bitstream)?,
+            b"senc" => track
+                .cenc_auxiliary
+                .senc
+                .push(parse_senc(path, file, child)?),
+            b"saiz" => track
+                .cenc_auxiliary
+                .saiz
+                .push(parse_saiz(path, file, child)?),
+            b"saio" => track
+                .cenc_auxiliary
+                .saio
+                .push(parse_saio(path, file, child)?),
             b"stco" => track.chunk_offsets = parse_offsets(path, file, child, false, bitstream)?,
             b"co64" => track.chunk_offsets = parse_offsets(path, file, child, true, bitstream)?,
             _ => {}
@@ -2289,9 +2666,8 @@ fn parse_stsd(
             valid = false;
             break;
         }
-        let codec = fourcc(&body[offset + 4..offset + 8]);
-        let is_iamf = codec == "iamf";
-        track.codecs.push(codec);
+        let sample_entry_type = fourcc(&body[offset + 4..offset + 8]);
+        let mut logical_codec = sample_entry_type.clone();
         if track.handler == Some(*b"soun") && size >= 36 {
             track.channels = Some(u16::from_be_bytes(
                 body[offset + 24..offset + 26].try_into().unwrap(),
@@ -2299,10 +2675,22 @@ fn parse_stsd(
             track.sample_rate = Some(be_u32(&body[offset + 32..offset + 36]) >> 16);
             match sample_entry_child_boxes(&body[offset..offset + size]) {
                 Ok(children) => {
+                    let protection = (sample_entry_type == "enca")
+                        .then(|| parse_cenc_protection(&children, checks));
+                    let is_iamf = sample_entry_type == "iamf"
+                        || protection
+                            .as_ref()
+                            .and_then(|item| item.original_format.as_deref())
+                            == Some("iamf");
+                    if is_iamf {
+                        logical_codec = "iamf".to_string();
+                    }
                     track.iamf_entries.push(if is_iamf {
                         Some(parse_iamf_sample_entry(
                             &body[offset..offset + size],
+                            &sample_entry_type,
                             &children,
+                            protection,
                             checks,
                         ))
                     } else {
@@ -2327,7 +2715,7 @@ fn parse_stsd(
                         ));
                     }
                     track.drc_boxes.extend(drc);
-                    if track.codecs.last().is_some_and(|codec| codec == "mp4a") {
+                    if logical_codec == "mp4a" {
                         let asc = children
                             .iter()
                             .find(|(kind, _)| kind == "esds")
@@ -2353,6 +2741,7 @@ fn parse_stsd(
                 }
             }
         }
+        track.codecs.push(logical_codec);
         if track.handler == Some(*b"soun") && track.iamf_entries.len() < track.codecs.len() {
             track.iamf_entries.push(None);
         }
@@ -2435,9 +2824,243 @@ fn sample_entry_child_boxes(entry: &[u8]) -> Result<Vec<(String, &[u8])>, ()> {
     Ok(output)
 }
 
+fn bounded_child_boxes(bytes: &[u8]) -> Result<Vec<(String, &[u8])>, String> {
+    let mut offset = 0_usize;
+    let mut output = Vec::new();
+    while offset < bytes.len() {
+        if bytes.len() - offset < 8 {
+            return Err("nested ISO-BMFF box header is truncated".into());
+        }
+        let size32 = be_u32(&bytes[offset..offset + 4]);
+        let kind = fourcc(&bytes[offset + 4..offset + 8]);
+        let (header_size, size) = if size32 == 1 {
+            if bytes.len() - offset < 16 {
+                return Err(format!("{kind} extended-size header is truncated"));
+            }
+            (
+                16_usize,
+                usize::try_from(be_u64(&bytes[offset + 8..offset + 16]))
+                    .map_err(|_| format!("{kind} size does not fit memory"))?,
+            )
+        } else if size32 == 0 {
+            (8_usize, bytes.len() - offset)
+        } else {
+            (
+                8_usize,
+                usize::try_from(size32).map_err(|_| format!("{kind} size does not fit memory"))?,
+            )
+        };
+        if size < header_size || size > bytes.len() - offset {
+            return Err(format!("{kind} box exceeds its parent"));
+        }
+        output.push((kind, &bytes[offset + header_size..offset + size]));
+        offset += size;
+    }
+    Ok(output)
+}
+
+fn parse_cenc_protection(
+    children: &[(String, &[u8])],
+    checks: &mut Vec<AuditCheck>,
+) -> CencProtection {
+    let sinf: Vec<_> = children
+        .iter()
+        .filter(|(kind, _)| kind == "sinf")
+        .map(|(_, payload)| *payload)
+        .collect();
+    let mut result = CencProtection::default();
+    let mut errors = Vec::new();
+    if sinf.len() != 1 {
+        errors.push(format!(
+            "encrypted audio sample entry contains {} ProtectionSchemeInfoBox values; exactly one is required",
+            sinf.len()
+        ));
+    }
+    let nested = sinf
+        .first()
+        .map(|payload| bounded_child_boxes(payload))
+        .transpose();
+    let nested = match nested {
+        Ok(Some(items)) => items,
+        Ok(None) => Vec::new(),
+        Err(error) => {
+            errors.push(error);
+            Vec::new()
+        }
+    };
+
+    let original_formats: Vec<_> = nested
+        .iter()
+        .filter(|(kind, _)| kind == "frma")
+        .map(|(_, payload)| *payload)
+        .collect();
+    result.original_format = original_formats
+        .iter()
+        .find(|payload| payload.len() == 4)
+        .map(|payload| fourcc(payload));
+    if original_formats.len() != 1 || original_formats[0].len() != 4 {
+        errors.push("ProtectionSchemeInfoBox requires one four-byte OriginalFormatBox".to_string());
+    }
+
+    let schemes: Vec<_> = nested
+        .iter()
+        .filter(|(kind, _)| kind == "schm")
+        .map(|(_, payload)| *payload)
+        .collect();
+    if schemes.len() == 1 {
+        let body = schemes[0];
+        if body.len() < 12 || body[0] != 0 {
+            errors.push("SchemeTypeBox is truncated or has unsupported version".to_string());
+        } else {
+            let flags = full_box_flags(body);
+            result.scheme = Some(fourcc(&body[4..8]));
+            result.scheme_version = Some(be_u32(&body[8..12]));
+            if flags & !1 != 0
+                || flags == 0 && body.len() != 12
+                || flags == 1 && (body.len() == 12 || body.last() != Some(&0))
+            {
+                errors.push("SchemeTypeBox flags, URI, or trailing bytes are invalid".to_string());
+            }
+            if !matches!(result.scheme.as_deref(), Some("cenc" | "cbcs")) {
+                errors.push("IAMF protection scheme must be cenc or cbcs".to_string());
+            }
+            if result.scheme_version != Some(0x0001_0000) {
+                errors.push("CENC scheme_version must be 0x00010000".to_string());
+            }
+        }
+    } else {
+        errors.push(format!(
+            "ProtectionSchemeInfoBox contains {} SchemeTypeBox values; exactly one is required",
+            schemes.len()
+        ));
+    }
+
+    let scheme_information: Vec<_> = nested
+        .iter()
+        .filter(|(kind, _)| kind == "schi")
+        .map(|(_, payload)| *payload)
+        .collect();
+    if scheme_information.len() == 1 {
+        match bounded_child_boxes(scheme_information[0]) {
+            Ok(items) => {
+                let tenc: Vec<_> = items
+                    .iter()
+                    .filter(|(kind, _)| kind == "tenc")
+                    .map(|(_, payload)| *payload)
+                    .collect();
+                if tenc.len() == 1 {
+                    parse_track_encryption(tenc[0], &mut result, &mut errors);
+                } else {
+                    errors.push(format!(
+                        "SchemeInformationBox contains {} TrackEncryptionBox values; exactly one is required",
+                        tenc.len()
+                    ));
+                }
+            }
+            Err(error) => errors.push(error),
+        }
+    } else {
+        errors.push(format!(
+            "ProtectionSchemeInfoBox contains {} SchemeInformationBox values; exactly one is required",
+            scheme_information.len()
+        ));
+    }
+    result.valid = sinf.len() == 1 && errors.is_empty();
+    if result.original_format.as_deref() == Some("iamf") {
+        checks.push(check(
+            "FORGE-ISOBMFF-IAMF-CENC-SIGNALING",
+            result.valid,
+            if errors.is_empty() {
+                "encrypted IAMF sample entry has bounded CENC full-sample protection signaling"
+                    .to_string()
+            } else {
+                errors.join("; ")
+            },
+            Some(cenc_protection_json(&result)),
+        ));
+    }
+    result
+}
+
+fn parse_track_encryption(body: &[u8], result: &mut CencProtection, errors: &mut Vec<String>) {
+    if body.len() < 24 || !matches!(body[0], 0 | 1) || full_box_flags(body) != 0 {
+        errors.push("TrackEncryptionBox is truncated or has unsupported fields".to_string());
+        return;
+    }
+    result.tenc_version = Some(body[0]);
+    if body[4] != 0 {
+        errors.push("TrackEncryptionBox reserved field is non-zero".to_string());
+    }
+    if body[0] == 0 {
+        if body[5] != 0 {
+            errors.push("TrackEncryptionBox version 0 reserved fields are non-zero".to_string());
+        }
+        result.crypt_byte_block = Some(0);
+        result.skip_byte_block = Some(0);
+    } else {
+        result.crypt_byte_block = Some(body[5] >> 4);
+        result.skip_byte_block = Some(body[5] & 0x0f);
+    }
+    result.default_is_protected = Some(body[6]);
+    result.per_sample_iv_size = Some(body[7]);
+    result.default_kid = Some(hex_bytes(&body[8..24]));
+    if result.default_is_protected != Some(1) {
+        errors.push("IAMF encrypted sample entry must set default_isProtected to 1".to_string());
+    }
+    if result.crypt_byte_block != Some(0) || result.skip_byte_block != Some(0) {
+        errors.push(
+            "IAMF cenc/cbcs protection must encrypt the full sample without a pattern skip"
+                .to_string(),
+        );
+    }
+    match result.per_sample_iv_size {
+        Some(8 | 16) if body.len() == 24 => {}
+        Some(0) if body.len() >= 25 => {
+            let size = body[24];
+            result.constant_iv_size = Some(size);
+            if !matches!(size, 8 | 16) || body.len() != 25 + usize::from(size) {
+                errors.push(
+                    "TrackEncryptionBox constant IV must be exactly 8 or 16 bytes".to_string(),
+                );
+            }
+        }
+        _ => errors.push(
+            "TrackEncryptionBox requires an 8/16-byte per-sample IV or constant IV".to_string(),
+        ),
+    }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        output.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+fn cenc_protection_json(protection: &CencProtection) -> Value {
+    json!({
+        "original_format": protection.original_format,
+        "scheme": protection.scheme,
+        "scheme_version": protection.scheme_version,
+        "tenc_version": protection.tenc_version,
+        "default_is_protected": protection.default_is_protected,
+        "per_sample_iv_size": protection.per_sample_iv_size,
+        "default_kid": protection.default_kid,
+        "crypt_byte_block": protection.crypt_byte_block,
+        "skip_byte_block": protection.skip_byte_block,
+        "constant_iv_size": protection.constant_iv_size,
+        "valid": protection.valid
+    })
+}
+
 fn parse_iamf_sample_entry(
     entry: &[u8],
+    sample_entry_type: &str,
     children: &[(String, &[u8])],
+    protection: Option<CencProtection>,
     checks: &mut Vec<AuditCheck>,
 ) -> IamfSampleEntry {
     let channel_count = entry
@@ -2451,10 +3074,12 @@ fn parse_iamf_sample_entry(
         .map(|(_, payload)| *payload)
         .collect();
     let mut result = IamfSampleEntry {
+        sample_entry_type: sample_entry_type.to_string(),
         channel_count,
         sample_rate,
         configuration_boxes: configurations.len(),
         has_sampling_rate_box,
+        protection,
         ..IamfSampleEntry::default()
     };
     checks.push(check(
@@ -3178,6 +3803,18 @@ fn parse_traf(
             }
             b"sgpd" => parse_sgpd(path, file, child, &mut groups, context.checks)?,
             b"sbgp" => parse_sbgp(path, file, child, &mut groups, context.checks)?,
+            b"senc" => groups
+                .cenc_auxiliary
+                .senc
+                .push(parse_senc(path, file, child)?),
+            b"saiz" => groups
+                .cenc_auxiliary
+                .saiz
+                .push(parse_saiz(path, file, child)?),
+            b"saio" => groups
+                .cenc_auxiliary
+                .saio
+                .push(parse_saio(path, file, child)?),
             _ => {}
         }
     }
@@ -3246,6 +3883,8 @@ fn parse_traf(
         roll_distances: groups.roll_distances,
         roll_default_description_index: groups.roll_default_description_index,
         roll_sample_runs: groups.roll_sample_runs,
+        has_cenc_sample_groups: groups.sample_group_types.iter().any(|kind| kind == "seig"),
+        cenc_auxiliary: groups.cenc_auxiliary,
         ..TrackFragment::default()
     };
     let mut run_data_offset = None;
@@ -3390,6 +4029,156 @@ fn parse_track_run(
 
 fn full_box_flags(body: &[u8]) -> u32 {
     (u32::from(body[1]) << 16) | (u32::from(body[2]) << 8) | u32::from(body[3])
+}
+
+fn parse_senc(
+    path: &Path,
+    file: &mut File,
+    header: BoxHeader,
+) -> Result<CencSampleEncryption, String> {
+    let body = read_control(path, file, header)?;
+    if body.len() < 8 || body[0] != 0 {
+        return Err("SampleEncryptionBox is truncated or has unsupported version".into());
+    }
+    let flags = full_box_flags(&body);
+    if flags & !0x000003 != 0 {
+        return Err(format!(
+            "SampleEncryptionBox has unsupported flags {flags:#08x}"
+        ));
+    }
+    let mut offset = 4_usize;
+    let iv_size_override = if flags & 0x000001 != 0 {
+        let fields = body
+            .get(offset..offset + 20)
+            .ok_or_else(|| "SampleEncryptionBox override fields are truncated".to_string())?;
+        offset += 20;
+        Some(fields[3])
+    } else {
+        None
+    };
+    let sample_count = take_u32(&body, &mut offset, "senc sample_count")?;
+    if usize::try_from(sample_count)
+        .ok()
+        .is_none_or(|count| count > MAX_TABLE_ENTRIES)
+    {
+        return Err("SampleEncryptionBox sample_count exceeds the safety limit".into());
+    }
+    Ok(CencSampleEncryption {
+        flags,
+        sample_count,
+        iv_size_override,
+        entry_bytes: body.len() - offset,
+    })
+}
+
+fn parse_saiz(
+    path: &Path,
+    file: &mut File,
+    header: BoxHeader,
+) -> Result<CencSampleAuxiliarySizes, String> {
+    let body = read_control(path, file, header)?;
+    if body.len() < 9 || body[0] != 0 {
+        return Err(
+            "SampleAuxiliaryInformationSizesBox is truncated or has unsupported version".into(),
+        );
+    }
+    let flags = full_box_flags(&body);
+    if flags & !1 != 0 {
+        return Err(format!(
+            "SampleAuxiliaryInformationSizesBox has unsupported flags {flags:#08x}"
+        ));
+    }
+    let mut offset = 4_usize;
+    let auxiliary_type = if flags == 1 {
+        let kind = body
+            .get(offset..offset + 4)
+            .map(fourcc)
+            .ok_or_else(|| "saiz auxiliary_info_type is truncated".to_string())?;
+        offset += 8;
+        Some(kind)
+    } else {
+        None
+    };
+    let default_size = *body
+        .get(offset)
+        .ok_or_else(|| "saiz default_sample_info_size is truncated".to_string())?;
+    offset += 1;
+    let sample_count = take_u32(&body, &mut offset, "saiz sample_count")?;
+    let count = usize::try_from(sample_count)
+        .map_err(|_| "saiz sample_count does not fit memory".to_string())?;
+    if count > MAX_TABLE_ENTRIES {
+        return Err("saiz sample_count exceeds the safety limit".into());
+    }
+    let sizes = if default_size == 0 {
+        let sizes = body
+            .get(offset..offset + count)
+            .ok_or_else(|| "saiz sample_info_size array is truncated".to_string())?
+            .to_vec();
+        offset += count;
+        sizes
+    } else {
+        Vec::new()
+    };
+    if offset != body.len() {
+        return Err("SampleAuxiliaryInformationSizesBox has trailing bytes".into());
+    }
+    Ok(CencSampleAuxiliarySizes {
+        auxiliary_type,
+        default_size,
+        sample_count,
+        sizes,
+    })
+}
+
+fn parse_saio(
+    path: &Path,
+    file: &mut File,
+    header: BoxHeader,
+) -> Result<CencSampleAuxiliaryOffsets, String> {
+    let body = read_control(path, file, header)?;
+    if body.len() < 8 || !matches!(body[0], 0 | 1) {
+        return Err(
+            "SampleAuxiliaryInformationOffsetsBox is truncated or has unsupported version".into(),
+        );
+    }
+    let flags = full_box_flags(&body);
+    if flags & !1 != 0 {
+        return Err(format!(
+            "SampleAuxiliaryInformationOffsetsBox has unsupported flags {flags:#08x}"
+        ));
+    }
+    let mut offset = 4_usize;
+    let auxiliary_type = if flags == 1 {
+        let kind = body
+            .get(offset..offset + 4)
+            .map(fourcc)
+            .ok_or_else(|| "saio auxiliary_info_type is truncated".to_string())?;
+        offset += 8;
+        Some(kind)
+    } else {
+        None
+    };
+    let entry_count = take_u32(&body, &mut offset, "saio entry_count")?;
+    let count = usize::try_from(entry_count)
+        .map_err(|_| "saio entry_count does not fit memory".to_string())?;
+    if count == 0 || count > MAX_TABLE_ENTRIES {
+        return Err("saio entry_count is zero or exceeds the safety limit".into());
+    }
+    let mut offsets = Vec::with_capacity(count);
+    for _ in 0..count {
+        offsets.push(if body[0] == 0 {
+            u64::from(take_u32(&body, &mut offset, "saio offset")?)
+        } else {
+            take_u64(&body, &mut offset, "saio offset")?
+        });
+    }
+    if offset != body.len() {
+        return Err("SampleAuxiliaryInformationOffsetsBox has trailing bytes".into());
+    }
+    Ok(CencSampleAuxiliaryOffsets {
+        auxiliary_type,
+        offsets,
+    })
 }
 
 fn take_u32(body: &[u8], offset: &mut usize, field: &str) -> Result<u32, String> {
@@ -3572,18 +4361,42 @@ fn track_json(track: &Track) -> Value {
         "roll_sample_runs": track.roll_sample_runs,
         "sync_sample_box": track.has_sync_sample_box,
         "composition_offsets": track.has_composition_offsets,
+        "cenc_auxiliary": cenc_auxiliary_json(&track.cenc_auxiliary),
         "iamf_sample_entries": track.iamf_entries.iter().enumerate().filter_map(|(index, entry)| {
             entry.as_ref().map(|entry| json!({
                 "sample_description_index": index + 1,
+                "sample_entry_type": entry.sample_entry_type,
                 "channel_count": entry.channel_count,
                 "sample_rate_fixed_16_16": entry.sample_rate,
                 "configuration_boxes": entry.configuration_boxes,
                 "configuration_version": entry.configuration_version,
                 "config_obus_bytes": entry.config_obus.len(),
                 "ignored_trailing_bytes": entry.config_trailing_bytes,
-                "sampling_rate_box": entry.has_sampling_rate_box
+                "sampling_rate_box": entry.has_sampling_rate_box,
+                "protection": entry.protection.as_ref().map(cenc_protection_json)
             }))
         }).collect::<Vec<_>>()
+    })
+}
+
+fn cenc_auxiliary_json(auxiliary: &CencAuxiliary) -> Value {
+    json!({
+        "senc": auxiliary.senc.iter().map(|item| json!({
+            "flags": item.flags,
+            "sample_count": item.sample_count,
+            "iv_size_override": item.iv_size_override,
+            "entry_bytes": item.entry_bytes
+        })).collect::<Vec<_>>(),
+        "saiz": auxiliary.saiz.iter().map(|item| json!({
+            "auxiliary_type": item.auxiliary_type,
+            "default_size": item.default_size,
+            "sample_count": item.sample_count,
+            "sizes": item.sizes
+        })).collect::<Vec<_>>(),
+        "saio": auxiliary.saio.iter().map(|item| json!({
+            "auxiliary_type": item.auxiliary_type,
+            "offsets": item.offsets
+        })).collect::<Vec<_>>()
     })
 }
 
@@ -3640,6 +4453,85 @@ mod tests {
         body
     }
 
+    fn full_box_with_flags(version: u8, flags: u32, payload: Vec<u8>) -> Vec<u8> {
+        let mut body = vec![
+            version,
+            ((flags >> 16) & 0xff) as u8,
+            ((flags >> 8) & 0xff) as u8,
+            (flags & 0xff) as u8,
+        ];
+        body.extend(payload);
+        body
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestCenc {
+        scheme: [u8; 4],
+        pattern: u8,
+        iv_size: u8,
+        subsample: bool,
+    }
+
+    fn test_cenc_sinf(config: TestCenc) -> Vec<u8> {
+        let mut tenc = [vec![0, config.pattern, 1, config.iv_size], vec![0x11; 16]].concat();
+        if config.iv_size == 0 {
+            tenc.extend([vec![16], vec![0x22; 16]].concat());
+        }
+        boxed(
+            b"sinf",
+            [
+                boxed(b"frma", b"iamf".to_vec()),
+                boxed(
+                    b"schm",
+                    full_box(
+                        0,
+                        [
+                            config.scheme.to_vec(),
+                            0x0001_0000_u32.to_be_bytes().to_vec(),
+                        ]
+                        .concat(),
+                    ),
+                ),
+                boxed(b"schi", boxed(b"tenc", full_box(1, tenc))),
+            ]
+            .concat(),
+        )
+    }
+
+    fn test_cenc_auxiliary(config: TestCenc) -> Vec<u8> {
+        if config.iv_size == 0 && !config.subsample {
+            return Vec::new();
+        }
+        let mut entries = if config.iv_size == 0 {
+            Vec::new()
+        } else {
+            vec![0x33; usize::from(config.iv_size)]
+        };
+        if config.subsample {
+            entries.extend([1_u16.to_be_bytes().to_vec(), vec![0; 6]].concat());
+        }
+        let flags = if config.subsample { 0x000002 } else { 0 };
+        let senc = boxed(
+            b"senc",
+            full_box_with_flags(0, flags, [1_u32.to_be_bytes().to_vec(), entries].concat()),
+        );
+        let auxiliary_size = config
+            .iv_size
+            .saturating_add(if config.subsample { 8 } else { 0 });
+        let saiz = boxed(
+            b"saiz",
+            full_box(
+                0,
+                [vec![auxiliary_size], 1_u32.to_be_bytes().to_vec()].concat(),
+            ),
+        );
+        let saio = boxed(
+            b"saio",
+            full_box(0, [1_u32.to_be_bytes(), 1_u32.to_be_bytes()].concat()),
+        );
+        [senc, saiz, saio].concat()
+    }
+
     fn aac_esds() -> Vec<u8> {
         let decoder_config = [vec![0x40, 0x15], vec![0; 11], vec![0x05, 0x02, 0x11, 0x90]].concat();
         let es_descriptor = [
@@ -3680,6 +4572,14 @@ mod tests {
     }
 
     fn minimal_iamf_mp4(compatible_brand: &[u8; 4], sample: Vec<u8>) -> Vec<u8> {
+        minimal_iamf_mp4_protected(compatible_brand, sample, None)
+    }
+
+    fn minimal_iamf_mp4_protected(
+        compatible_brand: &[u8; 4],
+        sample: Vec<u8>,
+        protection: Option<TestCenc>,
+    ) -> Vec<u8> {
         let mut config = iamf_obu(31, b"iamf\x00\x00");
         config.extend(iamf_obu(
             0,
@@ -3694,11 +4594,25 @@ mod tests {
         let mut sample_entry = vec![0_u8; 28];
         sample_entry[6..8].copy_from_slice(&1_u16.to_be_bytes());
         sample_entry.extend(iacb);
+        if let Some(protection) = protection {
+            sample_entry.extend(test_cenc_sinf(protection));
+        }
         let stsd = boxed(
             b"stsd",
             full_box(
                 0,
-                [1_u32.to_be_bytes().to_vec(), boxed(b"iamf", sample_entry)].concat(),
+                [
+                    1_u32.to_be_bytes().to_vec(),
+                    boxed(
+                        if protection.is_some() {
+                            b"enca"
+                        } else {
+                            b"iamf"
+                        },
+                        sample_entry,
+                    ),
+                ]
+                .concat(),
             ),
         );
         let stts = boxed(
@@ -3751,7 +4665,15 @@ mod tests {
             );
             let stbl = boxed(
                 b"stbl",
-                [stsd.clone(), stts.clone(), stsz.clone(), stsc.clone(), stco].concat(),
+                [
+                    stsd.clone(),
+                    stts.clone(),
+                    stsz.clone(),
+                    stsc.clone(),
+                    stco,
+                    protection.map(test_cenc_auxiliary).unwrap_or_default(),
+                ]
+                .concat(),
             );
             let mdhd = boxed(
                 b"mdhd",
@@ -3792,6 +4714,22 @@ mod tests {
         composition_offset: bool,
         initialization_only: bool,
     ) -> Vec<u8> {
+        minimal_fragmented_iamf_protected(
+            sample,
+            data_offset_adjustment,
+            composition_offset,
+            initialization_only,
+            None,
+        )
+    }
+
+    fn minimal_fragmented_iamf_protected(
+        sample: Vec<u8>,
+        data_offset_adjustment: i32,
+        composition_offset: bool,
+        initialization_only: bool,
+        protection: Option<TestCenc>,
+    ) -> Vec<u8> {
         let mut config = iamf_obu(31, b"iamf\x00\x00");
         config.extend(iamf_obu(
             0,
@@ -3806,11 +4744,25 @@ mod tests {
         let mut sample_entry = vec![0_u8; 28];
         sample_entry[6..8].copy_from_slice(&1_u16.to_be_bytes());
         sample_entry.extend(iacb);
+        if let Some(protection) = protection {
+            sample_entry.extend(test_cenc_sinf(protection));
+        }
         let stsd = boxed(
             b"stsd",
             full_box(
                 0,
-                [1_u32.to_be_bytes().to_vec(), boxed(b"iamf", sample_entry)].concat(),
+                [
+                    1_u32.to_be_bytes().to_vec(),
+                    boxed(
+                        if protection.is_some() {
+                            b"enca"
+                        } else {
+                            b"iamf"
+                        },
+                        sample_entry,
+                    ),
+                ]
+                .concat(),
             ),
         );
         let empty_table = |kind: &[u8; 4], tail: Vec<u8>| {
@@ -3939,7 +4891,16 @@ mod tests {
                 b"moof",
                 [
                     boxed(b"mfhd", full_box(0, 1_u32.to_be_bytes().to_vec())),
-                    boxed(b"traf", [tfhd, tfdt, trun].concat()),
+                    boxed(
+                        b"traf",
+                        [
+                            tfhd,
+                            tfdt,
+                            trun,
+                            protection.map(test_cenc_auxiliary).unwrap_or_default(),
+                        ]
+                        .concat(),
+                    ),
                 ]
                 .concat(),
             )
@@ -4225,6 +5186,233 @@ mod tests {
     }
 
     #[test]
+    fn audits_unfragmented_cenc_encrypted_iamf_without_parsing_ciphertext() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("encrypted-presentation.mp4");
+        let protection = TestCenc {
+            scheme: *b"cenc",
+            pattern: 0,
+            iv_size: 8,
+            subsample: false,
+        };
+        let bytes = minimal_iamf_mp4_protected(b"iamf", vec![0xff; 32], Some(protection));
+        File::create(&path).unwrap().write_all(&bytes).unwrap();
+        let result = crate::container_qc::audit(&path).unwrap();
+        assert!(result.passed, "{result:#?}");
+        assert_eq!(result.properties["tracks"][0]["codecs"][0], "iamf");
+        assert_eq!(
+            result.properties["tracks"][0]["iamf_sample_entries"][0]["sample_entry_type"],
+            "enca"
+        );
+        assert_eq!(result.properties["iamf_tracks"][0]["encrypted"], true);
+        assert_eq!(
+            result.properties["iamf_tracks"][0]["ciphertext_obu_validation"],
+            "requires_keys"
+        );
+        for rule_id in [
+            "FORGE-ISOBMFF-IAMF-CENC-SIGNALING",
+            "FORGE-ISOBMFF-IAMF-CENC",
+            "FORGE-ISOBMFF-IAMF-SAMPLE-DATA",
+            "FORGE-ISOBMFF-IAMF-SYNC-CTS",
+        ] {
+            assert!(result
+                .layers
+                .iter()
+                .flat_map(|layer| &layer.checks)
+                .any(|item| item.rule_id == rule_id && item.passed));
+        }
+    }
+
+    #[test]
+    fn audits_fragmented_cbcs_encrypted_iamf_with_constant_iv() {
+        let directory = tempfile::tempdir().unwrap();
+        let protection = TestCenc {
+            scheme: *b"cbcs",
+            pattern: 0,
+            iv_size: 0,
+            subsample: false,
+        };
+        for (name, initialization_only) in [("init.mp4", true), ("media.mp4", false)] {
+            let path = directory.path().join(name);
+            let bytes = minimal_fragmented_iamf_protected(
+                vec![0xee; 32],
+                0,
+                false,
+                initialization_only,
+                Some(protection),
+            );
+            File::create(&path).unwrap().write_all(&bytes).unwrap();
+            let result = crate::container_qc::audit(&path).unwrap();
+            assert!(result.passed, "{result:#?}");
+            assert_eq!(result.properties["iamf_tracks"][0]["encrypted"], true);
+            assert!(result
+                .layers
+                .iter()
+                .flat_map(|layer| &layer.checks)
+                .any(|item| item.rule_id == "FORGE-ISOBMFF-IAMF-CENC" && item.passed));
+        }
+    }
+
+    #[test]
+    fn rejects_pattern_and_subsample_encryption_for_iamf() {
+        let directory = tempfile::tempdir().unwrap();
+        let pattern = directory.path().join("pattern.mp4");
+        let bytes = minimal_iamf_mp4_protected(
+            b"iamf",
+            vec![0xaa; 32],
+            Some(TestCenc {
+                scheme: *b"cbcs",
+                pattern: 0x19,
+                iv_size: 16,
+                subsample: false,
+            }),
+        );
+        File::create(&pattern).unwrap().write_all(&bytes).unwrap();
+        let result = crate::container_qc::audit(&pattern).unwrap();
+        assert!(!result.passed);
+        assert!(result
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.checks)
+            .any(|item| { item.rule_id == "FORGE-ISOBMFF-IAMF-CENC-SIGNALING" && !item.passed }));
+
+        let subsample = directory.path().join("subsample.mp4");
+        let bytes = minimal_iamf_mp4_protected(
+            b"iamf",
+            vec![0xbb; 32],
+            Some(TestCenc {
+                scheme: *b"cenc",
+                pattern: 0,
+                iv_size: 8,
+                subsample: true,
+            }),
+        );
+        File::create(&subsample).unwrap().write_all(&bytes).unwrap();
+        let result = crate::container_qc::audit(&subsample).unwrap();
+        assert!(!result.passed);
+        assert!(result
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.checks)
+            .any(|item| item.rule_id == "FORGE-ISOBMFF-IAMF-CENC" && !item.passed));
+
+        let unsupported = directory.path().join("unsupported-scheme.mp4");
+        let bytes = minimal_iamf_mp4_protected(
+            b"iamf",
+            vec![0xcc; 32],
+            Some(TestCenc {
+                scheme: *b"cbc1",
+                pattern: 0,
+                iv_size: 16,
+                subsample: false,
+            }),
+        );
+        File::create(&unsupported)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        let result = crate::container_qc::audit(&unsupported).unwrap();
+        assert!(!result.passed);
+        assert!(result
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.checks)
+            .any(|item| { item.rule_id == "FORGE-ISOBMFF-IAMF-CENC-SIGNALING" && !item.passed }));
+
+        let missing_original_format = directory.path().join("missing-frma.mp4");
+        let mut bytes = minimal_iamf_mp4_protected(
+            b"iamf",
+            vec![0xdd; 32],
+            Some(TestCenc {
+                scheme: *b"cenc",
+                pattern: 0,
+                iv_size: 8,
+                subsample: false,
+            }),
+        );
+        let frma = bytes
+            .windows(4)
+            .position(|window| window == b"frma")
+            .unwrap();
+        bytes[frma..frma + 4].copy_from_slice(b"xxxx");
+        File::create(&missing_original_format)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        let result = crate::container_qc::audit(&missing_original_format).unwrap();
+        assert!(!result.passed);
+        assert!(result
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.checks)
+            .any(|item| item.rule_id == "FORGE-ISOBMFF-IAMF-TRACK" && !item.passed));
+    }
+
+    #[test]
+    fn validates_cenc_auxiliary_counts_and_iv_geometry() {
+        let senc = CencAuxiliary {
+            senc: vec![CencSampleEncryption {
+                flags: 0,
+                sample_count: 2,
+                iv_size_override: None,
+                entry_bytes: 16,
+            }],
+            ..CencAuxiliary::default()
+        };
+        assert!(validate_cenc_auxiliary(&senc, &[8, 8], "cenc").is_ok());
+        assert!(validate_cenc_auxiliary(&senc, &[8], "cenc").is_err());
+
+        let external = CencAuxiliary {
+            saiz: vec![CencSampleAuxiliarySizes {
+                auxiliary_type: Some("cenc".to_string()),
+                default_size: 8,
+                sample_count: 2,
+                sizes: Vec::new(),
+            }],
+            saio: vec![CencSampleAuxiliaryOffsets {
+                auxiliary_type: Some("cenc".to_string()),
+                offsets: vec![128],
+            }],
+            ..CencAuxiliary::default()
+        };
+        assert!(validate_cenc_auxiliary(&external, &[8, 8], "cenc").is_ok());
+        assert!(validate_cenc_auxiliary(&external, &[16, 16], "cenc").is_err());
+        assert!(validate_cenc_auxiliary(&CencAuxiliary::default(), &[0], "cbcs").is_ok());
+
+        let key_rotation = Track {
+            sample_group_types: vec!["seig".to_string()],
+            ..Track::default()
+        };
+        assert!(cenc_auxiliary_for_iamf(&key_rotation, &[], false, &[]).is_err());
+    }
+
+    #[test]
+    fn parses_iso_cenc_track_encryption_field_layout() {
+        let mut version_zero = vec![0, 0, 0, 0, 0, 0, 1, 8];
+        version_zero.extend(vec![0x44; 16]);
+        let mut parsed = CencProtection::default();
+        let mut errors = Vec::new();
+        parse_track_encryption(&version_zero, &mut parsed, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(parsed.tenc_version, Some(0));
+        assert_eq!(parsed.default_is_protected, Some(1));
+        assert_eq!(parsed.per_sample_iv_size, Some(8));
+        assert_eq!(parsed.default_kid, Some("44".repeat(16)));
+
+        let mut version_one = vec![1, 0, 0, 0, 0, 0, 1, 0];
+        version_one.extend(vec![0x55; 16]);
+        version_one.extend([16]);
+        version_one.extend(vec![0x66; 16]);
+        let mut parsed = CencProtection::default();
+        let mut errors = Vec::new();
+        parse_track_encryption(&version_one, &mut parsed, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(parsed.constant_iv_size, Some(16));
+        assert_eq!(parsed.crypt_byte_block, Some(0));
+        assert_eq!(parsed.skip_byte_block, Some(0));
+    }
+
+    #[test]
     fn accepts_iamf_initialization_segment_without_media_samples() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("init.mp4");
@@ -4308,7 +5496,7 @@ mod tests {
         let children = vec![("iacb".to_string(), invalid_version.as_slice())];
         let mut checks = Vec::new();
         let entry = vec![0_u8; 36];
-        parse_iamf_sample_entry(&entry, &children, &mut checks);
+        parse_iamf_sample_entry(&entry, "iamf", &children, None, &mut checks);
         assert!(checks
             .iter()
             .any(|item| item.rule_id == "FORGE-ISOBMFF-IAMF-CONFIG" && !item.passed));
@@ -4319,7 +5507,7 @@ mod tests {
             ("iacb".to_string(), valid_configuration.as_slice()),
         ];
         let mut checks = Vec::new();
-        parse_iamf_sample_entry(&entry, &duplicate_children, &mut checks);
+        parse_iamf_sample_entry(&entry, "iamf", &duplicate_children, None, &mut checks);
         assert!(checks
             .iter()
             .any(|item| item.rule_id == "FORGE-ISOBMFF-IAMF-CONFIG" && !item.passed));
