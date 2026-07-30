@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/rule-explanations-v2",
+  "title": "Forge failed QC rule explanations v2",
+  "description": "Actionable failed-rule evidence for compliance, EBU QC, container/codec, ADM/profile, and externally rendered presentation reports.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generator",
+    "source_schema",
+    "asset_count",
+    "failed_rule_count",
+    "explanations"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/rule-explanations-v2"
+    },
+    "generator": {
+      "type": "string",
+      "pattern": "^forge-normalizer/[0-9]+\\.[0-9]+\\.[0-9]+"
+    },
+    "source_schema": {"type": ["string", "null"]},
+    "asset_count": {"type": "integer", "minimum": 0},
+    "failed_rule_count": {"type": "integer", "minimum": 0},
+    "explanations": {
+      "type": "array",
+      "maxItems": 100000,
+      "items": {"$ref": "#/$defs/explanation"}
+    }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile"],
+      "properties": {
+        "profile": {"type": "string", "minLength": 1},
+        "standard": {"type": "string", "minLength": 1},
+        "standard_version": {"type": "string", "minLength": 1},
+        "url": {"type": "string", "format": "uri"}
+      }
+    },
+    "explanation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "asset",
+        "category",
+        "location",
+        "source",
+        "observation",
+        "requirement",
+        "remediation"
+      ],
+      "properties": {
+        "rule_id": {"type": "string", "minLength": 1},
+        "asset": {"type": "string", "minLength": 1},
+        "category": {
+          "enum": [
+            "compliance",
+            "ebu_qc",
+            "container",
+            "codec",
+            "adm",
+            "adm_profile",
+            "presentation"
+          ]
+        },
+        "location": {"type": "string", "pattern": "^(/.*)?$"},
+        "source": {"$ref": "#/$defs/source"},
+        "observation": {},
+        "requirement": {"type": "string", "minLength": 1},
+        "message": {"type": "string"},
+        "remediation": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

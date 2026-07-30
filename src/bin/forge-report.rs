@@ -11,7 +11,7 @@ use tempfile::Builder;
 #[command(
     name = "forge-report",
     version,
-    about = "Migrate Forge reports and explain failed compliance rules"
+    about = "Migrate Forge reports and explain failed compliance/QC rules"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -33,13 +33,16 @@ enum Command {
         #[arg(long)]
         overwrite: bool,
     },
-    /// Explain each failed compliance rule in analysis JSON or a manifest.
+    /// Explain failed compliance/QC rules in analysis, manifest, or audit JSON.
     Explain {
         input: PathBuf,
         #[arg(short, long)]
         output: Option<PathBuf>,
         #[arg(long, value_enum, default_value = "text")]
         format: ExplainFormat,
+        /// Explain all supported QC categories, or emit the v1 compliance-only contract.
+        #[arg(long, value_enum, default_value = "all")]
+        scope: ExplainScope,
         /// Replace an existing output file.
         #[arg(long)]
         overwrite: bool,
@@ -50,6 +53,12 @@ enum Command {
 enum ExplainFormat {
     Text,
     Json,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ExplainScope {
+    All,
+    Compliance,
 }
 
 fn main() -> ExitCode {
@@ -75,8 +84,9 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             input,
             output,
             format,
+            scope,
             overwrite,
-        } => explain(&input, output.as_deref(), format, overwrite),
+        } => explain(&input, output.as_deref(), format, scope, overwrite),
     }
 }
 
@@ -142,14 +152,39 @@ fn explain(
     input: &Path,
     output: Option<&Path>,
     format: ExplainFormat,
+    scope: ExplainScope,
     overwrite: bool,
 ) -> Result<ExitCode, String> {
     let bytes = read_report(input)?;
-    let report = report_tools::explain_failed_rules(&bytes)?;
-    let mut encoded = match format {
-        ExplainFormat::Json => serde_json::to_vec_pretty(&report)
-            .map_err(|error| format!("encode explanations: {error}"))?,
-        ExplainFormat::Text => format_text(&report).into_bytes(),
+    let (mut encoded, failed_rule_count, asset_count) = match scope {
+        ExplainScope::All => {
+            let report = report_tools::explain_failed_findings(&bytes)?;
+            let encoded = match format {
+                ExplainFormat::Json => {
+                    let value = serde_json::to_value(&report)
+                        .map_err(|error| format!("encode explanations: {error}"))?;
+                    validate_explanation_schema(&value, report.schema)?;
+                    serde_json::to_vec_pretty(&value)
+                        .map_err(|error| format!("encode explanations: {error}"))?
+                }
+                ExplainFormat::Text => format_text_v2(&report).into_bytes(),
+            };
+            (encoded, report.failed_rule_count, report.asset_count)
+        }
+        ExplainScope::Compliance => {
+            let report = report_tools::explain_failed_rules(&bytes)?;
+            let encoded = match format {
+                ExplainFormat::Json => {
+                    let value = serde_json::to_value(&report)
+                        .map_err(|error| format!("encode explanations: {error}"))?;
+                    validate_explanation_schema(&value, report.schema)?;
+                    serde_json::to_vec_pretty(&value)
+                        .map_err(|error| format!("encode explanations: {error}"))?
+                }
+                ExplainFormat::Text => format_text_v1(&report).into_bytes(),
+            };
+            (encoded, report.failed_rule_count, report.asset_count)
+        }
     };
     if !encoded.ends_with(b"\n") {
         encoded.push(b'\n');
@@ -164,12 +199,12 @@ fn explain(
     }
     eprintln!(
         "forge-report: explained {} failed rules across {} assets",
-        report.failed_rule_count, report.asset_count
+        failed_rule_count, asset_count
     );
     Ok(ExitCode::SUCCESS)
 }
 
-fn format_text(report: &report_tools::ExplanationReport) -> String {
+fn format_text_v1(report: &report_tools::ExplanationReport) -> String {
     if report.explanations.is_empty() {
         return "No failed compliance rules found.\n".into();
     }
@@ -192,6 +227,45 @@ fn format_text(report: &report_tools::ExplanationReport) -> String {
             "\n  observation: {} = {:.2} {}",
             explanation.metric, explanation.observation.measured, explanation.observation.unit
         ));
+        output.push_str(&format!(
+            "\n  requirement: {}\n  remediation: {}\n",
+            explanation.requirement, explanation.remediation
+        ));
+    }
+    output
+}
+
+fn format_text_v2(report: &report_tools::ExplanationReportV2) -> String {
+    if report.explanations.is_empty() {
+        return "No failed compliance/QC rules found.\n".into();
+    }
+    let mut output = String::new();
+    for explanation in &report.explanations {
+        output.push_str(&format!(
+            "{} [{}; {}]\n  location: {}\n  source: {}",
+            explanation.asset,
+            explanation.rule_id,
+            explanation.category.as_str(),
+            explanation.location,
+            explanation.source.profile
+        ));
+        if let Some(standard) = &explanation.source.standard {
+            output.push_str(&format!("; {standard}"));
+        }
+        if let Some(version) = &explanation.source.standard_version {
+            output.push_str(&format!(" {version}"));
+        }
+        if let Some(url) = &explanation.source.url {
+            output.push_str(&format!("; {url}"));
+        }
+        output.push_str(&format!(
+            "\n  observation: {}",
+            serde_json::to_string(&explanation.observation)
+                .expect("finding observations are serializable")
+        ));
+        if let Some(message) = &explanation.message {
+            output.push_str(&format!("\n  message: {message}"));
+        }
         output.push_str(&format!(
             "\n  requirement: {}\n  remediation: {}\n",
             explanation.requirement, explanation.remediation
@@ -265,6 +339,28 @@ fn validate_manifest_schema(instance: &Value, schema_id: &str, label: &str) -> R
     } else {
         Err(format!(
             "{label} manifest does not conform to {schema_id}: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+fn validate_explanation_schema(instance: &Value, schema_id: &str) -> Result<(), String> {
+    let encoded = report_tools::explanation_schema(schema_id)
+        .ok_or_else(|| format!("unsupported explanation schema {schema_id}"))?;
+    let schema: Value = serde_json::from_str(encoded)
+        .map_err(|error| format!("decode embedded {schema_id} schema: {error}"))?;
+    let validator = jsonschema::validator_for(&schema)
+        .map_err(|error| format!("compile embedded {schema_id} schema: {error}"))?;
+    let errors = validator
+        .iter_errors(instance)
+        .take(16)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "generated explanations fail {schema_id}: {}",
             errors.join("; ")
         ))
     }
