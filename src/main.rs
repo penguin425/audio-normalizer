@@ -123,6 +123,19 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
             "preset {}: {:.1} LUFS, {:.1} dBTP ({})",
             preset.name, preset.target_lufs, preset.ceiling_db, preset.description
         );
+        if let Some(source) = preset.provenance {
+            let source_date = source
+                .source_date
+                .map_or(String::new(), |date| format!(", source dated {date}"));
+            eprintln!(
+                "profile evidence: {}; source {} (checked {}{})",
+                source.evidence.as_str(),
+                source.source_url,
+                source.checked_on,
+                source_date
+            );
+            eprintln!("profile caveat: {}", source.caveat);
+        }
     }
 
     if cli.album && plan.mode != Mode::Lufs {

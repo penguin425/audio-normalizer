@@ -98,6 +98,9 @@ Forge already provides:
 - SPDX/CycloneDX release SBOMs, verified SLSA provenance, byte-reproducible
   Linux archives, dependency policy, Rust 1.89 MSRV checks, cargo-binstall
   metadata, and generated Homebrew/Scoop/WinGet manifests.
+- Versioned platform loudness profiles with canonical identifiers, first-party
+  source and verification dates, explicit published-policy versus engineering-
+  reference classification, stable pinned aliases, and runtime caveats.
 - Bounded iXML XML/root/track-list validation, one-based source/interleave
   index checks, PCM channel reconciliation, and ADM `chna` track-map
   cross-checks.
@@ -163,8 +166,6 @@ generations.
 - Remote-resource auditing only behind explicit allowlists, byte/time limits,
   redirect controls, and a recorded fetch manifest.
 - Apple Sound Check metadata read/write and round-trip checks.
-- Platform policy data as versioned profiles with source/date fields; never
-  hard-code a service name as a timeless fixed LUFS rule.
 
 ### Loudness workflow depth
 
