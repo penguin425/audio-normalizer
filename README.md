@@ -1808,6 +1808,19 @@ example, and compatibility policy are documented in [C-API.md](C-API.md).
 CI compiles the header as strict C11, links a real C consumer to the generated
 shared library, and runs it on Linux, macOS ARM, and Windows x86-64.
 
+## Python API
+
+GitHub Releases starting with v0.97.0 include dependency-free Python 3.10+
+platform wheels for Linux x86-64, macOS ARM64 and x86-64, and Windows x86-64.
+Each wheel bundles the matching C ABI v1 library and exposes bounded local-file
+analysis through `forge_normalizer.analyze_file`. The decoded-sample limit is
+mandatory, and the immutable result includes integrated, momentary, short-term,
+LRA, RMS, sample-peak, and true-peak measurements.
+
+Installation, supported wheel tags, the full result schema, exception and
+library-resolution contracts, concurrency behaviour, and supply-chain
+verification are documented in [PYTHON-API.md](PYTHON-API.md).
+
 ## Real-time DSP API
 
 Release archives include `forge-live`, a streaming CLI for shells, OBS/FFmpeg
