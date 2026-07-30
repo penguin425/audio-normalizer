@@ -69,7 +69,9 @@ jobs:
       - name: Compare CLI, CLAP, and LV2 output with the live processor
         env:
           RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace
-        run: cargo test --locked --release --target ${{ matrix.target }} --features clap-plugin,lv2-plugin plugin_parity
+        run: |
+          cargo test --locked --release --target ${{ matrix.target }} --features clap-plugin,lv2-plugin --lib plugin_parity
+          cargo test --locked --release --target ${{ matrix.target }} --features clap-plugin,lv2-plugin --test live_cli plugin_parity
 
   ebu-conformance:
     name: EBU conformance
