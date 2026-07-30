@@ -1380,6 +1380,27 @@ fn write_loudness_tags(
             )?;
             eprintln!("  wrote ReplayGain tags");
         }
+        if cli.sound_check {
+            let sound_check = forge_normalizer::metadata::SoundCheck::from_r128(
+                analysis.lufs,
+                analysis.sample_peak,
+            )?;
+            if cli.dry_run {
+                eprintln!(
+                    "  would write Apple Sound Check compatibility metadata \
+                     (non-normative iTunNORM mapping)"
+                );
+            } else {
+                let round_trip =
+                    forge_normalizer::metadata::write_sound_check(input, &sound_check)?;
+                eprintln!(
+                    "  wrote and verified Sound Check metadata: engineering gain {:+.2} dB, \
+                     sample peak {:.8}",
+                    round_trip.engineering_gain_db(),
+                    round_trip.engineering_sample_peak()
+                );
+            }
+        }
     }
     Ok(())
 }

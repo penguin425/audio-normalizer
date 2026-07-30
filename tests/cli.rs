@@ -76,6 +76,118 @@ fn preset_is_accepted_but_explicit_target_conflicts() {
 }
 
 #[test]
+fn sound_check_requires_metadata_write_mode() {
+    assert!(Cli::try_parse_from(["forge", "track.m4a", "--sound-check"]).is_err());
+    let cli = Cli::try_parse_from(["forge", "track.m4a", "--write-tags", "--sound-check"]).unwrap();
+    assert!(cli.write_tags);
+    assert!(cli.sound_check);
+}
+
+#[test]
+fn sound_check_m4a_write_is_read_back_exactly() {
+    if !Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("tone.m4a");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=1000:sample_rate=48000:duration=1",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            input.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(generated.success());
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([input.to_str().unwrap(), "--write-tags", "--sound-check"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    assert!(stderr.contains("wrote and verified Sound Check metadata"));
+
+    let value = forge_normalizer::metadata::read_sound_check(&input)
+        .unwrap()
+        .expect("Sound Check metadata");
+    assert_eq!(
+        forge_normalizer::metadata::SoundCheck::parse(&value.canonical_value()).unwrap(),
+        value
+    );
+}
+
+#[test]
+fn sound_check_metadata_api_round_trips_every_supported_container() {
+    if !Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let cases = [
+        ("m4a", "aac", Some("128k")),
+        ("mp3", "libmp3lame", Some("128k")),
+        ("aiff", "pcm_s16be", None),
+        ("aac", "aac", Some("128k")),
+    ];
+    let expected = forge_normalizer::metadata::SoundCheck::from_r128(-16.0, 0.75).unwrap();
+    for (extension, codec, bitrate) in cases {
+        let input = directory.path().join(format!("tone.{extension}"));
+        let mut command = Command::new("ffmpeg");
+        command.args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=1000:sample_rate=48000:duration=1",
+            "-c:a",
+            codec,
+        ]);
+        if let Some(bitrate) = bitrate {
+            command.args(["-b:a", bitrate]);
+        }
+        let generated = command.arg(&input).status().unwrap();
+        assert!(generated.success(), "failed to generate {extension}");
+
+        let written = forge_normalizer::metadata::write_sound_check(&input, &expected).unwrap();
+        assert_eq!(written, expected, "{extension} write result");
+        assert_eq!(
+            forge_normalizer::metadata::read_sound_check(&input).unwrap(),
+            Some(expected.clone()),
+            "{extension} read result"
+        );
+    }
+}
+
+#[test]
 fn platform_preset_reports_version_source_and_evidence() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("tone.wav");

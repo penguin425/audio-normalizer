@@ -101,6 +101,11 @@ Forge already provides:
 - Versioned platform loudness profiles with canonical identifiers, first-party
   source and verification dates, explicit published-policy versus engineering-
   reference classification, stable pinned aliases, and runtime caveats.
+- Apple Sound Check compatibility metadata for MP4/M4A, MP3, AIFF, and raw AAC,
+  with strict ten-word `iTunNORM` parsing, container-native read/write, exact
+  post-write round-trip verification, and an explicit non-normative
+  R128/ReplayGain engineering mapping because Apple does not publish the field
+  layout or analyser.
 - Bounded iXML XML/root/track-list validation, one-based source/interleave
   index checks, PCM channel reconciliation, and ADM `chna` track-map
   cross-checks.
@@ -165,7 +170,6 @@ generations.
 
 - Remote-resource auditing only behind explicit allowlists, byte/time limits,
   redirect controls, and a recorded fetch manifest.
-- Apple Sound Check metadata read/write and round-trip checks.
 
 ### Loudness workflow depth
 
