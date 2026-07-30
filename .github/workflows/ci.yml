@@ -109,6 +109,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Initialize the MSVC developer environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
       - name: Check Rust and C header contracts
         run: cargo test --locked --target ${{ matrix.target }} --test c_api --test c_header
 
