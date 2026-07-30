@@ -476,13 +476,16 @@ validates one `schm`/`schi`/`tenc` chain, scheme version 1, a protected default
 KID, 8/16-byte per-sample or constant IVs, and the IAMF-permitted `cenc` or
 `cbcs` scheme without pattern skipping. `FORGE-ISOBMFF-IAMF-CENC` reconciles
 `senc` or paired `saiz`/`saio` sample counts and IV sizes for both sample
-tables and track fragments, and rejects subsample encryption. Ciphertext
+tables and track fragments, and rejects subsample encryption. Version-1/2
+`sgpd` `seig` descriptions and `sbgp` runs are resolved per sample, including
+version-2 defaults, track-level key rotation, and fragment-local `0x10001`
+references. Each effective KID, 8/16-byte per-sample or constant IV, and
+full-sample policy is checked against the auxiliary-data geometry and exposed
+as bounded JSON evidence. Ciphertext
 ranges must remain bounded and disjoint inside `mdat`, but Forge deliberately
 does not accept keys or claim OBU, trim, or decoded-audio validation for
 encrypted payloads; JSON reports this boundary as
-`ciphertext_obu_validation = "requires_keys"`. CENC `seig` sample-group
-overrides are rejected rather than silently applying the wrong default key;
-key-rotation validation remains a separate roadmap item.
+`ciphertext_obu_validation = "requires_keys"`.
 
 Rendering is deliberately separate: render every Mix Presentation and target
 layout with an
