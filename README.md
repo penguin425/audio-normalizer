@@ -1070,6 +1070,21 @@ The script downloads the official attachments directly from ITU, pins every
 archive by SHA-256, and keeps the copyrighted WAV files outside the repository.
 CI runs the EBU and ITU suites as separate required evidence.
 
+Run the AOMedia OAR/IAMF interoperability matrix with:
+
+```sh
+./tools/test-iamf-conformance.sh
+```
+
+The matrix pins 42 artifacts from 14 libiamf v1.1.0 conformance vectors by
+commit and SHA-256. It exercises standalone IA Sequences, unfragmented MP4, and
+fragmented MP4 across LPCM, channel-based and Ambisonics elements, localized
+annotations, anchored loudness, and STEP/LINEAR/BEZIER parameter animation.
+It also preserves exact expected findings for one intentionally invalid vector
+and for upstream MP4 variants with missing or inconsistent packaging evidence.
+This provides the input-side vector coverage requested by OAR v1.0.0 section 9;
+it does not claim perceptual parity for a renderer.
+
 ### Parser hardening
 
 Property tests exercise arbitrary WAVE and delivery-manifest bytes during the

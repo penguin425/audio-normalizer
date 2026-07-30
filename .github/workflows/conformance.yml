@@ -43,7 +43,7 @@ jobs:
         run: ./tools/test-itu-conformance.sh
 
   iamf-interoperability:
-    name: AOMedia IAMF fragmented ISO-BMFF interoperability
+    name: AOMedia OAR/IAMF interoperability matrix
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -57,7 +57,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/forge-normalizer/iamf-f06e919e2ad5502a2adc4bdd4e146f2e7e7ffb63
-          key: iamf-libiamf-v1.1.0-fragmented-v1
+          key: iamf-libiamf-v1.1.0-oar-matrix-v2
 
-      - name: Run fragmented ISO-BMFF IAMF interoperability checks
+      - name: Run OAR/IAMF interoperability matrix
         run: ./tools/test-iamf-conformance.sh

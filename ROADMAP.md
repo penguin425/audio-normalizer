@@ -43,6 +43,11 @@ Forge already provides:
   carriage validates `enca`/`sinf`/`frma`/`schm`/`schi`/`tenc`,
   `cenc`/`cbcs` full-sample policy, IV geometry, and `senc` or paired
   `saiz`/`saio` sample coverage without accepting keys or parsing ciphertext.
+- Pinned AOMedia OAR/IAMF verification across 42 artifacts from 14 libiamf
+  v1.1.0 vectors, covering standalone, unfragmented, and fragmented carriage,
+  LPCM, channel-based and Ambisonics elements, localized annotations, anchored
+  loudness, parameter animation, intentionally invalid metadata, and exact
+  retained upstream packaging findings without claiming renderer parity.
 - Bounded MPEG-TS/M2TS QC for packet layout, continuity, PAT/PMT CRC and
   programme maps, audio PES headers, and PTS continuity.
 - Bounded SMPTE ST 377-1 MXF QC for KLV framing, partitions and links,
@@ -152,15 +157,6 @@ generations.
 - DTS core/HD metadata and decoded presentation checks through an optional
   adapter.
 - WavPack, Monkey's Audio, and ALAC native frame/checksum validation.
-- Broader OAR conformance vectors. CENC `seig` key rotation/sample-group
-  overrides and standalone
-  OBU bounds/order, supported codec configurations, full Audio Element and Mix
-  Presentation semantics, profile element/channel limits, descriptor/substream
-  linking, Parameter Block syntax, exact parameter/audio-frame timeline
-  reconciliation, trimming/delimiter validation, unfragmented and fragmented
-  `iamf`/`enca` sample entry, configuration, sample-table/fragment
-  decapsulation and CENC signaling, and externally rendered presentation QC
-  have shipped.
 
 ### Streaming and platform delivery
 
