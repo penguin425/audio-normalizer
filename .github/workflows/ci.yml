@@ -54,6 +54,7 @@ jobs:
       - name: Install Rust 1.97.0 and the WebAssembly target
         uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
         with:
+          components: clippy, rustfmt
           targets: wasm32-unknown-unknown
 
       - name: Install pinned wasm-bindgen CLI
