@@ -63,9 +63,6 @@ pub fn migrate_delivery_manifest(bytes: &[u8]) -> Result<(Value, MigrationSummar
     validate_manifest_counts(root, asset_count.len())?;
     let asset_count = asset_count.len();
     ensure_asset_count(asset_count)?;
-    if source_schema != DELIVERY_MANIFEST_V3 {
-        validate_manifest_schema(&manifest, &source_schema, "source")?;
-    }
     let root = manifest
         .as_object_mut()
         .expect("validated delivery manifest object");
@@ -88,7 +85,6 @@ pub fn migrate_delivery_manifest(bytes: &[u8]) -> Result<(Value, MigrationSummar
     }
     root.insert("schema".into(), Value::String(DELIVERY_MANIFEST_V3.into()));
     let changed = source_schema != DELIVERY_MANIFEST_V3 || migrated_qc_envelopes > 0;
-    validate_manifest_schema(&manifest, DELIVERY_MANIFEST_V3, "migrated")?;
     Ok((
         manifest,
         MigrationSummary {
@@ -101,30 +97,13 @@ pub fn migrate_delivery_manifest(bytes: &[u8]) -> Result<(Value, MigrationSummar
     ))
 }
 
-fn validate_manifest_schema(instance: &Value, schema_id: &str, label: &str) -> Result<(), String> {
-    let encoded = match schema_id {
+pub fn delivery_manifest_schema(schema_id: &str) -> Option<&'static str> {
+    Some(match schema_id {
         DELIVERY_MANIFEST_V1 => DELIVERY_MANIFEST_V1_SCHEMA,
         DELIVERY_MANIFEST_V2 => DELIVERY_MANIFEST_V2_SCHEMA,
         DELIVERY_MANIFEST_V3 => DELIVERY_MANIFEST_V3_SCHEMA,
-        _ => return Err(format!("unsupported delivery manifest schema {schema_id}")),
-    };
-    let schema: Value = serde_json::from_str(encoded)
-        .map_err(|error| format!("decode embedded {schema_id} schema: {error}"))?;
-    let validator = jsonschema::validator_for(&schema)
-        .map_err(|error| format!("compile embedded {schema_id} schema: {error}"))?;
-    let errors = validator
-        .iter_errors(instance)
-        .take(16)
-        .map(|error| error.to_string())
-        .collect::<Vec<_>>();
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "{label} manifest does not conform to {schema_id}: {}",
-            errors.join("; ")
-        ))
-    }
+        _ => return None,
+    })
 }
 
 fn ensure_report_size(size: usize) -> Result<(), String> {

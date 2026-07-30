@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use forge_normalizer::report_tools;
+use serde_json::Value;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -90,7 +91,17 @@ fn migrate(
         return Err("migrate requires --output, --in-place, or --check".into());
     }
     let bytes = read_report(input)?;
+    let source: Value =
+        serde_json::from_slice(&bytes).map_err(|error| format!("decode manifest JSON: {error}"))?;
+    let source_schema = source
+        .get("schema")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "delivery manifest requires a string schema".to_string())?;
     let (manifest, summary) = report_tools::migrate_delivery_manifest(&bytes)?;
+    if source_schema != report_tools::DELIVERY_MANIFEST_V3 {
+        validate_manifest_schema(&source, source_schema, "source")?;
+    }
+    validate_manifest_schema(&manifest, report_tools::DELIVERY_MANIFEST_V3, "migrated")?;
     if check {
         eprintln!(
             "forge-report: {} is {} ({} assets)",
@@ -235,4 +246,26 @@ fn read_report(path: &Path) -> Result<Vec<u8>, String> {
         ));
     }
     fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))
+}
+
+fn validate_manifest_schema(instance: &Value, schema_id: &str, label: &str) -> Result<(), String> {
+    let encoded = report_tools::delivery_manifest_schema(schema_id)
+        .ok_or_else(|| format!("unsupported delivery manifest schema {schema_id}"))?;
+    let schema: Value = serde_json::from_str(encoded)
+        .map_err(|error| format!("decode embedded {schema_id} schema: {error}"))?;
+    let validator = jsonschema::validator_for(&schema)
+        .map_err(|error| format!("compile embedded {schema_id} schema: {error}"))?;
+    let errors = validator
+        .iter_errors(instance)
+        .take(16)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} manifest does not conform to {schema_id}: {}",
+            errors.join("; ")
+        ))
+    }
 }
