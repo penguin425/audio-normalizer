@@ -93,6 +93,9 @@ Forge already provides:
   and LV2 ABI with the shared live processor on Linux, macOS, and Windows,
   including nonuniform block sizes, automated gain, true-peak limiting, and
   the LV2 Core-designated 5 ms latency output.
+- Rust source compatibility from the v0.94.0 baseline, with an explicit
+  pre-1.0 stability contract, all-feature `cargo-semver-checks` gating against
+  the latest release tag, and a downstream-style public API contract test.
 - EBU QC Items for channel count, clipping, duration, dropouts, loudness,
   phase reversal, test tones, clicks, minimum average level, silence, true
   peak, hum/buzz, band-limited noise, cross-talk, panning, LFE/centre
@@ -247,8 +250,7 @@ failure behaviour are documented.
 
 ## Product and developer experience
 
-- Stable Rust library API with semantic-versioning checks and C/Python
-  bindings.
+- Versioned C ABI and Python bindings over the stable Rust library API.
 - WASM analysis build for local browser use; encoding and filesystem features
   remain capability-gated.
 - Resumable batch jobs, content-addressed analysis cache, watch folders, and

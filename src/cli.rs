@@ -34,7 +34,7 @@ pub struct Cli {
     pub input_format: Option<String>,
 
     /// Output file (single input) or existing directory (multiple inputs).
-    /// If omitted, writes <stem>_normalized.wav next to each input.
+    /// If omitted, writes `<stem>_normalized.wav` next to each input.
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
 
