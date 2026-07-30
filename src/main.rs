@@ -563,6 +563,7 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                     report.codec_encoded_loudness_deviation_lu =
                         codec.encoded_loudness_deviation_lu;
                     report.codec_encoded_loudness_pass = codec.encoded_loudness_pass;
+                    report.codec_qc_tolerance_lu = Some(codec.metadata.tolerance_lu.unwrap_or(1.0));
                 }
                 if let Some(results) = &ebu_qc {
                     eprintln!("  EBU QC baseband:");
@@ -614,6 +615,7 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
                     report.codec_true_peak_drift_db = codec.true_peak_drift_db;
                     report.codec_duration_drift_seconds = codec.duration_drift_seconds;
                     report.codec_roundtrip_pass = codec.roundtrip_pass;
+                    report.codec_qc_tolerance_lu = Some(cli.codec_qc_tolerance);
                 }
                 if let Some(adm) = &adm_qc {
                     report.adm_axml_present = Some(adm.axml_present);

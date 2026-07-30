@@ -469,6 +469,8 @@ impl ComplianceProfile {
         }
         Ok(ComplianceResult {
             profile: self.name.clone(),
+            standard: self.standard.clone(),
+            standard_version: self.standard_version.clone(),
             passed: rules.iter().all(|rule| rule.passed),
             rules,
         })
@@ -539,6 +541,10 @@ impl ComplianceRuleResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct ComplianceResult {
     pub profile: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standard: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standard_version: Option<String>,
     pub rules: Vec<ComplianceRuleResult>,
     pub passed: bool,
 }
@@ -588,6 +594,7 @@ pub struct AnalysisReport {
     pub codec_dialnorm_pass: Option<bool>,
     pub codec_encoded_loudness_deviation_lu: Option<f64>,
     pub codec_encoded_loudness_pass: Option<bool>,
+    pub codec_qc_tolerance_lu: Option<f64>,
     pub codec_probe_tool: Option<String>,
     pub codec_probe_schema: Option<&'static str>,
     pub codec_profile: Option<String>,
@@ -800,6 +807,7 @@ impl AnalysisReport {
             codec_dialnorm_pass: None,
             codec_encoded_loudness_deviation_lu: None,
             codec_encoded_loudness_pass: None,
+            codec_qc_tolerance_lu: None,
             codec_probe_tool: None,
             codec_probe_schema: None,
             codec_profile: None,
@@ -1101,6 +1109,7 @@ mod tests {
             codec_dialnorm_pass: None,
             codec_encoded_loudness_deviation_lu: None,
             codec_encoded_loudness_pass: None,
+            codec_qc_tolerance_lu: None,
             codec_probe_tool: None,
             codec_probe_schema: None,
             codec_profile: None,

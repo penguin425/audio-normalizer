@@ -55,6 +55,7 @@ pub struct AdmProfileRule {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProductionProfileResult {
+    pub path: String,
     pub standard: &'static str,
     pub adm_standard: &'static str,
     pub adm_version: &'static str,
@@ -211,6 +212,7 @@ pub fn validate_production_profile(
         Ok(parsed) => parsed,
         Err(error) => {
             return Ok(profile_result(
+                input,
                 mode,
                 vec![AdmProfileRule {
                     rule_id: "TECH3393-XML",
@@ -474,14 +476,16 @@ pub fn validate_production_profile(
         observed: format!("{} ID reference(s)", parsed.references.len()),
         passed: true,
     });
-    Ok(profile_result(mode, rules))
+    Ok(profile_result(input, mode, rules))
 }
 
 fn profile_result(
+    input: &Path,
     mode: ProductionProfileMode,
     rules: Vec<AdmProfileRule>,
 ) -> ProductionProfileResult {
     ProductionProfileResult {
+        path: input.to_string_lossy().into_owned(),
         standard: PRODUCTION_PROFILE_STANDARD,
         adm_standard: ADM_STANDARD,
         adm_version: ADM_VERSION,

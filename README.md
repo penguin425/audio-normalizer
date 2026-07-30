@@ -1582,7 +1582,8 @@ Use `--manifest delivery.json` with batch analysis to write a versioned,
 per-asset delivery record containing measurements, metadata checks, compliance
 rules, and pass/fail totals.
 
-`forge-report` upgrades older delivery manifests and turns failed compliance
+`forge-report` upgrades older delivery manifests and turns failed compliance,
+EBU QC, container, codec, ADM/profile, and externally rendered presentation
 rules into actionable, auditable explanations:
 
 ```sh
@@ -1592,9 +1593,16 @@ forge-report migrate delivery.json --check
 # Preserve asset evidence while migrating v1/v2 to v3 atomically
 forge-report migrate delivery.json --in-place
 
-# Show source, measured boundary, requirement, and remediation for each failure
+# Show source, exact observation/location, requirement, and remediation
 forge-report explain delivery.json
 forge-report explain delivery.json --format json -o explanations.json
+
+# Retain the original compliance-only rule-explanations-v1 contract
+forge-report explain delivery.json --scope compliance --format json
+
+# Standalone audit reports are accepted too
+forge-container-qc broken.mkv -o container-qc.json
+forge-report explain container-qc.json
 ```
 
 Migration validates the declared asset/pass/fail counts, rejects unknown
@@ -1602,8 +1610,12 @@ manifest or embedded QC schemas, converts legacy flat
 `ebu_qc_results_json` evidence into the v3 `qc` envelope, and is idempotent.
 Inputs are bounded to 64 MiB, 100,000 assets, 10,000 QC results per asset, and
 1,000 compliance rules per asset.
-The machine-readable explanation format is versioned as
-`rule-explanations-v1`; custom profiles remain identified by profile and
+The default machine-readable explanation format is
+`rule-explanations-v2`, with stable rule/category IDs, a JSON Pointer-like
+evidence location, the exact structured observation, source identity,
+requirement, and remediation. Output is bounded to 20,000 findings per asset
+and 100,000 per report. The `--scope compliance` compatibility mode emits
+`rule-explanations-v1`. Custom profiles remain identified by profile and
 standard fields rather than being presented as normative first-party sources.
 
 Versioned EBU profiles also record `compliance_standard` and

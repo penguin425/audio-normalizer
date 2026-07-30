@@ -138,6 +138,45 @@ fn emitted_rule_explanations_conform_to_published_schema() {
 }
 
 #[test]
+fn emitted_all_qc_explanations_conform_to_v2_schema() {
+    let input = serde_json::to_vec(&json!({
+        "schema": forge_normalizer::container_qc::CONTAINER_QC_SCHEMA,
+        "generator": "forge-normalizer/0.92.0",
+        "path": "broken.mkv",
+        "format": "matroska",
+        "passed": false,
+        "layers": [
+            {
+                "layer": "wrapper",
+                "passed": false,
+                "checks": [{
+                    "rule_id": "FORGE-MATROSKA-CRC32",
+                    "passed": false,
+                    "message": "CRC-32 mismatch",
+                    "observed": {"offset": 128}
+                }]
+            },
+            {"layer": "bitstream", "passed": true, "checks": []},
+            {"layer": "x-check", "passed": true, "checks": []}
+        ],
+        "properties": {}
+    }))
+    .unwrap();
+    let explanation = forge_normalizer::report_tools::explain_failed_findings(&input).unwrap();
+    assert_eq!(explanation.failed_rule_count, 1);
+    let instance = serde_json::to_value(explanation).unwrap();
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/rule-explanations-v2.schema.json"))
+            .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
+
+#[test]
 fn migrated_legacy_manifest_conforms_to_v3_schema() {
     let legacy_qc = serde_json::to_string(&json!([{
         "ebu_qc_id": "0005B",
