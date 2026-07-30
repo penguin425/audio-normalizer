@@ -1,6 +1,7 @@
 //! Ogg Opus streaming I/O with RFC 7845 loudness metadata.
 
 use crate::decoder::StreamInfo;
+use crate::opus_tags::{build_opus_tags as opus_tags, parse_r128_comments};
 use crate::wav::{default_channel_roles, named_channel_layout, ChannelRole, PcmKind};
 use ::opus::{Application, Bitrate, Channels, Decoder, Encoder, MSDecoder, MSEncoder};
 use ogg::{Packet, PacketReader, PacketWriteEndInfo, PacketWriter};
@@ -10,6 +11,8 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+pub use crate::opus_tags::{read_r128_tags, rewrite_r128_tags};
 
 const OPUS_RATE: u32 = 48_000;
 const FRAME_SIZE: usize = 960;
@@ -412,19 +415,6 @@ where
     Ok(())
 }
 
-pub fn read_r128_tags(path: &Path) -> Result<(Option<i16>, Option<i16>), String> {
-    let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let mut packets = PacketReader::new(BufReader::new(file));
-    let _head = packets
-        .read_packet()
-        .map_err(|error| format!("{}: read OpusHead: {error}", path.display()))?;
-    let tags = packets
-        .read_packet()
-        .map_err(|error| format!("{}: read OpusTags: {error}", path.display()))?
-        .ok_or_else(|| format!("{}: missing OpusTags", path.display()))?;
-    parse_r128_comments(&tags.data)
-}
-
 /// Validate the Ogg wrapper and every sequential Opus logical stream without
 /// decoding sample payloads. `PacketReader` verifies every page CRC.
 pub fn inspect(path: &Path) -> Result<OpusInspection, String> {
@@ -593,75 +583,6 @@ fn validate_page_granule(
             "chain {chain_index} granule {granule} does not equal previous {previous} plus {completed_samples} completed sample(s)"
         ));
     }
-    Ok(())
-}
-
-pub fn rewrite_r128_tags(
-    path: &Path,
-    track_lufs: f64,
-    album_lufs: Option<f64>,
-) -> Result<(), String> {
-    let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let mut reader = PacketReader::new(BufReader::new(file));
-    let mut packets = Vec::new();
-    while let Some(packet) = reader
-        .read_packet()
-        .map_err(|error| format!("{}: read Ogg packet: {error}", path.display()))?
-    {
-        packets.push(packet);
-    }
-    let mut rewritten = 0_usize;
-    for index in 0..packets.len().saturating_sub(1) {
-        if packets[index].first_in_stream() && packets[index].data.starts_with(b"OpusHead") {
-            let serial = packets[index].stream_serial();
-            let tags = &mut packets[index + 1];
-            if tags.stream_serial() != serial || !tags.data.starts_with(b"OpusTags") {
-                return Err(format!(
-                    "{}: missing OpusTags after OpusHead",
-                    path.display()
-                ));
-            }
-            tags.data = replace_r128_comments(&tags.data, track_lufs, album_lufs)?;
-            rewritten += 1;
-        }
-    }
-    if rewritten == 0 {
-        return Err(format!("{}: missing OpusTags", path.display()));
-    }
-
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".forge-opus-tags-")
-        .suffix(".opus")
-        .tempfile_in(parent)
-        .map_err(|error| format!("create temporary OpusTags file: {error}"))?;
-    {
-        let mut writer = PacketWriter::new(temporary.as_file_mut());
-        for packet in packets {
-            let serial = packet.stream_serial();
-            let granule = packet.absgp_page();
-            let end = if packet.last_in_stream() {
-                PacketWriteEndInfo::EndStream
-            } else if packet.last_in_page() {
-                PacketWriteEndInfo::EndPage
-            } else {
-                PacketWriteEndInfo::NormalPacket
-            };
-            writer
-                .write_packet(packet.data, serial, end, granule)
-                .map_err(|error| format!("rewrite OpusTags: {error}"))?;
-        }
-    }
-    temporary.persist(path).map_err(|error| {
-        format!(
-            "replace {} after OpusTags update: {}",
-            path.display(),
-            error.error
-        )
-    })?;
     Ok(())
 }
 
@@ -934,122 +855,6 @@ impl OpusDecoder {
             Self::Multi(decoder) => decoder.decode_float(packet, output, fec),
         }
     }
-}
-
-fn opus_tags(track_lufs: f64, album_lufs: Option<f64>) -> Vec<u8> {
-    let vendor = b"Forge audio normalizer";
-    let mut comments = vec![format!("R128_TRACK_GAIN={}", r128_gain(track_lufs))];
-    if let Some(album_lufs) = album_lufs {
-        comments.push(format!("R128_ALBUM_GAIN={}", r128_gain(album_lufs)));
-    }
-    let mut tags = b"OpusTags".to_vec();
-    tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
-    tags.extend_from_slice(vendor);
-    tags.extend_from_slice(&(comments.len() as u32).to_le_bytes());
-    for comment in comments {
-        tags.extend_from_slice(&(comment.len() as u32).to_le_bytes());
-        tags.extend_from_slice(comment.as_bytes());
-    }
-    tags
-}
-
-fn r128_gain(lufs: f64) -> i16 {
-    if !lufs.is_finite() {
-        return 0;
-    }
-    ((-23.0 - lufs) * 256.0)
-        .round()
-        .clamp(i16::MIN as f64, i16::MAX as f64) as i16
-}
-
-fn parse_r128_comments(data: &[u8]) -> Result<(Option<i16>, Option<i16>), String> {
-    if !data.starts_with(b"OpusTags") || data.len() < 16 {
-        return Err("invalid OpusTags".into());
-    }
-    let mut offset = 8;
-    let vendor_len = read_u32(data, &mut offset)? as usize;
-    offset = offset
-        .checked_add(vendor_len)
-        .filter(|end| *end <= data.len())
-        .ok_or_else(|| "truncated OpusTags vendor".to_string())?;
-    let count = read_u32(data, &mut offset)?;
-    let mut track = None;
-    let mut album = None;
-    for _ in 0..count {
-        let length = read_u32(data, &mut offset)? as usize;
-        let end = offset
-            .checked_add(length)
-            .filter(|end| *end <= data.len())
-            .ok_or_else(|| "truncated OpusTags comment".to_string())?;
-        let comment = std::str::from_utf8(&data[offset..end])
-            .map_err(|_| "non-UTF-8 OpusTags comment".to_string())?;
-        let (key, value) = comment.split_once('=').unwrap_or((comment, ""));
-        if key.eq_ignore_ascii_case("R128_TRACK_GAIN") {
-            track = value.parse().ok();
-        } else if key.eq_ignore_ascii_case("R128_ALBUM_GAIN") {
-            album = value.parse().ok();
-        }
-        offset = end;
-    }
-    Ok((track, album))
-}
-
-fn replace_r128_comments(
-    data: &[u8],
-    track_lufs: f64,
-    album_lufs: Option<f64>,
-) -> Result<Vec<u8>, String> {
-    if !data.starts_with(b"OpusTags") || data.len() < 16 {
-        return Err("invalid OpusTags".into());
-    }
-    let mut offset = 8;
-    let vendor_len = read_u32(data, &mut offset)? as usize;
-    let vendor_end = offset
-        .checked_add(vendor_len)
-        .filter(|end| *end <= data.len())
-        .ok_or_else(|| "truncated OpusTags vendor".to_string())?;
-    let vendor = &data[offset..vendor_end];
-    offset = vendor_end;
-    let count = read_u32(data, &mut offset)?;
-    let mut comments = Vec::new();
-    for _ in 0..count {
-        let length = read_u32(data, &mut offset)? as usize;
-        let end = offset
-            .checked_add(length)
-            .filter(|end| *end <= data.len())
-            .ok_or_else(|| "truncated OpusTags comment".to_string())?;
-        let comment = data[offset..end].to_vec();
-        let key = comment.split(|byte| *byte == b'=').next().unwrap_or(&[]);
-        if !key.eq_ignore_ascii_case(b"R128_TRACK_GAIN")
-            && !key.eq_ignore_ascii_case(b"R128_ALBUM_GAIN")
-        {
-            comments.push(comment);
-        }
-        offset = end;
-    }
-    comments.push(format!("R128_TRACK_GAIN={}", r128_gain(track_lufs)).into_bytes());
-    if let Some(album_lufs) = album_lufs {
-        comments.push(format!("R128_ALBUM_GAIN={}", r128_gain(album_lufs)).into_bytes());
-    }
-    let mut result = b"OpusTags".to_vec();
-    result.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
-    result.extend_from_slice(vendor);
-    result.extend_from_slice(&(comments.len() as u32).to_le_bytes());
-    for comment in comments {
-        result.extend_from_slice(&(comment.len() as u32).to_le_bytes());
-        result.extend_from_slice(&comment);
-    }
-    Ok(result)
-}
-
-fn read_u32(data: &[u8], offset: &mut usize) -> Result<u32, String> {
-    let end = offset
-        .checked_add(4)
-        .filter(|end| *end <= data.len())
-        .ok_or_else(|| "truncated OpusTags".to_string())?;
-    let value = u32::from_le_bytes(data[*offset..end].try_into().unwrap());
-    *offset = end;
-    Ok(value)
 }
 
 #[cfg(test)]

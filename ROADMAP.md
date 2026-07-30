@@ -106,6 +106,10 @@ Forge already provides:
   post-write round-trip verification, and an explicit non-normative
   R128/ReplayGain engineering mapping because Apple does not publish the field
   layout or analyser.
+- Metadata-only loudness normalization dispatch with dependency-free RFC 7845
+  `R128_TRACK_GAIN`/`R128_ALBUM_GAIN` rewriting for existing Ogg Opus files,
+  ReplayGain 2.0 for other supported tag containers, exact post-write readback,
+  and chained-Opus coverage without requiring the optional encoder.
 - Bounded iXML XML/root/track-list validation, one-based source/interleave
   index checks, PCM channel reconciliation, and ADM `chna` track-map
   cross-checks.
@@ -180,8 +184,9 @@ generations.
   several codec/profile outputs and verify each result.
 - Segment-aware normalization with boundary smoothing and a two-pass manifest
   for large streaming catalogues.
-- Metadata-only normalization for every container that has a standardized,
-  widely honoured gain mechanism.
+- Extend metadata-only normalization when additional containers acquire a
+  standardized, widely honoured gain mechanism; avoid inventing private gain
+  fields where none exists.
 ### Immersive, personalized, and accessible audio
 
 - Validate every ADM programme/content/object presentation, not only the

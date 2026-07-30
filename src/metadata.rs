@@ -18,6 +18,55 @@ use std::path::Path;
 use crate::normalize::Analysis;
 use crate::wav::WaveChunk;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoudnessMetadataScheme {
+    ReplayGain2,
+    Rfc7845R128,
+}
+
+impl LoudnessMetadataScheme {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ReplayGain2 => "ReplayGain 2.0",
+            Self::Rfc7845R128 => "RFC 7845 R128_GAIN",
+        }
+    }
+}
+
+/// Select the container-native loudness metadata mechanism.
+///
+/// Ogg Opus has normative `R128_TRACK_GAIN` and `R128_ALBUM_GAIN` comments.
+/// Other containers retain Forge's existing ReplayGain 2.0 representation.
+pub fn loudness_metadata_scheme(path: &Path) -> Result<LoudnessMetadataScheme, String> {
+    Ok(match probe_file_type(path)? {
+        FileType::Opus => LoudnessMetadataScheme::Rfc7845R128,
+        _ => LoudnessMetadataScheme::ReplayGain2,
+    })
+}
+
+/// Write container-appropriate loudness metadata without changing audio.
+pub fn write_loudness_metadata(
+    path: &Path,
+    track_lufs: f64,
+    track_peak: f32,
+    album: Option<(f64, f32)>,
+) -> Result<LoudnessMetadataScheme, String> {
+    let scheme = loudness_metadata_scheme(path)?;
+    match scheme {
+        LoudnessMetadataScheme::Rfc7845R128 => {
+            crate::opus_tags::rewrite_r128_tags(
+                path,
+                track_lufs,
+                album.map(|(album_lufs, _)| album_lufs),
+            )?;
+        }
+        LoudnessMetadataScheme::ReplayGain2 => {
+            write_replaygain(path, track_lufs, track_peak, album)?;
+        }
+    }
+    Ok(scheme)
+}
+
 /// Copy the source's primary metadata tag to the destination container.
 ///
 /// Lofty's generic tag representation retains common text fields and artwork.
@@ -215,6 +264,14 @@ pub fn write_replaygain(
     track_peak: f32,
     album: Option<(f64, f32)>,
 ) -> Result<(), String> {
+    let track_gain = format!("{:+.2} dB", -18.0 - track_lufs);
+    let track_peak = format!("{:.8}", track_peak);
+    let album_values = album.map(|(album_lufs, album_peak)| {
+        (
+            format!("{:+.2} dB", -18.0 - album_lufs),
+            format!("{:.8}", album_peak),
+        )
+    });
     let tagged = lofty::read_from_path(path)
         .map_err(|error| format!("read metadata {}: {error}", path.display()))?;
     let mut tag = tagged
@@ -223,20 +280,42 @@ pub fn write_replaygain(
         .cloned()
         .unwrap_or_else(|| Tag::new(tagged.primary_tag_type()));
     tag.re_map(tagged.primary_tag_type());
-    tag.insert_text(
-        ItemKey::ReplayGainTrackGain,
-        format!("{:+.2} dB", -18.0 - track_lufs),
-    );
-    tag.insert_text(ItemKey::ReplayGainTrackPeak, format!("{:.8}", track_peak));
-    if let Some((album_lufs, album_peak)) = album {
-        tag.insert_text(
-            ItemKey::ReplayGainAlbumGain,
-            format!("{:+.2} dB", -18.0 - album_lufs),
-        );
-        tag.insert_text(ItemKey::ReplayGainAlbumPeak, format!("{:.8}", album_peak));
+    tag.insert_text(ItemKey::ReplayGainTrackGain, track_gain.clone());
+    tag.insert_text(ItemKey::ReplayGainTrackPeak, track_peak.clone());
+    if let Some((album_gain, album_peak)) = &album_values {
+        tag.insert_text(ItemKey::ReplayGainAlbumGain, album_gain.clone());
+        tag.insert_text(ItemKey::ReplayGainAlbumPeak, album_peak.clone());
     }
     tag.save_to_path(path, WriteOptions::default())
-        .map_err(|error| format!("write metadata {}: {error}", path.display()))
+        .map_err(|error| format!("write metadata {}: {error}", path.display()))?;
+
+    let round_trip = lofty::read_from_path(path)
+        .map_err(|error| format!("re-read metadata {}: {error}", path.display()))?;
+    let round_trip = round_trip
+        .primary_tag()
+        .or_else(|| round_trip.first_tag())
+        .ok_or_else(|| {
+            format!(
+                "{}: ReplayGain metadata disappeared after writing",
+                path.display()
+            )
+        })?;
+    let track_matches = round_trip.get_string(ItemKey::ReplayGainTrackGain)
+        == Some(track_gain.as_str())
+        && round_trip.get_string(ItemKey::ReplayGainTrackPeak) == Some(track_peak.as_str());
+    let album_matches = album_values
+        .as_ref()
+        .is_none_or(|(album_gain, album_peak)| {
+            round_trip.get_string(ItemKey::ReplayGainAlbumGain) == Some(album_gain.as_str())
+                && round_trip.get_string(ItemKey::ReplayGainAlbumPeak) == Some(album_peak.as_str())
+        });
+    if !track_matches || !album_matches {
+        return Err(format!(
+            "{}: ReplayGain metadata changed during write/read round trip",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 const SOUND_CHECK_DESCRIPTION: &str = "iTunNORM";
