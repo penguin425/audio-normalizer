@@ -98,6 +98,9 @@ Forge already provides:
 - SPDX/CycloneDX release SBOMs, verified SLSA provenance, byte-reproducible
   Linux archives, dependency policy, Rust 1.89 MSRV checks, cargo-binstall
   metadata, and generated Homebrew/Scoop/WinGet manifests.
+- Delivery-manifest v1/v2-to-v3 migration with count/schema validation,
+  atomic replacement, and actionable failed-compliance explanations carrying
+  stable rule IDs, source, exact boundary observation, and remediation.
 - Versioned platform loudness profiles with canonical identifiers, first-party
   source and verification dates, explicit published-policy versus engineering-
   reference classification, stable pinned aliases, and runtime caveats.
@@ -247,8 +250,9 @@ failure behaviour are documented.
   profile, tool version, and provenance report.
 - TUI/GUI views for waveform, loudness timeline, true peak, QC events, channel
   correlation, and before/after comparison.
-- JSON Schema migration tooling and a command that explains each failed rule,
-  its source, observation, and remediation.
+- Extend `forge-report explain` from compliance rules to every failed EBU QC,
+  container, ADM/profile, codec, and presentation rule while preserving each
+  rule's source, observation, and remediation.
 - Plugin parity tests across CLI, CLAP, LV2, and live-stream processing.
 - CPU/memory benchmarks for hour-long stereo, multichannel, lossless, lossy,
   and pathological inputs.

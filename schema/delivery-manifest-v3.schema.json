@@ -38,36 +38,43 @@
       "additionalProperties": false,
       "required": ["channel", "start_seconds", "end_seconds"],
       "properties": {
-        "channel": {"type": "integer", "minimum": 0},
+        "channel": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "related_channel": {"type": "integer", "minimum": 1, "maximum": 65535},
         "start_seconds": {"type": "number", "minimum": 0},
         "end_seconds": {"type": "number", "minimum": 0},
         "measured": {"type": "number"},
-        "unit": {"type": "string"}
+        "unit": {"type": "string", "minLength": 1}
       }
     },
     "qcResult": {
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "rule_id",
         "ebu_qc_id",
         "version",
         "name",
         "layer",
         "passed",
         "calculated",
+        "source_url",
+        "method",
         "events"
       ],
       "properties": {
-        "ebu_qc_id": {"type": "string", "pattern": "^[0-9]{4}[A-Z]$"},
-        "version": {"type": "string"},
-        "name": {"type": "string"},
-        "layer": {
-          "enum": ["wrapper", "bitstream", "baseband", "x-check", "programme-layout"]
-        },
+        "rule_id": {"type": "string", "minLength": 1},
+        "ebu_qc_id": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+        "name": {"type": "string", "minLength": 1},
+        "layer": {"enum": ["baseband", "bitstream"]},
         "passed": {"type": "boolean"},
         "calculated": {"type": "boolean"},
+        "source_url": {"type": "string", "format": "uri"},
+        "method": {"type": "string", "minLength": 1},
+        "events_truncated": {"type": "boolean"},
         "events": {
           "type": "array",
+          "maxItems": 10000,
           "items": {"$ref": "#/$defs/event"}
         }
       }
@@ -78,7 +85,7 @@
       "required": ["schema", "results"],
       "properties": {
         "schema": {
-          "const": "https://penguin425.github.io/audio-normalizer/schema/ebu-qc-results-v1"
+          "const": "https://penguin425.github.io/audio-normalizer/schema/ebu-qc-results-v2"
         },
         "results": {
           "type": "array",

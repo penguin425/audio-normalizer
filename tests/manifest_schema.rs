@@ -76,7 +76,15 @@ fn emitted_delivery_manifest_conforms_to_published_schema() {
         true_peak: 0.25,
         loudness_blocks: vec![],
     };
-    let reports = [AnalysisReport::new(&path, &analysis)];
+    let qc_results = forge_normalizer::qc::analyze(
+        &audio,
+        &analysis,
+        &forge_normalizer::qc::QcOptions::default(),
+    );
+    let mut report = AnalysisReport::new(&path, &analysis);
+    report.ebu_qc_passed = Some(qc_results.iter().all(|result| result.passed));
+    report.ebu_qc_results_json = Some(serde_json::to_string(&qc_results).unwrap());
+    let reports = [report];
     let mut output = Vec::new();
     report::write_manifest(&mut output, &reports).expect("manifest serialization");
     let instance: Value = serde_json::from_slice(&output).expect("manifest JSON");
@@ -90,6 +98,94 @@ fn emitted_delivery_manifest_conforms_to_published_schema() {
         .collect();
     assert!(errors.is_empty(), "schema violations: {errors:#?}");
     assert_eq!(instance["assets"][0]["container_qc"]["passed"], true);
+    assert_eq!(
+        instance["assets"][0]["qc"]["schema"],
+        forge_normalizer::qc::QC_SCHEMA
+    );
+}
+
+#[test]
+fn emitted_rule_explanations_conform_to_published_schema() {
+    let rules = serde_json::to_string(&json!([{
+        "metric": "true_peak_dbtp",
+        "measured": -0.5,
+        "minimum": null,
+        "maximum": -1.0,
+        "minimum_inclusive": null,
+        "maximum_inclusive": true,
+        "passed": false
+    }]))
+    .unwrap();
+    let input = serde_json::to_vec(&json!([{
+        "path": "programme.wav",
+        "compliance_profile": "ebu-r128",
+        "compliance_standard": "EBU R 128",
+        "compliance_standard_version": "5.0 (2023)",
+        "compliance_rules_json": rules
+    }]))
+    .unwrap();
+    let explanation = forge_normalizer::report_tools::explain_failed_rules(&input).unwrap();
+    let instance = serde_json::to_value(explanation).unwrap();
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/rule-explanations-v1.schema.json"))
+            .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+}
+
+#[test]
+fn migrated_legacy_manifest_conforms_to_v3_schema() {
+    let legacy_qc = serde_json::to_string(&json!([{
+        "ebu_qc_id": "0005B",
+        "version": "1.0",
+        "name": "Clipping",
+        "layer": "baseband",
+        "passed": true,
+        "calculated": true,
+        "events": []
+    }]))
+    .unwrap();
+    let input = serde_json::to_vec(&json!({
+        "schema": forge_normalizer::report_tools::DELIVERY_MANIFEST_V2,
+        "generator": "forge-normalizer/0.80.0",
+        "asset_count": 1,
+        "passed_count": 1,
+        "failed_count": 0,
+        "assets": [{
+            "path": "programme.wav",
+            "duration_seconds": 60.0,
+            "source_start_seconds": 0.0,
+            "sample_rate_hz": 48_000,
+            "channels": 2,
+            "sample_format": "s24",
+            "integrated_lufs": -23.0,
+            "max_momentary_lufs": -21.0,
+            "max_short_term_lufs": -22.0,
+            "loudness_range_lu": 4.0,
+            "loudness_range_stable": true,
+            "loudness_range_stable_after_seconds": 60.0,
+            "rms_dbfs": -24.0,
+            "sample_peak_dbfs": -2.0,
+            "true_peak_dbtp": -1.5,
+            "peak_to_loudness_ratio_lu": 21.5,
+            "ebu_qc_results_json": legacy_qc
+        }]
+    }))
+    .unwrap();
+    let (instance, _) = forge_normalizer::report_tools::migrate_delivery_manifest(&input).unwrap();
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/delivery-manifest-v3.schema.json"))
+            .expect("schema JSON");
+    let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
 }
 
 #[test]
