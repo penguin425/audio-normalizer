@@ -1796,7 +1796,11 @@ gain, maximum limiter reduction, processed frames, and exact latency. Linux
 release archives also contain the `forge-live.lv2` stereo plugin bundle; copy
 it to an LV2 search directory such as `$HOME/.lv2/`. Its audio callback uses
 only preallocated Forge DSP state and exposes a ±24 dB gain control with a
-fixed −1 dBTP, 5 ms look-ahead limiter.
+fixed −1 dBTP, 5 ms look-ahead limiter. The bundle exposes that delay through
+the current
+[LV2 Core `lv2:latency` designation](https://lv2plug.in/ns/lv2core#latency),
+so hosts can compensate it without relying on the deprecated
+`lv2:reportsLatency` port property.
 
 Every release archive contains `forge-live.clap`, a CLAP 1.x stereo effect for
 Linux, Windows, and macOS. Copy it to a CLAP directory scanned by your host
@@ -1828,6 +1832,10 @@ gain.process_interleaved(interleaved)?;
 
 The live gain API uses a fixed 5 ms look-ahead true-peak limiter and reports
 its exact processing latency through `latency_frames()`.
+CI compares deterministic sample output from the streaming CLI, CLAP host
+adapter, and LV2 ABI with this processor bit-for-bit on Linux, macOS, and
+Windows, including nonuniform host block sizes, gain automation, limiting, and
+latency reporting.
 It deliberately does not label a changing live estimate as final Integrated
 LUFS; programme-integrated normalization remains the two-pass file workflow.
 

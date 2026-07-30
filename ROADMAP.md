@@ -89,6 +89,10 @@ Forge already provides:
   `emsg`/`aid3`, including bounded ID3v2/RVA2 and timestamp checks.
 - ADM, S-ADM, presentation-aware rendering/QC, C2PA validation, CI comparison,
   real-time processing, LV2, and CLAP integration.
+- Bit-exact plugin parity checks compare the streaming CLI, CLAP host adapter,
+  and LV2 ABI with the shared live processor on Linux, macOS, and Windows,
+  including nonuniform block sizes, automated gain, true-peak limiting, and
+  the LV2 Core-designated 5 ms latency output.
 - EBU QC Items for channel count, clipping, duration, dropouts, loudness,
   phase reversal, test tones, clicks, minimum average level, silence, true
   peak, hum/buzz, band-limited noise, cross-talk, panning, LFE/centre
@@ -253,7 +257,6 @@ failure behaviour are documented.
   profile, tool version, and provenance report.
 - TUI/GUI views for waveform, loudness timeline, true peak, QC events, channel
   correlation, and before/after comparison.
-- Plugin parity tests across CLI, CLAP, LV2, and live-stream processing.
 - CPU/memory benchmarks for hour-long stereo, multichannel, lossless, lossy,
   and pathological inputs.
 - Internationalized CLI diagnostics and accessible visualizations.

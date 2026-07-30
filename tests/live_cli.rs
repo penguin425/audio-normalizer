@@ -2,17 +2,34 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 #[test]
-fn live_cli_streams_f32le_and_reports_ndjson() {
+fn plugin_parity_live_cli_output_matches_realtime_processor() {
     let sample_rate = 48_000.0_f32;
     let frames = 192_000;
-    let input = (0..frames)
+    let samples = (0..frames)
         .flat_map(|frame| {
             let sample = 0.1 * (std::f32::consts::TAU * 997.0 * frame as f32 / sample_rate).sin();
             [sample, -sample]
         })
+        .collect::<Vec<_>>();
+    let input = samples
+        .iter()
+        .copied()
         .flat_map(f32::to_le_bytes)
         .collect::<Vec<_>>();
     let input_len = input.len();
+    let mut expected = samples;
+    let mut reference = forge_normalizer::realtime::RealtimeGainProcessor::new(
+        48_000,
+        2,
+        forge_normalizer::realtime::RealtimeGainConfig {
+            initial_gain_db: 3.0,
+            ceiling_dbfs: -1.0,
+            attack_ms: 10.0,
+            release_ms: 100.0,
+        },
+    )
+    .unwrap();
+    reference.process_interleaved(&mut expected).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_forge-live"))
         .args([
             "--sample-rate",
@@ -41,6 +58,12 @@ fn live_cli_streams_f32le_and_reports_ndjson() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout.len(), input_len);
+    let actual = output
+        .stdout
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
     let reports = String::from_utf8(output.stderr)
         .unwrap()
         .lines()

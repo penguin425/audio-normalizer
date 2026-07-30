@@ -44,6 +44,23 @@ jobs:
       - name: Run tests with MP3 encoding
         run: cargo test --features mp3-encoding
 
+  plugin-parity:
+    name: Plugin parity (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Compare CLI, CLAP, and LV2 output with the live processor
+        run: cargo test --locked --features clap-plugin,lv2-plugin plugin_parity
+
   ebu-conformance:
     name: EBU conformance
     runs-on: ubuntu-latest
