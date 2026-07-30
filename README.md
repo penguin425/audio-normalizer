@@ -452,18 +452,25 @@ Validation is exercised against pinned AOMedia `libiamf` v1.1.0 and
 `iamf-tools` v2.1.0 streams in addition to clean and intentionally defective
 local fixtures.
 
-Unfragmented ISO-BMFF IAMF files reuse the same OBU validator after bounded,
-streaming decapsulation. The container audit requires the `iamf` compatible
-brand, zero-valued IAMF `AudioSampleEntry` channel-count/sample-rate fields,
-exactly one version-1 `iacb` box, descriptor-only `configOBUs`, and complete
-`stsc`/`stsz`/`stz2`/`stco`/`co64` sample addressing inside `mdat`. Every IA
-Sample must contain one descriptor-free Temporal Unit without a Temporal
-Delimiter OBU. Stable `FORGE-ISOBMFF-IAMF-*` checks reconcile `stts` duration
-with codec frame lengths and end trimming, require `roll` groups matching
-Opus/AAC `audio_roll_distance`, reject `stss`/`ctts`, and verify that start/end
-trim is represented exactly by `edts`/`elst`. Fragmented and encrypted IAMF
-carriage is reported as not yet validated rather than inheriting a false
-standalone-conformance claim.
+ISO-BMFF IAMF files reuse the same OBU validator after bounded, streaming
+decapsulation. The container audit requires the `iamf` compatible brand,
+zero-valued IAMF `AudioSampleEntry` channel-count/sample-rate fields, exactly
+one version-1 `iacb` box, descriptor-only `configOBUs`, and sample addressing
+inside `mdat`. Unfragmented files expand complete
+`stsc`/`stsz`/`stz2`/`stco`/`co64` tables. Fragmented files resolve
+`trex`/`tfhd` defaults, signed `trun` data offsets, per-sample duration, size,
+flags, sample-description changes, `tfdt` continuity, and track- or
+fragment-level `roll` groups; initialization segments are valid without media
+samples. Every IA Sample must contain one descriptor-free Temporal Unit
+without a Temporal Delimiter OBU. Stable `FORGE-ISOBMFF-IAMF-*` checks
+reconcile `stts` or `trun` duration with codec frame lengths and end trimming,
+require `roll` groups matching Opus/AAC `audio_roll_distance`, reject
+`stss`/`ctts`, fragment composition offsets, and non-sync sample flags, and
+verify that start/end trim is represented exactly by `edts`/`elst`. The
+fragmented path is continuously exercised against checksum-pinned AOMedia
+`libiamf` v1.1.0 positive and negative vectors. Encrypted IAMF remains
+explicitly outside this decapsulation claim until CENC signalling and
+full-sample protection can be verified.
 
 Rendering is deliberately separate: render every Mix Presentation and target
 layout with an

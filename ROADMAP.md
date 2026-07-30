@@ -28,13 +28,17 @@ Forge already provides:
   Atmos/JOC Extension Type A signalling, six-block access-unit and
   independent/dependent presentation grouping, plus authoritative external
   E-AC-3 JOC render checks.
-- Bounded standalone and unfragmented ISO-BMFF AOMedia IAMF v1.1 QC with
+- Bounded standalone, unfragmented, and fragmented ISO-BMFF AOMedia IAMF v1.1
+  QC with
   `iamf` brand/sample-entry/`iacb` configuration validation, streaming sample
-  table decapsulation, supported codec-config
+  table or `moof`/`traf`/`trun` decapsulation, supported codec-config
   4CC/frame/roll/decoder semantics, complete Audio Element parameter,
   scalable-channel/expanded-layout and Ambisonics validation, descriptor ID
   uniqueness, audio-frame linking, plus external OAR v1.0.0
   presentation-render loudness, true-peak, duration, and reference checks.
+  Fragmented carriage resolves `trex`/`tfhd` defaults, signed data offsets,
+  sample-description changes, decode-time continuity, fragment sample groups,
+  sync/CTS constraints, and pinned AOMedia interoperability vectors.
 - Bounded MPEG-TS/M2TS QC for packet layout, continuity, PAT/PMT CRC and
   programme maps, audio PES headers, and PTS continuity.
 - Bounded SMPTE ST 377-1 MXF QC for KLV framing, partitions and links,
@@ -144,14 +148,14 @@ generations.
 - DTS core/HD metadata and decoded presentation checks through an optional
   adapter.
 - WavPack, Monkey's Audio, and ALAC native frame/checksum validation.
-- Fragmented/CENC ISO-BMFF IAMF encapsulation and broader OAR conformance
-  vectors. Standalone
+- CENC ISO-BMFF IAMF encapsulation and broader OAR conformance vectors.
+  Standalone
   OBU bounds/order, supported codec configurations, full Audio Element and Mix
   Presentation semantics, profile element/channel limits, descriptor/substream
   linking, Parameter Block syntax, exact parameter/audio-frame timeline
-  reconciliation, trimming/delimiter validation, unfragmented `iamf` sample
-  entry/configuration/sample-table decapsulation, and externally rendered
-  presentation QC have shipped.
+  reconciliation, trimming/delimiter validation, unfragmented and fragmented
+  `iamf` sample entry/configuration/sample-table decapsulation, and externally
+  rendered presentation QC have shipped.
 
 ### Streaming and platform delivery
 

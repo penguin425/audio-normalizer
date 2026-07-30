@@ -41,3 +41,23 @@ jobs:
 
       - name: Run the official ITU-R BS.2217-2 conformance tests
         run: ./tools/test-itu-conformance.sh
+
+  iamf-interoperability:
+    name: AOMedia IAMF fragmented ISO-BMFF interoperability
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache pinned AOMedia libiamf vectors
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/forge-normalizer/iamf-f06e919e2ad5502a2adc4bdd4e146f2e7e7ffb63
+          key: iamf-libiamf-v1.1.0-fragmented-v1
+
+      - name: Run fragmented ISO-BMFF IAMF interoperability checks
+        run: ./tools/test-iamf-conformance.sh
