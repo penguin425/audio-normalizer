@@ -53,8 +53,60 @@ fn preset_is_accepted_but_explicit_target_conflicts() {
     assert!(
         Cli::try_parse_from(["forge", "track.wav", "--preset", "spotify", "--target=-12"]).is_err()
     );
+    let spotify_revision = Cli::try_parse_from([
+        "forge",
+        "track.wav",
+        "--preset",
+        "spotify-normal-2026-07-30",
+    ])
+    .unwrap();
+    assert_eq!(
+        spotify_revision.preset.as_deref(),
+        Some("spotify-normal-2026-07-30")
+    );
+    assert!(Cli::try_parse_from([
+        "forge",
+        "track.wav",
+        "--preset",
+        "spotify-normal-2025-01-01"
+    ])
+    .is_err());
     let arib = Cli::try_parse_from(["forge", "track.wav", "--preset", "arib-tr-b32"]).unwrap();
     assert_eq!(arib.preset.as_deref(), Some("arib-tr-b32"));
+}
+
+#[test]
+fn platform_preset_reports_version_source_and_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("tone.wav");
+    let samples = vec![0.0; 48_000];
+    let buffer = AudioBuffer {
+        sample_rate: 48_000,
+        channels: 1,
+        frames: samples.len(),
+        data: vec![samples],
+        channel_roles: default_channel_roles(1),
+        source_kind: PcmKind::F32,
+    };
+    WavWriter::write(&input, &buffer, PcmKind::F32, false).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            input.to_str().unwrap(),
+            "--preset",
+            "apple-music",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(result.status.success());
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    assert!(stderr.contains("preset apple-music-reference-2026-07-30"));
+    assert!(stderr.contains("profile evidence: engineering-reference"));
+    assert!(stderr.contains("https://support.apple.com/en-us/109331"));
+    assert!(stderr.contains("checked 2026-07-30"));
+    assert!(stderr.contains("does not publish these numeric values"));
 }
 
 #[test]

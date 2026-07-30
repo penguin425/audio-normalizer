@@ -1397,16 +1397,24 @@ difference_report = "reports/programme-normalization.json"
 
 ### Presets
 
-| Name | Integrated target | True-peak ceiling | Intended context |
-|------|-------------------|-------------------|------------------|
-| `spotify` | −14 LUFS | −1 dBTP | Spotify Normal playback/mastering guidance |
-| `apple-music` | −16 LUFS | −1 dBTP | Apple Music Sound Check playback reference |
-| `youtube` | −14 LUFS | −1 dBTP | YouTube playback-normalization reference |
+| Name | Integrated target | True-peak ceiling | Profile revision / evidence |
+|------|-------------------|-------------------|-----------------------------|
+| `spotify` | −14 LUFS | −1 dBTP | `spotify-normal-2026-07-30`; published platform policy |
+| `apple-music` | −16 LUFS | −1 dBTP | `apple-music-reference-2026-07-30`; Forge engineering reference |
+| `youtube` | −14 LUFS | −1 dBTP | `youtube-reference-2026-07-30`; Forge engineering reference |
 | `podcast-stereo` | −16 LUFS | −1 dBTP | Common stereo podcast delivery |
 | `podcast-mono` | −19 LUFS | −1 dBTP | Common mono podcast delivery |
 | `ebu-r128` | −23 LUFS | −1 dBTP | EBU R 128 programme delivery |
 | `atsc-a85` | −24 LUFS | −2 dBTP | ATSC A/85 television delivery |
 | `arib-tr-b32` | −24 LKFS | −1 dBTP | ARIB TR-B32 Japanese digital television delivery |
+
+The short platform names resolve to the exact revision shown above. The
+versioned identifiers are also accepted directly, so repeatable jobs can pin a
+revision. These compatibility aliases remain pinned to the listed revision;
+future policy observations receive a new identifier rather than changing an
+existing job. At startup Forge prints the canonical identifier, evidence
+class, first-party source, source publication date when available, verification
+date, and caveat.
 
 Spotify, EBU R 128, and ATSC A/85 values follow their published guidance:
 [Spotify loudness normalization](https://support.spotify.com/artists/article/loudness-normalization/),
@@ -1414,9 +1422,13 @@ Spotify, EBU R 128, and ATSC A/85 values follow their published guidance:
 [ATSC A/85](https://www.atsc.org/atsc-documents/a85-techniques-for-establishing-and-maintaining-audio-loudness-for-digital-television/).
 The Japanese broadcast preset follows
 [ARIB TR-B32 1.6](https://www.arib.or.jp/english/std_tr/broadcasting/desc/tr-b32.html).
-Service playback behavior can change and is not a substitute for a distributor's
-delivery specification; Apple Music, YouTube, and podcast entries are practical
-playback references rather than acceptance guarantees.
+[Apple documents Sound Check](https://support.apple.com/en-us/109331) but does not
+publish the numeric target or ceiling used by Forge's reference.
+[YouTube documents variable audio enhancement](https://support.google.com/youtube/answer/16619284)
+but likewise does not publish Forge's numeric values. Those two profiles and
+the podcast entries are engineering references, not platform acceptance
+guarantees. Service behaviour can also differ by playback setting, client, and
+device; always prefer a distributor's current delivery specification.
 
 ### Delivery compliance profiles
 

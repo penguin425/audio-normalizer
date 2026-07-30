@@ -59,8 +59,11 @@ pub struct Cli {
         long,
         value_parser = [
             "spotify",
+            "spotify-normal-2026-07-30",
             "apple-music",
+            "apple-music-reference-2026-07-30",
             "youtube",
+            "youtube-reference-2026-07-30",
             "podcast-stereo",
             "podcast-mono",
             "ebu-r128",
@@ -970,8 +973,11 @@ impl Cli {
                 preset,
                 &[
                     "spotify",
+                    "spotify-normal-2026-07-30",
                     "apple-music",
+                    "apple-music-reference-2026-07-30",
                     "youtube",
+                    "youtube-reference-2026-07-30",
                     "podcast-stereo",
                     "podcast-mono",
                     "ebu-r128",
