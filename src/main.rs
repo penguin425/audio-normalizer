@@ -1292,9 +1292,35 @@ fn print_compliance(
     eprintln!("  compliance {}:", result.profile);
     for rule in &result.rules {
         let bounds = match (rule.minimum, rule.maximum) {
-            (Some(minimum), Some(maximum)) => format!("{minimum:.2}..={maximum:.2}"),
-            (Some(minimum), None) => format!(">= {minimum:.2}"),
-            (None, Some(maximum)) => format!("<= {maximum:.2}"),
+            (Some(minimum), Some(maximum)) => format!(
+                "{}{minimum:.2}, {maximum:.2}{}",
+                if rule.minimum_inclusive == Some(false) {
+                    "("
+                } else {
+                    "["
+                },
+                if rule.maximum_inclusive == Some(false) {
+                    ")"
+                } else {
+                    "]"
+                }
+            ),
+            (Some(minimum), None) => format!(
+                "{} {minimum:.2}",
+                if rule.minimum_inclusive == Some(false) {
+                    ">"
+                } else {
+                    ">="
+                }
+            ),
+            (None, Some(maximum)) => format!(
+                "{} {maximum:.2}",
+                if rule.maximum_inclusive == Some(false) {
+                    "<"
+                } else {
+                    "<="
+                }
+            ),
             (None, None) => "unbounded".into(),
         };
         eprintln!(
