@@ -41,9 +41,12 @@ do
 done
 
 cp "target/${target}/release/libforge_normalizer.so" "$staging/forge-live.clap"
+cp "target/${target}/release/libforge_normalizer.so" "$staging/"
 cp -R plugins/forge-live.lv2 "$staging/"
 cp "target/${target}/release/libforge_normalizer.so" \
   "$staging/forge-live.lv2/forge_live.so"
+mkdir "$staging/include"
+cp include/forge_normalizer.h "$staging/include/"
 cp README.md LICENSE "$staging/"
 
 find "$staging" -exec touch -h -d "@${source_date_epoch}" {} +

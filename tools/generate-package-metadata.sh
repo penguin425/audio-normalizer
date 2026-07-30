@@ -43,6 +43,8 @@ class Forge < Formula
 
   def install
     bin.install Dir["forge", "forge-*"].select { |path| File.file?(path) && File.executable?(path) }
+    include.install "include/forge_normalizer.h"
+    lib.install Dir["libforge_normalizer.*"]
   end
 
   test do

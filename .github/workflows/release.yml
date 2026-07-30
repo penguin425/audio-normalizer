@@ -7,6 +7,9 @@ on:
   pull_request:
     paths:
       - ".github/workflows/release.yml"
+      - "include/forge_normalizer.h"
+      - "src/c_api.rs"
+      - "src/lib.rs"
       - "tools/package-linux-release.sh"
       - "tools/generate-package-metadata.sh"
       - "Cargo.toml"
@@ -55,21 +58,25 @@ jobs:
             asset: linux-x86_64
             archive: tar
             library: libforge_normalizer.so
+            rustflags: ""
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
             asset: windows-x86_64
             archive: zip
             library: forge_normalizer.dll
+            rustflags: ""
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             asset: macos-x86_64
             archive: tar
             library: libforge_normalizer.dylib
-          - runner: macos-15
+            rustflags: ""
+          - runner: macos-latest
             target: aarch64-apple-darwin
             asset: macos-aarch64
             archive: tar
             library: libforge_normalizer.dylib
+            rustflags: -Ctarget-feature=+neon,+aes,+sha2
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
@@ -82,7 +89,7 @@ jobs:
       - name: Build release binary
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace ${{ matrix.rustflags }}
         run: cargo build --locked --release --target ${{ matrix.target }} --features opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin
 
       - name: Package reproducible Linux binary
@@ -115,6 +122,10 @@ jobs:
              "target/${{ matrix.target }}/release/forge-report" "$staging/"
           cp "target/${{ matrix.target }}/release/${{ matrix.library }}" \
              "$staging/forge-live.clap"
+          cp "target/${{ matrix.target }}/release/${{ matrix.library }}" \
+             "$staging/${{ matrix.library }}"
+          mkdir "$staging/include"
+          cp include/forge_normalizer.h "$staging/include/"
           cp README.md LICENSE "$staging/"
           tar -czf "${staging}.tar.gz" "$staging"
 
@@ -126,6 +137,12 @@ jobs:
           New-Item -ItemType Directory -Path $staging | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/forge.exe","target/${{ matrix.target }}/release/forge-live.exe","target/${{ matrix.target }}/release/forge-compare.exe","target/${{ matrix.target }}/release/forge-audio-compare.exe","target/${{ matrix.target }}/release/forge-container-qc.exe","target/${{ matrix.target }}/release/forge-streaming-qc.exe","target/${{ matrix.target }}/release/forge-presentation-qc.exe","target/${{ matrix.target }}/release/forge-sadm-qc.exe","target/${{ matrix.target }}/release/forge-dialogue-provider.exe","target/${{ matrix.target }}/release/forge-provenance-qc.exe","target/${{ matrix.target }}/release/forge-imf-qc.exe","target/${{ matrix.target }}/release/forge-aes31-qc.exe","target/${{ matrix.target }}/release/forge-rtp-qc.exe","target/${{ matrix.target }}/release/forge-nmos-qc.exe","target/${{ matrix.target }}/release/forge-st2022-7-qc.exe","target/${{ matrix.target }}/release/forge-report.exe" $staging
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.library }}" "$staging/forge-live.clap"
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.library }}" "$staging/${{ matrix.library }}"
+          $importLibrary = Get-ChildItem "target/${{ matrix.target }}/release" -Filter "forge_normalizer*.lib" | Select-Object -First 1
+          if ($null -eq $importLibrary) { throw "Forge import library was not produced" }
+          Copy-Item $importLibrary.FullName "$staging/forge_normalizer.lib"
+          New-Item -ItemType Directory -Path "$staging/include" | Out-Null
+          Copy-Item include/forge_normalizer.h "$staging/include/"
           Copy-Item README.md, LICENSE $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
 
