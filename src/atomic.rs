@@ -1,5 +1,6 @@
 //! Transactional output files staged beside their final destination.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tempfile::{Builder, NamedTempFile};
 
@@ -38,6 +39,12 @@ impl AtomicOutput {
 
     pub(crate) fn path(&self) -> &Path {
         self.temporary.path()
+    }
+
+    pub(crate) fn write_all(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.temporary
+            .write_all(bytes)
+            .map_err(|error| format!("write {}: {error}", self.temporary.path().display()))
     }
 
     pub(crate) fn commit(mut self) -> Result<(), String> {

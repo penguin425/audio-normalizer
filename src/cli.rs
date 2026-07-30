@@ -698,6 +698,37 @@ pub struct Cli {
     /// Number of worker threads (default: all logical cores).
     #[arg(short = 'j', long = "jobs")]
     pub jobs: Option<usize>,
+
+    /// Atomically checkpoint a multi-file normalization job and resume it on
+    /// the next identical invocation.
+    #[arg(
+        long = "job-state",
+        value_name = "PATH",
+        conflicts_with_all = [
+            "analyze_only",
+            "album",
+            "dry_run",
+            "gain_only",
+            "write_tags",
+            "difference_report"
+        ]
+    )]
+    pub job_state: Option<PathBuf>,
+
+    /// Write versioned normalization lifecycle events as NDJSON (`-` for
+    /// stdout).
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = [
+            "analyze_only",
+            "album",
+            "dry_run",
+            "gain_only",
+            "write_tags"
+        ]
+    )]
+    pub progress: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]

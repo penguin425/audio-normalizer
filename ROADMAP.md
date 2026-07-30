@@ -165,6 +165,9 @@ Forge already provides:
   workflows, including the exact intended pre-codec measurement, bounded gain
   envelope, limiter amount, clipping/ceiling counts, decoded-output endpoints,
   SHA-256 provenance, and codec loudness/peak/duration drift.
+- Resumable independent-track batch jobs with atomic per-output checkpoints,
+  input/settings/output SHA-256 binding, missing-output recovery,
+  changed-output rejection, and schema-validated lifecycle NDJSON.
 - Bounded AAF stored-format, dynamic MetaDictionary, and core object-model/Edit
   Protocol QC with CFB/file/root identity, property/reference-index decoding,
   dynamically declared class/property/type graphs and extension values,
@@ -262,8 +265,7 @@ failure behaviour are documented.
 
 ## Product and developer experience
 
-- Resumable batch jobs, content-addressed analysis cache, watch folders, and
-  machine-readable progress.
+- Content-addressed analysis cache and watch folders.
 - SQLite catalogue with source/output hashes, measurement standard/version,
   profile, tool version, and provenance report.
 - TUI/GUI views for waveform, loudness timeline, true peak, QC events, channel

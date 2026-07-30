@@ -1155,6 +1155,11 @@ forge --album a.wav b.mp3 c.flac -o ./normalized/
 # Recursively normalize a library while preserving subdirectories
 forge ./library --recursive -o ./normalized
 
+# Checkpoint each completed track and emit versioned lifecycle NDJSON
+forge ./library --recursive -o ./normalized \
+  --job-state ./work/library-job.json \
+  --progress ./work/library-progress.ndjson
+
 # Preview outputs without writing, and explicitly allow replacement when ready
 forge ./library --recursive -o ./normalized --dry-run
 forge ./library --recursive -o ./normalized --overwrite
@@ -1276,6 +1281,22 @@ claim. It is available for track, recursive/batch, album, verified, and
 automatically corrected renders; it cannot be combined with analysis-only,
 gain-only, tag-only, or dry-run modes.
 
+### Resumable batch jobs
+
+For an independent multi-file normalization run, `--job-state PATH`
+atomically checkpoints every committed output. Repeating the identical command
+hash-verifies and skips completed outputs, rebuilds missing outputs, and rejects
+changed outputs unless `--overwrite` explicitly authorizes rebuilding them.
+Inputs, ordered paths, output formats, and normalization settings are bound to
+the state with SHA-256 evidence.
+
+`--progress PATH` writes schema-validated lifecycle NDJSON with job start,
+asset start/completion/skip/failure, and job completion events; use `-` for
+stdout. See [BATCH-JOBS.md](BATCH-JOBS.md) for recovery rules, limits, event
+semantics, and the versioned
+[`batch-job-v1`](schema/batch-job-v1.schema.json) and
+[`batch-progress-v1`](schema/batch-progress-v1.schema.json) contracts.
+
 ### Options
 
 | Flag | Default | Description |
@@ -1284,6 +1305,8 @@ gain-only, tag-only, or dry-run modes.
 | `-m, --mode` | `lufs` | `lufs`, `peak`, or `rms` |
 | `--preset` | none | Named playback/delivery loudness target (see below) |
 | `--recursive` | off | Recursively process input directories |
+| `--job-state` | none | Atomically checkpoint and resume an identical multi-file normalization job |
+| `--progress` | none | Write versioned lifecycle events as NDJSON (`-` for stdout) |
 | `--input-format` | none | Container hint required for stdin (`-`) |
 | `--dry-run` | off | Analyze and show output paths without writing |
 | `--overwrite` | off | Replace output files that already exist |

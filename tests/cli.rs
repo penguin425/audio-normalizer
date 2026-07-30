@@ -9,6 +9,26 @@ fn temp_root() -> PathBuf {
     std::env::temp_dir().join(format!("forge_cli_{}", std::process::id()))
 }
 
+fn write_batch_test_wav(path: &std::path::Path, frequency_hz: f64) {
+    let sample_rate = 48_000;
+    let frames = 24_000;
+    let samples = (0..frames)
+        .map(|frame| {
+            (0.2 * (std::f64::consts::TAU * frequency_hz * frame as f64 / sample_rate as f64).sin())
+                as f32
+        })
+        .collect::<Vec<_>>();
+    let buffer = AudioBuffer {
+        sample_rate,
+        channels: 1,
+        frames,
+        data: vec![samples],
+        channel_roles: default_channel_roles(1),
+        source_kind: PcmKind::F32,
+    };
+    WavWriter::write(path, &buffer, PcmKind::F32, false).unwrap();
+}
+
 #[test]
 fn recursive_dry_run_preserves_relative_directories() {
     let root = temp_root();
@@ -44,6 +64,326 @@ fn recursive_dry_run_preserves_relative_directories() {
     assert!(!output.exists(), "dry-run created the output directory");
 
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn resumable_batch_skips_verified_outputs_and_recovers_only_missing_or_changed_assets() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_input = directory.path().join("first.wav");
+    let second_input = directory.path().join("second.wav");
+    let output_directory = directory.path().join("normalized");
+    let state_path = directory.path().join("job.json");
+    let progress_path = directory.path().join("progress.ndjson");
+    write_batch_test_wav(&first_input, 440.0);
+    write_batch_test_wav(&second_input, 880.0);
+
+    let run = |overwrite: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_forge"));
+        command
+            .arg(&first_input)
+            .arg(&second_input)
+            .arg("-o")
+            .arg(&output_directory)
+            .arg("--job-state")
+            .arg(&state_path)
+            .arg("--progress")
+            .arg(&progress_path);
+        if overwrite {
+            command.arg("--overwrite");
+        }
+        command.output().unwrap()
+    };
+    let read_events = || {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../schema/batch-progress-v1.schema.json")).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        std::fs::read_to_string(&progress_path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert!(
+                    validator.is_valid(&event),
+                    "invalid progress event: {event}"
+                );
+                event
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let first_run = run(false);
+    assert!(
+        first_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first_run.stderr)
+    );
+    let state_schema: serde_json::Value =
+        serde_json::from_str(include_str!("../schema/batch-job-v1.schema.json")).unwrap();
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert!(jsonschema::validator_for(&state_schema)
+        .unwrap()
+        .is_valid(&state));
+    assert_eq!(state["asset_count"], 2);
+    assert_eq!(state["completed_count"], 2);
+    let first_output = PathBuf::from(state["assets"][0]["output"].as_str().unwrap());
+    let second_output = PathBuf::from(state["assets"][1]["output"].as_str().unwrap());
+    assert!(first_output.is_file());
+    assert!(second_output.is_file());
+    assert_eq!(
+        read_events()
+            .iter()
+            .map(|event| event["event"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "job_started",
+            "asset_started",
+            "asset_completed",
+            "asset_started",
+            "asset_completed",
+            "job_completed"
+        ]
+    );
+
+    let resumed = run(false);
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(
+        read_events()
+            .iter()
+            .map(|event| event["event"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "job_started",
+            "asset_skipped",
+            "asset_skipped",
+            "job_completed"
+        ]
+    );
+
+    let first_before_recovery = std::fs::read(&first_output).unwrap();
+    std::fs::remove_file(&second_output).unwrap();
+    let recovered = run(false);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(std::fs::read(&first_output).unwrap(), first_before_recovery);
+    assert!(second_output.is_file());
+    assert_eq!(
+        read_events()
+            .iter()
+            .map(|event| event["event"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "job_started",
+            "asset_skipped",
+            "asset_started",
+            "asset_completed",
+            "job_completed"
+        ]
+    );
+
+    std::fs::write(&first_output, b"externally changed").unwrap();
+    let rejected = run(false);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("completed output changed"));
+
+    let rebuilt = run(true);
+    assert!(
+        rebuilt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rebuilt.stderr)
+    );
+    assert_ne!(std::fs::read(&first_output).unwrap(), b"externally changed");
+    assert_eq!(
+        read_events()
+            .iter()
+            .map(|event| event["event"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "job_started",
+            "asset_started",
+            "asset_completed",
+            "asset_skipped",
+            "job_completed"
+        ]
+    );
+}
+
+#[test]
+fn resumable_batch_checkpoints_before_a_later_asset_fails() {
+    let directory = tempfile::tempdir().unwrap();
+    let valid_input = directory.path().join("valid.wav");
+    let invalid_input = directory.path().join("invalid.wav");
+    let output_directory = directory.path().join("normalized");
+    let state_path = directory.path().join("job.json");
+    let progress_path = directory.path().join("progress.ndjson");
+    write_batch_test_wav(&valid_input, 440.0);
+    std::fs::write(&invalid_input, b"not a WAVE file").unwrap();
+
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_forge"))
+            .arg(&valid_input)
+            .arg(&invalid_input)
+            .arg("-o")
+            .arg(&output_directory)
+            .arg("--job-state")
+            .arg(&state_path)
+            .arg("--progress")
+            .arg(&progress_path)
+            .output()
+            .unwrap()
+    };
+    let event_names = || {
+        std::fs::read_to_string(&progress_path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["event"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let first_run = run();
+    assert!(!first_run.status.success());
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(state["completed_count"], 1);
+    assert_eq!(
+        event_names(),
+        [
+            "job_started",
+            "asset_started",
+            "asset_completed",
+            "asset_started",
+            "asset_failed"
+        ]
+    );
+    let valid_output = PathBuf::from(state["assets"][0]["output"].as_str().unwrap());
+    let valid_output_bytes = std::fs::read(&valid_output).unwrap();
+
+    let resumed = run();
+    assert!(!resumed.status.success());
+    assert_eq!(std::fs::read(valid_output).unwrap(), valid_output_bytes);
+    assert_eq!(
+        event_names(),
+        [
+            "job_started",
+            "asset_skipped",
+            "asset_started",
+            "asset_failed"
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn progress_path_cannot_alias_an_audio_input_through_a_symlink() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("input.wav");
+    let output = directory.path().join("output.wav");
+    let progress_alias = directory.path().join("progress.ndjson");
+    write_batch_test_wav(&input, 440.0);
+    let original = std::fs::read(&input).unwrap();
+    std::os::unix::fs::symlink(&input, &progress_alias).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--progress")
+        .arg(&progress_alias)
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr)
+        .contains("--progress must not overwrite an audio input or output"));
+    assert_eq!(std::fs::read(input).unwrap(), original);
+}
+
+#[test]
+fn progress_can_use_stdout_but_cannot_share_it_with_binary_audio() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("input.wav");
+    let output = directory.path().join("output.wav");
+    write_batch_test_wav(&input, 440.0);
+
+    let progress = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--progress")
+        .arg("-")
+        .output()
+        .unwrap();
+    assert!(
+        progress.status.success(),
+        "{}",
+        String::from_utf8_lossy(&progress.stderr)
+    );
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../schema/batch-progress-v1.schema.json")).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let events = String::from_utf8(progress.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 4);
+    assert!(events.iter().all(|event| validator.is_valid(event)));
+    assert_eq!(events[0]["event"], "job_started");
+    assert_eq!(events[3]["event"], "job_completed");
+
+    let conflict = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .arg("-o")
+        .arg("-")
+        .arg("--progress")
+        .arg("-")
+        .output()
+        .unwrap();
+    assert!(!conflict.status.success());
+    assert!(String::from_utf8_lossy(&conflict.stderr)
+        .contains("binary output and --progress cannot both use stdout"));
+}
+
+#[test]
+fn album_mode_still_refuses_an_existing_output_without_overwrite() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_input = directory.path().join("first.wav");
+    let second_input = directory.path().join("second.wav");
+    let output_directory = directory.path().join("normalized");
+    let existing_output = output_directory.join("first_normalized.wav");
+    write_batch_test_wav(&first_input, 440.0);
+    write_batch_test_wav(&second_input, 880.0);
+    std::fs::create_dir(&output_directory).unwrap();
+    std::fs::write(&existing_output, b"keep this output").unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg("--album")
+        .arg(&first_input)
+        .arg(&second_input)
+        .arg("-o")
+        .arg(&output_directory)
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("(use --overwrite)"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(std::fs::read(existing_output).unwrap(), b"keep this output");
 }
 
 #[test]
