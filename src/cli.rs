@@ -698,37 +698,6 @@ pub struct Cli {
     /// Number of worker threads (default: all logical cores).
     #[arg(short = 'j', long = "jobs")]
     pub jobs: Option<usize>,
-
-    /// Atomically checkpoint a multi-file normalization job and resume it on
-    /// the next identical invocation.
-    #[arg(
-        long = "job-state",
-        value_name = "PATH",
-        conflicts_with_all = [
-            "analyze_only",
-            "album",
-            "dry_run",
-            "gain_only",
-            "write_tags",
-            "difference_report"
-        ]
-    )]
-    pub job_state: Option<PathBuf>,
-
-    /// Write versioned normalization lifecycle events as NDJSON (`-` for
-    /// stdout).
-    #[arg(
-        long,
-        value_name = "PATH",
-        conflicts_with_all = [
-            "analyze_only",
-            "album",
-            "dry_run",
-            "gain_only",
-            "write_tags"
-        ]
-    )]
-    pub progress: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -787,7 +756,18 @@ struct OutputConfig {
 impl Cli {
     pub fn parse_with_config() -> Result<Self, String> {
         let matches = Self::command().get_matches();
-        let mut cli = Self::from_arg_matches(&matches)
+        Self::from_matches_with_config(&matches)
+    }
+
+    /// Build a CLI value from already parsed matches and apply its optional
+    /// TOML configuration.
+    ///
+    /// Callers may add their own arguments to the command returned by
+    /// `Cli::command()` before parsing;
+    /// unknown match IDs are ignored while Forge's built-in options retain
+    /// their normal explicit-command-line precedence.
+    pub fn from_matches_with_config(matches: &clap::ArgMatches) -> Result<Self, String> {
+        let mut cli = Self::from_arg_matches(matches)
             .map_err(|error| format!("parse command line: {error}"))?;
         let Some(path) = cli.config.clone() else {
             return Ok(cli);
@@ -796,7 +776,7 @@ impl Cli {
             .map_err(|error| format!("read {}: {error}", path.display()))?;
         let config: ForgeConfig =
             toml::from_str(&text).map_err(|error| format!("parse {}: {error}", path.display()))?;
-        cli.apply_config(config, &matches, &path)?;
+        cli.apply_config(config, matches, &path)?;
         Ok(cli)
     }
 

@@ -1,5 +1,6 @@
 //! Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer.
 
+use clap::{Arg, CommandFactory};
 use forge_normalizer::adm::{self, ReferenceRendererOptions};
 use forge_normalizer::batch::{BatchAssetSpec, BatchJob, BatchProgressEvent};
 use forge_normalizer::cli;
@@ -25,15 +26,58 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tempfile::{Builder, NamedTempFile, TempDir};
 
+#[derive(Debug, Default)]
+struct BatchOptions {
+    job_state: Option<PathBuf>,
+    progress: Option<PathBuf>,
+}
+
 fn main() -> ExitCode {
-    let cli = match cli::Cli::parse_with_config() {
+    let matches = cli::Cli::command()
+        .arg(
+            Arg::new("job_state")
+                .long("job-state")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help(
+                    "Atomically checkpoint a multi-file normalization job and resume an identical invocation",
+                )
+                .conflicts_with_all([
+                    "analyze_only",
+                    "album",
+                    "dry_run",
+                    "gain_only",
+                    "write_tags",
+                    "difference_report",
+                ]),
+        )
+        .arg(
+            Arg::new("progress")
+                .long("progress")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help("Write versioned normalization lifecycle events as NDJSON (`-` for stdout)")
+                .conflicts_with_all([
+                    "analyze_only",
+                    "album",
+                    "dry_run",
+                    "gain_only",
+                    "write_tags",
+                ]),
+        )
+        .get_matches();
+    let batch_options = BatchOptions {
+        job_state: matches.get_one::<PathBuf>("job_state").cloned(),
+        progress: matches.get_one::<PathBuf>("progress").cloned(),
+    };
+    let cli = match cli::Cli::from_matches_with_config(&matches) {
         Ok(cli) => cli,
         Err(error) => {
             eprintln!("forge: error: {error}");
             return ExitCode::from(2);
         }
     };
-    if let Err(e) = run(cli) {
+    if let Err(e) = run(cli, batch_options) {
         eprintln!("forge: error: {e}");
         return ExitCode::from(1);
     }
@@ -69,13 +113,17 @@ fn parse_wav_container(value: &str) -> WavContainer {
     }
 }
 
-fn run(mut cli: cli::Cli) -> Result<(), String> {
-    let pipeline = PipelineFiles::prepare(&mut cli)?;
-    run_paths(cli, pipeline.stdin_requested())?;
+fn run(mut cli: cli::Cli, batch_options: BatchOptions) -> Result<(), String> {
+    let pipeline = PipelineFiles::prepare(&mut cli, &batch_options)?;
+    run_paths(cli, pipeline.stdin_requested(), &batch_options)?;
     pipeline.emit_stdout()
 }
 
-fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
+fn run_paths(
+    mut cli: cli::Cli,
+    stdin_requested: bool,
+    batch_options: &BatchOptions,
+) -> Result<(), String> {
     if let Some(j) = cli.jobs {
         ThreadPoolBuilder::new()
             .num_threads(j)
@@ -890,13 +938,15 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
     }
 
     if !cli.gain_only {
-        if cli.job_state.is_some() && cli.inputs.len() < 2 {
+        if batch_options.job_state.is_some() && cli.inputs.len() < 2 {
             return Err("--job-state requires at least two expanded input files".into());
         }
-        if stdin_requested && (cli.job_state.is_some() || cli.progress.is_some()) {
+        if stdin_requested
+            && (batch_options.job_state.is_some() || batch_options.progress.is_some())
+        {
             return Err("--job-state and --progress cannot be used with stdin".into());
         }
-        validate_control_paths(&cli, &outputs)?;
+        validate_control_paths(&cli, batch_options, &outputs)?;
         if cli.album {
             validate_outputs(&cli.inputs, &outputs, cli.overwrite)?;
         }
@@ -1060,7 +1110,7 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
         .zip(&outputs)
         .map(|(input, output)| BatchAssetSpec::new(input, output))
         .collect::<Vec<_>>();
-    let mut batch_job = cli
+    let mut batch_job = batch_options
         .job_state
         .as_ref()
         .map(|path| BatchJob::open(path, &batch_assets, &operation, cli.overwrite))
@@ -1088,7 +1138,7 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
             .collect::<Vec<_>>(),
         cli.overwrite,
     )?;
-    let mut progress = cli
+    let mut progress = batch_options
         .progress
         .as_deref()
         .map(ProgressWriter::open)
@@ -1322,7 +1372,7 @@ impl PipelineFiles {
         self._stdin_file.is_some()
     }
 
-    fn prepare(cli: &mut cli::Cli) -> Result<Self, String> {
+    fn prepare(cli: &mut cli::Cli, batch_options: &BatchOptions) -> Result<Self, String> {
         let stdin_requested = cli.inputs.iter().any(|path| path.as_os_str() == "-");
         let stdout_requested = cli
             .output
@@ -1336,7 +1386,7 @@ impl PipelineFiles {
             if cli.inputs.len() != 1 {
                 return Err("stdout (`-`) supports exactly one input".into());
             }
-            if cli.progress.as_deref() == Some(Path::new("-")) {
+            if batch_options.progress.as_deref() == Some(Path::new("-")) {
                 return Err("binary output and --progress cannot both use stdout".into());
             }
             if cli.analyze_only || cli.gain_only || cli.dry_run || cli.write_tags || cli.album {
@@ -1513,12 +1563,16 @@ fn batch_operation_descriptor(
     })
 }
 
-fn validate_control_paths(cli: &cli::Cli, outputs: &[PathBuf]) -> Result<(), String> {
+fn validate_control_paths(
+    cli: &cli::Cli,
+    batch_options: &BatchOptions,
+    outputs: &[PathBuf],
+) -> Result<(), String> {
     let mut controls = Vec::new();
-    if let Some(path) = &cli.job_state {
+    if let Some(path) = &batch_options.job_state {
         controls.push(("--job-state", comparison_path(path)?));
     }
-    if let Some(path) = &cli.progress {
+    if let Some(path) = &batch_options.progress {
         if path != Path::new("-") {
             controls.push(("--progress", comparison_path(path)?));
         }
