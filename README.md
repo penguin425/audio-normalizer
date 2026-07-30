@@ -1466,7 +1466,7 @@ device; always prefer a distributor's current delivery specification.
 | `ebu-r128-creative` | ≤ −22.8 LUFS | explicitly signalled lower-target exception; true peak ≤ −1 dBTP |
 | `ebu-r128-s2-streaming` | −23.0 ±0.2 LUFS | EBU R 128 s2 v3.0 unchanged stream; true peak ≤ −1 dBTP |
 | `ebu-r128-s2-streaming-adapted` | −18.0 ±0.2 LUFS | EBU R 128 s2 v3.0 interim adaptation; true peak ≤ −1 dBTP |
-| `ebu-r128-s2-music-low-plr` | −16.0 ±0.2 LUFS | EBU R 128 s2 v3.0 allowance for mostly-music PLR < 15 dB; true peak ≤ −1 dBTP |
+| `ebu-r128-s2-music-low-plr` | −16.0 ±0.2 LUFS | EBU R 128 s2 v3.0 allowance for mostly-music PLR < 15 LU (strictly enforced); true peak ≤ −1 dBTP |
 | `ebu-r128-s3-radio` | −23.0 ±0.2 LUFS | EBU R 128 s3:2023 production/exchange; true peak ≤ −1 dBTP |
 | `ebu-r128-short` | −23.0 ±0.2 LUFS | true peak ≤ −1 dBTP; max short-term ≤ −18 LUFS |
 | `atsc-a85-short` | −24 ±2 LUFS | true peak ≤ −2 dBTP |
@@ -1642,10 +1642,19 @@ confidence, and decision; `--dialogue-detection-report` writes the audit record
 separately. This remains a reviewable deterministic detector, not a claim of
 AI transcription or semantic understanding.
 
-Loudness Range (LRA) is reported for every analysis, together with
-`loudness_range_stable`. EBU Tech 3341 notes that LRA is not stable during the
-first 60 seconds, so shorter measurements are marked provisional instead of
-being presented as a settled programme characteristic.
+Loudness Range (LRA) and Peak-to-Loudness Ratio (PLR = maximum true peak in
+dBTP minus integrated programme loudness in LUFS) are reported for every
+analysis. Custom compliance profiles can apply inclusive minimum/maximum LRA
+and PLR limits. `peak_to_loudness_ratio_max_exclusive = true` changes only the
+PLR upper boundary from `<=` to `<`; the evaluated rule records its boundary
+inclusivity so a value exactly on the limit is auditable. The built-in
+`ebu-r128-s2-music-low-plr` profile uses that strict boundary because
+[EBU R 128 s2 v3.0](https://tech.ebu.ch/publications/r128s2) permits the
+−16 LUFS mostly-music alternative only when PLR is lower than 15 dB.
+
+Reports also include `loudness_range_stable`. EBU Tech 3341 notes that LRA is
+not stable during the first 60 seconds, so shorter measurements are marked
+provisional instead of being presented as a settled programme characteristic.
 
 Dialogue range files use JSON or TOML:
 
@@ -1678,6 +1687,9 @@ max_short_term_lufs = -18.0
 max_momentary_lufs = -15.0
 min_loudness_range_lu = 3.0
 max_loudness_range_lu = 18.0
+min_peak_to_loudness_ratio_lu = 8.0
+max_peak_to_loudness_ratio_lu = 15.0
+peak_to_loudness_ratio_max_exclusive = true
 ```
 
 ADM chunks are carried through unchanged during normal normalization. Forge

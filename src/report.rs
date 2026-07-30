@@ -116,6 +116,10 @@ pub struct ComplianceProfile {
     pub max_momentary_lufs: Option<f64>,
     pub min_loudness_range_lu: Option<f64>,
     pub max_loudness_range_lu: Option<f64>,
+    pub min_peak_to_loudness_ratio_lu: Option<f64>,
+    pub max_peak_to_loudness_ratio_lu: Option<f64>,
+    #[serde(default)]
+    pub peak_to_loudness_ratio_max_exclusive: bool,
     #[serde(default)]
     pub max_loudness_to_dialogue_ratio_lu: Option<f64>,
 }
@@ -149,9 +153,11 @@ impl ComplianceProfile {
             "ebu-r128-s2-streaming-adapted" => {
                 Self::symmetric(name, -18.0, 0.2, -1.0).sourced("EBU R 128 s2", "3.0 (2023)")
             }
-            "ebu-r128-s2-music-low-plr" => {
-                Self::symmetric(name, -16.0, 0.2, -1.0).sourced("EBU R 128 s2", "3.0 (2023)")
-            }
+            "ebu-r128-s2-music-low-plr" => Self {
+                max_peak_to_loudness_ratio_lu: Some(15.0),
+                peak_to_loudness_ratio_max_exclusive: true,
+                ..Self::symmetric(name, -16.0, 0.2, -1.0).sourced("EBU R 128 s2", "3.0 (2023)")
+            },
             "streaming-music" => Self::symmetric("streaming-music", -14.0, 1.0, -1.0),
             "streaming-speech-stereo" => {
                 Self::symmetric("streaming-speech-stereo", -16.0, 1.0, -1.0)
@@ -194,6 +200,9 @@ impl ComplianceProfile {
                 max_momentary_lufs: None,
                 min_loudness_range_lu: None,
                 max_loudness_range_lu: None,
+                min_peak_to_loudness_ratio_lu: None,
+                max_peak_to_loudness_ratio_lu: None,
+                peak_to_loudness_ratio_max_exclusive: false,
                 max_loudness_to_dialogue_ratio_lu: None,
             },
             "aes77-music-track" => {
@@ -222,6 +231,9 @@ impl ComplianceProfile {
             max_momentary_lufs: None,
             min_loudness_range_lu: None,
             max_loudness_range_lu: None,
+            min_peak_to_loudness_ratio_lu: None,
+            max_peak_to_loudness_ratio_lu: None,
+            peak_to_loudness_ratio_max_exclusive: false,
             max_loudness_to_dialogue_ratio_lu: None,
         }
     }
@@ -241,6 +253,9 @@ impl ComplianceProfile {
             max_momentary_lufs: None,
             min_loudness_range_lu: None,
             max_loudness_range_lu: None,
+            min_peak_to_loudness_ratio_lu: None,
+            max_peak_to_loudness_ratio_lu: None,
+            peak_to_loudness_ratio_max_exclusive: false,
             max_loudness_to_dialogue_ratio_lu: None,
         }
     }
@@ -299,6 +314,8 @@ impl ComplianceProfile {
             self.max_momentary_lufs,
             self.min_loudness_range_lu,
             self.max_loudness_range_lu,
+            self.min_peak_to_loudness_ratio_lu,
+            self.max_peak_to_loudness_ratio_lu,
             self.max_loudness_to_dialogue_ratio_lu,
         ];
         if values.into_iter().flatten().any(|value| !value.is_finite()) {
@@ -308,13 +325,19 @@ impl ComplianceProfile {
             self.loudness_tolerance_lu,
             self.lower_tolerance_lu,
             self.upper_tolerance_lu,
+            self.min_loudness_range_lu,
+            self.max_loudness_range_lu,
+            self.min_peak_to_loudness_ratio_lu,
+            self.max_peak_to_loudness_ratio_lu,
             self.max_loudness_to_dialogue_ratio_lu,
         ]
         .into_iter()
         .flatten()
         .any(|value| value < 0.0)
         {
-            return Err("loudness tolerances and LDR limits must be non-negative".into());
+            return Err(
+                "loudness tolerances, LRA, PLR, and LDR limits must be non-negative".into(),
+            );
         }
         if self.target_lufs.is_none()
             && self.max_true_peak_dbtp.is_none()
@@ -322,6 +345,8 @@ impl ComplianceProfile {
             && self.max_momentary_lufs.is_none()
             && self.min_loudness_range_lu.is_none()
             && self.max_loudness_range_lu.is_none()
+            && self.min_peak_to_loudness_ratio_lu.is_none()
+            && self.max_peak_to_loudness_ratio_lu.is_none()
             && self.max_loudness_to_dialogue_ratio_lu.is_none()
         {
             return Err("compliance profile must define at least one rule".into());
@@ -332,6 +357,20 @@ impl ComplianceProfile {
             .is_some_and(|(minimum, maximum)| minimum > maximum)
         {
             return Err("minimum loudness range exceeds maximum".into());
+        }
+        if self
+            .min_peak_to_loudness_ratio_lu
+            .zip(self.max_peak_to_loudness_ratio_lu)
+            .is_some_and(|(minimum, maximum)| minimum > maximum)
+        {
+            return Err("minimum peak-to-loudness ratio exceeds maximum".into());
+        }
+        if self.peak_to_loudness_ratio_max_exclusive && self.max_peak_to_loudness_ratio_lu.is_none()
+        {
+            return Err(
+                "peak_to_loudness_ratio_max_exclusive requires max_peak_to_loudness_ratio_lu"
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -402,6 +441,19 @@ impl ComplianceProfile {
                 self.max_loudness_range_lu.unwrap_or(f64::INFINITY),
             ));
         }
+        if self.min_peak_to_loudness_ratio_lu.is_some()
+            || self.max_peak_to_loudness_ratio_lu.is_some()
+        {
+            rules.push(ComplianceRuleResult::bounded(
+                "peak_to_loudness_ratio_lu",
+                analysis.peak_to_loudness_ratio_lu(),
+                self.min_peak_to_loudness_ratio_lu
+                    .unwrap_or(f64::NEG_INFINITY),
+                self.max_peak_to_loudness_ratio_lu.unwrap_or(f64::INFINITY),
+                true,
+                !self.peak_to_loudness_ratio_max_exclusive,
+            ));
+        }
         if let Some(maximum) = self.max_loudness_to_dialogue_ratio_lu {
             let dialogue = dialogue_lufs.ok_or_else(|| {
                 format!(
@@ -440,17 +492,42 @@ pub struct ComplianceRuleResult {
     pub measured: f64,
     pub minimum: Option<f64>,
     pub maximum: Option<f64>,
+    pub minimum_inclusive: Option<bool>,
+    pub maximum_inclusive: Option<bool>,
     pub passed: bool,
 }
 
 impl ComplianceRuleResult {
     fn range(metric: &'static str, measured: f64, minimum: f64, maximum: f64) -> Self {
+        Self::bounded(metric, measured, minimum, maximum, true, true)
+    }
+
+    fn bounded(
+        metric: &'static str,
+        measured: f64,
+        minimum: f64,
+        maximum: f64,
+        minimum_inclusive: bool,
+        maximum_inclusive: bool,
+    ) -> Self {
+        let minimum_passed = if minimum_inclusive {
+            measured >= minimum
+        } else {
+            measured > minimum
+        };
+        let maximum_passed = if maximum_inclusive {
+            measured <= maximum
+        } else {
+            measured < maximum
+        };
         Self {
             metric,
             measured,
             minimum: minimum.is_finite().then_some(minimum),
             maximum: maximum.is_finite().then_some(maximum),
-            passed: measured >= minimum && measured <= maximum,
+            minimum_inclusive: minimum.is_finite().then_some(minimum_inclusive),
+            maximum_inclusive: maximum.is_finite().then_some(maximum_inclusive),
+            passed: minimum_passed && maximum_passed,
         }
     }
 
@@ -566,6 +643,10 @@ pub struct AnalysisReport {
     pub compliance_min_loudness_range_lu: Option<f64>,
     pub compliance_max_loudness_range_lu: Option<f64>,
     pub compliance_loudness_range_pass: Option<bool>,
+    pub compliance_min_peak_to_loudness_ratio_lu: Option<f64>,
+    pub compliance_max_peak_to_loudness_ratio_lu: Option<f64>,
+    pub compliance_peak_to_loudness_ratio_max_exclusive: Option<bool>,
+    pub compliance_peak_to_loudness_ratio_pass: Option<bool>,
     pub compliance_max_loudness_to_dialogue_ratio_lu: Option<f64>,
     pub compliance_loudness_to_dialogue_ratio_pass: Option<bool>,
     /// Complete evaluated rule set, encoded as JSON so CSV remains flat.
@@ -775,6 +856,19 @@ impl AnalysisReport {
             compliance_min_loudness_range_lu: profile.and_then(|value| value.min_loudness_range_lu),
             compliance_max_loudness_range_lu: profile.and_then(|value| value.max_loudness_range_lu),
             compliance_loudness_range_pass: rule_pass(&compliance, "loudness_range_lu"),
+            compliance_min_peak_to_loudness_ratio_lu: profile
+                .and_then(|value| value.min_peak_to_loudness_ratio_lu),
+            compliance_max_peak_to_loudness_ratio_lu: profile
+                .and_then(|value| value.max_peak_to_loudness_ratio_lu),
+            compliance_peak_to_loudness_ratio_max_exclusive: profile.and_then(|value| {
+                value
+                    .max_peak_to_loudness_ratio_lu
+                    .map(|_| value.peak_to_loudness_ratio_max_exclusive)
+            }),
+            compliance_peak_to_loudness_ratio_pass: rule_pass(
+                &compliance,
+                "peak_to_loudness_ratio_lu",
+            ),
             compliance_max_loudness_to_dialogue_ratio_lu: profile
                 .and_then(|value| value.max_loudness_to_dialogue_ratio_lu),
             compliance_loudness_to_dialogue_ratio_pass: rule_pass(
@@ -1062,6 +1156,10 @@ mod tests {
             compliance_min_loudness_range_lu: None,
             compliance_max_loudness_range_lu: None,
             compliance_loudness_range_pass: None,
+            compliance_min_peak_to_loudness_ratio_lu: None,
+            compliance_max_peak_to_loudness_ratio_lu: None,
+            compliance_peak_to_loudness_ratio_max_exclusive: None,
+            compliance_peak_to_loudness_ratio_pass: None,
             compliance_max_loudness_to_dialogue_ratio_lu: None,
             compliance_loudness_to_dialogue_ratio_pass: None,
             compliance_rules_json: None,
@@ -1157,10 +1255,102 @@ mod tests {
         assert_eq!(adapted.target_lufs, Some(-18.0));
         let music = ComplianceProfile::builtin("ebu-r128-s2-music-low-plr").unwrap();
         assert_eq!(music.target_lufs, Some(-16.0));
+        assert_eq!(music.max_peak_to_loudness_ratio_lu, Some(15.0));
+        assert!(music.peak_to_loudness_ratio_max_exclusive);
 
         let radio = ComplianceProfile::builtin("ebu-r128-s3-radio").unwrap();
         assert_eq!(radio.target_lufs, Some(-23.0));
         assert_eq!(radio.standard_version.as_deref(), Some("2023"));
+    }
+
+    #[test]
+    fn low_plr_music_profile_enforces_the_exclusive_ebu_boundary() {
+        let profile = ComplianceProfile::builtin("ebu-r128-s2-music-low-plr").unwrap();
+        let mut analysis = crate::normalize::Analysis {
+            sample_rate: 48_000,
+            channels: 2,
+            channel_roles: crate::wav::default_channel_roles(2),
+            frames: 48_000 * 60,
+            kind: crate::wav::PcmKind::S24,
+            lufs: -16.0,
+            max_momentary_lufs: -14.0,
+            max_short_term_lufs: -15.0,
+            loudness_range_lu: 4.0,
+            rms_db: -18.0,
+            sample_peak: 0.8,
+            true_peak: 10.0_f32.powf(-1.1 / 20.0),
+            loudness_blocks: Vec::new(),
+        };
+        let result = profile.evaluate(&analysis).unwrap();
+        let plr = result
+            .rules
+            .iter()
+            .find(|rule| rule.metric == "peak_to_loudness_ratio_lu")
+            .unwrap();
+        assert!(plr.passed);
+        assert_eq!(plr.maximum, Some(15.0));
+        assert_eq!(plr.maximum_inclusive, Some(false));
+
+        analysis.true_peak = 10.0_f32.powf(-0.9 / 20.0);
+        assert!(!profile.evaluate(&analysis).unwrap().passed);
+
+        let boundary = ComplianceRuleResult::bounded(
+            "peak_to_loudness_ratio_lu",
+            15.0,
+            0.0,
+            15.0,
+            true,
+            false,
+        );
+        assert!(
+            !boundary.passed,
+            "EBU R 128 s2 requires PLR lower than 15 dB"
+        );
+    }
+
+    #[test]
+    fn custom_profile_checks_inclusive_lra_and_plr_ranges() {
+        let profile = ComplianceProfile {
+            name: "content-class".into(),
+            standard: None,
+            standard_version: None,
+            loudness_basis: LoudnessBasis::Programme,
+            target_lufs: None,
+            loudness_tolerance_lu: None,
+            lower_tolerance_lu: None,
+            upper_tolerance_lu: None,
+            max_true_peak_dbtp: None,
+            max_short_term_lufs: None,
+            max_momentary_lufs: None,
+            min_loudness_range_lu: Some(3.0),
+            max_loudness_range_lu: Some(18.0),
+            min_peak_to_loudness_ratio_lu: Some(8.0),
+            max_peak_to_loudness_ratio_lu: Some(20.0),
+            peak_to_loudness_ratio_max_exclusive: false,
+            max_loudness_to_dialogue_ratio_lu: None,
+        };
+        profile.validate().unwrap();
+        let analysis = crate::normalize::Analysis {
+            sample_rate: 48_000,
+            channels: 2,
+            channel_roles: crate::wav::default_channel_roles(2),
+            frames: 48_000 * 60,
+            kind: crate::wav::PcmKind::S24,
+            lufs: -20.0,
+            max_momentary_lufs: -15.0,
+            max_short_term_lufs: -17.0,
+            loudness_range_lu: 3.0,
+            rms_db: -22.0,
+            sample_peak: 0.8,
+            true_peak: 1.0,
+            loudness_blocks: Vec::new(),
+        };
+        let result = profile.evaluate(&analysis).unwrap();
+        assert!(result.passed);
+        assert_eq!(result.rules.len(), 2);
+        assert!(result.rules.iter().all(
+            |rule| rule.minimum_inclusive == Some(true) && rule.maximum_inclusive == Some(true)
+        ));
     }
 
     #[test]
@@ -1209,6 +1399,9 @@ mod tests {
             max_momentary_lufs: Some(-18.0),
             min_loudness_range_lu: None,
             max_loudness_range_lu: None,
+            min_peak_to_loudness_ratio_lu: None,
+            max_peak_to_loudness_ratio_lu: None,
+            peak_to_loudness_ratio_max_exclusive: false,
             max_loudness_to_dialogue_ratio_lu: None,
         };
         let reports =
@@ -1451,7 +1644,7 @@ mod tests {
 
     #[test]
     fn custom_profile_validation_rejects_conflicting_tolerances() {
-        let profile = ComplianceProfile {
+        let mut profile = ComplianceProfile {
             name: "custom".into(),
             standard: None,
             standard_version: None,
@@ -1465,8 +1658,21 @@ mod tests {
             max_momentary_lufs: None,
             min_loudness_range_lu: None,
             max_loudness_range_lu: None,
+            min_peak_to_loudness_ratio_lu: None,
+            max_peak_to_loudness_ratio_lu: None,
+            peak_to_loudness_ratio_max_exclusive: false,
             max_loudness_to_dialogue_ratio_lu: None,
         };
+        assert!(profile.validate().is_err());
+        profile.target_lufs = None;
+        profile.loudness_tolerance_lu = None;
+        profile.upper_tolerance_lu = None;
+        profile.peak_to_loudness_ratio_max_exclusive = true;
+        assert!(profile.validate().is_err());
+        profile.max_peak_to_loudness_ratio_lu = Some(10.0);
+        profile.min_peak_to_loudness_ratio_lu = Some(11.0);
+        assert!(profile.validate().is_err());
+        profile.min_peak_to_loudness_ratio_lu = Some(-1.0);
         assert!(profile.validate().is_err());
     }
 
@@ -1485,16 +1691,17 @@ mod tests {
                 "max_short_term_lufs": null,
                 "max_momentary_lufs": null,
                 "min_loudness_range_lu": null,
-                "max_loudness_range_lu": null
+                "max_loudness_range_lu": null,
+                "min_peak_to_loudness_ratio_lu": 8.0,
+                "max_peak_to_loudness_ratio_lu": 15.0,
+                "peak_to_loudness_ratio_max_exclusive": true
             }"#,
         )
         .unwrap();
-        assert_eq!(
-            ComplianceProfile::load(json_path.path().to_str().unwrap())
-                .unwrap()
-                .name,
-            "station-json"
-        );
+        let loaded = ComplianceProfile::load(json_path.path().to_str().unwrap()).unwrap();
+        assert_eq!(loaded.name, "station-json");
+        assert_eq!(loaded.min_peak_to_loudness_ratio_lu, Some(8.0));
+        assert!(loaded.peak_to_loudness_ratio_max_exclusive);
 
         let toml_path = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
         std::fs::write(

@@ -110,6 +110,9 @@ Forge already provides:
   `R128_TRACK_GAIN`/`R128_ALBUM_GAIN` rewriting for existing Ogg Opus files,
   ReplayGain 2.0 for other supported tag containers, exact post-write readback,
   and chained-Opus coverage without requiring the optional encoder.
+- Content-class compliance profiles with inclusive LRA and PLR ranges,
+  machine-readable boundary semantics, and a strict EBU R 128 s2 v3.0
+  mostly-music `PLR < 15 dB` gate for the −16 LUFS alternative.
 - Bounded iXML XML/root/track-list validation, one-based source/interleave
   index checks, PCM channel reconciliation, and ADM `chna` track-map
   cross-checks.
@@ -179,7 +182,6 @@ generations.
 
 - Loudness-to-dialogue ratio, speech-gated loudness confidence, and manual
   review ranges.
-- Loudness-range and peak-to-loudness targets per content class.
 - Multi-delivery optimization: derive one conservative master gain/ceiling for
   several codec/profile outputs and verify each result.
 - Segment-aware normalization with boundary smoothing and a two-pass manifest

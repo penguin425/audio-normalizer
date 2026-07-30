@@ -889,6 +889,74 @@ fn explicit_dialogue_ranges_drive_long_form_compliance() {
 }
 
 #[test]
+fn custom_content_profile_reports_lra_and_plr_boundaries() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("programme.wav");
+    let profile = directory.path().join("content-profile.toml");
+    std::fs::write(&input, wav_fixture_bytes()).unwrap();
+    std::fs::write(
+        &profile,
+        r#"
+name = "content-profile"
+min_loudness_range_lu = 0.0
+max_loudness_range_lu = 100.0
+min_peak_to_loudness_ratio_lu = 0.0
+max_peak_to_loudness_ratio_lu = 100.0
+peak_to_loudness_ratio_max_exclusive = true
+"#,
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            input.to_str().unwrap(),
+            "--analyze",
+            "--json",
+            "--compliance",
+            profile.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report[0]["compliance_min_peak_to_loudness_ratio_lu"], 0.0);
+    assert_eq!(report[0]["compliance_max_peak_to_loudness_ratio_lu"], 100.0);
+    assert_eq!(
+        report[0]["compliance_peak_to_loudness_ratio_max_exclusive"],
+        true
+    );
+    assert_eq!(report[0]["compliance_peak_to_loudness_ratio_pass"], true);
+    let rules: serde_json::Value =
+        serde_json::from_str(report[0]["compliance_rules_json"].as_str().unwrap()).unwrap();
+    let plr = rules
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|rule| rule["metric"] == "peak_to_loudness_ratio_lu")
+        .unwrap();
+    assert_eq!(plr["minimum_inclusive"], true);
+    assert_eq!(plr["maximum_inclusive"], false);
+
+    let text = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            input.to_str().unwrap(),
+            "--analyze",
+            "--compliance",
+            profile.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(text.status.success());
+    let stderr = String::from_utf8_lossy(&text.stderr);
+    assert!(stderr.contains("peak_to_loudness_ratio_lu:"));
+    assert!(stderr.contains("[0.00, 100.00)"));
+}
+
+#[test]
 fn toml_job_config_is_relative_and_cli_options_override_it() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("programme.wav");
