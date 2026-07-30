@@ -1778,6 +1778,23 @@ tests/
   integration.rs    in-memory round-trip tests (WAV LUFS/peak/album/silence + MP3)
 ```
 
+## Rust library API stability
+
+The `forge_normalizer` crate can be embedded directly. Starting with v0.94.0,
+Forge treats all documented public Rust items as source-compatible across
+releases, even while the package version remains below 1.0. Optional-feature
+APIs are covered when their feature is enabled, and removing or renaming a
+feature is also a compatibility break.
+
+Every pull request compares the all-feature public API with the latest
+reachable release tag using `cargo-semver-checks`. A separate downstream-style
+integration test compiles and exercises the core analysis, WAV I/O, preset,
+and real-time APIs. This gate catches many structural API regressions, but it
+does not prove behavioural equivalence or every possible Rust type change;
+review remains required. The exact guarantees, exclusions, MSRV policy, and
+intentional-breaking-change process are recorded in
+[API-STABILITY.md](API-STABILITY.md).
+
 ## Real-time DSP API
 
 Release archives include `forge-live`, a streaming CLI for shells, OBS/FFmpeg

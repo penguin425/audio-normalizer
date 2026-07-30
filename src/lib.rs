@@ -3,6 +3,13 @@
 //! This library crate exposes the WAV I/O, DSP, and normalization engine so it
 //! can be embedded in other tools or exercised by integration tests. The
 //! `forge` binary in `src/main.rs` is a thin CLI wrapper over this engine.
+//!
+//! # API stability
+//!
+//! Starting with v0.94.0, every documented public item is covered by Forge's
+//! source-compatibility policy, including items enabled by optional Cargo
+//! features. See `API-STABILITY.md` in the repository for the complete
+//! contract and its deliberately narrow exceptions.
 
 // clippy misreads `*emphasis*` inside doc comments as markdown list bullets and
 // then flags the surrounding lines as lazy continuations. It's a false positive

@@ -44,6 +44,49 @@ jobs:
       - name: Run tests with MP3 encoding
         run: cargo test --features mp3-encoding
 
+  rust-api:
+    name: Rust API compatibility
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Select the latest released API baseline
+        id: baseline
+        shell: bash
+        run: |
+          baseline=
+          while IFS= read -r tag; do
+            if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              baseline=$tag
+              break
+            fi
+          done < <(git tag --merged HEAD --sort=-version:refname)
+          if [[ -z "$baseline" ]]; then
+            echo "No released vMAJOR.MINOR.PATCH tag is reachable from HEAD" >&2
+            exit 1
+          fi
+          git rev-parse --verify "${baseline}^{commit}"
+          echo "tag=$baseline" >> "$GITHUB_OUTPUT"
+
+      - name: Install optional native API dependencies
+        run: sudo apt-get update && sudo apt-get install -y libmp3lame-dev
+
+      - name: Build all-feature API documentation without warnings
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --all-features --no-deps
+
+      - name: Reject public Rust API breakage
+        uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9.0
+        with:
+          package: forge-normalizer
+          baseline-rev: ${{ steps.baseline.outputs.tag }}
+          feature-group: all-features
+          release-type: patch
+
   plugin-parity:
     name: Plugin parity (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
