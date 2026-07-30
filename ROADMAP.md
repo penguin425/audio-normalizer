@@ -100,6 +100,10 @@ Forge already provides:
   caller-owned result layout, UTF-8 error contract, decoded-sample limit,
   packaged header/shared libraries, and real C consumer tests on Linux,
   macOS, and Windows.
+- Dependency-free Python 3.10+ bindings over C ABI v1, with immutable typed
+  results, explicit decoded-sample bounds, deterministic native-library
+  selection, concurrent-call coverage, and self-contained platform wheels for
+  Linux x86-64, macOS ARM64/x86-64, and Windows x86-64.
 - EBU QC Items for channel count, clipping, duration, dropouts, loudness,
   phase reversal, test tones, clicks, minimum average level, silence, true
   peak, hum/buzz, band-limited noise, cross-talk, panning, LFE/centre
@@ -254,7 +258,6 @@ failure behaviour are documented.
 
 ## Product and developer experience
 
-- Python bindings over the versioned C ABI.
 - WASM analysis build for local browser use; encoding and filesystem features
   remain capability-gated.
 - Resumable batch jobs, content-addressed analysis cache, watch folders, and

@@ -8,8 +8,11 @@ on:
     paths:
       - ".github/workflows/release.yml"
       - "include/forge_normalizer.h"
+      - "python/**"
       - "src/c_api.rs"
       - "src/lib.rs"
+      - "PYTHON-API.md"
+      - "tools/build-python-wheel.py"
       - "tools/package-linux-release.sh"
       - "tools/generate-package-metadata.sh"
       - "Cargo.toml"
@@ -39,6 +42,14 @@ jobs:
         run: |
           set -euo pipefail
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          python_version="$(
+            python3 -c \
+              "import runpy; print(runpy.run_path('python/src/forge_normalizer/_version.py')['__version__'])"
+          )"
+          if [[ "$python_version" != "$version" ]]; then
+            echo "::error::Python package version ${python_version} does not match Cargo.toml version ${version}"
+            exit 1
+          fi
           if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" != "v${version}" ]]; then
             echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}"
             exit 1
@@ -58,24 +69,28 @@ jobs:
             asset: linux-x86_64
             archive: tar
             library: libforge_normalizer.so
+            wheel-platform: manylinux_2_34_x86_64
             rustflags: ""
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
             asset: windows-x86_64
             archive: zip
             library: forge_normalizer.dll
+            wheel-platform: win_amd64
             rustflags: ""
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             asset: macos-x86_64
             archive: tar
             library: libforge_normalizer.dylib
+            wheel-platform: macosx_10_12_x86_64
             rustflags: ""
           - runner: macos-latest
             target: aarch64-apple-darwin
             asset: macos-aarch64
             archive: tar
             library: libforge_normalizer.dylib
+            wheel-platform: macosx_11_0_arm64
             rustflags: -Ctarget-feature=+neon,+aes,+sha2
     runs-on: ${{ matrix.runner }}
     steps:
@@ -86,11 +101,45 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install Python 3.14
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Install pinned Python wheel build tools
+        run: python -m pip install --disable-pip-version-check build==1.5.0 setuptools==83.0.0 wheel==0.47.0
+
       - name: Build release binary
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace ${{ matrix.rustflags }}
         run: cargo build --locked --release --target ${{ matrix.target }} --features opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin
+
+      - name: Build the self-contained Python platform wheel
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
+        run: >-
+          python tools/build-python-wheel.py
+          --library target/${{ matrix.target }}/release/${{ matrix.library }}
+          --library-name ${{ matrix.library }}
+          --platform ${{ matrix.wheel-platform }}
+          --outdir python-dist
+          --version ${{ needs.validate.outputs.version }}
+
+      - name: Check Linux wheel policy
+        if: matrix.asset == 'linux-x86_64'
+        run: |
+          python -m pip install --disable-pip-version-check auditwheel==6.7.0
+          python -m auditwheel show python-dist/*.whl
+
+      - name: Install and smoke-test the platform wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset FORGE_NORMALIZER_LIBRARY
+          python -m pip install python-dist/*.whl
+          python -m pip check
+          python python/tests/wheel_smoke.py
 
       - name: Package reproducible Linux binary
         if: matrix.asset == 'linux-x86_64'
@@ -150,7 +199,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
           name: forge-${{ matrix.asset }}
-          path: forge-v${{ needs.validate.outputs.version }}-${{ matrix.asset }}.*
+          path: |
+            forge-v${{ needs.validate.outputs.version }}-${{ matrix.asset }}.*
+            python-dist/*.whl
           if-no-files-found: error
           retention-days: 7
 
@@ -166,6 +217,14 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu
 
+      - name: Install Python 3.14
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Install pinned Python wheel build tools
+        run: python -m pip install --disable-pip-version-check build==1.5.0 setuptools==83.0.0 wheel==0.47.0
+
       - name: Download published build candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
         with:
@@ -176,18 +235,30 @@ jobs:
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace
+          SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
         shell: bash
         run: |
           set -euo pipefail
           cargo build --locked --release --target x86_64-unknown-linux-gnu --features opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin
           mkdir reproduced
           tools/package-linux-release.sh "${{ needs.validate.outputs.version }}" x86_64-unknown-linux-gnu "${{ needs.validate.outputs.source-date-epoch }}" reproduced
+          python tools/build-python-wheel.py \
+            --library target/x86_64-unknown-linux-gnu/release/libforge_normalizer.so \
+            --library-name libforge_normalizer.so \
+            --platform manylinux_2_34_x86_64 \
+            --outdir reproduced \
+            --version "${{ needs.validate.outputs.version }}"
           cmp \
             "actual/forge-v${{ needs.validate.outputs.version }}-linux-x86_64.tar.gz" \
             "reproduced/forge-v${{ needs.validate.outputs.version }}-linux-x86_64.tar.gz"
+          cmp \
+            "actual/forge_normalizer-${{ needs.validate.outputs.version }}-py3-none-manylinux_2_34_x86_64.whl" \
+            "reproduced/forge_normalizer-${{ needs.validate.outputs.version }}-py3-none-manylinux_2_34_x86_64.whl"
           sha256sum \
             "actual/forge-v${{ needs.validate.outputs.version }}-linux-x86_64.tar.gz" \
-            "reproduced/forge-v${{ needs.validate.outputs.version }}-linux-x86_64.tar.gz"
+            "reproduced/forge-v${{ needs.validate.outputs.version }}-linux-x86_64.tar.gz" \
+            "actual/forge_normalizer-${{ needs.validate.outputs.version }}-py3-none-manylinux_2_34_x86_64.whl" \
+            "reproduced/forge_normalizer-${{ needs.validate.outputs.version }}-py3-none-manylinux_2_34_x86_64.whl"
 
   publish:
     name: Publish GitHub Release

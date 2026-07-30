@@ -88,7 +88,7 @@ jobs:
           release-type: patch
 
   c-api:
-    name: C ABI (${{ matrix.os }})
+    name: C/Python ABI (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -97,12 +97,18 @@ jobs:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             rustflags: ""
+            python: "3.14"
+            library: libforge_normalizer.so
           - os: macos-latest
             target: aarch64-apple-darwin
             rustflags: -Ctarget-feature=+neon,+aes,+sha2
+            python: "3.10"
+            library: libforge_normalizer.dylib
           - os: windows-2025
             target: x86_64-pc-windows-msvc
             rustflags: ""
+            python: "3.10"
+            library: forge_normalizer.dll
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
@@ -111,6 +117,11 @@ jobs:
         uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install Python ${{ matrix.python }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python }}
 
       - name: Initialize the MSVC developer environment
         if: runner.os == 'Windows'
@@ -134,6 +145,15 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: tools/test-c-api.ps1 -Target "${{ matrix.target }}"
+
+      - name: Test the Python source binding against the built library
+        env:
+          FORGE_NORMALIZER_LIBRARY: ${{ github.workspace }}/target/${{ matrix.target }}/debug/${{ matrix.library }}
+          PYTHONPATH: ${{ github.workspace }}/python/src
+        run: |
+          python -m compileall -q python/src python/tests tools/build-python-wheel.py
+          python -c "from pathlib import Path; assert Path('LICENSE').read_bytes() == Path('python/LICENSE').read_bytes()"
+          python -m unittest discover -s python/tests -p "test_*.py" -v
 
   plugin-parity:
     name: Plugin parity (${{ matrix.os }})

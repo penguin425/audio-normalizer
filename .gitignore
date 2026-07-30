@@ -14,3 +14,10 @@
 .env
 .env.*
 *.log
+
+# Python build and bytecode output
+__pycache__/
+*.py[cod]
+python/build/
+python/dist/
+python/*.egg-info/
