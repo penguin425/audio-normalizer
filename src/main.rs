@@ -1,7 +1,11 @@
 //! Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer.
 
-use clap::{Arg, CommandFactory};
+use clap::{Arg, ArgAction, CommandFactory};
 use forge_normalizer::adm::{self, ReferenceRendererOptions};
+use forge_normalizer::analysis::Analysis;
+use forge_normalizer::analysis_cache::{
+    AnalysisCache, AnalysisCachePolicy, CacheDisposition, Cached,
+};
 use forge_normalizer::batch::{BatchAssetSpec, BatchJob, BatchProgressEvent};
 use forge_normalizer::cli;
 use forge_normalizer::codec_qc;
@@ -30,6 +34,33 @@ use tempfile::{Builder, NamedTempFile, TempDir};
 struct BatchOptions {
     job_state: Option<PathBuf>,
     progress: Option<PathBuf>,
+}
+
+#[derive(Debug, Default)]
+struct CacheOptions {
+    directory: Option<PathBuf>,
+    read_only: bool,
+    max_mib: Option<u64>,
+}
+
+impl CacheOptions {
+    fn open(&self) -> Result<Option<AnalysisCache>, String> {
+        let Some(directory) = &self.directory else {
+            return Ok(None);
+        };
+        let max_mib = self.max_mib.unwrap_or(1024);
+        let max_bytes = max_mib
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| "--analysis-cache-max-mib is too large".to_string())?;
+        AnalysisCache::new(
+            directory,
+            AnalysisCachePolicy {
+                read_only: self.read_only,
+                max_bytes,
+            },
+        )
+        .map(Some)
+    }
 }
 
 fn main() -> ExitCode {
@@ -65,10 +96,37 @@ fn main() -> ExitCode {
                     "write_tags",
                 ]),
         )
+        .arg(
+            Arg::new("analysis_cache")
+                .long("analysis-cache")
+                .value_name("DIR")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help("Reuse content-addressed, versioned loudness analyses from DIR"),
+        )
+        .arg(
+            Arg::new("analysis_cache_read_only")
+                .long("analysis-cache-read-only")
+                .action(ArgAction::SetTrue)
+                .requires("analysis_cache")
+                .help("Read cache hits but never create, repair, or evict entries"),
+        )
+        .arg(
+            Arg::new("analysis_cache_max_mib")
+                .long("analysis-cache-max-mib")
+                .value_name("MIB")
+                .value_parser(clap::value_parser!(u64).range(1..))
+                .requires("analysis_cache")
+                .help("Bound recognized cache entries (default: 1024 MiB)"),
+        )
         .get_matches();
     let batch_options = BatchOptions {
         job_state: matches.get_one::<PathBuf>("job_state").cloned(),
         progress: matches.get_one::<PathBuf>("progress").cloned(),
+    };
+    let cache_options = CacheOptions {
+        directory: matches.get_one::<PathBuf>("analysis_cache").cloned(),
+        read_only: matches.get_flag("analysis_cache_read_only"),
+        max_mib: matches.get_one::<u64>("analysis_cache_max_mib").copied(),
     };
     let cli = match cli::Cli::from_matches_with_config(&matches) {
         Ok(cli) => cli,
@@ -77,7 +135,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if let Err(e) = run(cli, batch_options) {
+    if let Err(e) = run(cli, batch_options, cache_options) {
         eprintln!("forge: error: {e}");
         return ExitCode::from(1);
     }
@@ -113,9 +171,18 @@ fn parse_wav_container(value: &str) -> WavContainer {
     }
 }
 
-fn run(mut cli: cli::Cli, batch_options: BatchOptions) -> Result<(), String> {
+fn run(
+    mut cli: cli::Cli,
+    batch_options: BatchOptions,
+    cache_options: CacheOptions,
+) -> Result<(), String> {
     let pipeline = PipelineFiles::prepare(&mut cli, &batch_options)?;
-    run_paths(cli, pipeline.stdin_requested(), &batch_options)?;
+    run_paths(
+        cli,
+        pipeline.stdin_requested(),
+        &batch_options,
+        &cache_options,
+    )?;
     pipeline.emit_stdout()
 }
 
@@ -123,6 +190,7 @@ fn run_paths(
     mut cli: cli::Cli,
     stdin_requested: bool,
     batch_options: &BatchOptions,
+    cache_options: &CacheOptions,
 ) -> Result<(), String> {
     if let Some(j) = cli.jobs {
         ThreadPoolBuilder::new()
@@ -167,6 +235,7 @@ fn run_paths(
         output_sample_rate: cli.sample_rate_hz,
         resample_quality: ResampleQuality::parse(&cli.resample_quality),
     };
+    let analysis_cache = cache_options.open()?;
     if let Some(preset) = preset {
         eprintln!(
             "preset {}: {:.1} LUFS, {:.1} dBTP ({})",
@@ -208,7 +277,11 @@ fn run_paths(
     }
 
     if cli.write_tags {
-        return write_loudness_tags(&cli, channel_roles_override.as_deref());
+        return write_loudness_tags(
+            &cli,
+            channel_roles_override.as_deref(),
+            analysis_cache.as_ref(),
+        );
     }
 
     let (outputs, formats) = resolve_outputs_and_formats(&cli, &relative_paths)?;
@@ -441,7 +514,8 @@ fn run_paths(
         let mut adm_profile_audit_output = None;
         let mut qc_failed = false;
         for input in &cli.inputs {
-            let timed = normalize::analyze_file_range_with_roles(
+            let timed = analyze_range_cached(
+                analysis_cache.as_ref(),
                 input,
                 channel_roles_override.as_deref(),
                 start_seconds,
@@ -954,14 +1028,37 @@ fn run_paths(
     let mut difference_assets = Vec::new();
 
     if cli.album {
+        let cached_analyses = analysis_cache
+            .as_ref()
+            .map(|cache| {
+                cli.inputs
+                    .iter()
+                    .map(|path| {
+                        analyze_for_plan_cached(
+                            Some(cache),
+                            path,
+                            channel_roles_override.as_deref(),
+                            &plan,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
         if cli.dry_run {
-            let analyses: Vec<_> = cli
-                .inputs
-                .iter()
-                .map(|path| {
-                    normalize::analyze_file_for_plan(path, channel_roles_override.as_deref(), &plan)
-                })
-                .collect::<Result<_, _>>()?;
+            let analyses = if let Some(analyses) = cached_analyses {
+                analyses
+            } else {
+                cli.inputs
+                    .iter()
+                    .map(|path| {
+                        normalize::analyze_file_for_plan(
+                            path,
+                            channel_roles_override.as_deref(),
+                            &plan,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            };
             let gain = normalize::album_gain(&analyses, &plan);
             for ((input, output), analysis) in
                 cli.inputs.iter().zip(outputs.iter()).zip(analyses.iter())
@@ -973,15 +1070,28 @@ fn run_paths(
         }
         prepare_output_directories(&outputs)?;
         if cli.verify {
-            let corrected = normalize::normalize_album_corrected_with_roles(
-                &cli.inputs,
-                &outputs,
-                &plan,
-                &formats,
-                cli.verify_tolerance,
-                cli.verify_retries as usize,
-                channel_roles_override.as_deref(),
-            )?;
+            let corrected = if let Some(analyses) = cached_analyses.as_deref() {
+                normalize::normalize_album_preanalyzed_corrected_with_roles(
+                    &cli.inputs,
+                    &outputs,
+                    &plan,
+                    &formats,
+                    cli.verify_tolerance,
+                    cli.verify_retries as usize,
+                    channel_roles_override.as_deref(),
+                    analyses,
+                )?
+            } else {
+                normalize::normalize_album_corrected_with_roles(
+                    &cli.inputs,
+                    &outputs,
+                    &plan,
+                    &formats,
+                    cli.verify_tolerance,
+                    cli.verify_retries as usize,
+                    channel_roles_override.as_deref(),
+                )?
+            };
             for (input, source) in cli.inputs.iter().zip(&corrected.sources) {
                 print_analysis(input, source, Some(corrected.gain));
             }
@@ -1044,24 +1154,46 @@ fn run_paths(
             return Ok(());
         }
         let results = if cli.difference_report.is_some() {
-            normalize::normalize_album_audited_with_roles(
-                &cli.inputs,
-                &outputs,
-                &plan,
-                &formats,
-                channel_roles_override.as_deref(),
-            )?
+            if let Some(analyses) = cached_analyses.as_deref() {
+                normalize::normalize_album_preanalyzed_audited_with_roles(
+                    &cli.inputs,
+                    &outputs,
+                    &plan,
+                    &formats,
+                    channel_roles_override.as_deref(),
+                    analyses,
+                )?
+            } else {
+                normalize::normalize_album_audited_with_roles(
+                    &cli.inputs,
+                    &outputs,
+                    &plan,
+                    &formats,
+                    channel_roles_override.as_deref(),
+                )?
+            }
             .into_iter()
             .map(|(analysis, gain, render)| (analysis, gain, Some(render)))
             .collect::<Vec<_>>()
         } else {
-            normalize::normalize_album_with_roles(
-                &cli.inputs,
-                &outputs,
-                &plan,
-                &formats,
-                channel_roles_override.as_deref(),
-            )?
+            if let Some(analyses) = cached_analyses.as_deref() {
+                normalize::normalize_album_preanalyzed_with_roles(
+                    &cli.inputs,
+                    &outputs,
+                    &plan,
+                    &formats,
+                    channel_roles_override.as_deref(),
+                    analyses,
+                )?
+            } else {
+                normalize::normalize_album_with_roles(
+                    &cli.inputs,
+                    &outputs,
+                    &plan,
+                    &formats,
+                    channel_roles_override.as_deref(),
+                )?
+            }
             .into_iter()
             .map(|(analysis, gain)| (analysis, gain, None))
             .collect()
@@ -1189,12 +1321,27 @@ fn run_paths(
             )?;
         }
         let result = (|| -> Result<(), String> {
+            let cached_analysis = analysis_cache
+                .as_ref()
+                .map(|cache| {
+                    analyze_for_plan_cached(
+                        Some(cache),
+                        input,
+                        channel_roles_override.as_deref(),
+                        &plan,
+                    )
+                })
+                .transpose()?;
             if cli.gain_only || cli.dry_run {
-                let an = normalize::analyze_file_for_plan(
-                    input,
-                    channel_roles_override.as_deref(),
-                    &plan,
-                )?;
+                let an = if let Some(analysis) = cached_analysis {
+                    analysis
+                } else {
+                    normalize::analyze_file_for_plan(
+                        input,
+                        channel_roles_override.as_deref(),
+                        &plan,
+                    )?
+                };
                 let gain = normalize::compute_gain(&an, &plan);
                 print_analysis(input, &an, Some(gain));
                 if cli.dry_run {
@@ -1203,15 +1350,28 @@ fn run_paths(
             } else {
                 prepare_output_directories(std::slice::from_ref(output))?;
                 if cli.verify {
-                    let corrected = normalize::normalize_one_corrected_with_roles(
-                        input,
-                        output,
-                        &plan,
-                        *fmt,
-                        cli.verify_tolerance,
-                        cli.verify_retries as usize,
-                        channel_roles_override.as_deref(),
-                    )?;
+                    let corrected = if let Some(analysis) = cached_analysis.as_ref() {
+                        normalize::normalize_one_preanalyzed_corrected_with_roles(
+                            input,
+                            output,
+                            &plan,
+                            *fmt,
+                            cli.verify_tolerance,
+                            cli.verify_retries as usize,
+                            channel_roles_override.as_deref(),
+                            analysis,
+                        )?
+                    } else {
+                        normalize::normalize_one_corrected_with_roles(
+                            input,
+                            output,
+                            &plan,
+                            *fmt,
+                            cli.verify_tolerance,
+                            cli.verify_retries as usize,
+                            channel_roles_override.as_deref(),
+                        )?
+                    };
                     print_analysis(input, &corrected.source, Some(corrected.gain));
                     if !print_verification(input, &corrected.verification, &plan) {
                         return Err(format!(
@@ -1242,13 +1402,24 @@ fn run_paths(
                     }
                 } else {
                     if cli.difference_report.is_some() {
-                        let (an, gain, render) = normalize::normalize_one_audited_with_roles(
-                            input,
-                            output,
-                            &plan,
-                            *fmt,
-                            channel_roles_override.as_deref(),
-                        )?;
+                        let (an, gain, render) = if let Some(analysis) = cached_analysis.as_ref() {
+                            normalize::normalize_one_preanalyzed_audited_with_roles(
+                                input,
+                                output,
+                                &plan,
+                                *fmt,
+                                channel_roles_override.as_deref(),
+                                analysis,
+                            )?
+                        } else {
+                            normalize::normalize_one_audited_with_roles(
+                                input,
+                                output,
+                                &plan,
+                                *fmt,
+                                channel_roles_override.as_deref(),
+                            )?
+                        };
                         print_analysis(input, &an, Some(gain));
                         let output_analysis = normalize::analyze_file_with_roles(
                             output,
@@ -1267,13 +1438,24 @@ fn run_paths(
                             },
                         )?);
                     } else {
-                        let (an, gain) = normalize::normalize_one_with_roles(
-                            input,
-                            output,
-                            &plan,
-                            *fmt,
-                            channel_roles_override.as_deref(),
-                        )?;
+                        let (an, gain) = if let Some(analysis) = cached_analysis.as_ref() {
+                            normalize::normalize_one_preanalyzed_with_roles(
+                                input,
+                                output,
+                                &plan,
+                                *fmt,
+                                channel_roles_override.as_deref(),
+                                analysis,
+                            )?
+                        } else {
+                            normalize::normalize_one_with_roles(
+                                input,
+                                output,
+                                &plan,
+                                *fmt,
+                                channel_roles_override.as_deref(),
+                            )?
+                        };
                         print_analysis(input, &an, Some(gain));
                     }
                 }
@@ -1694,14 +1876,86 @@ fn print_verification(input: &Path, verification: &normalize::Verification, plan
     verification.passed()
 }
 
+fn analyze_range_cached(
+    cache: Option<&AnalysisCache>,
+    input: &Path,
+    channel_roles: Option<&[ChannelRole]>,
+    start_seconds: f64,
+    duration_seconds: Option<f64>,
+    timeline_interval_ms: Option<f64>,
+) -> Result<normalize::TimedAnalysis, String> {
+    if let Some(cache) = cache {
+        return cache
+            .analyze_range(
+                input,
+                channel_roles,
+                start_seconds,
+                duration_seconds,
+                timeline_interval_ms,
+            )
+            .map(|cached| observe_cache(input, cached));
+    }
+    normalize::analyze_file_range_with_roles(
+        input,
+        channel_roles,
+        start_seconds,
+        duration_seconds,
+        timeline_interval_ms,
+    )
+}
+
+fn analyze_for_plan_cached(
+    cache: Option<&AnalysisCache>,
+    input: &Path,
+    channel_roles: Option<&[ChannelRole]>,
+    plan: &Plan,
+) -> Result<Analysis, String> {
+    if let Some(cache) = cache {
+        return cache
+            .analyze_for_plan(input, channel_roles, plan)
+            .map(|cached| observe_cache(input, cached));
+    }
+    normalize::analyze_file_for_plan(input, channel_roles, plan)
+}
+
+fn analyze_file_cached(
+    cache: Option<&AnalysisCache>,
+    input: &Path,
+    channel_roles: Option<&[ChannelRole]>,
+) -> Result<Analysis, String> {
+    if let Some(cache) = cache {
+        return cache
+            .analyze_file(input, channel_roles)
+            .map(|cached| observe_cache(input, cached));
+    }
+    normalize::analyze_file_with_roles(input, channel_roles)
+}
+
+fn observe_cache<T>(input: &Path, cached: Cached<T>) -> T {
+    let action = match cached.disposition {
+        CacheDisposition::Hit => "hit",
+        CacheDisposition::Stored => "miss; stored",
+        CacheDisposition::Repaired => "invalid; repaired",
+        CacheDisposition::ReadOnlyMiss => "miss; read-only",
+        CacheDisposition::ReadOnlyInvalid => "invalid; read-only",
+        CacheDisposition::TooLarge => "miss; entry too large to store",
+    };
+    eprintln!("analysis cache {action}: {}", input.display());
+    if let Some(warning) = cached.warning {
+        eprintln!("analysis cache warning: {warning}");
+    }
+    cached.value
+}
+
 fn write_loudness_tags(
     cli: &cli::Cli,
     channel_roles: Option<&[forge_normalizer::wav::ChannelRole]>,
+    cache: Option<&AnalysisCache>,
 ) -> Result<(), String> {
     let analyses: Vec<_> = cli
         .inputs
         .iter()
-        .map(|path| normalize::analyze_file_with_roles(path, channel_roles))
+        .map(|path| analyze_file_cached(cache, path, channel_roles))
         .collect::<Result<_, _>>()?;
     let album = if cli.album {
         Some((

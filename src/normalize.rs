@@ -1323,7 +1323,32 @@ pub fn normalize_one_with_roles<P: AsRef<Path>>(
     channel_roles: Option<&[ChannelRole]>,
 ) -> Result<(Analysis, f32), String> {
     let (analysis, gain, _) =
-        normalize_one_with_roles_impl(input, output, plan, format, channel_roles, false)?;
+        normalize_one_with_roles_impl(input, output, plan, format, channel_roles, None, false)?;
+    Ok((analysis, gain))
+}
+
+/// Normalize using an analysis already measured for the same input, channel
+/// roles, output sample rate, and resampling quality.
+///
+/// This is useful for durable analysis caches. The caller is responsible for
+/// preserving that content and request binding.
+pub fn normalize_one_preanalyzed_with_roles<P: AsRef<Path>>(
+    input: P,
+    output: P,
+    plan: &Plan,
+    format: OutputFormat,
+    channel_roles: Option<&[ChannelRole]>,
+    analysis: &Analysis,
+) -> Result<(Analysis, f32), String> {
+    let (analysis, gain, _) = normalize_one_with_roles_impl(
+        input,
+        output,
+        plan,
+        format,
+        channel_roles,
+        Some(analysis),
+        false,
+    )?;
     Ok((analysis, gain))
 }
 
@@ -1335,7 +1360,32 @@ pub fn normalize_one_audited_with_roles<P: AsRef<Path>>(
     channel_roles: Option<&[ChannelRole]>,
 ) -> Result<(Analysis, f32, RenderStatistics), String> {
     let (analysis, gain, render) =
-        normalize_one_with_roles_impl(input, output, plan, format, channel_roles, true)?;
+        normalize_one_with_roles_impl(input, output, plan, format, channel_roles, None, true)?;
+    Ok((
+        analysis,
+        gain,
+        render.expect("audited normalization captures render statistics"),
+    ))
+}
+
+/// Audited normalization using a content-bound, precomputed analysis.
+pub fn normalize_one_preanalyzed_audited_with_roles<P: AsRef<Path>>(
+    input: P,
+    output: P,
+    plan: &Plan,
+    format: OutputFormat,
+    channel_roles: Option<&[ChannelRole]>,
+    analysis: &Analysis,
+) -> Result<(Analysis, f32, RenderStatistics), String> {
+    let (analysis, gain, render) = normalize_one_with_roles_impl(
+        input,
+        output,
+        plan,
+        format,
+        channel_roles,
+        Some(analysis),
+        true,
+    )?;
     Ok((
         analysis,
         gain,
@@ -1349,9 +1399,14 @@ fn normalize_one_with_roles_impl<P: AsRef<Path>>(
     plan: &Plan,
     format: OutputFormat,
     channel_roles: Option<&[ChannelRole]>,
+    preanalyzed: Option<&Analysis>,
     capture_statistics: bool,
 ) -> Result<(Analysis, f32, Option<RenderStatistics>), String> {
-    let an = analyze_file_for_plan(input.as_ref(), channel_roles, plan)?;
+    let an = if let Some(analysis) = preanalyzed {
+        analysis.clone()
+    } else {
+        analyze_file_for_plan(input.as_ref(), channel_roles, plan)?
+    };
     let gain = compute_gain(&an, plan);
     let staged = AtomicOutput::new(output.as_ref())?;
     let render = normalize_stream(
@@ -1401,12 +1456,61 @@ pub fn normalize_one_corrected_with_roles<P: AsRef<Path>>(
     max_retries: usize,
     channel_roles: Option<&[ChannelRole]>,
 ) -> Result<CorrectedNormalization, String> {
+    normalize_one_corrected_with_optional_analysis(
+        input.as_ref(),
+        output.as_ref(),
+        plan,
+        format,
+        tolerance,
+        max_retries,
+        channel_roles,
+        None,
+    )
+}
+
+/// Corrected normalization using a content-bound, precomputed analysis.
+#[allow(clippy::too_many_arguments)]
+pub fn normalize_one_preanalyzed_corrected_with_roles<P: AsRef<Path>>(
+    input: P,
+    output: P,
+    plan: &Plan,
+    format: OutputFormat,
+    tolerance: f64,
+    max_retries: usize,
+    channel_roles: Option<&[ChannelRole]>,
+    analysis: &Analysis,
+) -> Result<CorrectedNormalization, String> {
+    normalize_one_corrected_with_optional_analysis(
+        input.as_ref(),
+        output.as_ref(),
+        plan,
+        format,
+        tolerance,
+        max_retries,
+        channel_roles,
+        Some(analysis),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_one_corrected_with_optional_analysis(
+    input: &Path,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    tolerance: f64,
+    max_retries: usize,
+    channel_roles: Option<&[ChannelRole]>,
+    preanalyzed: Option<&Analysis>,
+) -> Result<CorrectedNormalization, String> {
     if !tolerance.is_finite() || tolerance < 0.0 {
         return Err("verification tolerance must be a finite non-negative number".into());
     }
-    let input = input.as_ref();
-    let output = output.as_ref();
-    let source = analyze_file_for_plan(input, channel_roles, plan)?;
+    let source = if let Some(analysis) = preanalyzed {
+        analysis.clone()
+    } else {
+        analyze_file_for_plan(input, channel_roles, plan)?
+    };
     let mut gain = compute_gain(&source, plan);
     let mut intended_level = None;
     let staged = AtomicOutput::new(output)?;
@@ -1502,11 +1606,42 @@ pub fn normalize_album_with_roles(
     channel_roles: Option<&[ChannelRole]>,
 ) -> Result<Vec<(Analysis, f32)>, String> {
     Ok(
-        normalize_album_with_roles_impl(inputs, outputs, plan, formats, channel_roles, false)?
-            .into_iter()
-            .map(|(analysis, gain, _)| (analysis, gain))
-            .collect(),
+        normalize_album_with_roles_impl(
+            inputs,
+            outputs,
+            plan,
+            formats,
+            channel_roles,
+            None,
+            false,
+        )?
+        .into_iter()
+        .map(|(analysis, gain, _)| (analysis, gain))
+        .collect(),
     )
+}
+
+/// Album normalization using one content-bound analysis per input.
+pub fn normalize_album_preanalyzed_with_roles(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    channel_roles: Option<&[ChannelRole]>,
+    analyses: &[Analysis],
+) -> Result<Vec<(Analysis, f32)>, String> {
+    Ok(normalize_album_with_roles_impl(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        channel_roles,
+        Some(analyses),
+        false,
+    )?
+    .into_iter()
+    .map(|(analysis, gain, _)| (analysis, gain))
+    .collect())
 }
 
 pub fn normalize_album_audited_with_roles(
@@ -1517,7 +1652,7 @@ pub fn normalize_album_audited_with_roles(
     channel_roles: Option<&[ChannelRole]>,
 ) -> Result<Vec<(Analysis, f32, RenderStatistics)>, String> {
     Ok(
-        normalize_album_with_roles_impl(inputs, outputs, plan, formats, channel_roles, true)?
+        normalize_album_with_roles_impl(inputs, outputs, plan, formats, channel_roles, None, true)?
             .into_iter()
             .map(|(analysis, gain, render)| {
                 (
@@ -1530,18 +1665,55 @@ pub fn normalize_album_audited_with_roles(
     )
 }
 
+/// Audited album normalization using content-bound precomputed analyses.
+pub fn normalize_album_preanalyzed_audited_with_roles(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    channel_roles: Option<&[ChannelRole]>,
+    analyses: &[Analysis],
+) -> Result<Vec<(Analysis, f32, RenderStatistics)>, String> {
+    Ok(normalize_album_with_roles_impl(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        channel_roles,
+        Some(analyses),
+        true,
+    )?
+    .into_iter()
+    .map(|(analysis, gain, render)| {
+        (
+            analysis,
+            gain,
+            render.expect("audited album normalization captures render statistics"),
+        )
+    })
+    .collect())
+}
+
 fn normalize_album_with_roles_impl(
     inputs: &[PathBuf],
     outputs: &[PathBuf],
     plan: &Plan,
     formats: &[OutputFormat],
     channel_roles: Option<&[ChannelRole]>,
+    preanalyzed: Option<&[Analysis]>,
     capture_statistics: bool,
 ) -> Result<Vec<(Analysis, f32, Option<RenderStatistics>)>, String> {
-    let analyses: Vec<Analysis> = inputs
-        .iter()
-        .map(|path| analyze_file_for_plan(path, channel_roles, plan))
-        .collect::<Result<_, _>>()?;
+    if preanalyzed.is_some_and(|analyses| analyses.len() != inputs.len()) {
+        return Err("album precomputed analysis/input count mismatch".into());
+    }
+    let analyses: Vec<Analysis> = if let Some(analyses) = preanalyzed {
+        analyses.to_vec()
+    } else {
+        inputs
+            .iter()
+            .map(|path| analyze_file_for_plan(path, channel_roles, plan))
+            .collect::<Result<_, _>>()?
+    };
     let gain = album_gain(&analyses, plan);
     let album_output_lufs = album_lufs(&analyses) + gain_db(gain);
     let staged: Vec<AtomicOutput> = outputs
@@ -1610,6 +1782,53 @@ pub fn normalize_album_corrected_with_roles(
     max_retries: usize,
     channel_roles: Option<&[ChannelRole]>,
 ) -> Result<CorrectedAlbumNormalization, String> {
+    normalize_album_corrected_with_optional_analyses(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        tolerance,
+        max_retries,
+        channel_roles,
+        None,
+    )
+}
+
+/// Corrected album normalization using content-bound precomputed analyses.
+#[allow(clippy::too_many_arguments)]
+pub fn normalize_album_preanalyzed_corrected_with_roles(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    tolerance: f64,
+    max_retries: usize,
+    channel_roles: Option<&[ChannelRole]>,
+    analyses: &[Analysis],
+) -> Result<CorrectedAlbumNormalization, String> {
+    normalize_album_corrected_with_optional_analyses(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        tolerance,
+        max_retries,
+        channel_roles,
+        Some(analyses),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_album_corrected_with_optional_analyses(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    tolerance: f64,
+    max_retries: usize,
+    channel_roles: Option<&[ChannelRole]>,
+    preanalyzed: Option<&[Analysis]>,
+) -> Result<CorrectedAlbumNormalization, String> {
     if inputs.is_empty() {
         return Err("cannot correct an empty album".into());
     }
@@ -1619,10 +1838,17 @@ pub fn normalize_album_corrected_with_roles(
     if !tolerance.is_finite() || tolerance < 0.0 {
         return Err("verification tolerance must be a finite non-negative number".into());
     }
-    let sources: Vec<Analysis> = inputs
-        .iter()
-        .map(|path| analyze_file_for_plan(path, channel_roles, plan))
-        .collect::<Result<_, _>>()?;
+    if preanalyzed.is_some_and(|analyses| analyses.len() != inputs.len()) {
+        return Err("album precomputed analysis/input count mismatch".into());
+    }
+    let sources: Vec<Analysis> = if let Some(analyses) = preanalyzed {
+        analyses.to_vec()
+    } else {
+        inputs
+            .iter()
+            .map(|path| analyze_file_for_plan(path, channel_roles, plan))
+            .collect::<Result<_, _>>()?
+    };
     let mut gain = album_gain(&sources, plan);
     let mut intended_album_lufs = None;
     let mut intended_track_levels = None;

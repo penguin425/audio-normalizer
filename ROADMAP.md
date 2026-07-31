@@ -168,6 +168,9 @@ Forge already provides:
 - Resumable independent-track batch jobs with atomic per-output checkpoints,
   input/settings/output SHA-256 binding, missing-output recovery,
   changed-output rejection, and schema-validated lifecycle NDJSON.
+- Opt-in content-addressed core analysis cache with streaming input SHA-256,
+  request and algorithm revision binding, atomic schema-validated entries,
+  corruption recovery, read-only operation, and bounded FIFO eviction.
 - Bounded AAF stored-format, dynamic MetaDictionary, and core object-model/Edit
   Protocol QC with CFB/file/root identity, property/reference-index decoding,
   dynamically declared class/property/type graphs and extension values,
@@ -265,7 +268,7 @@ failure behaviour are documented.
 
 ## Product and developer experience
 
-- Content-addressed analysis cache and watch folders.
+- Watch folders with stable-file detection and durable processing state.
 - SQLite catalogue with source/output hashes, measurement standard/version,
   profile, tool version, and provenance report.
 - TUI/GUI views for waveform, loudness timeline, true peak, QC events, channel
