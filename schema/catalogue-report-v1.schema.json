@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/catalogue-report-v1",
+  "title": "Forge SQLite catalogue provenance report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "generator", "catalogue", "records"],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/catalogue-report-v1"
+    },
+    "generator": {
+      "type": "string",
+      "pattern": "^forge-normalizer/[0-9]+\\.[0-9]+\\.[0-9]+"
+    },
+    "catalogue": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "records": {
+      "type": "array",
+      "maxItems": 100000,
+      "items": { "$ref": "#/$defs/record" }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "finiteNumber": {
+      "type": ["number", "null"]
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sample_rate_hz",
+        "channels",
+        "frames",
+        "duration_seconds",
+        "integrated_lufs",
+        "loudness_range_lu",
+        "rms_dbfs",
+        "sample_peak_dbfs",
+        "true_peak_dbtp"
+      ],
+      "properties": {
+        "sample_rate_hz": { "type": "integer", "minimum": 1, "maximum": 384000 },
+        "channels": { "type": "integer", "minimum": 1, "maximum": 1024 },
+        "frames": { "type": "integer", "minimum": 0 },
+        "duration_seconds": { "type": "number", "minimum": 0 },
+        "integrated_lufs": { "$ref": "#/$defs/finiteNumber" },
+        "loudness_range_lu": { "$ref": "#/$defs/finiteNumber" },
+        "rms_dbfs": { "$ref": "#/$defs/finiteNumber" },
+        "sample_peak_dbfs": { "$ref": "#/$defs/finiteNumber" },
+        "true_peak_dbtp": { "$ref": "#/$defs/finiteNumber" }
+      }
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "recorded_unix_ms",
+        "operation",
+        "source",
+        "output",
+        "measurement_standard",
+        "measurement_version",
+        "profile",
+        "tool_version",
+        "measurement",
+        "provenance"
+      ],
+      "properties": {
+        "id": { "type": "integer", "minimum": 1 },
+        "recorded_unix_ms": { "type": "integer", "minimum": 0 },
+        "operation": {
+          "type": "string",
+          "enum": ["analysis", "normalization"]
+        },
+        "source": { "$ref": "#/$defs/file" },
+        "output": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/file" }
+          ]
+        },
+        "measurement_standard": { "type": "string", "minLength": 1 },
+        "measurement_version": { "type": "string", "minLength": 1 },
+        "profile": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "tool_version": { "type": "string", "minLength": 1 },
+        "measurement": { "$ref": "#/$defs/measurement" },
+        "provenance": {
+          "type": "object"
+        }
+      }
+    }
+  }
+}
