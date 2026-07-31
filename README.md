@@ -1689,6 +1689,23 @@ forge-ac4-qc programme.ac4 --adapter /opt/vendor/forge-ac4-adapter \
 See [AC4-ADAPTER.md](AC4-ADAPTER.md) for the request/response contract,
 current ETSI versions, resource limits, and trust boundary.
 
+For a raw MPEG-H Audio Stream, `forge-mpegh-qc` first parses every MHAS packet
+itself, including escaped type/label/length fields, SYNC, configuration labels,
+and `mpegh3daProfileLevelIndication`. It then uses an explicitly selected
+conforming/reference decoder adapter to enumerate the audio scene and render
+the default scene and every preset with loudness normalization and DRC
+disabled:
+
+```bash
+forge-mpegh-qc programme.mhas --adapter /opt/vendor/forge-mpegh-adapter \
+  --output mpegh-qc.json --loudness-tolerance-lu 1.0
+```
+
+Forge validates group, switch-group and preset references, binds the native
+MHAS profile/level to the decoder response, and independently measures every
+WAVE render. See [MPEGH-ADAPTER.md](MPEGH-ADAPTER.md) for the versioned JSON
+contract, current ISO standards, limits, and trust boundary.
+
 Ordered S-ADM XML frames can be checked as a live-flow capture:
 
 ```bash
@@ -1898,6 +1915,7 @@ src/
   aaf_object_qc.rs  AAF object graph, timeline, source, and Edit Protocol QC
   aes31_qc.rs       bounded AES31-3 EDML project/reference/timing QC
   ac4_adapter.rs    bounded licensed/reference AC-4 decoder adapter + evidence
+  mpegh_adapter.rs  native MHAS framing + bounded conforming decoder adapter
   flacenc.rs        bounded-memory pure-Rust FLAC encoder
   opus.rs           RFC 7845 mono/stereo and Mapping Family 1 Ogg Opus I/O
   mp3enc.rs         mono/stereo LAME encoder with gapless Info/LAME backpatch
@@ -1923,6 +1941,7 @@ src/
   bin/forge-provenance-qc.rs C2PA integrity and trust-policy audit CLI
   bin/forge-aes31-qc.rs AES31-3 EDML project audit CLI
   bin/forge-ac4-qc.rs licensed/reference AC-4 presentation audit CLI
+  bin/forge-mpegh-qc.rs MHAS/scene/preset/render MPEG-H audit CLI
   lv2.rs            hard-real-time-capable LV2 stereo plugin ABI
   clap_plugin.rs    CLAP stereo effect, automation, state, and latency ABI
   preset.rs         named playback and broadcast loudness targets

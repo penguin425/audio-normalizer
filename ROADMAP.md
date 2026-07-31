@@ -28,6 +28,10 @@ Forge already provides:
   Atmos/JOC Extension Type A signalling, six-block access-unit and
   independent/dependent presentation grouping, plus authoritative external
   E-AC-3 JOC render checks.
+- Native, bounded MPEG-H MHAS packet framing, label, SYNC, packet inventory,
+  configuration profile/level, and ordering checks, plus a versioned external
+  conforming-decoder adapter for complete audio-scene group/switch/preset
+  validation and independently measured presentation loudness/true peak.
 - Bounded standalone, unfragmented, fragmented, and CENC-protected ISO-BMFF
   AOMedia IAMF v1.1
   QC with
@@ -220,8 +224,6 @@ generations.
 
 ### Codec-specific QC
 
-- MPEG-H MHAS packets, scene metadata, profile/level, loudness, and
-  presentation rendering through an external conforming decoder.
 - DTS core/HD metadata and decoded presentation checks through an optional
   adapter.
 - WavPack, Monkey's Audio, and ALAC native frame/checksum validation.

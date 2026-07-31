@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/mpegh-adapter-request-v1",
+  "title": "Forge MPEG-H adapter request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "protocol_version", "input_path", "input_sha256", "input_bytes", "output_directory", "mhas_inventory", "requirements"],
+  "properties": {
+    "schema": {"const": "https://penguin425.github.io/audio-normalizer/schema/mpegh-adapter-request-v1"},
+    "protocol_version": {"const": 1},
+    "input_path": {"type": "string", "minLength": 1},
+    "input_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "input_bytes": {"type": "integer", "minimum": 1},
+    "output_directory": {"type": "string", "minLength": 1},
+    "mhas_inventory": {"$ref": "#/$defs/inventory"},
+    "requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enumerate_all_presentations", "enumerate_audio_scene", "rendered_format", "report_presentation_loudness_metadata", "loudness_normalization", "dynamic_range_control", "core_standard", "reference_software_standard", "conformance_standard"],
+      "properties": {
+        "enumerate_all_presentations": {"const": true},
+        "enumerate_audio_scene": {"const": true},
+        "rendered_format": {"const": "wave"},
+        "report_presentation_loudness_metadata": {"const": true},
+        "loudness_normalization": {"const": false},
+        "dynamic_range_control": {"const": false},
+        "core_standard": {"const": "ISO/IEC 23008-3:2026"},
+        "reference_software_standard": {"const": "ISO/IEC 23008-6:2025"},
+        "conformance_standard": {"const": "ISO/IEC 23008-9:2023"}
+      }
+    }
+  },
+  "$defs": {
+    "inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["packet_count", "payload_bytes", "packet_types", "labels", "configuration_count", "frame_count", "audio_scene_info_count", "loudness_drc_count", "loudness_count", "sync_count", "profile_levels"],
+      "properties": {
+        "packet_count": {"type": "integer", "minimum": 1, "maximum": 1000000},
+        "payload_bytes": {"type": "integer", "minimum": 1},
+        "packet_types": {"type": "array", "minItems": 2, "maxItems": 518, "items": {"$ref": "#/$defs/packet_type"}},
+        "labels": {"type": "array", "minItems": 1, "maxItems": 1000000, "items": {"type": "integer", "minimum": 0}},
+        "configuration_count": {"type": "integer", "minimum": 1},
+        "frame_count": {"type": "integer", "minimum": 1},
+        "audio_scene_info_count": {"type": "integer", "minimum": 0},
+        "loudness_drc_count": {"type": "integer", "minimum": 0},
+        "loudness_count": {"type": "integer", "minimum": 0},
+        "sync_count": {"type": "integer", "minimum": 0},
+        "profile_levels": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"$ref": "#/$defs/profile_level"}}
+      }
+    },
+    "packet_type": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["packet_type", "name", "count"],
+      "properties": {
+        "packet_type": {"type": "integer", "minimum": 0, "maximum": 517},
+        "name": {"type": "string", "minLength": 1},
+        "count": {"type": "integer", "minimum": 1}
+      }
+    },
+    "profile_level": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["indication", "profile", "level"],
+      "properties": {
+        "indication": {"type": "integer", "minimum": 1, "maximum": 20},
+        "profile": {"enum": ["main", "high", "low-complexity", "baseline"]},
+        "level": {"type": "integer", "minimum": 1, "maximum": 5}
+      }
+    }
+  }
+}
