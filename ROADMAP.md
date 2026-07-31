@@ -174,6 +174,10 @@ Forge already provides:
 - Stable-file watch folders with symlink-safe bounded discovery, durable
   atomic processing state, settings and input/output SHA-256 binding,
   restart recovery, explicit failed-item retry, and one-shot scheduling.
+- Versioned SQLite catalogue with source/output SHA-256, BS.1770-5/EBU R 128
+  measurement and algorithm revisions, selected profile, Forge version,
+  bounded structured provenance, transactional deduplication, and atomic
+  per-invocation JSON evidence export.
 - Bounded AAF stored-format, dynamic MetaDictionary, and core object-model/Edit
   Protocol QC with CFB/file/root identity, property/reference-index decoding,
   dynamically declared class/property/type graphs and extension values,
@@ -271,8 +275,6 @@ failure behaviour are documented.
 
 ## Product and developer experience
 
-- SQLite catalogue with source/output hashes, measurement standard/version,
-  profile, tool version, and provenance report.
 - TUI/GUI views for waveform, loudness timeline, true peak, QC events, channel
   correlation, and before/after comparison.
 - CPU/memory benchmarks for hour-long stereo, multichannel, lossless, lossy,

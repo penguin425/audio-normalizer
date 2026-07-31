@@ -1338,6 +1338,25 @@ scope, eviction and corruption behavior, bounds, measurement provenance, and
 the versioned
 [`analysis-cache-v1`](schema/analysis-cache-v1.schema.json) contract.
 
+### SQLite catalogue
+
+`--catalogue PATH` records content-addressed source/output evidence,
+BS.1770-5/EBU R 128 measurements, the selected profile, Forge/algorithm
+versions, and structured invocation provenance:
+
+```sh
+forge library/*.flac -o normalized/ \
+  --catalogue work/library.sqlite \
+  --catalogue-report work/last-run.json
+```
+
+Rows are committed with bounded SQLite transactions and deduplicated by
+content, method, profile, and tool version. `--catalogue-report` atomically
+exports records committed by the current invocation under the versioned
+[`catalogue-report-v1`](schema/catalogue-report-v1.schema.json) contract. See
+[CATALOGUE.md](CATALOGUE.md) for durability, concurrency, privacy, bounds, and
+backup behavior.
+
 ### Options
 
 | Flag | Default | Description |
@@ -1357,6 +1376,8 @@ the versioned
 | `--analysis-cache` | none | Reuse content-addressed core loudness analyses from a directory |
 | `--analysis-cache-read-only` | off | Permit cache hits without writes, repairs, or eviction |
 | `--analysis-cache-max-mib` | `1024` | Maximum recognized cache-entry storage when the cache is enabled |
+| `--catalogue` | none | Record hash-bound measurements, profile, tool version, and provenance in SQLite |
+| `--catalogue-report` | none | Atomically export catalogue rows committed by this invocation |
 | `--input-format` | none | Container hint required for stdin (`-`) |
 | `--dry-run` | off | Analyze and show output paths without writing |
 | `--overwrite` | off | Replace output files that already exist |

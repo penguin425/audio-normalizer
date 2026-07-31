@@ -33,6 +33,7 @@ pub mod audio_compare;
 pub mod batch;
 mod bwf_xml_qc;
 pub mod c_api;
+pub mod catalogue;
 #[cfg(feature = "clap-plugin")]
 pub mod clap_plugin;
 pub mod cli;

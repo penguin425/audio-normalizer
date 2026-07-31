@@ -30,6 +30,151 @@ fn write_batch_test_wav(path: &std::path::Path, frequency_hz: f64) {
 }
 
 #[test]
+fn sqlite_catalogue_records_normalization_hashes_and_exports_provenance() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("input.wav");
+    let output = directory.path().join("output.wav");
+    let database = directory.path().join("catalogue.sqlite");
+    let report = directory.path().join("catalogue-report.json");
+    write_batch_test_wav(&input, 440.0);
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--catalogue")
+        .arg(&database)
+        .arg("--catalogue-report")
+        .arg(&report)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let row: (String, String, String, String, String) = connection
+        .query_row(
+            "SELECT operation, source_sha256, output_sha256,
+                    measurement_standard, measurement_version
+             FROM catalogue_entries",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row.0, "normalization");
+    assert_eq!(row.1.len(), 64);
+    assert_eq!(row.2.len(), 64);
+    assert_eq!(row.3, "ITU-R BS.1770-5 / EBU R 128");
+    assert_eq!(row.4, "forge-bs1770-5-r1");
+
+    let report_value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../schema/catalogue-report-v1.schema.json")).unwrap();
+    assert!(jsonschema::validator_for(&schema)
+        .unwrap()
+        .is_valid(&report_value));
+    assert_eq!(report_value["records"][0]["source"]["sha256"], row.1);
+    assert_eq!(report_value["records"][0]["output"]["sha256"], row.2);
+}
+
+#[test]
+fn sqlite_catalogue_analysis_is_content_addressed_and_deduplicated() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("input.wav");
+    let database = directory.path().join("catalogue.sqlite");
+    write_batch_test_wav(&input, 440.0);
+
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_forge"))
+            .arg(&input)
+            .arg("--analyze")
+            .arg("--catalogue")
+            .arg(&database)
+            .output()
+            .unwrap()
+    };
+    let first = run();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let second = run();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM catalogue_entries", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let output_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM catalogue_entries WHERE output_sha256 IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(output_count, 0);
+}
+
+#[test]
+fn sqlite_catalogue_records_every_successful_album_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.wav");
+    let second = directory.path().join("second.wav");
+    let outputs = directory.path().join("normalized");
+    let database = directory.path().join("catalogue.sqlite");
+    write_batch_test_wav(&first, 440.0);
+    write_batch_test_wav(&second, 880.0);
+    std::fs::create_dir(&outputs).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&first)
+        .arg(&second)
+        .arg("--album")
+        .arg("-o")
+        .arg(&outputs)
+        .arg("--catalogue")
+        .arg(&database)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let evidence: (i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*),
+                    SUM(CASE WHEN json_extract(provenance_json, '$.album') = 1
+                             THEN 1 ELSE 0 END)
+             FROM catalogue_entries",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(evidence, (2, 2));
+}
+
+#[test]
 fn watch_folder_waits_for_stability_then_checkpoints_and_skips_completed_output() {
     let directory = tempfile::tempdir().unwrap();
     let input_directory = directory.path().join("input");

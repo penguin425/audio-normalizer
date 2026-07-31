@@ -7,6 +7,7 @@ use forge_normalizer::analysis_cache::{
     AnalysisCache, AnalysisCachePolicy, CacheDisposition, Cached,
 };
 use forge_normalizer::batch::{BatchAssetSpec, BatchJob, BatchProgressEvent};
+use forge_normalizer::catalogue::{Catalogue, CatalogueAsset, CatalogueRecord};
 use forge_normalizer::cli;
 use forge_normalizer::codec_qc;
 use forge_normalizer::dsp::limiter::LimiterConfig;
@@ -25,6 +26,7 @@ use forge_normalizer::report::{
 use forge_normalizer::watch::{WatchCandidate, WatchFolder};
 use forge_normalizer::wav::{named_channel_layout, ChannelRole, PcmKind, WavContainer};
 use rayon::ThreadPoolBuilder;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -53,6 +55,12 @@ struct WatchOptions {
     poll_seconds: Option<u64>,
     once: bool,
     retry_failed: bool,
+}
+
+#[derive(Debug, Default)]
+struct CatalogueOptions {
+    database: Option<PathBuf>,
+    report: Option<PathBuf>,
 }
 
 impl CacheOptions {
@@ -194,6 +202,24 @@ fn main() -> ExitCode {
                 .requires("watch")
                 .help("Requeue unchanged failed entries once at startup"),
         )
+        .arg(
+            Arg::new("catalogue")
+                .long("catalogue")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .conflicts_with_all(["dry_run", "gain_only", "write_tags", "watch"])
+                .help(
+                    "Record content hashes, measurements, profile, tool version, and provenance in SQLite",
+                ),
+        )
+        .arg(
+            Arg::new("catalogue_report")
+                .long("catalogue-report")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .requires("catalogue")
+                .help("Atomically export records committed by this invocation as JSON"),
+        )
         .get_matches();
     let batch_options = BatchOptions {
         job_state: matches.get_one::<PathBuf>("job_state").cloned(),
@@ -212,6 +238,10 @@ fn main() -> ExitCode {
         once: matches.get_flag("watch_once"),
         retry_failed: matches.get_flag("watch_retry_failed"),
     };
+    let catalogue_options = CatalogueOptions {
+        database: matches.get_one::<PathBuf>("catalogue").cloned(),
+        report: matches.get_one::<PathBuf>("catalogue_report").cloned(),
+    };
     let cli = match cli::Cli::from_matches_with_config(&matches) {
         Ok(cli) => cli,
         Err(error) => {
@@ -219,7 +249,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if let Err(e) = run(cli, batch_options, cache_options, watch_options) {
+    if let Err(e) = run(
+        cli,
+        batch_options,
+        cache_options,
+        watch_options,
+        catalogue_options,
+    ) {
         eprintln!("forge: error: {e}");
         return ExitCode::from(1);
     }
@@ -260,6 +296,7 @@ fn run(
     batch_options: BatchOptions,
     cache_options: CacheOptions,
     watch_options: WatchOptions,
+    catalogue_options: CatalogueOptions,
 ) -> Result<(), String> {
     if watch_options.enabled {
         return run_watch(cli, cache_options, watch_options);
@@ -270,6 +307,7 @@ fn run(
         pipeline.stdin_requested(),
         &batch_options,
         &cache_options,
+        &catalogue_options,
     )?;
     pipeline.emit_stdout()
 }
@@ -376,7 +414,13 @@ fn process_watch_candidate(
     cli.output = Some(output);
     cli.recursive = false;
     cli.overwrite = true;
-    let result = run_paths(cli, false, &BatchOptions::default(), cache_options);
+    let result = run_paths(
+        cli,
+        false,
+        &BatchOptions::default(),
+        cache_options,
+        &CatalogueOptions::default(),
+    );
     match result {
         Ok(()) => watch.mark_completed(&candidate.id),
         Err(error) => Err(error),
@@ -419,6 +463,7 @@ fn run_paths(
     stdin_requested: bool,
     batch_options: &BatchOptions,
     cache_options: &CacheOptions,
+    catalogue_options: &CatalogueOptions,
 ) -> Result<(), String> {
     if let Some(j) = cli.jobs {
         ThreadPoolBuilder::new()
@@ -513,6 +558,24 @@ fn run_paths(
     }
 
     let (outputs, formats) = resolve_outputs_and_formats(&cli, &relative_paths)?;
+    validate_catalogue_paths(&cli, catalogue_options, &outputs, stdin_requested)?;
+    let mut catalogue = catalogue_options
+        .database
+        .as_ref()
+        .map(Catalogue::open)
+        .transpose()?;
+    let mut catalogue_records = Vec::new();
+    let catalogue_source_hashes = if catalogue.is_some() {
+        cli.inputs
+            .iter()
+            .map(|input| {
+                normalization_diff::inspect_file(input)
+                    .map(|evidence| (input.clone(), evidence.sha256))
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?
+    } else {
+        HashMap::new()
+    };
     if let Some(path) = &cli.difference_report {
         if path == Path::new("-") {
             return Err("--difference-report requires a file path; stdout is not supported".into());
@@ -1171,6 +1234,21 @@ fn run_paths(
                     }
                 }
             }
+            record_catalogue_asset(
+                catalogue.as_mut(),
+                &mut catalogue_records,
+                CatalogueAsset {
+                    source: input,
+                    expected_source_sha256: catalogue_source_hashes
+                        .get(input)
+                        .map_or("", String::as_str),
+                    output: None,
+                    measurement: &an,
+                    operation: "analysis",
+                    profile: &catalogue_profile(&cli, &plan),
+                    provenance: catalogue_provenance(&cli, &plan, "analysis"),
+                },
+            )?;
             if cli.timeline.is_some() {
                 timeline_reports.extend(TimelineReport::from_points(
                     if stdin_requested {
@@ -1233,6 +1311,11 @@ fn run_paths(
             serde_json::to_writer_pretty(file, audit)
                 .map_err(|error| format!("write ADM profile report: {error}"))?;
         }
+        write_catalogue_report(
+            catalogue.as_ref(),
+            catalogue_options.report.as_deref(),
+            std::mem::take(&mut catalogue_records),
+        )?;
         if qc_failed {
             return Err("one or more inputs failed the requested compliance/QC checks".into());
         }
@@ -1362,6 +1445,24 @@ fn run_paths(
             if !album_ok {
                 return Err("post-encode album verification failed".into());
             }
+            for ((input, output), source) in cli.inputs.iter().zip(&outputs).zip(&corrected.sources)
+            {
+                record_catalogue_asset(
+                    catalogue.as_mut(),
+                    &mut catalogue_records,
+                    CatalogueAsset {
+                        source: input,
+                        expected_source_sha256: catalogue_source_hashes
+                            .get(input)
+                            .map_or("", String::as_str),
+                        output: Some(output),
+                        measurement: source,
+                        operation: "normalization",
+                        profile: &catalogue_profile(&cli, &plan),
+                        provenance: catalogue_provenance(&cli, &plan, "normalization"),
+                    },
+                )?;
+            }
             if let Some(path) = &cli.difference_report {
                 for index in 0..cli.inputs.len() {
                     difference_assets.push(normalization_diff::build_asset(
@@ -1379,6 +1480,11 @@ fn run_paths(
                 }
                 write_difference_report(path, difference_assets)?;
             }
+            write_catalogue_report(
+                catalogue.as_ref(),
+                catalogue_options.report.as_deref(),
+                std::mem::take(&mut catalogue_records),
+            )?;
             return Ok(());
         }
         let results = if cli.difference_report.is_some() {
@@ -1437,6 +1543,23 @@ fn run_paths(
             album_l,
             20.0 * (gain as f64).log10()
         );
+        for (index, (source, _, _)) in results.iter().enumerate() {
+            record_catalogue_asset(
+                catalogue.as_mut(),
+                &mut catalogue_records,
+                CatalogueAsset {
+                    source: &cli.inputs[index],
+                    expected_source_sha256: catalogue_source_hashes
+                        .get(&cli.inputs[index])
+                        .map_or("", String::as_str),
+                    output: Some(&outputs[index]),
+                    measurement: source,
+                    operation: "normalization",
+                    profile: &catalogue_profile(&cli, &plan),
+                    provenance: catalogue_provenance(&cli, &plan, "normalization"),
+                },
+            )?;
+        }
         if let Some(path) = &cli.difference_report {
             for (index, (source, asset_gain, render)) in results.iter().enumerate() {
                 let output_analysis = normalize::analyze_file_with_roles(
@@ -1460,6 +1583,11 @@ fn run_paths(
             }
             write_difference_report(path, difference_assets)?;
         }
+        write_catalogue_report(
+            catalogue.as_ref(),
+            catalogue_options.report.as_deref(),
+            std::mem::take(&mut catalogue_records),
+        )?;
         return Ok(());
     }
 
@@ -1548,6 +1676,7 @@ fn run_paths(
                 None,
             )?;
         }
+        let mut catalogue_measurement = None;
         let result = (|| -> Result<(), String> {
             let cached_analysis = analysis_cache
                 .as_ref()
@@ -1572,6 +1701,7 @@ fn run_paths(
                 };
                 let gain = normalize::compute_gain(&an, &plan);
                 print_analysis(input, &an, Some(gain));
+                catalogue_measurement = Some(an);
                 if cli.dry_run {
                     eprintln!("  would write {}", output.display());
                 }
@@ -1601,6 +1731,7 @@ fn run_paths(
                         )?
                     };
                     print_analysis(input, &corrected.source, Some(corrected.gain));
+                    catalogue_measurement = Some(corrected.source.clone());
                     if !print_verification(input, &corrected.verification, &plan) {
                         return Err(format!(
                             "post-encode verification failed: {}",
@@ -1649,6 +1780,7 @@ fn run_paths(
                             )?
                         };
                         print_analysis(input, &an, Some(gain));
+                        catalogue_measurement = Some(an.clone());
                         let output_analysis = normalize::analyze_file_with_roles(
                             output,
                             channel_roles_override.as_deref(),
@@ -1685,6 +1817,7 @@ fn run_paths(
                             )?
                         };
                         print_analysis(input, &an, Some(gain));
+                        catalogue_measurement = Some(an);
                     }
                 }
             }
@@ -1701,6 +1834,23 @@ fn run_paths(
                 )?;
             }
             return Err(error);
+        }
+        if let Some(measurement) = catalogue_measurement.as_ref() {
+            record_catalogue_asset(
+                catalogue.as_mut(),
+                &mut catalogue_records,
+                CatalogueAsset {
+                    source: input,
+                    expected_source_sha256: catalogue_source_hashes
+                        .get(input)
+                        .map_or("", String::as_str),
+                    output: Some(output),
+                    measurement,
+                    operation: "normalization",
+                    profile: &catalogue_profile(&cli, &plan),
+                    provenance: catalogue_provenance(&cli, &plan, "normalization"),
+                },
+            )?;
         }
         if let Some(job) = &mut batch_job {
             job.mark_completed(index)?;
@@ -1731,6 +1881,11 @@ fn run_paths(
     if let Some(path) = &cli.difference_report {
         write_difference_report(path, difference_assets)?;
     }
+    write_catalogue_report(
+        catalogue.as_ref(),
+        catalogue_options.report.as_deref(),
+        catalogue_records,
+    )?;
     Ok(())
 }
 
@@ -2002,6 +2157,117 @@ fn validate_control_paths(
         return Err("--job-state and --progress require different paths".into());
     }
     Ok(())
+}
+
+fn validate_catalogue_paths(
+    cli: &cli::Cli,
+    options: &CatalogueOptions,
+    outputs: &[PathBuf],
+    stdin_requested: bool,
+) -> Result<(), String> {
+    let Some(database) = &options.database else {
+        return Ok(());
+    };
+    if stdin_requested || cli.output.as_deref() == Some(Path::new("-")) {
+        return Err("--catalogue does not support stdin or binary stdout".into());
+    }
+    let database = comparison_path(database)?;
+    for path in cli.inputs.iter().chain(outputs) {
+        if comparison_path(path)? == database {
+            return Err(format!(
+                "--catalogue must not overwrite an audio input or output: {}",
+                database.display()
+            ));
+        }
+    }
+    if let Some(report) = &options.report {
+        if report == Path::new("-") {
+            return Err("--catalogue-report requires a file path".into());
+        }
+        if report.exists() && !cli.overwrite {
+            return Err(format!(
+                "{} already exists (use --overwrite to replace it)",
+                report.display()
+            ));
+        }
+        let report = comparison_path(report)?;
+        if report == database {
+            return Err("--catalogue and --catalogue-report require different paths".into());
+        }
+        for path in cli.inputs.iter().chain(outputs) {
+            if comparison_path(path)? == report {
+                return Err(format!(
+                    "--catalogue-report must not overwrite an audio input or output: {}",
+                    report.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn record_catalogue_asset(
+    catalogue: Option<&mut Catalogue>,
+    records: &mut Vec<CatalogueRecord>,
+    asset: CatalogueAsset<'_>,
+) -> Result<(), String> {
+    let Some(catalogue) = catalogue else {
+        return Ok(());
+    };
+    records.push(catalogue.record(asset)?);
+    Ok(())
+}
+
+fn write_catalogue_report(
+    catalogue: Option<&Catalogue>,
+    report: Option<&Path>,
+    records: Vec<CatalogueRecord>,
+) -> Result<(), String> {
+    match (catalogue, report) {
+        (Some(catalogue), Some(report)) => catalogue.write_report(report, records),
+        _ => Ok(()),
+    }
+}
+
+fn catalogue_profile(cli: &cli::Cli, plan: &Plan) -> String {
+    if let Some(preset) = &cli.preset {
+        return format!("preset:{preset}");
+    }
+    if let Some(compliance) = &cli.compliance {
+        return format!("compliance:{compliance}");
+    }
+    match plan.mode {
+        Mode::Lufs => format!(
+            "custom:lufs:{:.3}LUFS:{:.3}dBTP",
+            plan.target_lufs, plan.ceiling_db
+        ),
+        Mode::Peak => format!("custom:peak:{:.3}dBFS", plan.target_peak_db),
+        Mode::Rms => format!("custom:rms:{:.3}dBFS", plan.target_rms_db),
+    }
+}
+
+fn catalogue_provenance(cli: &cli::Cli, plan: &Plan, operation: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "forge-catalogue-provenance-v1",
+        "generator": format!("forge-normalizer/{}", env!("CARGO_PKG_VERSION")),
+        "operation": operation,
+        "preset": cli.preset,
+        "compliance": cli.compliance,
+        "mode": cli.mode,
+        "target_lufs": plan.target_lufs,
+        "target_peak_dbfs": plan.target_peak_db,
+        "target_rms_dbfs": plan.target_rms_db,
+        "ceiling_dbtp": plan.ceiling_db,
+        "max_gain_db": plan.max_gain_db,
+        "album": cli.album,
+        "verify": cli.verify,
+        "verify_tolerance": cli.verify_tolerance,
+        "verify_retries": cli.verify_retries,
+        "channel_layout": cli.channel_layout,
+        "dual_mono": cli.dual_mono,
+        "source_start_seconds": cli.start_seconds.unwrap_or(0.0),
+        "source_duration_seconds": cli.duration_seconds,
+    })
 }
 
 fn comparison_path(path: &Path) -> Result<PathBuf, String> {
