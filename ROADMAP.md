@@ -182,6 +182,10 @@ Forge already provides:
   stereo and 7.1 WAVE normalization, FLAC/MP3 analysis, and bounded
   pathological WAVE QC, with normalized CPU/RSS evidence and compatible-host
   baseline regression gates.
+- Versioned multi-delivery optimization for two to 32 codec/profile outputs,
+  using one conservative target, ceiling, and iteratively corrected gain;
+  staged post-metadata re-decoding, explicit infeasibility, path-alias and
+  overwrite safety, and schema-validated hash/measurement/profile evidence.
 - Bounded AAF stored-format, dynamic MetaDictionary, and core object-model/Edit
   Protocol QC with CFB/file/root identity, property/reference-index decoding,
   dynamically declared class/property/type graphs and extension values,
@@ -224,8 +228,6 @@ generations.
 
 - Loudness-to-dialogue ratio, speech-gated loudness confidence, and manual
   review ranges.
-- Multi-delivery optimization: derive one conservative master gain/ceiling for
-  several codec/profile outputs and verify each result.
 - Segment-aware normalization with boundary smoothing and a two-pass manifest
   for large streaming catalogues.
 - Extend metadata-only normalization when additional containers acquire a

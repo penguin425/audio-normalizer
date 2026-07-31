@@ -62,6 +62,7 @@ mod mp3_qc;
 #[cfg(feature = "mp3-encoding")]
 pub mod mp3enc;
 mod mpegts_qc;
+pub mod multi_delivery;
 mod mxf_qc;
 pub mod nmos_qc;
 pub mod normalization_diff;

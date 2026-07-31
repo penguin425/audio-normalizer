@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/multi-delivery-report-v1.schema.json",
+  "title": "Forge multi-delivery report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "generator", "method", "source", "source_measurement", "common", "deliveries", "passed"],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/multi-delivery-report-v1"
+    },
+    "generator": {"type": "string", "pattern": "^forge-normalizer/[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "method": {"$ref": "#/$defs/method"},
+    "source": {"$ref": "#/$defs/file"},
+    "source_measurement": {"$ref": "#/$defs/measurement"},
+    "common": {"$ref": "#/$defs/common"},
+    "deliveries": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 32,
+      "items": {"$ref": "#/$defs/delivery"}
+    },
+    "passed": {"type": "boolean"}
+  },
+  "$defs": {
+    "optionalNumber": {"type": ["number", "null"]},
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "bytes": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sample_rate_hz", "channels", "frames", "duration_seconds", "integrated_lufs", "loudness_range_lu", "rms_dbfs", "sample_peak_dbfs", "true_peak_dbtp"],
+      "properties": {
+        "sample_rate_hz": {"type": "integer", "minimum": 1},
+        "channels": {"type": "integer", "minimum": 1, "maximum": 32},
+        "frames": {"type": "integer", "minimum": 0},
+        "duration_seconds": {"type": "number", "minimum": 0},
+        "integrated_lufs": {"$ref": "#/$defs/optionalNumber"},
+        "loudness_range_lu": {"$ref": "#/$defs/optionalNumber"},
+        "rms_dbfs": {"$ref": "#/$defs/optionalNumber"},
+        "sample_peak_dbfs": {"$ref": "#/$defs/optionalNumber"},
+        "true_peak_dbtp": {"$ref": "#/$defs/optionalNumber"}
+      }
+    },
+    "method": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "classification", "common_target_rule", "common_ceiling_rule", "correction_rule", "maximum_deliveries"],
+      "properties": {
+        "id": {"const": "forge-multi-delivery-v1"},
+        "classification": {"type": "string", "minLength": 1},
+        "common_target_rule": {"type": "string", "minLength": 1},
+        "common_ceiling_rule": {"type": "string", "minLength": 1},
+        "correction_rule": {"type": "string", "minLength": 1},
+        "maximum_deliveries": {"const": 32}
+      }
+    },
+    "common": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_lufs", "ceiling_dbtp", "verification_target_lufs", "final_pre_codec_lufs", "shared_gain_db", "verification_tolerance_lu_db", "encoding_passes"],
+      "properties": {
+        "target_lufs": {"type": "number"},
+        "ceiling_dbtp": {"type": "number"},
+        "verification_target_lufs": {"type": "number"},
+        "final_pre_codec_lufs": {"type": "number"},
+        "shared_gain_db": {"type": "number"},
+        "verification_tolerance_lu_db": {"type": "number", "minimum": 0},
+        "encoding_passes": {"type": "integer", "minimum": 1, "maximum": 11}
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "resolved", "target_lufs", "ceiling_dbtp", "evidence", "source_url", "checked_on", "caveat"],
+      "properties": {
+        "requested": {"type": "string", "minLength": 1},
+        "resolved": {"type": "string", "minLength": 1},
+        "target_lufs": {"type": "number"},
+        "ceiling_dbtp": {"type": "number"},
+        "evidence": {"type": ["string", "null"]},
+        "source_url": {"type": ["string", "null"]},
+        "checked_on": {"type": ["string", "null"]},
+        "caveat": {"type": ["string", "null"]}
+      }
+    },
+    "delivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "format", "output", "profile", "decoded", "verification_target_lufs", "final_pre_codec_lufs", "level_deviation_lu", "profile_loudness_headroom_lu", "profile_true_peak_headroom_db", "level_passed", "true_peak_passed", "conservative_profile_bounds_passed", "passed"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_.-]+$"},
+        "format": {"enum": ["wav", "flac", "mp3", "opus", "m4a", "alac", "vorbis"]},
+        "output": {"$ref": "#/$defs/file"},
+        "profile": {"$ref": "#/$defs/profile"},
+        "decoded": {"$ref": "#/$defs/measurement"},
+        "verification_target_lufs": {"type": "number"},
+        "final_pre_codec_lufs": {"type": "number"},
+        "level_deviation_lu": {"type": "number", "minimum": 0},
+        "profile_loudness_headroom_lu": {"type": "number"},
+        "profile_true_peak_headroom_db": {"$ref": "#/$defs/optionalNumber"},
+        "level_passed": {"type": "boolean"},
+        "true_peak_passed": {"type": "boolean"},
+        "conservative_profile_bounds_passed": {"type": "boolean"},
+        "passed": {"type": "boolean"}
+      }
+    }
+  }
+}
