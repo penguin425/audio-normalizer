@@ -185,7 +185,7 @@ jobs:
              "$staging/${{ matrix.library }}"
           mkdir "$staging/include"
           cp include/forge_normalizer.h "$staging/include/"
-          cp README.md BATCH-JOBS.md LICENSE "$staging/"
+          cp README.md BATCH-JOBS.md ANALYSIS-CACHE.md LICENSE "$staging/"
           tar -czf "${staging}.tar.gz" "$staging"
 
       - name: Package Windows binary
@@ -202,7 +202,7 @@ jobs:
           Copy-Item $importLibrary.FullName "$staging/forge_normalizer.lib"
           New-Item -ItemType Directory -Path "$staging/include" | Out-Null
           Copy-Item include/forge_normalizer.h "$staging/include/"
-          Copy-Item "README.md","BATCH-JOBS.md","LICENSE" $staging
+          Copy-Item "README.md","BATCH-JOBS.md","ANALYSIS-CACHE.md","LICENSE" $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
 
       - name: Upload packaged binary
