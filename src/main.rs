@@ -1,6 +1,8 @@
 //! Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer.
 
+use clap::{Arg, CommandFactory};
 use forge_normalizer::adm::{self, ReferenceRendererOptions};
+use forge_normalizer::batch::{BatchAssetSpec, BatchJob, BatchProgressEvent};
 use forge_normalizer::cli;
 use forge_normalizer::codec_qc;
 use forge_normalizer::dsp::limiter::LimiterConfig;
@@ -24,15 +26,58 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tempfile::{Builder, NamedTempFile, TempDir};
 
+#[derive(Debug, Default)]
+struct BatchOptions {
+    job_state: Option<PathBuf>,
+    progress: Option<PathBuf>,
+}
+
 fn main() -> ExitCode {
-    let cli = match cli::Cli::parse_with_config() {
+    let matches = cli::Cli::command()
+        .arg(
+            Arg::new("job_state")
+                .long("job-state")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help(
+                    "Atomically checkpoint a multi-file normalization job and resume an identical invocation",
+                )
+                .conflicts_with_all([
+                    "analyze_only",
+                    "album",
+                    "dry_run",
+                    "gain_only",
+                    "write_tags",
+                    "difference_report",
+                ]),
+        )
+        .arg(
+            Arg::new("progress")
+                .long("progress")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help("Write versioned normalization lifecycle events as NDJSON (`-` for stdout)")
+                .conflicts_with_all([
+                    "analyze_only",
+                    "album",
+                    "dry_run",
+                    "gain_only",
+                    "write_tags",
+                ]),
+        )
+        .get_matches();
+    let batch_options = BatchOptions {
+        job_state: matches.get_one::<PathBuf>("job_state").cloned(),
+        progress: matches.get_one::<PathBuf>("progress").cloned(),
+    };
+    let cli = match cli::Cli::from_matches_with_config(&matches) {
         Ok(cli) => cli,
         Err(error) => {
             eprintln!("forge: error: {error}");
             return ExitCode::from(2);
         }
     };
-    if let Err(e) = run(cli) {
+    if let Err(e) = run(cli, batch_options) {
         eprintln!("forge: error: {e}");
         return ExitCode::from(1);
     }
@@ -68,13 +113,17 @@ fn parse_wav_container(value: &str) -> WavContainer {
     }
 }
 
-fn run(mut cli: cli::Cli) -> Result<(), String> {
-    let pipeline = PipelineFiles::prepare(&mut cli)?;
-    run_paths(cli, pipeline.stdin_requested())?;
+fn run(mut cli: cli::Cli, batch_options: BatchOptions) -> Result<(), String> {
+    let pipeline = PipelineFiles::prepare(&mut cli, &batch_options)?;
+    run_paths(cli, pipeline.stdin_requested(), &batch_options)?;
     pipeline.emit_stdout()
 }
 
-fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
+fn run_paths(
+    mut cli: cli::Cli,
+    stdin_requested: bool,
+    batch_options: &BatchOptions,
+) -> Result<(), String> {
     if let Some(j) = cli.jobs {
         ThreadPoolBuilder::new()
             .num_threads(j)
@@ -889,7 +938,18 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
     }
 
     if !cli.gain_only {
-        validate_outputs(&cli.inputs, &outputs, cli.overwrite)?;
+        if batch_options.job_state.is_some() && cli.inputs.len() < 2 {
+            return Err("--job-state requires at least two expanded input files".into());
+        }
+        if stdin_requested
+            && (batch_options.job_state.is_some() || batch_options.progress.is_some())
+        {
+            return Err("--job-state and --progress cannot be used with stdin".into());
+        }
+        validate_control_paths(&cli, batch_options, &outputs)?;
+        if cli.album {
+            validate_outputs(&cli.inputs, &outputs, cli.overwrite)?;
+        }
     }
     let mut difference_assets = Vec::new();
 
@@ -1043,6 +1103,57 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
         return Ok(());
     }
 
+    let operation = batch_operation_descriptor(&cli, &plan, &formats);
+    let batch_assets = cli
+        .inputs
+        .iter()
+        .zip(&outputs)
+        .map(|(input, output)| BatchAssetSpec::new(input, output))
+        .collect::<Vec<_>>();
+    let mut batch_job = batch_options
+        .job_state
+        .as_ref()
+        .map(|path| BatchJob::open(path, &batch_assets, &operation, cli.overwrite))
+        .transpose()?;
+    let pending_inputs = cli
+        .inputs
+        .iter()
+        .zip(&outputs)
+        .enumerate()
+        .filter(|(index, _)| {
+            !batch_job
+                .as_ref()
+                .is_some_and(|job| job.is_completed(*index))
+        })
+        .map(|(_, pair)| pair)
+        .collect::<Vec<_>>();
+    validate_outputs(
+        &pending_inputs
+            .iter()
+            .map(|(input, _)| (*input).clone())
+            .collect::<Vec<_>>(),
+        &pending_inputs
+            .iter()
+            .map(|(_, output)| (*output).clone())
+            .collect::<Vec<_>>(),
+        cli.overwrite,
+    )?;
+    let mut progress = batch_options
+        .progress
+        .as_deref()
+        .map(ProgressWriter::open)
+        .transpose()?;
+    let initial_completed = batch_job.as_ref().map_or(0, BatchJob::completed_count);
+    if let Some(writer) = &mut progress {
+        writer.emit(
+            "job_started",
+            initial_completed,
+            cli.inputs.len(),
+            None,
+            None,
+        )?;
+    }
+
     for (index, ((input, output), fmt)) in cli
         .inputs
         .iter()
@@ -1050,92 +1161,162 @@ fn run_paths(mut cli: cli::Cli, stdin_requested: bool) -> Result<(), String> {
         .zip(formats.iter())
         .enumerate()
     {
-        if cli.gain_only || cli.dry_run {
-            let an =
-                normalize::analyze_file_for_plan(input, channel_roles_override.as_deref(), &plan)?;
-            let gain = normalize::compute_gain(&an, &plan);
-            print_analysis(input, &an, Some(gain));
-            if cli.dry_run {
-                eprintln!("  would write {}", output.display());
-            }
-        } else {
-            prepare_output_directories(std::slice::from_ref(output))?;
-            if cli.verify {
-                let corrected = normalize::normalize_one_corrected_with_roles(
-                    input,
-                    output,
-                    &plan,
-                    *fmt,
-                    cli.verify_tolerance,
-                    cli.verify_retries as usize,
-                    channel_roles_override.as_deref(),
+        if batch_job
+            .as_ref()
+            .is_some_and(|job| job.is_completed(index))
+        {
+            if let Some(writer) = &mut progress {
+                writer.emit(
+                    "asset_skipped",
+                    batch_job
+                        .as_ref()
+                        .expect("checked batch job")
+                        .completed_count(),
+                    cli.inputs.len(),
+                    Some((index, input, output)),
+                    None,
                 )?;
-                print_analysis(input, &corrected.source, Some(corrected.gain));
-                if !print_verification(input, &corrected.verification, &plan) {
-                    return Err(format!(
-                        "post-encode verification failed: {}",
-                        output.display()
-                    ));
-                }
-                if corrected.attempts > 1 {
-                    eprintln!(
-                        "{} correction: {} re-encode pass(es)",
-                        input.display(),
-                        corrected.attempts - 1
-                    );
-                }
-                if cli.difference_report.is_some() {
-                    difference_assets.push(normalization_diff::build_asset(
-                        &difference_inputs[index],
-                        output,
-                        *fmt,
-                        &plan,
-                        normalization_diff::AssetMeasurements {
-                            source: &corrected.source,
-                            output: &corrected.verification.output,
-                            gain: corrected.gain,
-                            render: &corrected.render,
-                        },
-                    )?);
+            }
+            continue;
+        }
+        if let Some(writer) = &mut progress {
+            writer.emit(
+                "asset_started",
+                batch_job.as_ref().map_or(index, BatchJob::completed_count),
+                cli.inputs.len(),
+                Some((index, input, output)),
+                None,
+            )?;
+        }
+        let result = (|| -> Result<(), String> {
+            if cli.gain_only || cli.dry_run {
+                let an = normalize::analyze_file_for_plan(
+                    input,
+                    channel_roles_override.as_deref(),
+                    &plan,
+                )?;
+                let gain = normalize::compute_gain(&an, &plan);
+                print_analysis(input, &an, Some(gain));
+                if cli.dry_run {
+                    eprintln!("  would write {}", output.display());
                 }
             } else {
-                if cli.difference_report.is_some() {
-                    let (an, gain, render) = normalize::normalize_one_audited_with_roles(
+                prepare_output_directories(std::slice::from_ref(output))?;
+                if cli.verify {
+                    let corrected = normalize::normalize_one_corrected_with_roles(
                         input,
                         output,
                         &plan,
                         *fmt,
+                        cli.verify_tolerance,
+                        cli.verify_retries as usize,
                         channel_roles_override.as_deref(),
                     )?;
-                    print_analysis(input, &an, Some(gain));
-                    let output_analysis = normalize::analyze_file_with_roles(
-                        output,
-                        channel_roles_override.as_deref(),
-                    )?;
-                    difference_assets.push(normalization_diff::build_asset(
-                        &difference_inputs[index],
-                        output,
-                        *fmt,
-                        &plan,
-                        normalization_diff::AssetMeasurements {
-                            source: &an,
-                            output: &output_analysis,
-                            gain,
-                            render: &render,
-                        },
-                    )?);
+                    print_analysis(input, &corrected.source, Some(corrected.gain));
+                    if !print_verification(input, &corrected.verification, &plan) {
+                        return Err(format!(
+                            "post-encode verification failed: {}",
+                            output.display()
+                        ));
+                    }
+                    if corrected.attempts > 1 {
+                        eprintln!(
+                            "{} correction: {} re-encode pass(es)",
+                            input.display(),
+                            corrected.attempts - 1
+                        );
+                    }
+                    if cli.difference_report.is_some() {
+                        difference_assets.push(normalization_diff::build_asset(
+                            &difference_inputs[index],
+                            output,
+                            *fmt,
+                            &plan,
+                            normalization_diff::AssetMeasurements {
+                                source: &corrected.source,
+                                output: &corrected.verification.output,
+                                gain: corrected.gain,
+                                render: &corrected.render,
+                            },
+                        )?);
+                    }
                 } else {
-                    let (an, gain) = normalize::normalize_one_with_roles(
-                        input,
-                        output,
-                        &plan,
-                        *fmt,
-                        channel_roles_override.as_deref(),
-                    )?;
-                    print_analysis(input, &an, Some(gain));
+                    if cli.difference_report.is_some() {
+                        let (an, gain, render) = normalize::normalize_one_audited_with_roles(
+                            input,
+                            output,
+                            &plan,
+                            *fmt,
+                            channel_roles_override.as_deref(),
+                        )?;
+                        print_analysis(input, &an, Some(gain));
+                        let output_analysis = normalize::analyze_file_with_roles(
+                            output,
+                            channel_roles_override.as_deref(),
+                        )?;
+                        difference_assets.push(normalization_diff::build_asset(
+                            &difference_inputs[index],
+                            output,
+                            *fmt,
+                            &plan,
+                            normalization_diff::AssetMeasurements {
+                                source: &an,
+                                output: &output_analysis,
+                                gain,
+                                render: &render,
+                            },
+                        )?);
+                    } else {
+                        let (an, gain) = normalize::normalize_one_with_roles(
+                            input,
+                            output,
+                            &plan,
+                            *fmt,
+                            channel_roles_override.as_deref(),
+                        )?;
+                        print_analysis(input, &an, Some(gain));
+                    }
                 }
             }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if let Some(writer) = &mut progress {
+                writer.emit(
+                    "asset_failed",
+                    batch_job.as_ref().map_or(index, BatchJob::completed_count),
+                    cli.inputs.len(),
+                    Some((index, input, output)),
+                    Some(&error),
+                )?;
+            }
+            return Err(error);
         }
+        if let Some(job) = &mut batch_job {
+            job.mark_completed(index)?;
+        }
+        if let Some(writer) = &mut progress {
+            writer.emit(
+                "asset_completed",
+                batch_job
+                    .as_ref()
+                    .map_or(index + 1, BatchJob::completed_count),
+                cli.inputs.len(),
+                Some((index, input, output)),
+                None,
+            )?;
+        }
+    }
+    if let Some(writer) = &mut progress {
+        writer.emit(
+            "job_completed",
+            batch_job
+                .as_ref()
+                .map_or(cli.inputs.len(), BatchJob::completed_count),
+            cli.inputs.len(),
+            None,
+            None,
+        )?;
     }
     if let Some(path) = &cli.difference_report {
         write_difference_report(path, difference_assets)?;
@@ -1191,7 +1372,7 @@ impl PipelineFiles {
         self._stdin_file.is_some()
     }
 
-    fn prepare(cli: &mut cli::Cli) -> Result<Self, String> {
+    fn prepare(cli: &mut cli::Cli, batch_options: &BatchOptions) -> Result<Self, String> {
         let stdin_requested = cli.inputs.iter().any(|path| path.as_os_str() == "-");
         let stdout_requested = cli
             .output
@@ -1204,6 +1385,9 @@ impl PipelineFiles {
         if stdout_requested {
             if cli.inputs.len() != 1 {
                 return Err("stdout (`-`) supports exactly one input".into());
+            }
+            if batch_options.progress.as_deref() == Some(Path::new("-")) {
+                return Err("binary output and --progress cannot both use stdout".into());
             }
             if cli.analyze_only || cli.gain_only || cli.dry_run || cli.write_tags || cli.album {
                 return Err(
@@ -1281,6 +1465,141 @@ impl PipelineFiles {
         destination
             .flush()
             .map_err(|error| format!("flush stdout: {error}"))
+    }
+}
+
+struct ProgressWriter {
+    output: Box<dyn Write>,
+    sequence: u64,
+}
+
+impl ProgressWriter {
+    fn open(path: &Path) -> Result<Self, String> {
+        let output: Box<dyn Write> = if path == Path::new("-") {
+            Box::new(io::stdout())
+        } else {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| format!("create {}: {error}", parent.display()))?;
+            }
+            Box::new(
+                File::create(path)
+                    .map_err(|error| format!("create {}: {error}", path.display()))?,
+            )
+        };
+        Ok(Self {
+            output,
+            sequence: 0,
+        })
+    }
+
+    fn emit(
+        &mut self,
+        event: &'static str,
+        completed: usize,
+        total: usize,
+        asset: Option<(usize, &Path, &Path)>,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        let mut record = BatchProgressEvent::new(self.sequence, event, completed, total);
+        if let Some((index, input, output)) = asset {
+            record.index = Some(index);
+            record.input = Some(input.to_string_lossy().into_owned());
+            record.output = Some(output.to_string_lossy().into_owned());
+        }
+        record.error = error.map(str::to_owned);
+        serde_json::to_writer(&mut self.output, &record)
+            .map_err(|error| format!("write progress event: {error}"))?;
+        self.output
+            .write_all(b"\n")
+            .and_then(|_| self.output.flush())
+            .map_err(|error| format!("flush progress event: {error}"))?;
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| "progress event sequence overflow".to_string())?;
+        Ok(())
+    }
+}
+
+fn batch_operation_descriptor(
+    cli: &cli::Cli,
+    plan: &Plan,
+    formats: &[OutputFormat],
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "forge-normalization-operation-v1",
+        "mode": match plan.mode {
+            Mode::Lufs => "lufs",
+            Mode::Peak => "peak",
+            Mode::Rms => "rms",
+        },
+        "target_lufs": plan.target_lufs,
+        "target_peak_dbfs": plan.target_peak_db,
+        "target_rms_dbfs": plan.target_rms_db,
+        "ceiling_dbtp": plan.ceiling_db,
+        "max_gain_db": plan.max_gain_db,
+        "dither": plan.dither,
+        "output_bits": cli.bits,
+        "bitrate_kbps": plan.mp3_bitrate,
+        "encoder_quality": plan.mp3_quality,
+        "limiter": plan.limiter.as_ref().map(|limiter| serde_json::json!({
+            "lookahead_ms": limiter.lookahead_ms,
+            "release_ms": limiter.release_ms,
+        })),
+        "wav_container": cli.wav_container,
+        "bwf": plan.bwf,
+        "output_sample_rate_hz": plan.output_sample_rate,
+        "resample_quality": cli.resample_quality,
+        "verify": cli.verify,
+        "verify_tolerance": cli.verify_tolerance,
+        "verify_retries": cli.verify_retries,
+        "channel_layout": cli.channel_layout,
+        "dual_mono": cli.dual_mono,
+        "formats": formats.iter().map(|format| fmt_ext(*format)).collect::<Vec<_>>(),
+    })
+}
+
+fn validate_control_paths(
+    cli: &cli::Cli,
+    batch_options: &BatchOptions,
+    outputs: &[PathBuf],
+) -> Result<(), String> {
+    let mut controls = Vec::new();
+    if let Some(path) = &batch_options.job_state {
+        controls.push(("--job-state", comparison_path(path)?));
+    }
+    if let Some(path) = &batch_options.progress {
+        if path != Path::new("-") {
+            controls.push(("--progress", comparison_path(path)?));
+        }
+    }
+    for (label, control) in &controls {
+        for path in cli.inputs.iter().chain(outputs) {
+            if comparison_path(path)? != *control {
+                continue;
+            }
+            return Err(format!(
+                "{label} must not overwrite an audio input or output: {}",
+                control.display()
+            ));
+        }
+    }
+    if controls.len() == 2 && controls[0].1 == controls[1].1 {
+        return Err("--job-state and --progress require different paths".into());
+    }
+    Ok(())
+}
+
+fn comparison_path(path: &Path) -> Result<PathBuf, String> {
+    if path.exists() {
+        std::fs::canonicalize(path)
+            .map_err(|error| format!("canonicalize {}: {error}", path.display()))
+    } else {
+        std::path::absolute(path).map_err(|error| format!("resolve {}: {error}", path.display()))
     }
 }
 
