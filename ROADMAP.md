@@ -32,6 +32,10 @@ Forge already provides:
   configuration profile/level, and ordering checks, plus a versioned external
   conforming-decoder adapter for complete audio-scene group/switch/preset
   validation and independently measured presentation loudness/true peak.
+- Native, bounded DTS core/HD elementary-stream framing for all four core wire
+  representations and DTS-HD extension substreams, plus a versioned optional
+  licensed/reference-decoder adapter that enumerates every asset and
+  presentation and independently measures each WAVE render.
 - Bounded standalone, unfragmented, fragmented, and CENC-protected ISO-BMFF
   AOMedia IAMF v1.1
   QC with
@@ -224,8 +228,6 @@ generations.
 
 ### Codec-specific QC
 
-- DTS core/HD metadata and decoded presentation checks through an optional
-  adapter.
 - WavPack, Monkey's Audio, and ALAC native frame/checksum validation.
 
 ### Loudness workflow depth
