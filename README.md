@@ -1706,6 +1706,23 @@ MHAS profile/level to the decoder response, and independently measures every
 WAVE render. See [MPEGH-ADAPTER.md](MPEGH-ADAPTER.md) for the versioned JSON
 contract, current ISO standards, limits, and trust boundary.
 
+For raw DTS core or DTS-HD elementary streams, `forge-dts-qc` validates every
+frame boundary itself, including 16-bit/14-bit BE/LE core forms, core metadata,
+DWORD padding, and DTS-HD extension-substream sizes and static counts. It then
+uses an explicitly selected licensed or reference adapter to enumerate every
+asset and presentation and render each presentation once:
+
+```bash
+forge-dts-qc programme.dtshd --adapter /opt/vendor/forge-dts-adapter \
+  --output dts-qc.json --max-true-peak-dbtp -1.0
+```
+
+Forge checks each render's declared sample rate and channels, records the exact
+dialog-normalization/DRC policy, and independently measures integrated LUFS and
+true peak. DTS dialog normalization remains separate metadata and is never
+treated as programme loudness. See [DTS-ADAPTER.md](DTS-ADAPTER.md) for the
+ETSI TS 102 114 protocol contract and safety bounds.
+
 Ordered S-ADM XML frames can be checked as a live-flow capture:
 
 ```bash
@@ -1916,6 +1933,7 @@ src/
   aes31_qc.rs       bounded AES31-3 EDML project/reference/timing QC
   ac4_adapter.rs    bounded licensed/reference AC-4 decoder adapter + evidence
   mpegh_adapter.rs  native MHAS framing + bounded conforming decoder adapter
+  dts_adapter.rs    native DTS core/HD framing + bounded decoder adapter
   flacenc.rs        bounded-memory pure-Rust FLAC encoder
   opus.rs           RFC 7845 mono/stereo and Mapping Family 1 Ogg Opus I/O
   mp3enc.rs         mono/stereo LAME encoder with gapless Info/LAME backpatch
@@ -1942,6 +1960,7 @@ src/
   bin/forge-aes31-qc.rs AES31-3 EDML project audit CLI
   bin/forge-ac4-qc.rs licensed/reference AC-4 presentation audit CLI
   bin/forge-mpegh-qc.rs MHAS/scene/preset/render MPEG-H audit CLI
+  bin/forge-dts-qc.rs DTS core/HD asset/presentation audit CLI
   lv2.rs            hard-real-time-capable LV2 stereo plugin ABI
   clap_plugin.rs    CLAP stereo effect, automation, state, and latency ABI
   preset.rs         named playback and broadcast loudness targets

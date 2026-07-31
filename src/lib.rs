@@ -48,6 +48,7 @@ pub mod decoder;
 pub mod dialogue_provider;
 pub mod dsd;
 pub mod dsp;
+pub mod dts_adapter;
 mod flac_qc;
 pub mod flacenc;
 pub mod hls_qc;
