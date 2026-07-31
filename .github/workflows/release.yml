@@ -13,6 +13,9 @@ on:
       - "src/c_api.rs"
       - "src/lib.rs"
       - "PYTHON-API.md"
+      - "BENCHMARKS.md"
+      - "tools/benchmark.py"
+      - "schema/performance-benchmark-v1.schema.json"
       - "tools/build-python-wheel.py"
       - "tools/build-wasm-package.sh"
       - "tools/package-linux-release.sh"
@@ -185,7 +188,10 @@ jobs:
              "$staging/${{ matrix.library }}"
           mkdir "$staging/include"
           cp include/forge_normalizer.h "$staging/include/"
-          cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md LICENSE "$staging/"
+          mkdir "$staging/tools" "$staging/schema"
+          cp tools/benchmark.py "$staging/tools/"
+          cp schema/performance-benchmark-v1.schema.json "$staging/schema/"
+          cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md LICENSE "$staging/"
           tar -czf "${staging}.tar.gz" "$staging"
 
       - name: Package Windows binary
@@ -202,7 +208,10 @@ jobs:
           Copy-Item $importLibrary.FullName "$staging/forge_normalizer.lib"
           New-Item -ItemType Directory -Path "$staging/include" | Out-Null
           Copy-Item include/forge_normalizer.h "$staging/include/"
-          Copy-Item "README.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","LICENSE" $staging
+          New-Item -ItemType Directory -Path "$staging/tools","$staging/schema" | Out-Null
+          Copy-Item tools/benchmark.py "$staging/tools/"
+          Copy-Item schema/performance-benchmark-v1.schema.json "$staging/schema/"
+          Copy-Item "README.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","LICENSE" $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
 
       - name: Upload packaged binary

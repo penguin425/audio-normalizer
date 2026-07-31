@@ -47,7 +47,10 @@ cp "target/${target}/release/libforge_normalizer.so" \
   "$staging/forge-live.lv2/forge_live.so"
 mkdir "$staging/include"
 cp include/forge_normalizer.h "$staging/include/"
-cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md LICENSE "$staging/"
+mkdir "$staging/tools" "$staging/schema"
+cp tools/benchmark.py "$staging/tools/"
+cp schema/performance-benchmark-v1.schema.json "$staging/schema/"
+cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md LICENSE "$staging/"
 
 find "$staging" -exec touch -h -d "@${source_date_epoch}" {} +
 tar \

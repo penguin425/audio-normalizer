@@ -178,6 +178,10 @@ Forge already provides:
   measurement and algorithm revisions, selected profile, Forge version,
   bounded structured provenance, transactional deduplication, and atomic
   per-invocation JSON evidence export.
+- Versioned, standard-library-only performance harness for generated one-hour
+  stereo and 7.1 WAVE normalization, FLAC/MP3 analysis, and bounded
+  pathological WAVE QC, with normalized CPU/RSS evidence and compatible-host
+  baseline regression gates.
 - Bounded AAF stored-format, dynamic MetaDictionary, and core object-model/Edit
   Protocol QC with CFB/file/root identity, property/reference-index decoding,
   dynamically declared class/property/type graphs and extension values,
@@ -277,8 +281,6 @@ failure behaviour are documented.
 
 - TUI/GUI views for waveform, loudness timeline, true peak, QC events, channel
   correlation, and before/after comparison.
-- CPU/memory benchmarks for hour-long stereo, multichannel, lossless, lossy,
-  and pathological inputs.
 - Internationalized CLI diagnostics and accessible visualizations.
 
 ## Acceptance rules

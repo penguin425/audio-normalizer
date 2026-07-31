@@ -99,17 +99,19 @@ the `-o` extension override this.
 
 ### Benchmark
 
-On a 32-core host:
+Forge includes a reproducible, versioned CPU/memory benchmark harness:
 
-```
-# 60 s 48 kHz stereo WAV -> WAV (read + K-weight + LUFS + 4x true-peak + gain + write)
-Elapsed: 0.21 s   (~286x real-time)   CPU: 174%   RSS: 93 MB
-
-# 60 s 48 kHz stereo WAV -> MP3 @320 kbps (read + analyze + gain + LAME encode)
-Elapsed: 0.75 s   (~80x real-time)    CPU: 115%   RSS: 93 MB
+```sh
+cargo build --locked --release --bin forge --bin forge-container-qc
+python3 tools/benchmark.py --forge target/release/forge --output benchmark.json
 ```
 
-Decoded MP3 output lands within ~0.3 LU of the target (lossy round-trip).
+The suite covers one-hour stereo and 7.1 WAVE normalization, lossless FLAC and
+lossy MP3 analysis, and bounded rejection of a pathological WAVE chunk
+population. Fixture generation is excluded from measurement. Reports include
+wall/CPU time, peak RSS, real-time factor, host identity, workload settings,
+and optional same-host regression checks. See [BENCHMARKS.md](BENCHMARKS.md)
+for the contract, safety limits, and short smoke command.
 
 ## Why it's correct
 
