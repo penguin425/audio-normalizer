@@ -87,3 +87,4 @@ pub mod sadm;
 pub mod segment_normalize;
 pub mod watch;
 pub mod wav;
+mod wavpack_qc;

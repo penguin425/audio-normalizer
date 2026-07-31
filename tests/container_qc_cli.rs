@@ -8,6 +8,70 @@ use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::process::Command;
 
+fn wavpack_checksum(bytes: &[u8], width: usize) -> [u8; 4] {
+    let mut sum = u32::MAX;
+    for word in bytes.chunks_exact(2) {
+        sum = sum
+            .wrapping_mul(3)
+            .wrapping_add(u16::from_le_bytes([word[0], word[1]]) as u32);
+    }
+    if width == 2 {
+        sum ^= sum >> 16;
+    }
+    sum.to_le_bytes()
+}
+
+fn minimal_wavpack() -> Vec<u8> {
+    let mut bytes = vec![0_u8; 32];
+    bytes[..4].copy_from_slice(b"wvpk");
+    bytes[8..10].copy_from_slice(&0x410_u16.to_le_bytes());
+    bytes[12..16].copy_from_slice(&32_u32.to_le_bytes());
+    bytes[20..24].copy_from_slice(&32_u32.to_le_bytes());
+    let flags = 1_u32 | (1 << 2) | (1 << 11) | (1 << 12) | (10 << 23) | (1 << 28);
+    bytes[24..28].copy_from_slice(&flags.to_le_bytes());
+    bytes.extend_from_slice(&[0x2a, 0]);
+    let final_size = (bytes.len() + 6 - 8) as u32;
+    bytes[4..8].copy_from_slice(&final_size.to_le_bytes());
+    let checksum = wavpack_checksum(&bytes, 4);
+    bytes.extend_from_slice(&[0x2f, 2]);
+    bytes.extend_from_slice(&checksum);
+    bytes
+}
+
+#[test]
+fn container_qc_cli_validates_wavpack_encoded_block_checksums() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("archive.wv");
+    fs::write(&path, minimal_wavpack()).unwrap();
+    let valid = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(valid.status.success(), "{valid:#?}");
+    let audit: Value = serde_json::from_slice(&valid.stdout).unwrap();
+    assert_eq!(audit["format"], "wavpack");
+    assert_eq!(audit["properties"]["encoded_block_checksums"], 1);
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/container-qc-v1.schema.json")).unwrap();
+    assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&audit));
+
+    let mut corrupt = minimal_wavpack();
+    *corrupt.last_mut().unwrap() ^= 1;
+    fs::write(&path, corrupt).unwrap();
+    let invalid = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(1));
+    let audit: Value = serde_json::from_slice(&invalid.stdout).unwrap();
+    assert_eq!(audit["passed"], false);
+    assert!(audit["layers"].as_array().unwrap().iter().any(|layer| {
+        layer["checks"].as_array().unwrap().iter().any(|item| {
+            item["rule_id"] == "FORGE-WAVPACK-ENCODED-CHECKSUM" && item["passed"] == false
+        })
+    }));
+}
+
 fn minimal_iamf_mix(audio_element_id: u8) -> Vec<u8> {
     vec![
         0,

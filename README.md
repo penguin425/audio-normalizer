@@ -333,6 +333,7 @@ forge-container-qc archive.aiff
 forge-container-qc capture.caf
 forge-container-qc archive.dsf
 forge-container-qc master.dff
+forge-container-qc archive.wv
 forge-container-qc master.flac
 forge-container-qc delivery.mp3
 forge-container-qc broadcast.aac
@@ -348,6 +349,15 @@ forge-container-qc edit-project.aaf
 forge-container-qc programme.mka
 forge-container-qc delivery.webm
 ```
+
+For WavPack 4/5 files, the audit walks bounded `wvpk` blocks without decoding,
+checks header versions, sizes, metadata word lengths and padding, multichannel
+`INITIAL_BLOCK`/`FINAL_BLOCK` grouping, 40-bit sample-index continuity, declared
+total samples, and stable rate/channel/numeric format. WavPack 5 encoded-block
+checksums are recomputed over the exact little-endian 16-bit words using the
+reference algorithm; 16-bit hybrid/correction-style and 32-bit lossless
+checksums are both supported. The separate header CRC covers decoded samples,
+so reports identify it without claiming verification when no decoder ran.
 
 AAF audits identify the AMWA stored format by its Compound File Binary header
 and root CLSIDs, validate the CFB allocation/directory structure, require the
@@ -1934,6 +1944,7 @@ src/
   ac4_adapter.rs    bounded licensed/reference AC-4 decoder adapter + evidence
   mpegh_adapter.rs  native MHAS framing + bounded conforming decoder adapter
   dts_adapter.rs    native DTS core/HD framing + bounded decoder adapter
+  wavpack_qc.rs     native WavPack block/metadata/checksum structural QC
   flacenc.rs        bounded-memory pure-Rust FLAC encoder
   opus.rs           RFC 7845 mono/stereo and Mapping Family 1 Ogg Opus I/O
   mp3enc.rs         mono/stereo LAME encoder with gapless Info/LAME backpatch
