@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/ac4-adapter-response-v1",
+  "title": "Forge AC-4 adapter response v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "protocol_version", "input_sha256", "decoder", "ac4_part1_standard", "ac4_part2_standard", "presentation_count", "presentations"],
+  "properties": {
+    "schema": {"const": "https://penguin425.github.io/audio-normalizer/schema/ac4-adapter-response-v1"},
+    "protocol_version": {"const": 1},
+    "input_sha256": {"type": "string", "pattern": "^[0-9A-Fa-f]{64}$"},
+    "decoder": {"$ref": "#/$defs/decoder"},
+    "ac4_part1_standard": {"const": "ETSI TS 103 190-1 V1.4.1 (2025-07)"},
+    "ac4_part2_standard": {"const": "ETSI TS 103 190-2 V1.3.1 (2025-07)"},
+    "presentation_count": {"type": "integer", "minimum": 1, "maximum": 256},
+    "presentations": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"$ref": "#/$defs/presentation"}}
+  },
+  "$defs": {
+    "decoder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1}
+      }
+    },
+    "loudness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dialnorm_bits", "dialnorm_lkfs", "dialnorm_source"],
+      "properties": {
+        "dialnorm_bits": {"type": "integer", "minimum": 0, "maximum": 127},
+        "dialnorm_lkfs": {"type": "number", "minimum": -31.75, "maximum": 0},
+        "dialnorm_source": {"enum": ["presentation-substream", "associated-basic-metadata", "main-or-dialogue-substream"]},
+        "downmix_correction_db": {"type": ["number", "null"], "minimum": -64, "maximum": 64},
+        "alternative_presentation_correction_db": {"type": ["number", "null"], "minimum": -64, "maximum": 64},
+        "realtime_correction_db": {"type": ["number", "null"], "minimum": -64, "maximum": 64}
+      }
+    },
+    "presentation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "presentation_version", "rendered_path", "output_layout", "loudness"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"},
+        "presentation_version": {"type": "integer", "minimum": 0, "maximum": 1},
+        "rendered_path": {"type": "string", "pattern": "^[^/\\\\].*\\.wav$"},
+        "output_layout": {"type": "string", "minLength": 1, "maxLength": 64},
+        "language": {"type": ["string", "null"]},
+        "accessibility": {"type": ["string", "null"]},
+        "loudness": {"$ref": "#/$defs/loudness"}
+      }
+    }
+  }
+}

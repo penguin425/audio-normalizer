@@ -24,6 +24,7 @@ mod aaf_meta_qc;
 mod aaf_object_qc;
 mod aaf_qc;
 mod ac3_qc;
+pub mod ac4_adapter;
 pub mod adm;
 pub mod aes31_qc;
 pub mod analysis;
