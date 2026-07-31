@@ -22,12 +22,14 @@ use forge_normalizer::qc::{self, QcOptions};
 use forge_normalizer::report::{
     self, AnalysisReport, CodecMetadata, ComplianceProfile, TimelineReport,
 };
+use forge_normalizer::watch::{WatchCandidate, WatchFolder};
 use forge_normalizer::wav::{named_channel_layout, ChannelRole, PcmKind, WavContainer};
 use rayon::ThreadPoolBuilder;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 use tempfile::{Builder, NamedTempFile, TempDir};
 
 #[derive(Debug, Default)]
@@ -36,11 +38,21 @@ struct BatchOptions {
     progress: Option<PathBuf>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct CacheOptions {
     directory: Option<PathBuf>,
     read_only: bool,
     max_mib: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct WatchOptions {
+    enabled: bool,
+    state: Option<PathBuf>,
+    stable_seconds: Option<u64>,
+    poll_seconds: Option<u64>,
+    once: bool,
+    retry_failed: bool,
 }
 
 impl CacheOptions {
@@ -118,6 +130,70 @@ fn main() -> ExitCode {
                 .requires("analysis_cache")
                 .help("Bound recognized cache entries (default: 1024 MiB)"),
         )
+        .arg(
+            Arg::new("watch")
+                .long("watch")
+                .action(ArgAction::SetTrue)
+                .help("Continuously normalize stable files discovered below the input directory")
+                .conflicts_with_all([
+                    "analyze_only",
+                    "album",
+                    "dry_run",
+                    "gain_only",
+                    "write_tags",
+                    "start_seconds",
+                    "duration_seconds",
+                    "timeline",
+                    "compliance",
+                    "dialogue_ranges",
+                    "auto_dialogue",
+                    "codec_qc",
+                    "downmix_qc",
+                    "manifest",
+                    "ebu_qc",
+                    "difference_report",
+                    "job_state",
+                    "progress",
+                ]),
+        )
+        .arg(
+            Arg::new("watch_state")
+                .long("watch-state")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .requires("watch")
+                .help("Atomically persist stable-file observations and processing results"),
+        )
+        .arg(
+            Arg::new("watch_stable_seconds")
+                .long("watch-stable-seconds")
+                .value_name("SECONDS")
+                .value_parser(clap::value_parser!(u64).range(1..))
+                .requires("watch")
+                .help("Require unchanged size and modification time for this interval (default: 5)"),
+        )
+        .arg(
+            Arg::new("watch_poll_seconds")
+                .long("watch-poll-seconds")
+                .value_name("SECONDS")
+                .value_parser(clap::value_parser!(u64).range(1..))
+                .requires("watch")
+                .help("Delay between directory scans (default: 2)"),
+        )
+        .arg(
+            Arg::new("watch_once")
+                .long("watch-once")
+                .action(ArgAction::SetTrue)
+                .requires("watch")
+                .help("Scan once, process files already stable in durable state, and exit"),
+        )
+        .arg(
+            Arg::new("watch_retry_failed")
+                .long("watch-retry-failed")
+                .action(ArgAction::SetTrue)
+                .requires("watch")
+                .help("Requeue unchanged failed entries once at startup"),
+        )
         .get_matches();
     let batch_options = BatchOptions {
         job_state: matches.get_one::<PathBuf>("job_state").cloned(),
@@ -128,6 +204,14 @@ fn main() -> ExitCode {
         read_only: matches.get_flag("analysis_cache_read_only"),
         max_mib: matches.get_one::<u64>("analysis_cache_max_mib").copied(),
     };
+    let watch_options = WatchOptions {
+        enabled: matches.get_flag("watch"),
+        state: matches.get_one::<PathBuf>("watch_state").cloned(),
+        stable_seconds: matches.get_one::<u64>("watch_stable_seconds").copied(),
+        poll_seconds: matches.get_one::<u64>("watch_poll_seconds").copied(),
+        once: matches.get_flag("watch_once"),
+        retry_failed: matches.get_flag("watch_retry_failed"),
+    };
     let cli = match cli::Cli::from_matches_with_config(&matches) {
         Ok(cli) => cli,
         Err(error) => {
@@ -135,7 +219,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if let Err(e) = run(cli, batch_options, cache_options) {
+    if let Err(e) = run(cli, batch_options, cache_options, watch_options) {
         eprintln!("forge: error: {e}");
         return ExitCode::from(1);
     }
@@ -175,7 +259,11 @@ fn run(
     mut cli: cli::Cli,
     batch_options: BatchOptions,
     cache_options: CacheOptions,
+    watch_options: WatchOptions,
 ) -> Result<(), String> {
+    if watch_options.enabled {
+        return run_watch(cli, cache_options, watch_options);
+    }
     let pipeline = PipelineFiles::prepare(&mut cli, &batch_options)?;
     run_paths(
         cli,
@@ -184,6 +272,146 @@ fn run(
         &cache_options,
     )?;
     pipeline.emit_stdout()
+}
+
+fn run_watch(
+    mut cli: cli::Cli,
+    cache_options: CacheOptions,
+    options: WatchOptions,
+) -> Result<(), String> {
+    if cli.inputs.len() != 1 || !cli.inputs[0].is_dir() {
+        return Err("--watch requires exactly one input directory".into());
+    }
+    let output_root = cli
+        .output
+        .clone()
+        .ok_or_else(|| "--watch requires --output DIR".to_string())?;
+    if output_root.exists() && !output_root.is_dir() {
+        return Err(format!(
+            "--watch output is not a directory: {}",
+            output_root.display()
+        ));
+    }
+    std::fs::create_dir_all(&output_root)
+        .map_err(|error| format!("create {}: {error}", output_root.display()))?;
+    let output_root = std::fs::canonicalize(&output_root)
+        .map_err(|error| format!("canonicalize {}: {error}", output_root.display()))?;
+    let state = options
+        .state
+        .ok_or_else(|| "--watch requires --watch-state PATH".to_string())?;
+    let stable_seconds = options.stable_seconds.unwrap_or(5);
+    let poll_seconds = options.poll_seconds.unwrap_or(2);
+    if let Some(jobs) = cli.jobs.take() {
+        ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            .build_global()
+            .map_err(|error| format!("thread pool: {error}"))?;
+    }
+    let operation = watch_operation_descriptor(&cli);
+    let mut watch = WatchFolder::open(
+        state,
+        &cli.inputs[0],
+        &output_root,
+        cli.recursive,
+        Duration::from_secs(stable_seconds),
+        operation,
+    )?;
+    if options.retry_failed {
+        let retried = watch.retry_failed()?;
+        if retried != 0 {
+            eprintln!("watch: requeued {retried} failed file(s)");
+        }
+    }
+    loop {
+        let candidates = watch.scan()?;
+        let mut failures = Vec::new();
+        for candidate in candidates {
+            if let Err(error) =
+                process_watch_candidate(&cli, &cache_options, &mut watch, &candidate, &output_root)
+            {
+                watch.mark_failed(&candidate.id, &error)?;
+                eprintln!("watch failed: {}: {error}", candidate.input.display());
+                failures.push(error);
+            }
+        }
+        if options.once {
+            return if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("{} watched file(s) failed", failures.len()))
+            };
+        }
+        std::thread::sleep(Duration::from_secs(poll_seconds));
+    }
+}
+
+fn process_watch_candidate(
+    template: &cli::Cli,
+    cache_options: &CacheOptions,
+    watch: &mut WatchFolder,
+    candidate: &WatchCandidate,
+    output_root: &Path,
+) -> Result<(), String> {
+    let format = template
+        .format
+        .as_deref()
+        .map(parse_format)
+        .unwrap_or_else(|| default_format_for_input(&candidate.input));
+    let stem = candidate
+        .relative
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("out");
+    let parent = candidate.relative.parent().unwrap_or_else(|| Path::new(""));
+    let output = output_root
+        .join(parent)
+        .join(format!("{stem}_normalized.{}", fmt_ext(format)));
+    if let Some(directory) = output.parent() {
+        std::fs::create_dir_all(directory)
+            .map_err(|error| format!("create {}: {error}", directory.display()))?;
+    }
+    let output = watch.mark_processing(&candidate.id, &output)?;
+    let mut cli = template.clone();
+    cli.inputs = vec![candidate.input.clone()];
+    cli.output = Some(output);
+    cli.recursive = false;
+    cli.overwrite = true;
+    let result = run_paths(cli, false, &BatchOptions::default(), cache_options);
+    match result {
+        Ok(()) => watch.mark_completed(&candidate.id),
+        Err(error) => Err(error),
+    }
+}
+
+fn watch_operation_descriptor(cli: &cli::Cli) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "forge-watch-operation-v1",
+        "generator": format!("forge-normalizer/{}", env!("CARGO_PKG_VERSION")),
+        "preset": cli.preset,
+        "mode": cli.mode,
+        "target_lufs": cli.target_lufs,
+        "target_peak_dbfs": cli.target_peak_db,
+        "target_rms_dbfs": cli.target_rms_db,
+        "ceiling_dbtp": cli.ceiling_db,
+        "max_gain_db": cli.max_gain_db,
+        "format": cli.format,
+        "sample_rate_hz": cli.sample_rate_hz,
+        "resample_quality": cli.resample_quality,
+        "bitrate_kbps": cli.bitrate,
+        "encoder_quality": cli.quality,
+        "channel_layout": cli.channel_layout,
+        "dual_mono": cli.dual_mono,
+        "verify": cli.verify,
+        "verify_tolerance": cli.verify_tolerance,
+        "verify_retries": cli.verify_retries,
+        "limiter": cli.limiter,
+        "limiter_lookahead_ms": cli.limiter_lookahead,
+        "limiter_release_ms": cli.limiter_release,
+        "dither": cli.dither,
+        "bits": cli.bits,
+        "wav_container": cli.wav_container,
+        "bwf": cli.bwf,
+    })
 }
 
 fn run_paths(

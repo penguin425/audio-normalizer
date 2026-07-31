@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "forge",
     version,

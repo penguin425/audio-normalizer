@@ -47,7 +47,7 @@ cp "target/${target}/release/libforge_normalizer.so" \
   "$staging/forge-live.lv2/forge_live.so"
 mkdir "$staging/include"
 cp include/forge_normalizer.h "$staging/include/"
-cp README.md BATCH-JOBS.md ANALYSIS-CACHE.md LICENSE "$staging/"
+cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md LICENSE "$staging/"
 
 find "$staging" -exec touch -h -d "@${source_date_epoch}" {} +
 tar \

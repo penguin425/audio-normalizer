@@ -30,6 +30,169 @@ fn write_batch_test_wav(path: &std::path::Path, frequency_hz: f64) {
 }
 
 #[test]
+fn watch_folder_waits_for_stability_then_checkpoints_and_skips_completed_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let input_directory = directory.path().join("input");
+    let output_directory = directory.path().join("output");
+    let state = directory.path().join("watch.json");
+    std::fs::create_dir(&input_directory).unwrap();
+    let input = input_directory.join("tone.wav");
+    write_batch_test_wav(&input, 440.0);
+    write_batch_test_wav(&input_directory.join("second.wav"), 880.0);
+
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_forge"))
+            .arg(&input_directory)
+            .arg("--watch")
+            .arg("--watch-once")
+            .arg("--watch-state")
+            .arg(&state)
+            .arg("--watch-stable-seconds")
+            .arg("1")
+            .arg("-j")
+            .arg("1")
+            .arg("-o")
+            .arg(&output_directory)
+            .output()
+            .unwrap()
+    };
+    let first = run();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let output = output_directory.join("tone_normalized.wav");
+    assert!(!output.exists());
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let second = run();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(output.is_file());
+    assert!(output_directory.join("second_normalized.wav").is_file());
+    let output_bytes = std::fs::read(&output).unwrap();
+    let state_value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../schema/watch-folder-v1.schema.json")).unwrap();
+    assert!(jsonschema::validator_for(&schema)
+        .unwrap()
+        .is_valid(&state_value));
+    assert!(state_value["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["status"] == "completed"));
+
+    let third = run();
+    assert!(
+        third.status.success(),
+        "{}",
+        String::from_utf8_lossy(&third.stderr)
+    );
+    assert_eq!(std::fs::read(&output).unwrap(), output_bytes);
+
+    std::fs::write(&output, b"tampered").unwrap();
+    let tampered = run();
+    assert!(!tampered.status.success());
+    assert!(String::from_utf8_lossy(&tampered.stderr).contains("changed since checkpoint"));
+}
+
+#[test]
+fn watch_folder_validates_required_paths_and_incompatible_modes() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("input");
+    let output = directory.path().join("output");
+    let state = directory.path().join("watch.json");
+    std::fs::create_dir(&input).unwrap();
+    let help = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    let help = String::from_utf8(help.stdout).unwrap();
+    for option in [
+        "--watch",
+        "--watch-state <PATH>",
+        "--watch-stable-seconds <SECONDS>",
+        "--watch-poll-seconds <SECONDS>",
+        "--watch-once",
+        "--watch-retry-failed",
+    ] {
+        assert!(help.contains(option), "missing help option {option}");
+    }
+
+    let missing_state = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .arg("--watch")
+        .arg("--watch-once")
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(!missing_state.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_state.stderr).contains("--watch requires --watch-state")
+    );
+
+    let analyze = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .arg("--watch")
+        .arg("--watch-state")
+        .arg(&state)
+        .arg("-o")
+        .arg(&output)
+        .arg("--analyze")
+        .output()
+        .unwrap();
+    assert!(!analyze.status.success());
+    assert!(String::from_utf8_lossy(&analyze.stderr).contains("cannot be used with"));
+}
+
+#[test]
+fn recursive_watch_preserves_relative_paths_and_ignores_nested_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("input");
+    let nested = input.join("incoming/album");
+    let output = input.join("normalized");
+    let state = directory.path().join("watch.json");
+    std::fs::create_dir_all(&nested).unwrap();
+    write_batch_test_wav(&nested.join("tone.wav"), 440.0);
+
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_forge"))
+            .arg(&input)
+            .arg("--watch")
+            .arg("--watch-once")
+            .arg("--watch-state")
+            .arg(&state)
+            .arg("--watch-stable-seconds")
+            .arg("1")
+            .arg("--recursive")
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .unwrap()
+    };
+    assert!(run().status.success());
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let processed = run();
+    assert!(
+        processed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&processed.stderr)
+    );
+    assert!(output.join("incoming/album/tone_normalized.wav").is_file());
+    assert!(run().status.success());
+    let state_value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    assert_eq!(state_value["entries"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn recursive_dry_run_preserves_relative_directories() {
     let root = temp_root();
     let input = root.join("input/disc1");
