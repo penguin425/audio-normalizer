@@ -171,6 +171,9 @@ Forge already provides:
 - Opt-in content-addressed core analysis cache with streaming input SHA-256,
   request and algorithm revision binding, atomic schema-validated entries,
   corruption recovery, read-only operation, and bounded FIFO eviction.
+- Stable-file watch folders with symlink-safe bounded discovery, durable
+  atomic processing state, settings and input/output SHA-256 binding,
+  restart recovery, explicit failed-item retry, and one-shot scheduling.
 - Bounded AAF stored-format, dynamic MetaDictionary, and core object-model/Edit
   Protocol QC with CFB/file/root identity, property/reference-index decoding,
   dynamically declared class/property/type graphs and extension values,
@@ -268,7 +271,6 @@ failure behaviour are documented.
 
 ## Product and developer experience
 
-- Watch folders with stable-file detection and durable processing state.
 - SQLite catalogue with source/output hashes, measurement standard/version,
   profile, tool version, and provenance report.
 - TUI/GUI views for waveform, loudness timeline, true peak, QC events, channel

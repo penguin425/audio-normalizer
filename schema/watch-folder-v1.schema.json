@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/watch-folder-v1",
+  "title": "Forge watch folder state v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generator",
+    "input_root",
+    "output_root",
+    "recursive",
+    "stable_for_ms",
+    "operation",
+    "operation_sha256",
+    "entries"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/watch-folder-v1"
+    },
+    "generator": {
+      "type": "string",
+      "pattern": "^forge-normalizer/[0-9]+\\.[0-9]+\\.[0-9]+"
+    },
+    "input_root": {"type": "string", "minLength": 1},
+    "output_root": {"type": "string", "minLength": 1},
+    "recursive": {"type": "boolean"},
+    "stable_for_ms": {"type": "integer", "minimum": 1},
+    "operation": {"type": "object"},
+    "operation_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "entries": {
+      "type": "array",
+      "maxItems": 100000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "relative",
+          "fingerprint",
+          "first_observed_unix_ms",
+          "status"
+        ],
+        "properties": {
+          "relative": {"type": "string", "minLength": 1},
+          "fingerprint": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["size_bytes", "modified_unix_ns"],
+            "properties": {
+              "size_bytes": {"type": "integer", "minimum": 0},
+              "modified_unix_ns": {"type": "integer", "minimum": 0}
+            }
+          },
+          "first_observed_unix_ms": {"type": "integer", "minimum": 0},
+          "status": {
+            "enum": ["observing", "processing", "completed", "failed"]
+          },
+          "input_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "output": {"type": "string", "minLength": 1},
+          "output_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "prior_output_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "error": {"type": "string", "maxLength": 4096}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"status": {"const": "observing"}}},
+            "then": {
+              "not": {
+                "anyOf": [
+                  {"required": ["input_sha256"]},
+                  {"required": ["prior_output_sha256"]},
+                  {"required": ["error"]}
+                ]
+              },
+              "oneOf": [
+                {
+                  "not": {
+                    "anyOf": [
+                      {"required": ["output"]},
+                      {"required": ["output_sha256"]}
+                    ]
+                  }
+                },
+                {"required": ["output", "output_sha256"]}
+              ]
+            }
+          },
+          {
+            "if": {"properties": {"status": {"const": "processing"}}},
+            "then": {
+              "required": ["input_sha256", "output"],
+              "not": {
+                "anyOf": [
+                  {"required": ["output_sha256"]},
+                  {"required": ["error"]}
+                ]
+              }
+            }
+          },
+          {
+            "if": {"properties": {"status": {"const": "completed"}}},
+            "then": {
+              "required": ["input_sha256", "output", "output_sha256"],
+              "not": {
+                "anyOf": [
+                  {"required": ["prior_output_sha256"]},
+                  {"required": ["error"]}
+                ]
+              }
+            }
+          },
+          {
+            "if": {"properties": {"status": {"const": "failed"}}},
+            "then": {
+              "required": ["error"],
+              "not": {"required": ["prior_output_sha256"]},
+              "oneOf": [
+                {
+                  "not": {
+                    "anyOf": [
+                      {"required": ["output"]},
+                      {"required": ["output_sha256"]}
+                    ]
+                  }
+                },
+                {"required": ["output", "output_sha256"]}
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

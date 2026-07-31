@@ -1297,6 +1297,27 @@ semantics, and the versioned
 [`batch-job-v1`](schema/batch-job-v1.schema.json) and
 [`batch-progress-v1`](schema/batch-progress-v1.schema.json) contracts.
 
+### Watch folders
+
+`--watch` continuously discovers supported regular audio files below one input
+directory and processes them only after size and modification time remain
+unchanged for `--watch-stable-seconds` (default 5). A required
+`--watch-state PATH` atomically records observations, in-progress work,
+input/output SHA-256, failures, and restart recovery:
+
+```sh
+forge incoming/ --watch --recursive \
+  --watch-state work/incoming-watch.json \
+  --watch-stable-seconds 10 \
+  --output normalized/
+```
+
+`--watch-once` supports schedulers; `--watch-retry-failed` explicitly requeues
+unchanged failures once without creating an automatic retry loop. See
+[WATCH-FOLDERS.md](WATCH-FOLDERS.md) for recovery, collision, symlink, bounds,
+and edge behavior and the versioned
+[`watch-folder-v1`](schema/watch-folder-v1.schema.json) contract.
+
 ### Content-addressed analysis cache
 
 `--analysis-cache DIR` reuses core BS.1770-5 / EBU R 128 measurements across
@@ -1327,6 +1348,12 @@ the versioned
 | `--recursive` | off | Recursively process input directories |
 | `--job-state` | none | Atomically checkpoint and resume an identical multi-file normalization job |
 | `--progress` | none | Write versioned lifecycle events as NDJSON (`-` for stdout) |
+| `--watch` | off | Continuously normalize stable files discovered below one input directory |
+| `--watch-state` | none | Required atomic observation and processing state for `--watch` |
+| `--watch-stable-seconds` | `5` | Required unchanged size/mtime interval |
+| `--watch-poll-seconds` | `2` | Delay between continuous scans |
+| `--watch-once` | off | Perform one durable scan and exit |
+| `--watch-retry-failed` | off | Requeue unchanged failed entries once at startup |
 | `--analysis-cache` | none | Reuse content-addressed core loudness analyses from a directory |
 | `--analysis-cache-read-only` | off | Permit cache hits without writes, repairs, or eviction |
 | `--analysis-cache-max-mib` | `1024` | Maximum recognized cache-entry storage when the cache is enabled |

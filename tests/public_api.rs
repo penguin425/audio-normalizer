@@ -5,11 +5,13 @@ use forge_normalizer::normalize::{
 };
 use forge_normalizer::preset::{Preset, ProfileEvidence};
 use forge_normalizer::realtime::{RealtimeGainConfig, RealtimeGainProcessor, RealtimeMeter};
+use forge_normalizer::watch::{WatchCandidate, WatchFolder, WATCH_FOLDER_SCHEMA_V1};
 use forge_normalizer::wav::{
     default_channel_roles, AudioBuffer, ChannelRole, PcmKind, WavContainer, WavReader, WavWriter,
 };
 use std::f32::consts::TAU;
 use std::path::Path;
+use std::time::Duration;
 
 #[test]
 fn documented_public_api_works_from_a_downstream_crate() {
@@ -100,6 +102,25 @@ fn documented_public_api_works_from_a_downstream_crate() {
     )
     .expect("normalize with public precomputed-analysis API");
     assert!(preanalyzed_path.is_file());
+
+    let watch_input = temporary.path().join("watch-input");
+    let watch_output = temporary.path().join("watch-output");
+    std::fs::create_dir(&watch_input).expect("create public watch input");
+    let mut watch = WatchFolder::open(
+        temporary.path().join("watch-state.json"),
+        &watch_input,
+        &watch_output,
+        true,
+        Duration::from_secs(5),
+        serde_json::json!({"profile": "ebu-r128"}),
+    )
+    .expect("construct public watch API");
+    let candidates: Vec<WatchCandidate> = watch.scan().expect("scan public watch API");
+    assert!(candidates.is_empty());
+    assert_eq!(
+        WATCH_FOLDER_SCHEMA_V1,
+        "https://penguin425.github.io/audio-normalizer/schema/watch-folder-v1"
+    );
 
     let mut meter = RealtimeMeter::new(sample_rate, vec![ChannelRole::Main, ChannelRole::Main])
         .expect("construct public meter API");
