@@ -250,6 +250,18 @@ pub struct CorrectedAlbumNormalization {
     pub attempts: usize,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CorrectedMultiDeliveryNormalization {
+    pub source: Analysis,
+    /// One linear gain shared by every encoded delivery.
+    pub gain: f32,
+    pub verifications: Vec<Verification>,
+    pub renders: Vec<RenderStatistics>,
+    pub expected_level: f64,
+    /// Number of complete multi-output encoding passes, including the initial pass.
+    pub attempts: usize,
+}
+
 impl Verification {
     pub fn passed(&self) -> bool {
         self.level_ok && self.true_peak_ok
@@ -1567,6 +1579,123 @@ fn normalize_one_corrected_with_optional_analysis(
     unreachable!("the inclusive retry loop always returns")
 }
 
+/// Render one source to several containers with one shared gain, then
+/// re-decode every output. Corrections are accepted only when a single gain
+/// remains feasible for every output's level tolerance and the common
+/// true-peak ceiling.
+pub(crate) fn normalize_multi_delivery_corrected_with_roles(
+    input: &Path,
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    tolerance: f64,
+    max_retries: usize,
+    channel_roles: Option<&[ChannelRole]>,
+) -> Result<CorrectedMultiDeliveryNormalization, String> {
+    if outputs.is_empty() {
+        return Err("multi-delivery requires at least one output".into());
+    }
+    if outputs.len() != formats.len() {
+        return Err("multi-delivery output/format count mismatch".into());
+    }
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err("verification tolerance must be a finite non-negative number".into());
+    }
+    let source = analyze_file_for_plan(input, channel_roles, plan)?;
+    if plan.mode == Mode::Lufs && !source.lufs.is_finite() {
+        return Err("multi-delivery requires finite integrated source loudness".into());
+    }
+    let mut gain = compute_gain(&source, plan);
+    let mut expected_level = None;
+    let staged: Vec<AtomicOutput> = outputs
+        .iter()
+        .map(|output| AtomicOutput::new(output))
+        .collect::<Result<_, _>>()?;
+    let staged_paths: Vec<PathBuf> = staged
+        .iter()
+        .map(|output| output.path().to_owned())
+        .collect();
+
+    for attempt in 0..=max_retries {
+        let renders = staged_paths
+            .iter()
+            .zip(formats)
+            .map(|(output, format)| {
+                normalize_stream(
+                    input,
+                    output,
+                    &source,
+                    gain,
+                    plan,
+                    *format,
+                    StreamRenderOptions {
+                        opus_album_lufs: None,
+                        capture_statistics: true,
+                    },
+                )
+                .map(|render| render.expect("corrected multi-delivery captures render statistics"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let current_intended = analysis_level(&renders[0].intended, plan.mode);
+        let expected = *expected_level.get_or_insert(current_intended);
+        if renders.iter().any(|render| {
+            level_deviation(
+                current_intended,
+                analysis_level(&render.intended, plan.mode),
+            ) > 1.0e-9
+        }) {
+            return Err("multi-delivery pre-codec renders do not share one intended level".into());
+        }
+        let decoded = staged_paths
+            .iter()
+            .map(|path| analyze_file_with_roles(path, channel_roles))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut verifications = decoded
+            .iter()
+            .map(|output| verify_analysis_at_level(output, expected, plan, tolerance))
+            .collect::<Vec<_>>();
+        if verifications.iter().all(Verification::passed) {
+            for ((output, format), decoded) in staged_paths.iter().zip(formats).zip(&decoded) {
+                finalize_metadata(input, output, *format, decoded.lufs, None, plan)?;
+            }
+            // Metadata writers may rewrite a container. Verify the exact
+            // staged bytes that will become visible, not only the encodes
+            // before their final metadata was attached.
+            verifications = staged_paths
+                .iter()
+                .map(|path| {
+                    analyze_file_with_roles(path, channel_roles)
+                        .map(|output| verify_analysis_at_level(&output, expected, plan, tolerance))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if !verifications.iter().all(Verification::passed) {
+                return Err(
+                    "multi-delivery verification failed after final metadata was written".into(),
+                );
+            }
+            for output in staged {
+                output.commit()?;
+            }
+            return Ok(CorrectedMultiDeliveryNormalization {
+                source,
+                gain,
+                verifications,
+                renders,
+                expected_level: expected,
+                attempts: attempt + 1,
+            });
+        }
+        if attempt == max_retries {
+            return Err(format!(
+                "multi-delivery verification failed after {} complete encoding pass(es)",
+                attempt + 1
+            ));
+        }
+        gain = shared_corrected_gain(gain, &verifications, plan, tolerance)?;
+    }
+    unreachable!("the inclusive retry loop always returns")
+}
+
 /// Album loudness from the combined population of all complete gating blocks.
 pub fn album_lufs(analyses: &[Analysis]) -> f64 {
     lufs::gated_lufs(
@@ -2027,6 +2156,47 @@ fn corrected_gain(
     }
     if !corrected.is_finite() || corrected <= 0.0 {
         return Err("automatic correction produced an invalid gain".into());
+    }
+    Ok(corrected as f32)
+}
+
+fn shared_corrected_gain(
+    current_gain: f32,
+    verifications: &[Verification],
+    plan: &Plan,
+    tolerance: f64,
+) -> Result<f32, String> {
+    let mut minimum_adjustment = f64::NEG_INFINITY;
+    let mut maximum_adjustment = f64::INFINITY;
+    for verification in verifications {
+        if !verification.expected_level.is_finite() || !verification.actual_level.is_finite() {
+            return Err("cannot jointly correct a non-finite output level".into());
+        }
+        minimum_adjustment = minimum_adjustment
+            .max(verification.expected_level - tolerance - verification.actual_level);
+        maximum_adjustment = maximum_adjustment
+            .min(verification.expected_level + tolerance - verification.actual_level);
+        if verification.output.true_peak > 0.0 {
+            maximum_adjustment =
+                maximum_adjustment.min(plan.ceiling_db - verification.output.true_peak_db());
+        }
+    }
+    if let Some(max_gain_db) = plan.max_gain_db {
+        maximum_adjustment = maximum_adjustment.min(max_gain_db - gain_db(current_gain));
+    }
+    if !minimum_adjustment.is_finite()
+        || !maximum_adjustment.is_finite()
+        || minimum_adjustment > maximum_adjustment
+    {
+        return Err(
+            "no shared gain can satisfy every delivery's level and true-peak constraints".into(),
+        );
+    }
+    // The quietest feasible point preserves the most headroom while keeping
+    // every decoded output within the requested level tolerance.
+    let corrected = f64::from(current_gain) * 10.0_f64.powf(minimum_adjustment / 20.0);
+    if !corrected.is_finite() || corrected <= 0.0 {
+        return Err("shared gain correction produced an invalid gain".into());
     }
     Ok(corrected as f32)
 }
@@ -2492,6 +2662,37 @@ mod tests {
         let corrected = corrected_gain(1.0, &verification, &plan()).unwrap();
 
         assert!((gain_db(corrected) - (-0.8)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn shared_corrected_gain_uses_quietest_common_feasible_point() {
+        let first = verify_analysis_at_level(&analysis(-16.8, -3.0), -16.0, &plan(), 0.5);
+        let second = verify_analysis_at_level(&analysis(-16.2, -3.0), -16.0, &plan(), 0.5);
+
+        let corrected = shared_corrected_gain(1.0, &[first, second], &plan(), 0.5).unwrap();
+
+        // The intervals are +0.3..+1.3 dB and -0.3..+0.7 dB. Choosing
+        // +0.3 dB is the lowest common point and preserves the most headroom.
+        assert!((gain_db(corrected) - 0.3).abs() < 1e-5);
+    }
+
+    #[test]
+    fn shared_corrected_gain_rejects_disjoint_codec_constraints() {
+        let quiet = verify_analysis_at_level(&analysis(-16.8, -3.0), -16.0, &plan(), 0.1);
+        let loud = verify_analysis_at_level(&analysis(-15.6, -3.0), -16.0, &plan(), 0.1);
+
+        let error = shared_corrected_gain(1.0, &[quiet, loud], &plan(), 0.1).unwrap_err();
+
+        assert!(error.contains("no shared gain"));
+    }
+
+    #[test]
+    fn shared_corrected_gain_obeys_common_true_peak_ceiling() {
+        let quiet = verify_analysis_at_level(&analysis(-16.8, -0.5), -16.0, &plan(), 0.1);
+
+        let error = shared_corrected_gain(1.0, &[quiet], &plan(), 0.1).unwrap_err();
+
+        assert!(error.contains("no shared gain"));
     }
 
     #[test]

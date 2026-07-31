@@ -35,7 +35,8 @@ for binary in \
   forge-rtp-qc \
   forge-nmos-qc \
   forge-st2022-7-qc \
-  forge-report
+  forge-report \
+  forge-multi-delivery
 do
   cp "target/${target}/release/${binary}" "$staging/"
 done
@@ -50,7 +51,10 @@ cp include/forge_normalizer.h "$staging/include/"
 mkdir "$staging/tools" "$staging/schema"
 cp tools/benchmark.py "$staging/tools/"
 cp schema/performance-benchmark-v1.schema.json "$staging/schema/"
-cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md LICENSE "$staging/"
+cp schema/multi-delivery-request-v1.schema.json \
+   schema/multi-delivery-report-v1.schema.json "$staging/schema/"
+cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md \
+   BENCHMARKS.md MULTI-DELIVERY.md LICENSE "$staging/"
 
 find "$staging" -exec touch -h -d "@${source_date_epoch}" {} +
 tar \

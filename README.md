@@ -113,6 +113,25 @@ wall/CPU time, peak RSS, real-time factor, host identity, workload settings,
 and optional same-host regression checks. See [BENCHMARKS.md](BENCHMARKS.md)
 for the contract, safety limits, and short smoke command.
 
+### Multi-delivery optimization
+
+`forge-multi-delivery` derives one conservative target and true-peak ceiling
+from two to 32 versioned delivery profiles, renders every requested codec with
+the same linear gain, and re-decodes every staged output before publishing it.
+It emits schema-validated JSON evidence with hashes, measurements, resolved
+profile provenance, and per-profile headroom:
+
+```sh
+forge-multi-delivery master.wav \
+  --request delivery/multi-delivery.json \
+  --report delivery/multi-delivery-report.json
+```
+
+The method is explicitly non-normative and fails when no shared gain can meet
+all codec constraints; it never substitutes independent output gains. See
+[MULTI-DELIVERY.md](MULTI-DELIVERY.md) for the request contract, algorithm,
+safety rules, examples, optional codec requirements, and report schema.
+
 ## Why it's correct
 
 * **K-weighting** is implemented from the ITU-R BS.1770-5 design equations
