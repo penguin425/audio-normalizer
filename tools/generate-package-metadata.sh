@@ -83,7 +83,8 @@ cat >"${dist_dir}/forge-scoop.json" <<EOF
     "forge-nmos-qc.exe",
     "forge-st2022-7-qc.exe",
     "forge-report.exe",
-    "forge-multi-delivery.exe"
+    "forge-multi-delivery.exe",
+    "forge-segment-normalize.exe"
   ]
 }
 EOF

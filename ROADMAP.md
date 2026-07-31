@@ -186,6 +186,11 @@ Forge already provides:
   using one conservative target, ceiling, and iteratively corrected gain;
   staged post-metadata re-decoding, explicit infeasibility, path-alias and
   overwrite safety, and schema-validated hash/measurement/profile evidence.
+- Versioned two-pass segment-aware catalogue normalization for two to 4096
+  ordered sources, with SHA-256-bound plans, identical adjacent boundary
+  gains, capped cubic smoothstep dB ramps, per-segment memory limits,
+  re-decoded codec/true-peak/duration evidence, and explicit sequential
+  atomic-publication semantics.
 - Bounded AAF stored-format, dynamic MetaDictionary, and core object-model/Edit
   Protocol QC with CFB/file/root identity, property/reference-index decoding,
   dynamically declared class/property/type graphs and extension values,
@@ -228,11 +233,10 @@ generations.
 
 - Loudness-to-dialogue ratio, speech-gated loudness confidence, and manual
   review ranges.
-- Segment-aware normalization with boundary smoothing and a two-pass manifest
-  for large streaming catalogues.
 - Extend metadata-only normalization when additional containers acquire a
   standardized, widely honoured gain mechanism; avoid inventing private gain
   fields where none exists.
+
 ### Immersive, personalized, and accessible audio
 
 - Validate every ADM programme/content/object presentation, not only the

@@ -132,6 +132,28 @@ all codec constraints; it never substitutes independent output gains. See
 [MULTI-DELIVERY.md](MULTI-DELIVERY.md) for the request contract, algorithm,
 safety rules, examples, optional codec requirements, and report schema.
 
+### Segment-aware catalogue normalization
+
+`forge-segment-normalize` provides a content-bound two-pass workflow for two
+to 4096 ordered segments. Pass one records source hashes, measurements, and a
+shared-boundary gain plan; pass two verifies every binding, renders one segment
+at a time with smoothstep dB ramps, re-decodes each output, and publishes only
+segments whose codec loudness, true peak, and duration checks pass:
+
+```sh
+forge-segment-normalize plan \
+  --request catalogue/request.json \
+  --manifest catalogue/segment-plan.json
+forge-segment-normalize render \
+  --manifest catalogue/segment-plan.json \
+  --report catalogue/segment-report.json
+```
+
+The method is explicitly non-normative, memory is bounded per segment, and the
+report states that the sequential output set is not a filesystem transaction.
+See [SEGMENT-NORMALIZATION.md](SEGMENT-NORMALIZATION.md) for the formulas,
+limits, path safety, optional codec requirements, schemas, and exit status.
+
 ## Why it's correct
 
 * **K-weighting** is implemented from the ITU-R BS.1770-5 design equations
