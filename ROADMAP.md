@@ -191,6 +191,10 @@ Forge already provides:
   gains, capped cubic smoothstep dB ramps, per-segment memory limits,
   re-decoded codec/true-peak/duration evidence, and explicit sequential
   atomic-publication semantics.
+- Bounded AC-4 licensed/reference-decoder adapter protocol for complete
+  presentation enumeration, current ETSI TS 103 190-1/-2 dialnorm source and
+  loudness-correction metadata, input/adapter/render SHA-256 evidence,
+  independent BS.1770 measurement, and process/response/PCM safety limits.
 - Bounded AAF stored-format, dynamic MetaDictionary, and core object-model/Edit
   Protocol QC with CFB/file/root identity, property/reference-index decoding,
   dynamically declared class/property/type graphs and extension values,
@@ -216,23 +220,14 @@ generations.
 
 ### Codec-specific QC
 
-- AC-4 presentation and loudness metadata through a licensed/reference
-  decoder adapter.
 - MPEG-H MHAS packets, scene metadata, profile/level, loudness, and
   presentation rendering through an external conforming decoder.
 - DTS core/HD metadata and decoded presentation checks through an optional
   adapter.
 - WavPack, Monkey's Audio, and ALAC native frame/checksum validation.
 
-### Streaming and platform delivery
-
-- Remote-resource auditing only behind explicit allowlists, byte/time limits,
-  redirect controls, and a recorded fetch manifest.
-
 ### Loudness workflow depth
 
-- Loudness-to-dialogue ratio, speech-gated loudness confidence, and manual
-  review ranges.
 - Extend metadata-only normalization when additional containers acquire a
   standardized, widely honoured gain mechanism; avoid inventing private gain
   fields where none exists.

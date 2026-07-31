@@ -1675,6 +1675,20 @@ compliance profiles gate each Presentation independently. The report identifies
 ETSI TS 103 190 for AC-4, AOMedia IAMF v1.1/OAR v1.0.0 for IAMF, or
 ISO/IEC 23008-3 for MPEG-H and preserves renderer provenance as audit evidence.
 
+For AC-4, `forge-ac4-qc` can also drive an explicitly selected licensed or
+reference decoder through a bounded, versioned adapter protocol. It requires
+the adapter to enumerate every presentation, records AC-4 dialnorm and
+loudness-correction metadata, hashes the input/adapter/render bytes, and
+independently measures every rendered WAVE output:
+
+```bash
+forge-ac4-qc programme.ac4 --adapter /opt/vendor/forge-ac4-adapter \
+  --output ac4-qc.json --dialnorm-tolerance-lu 1.0
+```
+
+See [AC4-ADAPTER.md](AC4-ADAPTER.md) for the request/response contract,
+current ETSI versions, resource limits, and trust boundary.
+
 Ordered S-ADM XML frames can be checked as a live-flow capture:
 
 ```bash
@@ -1883,6 +1897,7 @@ src/
   aaf_meta_qc.rs    dynamic AAF MetaDictionary and extension-value validation
   aaf_object_qc.rs  AAF object graph, timeline, source, and Edit Protocol QC
   aes31_qc.rs       bounded AES31-3 EDML project/reference/timing QC
+  ac4_adapter.rs    bounded licensed/reference AC-4 decoder adapter + evidence
   flacenc.rs        bounded-memory pure-Rust FLAC encoder
   opus.rs           RFC 7845 mono/stereo and Mapping Family 1 Ogg Opus I/O
   mp3enc.rs         mono/stereo LAME encoder with gapless Info/LAME backpatch
@@ -1907,6 +1922,7 @@ src/
   bin/forge-container-qc.rs wrapper/bitstream/metadata audit CLI
   bin/forge-provenance-qc.rs C2PA integrity and trust-policy audit CLI
   bin/forge-aes31-qc.rs AES31-3 EDML project audit CLI
+  bin/forge-ac4-qc.rs licensed/reference AC-4 presentation audit CLI
   lv2.rs            hard-real-time-capable LV2 stereo plugin ABI
   clap_plugin.rs    CLAP stereo effect, automation, state, and latency ABI
   preset.rs         named playback and broadcast loudness targets

@@ -37,7 +37,8 @@ for binary in \
   forge-st2022-7-qc \
   forge-report \
   forge-multi-delivery \
-  forge-segment-normalize
+  forge-segment-normalize \
+  forge-ac4-qc
 do
   cp "target/${target}/release/${binary}" "$staging/"
 done
@@ -57,8 +58,11 @@ cp schema/multi-delivery-request-v1.schema.json \
 cp schema/segment-normalization-request-v1.schema.json \
    schema/segment-normalization-plan-v1.schema.json \
    schema/segment-normalization-report-v1.schema.json "$staging/schema/"
+cp schema/ac4-adapter-request-v1.schema.json \
+   schema/ac4-adapter-response-v1.schema.json \
+   schema/ac4-adapter-report-v1.schema.json "$staging/schema/"
 cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md \
-   BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md LICENSE "$staging/"
+   BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md LICENSE "$staging/"
 
 find "$staging" -exec touch -h -d "@${source_date_epoch}" {} +
 tar \

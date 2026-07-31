@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/ac4-adapter-request-v1",
+  "title": "Forge AC-4 adapter request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "protocol_version", "input_path", "input_sha256", "input_bytes", "output_directory", "requirements"],
+  "properties": {
+    "schema": {"const": "https://penguin425.github.io/audio-normalizer/schema/ac4-adapter-request-v1"},
+    "protocol_version": {"const": 1},
+    "input_path": {"type": "string", "minLength": 1},
+    "input_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "input_bytes": {"type": "integer", "minimum": 0},
+    "output_directory": {"type": "string", "minLength": 1},
+    "requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enumerate_all_presentations", "rendered_format", "report_presentation_loudness_metadata", "ac4_part1_standard", "ac4_part2_standard"],
+      "properties": {
+        "enumerate_all_presentations": {"const": true},
+        "rendered_format": {"const": "wave"},
+        "report_presentation_loudness_metadata": {"const": true},
+        "ac4_part1_standard": {"const": "ETSI TS 103 190-1 V1.4.1 (2025-07)"},
+        "ac4_part2_standard": {"const": "ETSI TS 103 190-2 V1.3.1 (2025-07)"}
+      }
+    }
+  }
+}

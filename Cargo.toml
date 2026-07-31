@@ -116,6 +116,10 @@ path = "src/bin/forge-multi-delivery.rs"
 name = "forge-segment-normalize"
 path = "src/bin/forge-segment-normalize.rs"
 
+[[bin]]
+name = "forge-ac4-qc"
+path = "src/bin/forge-ac4-qc.rs"
+
 [dependencies]
 rayon = "1.10"
 clap = { version = "4.5", features = ["derive"] }
