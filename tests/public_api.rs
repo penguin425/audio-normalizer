@@ -1,3 +1,4 @@
+use forge_normalizer::analysis_cache::{AnalysisCache, AnalysisCachePolicy, CacheDisposition};
 use forge_normalizer::decoder;
 use forge_normalizer::normalize::{
     analyze, apply_gain_and_protect, compute_gain, Mode, OutputFormat, Plan,
@@ -71,6 +72,34 @@ fn documented_public_api_works_from_a_downstream_crate() {
     let decode_fn: fn(&Path) -> Result<AudioBuffer, String> = decoder::decode;
     let decoded = decode_fn(&wave_path).expect("decode public API");
     assert_eq!((decoded.frames, decoded.channels), (frames, 2));
+
+    let cache = AnalysisCache::new(
+        temporary.path().join("analysis-cache"),
+        AnalysisCachePolicy::default(),
+    )
+    .expect("construct public cache API");
+    let cached = cache
+        .analyze_for_plan(&wave_path, None, &plan)
+        .expect("store public cache entry");
+    assert_eq!(cached.disposition, CacheDisposition::Stored);
+    assert_eq!(
+        cache
+            .analyze_for_plan(&wave_path, None, &plan)
+            .expect("read public cache entry")
+            .disposition,
+        CacheDisposition::Hit
+    );
+    let preanalyzed_path = temporary.path().join("preanalyzed.wav");
+    forge_normalizer::normalize::normalize_one_preanalyzed_with_roles(
+        &wave_path,
+        &preanalyzed_path,
+        &plan,
+        OutputFormat::Wav,
+        None,
+        &cached.value,
+    )
+    .expect("normalize with public precomputed-analysis API");
+    assert!(preanalyzed_path.is_file());
 
     let mut meter = RealtimeMeter::new(sample_rate, vec![ChannelRole::Main, ChannelRole::Main])
         .expect("construct public meter API");

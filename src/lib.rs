@@ -27,6 +27,7 @@ mod ac3_qc;
 pub mod adm;
 pub mod aes31_qc;
 pub mod analysis;
+pub mod analysis_cache;
 mod atomic;
 pub mod audio_compare;
 pub mod batch;

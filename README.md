@@ -1297,6 +1297,26 @@ semantics, and the versioned
 [`batch-job-v1`](schema/batch-job-v1.schema.json) and
 [`batch-progress-v1`](schema/batch-progress-v1.schema.json) contracts.
 
+### Content-addressed analysis cache
+
+`--analysis-cache DIR` reuses core BS.1770-5 / EBU R 128 measurements across
+analysis, dry-run, tag, track, verified, and album workflows:
+
+```sh
+forge library/*.flac -o normalized/ \
+  --analysis-cache .forge-analysis-cache \
+  --analysis-cache-max-mib 2048
+```
+
+The complete input byte stream and all measurement-changing options are
+SHA-256-bound; paths and modification times are not cache identity. Entries
+are atomically committed, schema validated, and invalid entries are visibly
+recomputed. `--analysis-cache-read-only` permits hits without creating,
+repairing, or evicting data. See [ANALYSIS-CACHE.md](ANALYSIS-CACHE.md) for
+scope, eviction and corruption behavior, bounds, measurement provenance, and
+the versioned
+[`analysis-cache-v1`](schema/analysis-cache-v1.schema.json) contract.
+
 ### Options
 
 | Flag | Default | Description |
@@ -1307,6 +1327,9 @@ semantics, and the versioned
 | `--recursive` | off | Recursively process input directories |
 | `--job-state` | none | Atomically checkpoint and resume an identical multi-file normalization job |
 | `--progress` | none | Write versioned lifecycle events as NDJSON (`-` for stdout) |
+| `--analysis-cache` | none | Reuse content-addressed core loudness analyses from a directory |
+| `--analysis-cache-read-only` | off | Permit cache hits without writes, repairs, or eviction |
+| `--analysis-cache-max-mib` | `1024` | Maximum recognized cache-entry storage when the cache is enabled |
 | `--input-format` | none | Container hint required for stdin (`-`) |
 | `--dry-run` | off | Analyze and show output paths without writing |
 | `--overwrite` | off | Replace output files that already exist |

@@ -67,6 +67,204 @@ fn recursive_dry_run_preserves_relative_directories() {
 }
 
 #[test]
+fn content_addressed_analysis_cache_is_reused_by_real_normalization() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("tone.wav");
+    let output = directory.path().join("normalized.wav");
+    let cache = directory.path().join("analysis-cache");
+    write_batch_test_wav(&input, 440.0);
+
+    let dry_run = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .arg("--dry-run")
+        .arg("--analysis-cache")
+        .arg(&cache)
+        .arg("--sample-rate")
+        .arg("44100")
+        .output()
+        .unwrap();
+    assert!(
+        dry_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&dry_run.stderr).contains("analysis cache miss; stored"));
+
+    let normalize = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--analysis-cache")
+        .arg(&cache)
+        .arg("--sample-rate")
+        .arg("44100")
+        .output()
+        .unwrap();
+    assert!(
+        normalize.status.success(),
+        "{}",
+        String::from_utf8_lossy(&normalize.stderr)
+    );
+    assert!(String::from_utf8_lossy(&normalize.stderr).contains("analysis cache hit"));
+    assert!(output.is_file());
+
+    let prefix = std::fs::read_dir(cache.join("v1"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let content = std::fs::read_dir(prefix)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let entry = std::fs::read_dir(content)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let instance: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(entry).unwrap()).unwrap();
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../schema/analysis-cache-v1.schema.json")).unwrap();
+    assert!(jsonschema::validator_for(&schema)
+        .unwrap()
+        .is_valid(&instance));
+}
+
+#[test]
+fn read_only_analysis_cache_miss_does_not_create_storage() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("tone.wav");
+    let cache = directory.path().join("absent-cache");
+    write_batch_test_wav(&input, 440.0);
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .arg("--dry-run")
+        .arg("--analysis-cache")
+        .arg(&cache)
+        .arg("--analysis-cache-read-only")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stderr).contains("analysis cache miss; read-only"));
+    assert!(!cache.exists());
+}
+
+#[test]
+fn analysis_cache_options_are_validated_and_exposed() {
+    let help = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("--analysis-cache <DIR>"));
+    assert!(help.contains("--analysis-cache-read-only"));
+    assert!(help.contains("--analysis-cache-max-mib <MIB>"));
+
+    let missing_directory = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg("--analysis-cache-read-only")
+        .output()
+        .unwrap();
+    assert_eq!(missing_directory.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing_directory.stderr).contains("--analysis-cache <DIR>"));
+
+    let zero_limit = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg("--analysis-cache")
+        .arg("cache")
+        .arg("--analysis-cache-max-mib")
+        .arg("0")
+        .output()
+        .unwrap();
+    assert_eq!(zero_limit.status.code(), Some(2));
+
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("tone.wav");
+    let not_a_directory = directory.path().join("cache-file");
+    write_batch_test_wav(&input, 440.0);
+    std::fs::write(&not_a_directory, b"not a directory").unwrap();
+    let invalid_root = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .arg("--dry-run")
+        .arg("--analysis-cache")
+        .arg(&not_a_directory)
+        .output()
+        .unwrap();
+    assert_eq!(invalid_root.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&invalid_root.stderr).contains("is not a directory"));
+}
+
+#[test]
+fn album_verification_consumes_cached_source_analyses() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.wav");
+    let second = directory.path().join("second.wav");
+    let output = directory.path().join("normalized");
+    let cache = directory.path().join("analysis-cache");
+    write_batch_test_wav(&first, 440.0);
+    write_batch_test_wav(&second, 880.0);
+
+    let warm = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&first)
+        .arg(&second)
+        .arg("--album")
+        .arg("--dry-run")
+        .arg("-o")
+        .arg(&output)
+        .arg("--analysis-cache")
+        .arg(&cache)
+        .output()
+        .unwrap();
+    assert!(
+        warm.status.success(),
+        "{}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&warm.stderr)
+            .matches("analysis cache miss; stored")
+            .count(),
+        2
+    );
+
+    let verified = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&first)
+        .arg(&second)
+        .arg("--album")
+        .arg("--verify")
+        .arg("--verify-tolerance")
+        .arg("1")
+        .arg("-o")
+        .arg(&output)
+        .arg("--analysis-cache")
+        .arg(&cache)
+        .output()
+        .unwrap();
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&verified.stderr)
+            .matches("analysis cache hit")
+            .count(),
+        2
+    );
+    assert!(output.join("first_normalized.wav").is_file());
+    assert!(output.join("second_normalized.wav").is_file());
+}
+
+#[test]
 fn resumable_batch_skips_verified_outputs_and_recovers_only_missing_or_changed_assets() {
     let directory = tempfile::tempdir().unwrap();
     let first_input = directory.path().join("first.wav");

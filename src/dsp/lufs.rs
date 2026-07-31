@@ -20,6 +20,11 @@ use crate::wav::{AudioBuffer, ChannelRole};
 use rayon::prelude::*;
 use std::collections::VecDeque;
 
+/// Maximum retained 400 ms gating or short-term blocks per analysis.
+pub const MAX_LOUDNESS_BLOCKS: usize = 1_000_000;
+/// Maximum retained points in an explicitly requested loudness timeline.
+pub const MAX_LOUDNESS_TIMELINE_POINTS: usize = 1_000_000;
+
 #[derive(Debug, Clone)]
 pub struct EbuMeasurements {
     pub integrated_lufs: f64,
@@ -165,12 +170,22 @@ impl StreamingAnalyzer {
             if self.momentary.len() == momentary_window
                 && (self.frames - momentary_window).is_multiple_of(hop)
             {
+                if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
+                    return Err(format!(
+                        "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-gating-block limit"
+                    ));
+                }
                 self.gating_blocks
                     .push(self.momentary_sum / momentary_window as f64);
             }
             if self.short_term.len() == short_term_window
                 && (self.frames - short_term_window).is_multiple_of(hop)
             {
+                if self.short_term_blocks.len() == MAX_LOUDNESS_BLOCKS {
+                    return Err(format!(
+                        "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-short-term-block limit"
+                    ));
+                }
                 self.short_term_blocks
                     .push(self.short_term_sum / short_term_window as f64);
             }
@@ -178,6 +193,12 @@ impl StreamingAnalyzer {
                 .timeline_interval_frames
                 .is_some_and(|interval| self.frames.is_multiple_of(interval))
             {
+                // Keep one slot for a final partial interval in `finish`.
+                if self.timeline.len() >= MAX_LOUDNESS_TIMELINE_POINTS - 1 {
+                    return Err(format!(
+                        "loudness timeline exceeds the {MAX_LOUDNESS_TIMELINE_POINTS}-point limit"
+                    ));
+                }
                 self.record_timeline_point(momentary_window, short_term_window);
             }
         }
