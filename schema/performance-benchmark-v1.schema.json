@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/performance-benchmark-v1",
+  "title": "Forge performance benchmark report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["$schema", "generator", "generated_unix_ms", "system", "configuration", "results", "error", "passed"],
+  "properties": {
+    "$schema": {"const": "https://penguin425.github.io/audio-normalizer/schema/performance-benchmark-v1"},
+    "generator": {"const": "forge-benchmark/1"},
+    "generated_unix_ms": {"type": "integer", "minimum": 0},
+    "system": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "os_release", "architecture", "cpu_model", "cpu_count", "python_version", "forge_version", "ffmpeg_version"],
+      "properties": {
+        "os": {"type": "string", "minLength": 1},
+        "os_release": {"type": "string"},
+        "architecture": {"type": "string", "minLength": 1},
+        "cpu_model": {"type": "string", "minLength": 1},
+        "cpu_count": {"type": ["integer", "null"], "minimum": 1},
+        "python_version": {"type": "string", "minLength": 1},
+        "forge_version": {"type": "string", "minLength": 1},
+        "ffmpeg_version": {"type": ["string", "null"]}
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["duration_seconds", "sample_rate_hz", "pathological_chunks", "timeout_seconds", "cases"],
+      "properties": {
+        "duration_seconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+        "sample_rate_hz": {"type": "integer", "minimum": 8000, "maximum": 192000},
+        "pathological_chunks": {"type": "integer", "minimum": 1, "maximum": 100001},
+        "timeout_seconds": {"type": "integer", "minimum": 1},
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"enum": ["wav-stereo-normalize", "wav-7.1-normalize", "flac-stereo-analyze", "mp3-stereo-analyze", "pathological-wave-qc"]}
+        }
+      }
+    },
+    "results": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/result"}
+    },
+    "error": {"type": ["string", "null"]},
+    "passed": {"type": "boolean"}
+  },
+  "$defs": {
+    "nullableNumber": {"type": ["number", "null"]},
+    "regression": {
+      "type": ["object", "null"],
+      "required": ["wall_change_percent", "peak_rss_change_percent", "max_wall_regression_percent", "max_peak_rss_regression_percent", "passed"],
+      "properties": {
+        "wall_change_percent": {"$ref": "#/$defs/nullableNumber"},
+        "peak_rss_change_percent": {"$ref": "#/$defs/nullableNumber"},
+        "max_wall_regression_percent": {"type": "number", "minimum": 0},
+        "max_peak_rss_regression_percent": {"type": "number", "minimum": 0},
+        "passed": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "category", "input_format", "operation", "channels", "sample_rate_hz", "duration_seconds", "input_bytes", "output_bytes", "command", "exit_code", "wall_seconds", "user_cpu_seconds", "system_cpu_seconds", "cpu_percent", "peak_rss_bytes", "realtime_factor", "expected_exit_codes", "passed", "regression"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "category": {"enum": ["lossless", "lossy", "multichannel", "pathological"]},
+        "input_format": {"type": "string", "minLength": 1},
+        "operation": {"enum": ["normalize", "analyze", "container-qc"]},
+        "channels": {"type": "integer", "minimum": 1},
+        "sample_rate_hz": {"type": "integer", "minimum": 8000},
+        "duration_seconds": {"$ref": "#/$defs/nullableNumber"},
+        "input_bytes": {"type": "integer", "minimum": 0},
+        "output_bytes": {"type": ["integer", "null"], "minimum": 0},
+        "command": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "exit_code": {"type": "integer"},
+        "wall_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "user_cpu_seconds": {"$ref": "#/$defs/nullableNumber"},
+        "system_cpu_seconds": {"$ref": "#/$defs/nullableNumber"},
+        "cpu_percent": {"$ref": "#/$defs/nullableNumber"},
+        "peak_rss_bytes": {"type": ["integer", "null"], "minimum": 0},
+        "realtime_factor": {"$ref": "#/$defs/nullableNumber"},
+        "expected_exit_codes": {"type": "array", "minItems": 1, "items": {"type": "integer"}},
+        "passed": {"type": "boolean"},
+        "regression": {"$ref": "#/$defs/regression"}
+      }
+    }
+  }
+}

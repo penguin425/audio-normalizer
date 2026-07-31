@@ -1,0 +1,78 @@
+name: Performance benchmark
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/benchmark.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "src/**"
+      - "tools/benchmark.py"
+      - "tools/test_benchmark.py"
+      - "schema/performance-benchmark-v1.schema.json"
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "Duration of each audio workload (1–3600 seconds)"
+        required: true
+        default: "3600"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
+
+      - name: Test benchmark contract
+        run: python3 -m unittest tools/test_benchmark.py
+
+      - name: Build measured binaries
+        run: cargo build --locked --release --bin forge --bin forge-container-qc
+
+      - name: Run benchmark
+        env:
+          BENCHMARK_DURATION: ${{ github.event_name == 'workflow_dispatch' && inputs.duration_seconds || '2' }}
+        run: |
+          python3 tools/benchmark.py \
+            --forge target/release/forge \
+            --duration-seconds "$BENCHMARK_DURATION" \
+            --output benchmark.json
+
+      - name: Validate report structure
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("benchmark.json").read_text(encoding="utf-8"))
+          schema = json.loads(Path("schema/performance-benchmark-v1.schema.json").read_text(encoding="utf-8"))
+          assert report["$schema"] == schema["$id"]
+          assert report["passed"] is True
+          assert report["error"] is None
+          assert len(report["results"]) == 5
+          assert all(item["passed"] for item in report["results"])
+          PY
+
+      - name: Upload report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: forge-performance-benchmark
+          path: benchmark.json
+          if-no-files-found: error
+          retention-days: 30
