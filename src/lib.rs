@@ -62,6 +62,7 @@ pub mod metadata;
 mod mp3_qc;
 #[cfg(feature = "mp3-encoding")]
 pub mod mp3enc;
+pub mod mpegh_adapter;
 mod mpegts_qc;
 pub mod multi_delivery;
 mod mxf_qc;

@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/mpegh-adapter-response-v1",
+  "title": "Forge MPEG-H adapter response v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "protocol_version", "input_sha256", "decoder", "core_standard", "reference_software_standard", "conformance_standard", "mpegh3da_profile_level_indication", "scene", "presentation_count", "presentations"],
+  "properties": {
+    "schema": {"const": "https://penguin425.github.io/audio-normalizer/schema/mpegh-adapter-response-v1"},
+    "protocol_version": {"const": 1},
+    "input_sha256": {"type": "string", "pattern": "^[0-9A-Fa-f]{64}$"},
+    "decoder": {"$ref": "#/$defs/decoder"},
+    "core_standard": {"const": "ISO/IEC 23008-3:2026"},
+    "reference_software_standard": {"const": "ISO/IEC 23008-6:2025"},
+    "conformance_standard": {"const": "ISO/IEC 23008-9:2023"},
+    "mpegh3da_profile_level_indication": {"type": "integer", "minimum": 1, "maximum": 20},
+    "scene": {"$ref": "#/$defs/scene"},
+    "presentation_count": {"type": "integer", "minimum": 1, "maximum": 33},
+    "presentations": {"type": "array", "minItems": 1, "maxItems": 33, "items": {"$ref": "#/$defs/presentation"}}
+  },
+  "$defs": {
+    "decoder": {
+      "type": "object", "additionalProperties": false, "required": ["name", "version"],
+      "properties": {"name": {"type": "string", "minLength": 1, "maxLength": 128}, "version": {"type": "string", "minLength": 1, "maxLength": 128}}
+    },
+    "scene": {
+      "type": "object", "additionalProperties": false,
+      "required": ["group_count", "groups", "switch_group_count", "switch_groups", "preset_count", "presets"],
+      "properties": {
+        "group_count": {"type": "integer", "minimum": 0, "maximum": 128},
+        "groups": {"type": "array", "maxItems": 128, "items": {"$ref": "#/$defs/group"}},
+        "switch_group_count": {"type": "integer", "minimum": 0, "maximum": 32},
+        "switch_groups": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/switch_group"}},
+        "preset_count": {"type": "integer", "minimum": 0, "maximum": 32},
+        "presets": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/preset"}}
+      }
+    },
+    "group": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "signal_kind", "allow_on_off", "default_on", "allow_gain_interactivity", "allow_position_interactivity"],
+      "properties": {
+        "id": {"type": "integer", "minimum": 0, "maximum": 127},
+        "signal_kind": {"enum": ["channels", "objects", "hoa"]},
+        "allow_on_off": {"type": "boolean"},
+        "default_on": {"type": "boolean"},
+        "language": {"type": ["string", "null"], "maxLength": 35},
+        "content_kind": {"type": ["string", "null"], "maxLength": 64},
+        "allow_gain_interactivity": {"type": "boolean"},
+        "min_gain_db": {"type": ["number", "null"], "minimum": -128, "maximum": 0},
+        "max_gain_db": {"type": ["number", "null"], "minimum": 0, "maximum": 128},
+        "allow_position_interactivity": {"type": "boolean"}
+      }
+    },
+    "switch_group": {
+      "type": "object", "additionalProperties": false, "required": ["id", "group_ids", "default_group_id"],
+      "properties": {
+        "id": {"type": "integer", "minimum": 0, "maximum": 31},
+        "group_ids": {"type": "array", "minItems": 1, "maxItems": 128, "uniqueItems": true, "items": {"type": "integer", "minimum": 0, "maximum": 127}},
+        "default_group_id": {"type": "integer", "minimum": 0, "maximum": 127}
+      }
+    },
+    "preset": {
+      "type": "object", "additionalProperties": false, "required": ["id", "kind", "group_ids"],
+      "properties": {
+        "id": {"type": "integer", "minimum": 0, "maximum": 31},
+        "name": {"type": ["string", "null"], "maxLength": 128},
+        "kind": {"type": "integer", "minimum": 0, "maximum": 31},
+        "group_ids": {"type": "array", "minItems": 1, "maxItems": 128, "uniqueItems": true, "items": {"type": "integer", "minimum": 0, "maximum": 127}}
+      }
+    },
+    "loudness": {
+      "type": "object", "additionalProperties": false,
+      "required": ["loudness_info_type", "method_definition", "program_loudness_lkfs", "drc_set_id", "downmix_id"],
+      "properties": {
+        "loudness_info_type": {"enum": [0, 3]},
+        "mae_group_id": {"type": ["integer", "null"], "minimum": 0, "maximum": 127},
+        "mae_group_preset_id": {"type": ["integer", "null"], "minimum": 0, "maximum": 31},
+        "method_definition": {"enum": [1, 2]},
+        "program_loudness_lkfs": {"type": "number", "minimum": -70, "maximum": 0},
+        "drc_set_id": {"const": 0},
+        "downmix_id": {"const": 0},
+        "measurement_system": {"type": ["string", "null"], "maxLength": 64}
+      },
+      "allOf": [
+        {"if": {"properties": {"loudness_info_type": {"const": 0}}}, "then": {"properties": {"mae_group_id": {"type": "null"}, "mae_group_preset_id": {"type": "null"}}}},
+        {"if": {"properties": {"loudness_info_type": {"const": 3}}}, "then": {"required": ["mae_group_preset_id"], "properties": {"mae_group_id": {"type": "null"}, "mae_group_preset_id": {"type": "integer", "minimum": 0, "maximum": 31}}}}
+      ]
+    },
+    "presentation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "rendered_path", "output_layout", "loudness"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"},
+        "preset_id": {"type": ["integer", "null"], "minimum": 0, "maximum": 31},
+        "rendered_path": {"type": "string", "pattern": "^[^/\\\\].*\\.wav$"},
+        "output_layout": {"type": "string", "minLength": 1, "maxLength": 64},
+        "language": {"type": ["string", "null"], "maxLength": 35},
+        "accessibility": {"type": ["string", "null"], "maxLength": 64},
+        "loudness": {"$ref": "#/$defs/loudness"}
+      }
+    }
+  }
+}
