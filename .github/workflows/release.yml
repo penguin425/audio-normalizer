@@ -15,12 +15,18 @@ on:
       - "PYTHON-API.md"
       - "BENCHMARKS.md"
       - "MULTI-DELIVERY.md"
+      - "SEGMENT-NORMALIZATION.md"
       - "tools/benchmark.py"
       - "schema/performance-benchmark-v1.schema.json"
       - "schema/multi-delivery-request-v1.schema.json"
       - "schema/multi-delivery-report-v1.schema.json"
+      - "schema/segment-normalization-request-v1.schema.json"
+      - "schema/segment-normalization-plan-v1.schema.json"
+      - "schema/segment-normalization-report-v1.schema.json"
       - "src/multi_delivery.rs"
       - "src/bin/forge-multi-delivery.rs"
+      - "src/segment_normalize.rs"
+      - "src/bin/forge-segment-normalize.rs"
       - "tools/build-python-wheel.py"
       - "tools/build-wasm-package.sh"
       - "tools/package-linux-release.sh"
@@ -187,7 +193,8 @@ jobs:
              "target/${{ matrix.target }}/release/forge-nmos-qc" \
              "target/${{ matrix.target }}/release/forge-st2022-7-qc" \
              "target/${{ matrix.target }}/release/forge-report" \
-             "target/${{ matrix.target }}/release/forge-multi-delivery" "$staging/"
+             "target/${{ matrix.target }}/release/forge-multi-delivery" \
+             "target/${{ matrix.target }}/release/forge-segment-normalize" "$staging/"
           cp "target/${{ matrix.target }}/release/${{ matrix.library }}" \
              "$staging/forge-live.clap"
           cp "target/${{ matrix.target }}/release/${{ matrix.library }}" \
@@ -199,7 +206,10 @@ jobs:
           cp schema/performance-benchmark-v1.schema.json "$staging/schema/"
           cp schema/multi-delivery-request-v1.schema.json \
              schema/multi-delivery-report-v1.schema.json "$staging/schema/"
-          cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md MULTI-DELIVERY.md LICENSE "$staging/"
+          cp schema/segment-normalization-request-v1.schema.json \
+             schema/segment-normalization-plan-v1.schema.json \
+             schema/segment-normalization-report-v1.schema.json "$staging/schema/"
+          cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md LICENSE "$staging/"
           tar -czf "${staging}.tar.gz" "$staging"
 
       - name: Package Windows binary
@@ -208,7 +218,7 @@ jobs:
         run: |
           $staging = "forge-v${{ needs.validate.outputs.version }}-${{ matrix.asset }}"
           New-Item -ItemType Directory -Path $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/forge.exe","target/${{ matrix.target }}/release/forge-live.exe","target/${{ matrix.target }}/release/forge-compare.exe","target/${{ matrix.target }}/release/forge-audio-compare.exe","target/${{ matrix.target }}/release/forge-container-qc.exe","target/${{ matrix.target }}/release/forge-streaming-qc.exe","target/${{ matrix.target }}/release/forge-presentation-qc.exe","target/${{ matrix.target }}/release/forge-sadm-qc.exe","target/${{ matrix.target }}/release/forge-dialogue-provider.exe","target/${{ matrix.target }}/release/forge-provenance-qc.exe","target/${{ matrix.target }}/release/forge-imf-qc.exe","target/${{ matrix.target }}/release/forge-aes31-qc.exe","target/${{ matrix.target }}/release/forge-rtp-qc.exe","target/${{ matrix.target }}/release/forge-nmos-qc.exe","target/${{ matrix.target }}/release/forge-st2022-7-qc.exe","target/${{ matrix.target }}/release/forge-report.exe","target/${{ matrix.target }}/release/forge-multi-delivery.exe" $staging
+          Copy-Item "target/${{ matrix.target }}/release/forge.exe","target/${{ matrix.target }}/release/forge-live.exe","target/${{ matrix.target }}/release/forge-compare.exe","target/${{ matrix.target }}/release/forge-audio-compare.exe","target/${{ matrix.target }}/release/forge-container-qc.exe","target/${{ matrix.target }}/release/forge-streaming-qc.exe","target/${{ matrix.target }}/release/forge-presentation-qc.exe","target/${{ matrix.target }}/release/forge-sadm-qc.exe","target/${{ matrix.target }}/release/forge-dialogue-provider.exe","target/${{ matrix.target }}/release/forge-provenance-qc.exe","target/${{ matrix.target }}/release/forge-imf-qc.exe","target/${{ matrix.target }}/release/forge-aes31-qc.exe","target/${{ matrix.target }}/release/forge-rtp-qc.exe","target/${{ matrix.target }}/release/forge-nmos-qc.exe","target/${{ matrix.target }}/release/forge-st2022-7-qc.exe","target/${{ matrix.target }}/release/forge-report.exe","target/${{ matrix.target }}/release/forge-multi-delivery.exe","target/${{ matrix.target }}/release/forge-segment-normalize.exe" $staging
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.library }}" "$staging/forge-live.clap"
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.library }}" "$staging/${{ matrix.library }}"
           $importLibrary = Get-ChildItem "target/${{ matrix.target }}/release" -Filter "forge_normalizer*.lib" | Select-Object -First 1
@@ -220,7 +230,8 @@ jobs:
           Copy-Item tools/benchmark.py "$staging/tools/"
           Copy-Item schema/performance-benchmark-v1.schema.json "$staging/schema/"
           Copy-Item "schema/multi-delivery-request-v1.schema.json","schema/multi-delivery-report-v1.schema.json" "$staging/schema/"
-          Copy-Item "README.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","MULTI-DELIVERY.md","LICENSE" $staging
+          Copy-Item "schema/segment-normalization-request-v1.schema.json","schema/segment-normalization-plan-v1.schema.json","schema/segment-normalization-report-v1.schema.json" "$staging/schema/"
+          Copy-Item "README.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","MULTI-DELIVERY.md","SEGMENT-NORMALIZATION.md","LICENSE" $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
 
       - name: Upload packaged binary

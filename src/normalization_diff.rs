@@ -4,7 +4,7 @@ use crate::atomic::AtomicOutput;
 use crate::decoder;
 use crate::normalize::{Analysis, OutputFormat, Plan, RenderStatistics};
 use crate::wav::PcmKind;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::fs::{self, File};
@@ -50,14 +50,16 @@ pub struct NormalizationDifferenceAsset {
     pub codec_drift: CodecDriftEvidence,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileEvidence {
     pub path: String,
     pub bytes: u64,
     pub sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeasurementEvidence {
     pub sample_rate_hz: u32,
     pub channels: u16,
