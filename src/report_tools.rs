@@ -619,7 +619,6 @@ pub enum FindingCategory {
     Adm,
     AdmProfile,
     Presentation,
-    ModelQc,
 }
 
 impl FindingCategory {
@@ -632,7 +631,6 @@ impl FindingCategory {
             Self::Adm => "adm",
             Self::AdmProfile => "adm_profile",
             Self::Presentation => "presentation",
-            Self::ModelQc => "model_qc",
         }
     }
 }
@@ -648,7 +646,7 @@ pub struct FindingSource {
     pub url: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct FindingExplanation {
     pub rule_id: String,
     pub asset: String,
@@ -657,9 +655,55 @@ pub struct FindingExplanation {
     pub source: FindingSource,
     pub observation: Value,
     pub requirement: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     pub remediation: String,
+}
+
+impl FindingExplanation {
+    /// Return the stable wire category. Model findings retain the historical
+    /// Rust enum representation for source compatibility, but serialize under
+    /// their dedicated advisory `model_qc` category.
+    pub fn category_name(&self) -> &'static str {
+        if self.rule_id.starts_with("FORGE-MODEL-ANOMALY-") {
+            "model_qc"
+        } else {
+            self.category.as_str()
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct FindingExplanationWire<'a> {
+    rule_id: &'a str,
+    asset: &'a str,
+    category: &'a str,
+    location: &'a str,
+    source: &'a FindingSource,
+    observation: &'a Value,
+    requirement: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'a String>,
+    remediation: &'a str,
+}
+
+impl Serialize for FindingExplanation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        FindingExplanationWire {
+            rule_id: &self.rule_id,
+            asset: &self.asset,
+            category: &self.category_name(),
+            location: &self.location,
+            source: &self.source,
+            observation: &self.observation,
+            requirement: &self.requirement,
+            message: self.message.as_ref(),
+            remediation: &self.remediation,
+        }
+        .serialize(serializer)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -952,7 +996,7 @@ fn explain_model_audit(
             FindingExplanation {
                 rule_id,
                 asset: asset.into(),
-                category: FindingCategory::ModelQc,
+                category: FindingCategory::Presentation,
                 location: format!("{location}/audit/events/{index}"),
                 source,
                 observation: json!({

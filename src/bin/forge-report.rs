@@ -245,7 +245,7 @@ fn format_text_v2(report: &report_tools::ExplanationReportV2) -> String {
             "{} [{}; {}]\n  location: {}\n  source: {}",
             explanation.asset,
             explanation.rule_id,
-            explanation.category.as_str(),
+            explanation.category_name(),
             explanation.location,
             explanation.source.profile
         ));

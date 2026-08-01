@@ -220,6 +220,19 @@ fn main() -> ExitCode {
                 .requires("catalogue")
                 .help("Atomically export records committed by this invocation as JSON"),
         )
+        .arg(
+            Arg::new("anomaly_audit")
+                .long("anomaly-audit")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .action(ArgAction::Append)
+                .requires("analyze_only")
+                .requires("manifest")
+                .conflicts_with("watch")
+                .help(
+                    "Attach one validated forge-anomaly-provider audit per analyzed input in input order",
+                ),
+        )
         .get_matches();
     let batch_options = BatchOptions {
         job_state: matches.get_one::<PathBuf>("job_state").cloned(),
@@ -249,12 +262,17 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let anomaly_audits = matches
+        .get_many::<PathBuf>("anomaly_audit")
+        .map(|values| values.cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
     if let Err(e) = run(
         cli,
         batch_options,
         cache_options,
         watch_options,
         catalogue_options,
+        anomaly_audits,
     ) {
         eprintln!("forge: error: {e}");
         return ExitCode::from(1);
@@ -297,9 +315,10 @@ fn run(
     cache_options: CacheOptions,
     watch_options: WatchOptions,
     catalogue_options: CatalogueOptions,
+    anomaly_audits: Vec<PathBuf>,
 ) -> Result<(), String> {
     if watch_options.enabled {
-        return run_watch(cli, cache_options, watch_options);
+        return run_watch(cli, cache_options, watch_options, anomaly_audits);
     }
     let pipeline = PipelineFiles::prepare(&mut cli, &batch_options)?;
     run_paths(
@@ -308,6 +327,7 @@ fn run(
         &batch_options,
         &cache_options,
         &catalogue_options,
+        &anomaly_audits,
     )?;
     pipeline.emit_stdout()
 }
@@ -316,7 +336,11 @@ fn run_watch(
     mut cli: cli::Cli,
     cache_options: CacheOptions,
     options: WatchOptions,
+    anomaly_audits: Vec<PathBuf>,
 ) -> Result<(), String> {
+    if !anomaly_audits.is_empty() {
+        return Err("--anomaly-audit cannot be used with --watch".into());
+    }
     if cli.inputs.len() != 1 || !cli.inputs[0].is_dir() {
         return Err("--watch requires exactly one input directory".into());
     }
@@ -420,6 +444,7 @@ fn process_watch_candidate(
         &BatchOptions::default(),
         cache_options,
         &CatalogueOptions::default(),
+        &[],
     );
     match result {
         Ok(()) => watch.mark_completed(&candidate.id),
@@ -464,6 +489,7 @@ fn run_paths(
     batch_options: &BatchOptions,
     cache_options: &CacheOptions,
     catalogue_options: &CatalogueOptions,
+    anomaly_audit_paths: &[PathBuf],
 ) -> Result<(), String> {
     if let Some(j) = cli.jobs {
         ThreadPoolBuilder::new()
@@ -475,7 +501,7 @@ fn run_paths(
     let (expanded, relative_paths) = expand_inputs(&cli.inputs, cli.recursive)?;
     cli.inputs = expanded;
 
-    let anomaly_audits = if cli.anomaly_audits.is_empty() {
+    let anomaly_audits = if anomaly_audit_paths.is_empty() {
         Vec::new()
     } else {
         if cli.manifest.is_none() {
@@ -484,14 +510,14 @@ fn run_paths(
         if stdin_requested || cli.inputs.iter().any(|input| input == Path::new("-")) {
             return Err("--anomaly-audit cannot be used with stdin".into());
         }
-        if cli.anomaly_audits.len() != cli.inputs.len() {
+        if anomaly_audit_paths.len() != cli.inputs.len() {
             return Err(format!(
                 "--anomaly-audit was supplied {} time(s), but {} analyzed input(s) were found; provide one audit per input in input order",
-                cli.anomaly_audits.len(),
+                anomaly_audit_paths.len(),
                 cli.inputs.len()
             ));
         }
-        cli.anomaly_audits
+        anomaly_audit_paths
             .iter()
             .map(|path| forge_normalizer::anomaly_provider::load_audit(path))
             .map(|result| result.map(Some))
