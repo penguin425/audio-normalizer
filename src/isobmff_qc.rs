@@ -14,6 +14,7 @@ const MAX_TRACKS: usize = 4_096;
 const MAX_TABLE_ENTRIES: usize = 10_000_000;
 const MAX_TIMED_ID3_EVENTS: usize = 4_096;
 const MAX_TIMED_ID3_STORED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ALAC_PACKET_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 struct BoxHeader {
@@ -71,6 +72,7 @@ struct Track {
     has_sync_sample_box: bool,
     has_composition_offsets: bool,
     iamf_entries: Vec<Option<IamfSampleEntry>>,
+    alac_entries: Vec<Option<AlacSampleEntry>>,
     cenc_auxiliary: CencAuxiliary,
 }
 
@@ -84,6 +86,18 @@ struct IamfSampleEntry {
     config_trailing_bytes: usize,
     configuration_boxes: usize,
     has_sampling_rate_box: bool,
+    protection: Option<CencProtection>,
+}
+
+#[derive(Clone, Default)]
+struct AlacSampleEntry {
+    sample_entry_type: String,
+    channel_count: Option<u16>,
+    sample_size: Option<u16>,
+    sample_rate: Option<u32>,
+    cookie: Vec<u8>,
+    config: Option<crate::alac_qc::AlacConfig>,
+    configuration_boxes: usize,
     protection: Option<CencProtection>,
 }
 
@@ -547,12 +561,26 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
         ));
         for (index, track) in audio_tracks.iter().enumerate() {
             let iamf = track.codecs.iter().any(|codec| codec == "iamf");
+            let alac = track.codecs.iter().any(|codec| codec == "alac");
             bitstream.push(check(
                 "FORGE-ISOBMFF-AUDIO-DESCRIPTION",
                 !track.codecs.is_empty()
                     && track.timescale.is_some_and(|value| value > 0)
                     && if iamf {
                         track.channels == Some(0) && track.sample_rate == Some(0)
+                    } else if alac {
+                        track.channels.is_some_and(|value| value > 0)
+                            && track.alac_entries.iter().any(|entry| {
+                                entry
+                                    .as_ref()
+                                    .and_then(|item| item.config.as_ref())
+                                    .is_some()
+                            })
+                            && track
+                                .alac_entries
+                                .iter()
+                                .flatten()
+                                .all(|entry| entry.config.is_some())
                     } else {
                         track.channels.is_none_or(|value| value > 0)
                             && track.sample_rate.is_none_or(|value| value > 0)
@@ -776,6 +804,19 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
         },
         (&mut bitstream, &mut xcheck),
     );
+    let alac_tracks = audit_alac_tracks(
+        path,
+        &mut file,
+        &state.tracks,
+        IamfContainerContext {
+            mdat_ranges: &state.mdat_ranges,
+            compatible_brands: &state.compatible_brands,
+            fragmented: state.has_mvex || has_moof,
+            fragments: &state.fragments,
+            movie_timescale: state.movie_timescale,
+        },
+        (&mut bitstream, &mut xcheck),
+    );
 
     let properties = json!({
         "file_size_bytes": file_size,
@@ -808,7 +849,8 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
         "timed_id3_aid3_compatible_brand": timed_id3_aid3_brand,
         "timed_id3_stored_bytes": state.timed_id3_bytes,
         "timed_id3_evidence_limit_hit": state.timed_id3_limit_hit,
-        "iamf_tracks": iamf_tracks
+        "iamf_tracks": iamf_tracks,
+        "alac_tracks": alac_tracks
     });
     Ok(finish_audit(
         path, "isobmff", wrapper, bitstream, xcheck, properties,
@@ -1323,6 +1365,300 @@ fn audit_iamf_tracks(
         }
     }
     observations
+}
+
+fn audit_alac_tracks(
+    _path: &Path,
+    file: &mut File,
+    tracks: &[Track],
+    context: IamfContainerContext<'_>,
+    checks: (&mut Vec<AuditCheck>, &mut Vec<AuditCheck>),
+) -> Vec<Value> {
+    let (bitstream, xcheck) = checks;
+    let mut observations = Vec::new();
+    for track in tracks
+        .iter()
+        .filter(|track| track.alac_entries.iter().any(Option::is_some))
+    {
+        let entries: Vec<_> = track.alac_entries.iter().flatten().collect();
+        let valid_entries = entries
+            .iter()
+            .filter(|entry| entry.config.is_some())
+            .count();
+        bitstream.push(check(
+            "FORGE-ISOBMFF-ALAC-CONFIG",
+            !entries.is_empty() && valid_entries == entries.len(),
+            if valid_entries == entries.len() {
+                "every ALAC sample entry contains one valid version-0 ALACSpecificConfig"
+            } else {
+                "one or more ALAC sample entries have a missing or invalid ALACSpecificConfig"
+            },
+            Some(json!({
+                "track_id": track.id,
+                "sample_entries": entries.len(),
+                "valid_configurations": valid_entries
+            })),
+        ));
+        if context.fragmented && context.fragments.is_empty() {
+            observations.push(json!({
+                "track_id": track.id,
+                "fragmented": true,
+                "initialization_segment": true,
+                "validated_packets": 0,
+                "integrity_mechanism": "strict_decode_no_native_checksum"
+            }));
+            continue;
+        }
+
+        let samples = match alac_sample_set(track, context.fragments, context.fragmented) {
+            Ok(samples) => samples,
+            Err(error) => {
+                bitstream.push(check(
+                    "FORGE-ISOBMFF-ALAC-SAMPLE-DATA",
+                    false,
+                    error,
+                    Some(json!({"track_id": track.id})),
+                ));
+                continue;
+            }
+        };
+        let locations = &samples.locations;
+        let ranges_valid = locations.iter().all(|sample| {
+            sample.offset.checked_add(sample.size).is_some_and(|end| {
+                sample.size > 0
+                    && sample.size <= MAX_ALAC_PACKET_BYTES
+                    && context
+                        .mdat_ranges
+                        .iter()
+                        .any(|(start, limit)| sample.offset >= *start && end <= *limit)
+            })
+        });
+        let mut sorted_ranges = locations
+            .iter()
+            .filter_map(|sample| {
+                sample
+                    .offset
+                    .checked_add(sample.size)
+                    .map(|end| (sample.offset, end))
+            })
+            .collect::<Vec<_>>();
+        sorted_ranges.sort_unstable();
+        let ranges_disjoint = sorted_ranges.len() == locations.len()
+            && sorted_ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0);
+        let entries_resolve = locations.iter().all(|sample| {
+            usize::try_from(sample.description_index.saturating_sub(1))
+                .ok()
+                .and_then(|index| track.alac_entries.get(index))
+                .and_then(Option::as_ref)
+                .and_then(|entry| entry.config.as_ref())
+                .is_some()
+        });
+        let encrypted_entries = entries
+            .iter()
+            .filter(|entry| entry.protection.is_some())
+            .count();
+        let encrypted = encrypted_entries > 0;
+        let protection_valid = encrypted_entries == 0
+            || encrypted_entries == entries.len()
+                && entries
+                    .iter()
+                    .all(|entry| entry.protection.as_ref().is_some_and(|item| item.valid));
+        let packet_sizes_fit_config = locations.iter().all(|sample| {
+            usize::try_from(sample.description_index.saturating_sub(1))
+                .ok()
+                .and_then(|index| track.alac_entries.get(index))
+                .and_then(Option::as_ref)
+                .and_then(|entry| entry.config.as_ref())
+                .is_some_and(|config| {
+                    config.max_frame_bytes == 0 || sample.size <= u64::from(config.max_frame_bytes)
+                })
+        });
+
+        let mut decoded_frames = 0_u64;
+        let mut packet_error = None;
+        if !encrypted && ranges_valid && entries_resolve {
+            let mut decoders: HashMap<u32, crate::alac_qc::PacketDecoder> = HashMap::new();
+            for (index, sample) in locations.iter().enumerate() {
+                let entry_index = usize::try_from(sample.description_index - 1)
+                    .expect("validated ALAC sample description fits usize");
+                let entry = track.alac_entries[entry_index]
+                    .as_ref()
+                    .expect("validated ALAC sample entry");
+                if let std::collections::hash_map::Entry::Vacant(slot) =
+                    decoders.entry(sample.description_index)
+                {
+                    let config = entry.config.clone().expect("validated ALAC config");
+                    match crate::alac_qc::PacketDecoder::new(&entry.cookie, config) {
+                        Ok(decoder) => {
+                            slot.insert(decoder);
+                        }
+                        Err(error) => {
+                            packet_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+                let size = usize::try_from(sample.size).expect("bounded ALAC packet fits usize");
+                let mut bytes = vec![0_u8; size];
+                if let Err(error) = file
+                    .seek(SeekFrom::Start(sample.offset))
+                    .and_then(|_| file.read_exact(&mut bytes))
+                {
+                    packet_error = Some(format!("ALAC access unit {}: {error}", index + 1));
+                    break;
+                }
+                let duration = samples
+                    .sample_durations
+                    .get(index)
+                    .copied()
+                    .map(u64::from)
+                    .unwrap_or(0);
+                match decoders
+                    .get_mut(&sample.description_index)
+                    .expect("ALAC decoder was inserted")
+                    .decode(&bytes, duration)
+                {
+                    Ok(frames) => {
+                        decoded_frames = decoded_frames.saturating_add(frames as u64);
+                        if track.timescale == entry.config.as_ref().map(|item| item.sample_rate_hz)
+                            && duration != frames as u64
+                        {
+                            packet_error = Some(format!(
+                                "ALAC access unit {} decodes to {frames} frames but stts/trun duration is {duration}",
+                                index + 1
+                            ));
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        packet_error = Some(format!("ALAC access unit {}: {error}", index + 1));
+                        break;
+                    }
+                }
+            }
+        }
+        let valid = !locations.is_empty()
+            && ranges_valid
+            && ranges_disjoint
+            && entries_resolve
+            && protection_valid
+            && packet_sizes_fit_config
+            && packet_error.is_none();
+        bitstream.push(check(
+            "FORGE-ISOBMFF-ALAC-SAMPLE-DATA",
+            valid,
+            packet_error.unwrap_or_else(|| {
+                if valid && encrypted {
+                    "every encrypted ALAC access unit is bounded and resolves to valid full-sample protection; ciphertext decode requires keys".into()
+                } else if valid {
+                    "every ALAC access unit is bounded and decodes successfully without skipping undecodable packets".into()
+                } else {
+                    "ALAC sample tables, MediaDataBox ranges, sample entries, or packet sizes are invalid".into()
+                }
+            }),
+            Some(json!({
+                "track_id": track.id,
+                "packets": locations.len(),
+                "fragments": samples.fragment_count,
+                "encrypted": encrypted,
+                "ranges_inside_mdat": ranges_valid,
+                "sample_ranges_disjoint": ranges_disjoint,
+                "sample_entries_resolve": entries_resolve,
+                "packet_sizes_fit_config": packet_sizes_fit_config,
+                "decoded_frames": decoded_frames,
+                "packet_validation": if encrypted { "requires_keys" } else { "complete" },
+                "native_checksum": "not_defined_by_alac"
+            })),
+        ));
+
+        let timing_valid = entries.iter().all(|entry| {
+            entry.config.as_ref().is_some_and(|config| {
+                entry.channel_count == Some(u16::from(config.channels))
+                    && entry.sample_size == Some(u16::from(config.bit_depth))
+                    && (entry.sample_rate == Some(config.sample_rate_hz)
+                        || entry.sample_rate == Some(0)
+                            && config.sample_rate_hz > u32::from(u16::MAX))
+                    && track.timescale == Some(config.sample_rate_hz)
+            })
+        });
+        xcheck.push(check(
+            "FORGE-ISOBMFF-ALAC-CONFIG-XCHECK",
+            timing_valid,
+            "ALACSpecificConfig agrees with the audio sample entry and media timescale",
+            Some(json!({
+                "track_id": track.id,
+                "timescale": track.timescale,
+                "configurations": entries.iter().filter_map(|entry| entry.config.as_ref()).collect::<Vec<_>>()
+            })),
+        ));
+        observations.push(json!({
+            "track_id": track.id,
+            "fragmented": context.fragmented,
+            "fragments": samples.fragment_count,
+            "encrypted": encrypted,
+            "validated_packets": if valid { locations.len() } else { 0 },
+            "decoded_frames": decoded_frames,
+            "configurations": valid_entries,
+            "integrity_mechanism": "strict_decode_no_native_checksum"
+        }));
+    }
+    observations
+}
+
+fn alac_sample_set(
+    track: &Track,
+    fragments: &[Fragment],
+    fragmented: bool,
+) -> Result<IamfSampleSet, String> {
+    if !fragmented {
+        return Ok(IamfSampleSet {
+            locations: sample_locations(track)?,
+            sample_durations: track.sample_durations.clone(),
+            sample_flags: Vec::new(),
+            roll_assignments: Vec::new(),
+            has_composition_offsets: false,
+            fragment_decode_times: Vec::new(),
+            decode_timeline_contiguous: true,
+            fragment_count: 0,
+        });
+    }
+    let track_id = track
+        .id
+        .ok_or_else(|| "fragmented ALAC track has no track_ID".to_string())?;
+    let mut locations = Vec::new();
+    let mut sample_durations = Vec::new();
+    let mut fragment_count = 0;
+    for fragment in fragments {
+        for track_fragment in &fragment.tracks {
+            if track_fragment.track_id != Some(track_id) {
+                continue;
+            }
+            fragment_count += 1;
+            if !track_fragment.samples_resolved {
+                return Err(format!(
+                    "ALAC fragment at {} cannot resolve sample descriptions, durations, and sizes",
+                    fragment.start
+                ));
+            }
+            locations.extend_from_slice(&track_fragment.samples);
+            sample_durations.extend_from_slice(&track_fragment.sample_durations);
+        }
+    }
+    if fragment_count == 0 || locations.is_empty() {
+        return Err(format!(
+            "fragmented ALAC track {track_id} has no bounded TrackRunBox samples"
+        ));
+    }
+    Ok(IamfSampleSet {
+        locations,
+        sample_durations,
+        sample_flags: Vec::new(),
+        roll_assignments: Vec::new(),
+        has_composition_offsets: false,
+        fragment_decode_times: Vec::new(),
+        decode_timeline_contiguous: true,
+        fragment_count,
+    })
 }
 
 struct IamfSampleSet {
@@ -2940,11 +3276,29 @@ fn parse_stsd(
                             .as_ref()
                             .and_then(|item| item.original_format.as_deref())
                             == Some("iamf");
+                    let is_alac = sample_entry_type == "alac"
+                        || protection
+                            .as_ref()
+                            .and_then(|item| item.original_format.as_deref())
+                            == Some("alac");
                     if is_iamf {
                         logical_codec = "iamf".to_string();
+                    } else if is_alac {
+                        logical_codec = "alac".to_string();
                     }
                     track.iamf_entries.push(if is_iamf {
                         Some(parse_iamf_sample_entry(
+                            &body[offset..offset + size],
+                            &sample_entry_type,
+                            &children,
+                            protection.clone(),
+                            checks,
+                        ))
+                    } else {
+                        None
+                    });
+                    track.alac_entries.push(if is_alac {
+                        Some(parse_alac_sample_entry(
                             &body[offset..offset + size],
                             &sample_entry_type,
                             &children,
@@ -3002,6 +3356,9 @@ fn parse_stsd(
         track.codecs.push(logical_codec);
         if track.handler == Some(*b"soun") && track.iamf_entries.len() < track.codecs.len() {
             track.iamf_entries.push(None);
+        }
+        if track.handler == Some(*b"soun") && track.alac_entries.len() < track.codecs.len() {
+            track.alac_entries.push(None);
         }
         offset += size;
     }
@@ -3312,6 +3669,72 @@ fn cenc_protection_json(protection: &CencProtection) -> Value {
         "constant_iv_size": protection.constant_iv_size,
         "valid": protection.valid
     })
+}
+
+fn parse_alac_sample_entry(
+    entry: &[u8],
+    sample_entry_type: &str,
+    children: &[(String, &[u8])],
+    protection: Option<CencProtection>,
+    checks: &mut Vec<AuditCheck>,
+) -> AlacSampleEntry {
+    let configs: Vec<_> = children
+        .iter()
+        .filter(|(kind, _)| kind == "alac")
+        .map(|(_, payload)| *payload)
+        .collect();
+    let mut result = AlacSampleEntry {
+        sample_entry_type: sample_entry_type.to_string(),
+        channel_count: entry
+            .get(24..26)
+            .map(|value| u16::from_be_bytes(value.try_into().unwrap())),
+        sample_size: entry
+            .get(26..28)
+            .map(|value| u16::from_be_bytes(value.try_into().unwrap())),
+        sample_rate: entry.get(32..36).map(|value| be_u32(value) >> 16),
+        configuration_boxes: configs.len(),
+        protection,
+        ..AlacSampleEntry::default()
+    };
+    let mut error = None;
+    if configs.len() != 1 {
+        error = Some(format!(
+            "ALAC sample entry contains {} ALACSpecificConfig boxes; expected exactly one",
+            configs.len()
+        ));
+    } else {
+        let payload = configs[0];
+        if !matches!(payload.len(), 28 | 52) {
+            error = Some(format!(
+                "ALACSpecificConfig FullBox payload is {} bytes; expected 28 or 52",
+                payload.len()
+            ));
+        } else if payload[..4] != [0, 0, 0, 0] {
+            error = Some("ALACSpecificConfig FullBox version or flags are non-zero".into());
+        } else {
+            result.cookie = payload[4..].to_vec();
+            match crate::alac_qc::AlacConfig::parse(&result.cookie) {
+                Ok(config) => result.config = Some(config),
+                Err(parse_error) => error = Some(parse_error),
+            }
+        }
+    }
+    checks.push(check(
+        "FORGE-ISOBMFF-ALAC-SAMPLE-ENTRY",
+        error.is_none(),
+        error.unwrap_or_else(|| {
+            "ALAC sample entry has one bounded version-0 configuration box and magic cookie".into()
+        }),
+        Some(json!({
+            "sample_entry_type": sample_entry_type,
+            "configuration_boxes": result.configuration_boxes,
+            "channel_count": result.channel_count,
+            "sample_size": result.sample_size,
+            "sample_rate_hz": result.sample_rate,
+            "config": result.config
+        })),
+    ));
+    result
 }
 
 fn parse_iamf_sample_entry(
@@ -4718,6 +5141,19 @@ fn track_json(track: &Track) -> Value {
                 "config_obus_bytes": entry.config_obus.len(),
                 "ignored_trailing_bytes": entry.config_trailing_bytes,
                 "sampling_rate_box": entry.has_sampling_rate_box,
+                "protection": entry.protection.as_ref().map(cenc_protection_json)
+            }))
+        }).collect::<Vec<_>>(),
+        "alac_sample_entries": track.alac_entries.iter().enumerate().filter_map(|(index, entry)| {
+            entry.as_ref().map(|entry| json!({
+                "sample_description_index": index + 1,
+                "sample_entry_type": entry.sample_entry_type,
+                "channel_count": entry.channel_count,
+                "sample_size": entry.sample_size,
+                "sample_rate_hz": entry.sample_rate,
+                "configuration_boxes": entry.configuration_boxes,
+                "magic_cookie_bytes": entry.cookie.len(),
+                "config": entry.config,
                 "protection": entry.protection.as_ref().map(cenc_protection_json)
             }))
         }).collect::<Vec<_>>()

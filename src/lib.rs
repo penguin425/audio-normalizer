@@ -27,6 +27,7 @@ mod ac3_qc;
 pub mod ac4_adapter;
 pub mod adm;
 pub mod aes31_qc;
+mod alac_qc;
 pub mod analysis;
 pub mod analysis_cache;
 mod atomic;

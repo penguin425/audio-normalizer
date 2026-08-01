@@ -222,6 +222,10 @@ Forge already provides:
   core section/header validation, source and event identity/reference checks,
   channel-map consistency, integer/fractional/drop-frame sample timing,
   source bounds, automation timing, and explicit extension evidence.
+- Native ALAC-in-ISO-BMFF QC with complete magic-cookie/channel-layout
+  validation, exact unfragmented and fragmented sample-table expansion,
+  bounded `mdat`/`maxFrameBytes` ranges, strict per-access-unit decoding, and
+  explicit evidence that ALAC defines no native packet checksum.
 
 ## P0 — next correctness and interoperability work
 
@@ -231,10 +235,6 @@ can iteratively re-render from the original input without compounding lossy
 generations.
 
 ## P1 — professional delivery expansion
-
-### Codec-specific QC
-
-- ALAC native frame/checksum validation.
 
 ### Loudness workflow depth
 
