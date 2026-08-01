@@ -29,6 +29,9 @@ jobs:
       - name: Run tests without LAME
         run: cargo test --no-default-features
 
+      - name: Run opt-in ONNX provider contract tests
+        run: cargo test --locked --features onnx-provider --lib onnx_provider --bin forge-onnx-provider
+
       - name: Run tests with static Opus support
         run: cargo test --features opus-encoding
 

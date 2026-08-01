@@ -51,7 +51,7 @@ impl AnomalyKind {
 }
 
 /// Provider output submitted to Forge.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderInput {
     pub schema_version: u32,
@@ -69,7 +69,7 @@ pub struct ProviderInput {
 
 /// One model finding.  Events may overlap when models report different kinds
 /// of defects over the same audio span; they are ordered by time, not merged.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderEvent {
     pub kind: AnomalyKind,

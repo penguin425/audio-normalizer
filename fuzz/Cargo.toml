@@ -8,7 +8,7 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
-forge-normalizer = { path = "..", features = ["opus-encoding"] }
+forge-normalizer = { path = "..", features = ["onnx-provider", "opus-encoding"] }
 libfuzzer-sys = "0.4"
 ogg = "0.9"
 serde_json = "1"
@@ -101,6 +101,13 @@ bench = false
 [[bin]]
 name = "anomaly_audit"
 path = "fuzz_targets/anomaly_audit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "onnx_provider"
+path = "fuzz_targets/onnx_provider.rs"
 test = false
 doc = false
 bench = false

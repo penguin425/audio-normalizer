@@ -179,6 +179,11 @@ Forge already provides:
   `forge-report explain` model findings using stable
   `FORGE-MODEL-ANOMALY-*` IDs; model evidence remains outside normative pass
   totals.
+- Opt-in CPU ONNX anomaly-provider reference adapter with explicit runtime and
+  model SHA-256 selection, licence/dataset/calibration evidence, bounded
+  feature-frame input, exact tensor contracts, fail-closed fallback, and
+  coalesced `audio-anomaly-provider-v1` output. The default build remains free
+  of ONNX Runtime and model weights.
 - Read-only DSF and uncompressed DSDIFF analysis with bounded structural QC,
   declared bit-order/channel mapping, a versioned cascaded half-band and
   21 kHz low-pass decimation policy, 88.2/96 kHz BS.1770 measurement, and

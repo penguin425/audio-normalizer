@@ -43,6 +43,7 @@ mp3-encoding = []
 opus-encoding = ["dep:audiopus_sys", "dep:opus"]
 lv2-plugin = []
 clap-plugin = ["dep:clack-plugin", "dep:clack-extensions"]
+onnx-provider = ["dep:ndarray", "dep:ort"]
 
 [[bin]]
 name = "forge"
@@ -83,6 +84,11 @@ path = "src/bin/forge-dialogue-provider.rs"
 [[bin]]
 name = "forge-anomaly-provider"
 path = "src/bin/forge-anomaly-provider.rs"
+
+[[bin]]
+name = "forge-onnx-provider"
+path = "src/bin/forge-onnx-provider.rs"
+required-features = ["onnx-provider"]
 
 [[bin]]
 name = "forge-provenance-qc"
@@ -164,6 +170,8 @@ url = "2.5"
 rubato = { version = "0.16.2", default-features = false }
 jsonschema = { version = "0.49.1", default-features = false }
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+ndarray = { version = "0.17", default-features = false, optional = true }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["ndarray", "load-dynamic"], optional = true }
 
 [build-dependencies]
 
