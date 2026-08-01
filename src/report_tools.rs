@@ -1177,18 +1177,20 @@ fn explain_container_audit(
 }
 
 fn container_category(rule_id: &str) -> FindingCategory {
-    if [
-        "FORGE-FLAC",
-        "FORGE-MP3",
-        "FORGE-AAC",
-        "FORGE-AC3",
-        "FORGE-EAC3",
-        "FORGE-OPUS",
-        "FORGE-VORBIS",
-        "FORGE-IAMF",
-    ]
-    .iter()
-    .any(|prefix| rule_id.starts_with(prefix))
+    if rule_id.contains("ALAC")
+        || rule_id.contains("IAMF")
+        || [
+            "FORGE-FLAC",
+            "FORGE-MP3",
+            "FORGE-AAC",
+            "FORGE-AC3",
+            "FORGE-EAC3",
+            "FORGE-OPUS",
+            "FORGE-VORBIS",
+            "FORGE-IAMF",
+        ]
+        .iter()
+        .any(|prefix| rule_id.starts_with(prefix))
     {
         FindingCategory::Codec
     } else {
@@ -1224,6 +1226,11 @@ fn container_source(rule_id: &str, format: &str) -> FindingSource {
         (
             "AOMedia IAMF v1.1",
             Some("https://aomediacodec.github.io/iamf/"),
+        )
+    } else if rule_id.contains("ALAC") {
+        (
+            "Apple Lossless Audio Codec",
+            Some("https://github.com/macosforge/alac"),
         )
     } else if rule_id.starts_with("FORGE-AC3") || rule_id.starts_with("FORGE-EAC3") {
         (
@@ -1805,6 +1812,11 @@ fn codec_source(codec: &str) -> FindingSource {
         (
             "AOMedia IAMF v1.1",
             Some("https://aomediacodec.github.io/iamf/"),
+        )
+    } else if key.contains("alac") {
+        (
+            "Apple Lossless Audio Codec",
+            Some("https://github.com/macosforge/alac"),
         )
     } else if key.contains("aac") {
         ("ISO/IEC 14496-3", None)

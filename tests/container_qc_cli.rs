@@ -8,6 +8,36 @@ use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::process::Command;
 
+fn top_level_box_payload(bytes: &[u8], wanted: &[u8; 4]) -> Option<std::ops::Range<usize>> {
+    let mut offset = 0_usize;
+    while bytes.len().saturating_sub(offset) >= 8 {
+        let size_32 = u32::from_be_bytes(bytes[offset..offset + 4].try_into().ok()?);
+        let (header_size, box_size) = if size_32 == 1 {
+            if bytes.len().saturating_sub(offset) < 16 {
+                return None;
+            }
+            let size = u64::from_be_bytes(bytes[offset + 8..offset + 16].try_into().ok()?);
+            (16_usize, usize::try_from(size).ok()?)
+        } else if size_32 == 0 {
+            (8_usize, bytes.len() - offset)
+        } else {
+            (8_usize, usize::try_from(size_32).ok()?)
+        };
+        if box_size < header_size {
+            return None;
+        }
+        let end = offset.checked_add(box_size)?;
+        if end > bytes.len() {
+            return None;
+        }
+        if &bytes[offset + 4..offset + 8] == wanted {
+            return Some(offset + header_size..end);
+        }
+        offset = end;
+    }
+    None
+}
+
 fn wavpack_checksum(bytes: &[u8], width: usize) -> [u8; 4] {
     let mut sum = u32::MAX;
     for word in bytes.chunks_exact(2) {
@@ -455,6 +485,116 @@ fn container_qc_cli_audits_real_aac_lc_and_he_aac_without_runtime_decoding() {
         audit["properties"]["audio_specific_config"]["output_sample_rate_hz"],
         48_000
     );
+}
+
+#[test]
+fn container_qc_cli_strictly_decodes_every_alac_access_unit() {
+    if !Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|result| result.status.success())
+    {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("lossless.m4a");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=997:sample_rate=48000:duration=0.22",
+            "-ac",
+            "2",
+            "-c:a",
+            "alac",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{generated:#?}");
+
+    let valid = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(valid.status.success(), "{valid:#?}");
+    let audit: Value = serde_json::from_slice(&valid.stdout).unwrap();
+    assert_eq!(audit["format"], "isobmff");
+    assert_eq!(audit["passed"], true);
+    assert_eq!(
+        audit["properties"]["alac_tracks"][0]["validated_packets"],
+        3
+    );
+    assert_eq!(
+        audit["properties"]["alac_tracks"][0]["decoded_frames"],
+        10_560
+    );
+    assert_eq!(
+        audit["properties"]["alac_tracks"][0]["integrity_mechanism"],
+        "strict_decode_no_native_checksum"
+    );
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/container-qc-v1.schema.json")).unwrap();
+    assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&audit));
+
+    // A 16.16 AudioSampleEntry cannot directly carry 96 kHz. FFmpeg writes 0
+    // there and keeps the authoritative rate in ALACSpecificConfig.
+    let surround = directory.path().join("surround-96k.m4a");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=96000:cl=5.1",
+            "-t",
+            "0.05",
+            "-c:a",
+            "alac",
+        ])
+        .arg(&surround)
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{generated:#?}");
+    let high_rate = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&surround)
+        .output()
+        .unwrap();
+    assert!(high_rate.status.success(), "{high_rate:#?}");
+    let high_rate_audit: Value = serde_json::from_slice(&high_rate.stdout).unwrap();
+    assert_eq!(
+        high_rate_audit["properties"]["tracks"][0]["alac_sample_entries"][0]["config"]
+            ["sample_rate_hz"],
+        96_000
+    );
+    assert_eq!(
+        high_rate_audit["properties"]["tracks"][0]["alac_sample_entries"][0]["config"]["channels"],
+        6
+    );
+
+    let mut corrupt = fs::read(&path).unwrap();
+    let mdat = top_level_box_payload(&corrupt, b"mdat")
+        .filter(|range| !range.is_empty())
+        .expect("FFmpeg ALAC fixture has a bounded top-level mdat payload");
+    corrupt[mdat.start] = 0xff;
+    fs::write(&path, corrupt).unwrap();
+    let invalid = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(1));
+    let audit: Value = serde_json::from_slice(&invalid.stdout).unwrap();
+    assert!(audit["layers"].as_array().unwrap().iter().any(|layer| {
+        layer["checks"].as_array().unwrap().iter().any(|item| {
+            item["rule_id"] == "FORGE-ISOBMFF-ALAC-SAMPLE-DATA" && item["passed"] == false
+        })
+    }));
 }
 
 #[test]

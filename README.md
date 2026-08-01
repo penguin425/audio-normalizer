@@ -324,7 +324,9 @@ and uses stable `FORGE-AUDIO-COMPARE-*` rule identifiers.
 
 ### Container quality control
 
-`forge-container-qc` audits the original delivery bytes without decoding them:
+`forge-container-qc` audits the original delivery bytes. Structural checks do
+not decode media except for ALAC, whose format defines no frame checksum and
+therefore requires strict native access-unit decoding for payload validity:
 
 ```sh
 forge-container-qc master.bw64 --output container-qc.json
@@ -335,6 +337,7 @@ forge-container-qc archive.dsf
 forge-container-qc master.dff
 forge-container-qc archive.wv
 forge-container-qc archive.ape
+forge-container-qc lossless.m4a
 forge-container-qc master.flac
 forge-container-qc delivery.mp3
 forge-container-qc broadcast.aac
@@ -369,6 +372,19 @@ terminating data, APE header, and complete seek table. Each frame must reserve
 at least the four bytes where its stored decoded-PCM CRC begins; the report
 counts these slots but does not emit CRC values or claim equality without
 running a decoder.
+
+For ALAC in MP4/M4A, the audit validates every 24/48-byte Apple Lossless magic
+cookie, version-0 configuration box, channel layout, bit depth, frame length,
+sample rate, and sample-entry/timescale cross-check. It expands `stsz`/`stz2`,
+`stsc`, and `stco`/`co64` (or fragmented `trun`) into exact access-unit ranges,
+requires each range to stay inside `mdat` and `maxFrameBytes`, and strictly
+decodes every unencrypted packet without skipping undecodable frames. ALAC
+defines no native packet CRC, so reports state `strict_decode_no_native_checksum`
+instead of claiming checksum equality; encrypted packets report that payload
+validation requires decryption keys. Configuration semantics follow Apple's
+[ALAC magic-cookie description](https://github.com/macosforge/alac/blob/master/ALACMagicCookieDescription.txt)
+and its [reference codec](https://github.com/macosforge/alac); packet decoding
+uses the hardened Symphonia 0.6 ALAC implementation.
 
 AAF audits identify the AMWA stored format by its Compound File Binary header
 and root CLSIDs, validate the CFB allocation/directory structure, require the
@@ -1957,6 +1973,7 @@ src/
   dts_adapter.rs    native DTS core/HD framing + bounded decoder adapter
   wavpack_qc.rs     native WavPack block/metadata/checksum structural QC
   monkeys_audio_qc.rs native Monkey's Audio frame-boundary + descriptor-MD5 QC
+  alac_qc.rs        ALAC magic-cookie + strict native access-unit decode QC
   flacenc.rs        bounded-memory pure-Rust FLAC encoder
   opus.rs           RFC 7845 mono/stereo and Mapping Family 1 Ogg Opus I/O
   mp3enc.rs         mono/stereo LAME encoder with gapless Info/LAME backpatch
