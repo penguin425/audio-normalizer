@@ -26,6 +26,7 @@ pub mod proto {
 }
 
 use proto::forge_analysis_server::{ForgeAnalysis, ForgeAnalysisServer};
+use proto::forge_metrics_server::{ForgeMetrics, ForgeMetricsServer};
 use proto::{
     AnalyzeRequest, AnalyzeResponse, CancelRequest, CancelResponse, HealthRequest, HealthResponse,
     MetricsRequest, MetricsResponse,
@@ -66,8 +67,10 @@ fn run_internal(
         };
         Server::builder()
             .add_service(
-                ForgeAnalysisServer::new(service).max_decoding_message_size(config.max_body_bytes),
+                ForgeAnalysisServer::new(service.clone())
+                    .max_decoding_message_size(config.max_body_bytes),
             )
+            .add_service(ForgeMetricsServer::new(service))
             .serve_with_shutdown(bind, shutdown)
             .await
             .map_err(|error| std::io::Error::other(format!("gRPC server: {error}")))
@@ -184,7 +187,10 @@ impl ForgeAnalysis for GrpcService {
         }
         result
     }
+}
 
+#[tonic::async_trait]
+impl ForgeMetrics for GrpcService {
     async fn metrics(
         &self,
         request: Request<MetricsRequest>,
@@ -533,7 +539,7 @@ mod tests {
         let timer = metrics.start_grpc_request();
         timer.finish(200, 0);
         let service = GrpcService::new(ServiceConfig::default(), Some(metrics));
-        let response = ForgeAnalysis::metrics(&service, Request::new(MetricsRequest::default()))
+        let response = ForgeMetrics::metrics(&service, Request::new(MetricsRequest::default()))
             .await
             .unwrap()
             .into_inner();
@@ -543,7 +549,7 @@ mod tests {
             .contains("forge_service_requests_total"));
 
         let disabled = GrpcService::new(ServiceConfig::default(), None);
-        let error = ForgeAnalysis::metrics(&disabled, Request::new(MetricsRequest::default()))
+        let error = ForgeMetrics::metrics(&disabled, Request::new(MetricsRequest::default()))
             .await
             .expect_err("metrics should be disabled without a registry");
         assert_eq!(error.code(), Code::NotFound);

@@ -9,6 +9,11 @@ service ForgeAnalysis {
   rpc Analyze(AnalyzeRequest) returns (AnalyzeResponse);
   rpc Cancel(CancelRequest) returns (CancelResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// Kept as a separate service so adding observability does not require
+// downstream implementations of ForgeAnalysis to add a new method.
+service ForgeMetrics {
   rpc Metrics(MetricsRequest) returns (MetricsResponse);
 }
 

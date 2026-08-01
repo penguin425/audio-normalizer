@@ -1895,9 +1895,11 @@ while active. `Cancel` marks a running request for cooperative cancellation at
 decode/analysis checkpoints, and client disconnects and request deadlines also
 trigger the same cancellation flag. The gRPC endpoint uses the REST service's
 bearer-token policy and upload, decoded-sample, worker, and timeout limits.
-`Metrics` returns the same Prometheus text as the REST endpoint when metrics are
-enabled. The feature is opt-in, so the default library/REST build does not
-include the Tokio or tonic runtime.
+The separate `ForgeMetrics` service's `Metrics` RPC returns the same Prometheus
+text when metrics are enabled. Keeping observability in a separate service
+preserves compatibility for existing `ForgeAnalysis` implementations. The
+feature is opt-in, so the default library/REST build does not include the
+Tokio or tonic runtime.
 
 An existing audit can be attached to a batch delivery manifest in input order:
 

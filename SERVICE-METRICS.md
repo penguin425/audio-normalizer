@@ -14,7 +14,7 @@ curl --fail http://127.0.0.1:8080/metrics
 ```
 
 The endpoint uses the Prometheus text exposition format. In gRPC mode, the
-same text is returned by the `Metrics` RPC in the optional
+same text is returned by the `ForgeMetrics/Metrics` RPC in the optional
 `forge.service.v1` protocol. The RPC is available only when the
 `grpc-service` feature is enabled and `--metrics` (or `--otel-jsonl`) was
 selected.
@@ -65,4 +65,3 @@ serialized, flushed after each record, and ignored if the destination becomes
 unavailable so an observability failure cannot change an analysis response.
 Keep the file on a protected local volume and rotate it outside the service;
 the reference binary does not perform unbounded buffering or remote export.
-
