@@ -8,6 +8,20 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=proto/forge_service.proto");
+
+    if std::env::var_os("CARGO_FEATURE_GRPC_SERVICE").is_some() {
+        let protoc = protoc_bin_vendored::protoc_bin_path()
+            .expect("bundled protoc must be available for grpc-service");
+        // SAFETY: build scripts run before compilation and this environment
+        // variable is consumed only by prost-build in this process.
+        unsafe { std::env::set_var("PROTOC", protoc) };
+        tonic_prost_build::configure()
+            .build_server(true)
+            .build_client(true)
+            .compile_protos(&["proto/forge_service.proto"], &["proto"])
+            .expect("forge gRPC protobuf compilation failed");
+    }
 
     if std::env::var_os("CARGO_FEATURE_MP3_ENCODING").is_none() {
         return;

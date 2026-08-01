@@ -1862,9 +1862,28 @@ the environment variable named by `--auth-token-env` (default
 `FORGE_SERVICE_BEARER_TOKEN`) contains a bearer token. Send it as
 `Authorization: Bearer <token>`. TLS termination, rate limiting, and durable
 job storage belong at the deployment gateway; this reference service is
-intentionally bounded and synchronous. gRPC, cancellation, and metrics are
-separate follow-up stages. See `schema/service-analysis-v1.schema.json`,
+intentionally bounded and synchronous. See `schema/service-analysis-v1.schema.json`,
 `schema/service-error-v1.schema.json`, and `schema/service-health-v1.schema.json`.
+
+### Optional gRPC service and cancellation
+
+Build the same `forge-service` binary with the `grpc-service` feature to expose
+an HTTP/2 endpoint:
+
+```bash
+cargo build --locked --release --features grpc-service --bin forge-service
+forge-service --grpc-bind 127.0.0.1:9090
+```
+
+The protocol is versioned in [`proto/forge_service.proto`](proto/forge_service.proto)
+and provides `Analyze`, `Cancel`, and `Health` RPCs. `Analyze` carries the
+audio bytes and an explicit `request_id`; IDs are bounded and must be unique
+while active. `Cancel` marks a running request for cooperative cancellation at
+decode/analysis checkpoints, and client disconnects and request deadlines also
+trigger the same cancellation flag. The gRPC endpoint uses the REST service's
+bearer-token policy and upload, decoded-sample, worker, and timeout limits.
+The feature is opt-in, so the default library/REST build does not include the
+Tokio or tonic runtime.
 
 An existing audit can be attached to a batch delivery manifest in input order:
 

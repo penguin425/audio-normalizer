@@ -2,6 +2,8 @@
 
 use clap::Parser;
 use forge_normalizer::service::{self, ServiceConfig};
+#[cfg(feature = "grpc-service")]
+use forge_normalizer::service_grpc;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -37,6 +39,11 @@ struct Args {
     /// unauthenticated loopback-only mode.
     #[arg(long, default_value = "FORGE_SERVICE_BEARER_TOKEN")]
     auth_token_env: String,
+
+    /// Start the gRPC endpoint instead of the REST endpoint. Requires the
+    /// grpc-service Cargo feature and uses the same limits and auth policy.
+    #[arg(long)]
+    grpc_bind: Option<SocketAddr>,
 }
 
 fn main() -> ExitCode {
@@ -56,8 +63,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let selected_bind = args.grpc_bind.unwrap_or(args.bind);
     let config = ServiceConfig {
-        bind: args.bind,
+        bind: selected_bind,
         max_body_bytes,
         max_decoded_samples: args.max_decoded_samples,
         workers: args.workers,
@@ -67,6 +75,25 @@ fn main() -> ExitCode {
     if let Err(error) = config.validate() {
         eprintln!("invalid service configuration: {error}");
         return ExitCode::from(2);
+    }
+    if let Some(bind) = args.grpc_bind {
+        #[cfg(feature = "grpc-service")]
+        {
+            eprintln!("forge-service gRPC listening on {bind}");
+            return match service_grpc::run(config, bind) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("forge-service gRPC failed: {error}");
+                    ExitCode::from(1)
+                }
+            };
+        }
+        #[cfg(not(feature = "grpc-service"))]
+        {
+            let _ = bind;
+            eprintln!("--grpc-bind requires building with --features grpc-service");
+            return ExitCode::from(2);
+        }
     }
     eprintln!("forge-service listening on {}", config.bind);
     match service::run(config) {

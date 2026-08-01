@@ -194,6 +194,11 @@ Forge already provides:
   deployments, strict HTTP framing, upload/decoded-sample/concurrency/time
   limits, and versioned health/analysis/error schemas. The service never
   accepts a local filesystem path or performs implicit remote access.
+- Optional tonic gRPC service on the same `forge-service` binary, with a
+  versioned `Analyze`/`Cancel`/`Health` protocol, explicit bounded request IDs,
+  the REST limits/authentication policy, deadline/disconnect cancellation, and
+  cooperative decode/analysis checkpoints. The default build remains free of
+  the async runtime and HTTP/2 stack.
 - Read-only DSF and uncompressed DSDIFF analysis with bounded structural QC,
   declared bit-order/channel mapping, a versioned cascaded half-band and
   21 kHz low-pass decimation policy, 88.2/96 kHz BS.1770 measurement, and

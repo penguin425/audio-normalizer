@@ -38,6 +38,9 @@ jobs:
       - name: Run bounded REST service tests
         run: cargo test --locked --lib service --test service_api --bin forge-service
 
+      - name: Run optional gRPC service and cancellation tests
+        run: cargo test --locked --features grpc-service --lib service_grpc --bin forge-service
+
       - name: Run tests with static Opus support
         run: cargo test --features opus-encoding
 
