@@ -30,6 +30,7 @@ for binary in \
   forge-sadm-qc \
   forge-dialogue-provider \
   forge-anomaly-provider \
+  forge-onnx-provider \
   forge-provenance-qc \
   forge-imf-qc \
   forge-aes31-qc \
@@ -72,7 +73,9 @@ cp schema/dts-adapter-request-v1.schema.json \
    schema/dts-adapter-report-v1.schema.json "$staging/schema/"
 cp schema/audio-anomaly-provider-v1.schema.json \
    schema/anomaly-provider-audit-v1.schema.json \
-   schema/model-qc-v1.schema.json "$staging/schema/"
+   schema/model-qc-v1.schema.json \
+   schema/onnx-anomaly-model-v1.schema.json \
+   schema/onnx-feature-frames-v1.schema.json "$staging/schema/"
 cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md \
    BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md \
    MPEGH-ADAPTER.md DTS-ADAPTER.md ANOMALY-ADAPTER.md \

@@ -74,6 +74,8 @@ pub mod nmos_qc;
 pub mod normalization_diff;
 pub mod normalize;
 mod ogg_qc;
+#[cfg(feature = "onnx-provider")]
+pub mod onnx_provider;
 #[cfg(feature = "opus-encoding")]
 pub mod opus;
 pub mod opus_tags;

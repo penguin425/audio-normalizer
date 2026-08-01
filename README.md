@@ -1806,6 +1806,13 @@ a model runtime to the default build. See
 [ANOMALY-ADAPTER.md](ANOMALY-ADAPTER.md) for the schema, limits, trust
 boundary, and future model acceptance requirements.
 
+An explicit CPU ONNX reference adapter is available only with the
+`onnx-provider` feature. It requires a caller-supplied runtime shared library,
+model manifest, model SHA-256, and bounded feature-frame sidecar; it never
+downloads weights or silently falls back to a passing result. See the
+`Explicit ONNX reference adapter` section in
+[ANOMALY-ADAPTER.md](ANOMALY-ADAPTER.md).
+
 An existing audit can be attached to a batch delivery manifest in input order:
 
 ```bash
@@ -2002,6 +2009,7 @@ src/
   aes31_qc.rs       bounded AES31-3 EDML project/reference/timing QC
   ac4_adapter.rs    bounded licensed/reference AC-4 decoder adapter + evidence
   anomaly_provider.rs external audio-quality anomaly adapter + audit contract
+  onnx_provider.rs  opt-in bounded ONNX model/feature contract + reference adapter
   report.rs          analysis/delivery manifest and advisory model-QC envelope
   report_tools.rs    versioned migration and explainable model/compliance findings
   mpegh_adapter.rs  native MHAS framing + bounded conforming decoder adapter
@@ -2037,6 +2045,7 @@ src/
   bin/forge-mpegh-qc.rs MHAS/scene/preset/render MPEG-H audit CLI
   bin/forge-dts-qc.rs DTS core/HD asset/presentation audit CLI
   bin/forge-anomaly-provider.rs external audio-quality anomaly audit CLI
+  bin/forge-onnx-provider.rs opt-in CPU ONNX anomaly-provider adapter CLI
   lv2.rs            hard-real-time-capable LV2 stereo plugin ABI
   clap_plugin.rs    CLAP stereo effect, automation, state, and latency ABI
   preset.rs         named playback and broadcast loudness targets
