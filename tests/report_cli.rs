@@ -640,3 +640,91 @@ fn migrate_rejects_inconsistent_counts() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("asset_count"));
 }
+
+#[test]
+fn explain_reports_model_qc_as_non_normative_with_stable_rule_id() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("model-manifest.json");
+    let audit = json!({
+        "schema": forge_normalizer::anomaly_provider::AUDIT_SCHEMA,
+        "schema_version": 1,
+        "adapter": forge_normalizer::anomaly_provider::ADAPTER,
+        "source_path": "programme.wav",
+        "source_sha256": "b".repeat(64),
+        "provider": "reviewed-detector",
+        "provider_version": "2.0",
+        "model": "audio-quality",
+        "model_version": "2026-08",
+        "model_sha256": "a".repeat(64),
+        "source_duration_seconds": 10.0,
+        "sample_rate_hz": 48_000,
+        "confidence_threshold": 0.6,
+        "severity_threshold": 0.5,
+        "input_event_count": 1,
+        "selected_event_count": 1,
+        "selected_event_duration_seconds": 0.1,
+        "selected_by_kind": {"pop": 1},
+        "passed": false,
+        "events": [{
+            "index": 1,
+            "kind": "pop",
+            "start_seconds": 1.0,
+            "end_seconds": 1.1,
+            "confidence": 0.9,
+            "severity": 0.8,
+            "channel": 1,
+            "related_channel": null,
+            "evidence_label": "impulse-spectrum",
+            "selected": true
+        }]
+    });
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!({
+            "schema": "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v3",
+            "generator": "forge-normalizer/0.112.0",
+            "asset_count": 1,
+            "passed_count": 1,
+            "failed_count": 0,
+            "assets": [{
+                "path": "programme.wav",
+                "model_qc": {
+                    "schema": forge_normalizer::report_tools::MODEL_QC_SCHEMA,
+                    "layer": "model-qc",
+                    "classification": "non-normative-model-evidence",
+                    "passed": false,
+                    "audit": audit
+                }
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_forge-report"))
+        .args(["explain"])
+        .arg(&input)
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["failed_rule_count"], 1);
+    assert_eq!(report["explanations"][0]["category"], "model_qc");
+    assert_eq!(
+        report["explanations"][0]["rule_id"],
+        "FORGE-MODEL-ANOMALY-POP"
+    );
+    assert_eq!(
+        report["explanations"][0]["source"]["standard"],
+        "non-normative model evidence"
+    );
+    assert!(report["explanations"][0]["requirement"]
+        .as_str()
+        .unwrap()
+        .contains("does not change EBU/ITU compliance"));
+}

@@ -475,6 +475,29 @@ fn run_paths(
     let (expanded, relative_paths) = expand_inputs(&cli.inputs, cli.recursive)?;
     cli.inputs = expanded;
 
+    let anomaly_audits = if cli.anomaly_audits.is_empty() {
+        Vec::new()
+    } else {
+        if cli.manifest.is_none() {
+            return Err("--anomaly-audit requires --manifest".into());
+        }
+        if stdin_requested || cli.inputs.iter().any(|input| input == Path::new("-")) {
+            return Err("--anomaly-audit cannot be used with stdin".into());
+        }
+        if cli.anomaly_audits.len() != cli.inputs.len() {
+            return Err(format!(
+                "--anomaly-audit was supplied {} time(s), but {} analyzed input(s) were found; provide one audit per input in input order",
+                cli.anomaly_audits.len(),
+                cli.inputs.len()
+            ));
+        }
+        cli.anomaly_audits
+            .iter()
+            .map(|path| forge_normalizer::anomaly_provider::load_audit(path))
+            .map(|result| result.map(Some))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
     let preset = cli
         .preset
         .as_deref()
@@ -1285,12 +1308,16 @@ fn run_paths(
         if let Some(path) = &cli.manifest {
             if path.as_os_str() == "-" {
                 let stdout = io::stdout();
-                report::write_manifest(stdout.lock(), &reports)?;
+                report::write_manifest_with_anomaly_audits(
+                    stdout.lock(),
+                    &reports,
+                    &anomaly_audits,
+                )?;
                 println!();
             } else {
                 let file = File::create(path)
                     .map_err(|error| format!("create {}: {error}", path.display()))?;
-                report::write_manifest(file, &reports)?;
+                report::write_manifest_with_anomaly_audits(file, &reports, &anomaly_audits)?;
             }
         }
         if let Some(path) = &cli.dialogue_detection_report {

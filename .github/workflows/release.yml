@@ -47,8 +47,16 @@ on:
       - "src/bin/forge-dts-qc.rs"
       - "src/anomaly_provider.rs"
       - "src/bin/forge-anomaly-provider.rs"
+      - "src/cli.rs"
+      - "src/main.rs"
+      - "src/report.rs"
+      - "src/report_tools.rs"
+      - "src/bin/forge-report.rs"
       - "schema/audio-anomaly-provider-v1.schema.json"
       - "schema/anomaly-provider-audit-v1.schema.json"
+      - "schema/model-qc-v1.schema.json"
+      - "schema/delivery-manifest-v3.schema.json"
+      - "schema/rule-explanations-v2.schema.json"
       - "ANOMALY-ADAPTER.md"
       - "NEXT-GENERATION-PLAN.md"
       - "tools/build-python-wheel.py"
@@ -247,7 +255,8 @@ jobs:
              schema/dts-adapter-response-v1.schema.json \
              schema/dts-adapter-report-v1.schema.json "$staging/schema/"
           cp schema/audio-anomaly-provider-v1.schema.json \
-             schema/anomaly-provider-audit-v1.schema.json "$staging/schema/"
+             schema/anomaly-provider-audit-v1.schema.json \
+             schema/model-qc-v1.schema.json "$staging/schema/"
           cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md MPEGH-ADAPTER.md DTS-ADAPTER.md ANOMALY-ADAPTER.md NEXT-GENERATION-PLAN.md LICENSE "$staging/"
           tar -czf "${staging}.tar.gz" "$staging"
 
@@ -273,7 +282,7 @@ jobs:
           Copy-Item "schema/ac4-adapter-request-v1.schema.json","schema/ac4-adapter-response-v1.schema.json","schema/ac4-adapter-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/mpegh-adapter-request-v1.schema.json","schema/mpegh-adapter-response-v1.schema.json","schema/mpegh-adapter-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/dts-adapter-request-v1.schema.json","schema/dts-adapter-response-v1.schema.json","schema/dts-adapter-report-v1.schema.json" "$staging/schema/"
-          Copy-Item "schema/audio-anomaly-provider-v1.schema.json","schema/anomaly-provider-audit-v1.schema.json" "$staging/schema/"
+          Copy-Item "schema/audio-anomaly-provider-v1.schema.json","schema/anomaly-provider-audit-v1.schema.json","schema/model-qc-v1.schema.json" "$staging/schema/"
           Copy-Item "README.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","MULTI-DELIVERY.md","SEGMENT-NORMALIZATION.md","AC4-ADAPTER.md","MPEGH-ADAPTER.md","DTS-ADAPTER.md","ANOMALY-ADAPTER.md","NEXT-GENERATION-PLAN.md","LICENSE" $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
 

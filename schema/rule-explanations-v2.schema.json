@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://penguin425.github.io/audio-normalizer/schema/rule-explanations-v2",
   "title": "Forge failed QC rule explanations v2",
-  "description": "Actionable failed-rule evidence for compliance, EBU QC, container/codec, ADM/profile, and externally rendered presentation reports.",
+  "description": "Actionable failed-rule evidence for compliance, EBU QC, container/codec, ADM/profile, externally rendered presentation, and non-normative model-QC reports.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -66,7 +66,8 @@
             "codec",
             "adm",
             "adm_profile",
-            "presentation"
+            "presentation",
+            "model_qc"
           ]
         },
         "location": {"type": "string", "pattern": "^(/.*)?$"},

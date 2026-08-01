@@ -1,5 +1,6 @@
 //! Versioned report migration and actionable compliance explanations.
 
+use crate::anomaly_provider::{self, ProviderAuditDocument};
 use crate::qc::{EBU_QC_CATALOGUE, FORGE_QC_SOURCE, QC_SCHEMA};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -14,6 +15,8 @@ pub const EXPLANATION_SCHEMA: &str =
     "https://penguin425.github.io/audio-normalizer/schema/rule-explanations-v1";
 pub const EXPLANATION_SCHEMA_V2: &str =
     "https://penguin425.github.io/audio-normalizer/schema/rule-explanations-v2";
+pub const MODEL_QC_SCHEMA: &str =
+    "https://penguin425.github.io/audio-normalizer/schema/model-qc-v1";
 const EBU_QC_SCHEMA_V1: &str =
     "https://penguin425.github.io/audio-normalizer/schema/ebu-qc-results-v1";
 const DELIVERY_MANIFEST_V1_SCHEMA: &str =
@@ -616,6 +619,7 @@ pub enum FindingCategory {
     Adm,
     AdmProfile,
     Presentation,
+    ModelQc,
 }
 
 impl FindingCategory {
@@ -628,6 +632,7 @@ impl FindingCategory {
             Self::Adm => "adm",
             Self::AdmProfile => "adm_profile",
             Self::Presentation => "presentation",
+            Self::ModelQc => "model_qc",
         }
     }
 }
@@ -677,7 +682,20 @@ pub fn explain_failed_findings(bytes: &[u8]) -> Result<ExplanationReportV2, Stri
     let value: Value =
         serde_json::from_slice(bytes).map_err(|error| format!("decode report JSON: {error}"))?;
     let mut explanations = Vec::new();
-    let (source_schema, asset_count) = if is_container_report(&value) {
+    let (source_schema, asset_count) = if is_model_qc_report(&value) {
+        let object = value
+            .as_object()
+            .ok_or_else(|| "model QC report must be an object".to_string())?;
+        let audit = decode_model_qc(object, "standalone model QC report")?;
+        explain_model_audit(&audit, &audit.source_path, "", &mut explanations)?;
+        (Some(MODEL_QC_SCHEMA.to_owned()), 1)
+    } else if is_anomaly_audit_report(&value) {
+        let audit: ProviderAuditDocument = serde_json::from_value(value.clone())
+            .map_err(|error| format!("decode anomaly audit: {error}"))?;
+        anomaly_provider::validate_audit(&audit)?;
+        explain_model_audit(&audit, &audit.source_path, "", &mut explanations)?;
+        (Some(anomaly_provider::AUDIT_SCHEMA.to_owned()), 1)
+    } else if is_container_report(&value) {
         let object = value
             .as_object()
             .ok_or_else(|| "container QC report must be an object".to_string())?;
@@ -790,6 +808,26 @@ fn is_container_report(value: &Value) -> bool {
     })
 }
 
+fn is_model_qc_report(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object
+            .get("schema")
+            .and_then(Value::as_str)
+            .is_some_and(|schema| schema == MODEL_QC_SCHEMA)
+            && object.contains_key("audit")
+    })
+}
+
+fn is_anomaly_audit_report(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object
+            .get("schema")
+            .and_then(Value::as_str)
+            .is_some_and(|schema| schema == anomaly_provider::AUDIT_SCHEMA)
+            && object.contains_key("events")
+    })
+}
+
 fn is_presentation_report(value: &Value) -> bool {
     value.as_object().is_some_and(|object| {
         object
@@ -833,7 +871,146 @@ fn explain_analysis_asset(
     explain_asset_adm_profile(object, asset, location, asset_index, explanations)?;
     explain_asset_adm(object, asset, location, asset_index, explanations)?;
     explain_asset_codec(object, asset, location, explanations)?;
+    explain_asset_model_qc(object, asset, location, asset_index, explanations)?;
     Ok(())
+}
+
+fn explain_asset_model_qc(
+    object: &Map<String, Value>,
+    asset: &str,
+    location: &str,
+    asset_index: usize,
+    explanations: &mut Vec<FindingExplanation>,
+) -> Result<(), String> {
+    let Some(value) = object.get("model_qc") else {
+        return Ok(());
+    };
+    let model_qc = value
+        .as_object()
+        .ok_or_else(|| format!("asset {} model_qc must be an object", asset_index + 1))?;
+    let audit = decode_model_qc(model_qc, &format!("asset {} model_qc", asset_index + 1))?;
+    explain_model_audit(&audit, asset, &format!("{location}/model_qc"), explanations)
+}
+
+fn decode_model_qc(
+    object: &Map<String, Value>,
+    label: &str,
+) -> Result<ProviderAuditDocument, String> {
+    if object.get("schema").and_then(Value::as_str) != Some(MODEL_QC_SCHEMA) {
+        return Err(format!("{label} uses unsupported schema"));
+    }
+    if object.get("layer").and_then(Value::as_str) != Some("model-qc") {
+        return Err(format!("{label} requires layer=model-qc"));
+    }
+    if object.get("classification").and_then(Value::as_str) != Some("non-normative-model-evidence")
+    {
+        return Err(format!(
+            "{label} requires classification=non-normative-model-evidence"
+        ));
+    }
+    let passed = object
+        .get("passed")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("{label} requires a boolean passed field"))?;
+    let audit_value = object
+        .get("audit")
+        .ok_or_else(|| format!("{label} requires an audit object"))?;
+    let audit: ProviderAuditDocument = serde_json::from_value(audit_value.clone())
+        .map_err(|error| format!("{label} decode audit: {error}"))?;
+    anomaly_provider::validate_audit(&audit)?;
+    if passed != audit.passed {
+        return Err(format!("{label} passed does not match audit.passed"));
+    }
+    Ok(audit)
+}
+
+fn explain_model_audit(
+    audit: &ProviderAuditDocument,
+    asset: &str,
+    location: &str,
+    explanations: &mut Vec<FindingExplanation>,
+) -> Result<(), String> {
+    for (index, event) in audit
+        .events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.selected)
+    {
+        let kind = event.kind.as_str();
+        let rule_id = format!("FORGE-MODEL-ANOMALY-{}", kind.to_ascii_uppercase());
+        let source = FindingSource {
+            profile: format!(
+                "external audio anomaly provider {} {}; model {}",
+                audit.provider, audit.provider_version, audit.model
+            ),
+            standard: Some("non-normative model evidence".into()),
+            standard_version: Some(audit.model_version.clone()),
+            url: None,
+        };
+        push_finding(
+            explanations,
+            FindingExplanation {
+                rule_id,
+                asset: asset.into(),
+                category: FindingCategory::ModelQc,
+                location: format!("{location}/audit/events/{index}"),
+                source,
+                observation: json!({
+                    "kind": kind,
+                    "start_seconds": event.start_seconds,
+                    "end_seconds": event.end_seconds,
+                    "confidence": event.confidence,
+                    "severity": event.severity,
+                    "channel": event.channel,
+                    "related_channel": event.related_channel,
+                    "evidence_label": event.evidence_label,
+                    "provider": audit.provider,
+                    "provider_version": audit.provider_version,
+                    "model": audit.model,
+                    "model_version": audit.model_version,
+                    "model_sha256": audit.model_sha256,
+                    "source_sha256": audit.source_sha256,
+                    "confidence_threshold": audit.confidence_threshold,
+                    "severity_threshold": audit.severity_threshold,
+                }),
+                requirement: format!(
+                    "No selected {kind} anomaly events under the recorded thresholds; this is non-normative model evidence and does not change EBU/ITU compliance."
+                ),
+                message: Some(format!(
+                    "{kind} anomaly selected by {} {} / {} {}",
+                    audit.provider,
+                    audit.provider_version,
+                    audit.model,
+                    audit.model_version
+                )),
+                remediation: model_remediation(kind).into(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn model_remediation(kind: &str) -> &'static str {
+    match kind {
+        "noise" => {
+            "Inspect the reported range and confirm the noise against the source; repair or document it, then rerun deterministic QC."
+        }
+        "pop" | "lip-noise" => {
+            "Review the reported transient and apply an edit/de-click only after listening; rerun deterministic QC and retain before/after evidence."
+        }
+        "dropout" => {
+            "Inspect the reported dropout range, restore the source or document the editorial intent, and rerun deterministic QC."
+        }
+        "phase-cancellation" => {
+            "Check channel polarity, alignment, and the mono/downmix result in the source, then rerun phase and loudness QC."
+        }
+        "clipping" => {
+            "Inspect the waveform and true-peak evidence; repair or limit the source without relying on the model finding alone."
+        }
+        _ => {
+            "Review the model evidence against the source, make any correction explicitly, and rerun deterministic QC."
+        }
+    }
 }
 
 fn explain_asset_compliance(

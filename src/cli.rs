@@ -289,6 +289,12 @@ pub struct Cli {
     #[arg(long, value_name = "PATH", requires = "analyze_only")]
     pub manifest: Option<PathBuf>,
 
+    /// Import one forge-anomaly-provider audit per analyzed input, in input
+    /// order, and attach it to the delivery manifest's advisory `model_qc`
+    /// layer. This evidence never changes EBU/ITU compliance totals.
+    #[arg(long = "anomaly-audit", value_name = "PATH", requires = "analyze_only")]
+    pub anomaly_audits: Vec<PathBuf>,
+
     /// Run published EBU QC baseband checks, including signal-health checks.
     #[arg(long = "ebu-qc", requires = "analyze_only")]
     pub ebu_qc: bool,

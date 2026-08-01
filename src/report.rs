@@ -1,5 +1,6 @@
 //! Stable machine-readable analysis reports.
 
+use crate::anomaly_provider::ProviderAuditDocument;
 use crate::dsp::lufs::LoudnessTimelinePoint;
 use crate::normalize::{Analysis, DialogueMeasurement, DialogueSource};
 use crate::qc::{QcResult, QC_SCHEMA};
@@ -923,6 +924,8 @@ struct DeliveryAsset<'a> {
     qc: Option<QcEnvelope>,
     #[serde(skip_serializing_if = "Option::is_none")]
     container_qc: Option<ContainerAudit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_qc: Option<ModelQcEnvelope>,
 }
 
 #[derive(Serialize)]
@@ -931,10 +934,42 @@ struct QcEnvelope {
     results: Vec<QcResult>,
 }
 
+#[derive(Serialize)]
+struct ModelQcEnvelope {
+    schema: &'static str,
+    layer: &'static str,
+    classification: &'static str,
+    passed: bool,
+    audit: ProviderAuditDocument,
+}
+
+pub const MODEL_QC_SCHEMA: &str =
+    "https://penguin425.github.io/audio-normalizer/schema/model-qc-v1";
+
 pub fn write_manifest<W: Write>(writer: W, reports: &[AnalysisReport]) -> Result<(), String> {
+    write_manifest_with_anomaly_audits(writer, reports, &[])
+}
+
+/// Write a delivery manifest and optionally attach one validated external
+/// anomaly audit to each asset. `model_qc` is an advisory layer: its `passed`
+/// value is reported for review but never changes the manifest's normative
+/// `passed_count`/`failed_count` totals.
+pub fn write_manifest_with_anomaly_audits<W: Write>(
+    writer: W,
+    reports: &[AnalysisReport],
+    anomaly_audits: &[Option<ProviderAuditDocument>],
+) -> Result<(), String> {
+    if !anomaly_audits.is_empty() && anomaly_audits.len() != reports.len() {
+        return Err(format!(
+            "anomaly audit count ({}) must match asset count ({})",
+            anomaly_audits.len(),
+            reports.len()
+        ));
+    }
     let assets = reports
         .iter()
-        .map(|report| {
+        .enumerate()
+        .map(|(index, report)| {
             let qc = report
                 .ebu_qc_results_json
                 .as_deref()
@@ -955,6 +990,16 @@ pub fn write_manifest<W: Write>(writer: W, reports: &[AnalysisReport]) -> Result
                 report,
                 qc,
                 container_qc,
+                model_qc: anomaly_audits
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .map(|audit| ModelQcEnvelope {
+                        schema: MODEL_QC_SCHEMA,
+                        layer: "model-qc",
+                        classification: "non-normative-model-evidence",
+                        passed: audit.passed,
+                        audit: audit.clone(),
+                    }),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;

@@ -1806,6 +1806,21 @@ a model runtime to the default build. See
 [ANOMALY-ADAPTER.md](ANOMALY-ADAPTER.md) for the schema, limits, trust
 boundary, and future model acceptance requirements.
 
+An existing audit can be attached to a batch delivery manifest in input order:
+
+```bash
+forge one.wav --analyze --manifest delivery.json \
+  --anomaly-audit anomaly-audit.json
+```
+
+Repeat `--anomaly-audit` once per input when analyzing multiple files. Forge
+revalidates the audit before embedding it under each asset's `model_qc` layer.
+That layer is explicitly `non-normative-model-evidence`; a finding is visible
+to downstream review but does not change the manifest's EBU/ITU pass totals.
+`forge-report explain delivery.json` emits stable
+`FORGE-MODEL-ANOMALY-*` findings with time locations, provider/model hashes,
+thresholds, and corrective guidance.
+
 The reviewable JSON/TOML sidecar flow remains available through
 `--codec-metadata`. Fields include `codec`, `dialnorm_lkfs`,
 `encoded_loudness_lufs`, `downmix_mode`, and `tolerance_lu`. Dialnorm is
@@ -1822,8 +1837,8 @@ per-asset delivery record containing measurements, metadata checks, compliance
 rules, and pass/fail totals.
 
 `forge-report` upgrades older delivery manifests and turns failed compliance,
-EBU QC, container, codec, ADM/profile, and externally rendered presentation
-rules into actionable, auditable explanations:
+EBU QC, container, codec, ADM/profile, externally rendered presentation, and
+non-normative model-QC rules into actionable, auditable explanations:
 
 ```sh
 # Exit 1 when migration is needed, without changing the file
@@ -1987,6 +2002,8 @@ src/
   aes31_qc.rs       bounded AES31-3 EDML project/reference/timing QC
   ac4_adapter.rs    bounded licensed/reference AC-4 decoder adapter + evidence
   anomaly_provider.rs external audio-quality anomaly adapter + audit contract
+  report.rs          analysis/delivery manifest and advisory model-QC envelope
+  report_tools.rs    versioned migration and explainable model/compliance findings
   mpegh_adapter.rs  native MHAS framing + bounded conforming decoder adapter
   dts_adapter.rs    native DTS core/HD framing + bounded decoder adapter
   wavpack_qc.rs     native WavPack block/metadata/checksum structural QC

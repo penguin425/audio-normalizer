@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v3",
   "title": "Forge delivery manifest v3",
-  "description": "Versioned loudness, ADM, codec, EBU and container QC evidence emitted by forge --manifest.",
+  "description": "Versioned loudness, ADM, codec, EBU, container, and optional non-normative model-QC evidence emitted by forge --manifest.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -182,7 +182,73 @@
         "ebu_qc_results_json": {"$ref": "#/$defs/nullableString"},
         "ebu_qc_passed": {"$ref": "#/$defs/nullableBoolean"},
         "qc": {"$ref": "#/$defs/qc"},
-        "container_qc": {"$ref": "#/$defs/containerQc"}
+        "container_qc": {"$ref": "#/$defs/containerQc"},
+        "model_qc": {"$ref": "#/$defs/modelQc"}
+      }
+    },
+    "modelQc": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "layer", "classification", "passed", "audit"],
+      "properties": {
+        "schema": {
+          "const": "https://penguin425.github.io/audio-normalizer/schema/model-qc-v1"
+        },
+        "layer": {"const": "model-qc"},
+        "classification": {"const": "non-normative-model-evidence"},
+        "passed": {"type": "boolean"},
+        "audit": {"$ref": "#/$defs/anomalyAudit"}
+      }
+    },
+    "anomalyAudit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "schema_version", "adapter", "source_path", "source_sha256",
+        "provider", "provider_version", "model", "model_version", "model_sha256",
+        "source_duration_seconds", "confidence_threshold",
+        "severity_threshold", "input_event_count", "selected_event_count",
+        "selected_event_duration_seconds", "selected_by_kind", "passed", "events"
+      ],
+      "properties": {
+        "schema": {"const": "https://penguin425.github.io/audio-normalizer/schema/anomaly-provider-audit-v1"},
+        "schema_version": {"const": 1},
+        "adapter": {"const": "forge-anomaly-provider-1"},
+        "source_path": {"type": "string", "minLength": 1},
+        "source_sha256": {"$ref": "#/$defs/sha256"},
+        "provider": {"type": "string", "minLength": 1},
+        "provider_version": {"type": "string", "minLength": 1},
+        "model": {"type": "string", "minLength": 1},
+        "model_version": {"type": "string", "minLength": 1},
+        "model_sha256": {"$ref": "#/$defs/sha256"},
+        "source_duration_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 604800},
+        "sample_rate_hz": {"type": ["integer", "null"], "minimum": 1},
+        "confidence_threshold": {"type": "number", "minimum": 0, "maximum": 1},
+        "severity_threshold": {"type": "number", "minimum": 0, "maximum": 1},
+        "input_event_count": {"type": "integer", "minimum": 0, "maximum": 100000},
+        "selected_event_count": {"type": "integer", "minimum": 0, "maximum": 100000},
+        "selected_event_duration_seconds": {"type": "number", "minimum": 0},
+        "selected_by_kind": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}},
+        "passed": {"type": "boolean"},
+        "events": {"type": "array", "maxItems": 100000, "items": {"$ref": "#/$defs/anomalyEvent"}}
+      }
+    },
+    "sha256": {"type": "string", "pattern": "^[A-Fa-f0-9]{64}$"},
+    "anomalyEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "kind", "start_seconds", "end_seconds", "confidence", "severity", "selected"],
+      "properties": {
+        "index": {"type": "integer", "minimum": 1, "maximum": 100000},
+        "kind": {"enum": ["noise", "pop", "dropout", "lip-noise", "phase-cancellation", "clipping", "other"]},
+        "start_seconds": {"type": "number", "minimum": 0},
+        "end_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "severity": {"type": "number", "minimum": 0, "maximum": 1},
+        "channel": {"type": ["integer", "null"], "minimum": 1, "maximum": 65535},
+        "related_channel": {"type": ["integer", "null"], "minimum": 1, "maximum": 65535},
+        "evidence_label": {"type": ["string", "null"], "minLength": 1, "maxLength": 128},
+        "selected": {"type": "boolean"}
       }
     }
   }

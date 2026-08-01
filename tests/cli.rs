@@ -1549,6 +1549,70 @@ fn batch_analysis_writes_a_delivery_manifest() {
 }
 
 #[test]
+fn anomaly_audit_is_attached_to_manifest_in_input_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("one.wav");
+    let provider = directory.path().join("provider.json");
+    let audit = directory.path().join("audit.json");
+    let manifest = directory.path().join("delivery.json");
+    std::fs::write(&input, wav_fixture_bytes()).unwrap();
+    std::fs::write(
+        &provider,
+        format!(
+            r#"{{
+              "schema_version":1,
+              "provider":"reviewed-detector",
+              "provider_version":"2.0",
+              "model":"audio-quality",
+              "model_version":"2026-08",
+              "model_sha256":"{}",
+              "source_sha256":"{}",
+              "source_duration_seconds":1.0,
+              "sample_rate_hz":48000,
+              "events":[{{"kind":"pop","start_seconds":0.1,"end_seconds":0.2,"confidence":0.95,"severity":0.8,"channel":1}}]
+            }}"#,
+            "a".repeat(64),
+            "b".repeat(64)
+        ),
+    )
+    .unwrap();
+    let provider_status = Command::new(env!("CARGO_BIN_EXE_forge-anomaly-provider"))
+        .args([
+            "--output",
+            audit.to_str().unwrap(),
+            provider.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(provider_status.success());
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            input.to_str().unwrap(),
+            "--analyze",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--anomaly-audit",
+            audit.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(manifest).unwrap()).unwrap();
+    assert_eq!(value["passed_count"], 1);
+    assert_eq!(value["assets"][0]["model_qc"]["passed"], false);
+    assert_eq!(
+        value["assets"][0]["model_qc"]["audit"]["selected_by_kind"]["pop"],
+        1
+    );
+}
+
+#[test]
 fn ebu_qc_writes_versioned_baseband_evidence() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("programme.wav");
