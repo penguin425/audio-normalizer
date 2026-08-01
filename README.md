@@ -334,6 +334,7 @@ forge-container-qc capture.caf
 forge-container-qc archive.dsf
 forge-container-qc master.dff
 forge-container-qc archive.wv
+forge-container-qc archive.ape
 forge-container-qc master.flac
 forge-container-qc delivery.mp3
 forge-container-qc broadcast.aac
@@ -358,6 +359,15 @@ checksums are recomputed over the exact little-endian 16-bit words using the
 reference algorithm; 16-bit hybrid/correction-style and 32-bit lossless
 checksums are both supported. The separate header CRC covers decoded samples,
 so reports identify it without claiming verification when no decoder ran.
+
+For current-format Monkey's Audio 3.98/3.99 files, the audit locates a bounded
+`MAC `/`MACF` descriptor, validates every declared region and PCM/frame field,
+unwraps 32-bit seek offsets across files larger than 4 GiB, and requires a
+strict in-range boundary for every frame. It recomputes the descriptor MD5 in
+the reference format order over the original header data, encoded frames,
+terminating data, APE header, and complete seek table. Each stored frame CRC
+field is bounds-checked and reported, but its decoded-PCM equality is not
+claimed without running a decoder.
 
 AAF audits identify the AMWA stored format by its Compound File Binary header
 and root CLSIDs, validate the CFB allocation/directory structure, require the
@@ -1945,6 +1955,7 @@ src/
   mpegh_adapter.rs  native MHAS framing + bounded conforming decoder adapter
   dts_adapter.rs    native DTS core/HD framing + bounded decoder adapter
   wavpack_qc.rs     native WavPack block/metadata/checksum structural QC
+  monkeys_audio_qc.rs native Monkey's Audio frame-boundary + descriptor-MD5 QC
   flacenc.rs        bounded-memory pure-Rust FLAC encoder
   opus.rs           RFC 7845 mono/stereo and Mapping Family 1 Ogg Opus I/O
   mp3enc.rs         mono/stereo LAME encoder with gapless Info/LAME backpatch

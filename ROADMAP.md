@@ -39,6 +39,9 @@ Forge already provides:
 - Dependency-free WavPack 4/5 block QC for bounded header and metadata framing,
   multichannel sequence/sample continuity, stable stream format, and exact
   16/32-bit WavPack 5 encoded-block checksum verification.
+- Dependency-free current-format Monkey's Audio 3.98/3.99 QC for bounded
+  descriptors and regions, overflow-aware seek-table frame boundaries, stored
+  decoded-PCM CRC-field presence, and exact descriptor-MD5 quick verification.
 - Bounded standalone, unfragmented, fragmented, and CENC-protected ISO-BMFF
   AOMedia IAMF v1.1
   QC with
@@ -231,7 +234,7 @@ generations.
 
 ### Codec-specific QC
 
-- Monkey's Audio and ALAC native frame/checksum validation.
+- ALAC native frame/checksum validation.
 
 ### Loudness workflow depth
 

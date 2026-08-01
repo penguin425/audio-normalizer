@@ -38,6 +38,45 @@ fn minimal_wavpack() -> Vec<u8> {
     bytes
 }
 
+fn minimal_monkeys_audio() -> Vec<u8> {
+    use md5::{Digest, Md5};
+
+    let mut header = vec![0_u8; 24];
+    header[0..2].copy_from_slice(&2000_u16.to_le_bytes());
+    header[2..4].copy_from_slice(&(1_u16 << 5).to_le_bytes());
+    header[4..8].copy_from_slice(&73_728_u32.to_le_bytes());
+    header[8..12].copy_from_slice(&321_u32.to_le_bytes());
+    header[12..16].copy_from_slice(&2_u32.to_le_bytes());
+    header[16..18].copy_from_slice(&16_u16.to_le_bytes());
+    header[18..20].copy_from_slice(&2_u16.to_le_bytes());
+    header[20..24].copy_from_slice(&48_000_u32.to_le_bytes());
+
+    let first = 84_u32;
+    let second = 91_u32;
+    let mut seek = Vec::new();
+    seek.extend_from_slice(&first.to_le_bytes());
+    seek.extend_from_slice(&second.to_le_bytes());
+    let frames = [1, 2, 3, 4, 0xaa, 0xbb, 0xcc, 5, 6, 7, 8, 0xdd, 0xee];
+    let mut digest = Md5::new();
+    digest.update(frames);
+    digest.update(&header);
+    digest.update(&seek);
+    let checksum: [u8; 16] = digest.finalize().into();
+
+    let mut bytes = vec![0_u8; 52];
+    bytes[..4].copy_from_slice(b"MAC ");
+    bytes[4..6].copy_from_slice(&3990_u16.to_le_bytes());
+    bytes[8..12].copy_from_slice(&52_u32.to_le_bytes());
+    bytes[12..16].copy_from_slice(&24_u32.to_le_bytes());
+    bytes[16..20].copy_from_slice(&8_u32.to_le_bytes());
+    bytes[24..28].copy_from_slice(&(frames.len() as u32).to_le_bytes());
+    bytes[36..52].copy_from_slice(&checksum);
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&seek);
+    bytes.extend_from_slice(&frames);
+    bytes
+}
+
 #[test]
 fn container_qc_cli_validates_wavpack_encoded_block_checksums() {
     let directory = tempfile::tempdir().unwrap();
@@ -69,6 +108,41 @@ fn container_qc_cli_validates_wavpack_encoded_block_checksums() {
         layer["checks"].as_array().unwrap().iter().any(|item| {
             item["rule_id"] == "FORGE-WAVPACK-ENCODED-CHECKSUM" && item["passed"] == false
         })
+    }));
+}
+
+#[test]
+fn container_qc_cli_validates_monkeys_audio_descriptor_md5() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("archive.ape");
+    fs::write(&path, minimal_monkeys_audio()).unwrap();
+    let valid = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(valid.status.success(), "{valid:#?}");
+    let audit: Value = serde_json::from_slice(&valid.stdout).unwrap();
+    assert_eq!(audit["format"], "monkeys-audio");
+    assert_eq!(audit["properties"]["descriptor_md5_verified"], true);
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/container-qc-v1.schema.json")).unwrap();
+    assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&audit));
+
+    let mut corrupt = minimal_monkeys_audio();
+    *corrupt.last_mut().unwrap() ^= 1;
+    fs::write(&path, corrupt).unwrap();
+    let invalid = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(1));
+    let audit: Value = serde_json::from_slice(&invalid.stdout).unwrap();
+    assert!(audit["layers"].as_array().unwrap().iter().any(|layer| {
+        layer["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["rule_id"] == "FORGE-APE-DESCRIPTOR-MD5" && item["passed"] == false)
     }));
 }
 
