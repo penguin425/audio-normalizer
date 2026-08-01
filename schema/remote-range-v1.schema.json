@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/remote-range-v1",
+  "title": "Forge remote range fetch evidence",
+  "type": "object",
+  "required": [
+    "schema",
+    "requested_uri",
+    "allowed_origins",
+    "object_size_bytes",
+    "bytes_fetched",
+    "request_count",
+    "range_count",
+    "ranges",
+    "passed"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/remote-range-v1"
+    },
+    "requested_uri": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(https://|http://)"
+    },
+    "allowed_origins": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "maxItems": 1024
+    },
+    "final_uri": { "type": ["string", "null"] },
+    "object_size_bytes": { "type": ["integer", "null"], "minimum": 1 },
+    "bytes_fetched": { "type": "integer", "minimum": 0 },
+    "request_count": { "type": "integer", "minimum": 0 },
+    "range_count": { "type": "integer", "minimum": 0 },
+    "ranges": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+        "type": "object",
+        "required": [
+          "requested_start",
+          "requested_end",
+          "requested_uri",
+          "redirect_chain",
+          "returned_start",
+          "returned_end",
+          "object_size_bytes",
+          "response_bytes",
+          "response_headers",
+          "passed"
+        ],
+        "properties": {
+          "requested_start": { "type": "integer", "minimum": 0 },
+          "requested_end": { "type": "integer", "minimum": 0 },
+          "requested_uri": { "type": "string", "minLength": 1 },
+          "final_uri": { "type": ["string", "null"] },
+          "redirect_chain": {
+            "type": "array",
+            "maxItems": 8,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "status": { "type": ["integer", "null"], "minimum": 100, "maximum": 599 },
+          "returned_start": { "type": ["integer", "null"], "minimum": 0 },
+          "returned_end": { "type": ["integer", "null"], "minimum": 0 },
+          "object_size_bytes": { "type": ["integer", "null"], "minimum": 1 },
+          "response_bytes": { "type": "integer", "minimum": 0 },
+          "response_headers": {
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+            "maxProperties": 16
+          },
+          "passed": { "type": "boolean" },
+          "error": { "type": ["string", "null"], "maxLength": 4096 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "passed": { "type": "boolean" },
+    "error": { "type": ["string", "null"], "maxLength": 4096 }
+  },
+  "additionalProperties": false
+}

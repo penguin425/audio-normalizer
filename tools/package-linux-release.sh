@@ -42,7 +42,8 @@ for binary in \
   forge-segment-normalize \
   forge-ac4-qc \
   forge-mpegh-qc \
-  forge-dts-qc
+  forge-dts-qc \
+  forge-remote-qc
 do
   cp "target/${target}/release/${binary}" "$staging/"
 done
@@ -75,11 +76,13 @@ cp schema/audio-anomaly-provider-v1.schema.json \
    schema/anomaly-provider-audit-v1.schema.json \
    schema/model-qc-v1.schema.json \
    schema/onnx-anomaly-model-v1.schema.json \
-   schema/onnx-feature-frames-v1.schema.json "$staging/schema/"
+   schema/onnx-feature-frames-v1.schema.json \
+   schema/remote-range-v1.schema.json \
+   schema/remote-qc-v1.schema.json "$staging/schema/"
 cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md \
    BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md \
    MPEGH-ADAPTER.md DTS-ADAPTER.md ANOMALY-ADAPTER.md \
-   NEXT-GENERATION-PLAN.md LICENSE "$staging/"
+   NEXT-GENERATION-PLAN.md ROADMAP.md LICENSE "$staging/"
 
 find "$staging" -exec touch -h -d "@${source_date_epoch}" {} +
 tar \

@@ -1813,6 +1813,26 @@ downloads weights or silently falls back to a passing result. See the
 `Explicit ONNX reference adapter` section in
 [ANOMALY-ADAPTER.md](ANOMALY-ADAPTER.md).
 
+Remote media probing is a separate, explicit network operation. The
+`forge-remote-qc` command reads only an allow-listed HTTP Range response,
+supports public `s3://bucket/key`, `gs://bucket/key`, and HTTPS object syntax,
+and emits a redacted fetch manifest. It rejects credentials, unauthorized
+redirects, origins that ignore Range, and responses beyond the configured
+request/byte/time/object limits:
+
+```bash
+forge-remote-qc https://cdn.example.test/audio.wav \
+  --allow-origin https://cdn.example.test \
+  --range 0-131072 --output remote-qc.json
+```
+
+The result is a header/prefix probe, not a loudness measurement or a
+full-object download. Plain HTTP requires the explicit
+`--allow-insecure-http` flag. Local `forge` and other QC commands never make
+network requests implicitly. See
+`schema/remote-qc-v1.schema.json` and
+`schema/remote-range-v1.schema.json` for the machine-readable contracts.
+
 An existing audit can be attached to a batch delivery manifest in input order:
 
 ```bash
@@ -2010,6 +2030,7 @@ src/
   ac4_adapter.rs    bounded licensed/reference AC-4 decoder adapter + evidence
   anomaly_provider.rs external audio-quality anomaly adapter + audit contract
   onnx_provider.rs  opt-in bounded ONNX model/feature contract + reference adapter
+  remote_range.rs   allow-listed HTTP Range reader + redacted remote probe
   report.rs          analysis/delivery manifest and advisory model-QC envelope
   report_tools.rs    versioned migration and explainable model/compliance findings
   mpegh_adapter.rs  native MHAS framing + bounded conforming decoder adapter
@@ -2043,6 +2064,7 @@ src/
   bin/forge-aes31-qc.rs AES31-3 EDML project audit CLI
   bin/forge-ac4-qc.rs licensed/reference AC-4 presentation audit CLI
   bin/forge-mpegh-qc.rs MHAS/scene/preset/render MPEG-H audit CLI
+  bin/forge-remote-qc.rs bounded S3/GCS/HTTPS header and Range probe
   bin/forge-dts-qc.rs DTS core/HD asset/presentation audit CLI
   bin/forge-anomaly-provider.rs external audio-quality anomaly audit CLI
   bin/forge-onnx-provider.rs opt-in CPU ONNX anomaly-provider adapter CLI

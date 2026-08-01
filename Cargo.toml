@@ -138,6 +138,10 @@ path = "src/bin/forge-mpegh-qc.rs"
 name = "forge-dts-qc"
 path = "src/bin/forge-dts-qc.rs"
 
+[[bin]]
+name = "forge-remote-qc"
+path = "src/bin/forge-remote-qc.rs"
+
 [dependencies]
 rayon = "1.10"
 clap = { version = "4.5", features = ["derive"] }

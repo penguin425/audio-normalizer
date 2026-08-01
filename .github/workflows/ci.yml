@@ -32,6 +32,9 @@ jobs:
       - name: Run opt-in ONNX provider contract tests
         run: cargo test --locked --features onnx-provider --lib onnx_provider --bin forge-onnx-provider
 
+      - name: Run bounded remote Range and probe tests
+        run: cargo test --locked --lib remote_range --test remote_qc_cli --bin forge-remote-qc
+
       - name: Run tests with static Opus support
         run: cargo test --features opus-encoding
 

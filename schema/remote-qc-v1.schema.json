@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/remote-qc-v1",
+  "title": "Forge bounded remote media probe",
+  "type": "object",
+  "required": [
+    "schema",
+    "uri",
+    "requested_start",
+    "requested_length",
+    "returned_bytes",
+    "prefix_sha256",
+    "detected_format",
+    "fetch",
+    "passed"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/remote-qc-v1"
+    },
+    "uri": { "type": "string", "minLength": 1 },
+    "requested_start": { "type": "integer", "minimum": 0 },
+    "requested_length": { "type": "integer", "minimum": 1 },
+    "returned_bytes": { "type": "integer", "minimum": 0 },
+    "prefix_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "detected_format": {
+      "enum": ["wave", "flac", "ogg", "iso-bmff", "dsf", "dsdiff", "mpeg-audio", "unknown"]
+    },
+    "wave": {
+      "type": ["object", "null"],
+      "required": [
+        "container",
+        "audio_format_code",
+        "channels",
+        "sample_rate_hz",
+        "bits_per_sample",
+        "data_offset",
+        "data_bytes"
+      ],
+      "properties": {
+        "container": { "type": "string", "enum": ["RIFF", "RF64", "BW64"] },
+        "audio_format_code": { "type": ["integer", "null"], "minimum": 1 },
+        "channels": { "type": ["integer", "null"], "minimum": 1 },
+        "sample_rate_hz": { "type": ["integer", "null"], "minimum": 1 },
+        "bits_per_sample": { "type": ["integer", "null"], "minimum": 1 },
+        "data_offset": { "type": ["integer", "null"], "minimum": 0 },
+        "data_bytes": { "type": ["integer", "null"], "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "fetch": {
+      "type": "object",
+      "required": [
+        "schema",
+        "requested_uri",
+        "allowed_origins",
+        "object_size_bytes",
+        "bytes_fetched",
+        "request_count",
+        "range_count",
+        "ranges",
+        "passed"
+      ],
+      "properties": {
+        "schema": {
+          "const": "https://penguin425.github.io/audio-normalizer/schema/remote-range-v1"
+        },
+        "requested_uri": { "type": "string", "minLength": 1 },
+        "allowed_origins": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "final_uri": { "type": ["string", "null"] },
+        "object_size_bytes": { "type": ["integer", "null"], "minimum": 1 },
+        "bytes_fetched": { "type": "integer", "minimum": 0 },
+        "request_count": { "type": "integer", "minimum": 0 },
+        "range_count": { "type": "integer", "minimum": 0 },
+        "ranges": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "type": "object",
+            "required": [
+              "requested_start",
+              "requested_end",
+              "requested_uri",
+              "redirect_chain",
+              "returned_start",
+              "returned_end",
+              "object_size_bytes",
+              "response_bytes",
+              "response_headers",
+              "passed"
+            ],
+            "properties": {
+              "requested_start": { "type": "integer", "minimum": 0 },
+              "requested_end": { "type": "integer", "minimum": 0 },
+              "requested_uri": { "type": "string", "minLength": 1 },
+              "final_uri": { "type": ["string", "null"] },
+              "redirect_chain": {
+                "type": "array",
+                "maxItems": 8,
+                "items": { "type": "string", "minLength": 1 }
+              },
+              "status": { "type": ["integer", "null"], "minimum": 100, "maximum": 599 },
+              "returned_start": { "type": ["integer", "null"], "minimum": 0 },
+              "returned_end": { "type": ["integer", "null"], "minimum": 0 },
+              "object_size_bytes": { "type": ["integer", "null"], "minimum": 1 },
+              "response_bytes": { "type": "integer", "minimum": 0 },
+              "response_headers": {
+                "type": "object",
+                "maxProperties": 16,
+                "additionalProperties": { "type": "string" }
+              },
+              "passed": { "type": "boolean" },
+              "error": { "type": ["string", "null"], "maxLength": 4096 }
+            },
+            "additionalProperties": false
+          }
+        },
+        "passed": { "type": "boolean" },
+        "error": { "type": ["string", "null"], "maxLength": 4096 }
+      },
+      "additionalProperties": false
+    },
+    "passed": { "type": "boolean" }
+  },
+  "additionalProperties": false
+}
