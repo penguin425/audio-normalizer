@@ -19,6 +19,7 @@ pub const AUDIT_SCHEMA: &str =
 pub const ADAPTER: &str = "forge-anomaly-provider-1";
 
 const MAX_EVENTS: usize = 100_000;
+const MAX_AUDIT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SOURCE_DURATION_SECONDS: f64 = 7.0 * 24.0 * 60.0 * 60.0;
 const MAX_LABEL_LENGTH: usize = 128;
 
@@ -36,7 +37,7 @@ pub enum AnomalyKind {
 }
 
 impl AnomalyKind {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Noise => "noise",
             Self::Pop => "pop",
@@ -112,7 +113,8 @@ pub struct ProviderAudit {
     pub events: Vec<AuditedEvent>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditedEvent {
     pub index: usize,
     pub kind: AnomalyKind,
@@ -120,10 +122,228 @@ pub struct AuditedEvent {
     pub end_seconds: f64,
     pub confidence: f64,
     pub severity: f64,
+    #[serde(default)]
     pub channel: Option<u16>,
+    #[serde(default)]
     pub related_channel: Option<u16>,
+    #[serde(default)]
     pub evidence_label: Option<String>,
     pub selected: bool,
+}
+
+/// A previously generated anomaly-provider audit that is safe to import into
+/// a delivery manifest.  This is deliberately separate from [`ProviderAudit`]
+/// because the latter contains static string fields for the generator output,
+/// while an imported document must be fully owned and independently validated.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderAuditDocument {
+    pub schema: String,
+    pub schema_version: u32,
+    pub adapter: String,
+    pub source_path: String,
+    pub source_sha256: String,
+    pub provider: String,
+    pub provider_version: String,
+    pub model: String,
+    pub model_version: String,
+    pub model_sha256: String,
+    pub source_duration_seconds: f64,
+    #[serde(default)]
+    pub sample_rate_hz: Option<u32>,
+    pub confidence_threshold: f64,
+    pub severity_threshold: f64,
+    pub input_event_count: usize,
+    pub selected_event_count: usize,
+    pub selected_event_duration_seconds: f64,
+    pub selected_by_kind: BTreeMap<String, usize>,
+    pub passed: bool,
+    pub events: Vec<AuditedEvent>,
+}
+
+/// Read and validate a generated anomaly-provider audit under the same bounds
+/// used by the provider contract.  The audit is evidence, not a signature: the
+/// caller must still decide how much trust to place in the external model.
+pub fn load_audit(path: &Path) -> Result<ProviderAuditDocument, String> {
+    let bytes = fs::read(path)
+        .map_err(|error| format!("read anomaly audit {}: {error}", path.display()))?;
+    if bytes.len() > MAX_AUDIT_BYTES {
+        return Err(format!(
+            "anomaly audit is {} bytes; maximum is {MAX_AUDIT_BYTES}",
+            bytes.len()
+        ));
+    }
+    let document: ProviderAuditDocument = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse anomaly audit {}: {error}", path.display()))?;
+    validate_audit(&document)?;
+    Ok(document)
+}
+
+/// Validate an imported anomaly-provider audit in memory.
+pub fn validate_audit(document: &ProviderAuditDocument) -> Result<(), String> {
+    if document.schema != AUDIT_SCHEMA {
+        return Err(format!(
+            "unsupported anomaly audit schema {}; expected {AUDIT_SCHEMA}",
+            document.schema
+        ));
+    }
+    if document.schema_version != SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported anomaly audit schema version {}; expected {SCHEMA_VERSION}",
+            document.schema_version
+        ));
+    }
+    if document.adapter != ADAPTER {
+        return Err(format!(
+            "unsupported anomaly audit adapter {}; expected {ADAPTER}",
+            document.adapter
+        ));
+    }
+    for (label, value) in [
+        ("source_path", document.source_path.as_str()),
+        ("provider", document.provider.as_str()),
+        ("provider_version", document.provider_version.as_str()),
+        ("model", document.model.as_str()),
+        ("model_version", document.model_version.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(format!("anomaly audit {label} is required"));
+        }
+    }
+    validate_sha256("source_sha256", &document.source_sha256)?;
+    validate_sha256("model_sha256", &document.model_sha256)?;
+    if !document.source_duration_seconds.is_finite()
+        || document.source_duration_seconds <= 0.0
+        || document.source_duration_seconds > MAX_SOURCE_DURATION_SECONDS
+    {
+        return Err(format!(
+            "anomaly audit source_duration_seconds must be greater than 0 and no more than {MAX_SOURCE_DURATION_SECONDS}"
+        ));
+    }
+    if document.sample_rate_hz == Some(0) {
+        return Err("anomaly audit sample_rate_hz must be positive when present".into());
+    }
+    validate_threshold("confidence", document.confidence_threshold)?;
+    validate_threshold("severity", document.severity_threshold)?;
+    if document.input_event_count > MAX_EVENTS || document.events.len() > MAX_EVENTS {
+        return Err(format!(
+            "anomaly audit contains more than {MAX_EVENTS} events"
+        ));
+    }
+    if document.input_event_count != document.events.len() {
+        return Err(format!(
+            "anomaly audit input_event_count is {}, but events contains {} entries",
+            document.input_event_count,
+            document.events.len()
+        ));
+    }
+    if document.selected_event_count > document.input_event_count {
+        return Err("anomaly audit selected_event_count exceeds input_event_count".into());
+    }
+
+    let mut selected_count = 0usize;
+    let mut selected_duration = 0.0;
+    let mut selected_by_kind = BTreeMap::new();
+    let mut previous = None;
+    for (offset, event) in document.events.iter().enumerate() {
+        if event.index != offset + 1 {
+            return Err(format!(
+                "anomaly audit event {} has index {}; expected {}",
+                offset + 1,
+                event.index,
+                offset + 1
+            ));
+        }
+        if !event.start_seconds.is_finite()
+            || !event.end_seconds.is_finite()
+            || event.start_seconds < 0.0
+            || event.end_seconds <= event.start_seconds
+            || event.end_seconds > document.source_duration_seconds
+        {
+            return Err(format!(
+                "anomaly audit event {} has invalid time bounds",
+                offset + 1
+            ));
+        }
+        if previous.is_some_and(|(start, end)| {
+            event.start_seconds < start || (event.start_seconds == start && event.end_seconds < end)
+        }) {
+            return Err(format!(
+                "anomaly audit event {} is not sorted by start/end time",
+                offset + 1
+            ));
+        }
+        previous = Some((event.start_seconds, event.end_seconds));
+        for (label, value) in [
+            ("confidence", event.confidence),
+            ("severity", event.severity),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(format!(
+                    "anomaly audit event {} {label} must be between 0 and 1",
+                    offset + 1
+                ));
+            }
+        }
+        if event.channel == Some(0) || event.related_channel == Some(0) {
+            return Err(format!(
+                "anomaly audit event {} channel numbers are one-based",
+                offset + 1
+            ));
+        }
+        if event.channel.is_some() && event.channel == event.related_channel {
+            return Err(format!(
+                "anomaly audit event {} channel and related_channel must differ",
+                offset + 1
+            ));
+        }
+        if let Some(label) = event.evidence_label.as_deref() {
+            if label.is_empty()
+                || label.chars().count() > MAX_LABEL_LENGTH
+                || label.chars().any(char::is_control)
+            {
+                return Err(format!(
+                    "anomaly audit event {} evidence_label must be 1-{MAX_LABEL_LENGTH} printable characters",
+                    offset + 1
+                ));
+            }
+        }
+        let expected_selected = event.confidence >= document.confidence_threshold
+            && event.severity >= document.severity_threshold;
+        if event.selected != expected_selected {
+            return Err(format!(
+                "anomaly audit event {} selected flag does not match the recorded thresholds",
+                offset + 1
+            ));
+        }
+        if event.selected {
+            selected_count += 1;
+            selected_duration += event.end_seconds - event.start_seconds;
+            *selected_by_kind
+                .entry(event.kind.as_str().to_owned())
+                .or_insert(0) += 1;
+        }
+    }
+    if selected_count != document.selected_event_count {
+        return Err(format!(
+            "anomaly audit selected_event_count is {}, but {} events are selected",
+            document.selected_event_count, selected_count
+        ));
+    }
+    if document.passed != (selected_count == 0) {
+        return Err("anomaly audit passed does not match selected_event_count".into());
+    }
+    if selected_by_kind != document.selected_by_kind {
+        return Err("anomaly audit selected_by_kind does not match selected events".into());
+    }
+    if !document.selected_event_duration_seconds.is_finite()
+        || document.selected_event_duration_seconds < 0.0
+        || (document.selected_event_duration_seconds - selected_duration).abs()
+            > 1e-9_f64.max(selected_duration.abs() * 1e-9)
+    {
+        return Err("anomaly audit selected event duration does not match events".into());
+    }
+    Ok(())
 }
 
 pub fn load_and_audit(
@@ -396,5 +616,18 @@ mod tests {
         let mut input = fixture();
         input.events[0].related_channel = Some(1);
         assert!(audit(Path::new("programme.wav"), input, 0.6, 0.5).is_err());
+    }
+
+    #[test]
+    fn validates_audit_round_trip_and_rejects_tampering() {
+        let generated = audit(Path::new("programme.wav"), fixture(), 0.6, 0.5).unwrap();
+        let value = serde_json::to_value(&generated).unwrap();
+        let document: ProviderAuditDocument = serde_json::from_value(value.clone()).unwrap();
+        validate_audit(&document).unwrap();
+
+        let mut tampered = value;
+        tampered["events"][0]["selected"] = serde_json::Value::Bool(false);
+        let document: ProviderAuditDocument = serde_json::from_value(tampered).unwrap();
+        assert!(validate_audit(&document).is_err());
     }
 }

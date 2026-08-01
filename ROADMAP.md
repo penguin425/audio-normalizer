@@ -175,6 +175,10 @@ Forge already provides:
   provenance, bounded time-sorted noise/pop/dropout/lip-noise/phase-cancellation
   findings, confidence/severity thresholds, and a separate non-normative audit
   layer that never changes EBU/ITU compliance results.
+- Delivery-manifest `model_qc` bridge with complete audit revalidation and
+  `forge-report explain` model findings using stable
+  `FORGE-MODEL-ANOMALY-*` IDs; model evidence remains outside normative pass
+  totals.
 - Read-only DSF and uncompressed DSDIFF analysis with bounded structural QC,
   declared bit-order/channel mapping, a versioned cascaded half-band and
   21 kHz low-pass decimation policy, 88.2/96 kHz BS.1770 measurement, and

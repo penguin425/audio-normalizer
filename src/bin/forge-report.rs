@@ -237,7 +237,7 @@ fn format_text_v1(report: &report_tools::ExplanationReport) -> String {
 
 fn format_text_v2(report: &report_tools::ExplanationReportV2) -> String {
     if report.explanations.is_empty() {
-        return "No failed compliance/QC rules found.\n".into();
+        return "No failed compliance/QC/model-QC rules found.\n".into();
     }
     let mut output = String::new();
     for explanation in &report.explanations {
@@ -245,7 +245,7 @@ fn format_text_v2(report: &report_tools::ExplanationReportV2) -> String {
             "{} [{}; {}]\n  location: {}\n  source: {}",
             explanation.asset,
             explanation.rule_id,
-            explanation.category.as_str(),
+            explanation.category_name(),
             explanation.location,
             explanation.source.profile
         ));

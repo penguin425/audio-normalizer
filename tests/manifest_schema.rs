@@ -1,5 +1,6 @@
 mod common;
 
+use forge_normalizer::anomaly_provider::{AnomalyKind, AuditedEvent, ProviderAuditDocument};
 use forge_normalizer::normalize::Analysis;
 use forge_normalizer::report::{self, AnalysisReport};
 use forge_normalizer::wav::{ChannelRole, PcmKind, WavContainer, WaveChunk};
@@ -101,6 +102,96 @@ fn emitted_delivery_manifest_conforms_to_published_schema() {
     assert_eq!(
         instance["assets"][0]["qc"]["schema"],
         forge_normalizer::qc::QC_SCHEMA
+    );
+}
+
+#[test]
+fn model_qc_is_embedded_as_advisory_evidence_without_failing_normative_totals() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("programme.wav");
+    let audio = forge_normalizer::wav::AudioBuffer {
+        sample_rate: 48_000,
+        channels: 2,
+        frames: 100,
+        data: vec![vec![0.0; 100], vec![0.0; 100]],
+        channel_roles: vec![ChannelRole::Main, ChannelRole::Main],
+        source_kind: PcmKind::S16,
+    };
+    forge_normalizer::wav::WavWriter::write_with_metadata(
+        &path,
+        &audio,
+        PcmKind::S16,
+        false,
+        WavContainer::Riff,
+        &[],
+    )
+    .unwrap();
+    let analysis = Analysis {
+        sample_rate: 48_000,
+        channels: 2,
+        channel_roles: vec![ChannelRole::Main, ChannelRole::Main],
+        frames: 480_000,
+        kind: PcmKind::S16,
+        lufs: -23.0,
+        max_momentary_lufs: -22.5,
+        max_short_term_lufs: -22.8,
+        loudness_range_lu: 5.0,
+        rms_db: -24.0,
+        sample_peak: 0.2,
+        true_peak: 0.25,
+        loudness_blocks: vec![],
+    };
+    let report = AnalysisReport::new(&path, &analysis);
+    let audit = ProviderAuditDocument {
+        schema: forge_normalizer::anomaly_provider::AUDIT_SCHEMA.into(),
+        schema_version: 1,
+        adapter: forge_normalizer::anomaly_provider::ADAPTER.into(),
+        source_path: path.to_string_lossy().into_owned(),
+        source_sha256: "b".repeat(64),
+        provider: "reviewed-detector".into(),
+        provider_version: "2.0".into(),
+        model: "audio-quality".into(),
+        model_version: "2026-08".into(),
+        model_sha256: "a".repeat(64),
+        source_duration_seconds: 10.0,
+        sample_rate_hz: Some(48_000),
+        confidence_threshold: 0.6,
+        severity_threshold: 0.5,
+        input_event_count: 1,
+        selected_event_count: 1,
+        selected_event_duration_seconds: 0.1,
+        selected_by_kind: [("pop".into(), 1)].into_iter().collect(),
+        passed: false,
+        events: vec![AuditedEvent {
+            index: 1,
+            kind: AnomalyKind::Pop,
+            start_seconds: 1.0,
+            end_seconds: 1.1,
+            confidence: 0.9,
+            severity: 0.8,
+            channel: Some(1),
+            related_channel: None,
+            evidence_label: Some("impulse-spectrum".into()),
+            selected: true,
+        }],
+    };
+    forge_normalizer::anomaly_provider::validate_audit(&audit).unwrap();
+    let mut output = Vec::new();
+    report::write_manifest_with_anomaly_audits(&mut output, &[report], &[Some(audit)]).unwrap();
+    let instance: Value = serde_json::from_slice(&output).unwrap();
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/delivery-manifest-v3.schema.json")).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let errors: Vec<_> = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "schema violations: {errors:#?}");
+    assert_eq!(instance["passed_count"], 1);
+    assert_eq!(instance["assets"][0]["model_qc"]["passed"], false);
+    assert_eq!(
+        instance["assets"][0]["model_qc"]["classification"],
+        "non-normative-model-evidence"
     );
 }
 

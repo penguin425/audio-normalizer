@@ -49,3 +49,27 @@ The v1 contract is an integration boundary, not a claim that any particular
 model is accurate.  A future ONNX/Demucs adapter must publish its model
 licence, dataset/provenance, calibration evidence, deterministic fallback, and
 false-positive/false-negative fixtures before it can be enabled by default.
+
+## Delivery-manifest bridge
+
+An audit produced by this command can be attached to a batch manifest without
+installing a model runtime:
+
+```text
+forge programme.wav --analyze --manifest delivery.json \
+  --anomaly-audit anomaly-audit.json
+```
+
+For multiple inputs, repeat `--anomaly-audit` once per input in the same order.
+Forge revalidates the complete audit, including selected flags, event counts,
+thresholds, sorted time bounds, and duration totals. The manifest stores the
+result under `assets[].model_qc` with the `model-qc-v1` schema, the explicit
+`model-qc` layer, and the classification
+`non-normative-model-evidence`. Its `passed` field is advisory and is excluded
+from the manifest's normative `passed_count` and `failed_count` totals.
+
+`forge-report explain` turns selected events into stable
+`FORGE-MODEL-ANOMALY-<KIND>` findings. Explanations include the provider/model
+identity, SHA-256 provenance, thresholds, exact time location, and the explicit
+statement that model evidence does not change EBU/ITU compliance. The bridge
+does not authenticate a provider or claim that a model finding is correct.
