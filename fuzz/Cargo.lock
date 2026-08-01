@@ -572,7 +572,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "forge-normalizer"
-version = "0.108.0"
+version = "0.109.0"
 dependencies = [
  "audiopus_sys",
  "base64 0.23.0",
