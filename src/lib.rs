@@ -30,6 +30,7 @@ pub mod aes31_qc;
 mod alac_qc;
 pub mod analysis;
 pub mod analysis_cache;
+pub mod anomaly_provider;
 mod atomic;
 pub mod audio_compare;
 pub mod batch;
