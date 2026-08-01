@@ -91,6 +91,7 @@ pub mod report_tools;
 pub mod rtp_qc;
 pub mod sadm;
 pub mod segment_normalize;
+pub mod service;
 pub mod watch;
 pub mod wav;
 mod wavpack_qc;

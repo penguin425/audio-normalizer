@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/service-error-v1",
+  "title": "Forge bounded service error response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "generator", "error_code", "message"],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/service-error-v1"
+    },
+    "generator": { "type": "string", "minLength": 1 },
+    "error_code": {
+      "type": "string",
+      "enum": [
+        "unauthorized",
+        "invalid_target",
+        "not_found",
+        "empty_body",
+        "invalid_filename",
+        "unsupported_format",
+        "unknown_profile",
+        "unsupported_profile",
+        "temporary_file",
+        "decode_failed",
+        "non_finite_measurement",
+        "compliance_failed",
+        "busy",
+        "read_timeout",
+        "incomplete_request",
+        "headers_too_large",
+        "invalid_request",
+        "http_version",
+        "invalid_headers",
+        "duplicate_header",
+        "transfer_encoding",
+        "invalid_content_length",
+        "body_too_large",
+        "body_mismatch",
+        "incomplete_body",
+        "missing_host",
+        "serialization"
+      ]
+    },
+    "message": { "type": "string", "minLength": 1, "maxLength": 513 }
+  }
+}

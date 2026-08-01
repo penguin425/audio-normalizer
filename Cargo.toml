@@ -142,6 +142,10 @@ path = "src/bin/forge-dts-qc.rs"
 name = "forge-remote-qc"
 path = "src/bin/forge-remote-qc.rs"
 
+[[bin]]
+name = "forge-service"
+path = "src/bin/forge-service.rs"
+
 [dependencies]
 rayon = "1.10"
 clap = { version = "4.5", features = ["derive"] }
