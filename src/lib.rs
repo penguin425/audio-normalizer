@@ -92,6 +92,8 @@ pub mod rtp_qc;
 pub mod sadm;
 pub mod segment_normalize;
 pub mod service;
+#[cfg(feature = "grpc-service")]
+pub mod service_grpc;
 pub mod watch;
 pub mod wav;
 mod wavpack_qc;

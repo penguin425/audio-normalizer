@@ -44,6 +44,7 @@ opus-encoding = ["dep:audiopus_sys", "dep:opus"]
 lv2-plugin = []
 clap-plugin = ["dep:clack-plugin", "dep:clack-extensions"]
 onnx-provider = ["dep:ndarray", "dep:ort"]
+grpc-service = ["dep:prost", "dep:tokio", "dep:tonic", "dep:tonic-prost"]
 
 [[bin]]
 name = "forge"
@@ -180,8 +181,14 @@ jsonschema = { version = "0.49.1", default-features = false }
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 ndarray = { version = "0.17", default-features = false, optional = true }
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["ndarray", "load-dynamic"], optional = true }
+prost = { version = "0.14.4", optional = true }
+tokio = { version = "1.53.1", optional = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tonic = { version = "0.14.6", optional = true, default-features = false, features = ["codegen", "router", "transport"] }
+tonic-prost = { version = "0.14.6", optional = true }
 
 [build-dependencies]
+protoc-bin-vendored = "3.2.0"
+tonic-prost-build = "0.14.6"
 
 [dev-dependencies]
 clack-host = { version = "0.1", features = ["clack-plugin"] }

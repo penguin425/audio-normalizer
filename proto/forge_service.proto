@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package forge.service.v1;
+
+// Stateless bounded audio analysis service.  The request and response fields
+// deliberately mirror the REST service while keeping the report JSON payload
+// versioned by the existing service-analysis schema.
+service ForgeAnalysis {
+  rpc Analyze(AnalyzeRequest) returns (AnalyzeResponse);
+  rpc Cancel(CancelRequest) returns (CancelResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message AnalyzeRequest {
+  bytes audio = 1;
+  string filename = 2;
+  string content_type = 3;
+  string profile = 4;
+  // A caller supplied opaque identifier used by Cancel.  It is bounded by the
+  // server and must be unique while the request is active.
+  string request_id = 5;
+}
+
+message AnalyzeResponse {
+  string schema = 1;
+  string generator = 2;
+  string filename = 3;
+  string content_type = 4;
+  uint64 bytes_received = 5;
+  string report_json = 6;
+  string request_id = 7;
+}
+
+message CancelRequest {
+  string request_id = 1;
+}
+
+message CancelResponse {
+  bool cancelled = 1;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string schema = 1;
+  string generator = 2;
+  string status = 3;
+}
