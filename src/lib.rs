@@ -60,6 +60,7 @@ mod isobmff_qc;
 mod lv2;
 mod matroska_qc;
 pub mod metadata;
+mod monkeys_audio_qc;
 mod mp3_qc;
 #[cfg(feature = "mp3-encoding")]
 pub mod mp3enc;

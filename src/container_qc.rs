@@ -47,7 +47,7 @@ pub struct AuditCheck {
 pub fn audit(path: &Path) -> Result<ContainerAudit, String> {
     audit_if_supported(path)?.ok_or_else(|| {
         format!(
-            "{}: unsupported container (expected WAVE, AIFF/AIFC, CAF, AU, DSF/DSDIFF, WavPack, FLAC, MP3, AAC ADTS/LOAS, AC-3/E-AC-3, standalone IAMF, MPEG-TS/M2TS, MXF, AAF, Ogg Opus/Vorbis, Matroska/WebM, or ISO-BMFF MP4/M4A/fMP4)",
+            "{}: unsupported container (expected WAVE, AIFF/AIFC, CAF, AU, DSF/DSDIFF, WavPack, Monkey's Audio, FLAC, MP3, AAC ADTS/LOAS, AC-3/E-AC-3, standalone IAMF, MPEG-TS/M2TS, MXF, AAF, Ogg Opus/Vorbis, Matroska/WebM, or ISO-BMFF MP4/M4A/fMP4)",
             path.display()
         )
     })
@@ -80,6 +80,8 @@ pub fn audit_if_supported(path: &Path) -> Result<Option<ContainerAudit>, String>
         crate::dsd::audit(path, file, file_size).map(Some)
     } else if crate::wavpack_qc::looks_like_wavpack(&header[..header_size]) {
         crate::wavpack_qc::audit(path, file, file_size).map(Some)
+    } else if crate::monkeys_audio_qc::probe(&mut file, file_size)? {
+        crate::monkeys_audio_qc::audit(path, file, file_size).map(Some)
     } else if header_size >= 4 && &header[..4] == b"fLaC" {
         crate::flac_qc::audit(path, file, file_size).map(Some)
     } else if header_size >= 4 && &header[..4] == b"OggS" {
