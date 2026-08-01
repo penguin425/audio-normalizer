@@ -161,7 +161,7 @@ impl PacketDecoder {
         let (frames, channels) = decoded;
         if frames == 0 || frames > self.config.frame_length as usize {
             return Err(format!(
-                "decoded ALAC frame count {frames} is outside 1..={} ",
+                "decoded ALAC frame count {frames} is outside 1..={}",
                 self.config.frame_length
             ));
         }

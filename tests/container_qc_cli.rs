@@ -8,6 +8,36 @@ use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::process::Command;
 
+fn top_level_box_payload(bytes: &[u8], wanted: &[u8; 4]) -> Option<std::ops::Range<usize>> {
+    let mut offset = 0_usize;
+    while bytes.len().saturating_sub(offset) >= 8 {
+        let size_32 = u32::from_be_bytes(bytes[offset..offset + 4].try_into().ok()?);
+        let (header_size, box_size) = if size_32 == 1 {
+            if bytes.len().saturating_sub(offset) < 16 {
+                return None;
+            }
+            let size = u64::from_be_bytes(bytes[offset + 8..offset + 16].try_into().ok()?);
+            (16_usize, usize::try_from(size).ok()?)
+        } else if size_32 == 0 {
+            (8_usize, bytes.len() - offset)
+        } else {
+            (8_usize, usize::try_from(size_32).ok()?)
+        };
+        if box_size < header_size {
+            return None;
+        }
+        let end = offset.checked_add(box_size)?;
+        if end > bytes.len() {
+            return None;
+        }
+        if &bytes[offset + 4..offset + 8] == wanted {
+            return Some(offset + header_size..end);
+        }
+        offset = end;
+    }
+    None
+}
+
 fn wavpack_checksum(bytes: &[u8], width: usize) -> [u8; 4] {
     let mut sum = u32::MAX;
     for word in bytes.chunks_exact(2) {
@@ -549,11 +579,10 @@ fn container_qc_cli_strictly_decodes_every_alac_access_unit() {
     );
 
     let mut corrupt = fs::read(&path).unwrap();
-    let mdat = corrupt
-        .windows(4)
-        .position(|window| window == b"mdat")
-        .expect("FFmpeg ALAC fixture has mdat");
-    corrupt[mdat + 4] = 0xff;
+    let mdat = top_level_box_payload(&corrupt, b"mdat")
+        .filter(|range| !range.is_empty())
+        .expect("FFmpeg ALAC fixture has a bounded top-level mdat payload");
+    corrupt[mdat.start] = 0xff;
     fs::write(&path, corrupt).unwrap();
     let invalid = Command::new(env!("CARGO_BIN_EXE_forge-container-qc"))
         .arg(&path)
