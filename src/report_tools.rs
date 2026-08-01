@@ -694,7 +694,7 @@ impl Serialize for FindingExplanation {
         FindingExplanationWire {
             rule_id: &self.rule_id,
             asset: &self.asset,
-            category: &self.category_name(),
+            category: self.category_name(),
             location: &self.location,
             source: &self.source,
             observation: &self.observation,
