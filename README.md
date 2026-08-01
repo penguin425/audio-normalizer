@@ -1789,6 +1789,23 @@ non-overlapping segment. Forge validates that provenance and the time bounds,
 then exports only accepted ranges. Transcripts are deliberately not copied
 into the audit report; their presence is recorded for privacy review.
 
+Optional audio-quality models use a separate, non-normative anomaly contract so
+that model findings never redefine LUFS or EBU compliance:
+
+```bash
+forge-anomaly-provider anomaly-provider.json \
+  --confidence-threshold 0.6 --severity-threshold 0.5 \
+  --output anomaly-audit.json
+```
+
+The v1 contract records the source/model SHA-256, provider and model versions,
+bounded time-sorted findings (`noise`, `pop`, `dropout`, `lip-noise`,
+`phase-cancellation`, `clipping`, or `other`), and the thresholds used for
+review. It accepts optional external ONNX/Demucs-like providers without adding
+a model runtime to the default build. See
+[ANOMALY-ADAPTER.md](ANOMALY-ADAPTER.md) for the schema, limits, trust
+boundary, and future model acceptance requirements.
+
 The reviewable JSON/TOML sidecar flow remains available through
 `--codec-metadata`. Fields include `codec`, `dialnorm_lkfs`,
 `encoded_loudness_lufs`, `downmix_mode`, and `tolerance_lu`. Dialnorm is
@@ -1969,6 +1986,7 @@ src/
   aaf_object_qc.rs  AAF object graph, timeline, source, and Edit Protocol QC
   aes31_qc.rs       bounded AES31-3 EDML project/reference/timing QC
   ac4_adapter.rs    bounded licensed/reference AC-4 decoder adapter + evidence
+  anomaly_provider.rs external audio-quality anomaly adapter + audit contract
   mpegh_adapter.rs  native MHAS framing + bounded conforming decoder adapter
   dts_adapter.rs    native DTS core/HD framing + bounded decoder adapter
   wavpack_qc.rs     native WavPack block/metadata/checksum structural QC
@@ -2001,6 +2019,7 @@ src/
   bin/forge-ac4-qc.rs licensed/reference AC-4 presentation audit CLI
   bin/forge-mpegh-qc.rs MHAS/scene/preset/render MPEG-H audit CLI
   bin/forge-dts-qc.rs DTS core/HD asset/presentation audit CLI
+  bin/forge-anomaly-provider.rs external audio-quality anomaly audit CLI
   lv2.rs            hard-real-time-capable LV2 stereo plugin ABI
   clap_plugin.rs    CLAP stereo effect, automation, state, and latency ABI
   preset.rs         named playback and broadcast loudness targets

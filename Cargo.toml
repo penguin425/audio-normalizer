@@ -81,6 +81,10 @@ name = "forge-dialogue-provider"
 path = "src/bin/forge-dialogue-provider.rs"
 
 [[bin]]
+name = "forge-anomaly-provider"
+path = "src/bin/forge-anomaly-provider.rs"
+
+[[bin]]
 name = "forge-provenance-qc"
 path = "src/bin/forge-provenance-qc.rs"
 

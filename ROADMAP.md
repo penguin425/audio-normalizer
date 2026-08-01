@@ -171,6 +171,10 @@ Forge already provides:
   channel assignment/permutation and polarity evidence, full-overlap null
   residual/peak, exact-sample ratio, and excerpted one-third-octave spectral
   error, explicitly classified as non-normative engineering QC.
+- Versioned external audio-anomaly provider v1 with source/model SHA-256
+  provenance, bounded time-sorted noise/pop/dropout/lip-noise/phase-cancellation
+  findings, confidence/severity thresholds, and a separate non-normative audit
+  layer that never changes EBU/ITU compliance results.
 - Read-only DSF and uncompressed DSDIFF analysis with bounded structural QC,
   declared bit-order/channel mapping, a versioned cascaded half-band and
   21 kHz low-pass decimation policy, 88.2/96 kHz BS.1770 measurement, and

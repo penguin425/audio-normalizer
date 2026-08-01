@@ -90,3 +90,10 @@ path = "fuzz_targets/nmos_qc.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "anomaly_provider"
+path = "fuzz_targets/anomaly_provider.rs"
+test = false
+doc = false
+bench = false
