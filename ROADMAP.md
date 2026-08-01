@@ -36,6 +36,9 @@ Forge already provides:
   representations and DTS-HD extension substreams, plus a versioned optional
   licensed/reference-decoder adapter that enumerates every asset and
   presentation and independently measures each WAVE render.
+- Dependency-free WavPack 4/5 block QC for bounded header and metadata framing,
+  multichannel sequence/sample continuity, stable stream format, and exact
+  16/32-bit WavPack 5 encoded-block checksum verification.
 - Bounded standalone, unfragmented, fragmented, and CENC-protected ISO-BMFF
   AOMedia IAMF v1.1
   QC with
@@ -228,7 +231,7 @@ generations.
 
 ### Codec-specific QC
 
-- WavPack, Monkey's Audio, and ALAC native frame/checksum validation.
+- Monkey's Audio and ALAC native frame/checksum validation.
 
 ### Loudness workflow depth
 
