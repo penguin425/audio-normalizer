@@ -87,7 +87,7 @@ cp schema/audio-anomaly-provider-v1.schema.json \
 cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md \
    BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md \
    MPEGH-ADAPTER.md DTS-ADAPTER.md ANOMALY-ADAPTER.md \
-   NEXT-GENERATION-PLAN.md ROADMAP.md LICENSE "$staging/"
+   SERVICE-METRICS.md NEXT-GENERATION-PLAN.md ROADMAP.md LICENSE "$staging/"
 
 find "$staging" -exec touch -h -d "@${source_date_epoch}" {} +
 tar \

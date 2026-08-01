@@ -25,6 +25,19 @@ fn spawn_service_with_token(token: Option<&str>) -> (Child, String) {
     (child, address)
 }
 
+fn spawn_metrics_service() -> (Child, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let address = address.to_string();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_forge-service"));
+    command
+        .args(["--bind", &address, "--workers", "1", "--metrics"])
+        .env_remove("FORGE_SERVICE_BEARER_TOKEN");
+    let child = command.spawn().expect("start forge-service with metrics");
+    (child, address)
+}
+
 fn request(address: &str, request: &[u8]) -> Vec<u8> {
     let mut stream = TcpStream::connect(address).expect("connect service");
     stream
@@ -160,6 +173,21 @@ fn bearer_token_is_required_when_configured() {
         b"GET /healthz HTTP/1.1\r\nHost: forge\r\nAuthorization: Bearer test-token\r\n\r\n",
     );
     assert!(authorized.starts_with(b"HTTP/1.1 200"));
+    child.kill().unwrap();
+    let _ = child.wait();
+}
+
+#[test]
+fn metrics_endpoint_exposes_bounded_prometheus_text() {
+    let (mut child, address) = spawn_metrics_service();
+    wait_for_service(&address);
+    let response = request(&address, b"GET /metrics HTTP/1.1\r\nHost: forge\r\n\r\n");
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8"));
+    assert!(text.contains("forge_service_requests_total"));
+    assert!(text.contains("forge_service_request_duration_seconds_bucket"));
+    assert!(!text.contains("request_id"));
     child.kill().unwrap();
     let _ = child.wait();
 }

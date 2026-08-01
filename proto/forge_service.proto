@@ -11,6 +11,12 @@ service ForgeAnalysis {
   rpc Health(HealthRequest) returns (HealthResponse);
 }
 
+// Kept as a separate service so adding observability does not require
+// downstream implementations of ForgeAnalysis to add a new method.
+service ForgeMetrics {
+  rpc Metrics(MetricsRequest) returns (MetricsResponse);
+}
+
 message AnalyzeRequest {
   bytes audio = 1;
   string filename = 2;
@@ -45,4 +51,11 @@ message HealthResponse {
   string schema = 1;
   string generator = 2;
   string status = 3;
+}
+
+message MetricsRequest {}
+
+message MetricsResponse {
+  string content_type = 1;
+  string prometheus_text = 2;
 }

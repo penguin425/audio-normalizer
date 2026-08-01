@@ -4,8 +4,11 @@ use clap::Parser;
 use forge_normalizer::service::{self, ServiceConfig};
 #[cfg(feature = "grpc-service")]
 use forge_normalizer::service_grpc;
+use forge_normalizer::service_metrics::{JsonlSpanRecorder, ServiceMetrics};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Parser)]
@@ -44,6 +47,14 @@ struct Args {
     /// grpc-service Cargo feature and uses the same limits and auth policy.
     #[arg(long)]
     grpc_bind: Option<SocketAddr>,
+
+    /// Expose Prometheus metrics at GET /metrics (REST) or the Metrics RPC.
+    #[arg(long)]
+    metrics: bool,
+
+    /// Append bounded OpenTelemetry-compatible request spans as JSONL.
+    #[arg(long, value_name = "PATH")]
+    otel_jsonl: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -76,11 +87,32 @@ fn main() -> ExitCode {
         eprintln!("invalid service configuration: {error}");
         return ExitCode::from(2);
     }
+    let metrics = if args.metrics || args.otel_jsonl.is_some() {
+        let metrics = ServiceMetrics::new();
+        if let Some(path) = args.otel_jsonl.as_ref() {
+            let recorder = match JsonlSpanRecorder::from_path(path) {
+                Ok(recorder) => recorder,
+                Err(error) => {
+                    eprintln!("could not open --otel-jsonl {}: {error}", path.display());
+                    return ExitCode::from(2);
+                }
+            };
+            Some(metrics.with_span_recorder(Arc::new(recorder)))
+        } else {
+            Some(metrics)
+        }
+    } else {
+        None
+    };
     if let Some(bind) = args.grpc_bind {
         #[cfg(feature = "grpc-service")]
         {
             eprintln!("forge-service gRPC listening on {bind}");
-            return match service_grpc::run(config, bind) {
+            let result = match metrics {
+                Some(metrics) => service_grpc::run_with_metrics(config, bind, metrics),
+                None => service_grpc::run(config, bind),
+            };
+            return match result {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("forge-service gRPC failed: {error}");
@@ -91,12 +123,17 @@ fn main() -> ExitCode {
         #[cfg(not(feature = "grpc-service"))]
         {
             let _ = bind;
+            let _ = metrics;
             eprintln!("--grpc-bind requires building with --features grpc-service");
             return ExitCode::from(2);
         }
     }
     eprintln!("forge-service listening on {}", config.bind);
-    match service::run(config) {
+    let result = match metrics {
+        Some(metrics) => service::run_with_metrics(config, metrics),
+        None => service::run(config),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("forge-service failed: {error}");

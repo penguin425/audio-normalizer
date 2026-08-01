@@ -9,6 +9,7 @@
 
 use crate::decoder;
 use crate::report::{AnalysisReport, ComplianceProfile};
+use crate::service_metrics::{RequestTimer, ServiceMetrics, PROMETHEUS_CONTENT_TYPE};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -91,9 +92,22 @@ impl ServiceConfig {
 
 /// Start the service and accept connections until the listener fails.
 pub fn run(config: ServiceConfig) -> io::Result<()> {
+    run_internal(config, None)
+}
+
+/// Start the service with an optional shared metrics registry.
+///
+/// The plain [`run`] entry point remains unchanged for callers that do not
+/// need observability.  This variant exposes the same bounded HTTP API and
+/// additionally serves `GET /metrics`.
+pub fn run_with_metrics(config: ServiceConfig, metrics: ServiceMetrics) -> io::Result<()> {
+    run_internal(config, Some(metrics))
+}
+
+fn run_internal(config: ServiceConfig, metrics: Option<ServiceMetrics>) -> io::Result<()> {
     config.validate().map_err(invalid_config)?;
     let listener = TcpListener::bind(config.bind)?;
-    serve(listener, config)
+    serve_internal(listener, config, metrics)
 }
 
 fn invalid_config(message: String) -> io::Error {
@@ -104,18 +118,43 @@ fn invalid_config(message: String) -> io::Error {
 /// tests able to bind an ephemeral port without exposing a shutdown primitive
 /// in the public daemon API.
 pub fn serve(listener: TcpListener, config: ServiceConfig) -> io::Result<()> {
+    serve_internal(listener, config, None)
+}
+
+/// Serve an already-bound listener with a shared metrics registry.
+pub fn serve_with_metrics(
+    listener: TcpListener,
+    config: ServiceConfig,
+    metrics: ServiceMetrics,
+) -> io::Result<()> {
+    serve_internal(listener, config, Some(metrics))
+}
+
+fn serve_internal(
+    listener: TcpListener,
+    config: ServiceConfig,
+    metrics: Option<ServiceMetrics>,
+) -> io::Result<()> {
     config.validate().map_err(invalid_config)?;
     let config = Arc::new(config);
     let gate = Arc::new(WorkerGate::new(config.workers));
     for incoming in listener.incoming() {
         let stream = incoming?;
+        let timer = metrics.as_ref().map(ServiceMetrics::start_http_request);
         let Some(permit) = gate.try_acquire() else {
+            if let Some(timer) = timer {
+                timer.finish(503, 0);
+            }
+            if let Some(metrics) = metrics.as_ref() {
+                metrics.record_busy();
+            }
             let _ = write_response(stream, Response::error(503, "busy", "service is busy"));
             continue;
         };
         let config = Arc::clone(&config);
+        let metrics = metrics.clone();
         thread::spawn(move || {
-            handle_connection(stream, &config);
+            handle_connection(stream, &config, metrics.as_ref(), timer);
             drop(permit);
         });
     }
@@ -223,6 +262,14 @@ impl Response {
             },
         )
     }
+
+    fn text(status: u16, content_type: &'static str, body: String) -> Self {
+        Self {
+            status,
+            content_type,
+            body: body.into_bytes(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -246,17 +293,37 @@ struct AnalysisResponse {
     report: AnalysisReport,
 }
 
-fn handle_connection(mut stream: TcpStream, config: &ServiceConfig) {
+fn handle_connection(
+    mut stream: TcpStream,
+    config: &ServiceConfig,
+    metrics: Option<&ServiceMetrics>,
+    mut timer: Option<RequestTimer>,
+) {
     let _ = stream.set_read_timeout(Some(config.timeout));
     let _ = stream.set_write_timeout(Some(config.timeout));
+    let mut request_bytes = 0_u64;
     let response = match read_request(&mut stream, config.max_body_bytes) {
-        Ok(request) => route(request, config),
+        Ok(request) => {
+            request_bytes = request.body.len() as u64;
+            if let Some(timer) = timer.as_mut() {
+                timer.set_traceparent(request.headers.get("traceparent").map(String::as_str));
+            }
+            route(request, config, metrics, timer.as_mut())
+        }
         Err(error) => Response::error(error.status, error.code, error.message),
     };
+    if let Some(timer) = timer {
+        timer.finish(response.status, request_bytes);
+    }
     let _ = write_response(stream, response);
 }
 
-fn route(request: HttpRequest, config: &ServiceConfig) -> Response {
+fn route(
+    request: HttpRequest,
+    config: &ServiceConfig,
+    metrics: Option<&ServiceMetrics>,
+    timer: Option<&mut RequestTimer>,
+) -> Response {
     if let Some(token) = &config.bearer_token {
         let expected = format!("Bearer {token}");
         if request.headers.get("authorization") != Some(&expected) {
@@ -285,7 +352,11 @@ fn route(request: HttpRequest, config: &ServiceConfig) -> Response {
                 status: "ok",
             },
         ),
-        ("POST", "/v1/analyze") => analyze_upload(request, config, &target),
+        ("GET", "/metrics") => metrics.map_or_else(
+            || Response::error(404, "not_found", "endpoint not found"),
+            |metrics| Response::text(200, PROMETHEUS_CONTENT_TYPE, metrics.render_prometheus()),
+        ),
+        ("POST", "/v1/analyze") => analyze_upload(request, config, &target, metrics, timer),
         _ => Response::error(404, "not_found", "endpoint not found"),
     }
 }
@@ -297,7 +368,13 @@ struct HealthResponse {
     status: &'static str,
 }
 
-fn analyze_upload(request: HttpRequest, config: &ServiceConfig, target: &Url) -> Response {
+fn analyze_upload(
+    request: HttpRequest,
+    config: &ServiceConfig,
+    target: &Url,
+    metrics: Option<&ServiceMetrics>,
+    mut timer: Option<&mut RequestTimer>,
+) -> Response {
     if request.body.is_empty() {
         return Response::error(400, "empty_body", "audio request body is empty");
     }
@@ -357,6 +434,17 @@ fn analyze_upload(request: HttpRequest, config: &ServiceConfig, target: &Url) ->
             "non_finite_measurement",
             "the audio measurement contains a non-finite value",
         );
+    }
+    let decoded_samples = (decoded.frames as u64).saturating_mul(u64::from(decoded.channels));
+    if let Some(metrics) = metrics {
+        metrics.observe_analysis(
+            request.body.len() as u64,
+            decoded_samples,
+            report.integrated_lufs,
+        );
+    }
+    if let Some(timer) = timer.as_mut() {
+        timer.observe_analysis(decoded_samples, report.integrated_lufs);
     }
     Response::json(
         200,
