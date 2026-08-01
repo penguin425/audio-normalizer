@@ -111,3 +111,10 @@ path = "fuzz_targets/onnx_provider.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "remote_range"
+path = "fuzz_targets/remote_range.rs"
+test = false
+doc = false
+bench = false

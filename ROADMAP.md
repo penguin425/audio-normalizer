@@ -184,6 +184,11 @@ Forge already provides:
   feature-frame input, exact tensor contracts, fail-closed fallback, and
   coalesced `audio-anomaly-provider-v1` output. The default build remains free
   of ONNX Runtime and model weights.
+- Explicitly allow-listed, seekable HTTP Range access for HTTPS, S3, and GCS
+  objects with redirect reauthorization, request/byte/object/time limits,
+  strict 206/Content-Range validation, redacted fetch evidence, and the
+  `forge-remote-qc` header/prefix probe. Remote access is never implicit in
+  local normalization or QC commands.
 - Read-only DSF and uncompressed DSDIFF analysis with bounded structural QC,
   declared bit-order/channel mapping, a versioned cascaded half-band and
   21 kHz low-pass decimation policy, 88.2/96 kHz BS.1770 measurement, and

@@ -9,6 +9,7 @@ on:
       - "src/audio_compare.rs"
       - "src/anomaly_provider.rs"
       - "src/onnx_provider.rs"
+      - "src/remote_range.rs"
       - "src/compare.rs"
       - "src/container_qc.rs"
       - "src/decoder.rs"
@@ -30,6 +31,7 @@ on:
       - "src/audio_compare.rs"
       - "src/anomaly_provider.rs"
       - "src/onnx_provider.rs"
+      - "src/remote_range.rs"
       - "src/compare.rs"
       - "src/container_qc.rs"
       - "src/decoder.rs"
@@ -68,6 +70,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for target in wave_reader container_qc adm_profile manifest_compare audio_compare dsd hls_qc dash_qc imf_qc rtp_qc nmos_qc anomaly_provider anomaly_audit onnx_provider; do
+          for target in wave_reader container_qc adm_profile manifest_compare audio_compare dsd hls_qc dash_qc imf_qc rtp_qc nmos_qc anomaly_provider anomaly_audit onnx_provider remote_range; do
             cargo fuzz run "$target" -- -runs=1000
           done
