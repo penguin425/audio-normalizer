@@ -44,7 +44,7 @@ struct Parsed {
     channels: u16,
     sample_rate_hz: u32,
     total_samples: u64,
-    frame_crc_fields: u32,
+    frame_crc_slots: u32,
     stored_md5: [u8; 16],
     computed_md5: [u8; 16],
 }
@@ -61,7 +61,7 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
                 true,
                 valid_format(value),
                 true,
-                value.frame_crc_fields == value.total_frames,
+                value.frame_crc_slots == value.total_frames,
                 value.stored_md5 == value.computed_md5 && value.stored_md5 != [0; 16],
                 value.total_samples > 0,
             ),
@@ -113,9 +113,9 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
         check(
             "FORGE-APE-FRAME-CRC-PRESENCE",
             crc_present,
-            "every frame contains its stored decoded-PCM CRC field within the validated frame bounds",
+            "every frame is large enough to contain the required 32-bit decoded-PCM CRC field",
             Some(json!({
-                "declared_crc_fields": value.map(|v| v.frame_crc_fields),
+                "frame_crc_slots": value.map(|v| v.frame_crc_slots),
                 "decoded_crc_note": "frame CRC equality requires decoding and is not claimed by this structural audit"
             })),
         ),
@@ -156,7 +156,7 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
             "frames": value.map(|v| v.total_frames),
             "samples": value.map(|v| v.total_samples),
             "descriptor_md5_verified": md5_valid,
-            "frame_crc_fields": value.map(|v| v.frame_crc_fields),
+            "frame_crc_slots": value.map(|v| v.frame_crc_slots),
             "decoded_frame_crc_note": "stored CRCs cover decoded PCM and are not independently verified without decoding"
         }),
     ))
@@ -331,7 +331,7 @@ fn parse(file: &mut File, file_size: u64) -> Result<Parsed, String> {
         channels,
         sample_rate_hz,
         total_samples,
-        frame_crc_fields: total_frames,
+        frame_crc_slots: total_frames,
         stored_md5,
         computed_md5,
     })
@@ -387,17 +387,49 @@ fn hash_region(
 fn find_descriptor(file: &mut File, file_size: u64) -> Result<Option<u64>, String> {
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("seek Monkey's Audio input: {error}"))?;
-    let bytes = usize::try_from(file_size.min(MAX_JUNK_BYTES + 8)).unwrap();
+    let bytes = usize::try_from(file_size.min(MAX_JUNK_BYTES + DESCRIPTOR_BYTES)).unwrap();
     let mut prefix = vec![0_u8; bytes];
     file.read_exact(&mut prefix)
         .map_err(|error| format!("read Monkey's Audio prefix: {error}"))?;
     Ok(prefix
-        .windows(6)
-        .position(|window| {
-            matches!(&window[..4], b"MAC " | b"MACF")
-                && (3000..=3990).contains(&le_u16(&window[4..6]))
-        })
-        .map(|offset| offset as u64))
+        .windows(DESCRIPTOR_BYTES as usize)
+        .enumerate()
+        .find(|(offset, descriptor)| descriptor_is_sane(descriptor, *offset as u64, file_size))
+        .map(|(offset, _)| offset as u64))
+}
+
+fn descriptor_is_sane(descriptor: &[u8], offset: u64, file_size: u64) -> bool {
+    if !matches!(&descriptor[..4], b"MAC " | b"MACF")
+        || !(3980..=3990).contains(&le_u16(&descriptor[4..6]))
+    {
+        return false;
+    }
+    let descriptor_bytes = u64::from(le_u32(&descriptor[8..12]));
+    let header_bytes = u64::from(le_u32(&descriptor[12..16]));
+    let seek_table_bytes = u64::from(le_u32(&descriptor[16..20]));
+    let header_data_bytes = u64::from(le_u32(&descriptor[20..24]));
+    let frame_data_bytes =
+        u64::from(le_u32(&descriptor[24..28])) | (u64::from(le_u32(&descriptor[28..32])) << 32);
+    let terminating_data_bytes = u64::from(le_u32(&descriptor[32..36]));
+    if !(DESCRIPTOR_BYTES..=MAX_CONTROL_BYTES).contains(&descriptor_bytes)
+        || !(HEADER_BYTES..=MAX_CONTROL_BYTES).contains(&header_bytes)
+        || seek_table_bytes == 0
+        || seek_table_bytes % 4 != 0
+        || seek_table_bytes > MAX_CONTROL_BYTES
+        || header_data_bytes > MAX_HEADER_OR_FOOTER_BYTES
+        || terminating_data_bytes > MAX_HEADER_OR_FOOTER_BYTES
+        || frame_data_bytes == 0
+    {
+        return false;
+    }
+    offset
+        .checked_add(descriptor_bytes)
+        .and_then(|value| value.checked_add(header_bytes))
+        .and_then(|value| value.checked_add(seek_table_bytes))
+        .and_then(|value| value.checked_add(header_data_bytes))
+        .and_then(|value| value.checked_add(frame_data_bytes))
+        .and_then(|value| value.checked_add(terminating_data_bytes))
+        .is_some_and(|declared_end| declared_end <= file_size)
 }
 
 fn read_region(file: &mut File, start: u64, bytes: u64) -> Result<Vec<u8>, String> {
@@ -454,6 +486,10 @@ mod tests {
     use std::io::Write;
 
     fn current_file() -> Vec<u8> {
+        current_file_with_wrappers(&[], &[])
+    }
+
+    fn current_file_with_wrappers(header_data: &[u8], terminating_data: &[u8]) -> Vec<u8> {
         let mut header = vec![0_u8; HEADER_BYTES as usize];
         header[0..2].copy_from_slice(&2000_u16.to_le_bytes());
         header[2..4].copy_from_slice(&CREATE_WAV_HEADER.to_le_bytes());
@@ -464,7 +500,7 @@ mod tests {
         header[18..20].copy_from_slice(&2_u16.to_le_bytes());
         header[20..24].copy_from_slice(&48_000_u32.to_le_bytes());
 
-        let frame_start = DESCRIPTOR_BYTES + HEADER_BYTES + 8;
+        let frame_start = DESCRIPTOR_BYTES + HEADER_BYTES + 8 + header_data.len() as u64;
         let first = frame_start as u32;
         let second = first + 7;
         let mut seek = Vec::new();
@@ -473,7 +509,9 @@ mod tests {
         let frames = [1, 2, 3, 4, 0xaa, 0xbb, 0xcc, 5, 6, 7, 8, 0xdd, 0xee];
 
         let mut digest = Md5::new();
+        digest.update(header_data);
         digest.update(frames);
+        digest.update(terminating_data);
         digest.update(&header);
         digest.update(&seek);
         let md5: [u8; 16] = digest.finalize().into();
@@ -484,11 +522,15 @@ mod tests {
         descriptor[8..12].copy_from_slice(&(DESCRIPTOR_BYTES as u32).to_le_bytes());
         descriptor[12..16].copy_from_slice(&(HEADER_BYTES as u32).to_le_bytes());
         descriptor[16..20].copy_from_slice(&8_u32.to_le_bytes());
+        descriptor[20..24].copy_from_slice(&(header_data.len() as u32).to_le_bytes());
         descriptor[24..28].copy_from_slice(&(frames.len() as u32).to_le_bytes());
+        descriptor[32..36].copy_from_slice(&(terminating_data.len() as u32).to_le_bytes());
         descriptor[36..52].copy_from_slice(&md5);
         descriptor.extend_from_slice(&header);
         descriptor.extend_from_slice(&seek);
+        descriptor.extend_from_slice(header_data);
         descriptor.extend_from_slice(&frames);
+        descriptor.extend_from_slice(terminating_data);
         descriptor
     }
 
@@ -510,6 +552,27 @@ mod tests {
         let mut temporary = tempfile::tempfile().unwrap();
         temporary.write_all(&bytes).unwrap();
         let parsed = parse(&mut temporary, bytes.len() as u64).unwrap();
+        assert_ne!(parsed.stored_md5, parsed.computed_md5);
+    }
+
+    #[test]
+    fn hashes_original_header_and_terminating_data() {
+        let header_data = b"RIFF-original-header";
+        let terminating_data = b"original-footer";
+        let bytes = current_file_with_wrappers(header_data, terminating_data);
+        let mut temporary = tempfile::tempfile().unwrap();
+        temporary.write_all(&bytes).unwrap();
+        let parsed = parse(&mut temporary, bytes.len() as u64).unwrap();
+        assert_eq!(parsed.header_data_bytes, header_data.len() as u64);
+        assert_eq!(parsed.terminating_data_bytes, terminating_data.len() as u64);
+        assert_eq!(parsed.stored_md5, parsed.computed_md5);
+
+        let header_offset = (DESCRIPTOR_BYTES + HEADER_BYTES + 8) as usize;
+        let mut corrupted = bytes;
+        corrupted[header_offset] ^= 1;
+        let mut temporary = tempfile::tempfile().unwrap();
+        temporary.write_all(&corrupted).unwrap();
+        let parsed = parse(&mut temporary, corrupted.len() as u64).unwrap();
         assert_ne!(parsed.stored_md5, parsed.computed_md5);
     }
 
@@ -538,5 +601,13 @@ mod tests {
         assert_eq!(parsed.descriptor_offset, descriptor_offset);
         assert_eq!(parsed.trailing_bytes, 18);
         assert_eq!(parsed.stored_md5, parsed.computed_md5);
+    }
+
+    #[test]
+    fn probe_rejects_embedded_magic_without_a_sane_descriptor() {
+        let bytes = b"unrelated data with MAC \x96\x0f but no descriptor";
+        let mut temporary = tempfile::tempfile().unwrap();
+        temporary.write_all(bytes).unwrap();
+        assert!(!probe(&mut temporary, bytes.len() as u64).unwrap());
     }
 }

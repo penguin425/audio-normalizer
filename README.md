@@ -365,9 +365,10 @@ For current-format Monkey's Audio 3.98/3.99 files, the audit locates a bounded
 unwraps 32-bit seek offsets across files larger than 4 GiB, and requires a
 strict in-range boundary for every frame. It recomputes the descriptor MD5 in
 the reference format order over the original header data, encoded frames,
-terminating data, APE header, and complete seek table. Each stored frame CRC
-field is bounds-checked and reported, but its decoded-PCM equality is not
-claimed without running a decoder.
+terminating data, APE header, and complete seek table. Each frame must reserve
+at least the four bytes where its stored decoded-PCM CRC begins; the report
+counts these slots but does not emit CRC values or claim equality without
+running a decoder.
 
 AAF audits identify the AMWA stored format by its Compound File Binary header
 and root CLSIDs, validate the CFB allocation/directory structure, require the
