@@ -43,7 +43,8 @@ for binary in \
   forge-ac4-qc \
   forge-mpegh-qc \
   forge-dts-qc \
-  forge-remote-qc
+  forge-remote-qc \
+  forge-service
 do
   cp "target/${target}/release/${binary}" "$staging/"
 done
@@ -78,7 +79,10 @@ cp schema/audio-anomaly-provider-v1.schema.json \
    schema/onnx-anomaly-model-v1.schema.json \
    schema/onnx-feature-frames-v1.schema.json \
    schema/remote-range-v1.schema.json \
-   schema/remote-qc-v1.schema.json "$staging/schema/"
+   schema/remote-qc-v1.schema.json \
+   schema/service-analysis-v1.schema.json \
+   schema/service-error-v1.schema.json \
+   schema/service-health-v1.schema.json "$staging/schema/"
 cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md \
    BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md \
    MPEGH-ADAPTER.md DTS-ADAPTER.md ANOMALY-ADAPTER.md \

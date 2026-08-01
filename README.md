@@ -1833,6 +1833,39 @@ network requests implicitly. See
 `schema/remote-qc-v1.schema.json` and
 `schema/remote-range-v1.schema.json` for the machine-readable contracts.
 
+### Bounded REST service
+
+`forge-service` provides an optional stateless HTTP analysis endpoint for
+workers and upload gateways. It accepts audio bytes, never accepts a local
+filesystem path, and writes the upload only to a temporary file before using
+the same decoder and report contract as the CLI:
+
+```bash
+forge-service --bind 127.0.0.1:8080
+curl --fail-with-body -X POST \
+  -H 'Content-Type: audio/wav' \
+  -H 'X-Forge-Filename: programme.wav' \
+  --data-binary @programme.wav \
+  http://127.0.0.1:8080/v1/analyze?profile=ebu-r128
+```
+
+`GET /healthz` and `GET /readyz` return a small health contract. `POST
+/v1/analyze` returns the normal `AnalysisReport` inside
+`service-analysis-v1`; built-in programme profiles can be selected with the
+`profile` query parameter. The service rejects chunked requests and duplicate
+headers, and has explicit defaults of 64 MiB upload bytes, 100 million decoded
+samples, four workers, and a 30-second I/O timeout. Override them with
+`--max-body-mib`, `--max-decoded-samples`, `--workers`, and `--timeout-ms`.
+
+The default bind address is loopback. A non-loopback bind is rejected unless
+the environment variable named by `--auth-token-env` (default
+`FORGE_SERVICE_BEARER_TOKEN`) contains a bearer token. Send it as
+`Authorization: Bearer <token>`. TLS termination, rate limiting, and durable
+job storage belong at the deployment gateway; this reference service is
+intentionally bounded and synchronous. gRPC, cancellation, and metrics are
+separate follow-up stages. See `schema/service-analysis-v1.schema.json`,
+`schema/service-error-v1.schema.json`, and `schema/service-health-v1.schema.json`.
+
 An existing audit can be attached to a batch delivery manifest in input order:
 
 ```bash
@@ -2031,6 +2064,7 @@ src/
   anomaly_provider.rs external audio-quality anomaly adapter + audit contract
   onnx_provider.rs  opt-in bounded ONNX model/feature contract + reference adapter
   remote_range.rs   allow-listed HTTP Range reader + redacted remote probe
+  service.rs         bounded HTTP upload/analyze service and response contracts
   report.rs          analysis/delivery manifest and advisory model-QC envelope
   report_tools.rs    versioned migration and explainable model/compliance findings
   mpegh_adapter.rs  native MHAS framing + bounded conforming decoder adapter
@@ -2065,6 +2099,7 @@ src/
   bin/forge-ac4-qc.rs licensed/reference AC-4 presentation audit CLI
   bin/forge-mpegh-qc.rs MHAS/scene/preset/render MPEG-H audit CLI
   bin/forge-remote-qc.rs bounded S3/GCS/HTTPS header and Range probe
+  bin/forge-service.rs bounded stateless REST analysis service
   bin/forge-dts-qc.rs DTS core/HD asset/presentation audit CLI
   bin/forge-anomaly-provider.rs external audio-quality anomaly audit CLI
   bin/forge-onnx-provider.rs opt-in CPU ONNX anomaly-provider adapter CLI

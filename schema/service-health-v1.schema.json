@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/service-health-v1",
+  "title": "Forge service health response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "generator", "status"],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/service-health-v1"
+    },
+    "generator": { "type": "string", "minLength": 1 },
+    "status": { "const": "ok" }
+  }
+}

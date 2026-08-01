@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/service-analysis-v1",
+  "title": "Forge bounded service analysis response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generator",
+    "filename",
+    "content_type",
+    "bytes_received",
+    "max_decoded_samples",
+    "report"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/service-analysis-v1"
+    },
+    "generator": { "type": "string", "minLength": 1 },
+    "filename": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "content_type": { "type": "string", "minLength": 1, "maxLength": 8192 },
+    "bytes_received": { "type": "integer", "minimum": 1 },
+    "max_decoded_samples": { "type": "integer", "minimum": 1 },
+    "compliance_profile": { "type": "string", "minLength": 1 },
+    "report": {
+      "type": "object",
+      "required": [
+        "path",
+        "duration_seconds",
+        "sample_rate_hz",
+        "channels",
+        "integrated_lufs",
+        "true_peak_dbtp"
+      ],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "duration_seconds": { "type": "number" },
+        "sample_rate_hz": { "type": "integer", "minimum": 1 },
+        "channels": { "type": "integer", "minimum": 1 },
+        "integrated_lufs": { "type": "number" },
+        "true_peak_dbtp": { "type": "number" }
+      },
+      "additionalProperties": true
+    }
+  }
+}

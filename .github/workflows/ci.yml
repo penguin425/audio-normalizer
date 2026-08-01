@@ -35,6 +35,9 @@ jobs:
       - name: Run bounded remote Range and probe tests
         run: cargo test --locked --lib remote_range --test remote_qc_cli --bin forge-remote-qc
 
+      - name: Run bounded REST service tests
+        run: cargo test --locked --lib service --test service_api --bin forge-service
+
       - name: Run tests with static Opus support
         run: cargo test --features opus-encoding
 
