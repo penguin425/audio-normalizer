@@ -9,6 +9,7 @@ service ForgeAnalysis {
   rpc Analyze(AnalyzeRequest) returns (AnalyzeResponse);
   rpc Cancel(CancelRequest) returns (CancelResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Metrics(MetricsRequest) returns (MetricsResponse);
 }
 
 message AnalyzeRequest {
@@ -45,4 +46,11 @@ message HealthResponse {
   string schema = 1;
   string generator = 2;
   string status = 3;
+}
+
+message MetricsRequest {}
+
+message MetricsResponse {
+  string content_type = 1;
+  string prometheus_text = 2;
 }

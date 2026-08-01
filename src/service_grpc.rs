@@ -9,6 +9,7 @@
 use crate::decoder;
 use crate::report::{AnalysisReport, ComplianceProfile};
 use crate::service::{ServiceConfig, SERVICE_ANALYSIS_SCHEMA, SERVICE_HEALTH_SCHEMA};
+use crate::service_metrics::{RequestTimer, ServiceMetrics, PROMETHEUS_CONTENT_TYPE};
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -18,7 +19,7 @@ use tempfile::Builder;
 use tokio::sync::Semaphore;
 use tokio::time;
 use tonic::transport::Server;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 
 pub mod proto {
     tonic::include_proto!("forge.service.v1");
@@ -27,13 +28,31 @@ pub mod proto {
 use proto::forge_analysis_server::{ForgeAnalysis, ForgeAnalysisServer};
 use proto::{
     AnalyzeRequest, AnalyzeResponse, CancelRequest, CancelResponse, HealthRequest, HealthResponse,
+    MetricsRequest, MetricsResponse,
 };
 
 const MAX_REQUEST_ID_BYTES: usize = 128;
 const MAX_FILENAME_BYTES: usize = 256;
 
 /// Run the optional gRPC endpoint until the process receives Ctrl-C.
-pub fn run(mut config: ServiceConfig, bind: SocketAddr) -> std::io::Result<()> {
+pub fn run(config: ServiceConfig, bind: SocketAddr) -> std::io::Result<()> {
+    run_internal(config, bind, None)
+}
+
+/// Run the optional gRPC endpoint with a shared metrics registry.
+pub fn run_with_metrics(
+    config: ServiceConfig,
+    bind: SocketAddr,
+    metrics: ServiceMetrics,
+) -> std::io::Result<()> {
+    run_internal(config, bind, Some(metrics))
+}
+
+fn run_internal(
+    mut config: ServiceConfig,
+    bind: SocketAddr,
+    metrics: Option<ServiceMetrics>,
+) -> std::io::Result<()> {
     config.bind = bind;
     config.validate().map_err(invalid_config)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -41,7 +60,7 @@ pub fn run(mut config: ServiceConfig, bind: SocketAddr) -> std::io::Result<()> {
         .build()
         .map_err(|error| std::io::Error::other(format!("tokio runtime: {error}")))?;
     runtime.block_on(async move {
-        let service = GrpcService::new(config.clone());
+        let service = GrpcService::new(config.clone(), metrics);
         let shutdown = async {
             let _ = tokio::signal::ctrl_c().await;
         };
@@ -64,14 +83,16 @@ struct GrpcService {
     config: Arc<ServiceConfig>,
     active: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     permits: Arc<Semaphore>,
+    metrics: Option<ServiceMetrics>,
 }
 
 impl GrpcService {
-    fn new(config: ServiceConfig) -> Self {
+    fn new(config: ServiceConfig, metrics: Option<ServiceMetrics>) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(config.workers)),
             config: Arc::new(config),
             active: Arc::new(Mutex::new(HashMap::new())),
+            metrics,
         }
     }
 
@@ -131,6 +152,57 @@ impl ForgeAnalysis for GrpcService {
         &self,
         request: Request<AnalyzeRequest>,
     ) -> Result<Response<AnalyzeResponse>, Status> {
+        let request_bytes = request.get_ref().audio.len() as u64;
+        let mut timer = self.start_timer(&request);
+        let result = self.analyze_inner(request).await;
+        if let Some(timer) = timer.take() {
+            timer.finish(status_code(&result), request_bytes);
+        }
+        result
+    }
+
+    async fn cancel(
+        &self,
+        request: Request<CancelRequest>,
+    ) -> Result<Response<CancelResponse>, Status> {
+        let mut timer = self.start_timer(&request);
+        let result = self.cancel_inner(request).await;
+        if let Some(timer) = timer.take() {
+            timer.finish(status_code(&result), 0);
+        }
+        result
+    }
+
+    async fn health(
+        &self,
+        request: Request<HealthRequest>,
+    ) -> Result<Response<HealthResponse>, Status> {
+        let mut timer = self.start_timer(&request);
+        let result = self.health_inner(request).await;
+        if let Some(timer) = timer.take() {
+            timer.finish(status_code(&result), 0);
+        }
+        result
+    }
+
+    async fn metrics(
+        &self,
+        request: Request<MetricsRequest>,
+    ) -> Result<Response<MetricsResponse>, Status> {
+        let mut timer = self.start_timer(&request);
+        let result = self.metrics_inner(request).await;
+        if let Some(timer) = timer.take() {
+            timer.finish(status_code(&result), 0);
+        }
+        result
+    }
+}
+
+impl GrpcService {
+    async fn analyze_inner(
+        &self,
+        request: Request<AnalyzeRequest>,
+    ) -> Result<Response<AnalyzeResponse>, Status> {
         self.authorize(&request)?;
         let request = request.into_inner();
         let request_id = validate_request_id(&request.request_id)?;
@@ -142,11 +214,15 @@ impl ForgeAnalysis for GrpcService {
                 "request body exceeds the configured limit",
             ));
         }
-        let permit = self
-            .permits
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Status::resource_exhausted("service is busy"))?;
+        let permit = match self.permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_busy();
+                }
+                return Err(Status::resource_exhausted("service is busy"));
+            }
+        };
         let filename = safe_filename(&request.filename)?;
         let suffix = audio_suffix(&filename, &request.content_type)?;
         let profile = resolve_profile(&request.profile)?;
@@ -154,6 +230,7 @@ impl ForgeAnalysis for GrpcService {
         let guard = CancellationGuard(Arc::clone(&cancelled));
         let config = Arc::clone(&self.config);
         let service = self.clone();
+        let metrics = service.metrics.clone();
         let worker_request_id = request_id.clone();
         let audio = request.audio;
         let content_type = if request.content_type.is_empty() {
@@ -173,6 +250,7 @@ impl ForgeAnalysis for GrpcService {
                     request_id: worker_request_id,
                     max_decoded_samples: config.max_decoded_samples,
                     cancelled,
+                    metrics,
                 })
             }),
         )
@@ -188,7 +266,7 @@ impl ForgeAnalysis for GrpcService {
         }
     }
 
-    async fn cancel(
+    async fn cancel_inner(
         &self,
         request: Request<CancelRequest>,
     ) -> Result<Response<CancelResponse>, Status> {
@@ -199,7 +277,7 @@ impl ForgeAnalysis for GrpcService {
         }))
     }
 
-    async fn health(
+    async fn health_inner(
         &self,
         request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
@@ -209,6 +287,32 @@ impl ForgeAnalysis for GrpcService {
             generator: concat!("forge-normalizer/", env!("CARGO_PKG_VERSION")).to_owned(),
             status: "ok".to_owned(),
         }))
+    }
+
+    async fn metrics_inner(
+        &self,
+        request: Request<MetricsRequest>,
+    ) -> Result<Response<MetricsResponse>, Status> {
+        self.authorize(&request)?;
+        let Some(metrics) = &self.metrics else {
+            return Err(Status::not_found("metrics exporter is disabled"));
+        };
+        Ok(Response::new(MetricsResponse {
+            content_type: PROMETHEUS_CONTENT_TYPE.to_owned(),
+            prometheus_text: metrics.render_prometheus(),
+        }))
+    }
+
+    fn start_timer<T>(&self, request: &Request<T>) -> Option<RequestTimer> {
+        let metrics = self.metrics.as_ref()?;
+        let mut timer = metrics.start_grpc_request();
+        timer.set_traceparent(
+            request
+                .metadata()
+                .get("traceparent")
+                .and_then(|value| value.to_str().ok()),
+        );
+        Some(timer)
     }
 }
 
@@ -229,6 +333,7 @@ struct AnalyzeJob {
     request_id: String,
     max_decoded_samples: u64,
     cancelled: Arc<AtomicBool>,
+    metrics: Option<ServiceMetrics>,
 }
 
 fn analyze_audio(job: AnalyzeJob) -> Result<AnalyzeResponse, Status> {
@@ -241,6 +346,7 @@ fn analyze_audio(job: AnalyzeJob) -> Result<AnalyzeResponse, Status> {
         request_id,
         max_decoded_samples,
         cancelled,
+        metrics,
     } = job;
     check_cancelled(&cancelled)?;
     let mut temporary = Builder::new()
@@ -266,6 +372,10 @@ fn analyze_audio(job: AnalyzeJob) -> Result<AnalyzeResponse, Status> {
     check_cancelled(&cancelled)?;
     let report_json = serde_json::to_string(&report)
         .map_err(|_| Status::invalid_argument("measurement contains a non-finite value"))?;
+    if let Some(metrics) = metrics {
+        let decoded_samples = (decoded.frames as u64).saturating_mul(u64::from(decoded.channels));
+        metrics.observe_analysis(audio.len() as u64, decoded_samples, analysis.lufs);
+    }
     Ok(AnalyzeResponse {
         schema: SERVICE_ANALYSIS_SCHEMA.to_owned(),
         generator: concat!("forge-normalizer/", env!("CARGO_PKG_VERSION")).to_owned(),
@@ -282,6 +392,27 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<(), Status> {
         Err(Status::cancelled("analysis request was cancelled"))
     } else {
         Ok(())
+    }
+}
+
+fn status_code<T>(result: &Result<Response<T>, Status>) -> u16 {
+    match result {
+        Ok(_) => 200,
+        Err(status) => match status.code() {
+            Code::Ok => 200,
+            Code::InvalidArgument | Code::FailedPrecondition | Code::OutOfRange => 400,
+            Code::Unauthenticated => 401,
+            Code::PermissionDenied => 403,
+            Code::NotFound => 404,
+            Code::AlreadyExists => 409,
+            Code::ResourceExhausted => 429,
+            Code::Cancelled => 499,
+            Code::DeadlineExceeded => 504,
+            Code::Unavailable => 503,
+            Code::Internal | Code::Unknown | Code::DataLoss => 500,
+            Code::Unimplemented => 501,
+            Code::Aborted => 409,
+        },
     }
 }
 
@@ -383,7 +514,7 @@ mod tests {
 
     #[test]
     fn cancellation_registry_is_explicit() {
-        let service = GrpcService::new(ServiceConfig::default());
+        let service = GrpcService::new(ServiceConfig::default(), None);
         let flag = service.register("job").unwrap();
         assert!(service.cancel("job").unwrap());
         assert!(flag.load(Ordering::Acquire));
@@ -394,5 +525,27 @@ mod tests {
     #[test]
     fn protobuf_health_request_has_stable_empty_encoding() {
         assert!(HealthRequest::default().encode_to_vec().is_empty());
+    }
+
+    #[tokio::test]
+    async fn metrics_rpc_returns_prometheus_text_when_enabled() {
+        let metrics = ServiceMetrics::new();
+        let timer = metrics.start_grpc_request();
+        timer.finish(200, 0);
+        let service = GrpcService::new(ServiceConfig::default(), Some(metrics));
+        let response = ForgeAnalysis::metrics(&service, Request::new(MetricsRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.content_type, PROMETHEUS_CONTENT_TYPE);
+        assert!(response
+            .prometheus_text
+            .contains("forge_service_requests_total"));
+
+        let disabled = GrpcService::new(ServiceConfig::default(), None);
+        let error = ForgeAnalysis::metrics(&disabled, Request::new(MetricsRequest::default()))
+            .await
+            .expect_err("metrics should be disabled without a registry");
+        assert_eq!(error.code(), Code::NotFound);
     }
 }

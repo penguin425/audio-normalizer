@@ -199,6 +199,11 @@ Forge already provides:
   the REST limits/authentication policy, deadline/disconnect cancellation, and
   cooperative decode/analysis checkpoints. The default build remains free of
   the async runtime and HTTP/2 stack.
+- Opt-in bounded service observability with fixed Prometheus counters,
+  duration histogram buckets, analysis aggregates, REST `GET /metrics`, gRPC
+  `Metrics`, and a local JSONL bridge for OpenTelemetry-compatible server-span
+  attributes. User paths, filenames, request IDs, and model payloads are never
+  labels or span fields.
 - Read-only DSF and uncompressed DSDIFF analysis with bounded structural QC,
   declared bit-order/channel mapping, a versioned cascaded half-band and
   21 kHz low-pass decimation policy, 88.2/96 kHz BS.1770 measurement, and

@@ -1857,6 +1857,19 @@ headers, and has explicit defaults of 64 MiB upload bytes, 100 million decoded
 samples, four workers, and a 30-second I/O timeout. Override them with
 `--max-body-mib`, `--max-decoded-samples`, `--workers`, and `--timeout-ms`.
 
+Pass `--metrics` to expose bounded Prometheus text at `GET /metrics`:
+
+```bash
+forge-service --bind 127.0.0.1:8080 --metrics
+curl --fail http://127.0.0.1:8080/metrics
+```
+
+For a local OpenTelemetry adapter, add `--otel-jsonl PATH`. It appends fixed,
+bounded server-span records as JSONL; it is intentionally not an OTLP client.
+Both options preserve the same authentication policy as the analysis
+endpoints. See [`SERVICE-METRICS.md`](SERVICE-METRICS.md) for metric names,
+bucket units, trace metadata, and deployment guidance.
+
 The default bind address is loopback. A non-loopback bind is rejected unless
 the environment variable named by `--auth-token-env` (default
 `FORGE_SERVICE_BEARER_TOKEN`) contains a bearer token. Send it as
@@ -1876,14 +1889,15 @@ forge-service --grpc-bind 127.0.0.1:9090
 ```
 
 The protocol is versioned in [`proto/forge_service.proto`](proto/forge_service.proto)
-and provides `Analyze`, `Cancel`, and `Health` RPCs. `Analyze` carries the
+and provides `Analyze`, `Cancel`, `Health`, and opt-in `Metrics` RPCs. `Analyze` carries the
 audio bytes and an explicit `request_id`; IDs are bounded and must be unique
 while active. `Cancel` marks a running request for cooperative cancellation at
 decode/analysis checkpoints, and client disconnects and request deadlines also
 trigger the same cancellation flag. The gRPC endpoint uses the REST service's
 bearer-token policy and upload, decoded-sample, worker, and timeout limits.
-The feature is opt-in, so the default library/REST build does not include the
-Tokio or tonic runtime.
+`Metrics` returns the same Prometheus text as the REST endpoint when metrics are
+enabled. The feature is opt-in, so the default library/REST build does not
+include the Tokio or tonic runtime.
 
 An existing audit can be attached to a batch delivery manifest in input order:
 
@@ -2118,6 +2132,8 @@ src/
   bin/forge-ac4-qc.rs licensed/reference AC-4 presentation audit CLI
   bin/forge-mpegh-qc.rs MHAS/scene/preset/render MPEG-H audit CLI
   bin/forge-remote-qc.rs bounded S3/GCS/HTTPS header and Range probe
+  service.rs         bounded REST upload/analyze service
+  service_metrics.rs Prometheus counters and OpenTelemetry-compatible spans
   bin/forge-service.rs bounded stateless REST analysis service
   bin/forge-dts-qc.rs DTS core/HD asset/presentation audit CLI
   bin/forge-anomaly-provider.rs external audio-quality anomaly audit CLI
