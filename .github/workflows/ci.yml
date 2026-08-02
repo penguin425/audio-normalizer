@@ -223,6 +223,24 @@ jobs:
       - name: Compile and smoke-test host adapters
         run: tools/test-host-adapters.sh
 
+  vst3-adapter:
+    name: VST3 adapter
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+
+      - name: Install VST3 build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ git ca-certificates
+
+      - name: Compile and validate VST3 bundle
+        run: tools/test-vst3-adapter.sh
+
   plugin-parity:
     name: Plugin parity (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

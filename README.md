@@ -210,6 +210,9 @@ cargo build --release --features ffmpeg-encoding
 # Optional cross-platform CLAP and Linux LV2 plug-ins:
 cargo build --release --features clap-plugin,lv2-plugin
 
+# Optional VST3 host wrapper (requires CMake 3.20+, C++17, and Git):
+tools/test-vst3-adapter.sh
+
 cargo test
 ```
 
@@ -2285,6 +2288,10 @@ latency reporting.
 The optional FFmpeg AVFrame bridge and GStreamer `forge_normalizer` element
 reuse the same processor; build and host-lifecycle requirements are in
 [HOST-ADAPTERS.md](HOST-ADAPTERS.md).
+The optional VST3 wrapper uses the same C ABI and is built outside Cargo; it
+supports mono/stereo float32 processing, host automation, state persistence,
+and exact latency reporting. See [VST3-ADAPTER.md](VST3-ADAPTER.md) for the
+pinned SDK build and redistribution guidance.
 It deliberately does not label a changing live estimate as final Integrated
 LUFS; programme-integrated normalization remains the two-pass file workflow.
 
