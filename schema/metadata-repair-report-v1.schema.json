@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/metadata-repair-report-v1.schema.json",
+  "title": "Forge metadata repair report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "validator", "classification", "mode", "source", "destination",
+    "source_bytes", "output_bytes", "source_sha256", "output_sha256", "limits",
+    "source_format", "before", "after", "actions", "warnings", "passed", "changed",
+    "unknown_bytes_preserved", "atomic_replace"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "validator": {"const": "forge-metadata-repair-1"},
+    "classification": {"type": "string", "minLength": 1},
+    "mode": {"enum": ["validate", "repair"]},
+    "source": {"type": "string", "minLength": 1},
+    "destination": {"type": "string", "minLength": 1},
+    "source_bytes": {"type": "integer", "minimum": 0},
+    "output_bytes": {"type": "integer", "minimum": 0},
+    "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "output_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_input_bytes", "max_output_bytes", "max_metadata_chunk_bytes", "max_xml_bytes", "max_chunks"],
+      "properties": {
+        "max_input_bytes": {"type": "integer", "minimum": 1},
+        "max_output_bytes": {"type": "integer", "minimum": 1},
+        "max_metadata_chunk_bytes": {"type": "integer", "minimum": 1},
+        "max_xml_bytes": {"type": "integer", "minimum": 1},
+        "max_chunks": {"type": "integer", "minimum": 1}
+      }
+    },
+    "source_format": {"type": "string", "minLength": 1},
+    "before": {"type": "object"},
+    "after": {"type": "object"},
+    "adm_before": {"type": ["object", "null"]},
+    "adm_after": {"type": ["object", "null"]},
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "changed", "detail"],
+        "properties": {
+          "kind": {"type": "string", "minLength": 1},
+          "changed": {"type": "boolean"},
+          "detail": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "passed": {"type": "boolean"},
+    "changed": {"type": "boolean"},
+    "unknown_bytes_preserved": {"type": "boolean"},
+    "atomic_replace": {"type": "boolean"}
+  }
+}

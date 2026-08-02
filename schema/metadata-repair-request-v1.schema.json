@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/metadata-repair-request-v1.schema.json",
+  "title": "Forge metadata repair request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source", "destination"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "source": {"type": "string", "minLength": 1},
+    "destination": {"type": "string", "minLength": 1},
+    "mode": {"enum": ["validate", "repair"]},
+    "ensure_bwf_v2": {"type": "boolean"},
+    "bwf_loudness": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": [
+        "integrated_lufs",
+        "loudness_range_lu",
+        "true_peak_dbtp",
+        "max_momentary_lufs",
+        "max_short_term_lufs"
+      ],
+      "properties": {
+        "integrated_lufs": {"type": "number", "minimum": -120, "maximum": 6},
+        "loudness_range_lu": {"type": "number", "minimum": 0, "maximum": 50},
+        "true_peak_dbtp": {"type": "number", "minimum": -120, "maximum": 6},
+        "max_momentary_lufs": {"type": "number", "minimum": -120, "maximum": 6},
+        "max_short_term_lufs": {"type": "number", "minimum": -120, "maximum": 6}
+      }
+    },
+    "adm_version": {"type": ["string", "null"], "enum": ["ITU-R_BS.2076-3", null]},
+    "overwrite": {"type": "boolean"},
+    "atomic_replace": {"type": "boolean"},
+    "max_input_bytes": {"type": "integer", "minimum": 1},
+    "max_output_bytes": {"type": "integer", "minimum": 1},
+    "max_metadata_chunk_bytes": {"type": "integer", "minimum": 1},
+    "max_xml_bytes": {"type": "integer", "minimum": 1},
+    "max_chunks": {"type": "integer", "minimum": 1}
+  }
+}

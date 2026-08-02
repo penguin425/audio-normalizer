@@ -1,6 +1,6 @@
 [package]
 name = "forge-normalizer"
-version = "0.125.0"
+version = "0.126.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer (WAV/MP3/FLAC/Opus/AAC/Vorbis)"
@@ -85,6 +85,10 @@ path = "src/bin/forge-binaural-qc.rs"
 [[bin]]
 name = "forge-remediate"
 path = "src/bin/forge-remediate.rs"
+
+[[bin]]
+name = "forge-metadata-repair"
+path = "src/bin/forge-metadata-repair.rs"
 
 [[bin]]
 name = "forge-sadm-qc"

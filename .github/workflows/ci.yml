@@ -44,6 +44,11 @@ jobs:
           cargo test --locked --no-default-features --lib remediation --bin forge-remediate
           cargo test --locked --no-default-features --test remediation_cli
 
+      - name: Run metadata repair contract tests
+        run: |
+          cargo test --locked --no-default-features --lib metadata_repair --bin forge-metadata-repair
+          cargo test --locked --no-default-features --test metadata_repair_cli
+
       - name: Run opt-in ONNX provider contract tests
         run: cargo test --locked --features onnx-provider --lib onnx_provider --bin forge-onnx-provider
 

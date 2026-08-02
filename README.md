@@ -1769,6 +1769,23 @@ status 1 preserves a JSON report with infeasibility reasons; status 2 denotes a
 request, decode, or resource error. See [REMEDIATION.md](REMEDIATION.md) and
 the versioned request/report schemas in `schema/`.
 
+For delivery metadata that needs a conservative, auditable correction,
+`forge-metadata-repair` validates the source and writes a separate output
+file. It can normalize RIFF/WAVE BWF `bext` v2 loudness fields and the ADM
+`audioFormatExtended/@version` declaration while preserving unknown chunks,
+XML, and audio bytes:
+
+```bash
+forge-metadata-repair metadata-repair.json --output metadata-repair-report.json
+```
+
+Use `mode: "validate"` for an exact validate-and-copy operation. MXF is
+validate-and-copy only; mutation requests fail closed until a partition/index
+table writer is available. `atomic_replace: true` atomically replaces the
+destination after the post-write container/ADM validators pass. See
+[METADATA-REPAIR.md](METADATA-REPAIR.md) and the versioned metadata repair
+schemas.
+
 For AC-4, `forge-ac4-qc` can also drive an explicitly selected licensed or
 reference decoder through a bounded, versioned adapter protocol. It requires
 the adapter to enumerate every presentation, records AC-4 dialnorm and
@@ -2184,6 +2201,7 @@ src/
   downmix_qc.rs     bounded immersive downmix evidence and clip-risk reports
   binaural_qc.rs    external renderer/model evidence and binaural drift gates
   remediation.rs    dry-run true-peak/LRA remediation planner
+  metadata_repair.rs bounded BWF/ADM metadata repair and validate-and-copy
   normalize.rs      analyze -> gain (ceiling-protected) -> apply -> write; album mode
   realtime.rs       allocation-free live M/S meter + smoothed gain processor
   bin/forge-live.rs raw f32le real-time pipeline and NDJSON meter
@@ -2192,6 +2210,7 @@ src/
   bin/forge-downmix-qc.rs explicit immersive downmix matrix/QC CLI
   bin/forge-binaural-qc.rs external binaural renderer verification CLI
   bin/forge-remediate.rs bounded smart-remediation dry-run planner
+  bin/forge-metadata-repair.rs bounded copy-to-new-file metadata repair CLI
   bin/forge-container-qc.rs wrapper/bitstream/metadata audit CLI
   bin/forge-provenance-qc.rs C2PA integrity and trust-policy audit CLI
   bin/forge-aes31-qc.rs AES31-3 EDML project audit CLI
