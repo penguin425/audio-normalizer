@@ -18,6 +18,7 @@ extern "C" {
 
 #define FORGE_NORMALIZER_C_API_VERSION 1u
 #define FORGE_NORMALIZER_ANALYSIS_V1_SIZE 80u
+#define FORGE_NORMALIZER_LIVE_CONFIG_V1_SIZE 48u
 
 typedef enum ForgeStatus {
     FORGE_STATUS_OK = 0,
@@ -43,6 +44,22 @@ typedef struct ForgeAnalysisV1 {
     double true_peak_dbtp;
 } ForgeAnalysisV1;
 
+/* Bounded real-time processor configuration. All gain/ceiling fields are dB;
+ * sample_rate_hz is Hz and attack/release are milliseconds. */
+typedef struct ForgeLiveConfigV1 {
+    uint32_t struct_size;
+    uint32_t api_version;
+    uint32_t sample_rate_hz;
+    uint32_t channels;
+    double initial_gain_db;
+    double ceiling_dbtp;
+    double attack_ms;
+    double release_ms;
+} ForgeLiveConfigV1;
+
+/* Opaque, single-threaded streaming state. */
+typedef struct ForgeLiveV1 ForgeLiveV1;
+
 #if defined(__cplusplus)
 static_assert(sizeof(ForgeStatus) == 4u,
               "unexpected ForgeStatus layout");
@@ -52,6 +69,8 @@ static_assert(offsetof(ForgeAnalysisV1, frames) == 16u,
               "unexpected ForgeAnalysisV1 frames offset");
 static_assert(offsetof(ForgeAnalysisV1, true_peak_dbtp) == 72u,
               "unexpected ForgeAnalysisV1 true-peak offset");
+static_assert(sizeof(ForgeLiveConfigV1) == FORGE_NORMALIZER_LIVE_CONFIG_V1_SIZE,
+              "unexpected ForgeLiveConfigV1 layout");
 #else
 _Static_assert(sizeof(ForgeStatus) == 4u,
                "unexpected ForgeStatus layout");
@@ -61,11 +80,14 @@ _Static_assert(offsetof(ForgeAnalysisV1, frames) == 16u,
                "unexpected ForgeAnalysisV1 frames offset");
 _Static_assert(offsetof(ForgeAnalysisV1, true_peak_dbtp) == 72u,
                "unexpected ForgeAnalysisV1 true-peak offset");
+_Static_assert(sizeof(ForgeLiveConfigV1) == FORGE_NORMALIZER_LIVE_CONFIG_V1_SIZE,
+               "unexpected ForgeLiveConfigV1 layout");
 #endif
 
 FORGE_NORMALIZER_API uint32_t forge_normalizer_c_api_version(void);
 FORGE_NORMALIZER_API const char *forge_normalizer_version(void);
 FORGE_NORMALIZER_API size_t forge_normalizer_analysis_v1_size(void);
+FORGE_NORMALIZER_API size_t forge_normalizer_live_config_v1_size(void);
 
 /*
  * Analyze a local file using at most max_decoded_samples decoded
@@ -82,6 +104,57 @@ FORGE_NORMALIZER_API ForgeStatus forge_normalizer_analyze_file_v1(
     uint64_t max_decoded_samples,
     ForgeAnalysisV1 *result,
     size_t result_size,
+    char *error_buffer,
+    size_t error_capacity);
+
+/*
+ * Create and destroy the allocation-owning streaming processor. A handle is
+ * single-threaded; distinct handles may be used concurrently. The v1 limits
+ * are 8..384 kHz, 1..64 channels, -120..120 dB initial gain, -120..0 dBTP
+ * ceiling, and 0.01..10000 ms attack/release.
+ */
+FORGE_NORMALIZER_API ForgeLiveV1 *forge_normalizer_live_create_v1(
+    const ForgeLiveConfigV1 *config,
+    char *error_buffer,
+    size_t error_capacity);
+FORGE_NORMALIZER_API void forge_normalizer_live_destroy_v1(ForgeLiveV1 *handle);
+FORGE_NORMALIZER_API size_t forge_normalizer_live_latency_frames_v1(
+    const ForgeLiveV1 *handle);
+
+/*
+ * Process interleaved IEEE-754 f32 samples in place. The processor has a
+ * fixed look-ahead latency; the first latency_frames output frames are zero.
+ * A zero-frame call is a no-op before flush and accepts a NULL samples pointer.
+ */
+FORGE_NORMALIZER_API ForgeStatus forge_normalizer_live_process_interleaved_f32_v1(
+    ForgeLiveV1 *handle,
+    float *samples,
+    size_t frames,
+    char *error_buffer,
+    size_t error_capacity);
+
+/*
+ * End-of-stream flush. The caller must provide capacity_frames >= latency and
+ * writable interleaved storage for latency*channels f32 values. Exactly
+ * latency_frames are written to output and written_frames. Flush is one-shot;
+ * create a new handle for a later stream.
+ */
+FORGE_NORMALIZER_API ForgeStatus forge_normalizer_live_flush_interleaved_f32_v1(
+    ForgeLiveV1 *handle,
+    float *output,
+    size_t capacity_frames,
+    size_t *written_frames,
+    char *error_buffer,
+    size_t error_capacity);
+
+FORGE_NORMALIZER_API ForgeStatus forge_normalizer_live_set_target_gain_db_v1(
+    ForgeLiveV1 *handle,
+    double gain_db,
+    char *error_buffer,
+    size_t error_capacity);
+FORGE_NORMALIZER_API ForgeStatus forge_normalizer_live_set_ceiling_dbtp_v1(
+    ForgeLiveV1 *handle,
+    double ceiling_dbtp,
     char *error_buffer,
     size_t error_capacity);
 

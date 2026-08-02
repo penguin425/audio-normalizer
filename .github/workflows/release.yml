@@ -8,6 +8,7 @@ on:
     paths:
       - ".github/workflows/release.yml"
       - "include/forge_normalizer.h"
+      - "C-API.md"
       - "python/**"
       - "wasm/**"
       - "src/c_api.rs"
@@ -289,7 +290,7 @@ jobs:
              schema/service-analysis-v1.schema.json \
              schema/service-error-v1.schema.json \
              schema/service-health-v1.schema.json "$staging/schema/"
-          cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md MPEGH-ADAPTER.md DTS-ADAPTER.md ANOMALY-ADAPTER.md SERVICE-METRICS.md NEXT-GENERATION-PLAN.md ROADMAP.md LICENSE "$staging/"
+          cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md MPEGH-ADAPTER.md DTS-ADAPTER.md ANOMALY-ADAPTER.md SERVICE-METRICS.md C-API.md NEXT-GENERATION-PLAN.md ROADMAP.md LICENSE "$staging/"
           tar -czf "${staging}.tar.gz" "$staging"
 
       - name: Package Windows binary
@@ -316,7 +317,7 @@ jobs:
           Copy-Item "schema/mpegh-adapter-request-v1.schema.json","schema/mpegh-adapter-response-v1.schema.json","schema/mpegh-adapter-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/dts-adapter-request-v1.schema.json","schema/dts-adapter-response-v1.schema.json","schema/dts-adapter-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/audio-anomaly-provider-v1.schema.json","schema/anomaly-provider-audit-v1.schema.json","schema/model-qc-v1.schema.json","schema/onnx-anomaly-model-v1.schema.json","schema/onnx-feature-frames-v1.schema.json","schema/remote-range-v1.schema.json","schema/remote-qc-v1.schema.json","schema/service-analysis-v1.schema.json","schema/service-error-v1.schema.json","schema/service-health-v1.schema.json" "$staging/schema/"
-          Copy-Item "README.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","MULTI-DELIVERY.md","SEGMENT-NORMALIZATION.md","AC4-ADAPTER.md","MPEGH-ADAPTER.md","DTS-ADAPTER.md","ANOMALY-ADAPTER.md","SERVICE-METRICS.md","NEXT-GENERATION-PLAN.md","ROADMAP.md","LICENSE" $staging
+          Copy-Item "README.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","MULTI-DELIVERY.md","SEGMENT-NORMALIZATION.md","AC4-ADAPTER.md","MPEGH-ADAPTER.md","DTS-ADAPTER.md","ANOMALY-ADAPTER.md","SERVICE-METRICS.md","C-API.md","NEXT-GENERATION-PLAN.md","ROADMAP.md","LICENSE" $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
 
       - name: Upload packaged binary
