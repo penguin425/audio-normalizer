@@ -88,6 +88,7 @@ pub mod preset;
 pub mod provenance;
 pub mod qc;
 pub mod realtime;
+pub mod remediation;
 pub mod remote_range;
 pub mod report;
 pub mod report_tools;

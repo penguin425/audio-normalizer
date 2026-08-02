@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/remediation-report-v1.schema.json",
+  "title": "Forge smart remediation dry-run report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "validator", "classification", "source", "source_bytes",
+    "source_sha256", "settings_sha256", "limits", "before", "plan", "warnings",
+    "feasible", "requires_audio_write", "manual_review_required"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "validator": {"const": "forge-smart-remediation-1"},
+    "classification": {"type": "string", "minLength": 1},
+    "source": {"type": "string", "minLength": 1},
+    "source_bytes": {"type": "integer", "minimum": 0},
+    "source_sha256": {"$ref": "#/$defs/sha256"},
+    "settings_sha256": {"$ref": "#/$defs/sha256"},
+    "limits": {"$ref": "#/$defs/limits"},
+    "before": {"$ref": "#/$defs/measurement"},
+    "plan": {"$ref": "#/$defs/plan"},
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "feasible": {"type": "boolean"},
+    "requires_audio_write": {"type": "boolean"},
+    "manual_review_required": {"type": "boolean"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "optionalNumber": {"type": ["number", "null"]},
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_lufs", "true_peak_ceiling_dbtp", "max_loudness_range_lu",
+        "max_static_gain_db", "max_dynamic_reduction_db"
+      ],
+      "properties": {
+        "target_lufs": {"type": ["number", "null"]},
+        "true_peak_ceiling_dbtp": {"type": "number"},
+        "max_loudness_range_lu": {"type": ["number", "null"]},
+        "max_static_gain_db": {"type": "number"},
+        "max_dynamic_reduction_db": {"type": "number"}
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sample_rate_hz", "channels", "frames", "duration_seconds", "integrated_lufs",
+        "loudness_range_lu", "sample_peak_dbfs", "true_peak_dbtp", "lra_stable"
+      ],
+      "properties": {
+        "sample_rate_hz": {"type": "integer", "minimum": 1},
+        "channels": {"type": "integer", "minimum": 1, "maximum": 32},
+        "frames": {"type": "integer", "minimum": 0},
+        "duration_seconds": {"type": "number", "minimum": 0},
+        "integrated_lufs": {"$ref": "#/$defs/optionalNumber"},
+        "loudness_range_lu": {"$ref": "#/$defs/optionalNumber"},
+        "sample_peak_dbfs": {"$ref": "#/$defs/optionalNumber"},
+        "true_peak_dbtp": {"$ref": "#/$defs/optionalNumber"},
+        "lra_stable": {"type": "boolean"}
+      }
+    },
+    "projected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["integrated_lufs", "loudness_range_lu", "true_peak_dbtp"],
+      "properties": {
+        "integrated_lufs": {"$ref": "#/$defs/optionalNumber"},
+        "loudness_range_lu": {"$ref": "#/$defs/optionalNumber"},
+        "true_peak_dbtp": {"$ref": "#/$defs/optionalNumber"}
+      }
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "amount_db", "amount_lu", "rationale", "requires_render_verification"],
+      "properties": {
+        "kind": {"enum": ["static-gain", "true-peak-limiter", "lra-compressor"]},
+        "amount_db": {"$ref": "#/$defs/optionalNumber"},
+        "amount_lu": {"$ref": "#/$defs/optionalNumber"},
+        "rationale": {"type": "string", "minLength": 1},
+        "requires_render_verification": {"type": "boolean"}
+      }
+    },
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "static_gain_db", "projected_after_static_gain", "projected_after_dynamic_actions",
+        "target_loudness_passed", "true_peak_passed", "loudness_range_passed",
+        "true_peak_excess_db", "loudness_range_excess_lu", "actions",
+        "infeasibility_reasons", "minimal_change"
+      ],
+      "properties": {
+        "static_gain_db": {"type": "number"},
+        "projected_after_static_gain": {"$ref": "#/$defs/projected"},
+        "projected_after_dynamic_actions": {"$ref": "#/$defs/projected"},
+        "target_loudness_passed": {"type": ["boolean", "null"]},
+        "true_peak_passed": {"type": "boolean"},
+        "loudness_range_passed": {"type": ["boolean", "null"]},
+        "true_peak_excess_db": {"$ref": "#/$defs/optionalNumber"},
+        "loudness_range_excess_lu": {"$ref": "#/$defs/optionalNumber"},
+        "actions": {"type": "array", "items": {"$ref": "#/$defs/action"}},
+        "infeasibility_reasons": {"type": "array", "items": {"type": "string"}},
+        "minimal_change": {"type": "boolean"}
+      }
+    }
+  }
+}

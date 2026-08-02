@@ -39,6 +39,11 @@ jobs:
           cargo test --locked --no-default-features --lib binaural_qc --bin forge-binaural-qc
           cargo test --locked --no-default-features --test binaural_qc_cli
 
+      - name: Run smart remediation contract tests
+        run: |
+          cargo test --locked --no-default-features --lib remediation --bin forge-remediate
+          cargo test --locked --no-default-features --test remediation_cli
+
       - name: Run opt-in ONNX provider contract tests
         run: cargo test --locked --features onnx-provider --lib onnx_provider --bin forge-onnx-provider
 

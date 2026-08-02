@@ -285,6 +285,9 @@ generations.
   `forge-binaural-qc` now verifies externally
   rendered stereo output with mandatory renderer/model hash evidence and
   optional trusted-reference drift gates; it does not bundle an HRTF renderer.
+- `forge-remediate` produces a bounded dry-run plan for true-peak and LRA
+  remediation, binding source/settings hashes and requiring a fresh render and
+  remeasurement for every dynamic action. It never rewrites audio.
 - Separate dialogue, effects, music, audio-description, and clean-audio stem
   loudness checks.
 - Personalization-range safety: verify that user gain/interactivity limits
