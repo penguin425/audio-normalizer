@@ -1,7 +1,8 @@
 use forge_normalizer::c_api::{
     forge_normalizer_analysis_v1_size, forge_normalizer_analyze_file_v1,
-    forge_normalizer_c_api_version, forge_normalizer_version, ForgeAnalysisV1, ForgeStatus,
-    ANALYSIS_V1_SIZE, C_API_VERSION,
+    forge_normalizer_c_api_version, forge_normalizer_live_config_v1_size, forge_normalizer_version,
+    ForgeAnalysisV1, ForgeLiveConfigV1, ForgeStatus, ANALYSIS_V1_SIZE, C_API_VERSION,
+    LIVE_CONFIG_V1_SIZE,
 };
 use forge_normalizer::wav::{default_channel_roles, AudioBuffer, PcmKind, WavWriter};
 use std::f32::consts::TAU;
@@ -21,6 +22,11 @@ fn error_text(buffer: &[c_char]) -> &str {
 fn version_and_size_queries_are_stable() {
     assert_eq!(forge_normalizer_c_api_version(), C_API_VERSION);
     assert_eq!(forge_normalizer_analysis_v1_size(), ANALYSIS_V1_SIZE);
+    assert_eq!(
+        forge_normalizer_live_config_v1_size(),
+        std::mem::size_of::<ForgeLiveConfigV1>()
+    );
+    assert_eq!(forge_normalizer_live_config_v1_size(), LIVE_CONFIG_V1_SIZE);
     // SAFETY: the version API returns a process-lifetime NUL-terminated string.
     let version = unsafe { CStr::from_ptr(forge_normalizer_version()) }
         .to_str()

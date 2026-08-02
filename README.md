@@ -2168,13 +2168,17 @@ intentional-breaking-change process are recorded in
 ## C API
 
 Release archives contain the versioned Forge C ABI v1 shared library and
-`include/forge_normalizer.h`. It provides bounded local-file analysis without
-passing Rust-owned memory across the language boundary. The caller supplies a
-fixed 80-byte result, an optional error buffer, and an explicit maximum number
-of decoded samples.
+`include/forge_normalizer.h`. It provides bounded local-file analysis and a
+host-neutral, interleaved-f32 streaming processor without passing Rust-owned
+memory across the language boundary. The caller supplies a fixed 80-byte
+analysis result, an optional error buffer, and an explicit maximum number of
+decoded samples; streaming hosts own their input/output blocks and flush the
+processor's fixed look-ahead tail at end-of-stream.
 
 The ABI version, status values, field layout, units, ownership rules, compile
-example, and compatibility policy are documented in [C-API.md](C-API.md).
+examples, streaming latency/flush contract, and compatibility policy are
+documented in [C-API.md](C-API.md). FFmpeg and GStreamer adapters can use the
+same streaming symbols without depending on Rust internals.
 CI compiles the header as strict C11, links a real C consumer to the generated
 shared library, and runs it on Linux, macOS ARM, and Windows x86-64.
 
