@@ -2179,6 +2179,12 @@ The ABI version, status values, field layout, units, ownership rules, compile
 examples, streaming latency/flush contract, and compatibility policy are
 documented in [C-API.md](C-API.md). FFmpeg and GStreamer adapters can use the
 same streaming symbols without depending on Rust internals.
+
+Optional host adapters are documented in [HOST-ADAPTERS.md](HOST-ADAPTERS.md).
+The FFmpeg integration is a public-`AVFrame` bridge for an application-owned
+filter (FFmpeg does not provide a stable external `AVFilterPad` plug-in ABI),
+while GStreamer provides a dynamic `forge_normalizer` element. Both preserve
+the C ABI's fixed latency and explicit end-of-stream flush semantics.
 CI compiles the header as strict C11, links a real C consumer to the generated
 shared library, and runs it on Linux, macOS ARM, and Windows x86-64.
 
@@ -2276,6 +2282,9 @@ CI compares deterministic sample output from the streaming CLI, CLAP host
 adapter, and LV2 ABI with this processor bit-for-bit on Linux, macOS, and
 Windows, including nonuniform host block sizes, gain automation, limiting, and
 latency reporting.
+The optional FFmpeg AVFrame bridge and GStreamer `forge_normalizer` element
+reuse the same processor; build and host-lifecycle requirements are in
+[HOST-ADAPTERS.md](HOST-ADAPTERS.md).
 It deliberately does not label a changing live estimate as final Integrated
 LUFS; programme-integrated normalization remains the two-pass file workflow.
 

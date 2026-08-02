@@ -201,6 +201,28 @@ jobs:
           python -c "from pathlib import Path; assert Path('LICENSE').read_bytes() == Path('python/LICENSE').read_bytes()"
           python -m unittest discover -s python/tests -p "test_*.py" -v
 
+  host-adapters:
+    name: FFmpeg/GStreamer host adapters
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+
+      - name: Install host development packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libavutil-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-tools gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good
+
+      - name: Compile and smoke-test host adapters
+        run: tools/test-host-adapters.sh
+
   plugin-parity:
     name: Plugin parity (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

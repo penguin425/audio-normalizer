@@ -9,6 +9,10 @@ on:
       - ".github/workflows/release.yml"
       - "include/forge_normalizer.h"
       - "C-API.md"
+      - "HOST-ADAPTERS.md"
+      - "integrations/**"
+      - "tests/fixtures/ffmpeg_bridge_consumer.c"
+      - "tools/test-host-adapters.sh"
       - "python/**"
       - "wasm/**"
       - "src/c_api.rs"
@@ -262,6 +266,10 @@ jobs:
              "$staging/${{ matrix.library }}"
           mkdir "$staging/include"
           cp include/forge_normalizer.h "$staging/include/"
+          mkdir -p "$staging/integrations/ffmpeg" "$staging/integrations/gstreamer"
+          cp integrations/ffmpeg/forge_ffmpeg_bridge.c \
+             integrations/ffmpeg/forge_ffmpeg_bridge.h "$staging/integrations/ffmpeg/"
+          cp integrations/gstreamer/gstforge.c "$staging/integrations/gstreamer/"
           mkdir "$staging/tools" "$staging/schema" "$staging/proto"
           cp proto/forge_service.proto "$staging/proto/"
           cp tools/benchmark.py "$staging/tools/"
@@ -290,7 +298,7 @@ jobs:
              schema/service-analysis-v1.schema.json \
              schema/service-error-v1.schema.json \
              schema/service-health-v1.schema.json "$staging/schema/"
-          cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md MPEGH-ADAPTER.md DTS-ADAPTER.md ANOMALY-ADAPTER.md SERVICE-METRICS.md C-API.md NEXT-GENERATION-PLAN.md ROADMAP.md LICENSE "$staging/"
+          cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md MPEGH-ADAPTER.md DTS-ADAPTER.md ANOMALY-ADAPTER.md SERVICE-METRICS.md C-API.md HOST-ADAPTERS.md NEXT-GENERATION-PLAN.md ROADMAP.md LICENSE "$staging/"
           tar -czf "${staging}.tar.gz" "$staging"
 
       - name: Package Windows binary
@@ -307,6 +315,9 @@ jobs:
           Copy-Item $importLibrary.FullName "$staging/forge_normalizer.lib"
           New-Item -ItemType Directory -Path "$staging/include" | Out-Null
           Copy-Item include/forge_normalizer.h "$staging/include/"
+          New-Item -ItemType Directory -Path "$staging/integrations/ffmpeg","$staging/integrations/gstreamer" | Out-Null
+          Copy-Item "integrations/ffmpeg/forge_ffmpeg_bridge.c","integrations/ffmpeg/forge_ffmpeg_bridge.h" "$staging/integrations/ffmpeg/"
+          Copy-Item integrations/gstreamer/gstforge.c "$staging/integrations/gstreamer/"
           New-Item -ItemType Directory -Path "$staging/tools","$staging/schema","$staging/proto" | Out-Null
           Copy-Item proto/forge_service.proto "$staging/proto/"
           Copy-Item tools/benchmark.py "$staging/tools/"
@@ -317,7 +328,7 @@ jobs:
           Copy-Item "schema/mpegh-adapter-request-v1.schema.json","schema/mpegh-adapter-response-v1.schema.json","schema/mpegh-adapter-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/dts-adapter-request-v1.schema.json","schema/dts-adapter-response-v1.schema.json","schema/dts-adapter-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/audio-anomaly-provider-v1.schema.json","schema/anomaly-provider-audit-v1.schema.json","schema/model-qc-v1.schema.json","schema/onnx-anomaly-model-v1.schema.json","schema/onnx-feature-frames-v1.schema.json","schema/remote-range-v1.schema.json","schema/remote-qc-v1.schema.json","schema/service-analysis-v1.schema.json","schema/service-error-v1.schema.json","schema/service-health-v1.schema.json" "$staging/schema/"
-          Copy-Item "README.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","MULTI-DELIVERY.md","SEGMENT-NORMALIZATION.md","AC4-ADAPTER.md","MPEGH-ADAPTER.md","DTS-ADAPTER.md","ANOMALY-ADAPTER.md","SERVICE-METRICS.md","C-API.md","NEXT-GENERATION-PLAN.md","ROADMAP.md","LICENSE" $staging
+          Copy-Item "README.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","MULTI-DELIVERY.md","SEGMENT-NORMALIZATION.md","AC4-ADAPTER.md","MPEGH-ADAPTER.md","DTS-ADAPTER.md","ANOMALY-ADAPTER.md","SERVICE-METRICS.md","C-API.md","HOST-ADAPTERS.md","NEXT-GENERATION-PLAN.md","ROADMAP.md","LICENSE" $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
 
       - name: Upload packaged binary
