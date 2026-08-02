@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/audio-normalizer/schema/binaural-qc-report-v1.schema.json",
+  "title": "Forge binaural QC report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "validator", "source", "rendered", "reference", "input_layout",
+    "output_layout", "renderer", "source_measurement", "rendered_measurement",
+    "reference_measurement", "source_duration_delta_seconds", "source_duration_passed",
+    "reference_drift", "true_peak_ceiling_dbtp", "max_clipped_samples",
+    "rendered_clipped_samples", "rendered_maximum_sample", "rendered_clip_risk",
+    "clip_risk_passed", "passed"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "validator": {"const": "forge-binaural-qc-1"},
+    "source": {"type": "string", "minLength": 1},
+    "rendered": {"type": "string", "minLength": 1},
+    "reference": {"type": ["string", "null"]},
+    "input_layout": {"type": "string", "enum": ["5.1", "6.1", "7.1", "5.1.4", "7.1.4"]},
+    "output_layout": {"const": "binaural"},
+    "renderer": {"$ref": "#/$defs/renderer"},
+    "source_measurement": {"$ref": "#/$defs/measurement"},
+    "rendered_measurement": {"$ref": "#/$defs/measurement"},
+    "reference_measurement": {"anyOf": [{"$ref": "#/$defs/measurement"}, {"type": "null"}]},
+    "source_duration_delta_seconds": {"type": "number"},
+    "source_duration_passed": {"type": "boolean"},
+    "reference_drift": {"anyOf": [{"$ref": "#/$defs/reference_drift"}, {"type": "null"}]},
+    "true_peak_ceiling_dbtp": {"type": "number", "minimum": -120, "maximum": 6},
+    "max_clipped_samples": {"type": "integer", "minimum": 0},
+    "rendered_clipped_samples": {"type": "integer", "minimum": 0},
+    "rendered_maximum_sample": {"type": "number"},
+    "rendered_clip_risk": {"enum": ["none", "true-peak-ceiling", "sample-clipping"]},
+    "clip_risk_passed": {"type": "boolean"},
+    "passed": {"type": "boolean"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "renderer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "renderer_sha256", "model", "model_version", "model_sha256", "config_sha256"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1},
+        "renderer_sha256": {"$ref": "#/$defs/sha256"},
+        "model": {"type": "string", "minLength": 1},
+        "model_version": {"type": "string", "minLength": 1},
+        "model_sha256": {"$ref": "#/$defs/sha256"},
+        "config_sha256": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]}
+      }
+    },
+    "measurement_value": {"type": ["number", "null"]},
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["layout", "channels", "sample_rate_hz", "frames", "duration_seconds", "integrated_lufs", "loudness_range_lu", "sample_peak_dbfs", "true_peak_dbtp"],
+      "properties": {
+        "layout": {"type": "string"},
+        "channels": {"type": "integer", "minimum": 1},
+        "sample_rate_hz": {"type": "integer", "minimum": 1},
+        "frames": {"type": "integer", "minimum": 0},
+        "duration_seconds": {"type": "number", "minimum": 0},
+        "integrated_lufs": {"$ref": "#/$defs/measurement_value"},
+        "loudness_range_lu": {"$ref": "#/$defs/measurement_value"},
+        "sample_peak_dbfs": {"$ref": "#/$defs/measurement_value"},
+        "true_peak_dbtp": {"$ref": "#/$defs/measurement_value"}
+      }
+    },
+    "reference_drift": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["loudness_delta_lu", "true_peak_delta_db", "duration_delta_seconds", "duration_tolerance_seconds", "loudness_passed", "true_peak_passed", "duration_passed", "passed"],
+      "properties": {
+        "loudness_delta_lu": {"$ref": "#/$defs/measurement_value"},
+        "true_peak_delta_db": {"$ref": "#/$defs/measurement_value"},
+        "duration_delta_seconds": {"type": "number"},
+        "duration_tolerance_seconds": {"type": "number", "minimum": 0},
+        "loudness_passed": {"type": "boolean"},
+        "true_peak_passed": {"type": "boolean"},
+        "duration_passed": {"type": "boolean"},
+        "passed": {"type": "boolean"}
+      }
+    }
+  }
+}
