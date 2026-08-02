@@ -288,6 +288,11 @@ generations.
 - `forge-remediate` produces a bounded dry-run plan for true-peak and LRA
   remediation, binding source/settings hashes and requiring a fresh render and
   remeasurement for every dynamic action. It never rewrites audio.
+- `forge-metadata-repair` provides bounded copy-to-new-file BWF/ADM repair with
+  pre/post container and ADM validators, source/output hashes, unknown-chunk/XML
+  preservation, and explicit validate-and-copy-only behaviour for MXF. Source
+  replacement is intentionally not exposed; `atomic_replace` applies only to
+  the requested destination.
 - Separate dialogue, effects, music, audio-description, and clean-audio stem
   loudness checks.
 - Personalization-range safety: verify that user gain/interactivity limits

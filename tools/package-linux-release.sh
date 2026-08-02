@@ -30,6 +30,7 @@ for binary in \
   forge-downmix-qc \
   forge-binaural-qc \
   forge-remediate \
+  forge-metadata-repair \
   forge-sadm-qc \
   forge-dialogue-provider \
   forge-anomaly-provider \
@@ -97,6 +98,8 @@ cp schema/binaural-qc-request-v1.schema.json \
    schema/binaural-qc-report-v1.schema.json "$staging/schema/"
 cp schema/remediation-request-v1.schema.json \
    schema/remediation-report-v1.schema.json "$staging/schema/"
+cp schema/metadata-repair-request-v1.schema.json \
+   schema/metadata-repair-report-v1.schema.json "$staging/schema/"
 cp schema/audio-anomaly-provider-v1.schema.json \
    schema/anomaly-provider-audit-v1.schema.json \
    schema/model-qc-v1.schema.json \
@@ -111,7 +114,7 @@ cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md \
    BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md \
    MPEGH-ADAPTER.md DTS-ADAPTER.md ANOMALY-ADAPTER.md \
    SERVICE-METRICS.md C-API.md HOST-ADAPTERS.md NEXT-GENERATION-PLAN.md \
-   VST3-ADAPTER.md AU-ADAPTER.md IMMERSIVE-DOWNMIX.md BINAURAL-QC.md REMEDIATION.md ROADMAP.md LICENSE "$staging/"
+   VST3-ADAPTER.md AU-ADAPTER.md IMMERSIVE-DOWNMIX.md BINAURAL-QC.md REMEDIATION.md METADATA-REPAIR.md ROADMAP.md LICENSE "$staging/"
 
 find "$staging" -exec touch -h -d "@${source_date_epoch}" {} +
 tar \
