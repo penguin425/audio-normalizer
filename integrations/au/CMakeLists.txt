@@ -54,7 +54,12 @@ add_subdirectory(
     "${CMAKE_CURRENT_BINARY_DIR}/vst3"
 )
 
-list(APPEND CMAKE_MODULE_PATH "${vst3sdk_SOURCE_DIR}/cmake/modules")
+get_target_property(FORGE_VST3_SDK_SOURCE_DIR sdk SOURCE_DIR)
+if(NOT FORGE_VST3_SDK_SOURCE_DIR OR
+   NOT EXISTS "${FORGE_VST3_SDK_SOURCE_DIR}/cmake/modules/SMTG_AddVST3AuV2.cmake")
+    message(FATAL_ERROR "The pinned VST3 SDK did not expose its CMake modules")
+endif()
+list(APPEND CMAKE_MODULE_PATH "${FORGE_VST3_SDK_SOURCE_DIR}/cmake/modules")
 include(SMTG_AddVST3AuV2)
 
 smtg_target_add_auv2(ForgeLiveAu
