@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(ForgeLiveAudioUnit VERSION 0.121.0 LANGUAGES CXX)
+project(ForgeLiveAudioUnit VERSION 0.122.0 LANGUAGES CXX)
 
 if(NOT APPLE)
     message(FATAL_ERROR "The Forge Audio Unit adapter is only supported on macOS")
