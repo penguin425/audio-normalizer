@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/audio-normalizer/schema/downmix-qc-request-v1.schema.json",
+  "title": "Forge immersive downmix QC request v1",
+  "description": "Bounded request for deterministic WAVE-order immersive downmix simulation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source", "input_layout", "profiles"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "source": {"type": "string", "minLength": 1},
+    "input_layout": {
+      "type": "string",
+      "enum": ["mono", "stereo", "5.1", "6.1", "7.1", "5.1.4", "7.1.4"]
+    },
+    "profiles": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"enum": ["stereo", "5.1", "7.1.4"]}
+    },
+    "true_peak_ceiling_dbtp": {
+      "type": "number",
+      "minimum": -120,
+      "maximum": 6,
+      "default": 0
+    },
+    "max_clipped_samples": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0
+    },
+    "max_loudness_delta_lu": {
+      "type": ["number", "null"],
+      "minimum": 0
+    },
+    "max_true_peak_delta_db": {
+      "type": ["number", "null"],
+      "minimum": 0
+    },
+    "max_input_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 536870912
+    },
+    "max_decoded_samples": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 25165824
+    }
+  }
+}

@@ -48,6 +48,8 @@ mod dash_patch;
 pub mod dash_qc;
 pub mod decoder;
 pub mod dialogue_provider;
+pub mod downmix;
+pub mod downmix_qc;
 pub mod dsd;
 pub mod dsp;
 pub mod dts_adapter;
