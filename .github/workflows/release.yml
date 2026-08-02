@@ -333,7 +333,7 @@ jobs:
           Copy-Item integrations/vst3/external/vst3sdk/CMakeLists.txt "$staging/integrations/vst3/external/vst3sdk/"
           New-Item -ItemType Directory -Path "$staging/tools","$staging/schema","$staging/proto" | Out-Null
           Copy-Item proto/forge_service.proto "$staging/proto/"
-          Copy-Item tools/benchmark.py tools/test-vst3-adapter.sh "$staging/tools/"
+          Copy-Item @("tools/benchmark.py","tools/test-vst3-adapter.sh") "$staging/tools/"
           Copy-Item schema/performance-benchmark-v1.schema.json "$staging/schema/"
           Copy-Item "schema/multi-delivery-request-v1.schema.json","schema/multi-delivery-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/segment-normalization-request-v1.schema.json","schema/segment-normalization-plan-v1.schema.json","schema/segment-normalization-report-v1.schema.json" "$staging/schema/"
