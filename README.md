@@ -213,8 +213,15 @@ cargo build --release --features clap-plugin,lv2-plugin
 # Optional VST3 host wrapper (requires CMake 3.20+, C++17, and Git):
 tools/test-vst3-adapter.sh
 
+# Optional macOS Audio Unit v2 wrapper (requires Xcode and macOS):
+tools/test-au-adapter.sh
+
 cargo test
 ```
+
+The VST3 and Audio Unit adapters are optional source integrations. See
+[VST3-ADAPTER.md](VST3-ADAPTER.md) and [AU-ADAPTER.md](AU-ADAPTER.md) for
+SDK, signing, and host-installation details.
 
 When `mp3-encoding` is enabled, `build.rs` finds `libmp3lame` via pkg-config,
 then standard library paths, and prints a clear install hint if it is missing.
