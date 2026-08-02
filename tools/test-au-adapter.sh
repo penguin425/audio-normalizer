@@ -30,7 +30,16 @@ xcodebuild -version
 xcrun --sdk macosx --show-sdk-path >/dev/null
 
 if [[ "${FORGE_SKIP_CARGO_BUILD:-0}" != "1" ]]; then
-  cargo build --locked --manifest-path "$root_dir/Cargo.toml" --release --lib
+  # ring's aarch64-apple-darwin build intentionally requires the baseline
+  # AES/NEON/SHA2 feature set.  The repository's native-CPU Cargo config can
+  # add newer features (notably SHA3), so use the same conservative flags as
+  # the macOS ABI CI job unless the caller supplied RUSTFLAGS explicitly.
+  if [[ -z "${RUSTFLAGS+x}" && "$(uname -m)" == "arm64" ]]; then
+    RUSTFLAGS="-Ctarget-feature=+neon,+aes,+sha2" \
+      cargo build --locked --manifest-path "$root_dir/Cargo.toml" --release --lib
+  else
+    cargo build --locked --manifest-path "$root_dir/Cargo.toml" --release --lib
+  fi
 fi
 
 if [[ ! -f "$library_path" ]]; then
