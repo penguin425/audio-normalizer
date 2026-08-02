@@ -34,6 +34,7 @@ pub mod anomaly_provider;
 mod atomic;
 pub mod audio_compare;
 pub mod batch;
+pub mod binaural_qc;
 mod bwf_xml_qc;
 pub mod c_api;
 pub mod catalogue;

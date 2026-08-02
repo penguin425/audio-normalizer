@@ -1739,6 +1739,21 @@ non-normative deterministic engineering profile, not an object renderer or a
 binaural/HRTF renderer. See [IMMERSIVE-DOWNMIX.md](IMMERSIVE-DOWNMIX.md) and
 the versioned [request schema](schema/downmix-qc-request-v1.schema.json).
 
+For a binaural file produced by an external HRTF/object renderer,
+`forge-binaural-qc` verifies the stereo output against the immersive source
+and, when supplied, a trusted reference render:
+
+```bash
+forge-binaural-qc binaural.json --output binaural-report.json
+```
+
+The request requires the selected renderer's name/version, model/version, and
+lowercase SHA-256 evidence for both renderer and model. Reports gate source
+and reference duration drift, reference loudness/true-peak drift, output
+true-peak ceiling, and sample clipping. Forge does not bundle or execute an
+HRTF renderer; the profile is an auditable engineering boundary. See
+[BINAURAL-QC.md](BINAURAL-QC.md) and the versioned schemas in `schema/`.
+
 For AC-4, `forge-ac4-qc` can also drive an explicitly selected licensed or
 reference decoder through a bounded, versioned adapter protocol. It requires
 the adapter to enumerate every presentation, records AC-4 dialnorm and
@@ -2152,12 +2167,14 @@ src/
     truepeak.rs     4x polyphase FIR true-peak meter
   downmix.rs        explicit WAVE-order stereo/5.1/7.1.4 matrices
   downmix_qc.rs     bounded immersive downmix evidence and clip-risk reports
+  binaural_qc.rs    external renderer/model evidence and binaural drift gates
   normalize.rs      analyze -> gain (ceiling-protected) -> apply -> write; album mode
   realtime.rs       allocation-free live M/S meter + smoothed gain processor
   bin/forge-live.rs raw f32le real-time pipeline and NDJSON meter
   bin/forge-compare.rs delivery-manifest regression gate for CI
   bin/forge-audio-compare.rs decoded reference/candidate signal comparison
   bin/forge-downmix-qc.rs explicit immersive downmix matrix/QC CLI
+  bin/forge-binaural-qc.rs external binaural renderer verification CLI
   bin/forge-container-qc.rs wrapper/bitstream/metadata audit CLI
   bin/forge-provenance-qc.rs C2PA integrity and trust-policy audit CLI
   bin/forge-aes31-qc.rs AES31-3 EDML project audit CLI

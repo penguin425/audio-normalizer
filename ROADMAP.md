@@ -281,8 +281,10 @@ generations.
   default render.
 - `forge-downmix-qc` now measures deterministic WAVE-order stereo/5.1/7.1.4
   profiles with explicit matrices, loudness/true-peak deltas, and clip-risk
-  gates. Render-and-measure binaural and user-selected speaker layouts remain
-  future renderer-adapter work.
+  gates. User-selected speaker layouts remain future renderer-adapter work.
+  `forge-binaural-qc` now verifies externally
+  rendered stereo output with mandatory renderer/model hash evidence and
+  optional trusted-reference drift gates; it does not bundle an HRTF renderer.
 - Separate dialogue, effects, music, audio-description, and clean-audio stem
   loudness checks.
 - Personalization-range safety: verify that user gain/interactivity limits

@@ -34,6 +34,11 @@ jobs:
           cargo test --locked --no-default-features --lib downmix --bin forge-downmix-qc
           cargo test --locked --no-default-features --test downmix_qc_cli
 
+      - name: Run binaural QC contract tests
+        run: |
+          cargo test --locked --no-default-features --lib binaural_qc --bin forge-binaural-qc
+          cargo test --locked --no-default-features --test binaural_qc_cli
+
       - name: Run opt-in ONNX provider contract tests
         run: cargo test --locked --features onnx-provider --lib onnx_provider --bin forge-onnx-provider
 
