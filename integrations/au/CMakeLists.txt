@@ -66,6 +66,16 @@ if(NOT FORGE_VST3_SDK_SOURCE_DIR OR
    NOT EXISTS "${FORGE_VST3_SDK_MODULE_DIR}/SMTG_AddVST3AuV2.cmake")
     message(FATAL_ERROR "The pinned VST3 SDK did not expose its CMake modules")
 endif()
+if(EXISTS "${FORGE_VST3_SDK_SOURCE_DIR}/source/vst/auwrapper/auwrapper.mm")
+    set(public_sdk_SOURCE_DIR "${FORGE_VST3_SDK_SOURCE_DIR}")
+else()
+    get_filename_component(FORGE_VST3_SDK_ROOT
+        "${FORGE_VST3_SDK_SOURCE_DIR}/.." ABSOLUTE)
+    set(public_sdk_SOURCE_DIR "${FORGE_VST3_SDK_ROOT}/public.sdk")
+endif()
+if(NOT EXISTS "${public_sdk_SOURCE_DIR}/source/vst/auwrapper/auwrapper.mm")
+    message(FATAL_ERROR "The pinned VST3 SDK did not expose its AU wrapper sources")
+endif()
 list(APPEND CMAKE_MODULE_PATH "${FORGE_VST3_SDK_MODULE_DIR}")
 include(SMTG_AddVST3AuV2)
 
