@@ -21,6 +21,12 @@ FORGE_AU_ARCHITECTURES=arm64 \
 tools/test-au-adapter.sh
 ```
 
+The smoke test builds the selected `FORGE_AU_ARCHITECTURES` slice (arm64 on
+Apple Silicon, or x86_64 on an Intel host). The SDK's universal-binary option
+is disabled because a universal component must be linked against a matching
+universal Forge dylib; distributors can provide that lipo-combined library and
+configure a universal CMake build separately.
+
 The SDK's build step copies the resulting component to
 `~/Library/Audio/Plug-Ins/Components/ForgeLive.component` for local host
 testing. Code signing is intentionally not performed in CI; distributors
