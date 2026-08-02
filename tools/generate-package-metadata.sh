@@ -76,6 +76,7 @@ cat >"${dist_dir}/forge-scoop.json" <<EOF
     "forge-presentation-qc.exe",
     "forge-downmix-qc.exe",
     "forge-binaural-qc.exe",
+    "forge-remediate.exe",
     "forge-sadm-qc.exe",
     "forge-dialogue-provider.exe",
     "forge-anomaly-provider.exe",

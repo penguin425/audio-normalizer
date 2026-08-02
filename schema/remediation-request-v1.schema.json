@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/remediation-request-v1.schema.json",
+  "title": "Forge smart remediation request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "source": {"type": "string", "minLength": 1},
+    "target_lufs": {"type": ["number", "null"], "minimum": -120, "maximum": 6},
+    "true_peak_ceiling_dbtp": {"type": "number", "minimum": -120, "maximum": 6},
+    "max_loudness_range_lu": {"type": ["number", "null"], "minimum": 0, "maximum": 50},
+    "max_static_gain_db": {"type": "number", "minimum": 0, "maximum": 60},
+    "max_dynamic_reduction_db": {"type": "number", "minimum": 0, "maximum": 60},
+    "channel_layout": {
+      "type": ["string", "null"],
+      "enum": ["mono", "stereo", "5.1", "6.1", "7.1", "5.1.4", "7.1.4", null]
+    },
+    "max_input_bytes": {"type": "integer", "minimum": 1},
+    "max_decoded_samples": {"type": "integer", "minimum": 1}
+  }
+}
