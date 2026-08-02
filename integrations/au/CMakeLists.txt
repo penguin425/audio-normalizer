@@ -89,3 +89,9 @@ smtg_target_add_auv2(ForgeLiveAu
     INFO_PLIST_TEMPLATE "${CMAKE_CURRENT_LIST_DIR}/au-info.plist"
     VST3_PLUGIN_TARGET ForgeLiveVst3
 )
+
+# The pinned Apple AudioUnitSDK uses std::span and concepts in its current
+# public headers. The Steinberg helper requests C++17 by default, so raise the
+# wrapper target explicitly while leaving the shared VST3 target unchanged.
+target_compile_features(ForgeLiveAu PUBLIC cxx_std_20)
+set_target_properties(ForgeLiveAu PROPERTIES CXX_EXTENSIONS OFF)
