@@ -166,7 +166,7 @@ path = "src/bin/forge-service.rs"
 [dependencies]
 rayon = "1.10"
 clap = { version = "4.5", features = ["derive"] }
-symphonia = { version = "0.5", features = ["mp3", "isomp4", "aac", "alac", "flac", "vorbis", "pcm"] }
+symphonia = { version = "0.6", features = ["mp3", "isomp4", "aac", "alac", "flac", "vorbis", "pcm"] }
 symphonia-alac-qc = { package = "symphonia-codec-alac", version = "0.6" }
 symphonia-core-alac-qc = { package = "symphonia-core", version = "0.6" }
 serde = { version = "1", features = ["derive"] }
@@ -192,7 +192,7 @@ opus = { version = "0.3.1", optional = true }
 httpdate = "1"
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }
 url = "2.5"
-rubato = { version = "0.16.2", default-features = false }
+rubato = { version = "4.0.0", default-features = false }
 jsonschema = { version = "0.49.1", default-features = false }
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 ndarray = { version = "0.17", default-features = false, optional = true }
