@@ -29,6 +29,11 @@ jobs:
       - name: Run tests without LAME
         run: cargo test --no-default-features
 
+      - name: Run immersive downmix QC contract tests
+        run: |
+          cargo test --locked --no-default-features --lib downmix --bin forge-downmix-qc
+          cargo test --locked --no-default-features --test downmix_qc_cli
+
       - name: Run opt-in ONNX provider contract tests
         run: cargo test --locked --features onnx-provider --lib onnx_provider --bin forge-onnx-provider
 

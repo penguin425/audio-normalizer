@@ -1722,6 +1722,23 @@ compliance profiles gate each Presentation independently. The report identifies
 ETSI TS 103 190 for AC-4, AOMedia IAMF v1.1/OAR v1.0.0 for IAMF, or
 ISO/IEC 23008-3 for MPEG-H and preserves renderer provenance as audit evidence.
 
+For channel-based immersive masters, `forge-downmix-qc` applies explicit,
+fixture-backed WAVE-order profiles and reports the matrix, loudness delta,
+true-peak delta, sample clipping, and ceiling risk. It supports stereo and 5.1
+downmix targets plus a 7.1.4 identity verification profile:
+
+```bash
+forge-downmix-qc downmix.json --output downmix-qc.json
+```
+
+The request names the source layout (`mono`, `stereo`, `5.1`, `6.1`, `7.1`,
+`5.1.4`, or `7.1.4`) and one or more profiles. Coefficients and channel
+mapping are included in the report; the default true-peak ceiling is 0 dBTP
+and optional loudness/peak-delta limits can be used as gates. This is a
+non-normative deterministic engineering profile, not an object renderer or a
+binaural/HRTF renderer. See [IMMERSIVE-DOWNMIX.md](IMMERSIVE-DOWNMIX.md) and
+the versioned [request schema](schema/downmix-qc-request-v1.schema.json).
+
 For AC-4, `forge-ac4-qc` can also drive an explicitly selected licensed or
 reference decoder through a bounded, versioned adapter protocol. It requires
 the adapter to enumerate every presentation, records AC-4 dialnorm and
@@ -2133,11 +2150,14 @@ src/
     lufs.rs         gated integrated loudness + RMS/peak
     limiter.rs      streaming look-ahead true-peak limiter
     truepeak.rs     4x polyphase FIR true-peak meter
+  downmix.rs        explicit WAVE-order stereo/5.1/7.1.4 matrices
+  downmix_qc.rs     bounded immersive downmix evidence and clip-risk reports
   normalize.rs      analyze -> gain (ceiling-protected) -> apply -> write; album mode
   realtime.rs       allocation-free live M/S meter + smoothed gain processor
   bin/forge-live.rs raw f32le real-time pipeline and NDJSON meter
   bin/forge-compare.rs delivery-manifest regression gate for CI
   bin/forge-audio-compare.rs decoded reference/candidate signal comparison
+  bin/forge-downmix-qc.rs explicit immersive downmix matrix/QC CLI
   bin/forge-container-qc.rs wrapper/bitstream/metadata audit CLI
   bin/forge-provenance-qc.rs C2PA integrity and trust-policy audit CLI
   bin/forge-aes31-qc.rs AES31-3 EDML project audit CLI

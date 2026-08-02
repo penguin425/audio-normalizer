@@ -12,6 +12,7 @@
 pub use crate::analysis::{analyze, Analysis};
 use crate::atomic::AtomicOutput;
 use crate::decoder;
+use crate::downmix;
 use crate::dsp::limiter::{LimiterConfig, LimiterStatistics, TruePeakLimiter};
 use crate::dsp::resample::{ResampleQuality, SampleRateConverter};
 use crate::dsp::{lufs, simd};
@@ -276,6 +277,17 @@ pub fn analyze_stereo_downmix(path: &Path) -> Result<DownmixMeasurement, String>
     if source.channels < 3 {
         return Err("stereo downmix QC requires at least three input channels".into());
     }
+    // Keep the legacy manifest option on the same explicit WAVE-order matrix
+    // as forge-downmix-qc whenever the file carries one of the supported
+    // standard masks. Unusual channel counts/masks retain the historical
+    // alternating fallback below for compatibility.
+    if let Some(layout) = standard_stereo_downmix_layout(&source) {
+        let rendered = downmix::render(&source, layout, downmix::Profile::Stereo)?;
+        return Ok(DownmixMeasurement {
+            analysis: analyze(&rendered.buffer),
+            method: "Lo/Ro: L/R + center/surround at -3.01 dB; LFE omitted; WAVE channel order",
+        });
+    }
     let mut left = source.data[0].clone();
     let mut right = source.data[1].clone();
     let coefficient = std::f32::consts::FRAC_1_SQRT_2;
@@ -310,6 +322,17 @@ pub fn analyze_stereo_downmix(path: &Path) -> Result<DownmixMeasurement, String>
         analysis: analyze(&downmix),
         method: "Lo/Ro: L/R + center/surround at -3.01 dB; LFE omitted; WAVE channel order",
     })
+}
+
+fn standard_stereo_downmix_layout(source: &AudioBuffer) -> Option<downmix::Layout> {
+    let layout = match source.channels {
+        6 => downmix::Layout::FiveOne,
+        8 => downmix::Layout::SevenOne,
+        10 => downmix::Layout::FiveOneFour,
+        12 => downmix::Layout::SevenOneFour,
+        _ => return None,
+    };
+    (source.channel_roles == layout.roles()).then_some(layout)
 }
 
 pub fn load_adm_presentation_map(path: &Path) -> Result<AdmPresentationMap, String> {
