@@ -6,7 +6,7 @@
 #include "forge_normalizer.h"
 
 #ifndef FORGE_PLUGIN_VERSION
-#define FORGE_PLUGIN_VERSION "0.119.0"
+#define FORGE_PLUGIN_VERSION "0.120.0"
 #endif
 
 typedef struct _GstForgeNormalizer GstForgeNormalizer;
