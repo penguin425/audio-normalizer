@@ -29,6 +29,11 @@ set(SMTG_ENABLE_VST3_PLUGIN_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SMTG_ENABLE_VST3_HOSTING_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SMTG_ENABLE_VSTGUI_SUPPORT OFF CACHE BOOL "" FORCE)
 set(SMTG_ENABLE_AUV2_BUILDS ON CACHE BOOL "" FORCE)
+# CI and local smoke builds generally do not have an Apple Development
+# identity. Keep the optional adapter buildable without credentials; release
+# builders can set this cache entry to OFF and provide a signing identity.
+set(SMTG_DISABLE_CODE_SIGNING ON CACHE BOOL
+    "Disable Steinberg/Xcode code signing for the Audio Unit smoke build")
 # The Rust shared library supplied to this build is for the selected
 # CMAKE_OSX_ARCHITECTURES. A universal AU build must provide a matching lipo
 # library explicitly; the default smoke test intentionally builds one slice.
