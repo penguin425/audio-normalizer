@@ -49,7 +49,7 @@ if [[ ! -f "$library_path" ]]; then
 fi
 
 cmake -S "$root_dir/integrations/au" -B "$tmp_dir/build" -G Xcode \
-  -DCMAKE_OSX_DEPLOYMENT_TARGET="${FORGE_AU_DEPLOYMENT_TARGET:-10.13}" \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET="${FORGE_AU_DEPLOYMENT_TARGET:-11.0}" \
   -DCMAKE_OSX_ARCHITECTURES="${FORGE_AU_ARCHITECTURES:-$(uname -m)}" \
   -DFORGE_NORMALIZER_LIBRARY="$library_path" \
   -DFORGE_NORMALIZER_INCLUDE_DIR="$root_dir/include"

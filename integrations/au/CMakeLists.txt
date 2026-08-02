@@ -90,8 +90,23 @@ smtg_target_add_auv2(ForgeLiveAu
     VST3_PLUGIN_TARGET ForgeLiveVst3
 )
 
-# The pinned Apple AudioUnitSDK uses std::span and concepts in its current
-# public headers. The Steinberg helper requests C++17 by default, so raise the
-# wrapper target explicitly while leaving the shared VST3 target unchanged.
-target_compile_features(ForgeLiveAu PUBLIC cxx_std_20)
-set_target_properties(ForgeLiveAu PROPERTIES CXX_EXTENSIONS OFF)
+# The pinned Apple AudioUnitSDK 1.4 headers use std::expected, which requires
+# C++23. The Steinberg helper requests C++17 by default, so raise both C++ and
+# Objective-C++ modes explicitly while leaving the shared VST3 target
+# unchanged. The Xcode attribute is intentional: CMake's Xcode generator can
+# otherwise omit the language flag for Objective-C++ sources in a MODULE
+# target.
+target_compile_features(ForgeLiveAu PUBLIC cxx_std_23)
+target_compile_options(ForgeLiveAu PRIVATE
+    "$<$<OR:$<COMPILE_LANGUAGE:CXX>,$<COMPILE_LANGUAGE:OBJCXX>>:-std=c++23>"
+)
+set_target_properties(ForgeLiveAu PROPERTIES
+    CXX_EXTENSIONS OFF
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+    OBJCXX_EXTENSIONS OFF
+    OBJCXX_STANDARD 23
+    OBJCXX_STANDARD_REQUIRED ON
+    XCODE_ATTRIBUTE_CLANG_CXX_LANGUAGE_STANDARD "c++23"
+    XCODE_ATTRIBUTE_CLANG_CXX_LIBRARY "libc++"
+)

@@ -6,7 +6,7 @@ same C ABI live processor, parameter ranges, state handling, mono/stereo
 layouts, float32 processing, and fixed five-millisecond latency contract.
 
 The adapter is source-only and is not built by the default Rust build. It
-requires macOS, Xcode's CMake generator, CMake 3.20 or newer, C++20, Git, and
+requires macOS 11 or newer, Xcode's CMake generator, CMake 3.20 or newer, C++23, Git, and
 the Apple macOS SDK. The pinned VST3 SDK and Apple AudioUnit SDK are fetched at
 configure time; neither is vendored into this repository.
 
