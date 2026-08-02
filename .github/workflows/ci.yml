@@ -241,6 +241,21 @@ jobs:
       - name: Compile and validate VST3 bundle
         run: tools/test-vst3-adapter.sh
 
+  au-adapter:
+    name: Audio Unit adapter
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+
+      - name: Compile and validate Audio Unit component
+        env:
+          FORGE_BUILD_JOBS: "2"
+        run: tools/test-au-adapter.sh
+
   plugin-parity:
     name: Plugin parity (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

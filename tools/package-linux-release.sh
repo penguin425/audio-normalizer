@@ -61,6 +61,9 @@ mkdir -p "$staging/integrations/ffmpeg" "$staging/integrations/gstreamer"
 cp integrations/ffmpeg/forge_ffmpeg_bridge.c \
    integrations/ffmpeg/forge_ffmpeg_bridge.h "$staging/integrations/ffmpeg/"
 cp integrations/gstreamer/gstforge.c "$staging/integrations/gstreamer/"
+mkdir -p "$staging/integrations/au"
+cp integrations/au/CMakeLists.txt integrations/au/au-info.plist \
+   "$staging/integrations/au/"
 mkdir -p "$staging/integrations/vst3/external/vst3sdk"
 cp integrations/vst3/CMakeLists.txt integrations/vst3/*.h \
    integrations/vst3/*.cpp "$staging/integrations/vst3/"
@@ -69,7 +72,7 @@ cp integrations/vst3/external/CMakeLists.txt \
 cp integrations/vst3/external/vst3sdk/CMakeLists.txt \
    "$staging/integrations/vst3/external/vst3sdk/"
 mkdir "$staging/tools" "$staging/schema"
-cp tools/benchmark.py tools/test-vst3-adapter.sh "$staging/tools/"
+cp tools/benchmark.py tools/test-vst3-adapter.sh tools/test-au-adapter.sh "$staging/tools/"
 cp schema/performance-benchmark-v1.schema.json "$staging/schema/"
 cp schema/multi-delivery-request-v1.schema.json \
    schema/multi-delivery-report-v1.schema.json "$staging/schema/"
@@ -99,7 +102,7 @@ cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md \
    BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md \
    MPEGH-ADAPTER.md DTS-ADAPTER.md ANOMALY-ADAPTER.md \
    SERVICE-METRICS.md C-API.md HOST-ADAPTERS.md NEXT-GENERATION-PLAN.md \
-   VST3-ADAPTER.md ROADMAP.md LICENSE "$staging/"
+   VST3-ADAPTER.md AU-ADAPTER.md ROADMAP.md LICENSE "$staging/"
 
 find "$staging" -exec touch -h -d "@${source_date_epoch}" {} +
 tar \
