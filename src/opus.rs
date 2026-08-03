@@ -10,6 +10,7 @@ use rubato::{Async, FixedAsync, Indexing, PolynomialDegree, Resampler};
 use serde::Serialize;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -62,7 +63,7 @@ pub struct OpusStreamWriter {
     encoded_frames: u64,
     input_pending: Vec<Vec<f32>>,
     encode_pending: Vec<f32>,
-    resampler: Option<Async<f32>>,
+    resampler: Option<AssertUnwindSafe<Async<f32>>>,
 }
 
 impl OpusStreamWriter {
@@ -113,7 +114,7 @@ impl OpusStreamWriter {
         let resampler = if input_rate == OPUS_RATE {
             None
         } else {
-            Some(
+            Some(AssertUnwindSafe(
                 Async::<f32>::new_poly(
                     OPUS_RATE as f64 / input_rate as f64,
                     1.0,
@@ -123,9 +124,11 @@ impl OpusStreamWriter {
                     FixedAsync::Input,
                 )
                 .map_err(|error| format!("create Opus resampler: {error}"))?,
-            )
+            ))
         };
-        let resampler_delay = resampler.as_ref().map_or(0, Resampler::output_delay);
+        let resampler_delay = resampler
+            .as_ref()
+            .map_or(0, |resampler| resampler.output_delay());
         let expected_output_frames = ((input_frames as u128 * OPUS_RATE as u128
             + input_rate as u128 / 2)
             / input_rate as u128) as u64;
@@ -901,6 +904,13 @@ impl OpusDecoder {
 mod tests {
     use super::*;
     use std::f32::consts::TAU;
+
+    #[test]
+    fn stream_writer_preserves_unwind_safety_traits() {
+        fn assert_traits<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+
+        assert_traits::<OpusStreamWriter>();
+    }
 
     #[test]
     fn granules_follow_completed_packet_durations() {
