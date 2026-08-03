@@ -755,53 +755,59 @@ fn take_be_string<'a>(bytes: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
 }
 
 fn verify_decoded_audio(path: &Path) -> Result<DecodedIntegrity, String> {
-    use symphonia::core::codecs::DecoderOptions;
-    use symphonia::core::errors::Error;
-    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::{FormatOptions, TrackType};
     use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
     use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
     use symphonia::default::{get_codecs, get_probe};
 
     let input = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
     let source = MediaSourceStream::new(Box::new(input), MediaSourceStreamOptions::default());
     let mut hint = Hint::new();
     hint.with_extension("flac");
-    let probed = get_probe()
-        .format(
+    let mut format = get_probe()
+        .probe(
             &hint,
             source,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            MetadataOptions::default(),
         )
         .map_err(|error| format!("strict FLAC probe: {error}"))?;
-    let mut format = probed.format;
     let track = format
-        .default_track()
+        .default_track(TrackType::Audio)
         .ok_or_else(|| "strict FLAC probe found no audio track".to_string())?
         .clone();
-    let sample_rate = track
+    let codec_params = track
         .codec_params
+        .as_ref()
+        .and_then(|params| params.audio())
+        .ok_or_else(|| "strict FLAC probe found no audio codec parameters".to_string())?
+        .clone();
+    let sample_rate = codec_params
         .sample_rate
         .ok_or_else(|| "strict FLAC probe found no sample rate".to_string())?;
-    let channels = track
-        .codec_params
+    let channels = codec_params
         .channels
+        .as_ref()
         .map(|value| value.count())
         .ok_or_else(|| "strict FLAC probe found no channel layout".to_string())?;
     let mut decoder = get_codecs()
-        .make(&track.codec_params, &DecoderOptions { verify: true })
+        // Verify the MD5 over the audible programme after codec delay/padding
+        // trimming, matching the samples used by normalization and analysis.
+        .make_audio_decoder(
+            &codec_params,
+            &AudioDecoderOptions::default().gapless(true).verify(true),
+        )
         .map_err(|error| format!("create strict FLAC decoder: {error}"))?;
     let mut frames = 0_u64;
     loop {
         let packet = match format.next_packet() {
-            Ok(packet) => packet,
-            Err(Error::IoError(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                break;
-            }
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
             Err(error) => return Err(format!("read strict FLAC packet: {error}")),
         };
-        if packet.track_id() != track.id {
+        if packet.track_id != track.id {
             continue;
         }
         let decoded = decoder

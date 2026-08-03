@@ -1058,53 +1058,59 @@ fn finish_chain(chain: ActiveChain) -> Result<ChainInspection, String> {
 }
 
 fn verify_vorbis_decode(path: &Path) -> Result<DecodedAudio, String> {
-    use symphonia::core::codecs::DecoderOptions;
-    use symphonia::core::errors::Error;
-    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::{FormatOptions, TrackType};
     use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
     use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
     use symphonia::default::{get_codecs, get_probe};
 
     let input = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
     let source = MediaSourceStream::new(Box::new(input), MediaSourceStreamOptions::default());
     let mut hint = Hint::new();
     hint.with_extension("ogg");
-    let probed = get_probe()
-        .format(
+    let mut format = get_probe()
+        .probe(
             &hint,
             source,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            MetadataOptions::default(),
         )
         .map_err(|error| format!("probe Ogg Vorbis: {error}"))?;
-    let mut format = probed.format;
     let track = format
-        .default_track()
+        .default_track(TrackType::Audio)
         .ok_or_else(|| "Ogg Vorbis contains no default audio track".to_string())?
         .clone();
-    let sample_rate = track
+    let codec_params = track
         .codec_params
+        .as_ref()
+        .and_then(|params| params.audio())
+        .ok_or_else(|| "Vorbis decoder found no audio codec parameters".to_string())?
+        .clone();
+    let sample_rate = codec_params
         .sample_rate
         .ok_or_else(|| "Vorbis decoder found no sample rate".to_string())?;
-    let channels = track
-        .codec_params
+    let channels = codec_params
         .channels
+        .as_ref()
         .map(|value| value.count())
         .ok_or_else(|| "Vorbis decoder found no channel layout".to_string())?;
     let mut decoder = get_codecs()
-        .make(&track.codec_params, &DecoderOptions { verify: true })
+        // Count only the audible programme: Vorbis overlap priming and final
+        // granule trimming must match the normal decode path.
+        .make_audio_decoder(
+            &codec_params,
+            &AudioDecoderOptions::default().gapless(true).verify(true),
+        )
         .map_err(|error| format!("create Vorbis decoder: {error}"))?;
     let mut frames = 0_u64;
     loop {
         let packet = match format.next_packet() {
-            Ok(packet) => packet,
-            Err(Error::IoError(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                break;
-            }
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
             Err(error) => return Err(format!("read Vorbis packet: {error}")),
         };
-        if packet.track_id() != track.id {
+        if packet.track_id != track.id {
             continue;
         }
         let decoded = decoder
