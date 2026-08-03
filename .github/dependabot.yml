@@ -1,13 +1,25 @@
 version: 2
 updates:
   - package-ecosystem: cargo
-    directory: /
+    directories:
+      - "/"
+      - "/wasm"
+      - "/fuzz"
     schedule:
       interval: weekly
     groups:
+      symphonia:
+        patterns:
+          - "symphonia*"
+      rubato:
+        patterns:
+          - "rubato"
       rust-dependencies:
         patterns:
           - "*"
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: github-actions
     directory: /
