@@ -255,6 +255,10 @@ Forge already provides:
   coefficient loads and exposes both meter states in one hot loop while
   retaining separate histories, per-channel FMA/reduction order, runtime SIMD
   fallbacks, and bit-identical 48/96/192 kHz measurements.
+- Multichannel true-peak pair passes that retain meter state across each
+  channel-contiguous decoder chunk, share immutable polyphase coefficients for
+  adjacent channels, handle odd channel counts with the scalar tail, and leave
+  K-weighting, energy, gating, channel order, and reported results unchanged.
 - Versioned multi-delivery optimization for two to 32 codec/profile outputs,
   using one conservative target, ceiling, and iteratively corrected gain;
   staged post-metadata re-decoding, explicit infeasibility, path-alias and
