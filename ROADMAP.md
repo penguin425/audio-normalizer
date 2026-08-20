@@ -218,7 +218,8 @@ Forge already provides:
   changed-output rejection, and schema-validated lifecycle NDJSON.
 - Opt-in content-addressed core analysis cache with streaming input SHA-256,
   request and algorithm revision binding, atomic schema-validated entries,
-  corruption recovery, read-only operation, and bounded FIFO eviction.
+  corruption recovery, read-only operation, bounded FIFO eviction, and
+  ordered file-level parallel hit/miss integration for album and batch jobs.
 - Stable-file watch folders with symlink-safe bounded discovery, durable
   atomic processing state, settings and input/output SHA-256 binding,
   restart recovery, explicit failed-item retry, and one-shot scheduling.

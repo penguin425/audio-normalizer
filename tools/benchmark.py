@@ -32,7 +32,11 @@ DEFAULT_CASES = (
     "wav-to-flac-verify",
     "wav-stereo-resample-normalize",
     "wav-stereo-batch-normalize",
+    "wav-stereo-batch-cache-hit-normalize",
+    "wav-stereo-batch-cache-miss-normalize",
     "wav-stereo-album-normalize",
+    "wav-stereo-album-cache-hit-normalize",
+    "wav-stereo-album-cache-miss-normalize",
     "wav-7.1-normalize",
     "flac-stereo-analyze",
     "flac-stereo-normalize",
@@ -45,6 +49,25 @@ MAX_PATHOLOGICAL_CHUNKS = 100_001
 MAX_ITERATIONS = 100
 CHUNK_FRAMES = 8_192
 ALBUM_TRACKS = 8
+ALBUM_CASES = (
+    "wav-stereo-album-normalize",
+    "wav-stereo-album-cache-hit-normalize",
+    "wav-stereo-album-cache-miss-normalize",
+)
+CACHE_HIT_CASES = (
+    "wav-stereo-batch-cache-hit-normalize",
+    "wav-stereo-album-cache-hit-normalize",
+)
+CACHE_MISS_CASES = (
+    "wav-stereo-batch-cache-miss-normalize",
+    "wav-stereo-album-cache-miss-normalize",
+)
+MULTI_INPUT_CASES = (
+    "wav-stereo-batch-normalize",
+    "wav-stereo-batch-cache-hit-normalize",
+    "wav-stereo-batch-cache-miss-normalize",
+    *ALBUM_CASES,
+)
 
 
 def positive_int(value: str) -> int:
@@ -256,10 +279,34 @@ def sanitized_command(case_id: str) -> list[str]:
             *[f"<input-{index:02d}.wav>" for index in range(1, ALBUM_TRACKS + 1)],
             "--jobs", str(ALBUM_TRACKS), "--overwrite", "-o", "<output-dir>",
         ],
+        "wav-stereo-batch-cache-hit-normalize": [
+            "forge",
+            *[f"<input-{index:02d}.wav>" for index in range(1, ALBUM_TRACKS + 1)],
+            "--jobs", str(ALBUM_TRACKS), "--analysis-cache", "<warm-cache-dir>",
+            "--overwrite", "-o", "<output-dir>",
+        ],
+        "wav-stereo-batch-cache-miss-normalize": [
+            "forge",
+            *[f"<input-{index:02d}.wav>" for index in range(1, ALBUM_TRACKS + 1)],
+            "--jobs", str(ALBUM_TRACKS), "--analysis-cache", "<empty-cache-dir>",
+            "--overwrite", "-o", "<output-dir>",
+        ],
         "wav-stereo-album-normalize": [
             "forge",
             *[f"<input-{index:02d}.wav>" for index in range(1, ALBUM_TRACKS + 1)],
             "--album", "--overwrite", "-o", "<output-dir>",
+        ],
+        "wav-stereo-album-cache-hit-normalize": [
+            "forge",
+            *[f"<input-{index:02d}.wav>" for index in range(1, ALBUM_TRACKS + 1)],
+            "--album", "--analysis-cache", "<warm-cache-dir>",
+            "--overwrite", "-o", "<output-dir>",
+        ],
+        "wav-stereo-album-cache-miss-normalize": [
+            "forge",
+            *[f"<input-{index:02d}.wav>" for index in range(1, ALBUM_TRACKS + 1)],
+            "--album", "--analysis-cache", "<empty-cache-dir>",
+            "--overwrite", "-o", "<output-dir>",
         ],
         "wav-7.1-normalize": [
             "forge", "<input.wav>", "--channel-layout", "7.1", "--overwrite",
@@ -288,7 +335,11 @@ def case_spec(case_id: str) -> tuple[str, str, int, str]:
         "wav-to-flac-verify": ("lossless", "wav", 2, "normalize"),
         "wav-stereo-resample-normalize": ("lossless", "wav", 2, "normalize"),
         "wav-stereo-batch-normalize": ("lossless", "wav", 2, "normalize"),
+        "wav-stereo-batch-cache-hit-normalize": ("lossless", "wav", 2, "normalize"),
+        "wav-stereo-batch-cache-miss-normalize": ("lossless", "wav", 2, "normalize"),
         "wav-stereo-album-normalize": ("lossless", "wav", 2, "normalize"),
+        "wav-stereo-album-cache-hit-normalize": ("lossless", "wav", 2, "normalize"),
+        "wav-stereo-album-cache-miss-normalize": ("lossless", "wav", 2, "normalize"),
         "wav-7.1-normalize": ("multichannel", "wav", 8, "normalize"),
         "flac-stereo-analyze": ("lossless", "flac", 2, "analyze"),
         "flac-stereo-normalize": ("lossless", "flac", 2, "normalize"),
@@ -317,6 +368,7 @@ def run_case(
     case_dir.mkdir(parents=True, exist_ok=True)
     output_paths: list[Path] = []
     output_directory: Path | None = None
+    cache_directory: Path | None = None
     output_sample_rate: int | None = None
     expected = [0]
 
@@ -334,10 +386,7 @@ def run_case(
         measured_duration: float | None = None
     else:
         estimated = pcm_bytes(duration, sample_rate, channels)
-        if case_id in (
-            "wav-stereo-batch-normalize",
-            "wav-stereo-album-normalize",
-        ):
+        if case_id in MULTI_INPUT_CASES:
             require_space(case_dir, estimated * ALBUM_TRACKS * 2)
             input_directory = case_dir / "inputs"
             input_paths = [
@@ -353,10 +402,34 @@ def run_case(
             command = [
                 str(forge), *[str(path) for path in input_paths],
             ]
-            if case_id == "wav-stereo-album-normalize":
+            if case_id in ALBUM_CASES:
                 command.append("--album")
             else:
                 command += ["--jobs", str(ALBUM_TRACKS)]
+            if case_id in (*CACHE_HIT_CASES, *CACHE_MISS_CASES):
+                cache_directory = case_dir / "analysis-cache"
+                command += ["--analysis-cache", str(cache_directory)]
+            if case_id in CACHE_HIT_CASES:
+                warm_mode = ["--album"] if case_id in ALBUM_CASES else [
+                    "--jobs", str(ALBUM_TRACKS)
+                ]
+                warm = subprocess.run(
+                    [
+                        str(forge), *[str(path) for path in input_paths],
+                        *warm_mode,
+                        "--analysis-cache", str(cache_directory),
+                        "--dry-run", "-o", str(output_directory),
+                    ],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout_seconds,
+                )
+                if warm.returncode != 0:
+                    detail = warm.stderr.decode("utf-8", errors="replace")[-2_000:]
+                    raise RuntimeError(
+                        f"analysis-cache warm-up failed with {warm.returncode}: {detail}"
+                    )
             command += ["--overwrite", "-o", str(output_directory)]
             measured_duration = float(duration * ALBUM_TRACKS)
         else:
@@ -413,6 +486,12 @@ def run_case(
             for output_path in output_directory.iterdir():
                 if output_path.is_file():
                     output_path.unlink()
+        if (
+            case_id in CACHE_MISS_CASES
+            and cache_directory is not None
+            and cache_directory.exists()
+        ):
+            shutil.rmtree(cache_directory)
         measurements.append(
             run_measured(
                 command,

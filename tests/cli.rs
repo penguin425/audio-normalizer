@@ -910,6 +910,125 @@ fn parallel_batch_matches_serial_bytes_and_reports_ordered_waves() {
     );
 }
 
+#[test]
+fn parallel_cached_batch_matches_serial_bytes_and_reports_hits_in_input_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let inputs = (0..4)
+        .map(|index| {
+            let path = directory.path().join(format!("cached-track-{index}.wav"));
+            write_batch_test_wav(&path, 250.0 + f64::from(index) * 173.0);
+            path
+        })
+        .collect::<Vec<_>>();
+    let cache = directory.path().join("analysis-cache");
+    let warm_outputs = directory.path().join("warm-outputs");
+    std::fs::create_dir(&warm_outputs).unwrap();
+    let warm = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args(&inputs)
+        .arg("--dry-run")
+        .arg("--analysis-cache")
+        .arg(&cache)
+        .arg("-o")
+        .arg(&warm_outputs)
+        .output()
+        .unwrap();
+    assert!(
+        warm.status.success(),
+        "{}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&warm.stderr)
+            .matches("analysis cache miss; stored")
+            .count(),
+        inputs.len()
+    );
+
+    let serial_directory = directory.path().join("cached-serial");
+    let parallel_directory = directory.path().join("cached-parallel");
+    let progress_path = directory.path().join("cached-parallel.ndjson");
+    let run = |jobs: usize, output: &std::path::Path, progress: Option<&std::path::Path>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_forge"));
+        command
+            .args(&inputs)
+            .arg("-o")
+            .arg(output)
+            .arg("--jobs")
+            .arg(jobs.to_string())
+            .arg("--analysis-cache")
+            .arg(&cache);
+        if let Some(progress) = progress {
+            command.arg("--progress").arg(progress);
+        }
+        command.output().unwrap()
+    };
+
+    let serial = run(1, &serial_directory, None);
+    assert!(
+        serial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&serial.stderr)
+    );
+    let parallel = run(4, &parallel_directory, Some(&progress_path));
+    assert!(
+        parallel.status.success(),
+        "{}",
+        String::from_utf8_lossy(&parallel.stderr)
+    );
+
+    let expected_hits = inputs
+        .iter()
+        .map(|input| format!("analysis cache hit: {}", input.display()))
+        .collect::<Vec<_>>();
+    for result in [&serial, &parallel] {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let hits = stderr
+            .lines()
+            .filter(|line| line.starts_with("analysis cache hit:"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(hits, expected_hits);
+    }
+
+    for input in &inputs {
+        let output_name = format!(
+            "{}_normalized.wav",
+            input.file_stem().unwrap().to_string_lossy()
+        );
+        assert_eq!(
+            std::fs::read(serial_directory.join(&output_name)).unwrap(),
+            std::fs::read(parallel_directory.join(&output_name)).unwrap(),
+            "parallel cached output differed for {output_name}"
+        );
+    }
+
+    let event_names = std::fs::read_to_string(&progress_path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["event"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        event_names,
+        [
+            "job_started",
+            "asset_started",
+            "asset_started",
+            "asset_started",
+            "asset_started",
+            "asset_completed",
+            "asset_completed",
+            "asset_completed",
+            "asset_completed",
+            "job_completed"
+        ]
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn progress_path_cannot_alias_an_audio_input_through_a_symlink() {
