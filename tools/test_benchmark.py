@@ -93,6 +93,11 @@ class BenchmarkTests(unittest.TestCase):
         schema_path = MODULE_PATH.parent.parent / "schema" / "performance-benchmark-v1.schema.json"
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
         self.assertEqual(schema["$id"], benchmark.SCHEMA)
+        schema_cases = schema["properties"]["configuration"]["properties"]["cases"]["items"]["enum"]
+        self.assertEqual(set(schema_cases), set(benchmark.DEFAULT_CASES))
+        for case_id in benchmark.DEFAULT_CASES:
+            self.assertTrue(benchmark.sanitized_command(case_id))
+            self.assertEqual(len(benchmark.case_spec(case_id)), 4)
 
 
 if __name__ == "__main__":

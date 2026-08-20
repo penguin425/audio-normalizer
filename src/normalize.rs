@@ -20,6 +20,7 @@ use crate::flacenc::FlacStreamWriter;
 use crate::metadata;
 #[cfg(feature = "mp3-encoding")]
 use crate::mp3enc;
+use crate::pcm_spool::PcmSpool;
 use crate::wav::{AudioBuffer, ChannelRole, PcmKind, WavContainer, WavStreamWriter, WavWriter};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -886,41 +887,143 @@ pub fn analyze_file_for_plan<P: AsRef<Path>>(
     channel_roles: Option<&[ChannelRole]>,
     plan: &Plan,
 ) -> Result<Analysis, String> {
-    let source = analyze_file_with_roles(path.as_ref(), channel_roles)?;
-    let Some(output_rate) = plan
-        .output_sample_rate
-        .filter(|rate| *rate != source.sample_rate)
-    else {
-        return Ok(source);
-    };
-    let mut converter = SampleRateConverter::new(
-        source.sample_rate,
-        output_rate,
-        source.frames,
-        source.channels as usize,
-        plan.resample_quality,
-    )?;
-    let mut analyzer = lufs::StreamingAnalyzer::new(output_rate, source.channel_roles.clone());
-    decoder::decode_stream(path.as_ref(), |_, chunk| {
-        converter.process(chunk, |output| analyzer.process(output))
+    Ok(prepare_file_for_plan(path.as_ref(), channel_roles, plan, false)?.analysis)
+}
+
+struct PreparedAnalysis {
+    analysis: Analysis,
+    spool: Option<PcmSpool>,
+}
+
+fn prepare_file_for_plan(
+    path: &Path,
+    channel_roles: Option<&[ChannelRole]>,
+    plan: &Plan,
+    capture_spool: bool,
+) -> Result<PreparedAnalysis, String> {
+    let mut analyzer: Option<lufs::StreamingAnalyzer> = None;
+    let mut converter: Option<SampleRateConverter> = None;
+    let mut spool: Option<PcmSpool> = None;
+    let mut resolved_roles = None;
+    let info = decoder::decode_stream(path, |info, chunk| {
+        if analyzer.is_none() {
+            let roles = resolve_stream_roles(path, info, channel_roles)?;
+            let output_rate = plan.output_sample_rate.unwrap_or(info.sample_rate);
+            analyzer = Some(lufs::StreamingAnalyzer::new(output_rate, roles.clone()));
+            resolved_roles = Some(roles);
+            if output_rate != info.sample_rate {
+                converter = Some(SampleRateConverter::new_streaming(
+                    info.sample_rate,
+                    output_rate,
+                    info.channels as usize,
+                    plan.resample_quality,
+                )?);
+            }
+            if capture_spool && should_capture_pcm(path, converter.is_some()) {
+                // The spool is a performance optimization. If the host cannot
+                // create its temporary file, retain the established two-decode
+                // path rather than turning a successful normalization into an
+                // out-of-space/temp-directory failure.
+                spool = PcmSpool::new(info.channels as usize).ok();
+            }
+        }
+        if let Some(converter) = converter.as_mut() {
+            converter.process(chunk, |output| {
+                analyze_and_capture(output, analyzer.as_mut().unwrap(), &mut spool)
+            })
+        } else {
+            analyze_and_capture(chunk, analyzer.as_mut().unwrap(), &mut spool)
+        }
     })?;
-    converter.finish(|output| analyzer.process(output))?;
+    if let Some(converter) = converter.as_mut() {
+        converter
+            .finish(|output| analyze_and_capture(output, analyzer.as_mut().unwrap(), &mut spool))?;
+    }
+    let analyzer = analyzer.ok_or_else(|| format!("{}: no audio decoded", path.display()))?;
+    let roles = resolved_roles.expect("analyzer creation resolves channel roles");
     let measured = analyzer.finish();
-    Ok(Analysis {
-        sample_rate: output_rate,
-        channels: source.channels,
-        channel_roles: source.channel_roles,
-        frames: measured.frames,
-        kind: source.kind,
-        lufs: measured.ebu.integrated_lufs,
-        max_momentary_lufs: measured.ebu.max_momentary_lufs,
-        max_short_term_lufs: measured.ebu.max_short_term_lufs,
-        loudness_range_lu: measured.ebu.loudness_range_lu,
-        rms_db: measured.rms_db,
-        sample_peak: measured.sample_peak,
-        true_peak: measured.true_peak,
-        loudness_blocks: measured.ebu.gating_blocks,
+    if spool
+        .as_ref()
+        .is_some_and(|captured| captured.frames() != measured.frames)
+    {
+        spool = None;
+    }
+    Ok(PreparedAnalysis {
+        analysis: Analysis {
+            sample_rate: plan.output_sample_rate.unwrap_or(info.sample_rate),
+            channels: info.channels,
+            channel_roles: roles,
+            frames: measured.frames,
+            kind: info.source_kind,
+            lufs: measured.ebu.integrated_lufs,
+            max_momentary_lufs: measured.ebu.max_momentary_lufs,
+            max_short_term_lufs: measured.ebu.max_short_term_lufs,
+            loudness_range_lu: measured.ebu.loudness_range_lu,
+            rms_db: measured.rms_db,
+            sample_peak: measured.sample_peak,
+            true_peak: measured.true_peak,
+            loudness_blocks: measured.ebu.gating_blocks,
+        },
+        spool,
     })
+}
+
+fn analyze_and_capture(
+    planar: &mut [Vec<f32>],
+    analyzer: &mut lufs::StreamingAnalyzer,
+    spool: &mut Option<PcmSpool>,
+) -> Result<(), String> {
+    analyzer.process(planar)?;
+    let capture_failed = spool
+        .as_mut()
+        .is_some_and(|captured| captured.write_chunk(planar).is_err());
+    if capture_failed {
+        *spool = None;
+    }
+    Ok(())
+}
+
+fn resolve_stream_roles(
+    path: &Path,
+    info: &decoder::StreamInfo,
+    channel_roles: Option<&[ChannelRole]>,
+) -> Result<Vec<ChannelRole>, String> {
+    if let Some(roles) = channel_roles {
+        if roles.len() != info.channels as usize {
+            return Err(format!(
+                "channel layout has {} channels but input has {}",
+                roles.len(),
+                info.channels
+            ));
+        }
+        return Ok(roles.to_vec());
+    }
+    if info.channels > 6
+        && info
+            .channel_roles
+            .iter()
+            .all(|role| matches!(role, ChannelRole::Main))
+    {
+        return Err(format!(
+            "{}: ambiguous {}-channel layout; provide --channel-layout",
+            path.display(),
+            info.channels
+        ));
+    }
+    Ok(info.channel_roles.clone())
+}
+
+fn should_capture_pcm(path: &Path, resampling: bool) -> bool {
+    resampling
+        || path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "flac" | "dsf" | "dff"
+                )
+            })
 }
 
 /// Analyze an optional source-time range and optionally capture a loudness
@@ -1340,7 +1443,11 @@ fn level_deviation(expected: f64, actual: f64) -> f64 {
     }
 }
 
-/// Normalize a single file in one pass (load, analyze, gain, write).
+/// Normalize a single file with exact analysis followed by gain application.
+///
+/// Expensive decode/resample paths may spool output-domain PCM to temporary
+/// storage between the two stages; the complete signal is never retained in
+/// memory.
 pub fn normalize_one<P: AsRef<Path>>(
     input: P,
     output: P,
@@ -1437,15 +1544,19 @@ fn normalize_one_with_roles_impl<P: AsRef<Path>>(
     preanalyzed: Option<&Analysis>,
     capture_statistics: bool,
 ) -> Result<(Analysis, f32, Option<RenderStatistics>), String> {
-    let an = if let Some(analysis) = preanalyzed {
-        analysis.clone()
+    let (an, mut source_spool) = if let Some(analysis) = preanalyzed {
+        (analysis.clone(), None)
     } else {
-        analyze_file_for_plan(input.as_ref(), channel_roles, plan)?
+        let prepared = prepare_file_for_plan(input.as_ref(), channel_roles, plan, true)?;
+        (prepared.analysis, prepared.spool)
     };
     let gain = compute_gain(&an, plan);
     let staged = AtomicOutput::new(output.as_ref())?;
     let render = normalize_stream(
-        input.as_ref(),
+        StreamSource {
+            path: input.as_ref(),
+            spool: source_spool.as_mut(),
+        },
         staged.path(),
         &an,
         gain,
@@ -1541,10 +1652,11 @@ fn normalize_one_corrected_with_optional_analysis(
     if !tolerance.is_finite() || tolerance < 0.0 {
         return Err("verification tolerance must be a finite non-negative number".into());
     }
-    let source = if let Some(analysis) = preanalyzed {
-        analysis.clone()
+    let (source, mut source_spool) = if let Some(analysis) = preanalyzed {
+        (analysis.clone(), None)
     } else {
-        analyze_file_for_plan(input, channel_roles, plan)?
+        let prepared = prepare_file_for_plan(input, channel_roles, plan, true)?;
+        (prepared.analysis, prepared.spool)
     };
     let mut gain = compute_gain(&source, plan);
     let mut intended_level = None;
@@ -1552,7 +1664,10 @@ fn normalize_one_corrected_with_optional_analysis(
 
     for attempt in 0..=max_retries {
         let render = normalize_stream(
-            input,
+            StreamSource {
+                path: input,
+                spool: source_spool.as_mut(),
+            },
             staged.path(),
             &source,
             gain,
@@ -1624,7 +1739,9 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
     if !tolerance.is_finite() || tolerance < 0.0 {
         return Err("verification tolerance must be a finite non-negative number".into());
     }
-    let source = analyze_file_for_plan(input, channel_roles, plan)?;
+    let prepared = prepare_file_for_plan(input, channel_roles, plan, true)?;
+    let source = prepared.analysis;
+    let mut source_spool = prepared.spool;
     if plan.mode == Mode::Lufs && !source.lufs.is_finite() {
         return Err("multi-delivery requires finite integrated source loudness".into());
     }
@@ -1645,7 +1762,10 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
             .zip(formats)
             .map(|(output, format)| {
                 normalize_stream(
-                    input,
+                    StreamSource {
+                        path: input,
+                        spool: source_spool.as_mut(),
+                    },
                     output,
                     &source,
                     gain,
@@ -1858,13 +1978,17 @@ fn normalize_album_with_roles_impl(
     if preanalyzed.is_some_and(|analyses| analyses.len() != inputs.len()) {
         return Err("album precomputed analysis/input count mismatch".into());
     }
-    let analyses: Vec<Analysis> = if let Some(analyses) = preanalyzed {
+    let analyses = if let Some(analyses) = preanalyzed {
         analyses.to_vec()
     } else {
+        // Do not retain one raw PCM temporary file per track. Large albums can
+        // otherwise exhaust file descriptors or temporary storage before the
+        // shared gain is known. The plan-aware analyzer still removes the old
+        // extra source-rate analysis pass when resampling.
         inputs
             .iter()
             .map(|path| analyze_file_for_plan(path, channel_roles, plan))
-            .collect::<Result<_, _>>()?
+            .collect::<Result<Vec<_>, _>>()?
     };
     let gain = album_gain(&analyses, plan);
     let album_output_lufs = album_lufs(&analyses) + gain_db(gain);
@@ -1876,7 +2000,10 @@ fn normalize_album_with_roles_impl(
     for (i, (input, output)) in inputs.iter().zip(staged.iter()).enumerate() {
         let fmt = formats.get(i).copied().unwrap_or(OutputFormat::Wav);
         let render = normalize_stream(
-            input,
+            StreamSource {
+                path: input,
+                spool: None,
+            },
             output.path(),
             &analyses[i],
             gain,
@@ -1993,13 +2120,13 @@ fn normalize_album_corrected_with_optional_analyses(
     if preanalyzed.is_some_and(|analyses| analyses.len() != inputs.len()) {
         return Err("album precomputed analysis/input count mismatch".into());
     }
-    let sources: Vec<Analysis> = if let Some(analyses) = preanalyzed {
+    let sources = if let Some(analyses) = preanalyzed {
         analyses.to_vec()
     } else {
         inputs
             .iter()
             .map(|path| analyze_file_for_plan(path, channel_roles, plan))
-            .collect::<Result<_, _>>()?
+            .collect::<Result<Vec<_>, _>>()?
     };
     let mut gain = album_gain(&sources, plan);
     let mut intended_album_lufs = None;
@@ -2019,7 +2146,10 @@ fn normalize_album_corrected_with_optional_analyses(
             let format = formats.get(index).copied().unwrap_or(OutputFormat::Wav);
             renders.push(
                 normalize_stream(
-                    input,
+                    StreamSource {
+                        path: input,
+                        spool: None,
+                    },
                     output,
                     &sources[index],
                     gain,
@@ -2230,8 +2360,13 @@ struct StreamRenderOptions {
     capture_statistics: bool,
 }
 
+struct StreamSource<'a> {
+    path: &'a Path,
+    spool: Option<&'a mut PcmSpool>,
+}
+
 fn normalize_stream(
-    input: &Path,
+    source: StreamSource<'_>,
     output: &Path,
     analysis: &Analysis,
     gain: f32,
@@ -2243,6 +2378,7 @@ fn normalize_stream(
         opus_album_lufs: _opus_album_lufs,
         capture_statistics,
     } = options;
+    let input = source.path;
     let ceiling = 10.0_f64.powf(plan.ceiling_db / 20.0) as f32;
     match format {
         OutputFormat::Wav => {
@@ -2265,7 +2401,7 @@ fn normalize_stream(
             )
             .map_err(|error| format!("write {}: {error}", output.display()))?;
             let statistics = process_normalized_stream(
-                input,
+                source,
                 analysis,
                 gain,
                 ceiling,
@@ -2292,7 +2428,7 @@ fn normalize_stream(
                 plan.dither,
             )?;
             let statistics = process_normalized_stream(
-                input,
+                source,
                 analysis,
                 gain,
                 ceiling,
@@ -2314,7 +2450,7 @@ fn normalize_stream(
                     plan.mp3_quality,
                 )?;
                 let statistics = process_normalized_stream(
-                    input,
+                    source,
                     analysis,
                     gain,
                     ceiling,
@@ -2346,7 +2482,7 @@ fn normalize_stream(
                     _opus_album_lufs,
                 )?;
                 let statistics = process_normalized_stream(
-                    input,
+                    source,
                     analysis,
                     gain,
                     ceiling,
@@ -2383,7 +2519,7 @@ fn normalize_stream(
                     codec,
                 )?;
                 let statistics = process_normalized_stream(
-                    input,
+                    source,
                     analysis,
                     gain,
                     ceiling,
@@ -2407,7 +2543,7 @@ fn normalize_stream(
 }
 
 fn process_normalized_stream(
-    input: &Path,
+    source: StreamSource<'_>,
     analysis: &Analysis,
     gain: f32,
     ceiling: f32,
@@ -2415,6 +2551,10 @@ fn process_normalized_stream(
     capture_statistics: bool,
     mut write: impl FnMut(&[Vec<f32>]) -> Result<(), String>,
 ) -> Result<Option<RenderStatistics>, String> {
+    let StreamSource {
+        path: input,
+        spool: source_spool,
+    } = source;
     let mut limiter = plan
         .limiter
         .map(|config| {
@@ -2435,42 +2575,10 @@ fn process_normalized_stream(
         }
     }
     let mut statistics = capture_statistics.then(|| RenderStatisticsBuilder::new(analysis));
-    let mut converter: Option<SampleRateConverter> = None;
-    decoder::decode_stream(input, |info, planar| {
-        if info.sample_rate == analysis.sample_rate {
-            return process_normalized_chunk(
+    if let Some(spool) = source_spool {
+        spool.replay(|planar| {
+            process_normalized_chunk(
                 planar,
-                gain,
-                ceiling,
-                &mut limiter,
-                &mut statistics,
-                &mut write,
-            );
-        }
-        if converter.is_none() {
-            converter = Some(SampleRateConverter::new_with_expected_output(
-                info.sample_rate,
-                analysis.sample_rate,
-                analysis.frames,
-                analysis.channels as usize,
-                plan.resample_quality,
-            )?);
-        }
-        converter.as_mut().unwrap().process(planar, |output| {
-            process_normalized_chunk(
-                output,
-                gain,
-                ceiling,
-                &mut limiter,
-                &mut statistics,
-                &mut write,
-            )
-        })
-    })?;
-    if let Some(converter) = converter.as_mut() {
-        converter.finish(|output| {
-            process_normalized_chunk(
-                output,
                 gain,
                 ceiling,
                 &mut limiter,
@@ -2478,6 +2586,51 @@ fn process_normalized_stream(
                 &mut write,
             )
         })?;
+    } else {
+        let mut converter: Option<SampleRateConverter> = None;
+        decoder::decode_stream(input, |info, planar| {
+            if info.sample_rate == analysis.sample_rate {
+                return process_normalized_chunk(
+                    planar,
+                    gain,
+                    ceiling,
+                    &mut limiter,
+                    &mut statistics,
+                    &mut write,
+                );
+            }
+            if converter.is_none() {
+                converter = Some(SampleRateConverter::new_with_expected_output(
+                    info.sample_rate,
+                    analysis.sample_rate,
+                    analysis.frames,
+                    analysis.channels as usize,
+                    plan.resample_quality,
+                )?);
+            }
+            converter.as_mut().unwrap().process(planar, |output| {
+                process_normalized_chunk(
+                    output,
+                    gain,
+                    ceiling,
+                    &mut limiter,
+                    &mut statistics,
+                    &mut write,
+                )
+            })
+        })?;
+        if let Some(converter) = converter.as_mut() {
+            converter.finish(|output| {
+                process_normalized_chunk(
+                    output,
+                    gain,
+                    ceiling,
+                    &mut limiter,
+                    &mut statistics,
+                    &mut write,
+                )
+            })?;
+        }
     }
     let limiter_statistics = if let Some(limiter) = limiter {
         let (tail, limiter_statistics) = if capture_statistics {
@@ -2792,5 +2945,118 @@ mod tests {
         assert_eq!(result.attempts, 1);
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn output_domain_spool_matches_the_redecode_resample_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.wav");
+        let spooled_output = directory.path().join("spooled.wav");
+        let redecode_output = directory.path().join("redecoded.wav");
+        let sample_rate = 44_100;
+        let frames = sample_rate as usize * 2 + 137;
+        let samples = (0..frames)
+            .map(|frame| {
+                0.15 * (2.0 * std::f32::consts::PI * 997.0 * frame as f32 / sample_rate as f32)
+                    .sin()
+            })
+            .collect::<Vec<_>>();
+        let buffer = AudioBuffer {
+            sample_rate,
+            channels: 2,
+            frames,
+            data: vec![samples.clone(), samples],
+            channel_roles: default_channel_roles(2),
+            source_kind: PcmKind::F32,
+        };
+        WavWriter::write(&input, &buffer, PcmKind::F32, false).unwrap();
+
+        let mut resample_plan = plan();
+        resample_plan.output_sample_rate = Some(48_000);
+        let prepared =
+            prepare_file_for_plan(&input, None, &resample_plan, true).expect("prepare input");
+        assert_eq!(prepared.analysis.sample_rate, 48_000);
+        assert_eq!(
+            prepared.spool.as_ref().map(PcmSpool::frames),
+            Some(prepared.analysis.frames)
+        );
+        let preanalyzed = prepared.analysis;
+
+        let (spooled_analysis, spooled_gain) =
+            normalize_one(&input, &spooled_output, &resample_plan, OutputFormat::Wav).unwrap();
+        let (redecoded_analysis, redecoded_gain) = normalize_one_preanalyzed_with_roles(
+            &input,
+            &redecode_output,
+            &resample_plan,
+            OutputFormat::Wav,
+            None,
+            &preanalyzed,
+        )
+        .unwrap();
+
+        assert_eq!(spooled_analysis.frames, redecoded_analysis.frames);
+        assert_eq!(spooled_gain.to_bits(), redecoded_gain.to_bits());
+        assert_eq!(
+            std::fs::read(spooled_output).unwrap(),
+            std::fs::read(redecode_output).unwrap()
+        );
+
+        let same_rate = prepare_file_for_plan(&input, None, &plan(), true).unwrap();
+        assert!(
+            same_rate.spool.is_none(),
+            "same-rate WAVE should skip spooling"
+        );
+    }
+
+    #[test]
+    fn compressed_input_spool_matches_the_redecode_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.flac");
+        let spooled_output = directory.path().join("spooled.wav");
+        let redecode_output = directory.path().join("redecoded.wav");
+        let frames = 48_000 * 2 + 73;
+        let samples = (0..frames)
+            .map(|frame| {
+                0.1 * (2.0 * std::f32::consts::PI * 1_003.0 * frame as f32 / 48_000.0).sin()
+            })
+            .collect::<Vec<_>>();
+        let mut writer = FlacStreamWriter::create(&input, 48_000, 2, 24, false).unwrap();
+        writer.write_chunk(&[samples.clone(), samples]).unwrap();
+        writer.finish().unwrap();
+
+        let prepared = prepare_file_for_plan(&input, None, &plan(), true).unwrap();
+        assert_eq!(
+            prepared.spool.as_ref().map(PcmSpool::frames),
+            Some(prepared.analysis.frames)
+        );
+        let preanalyzed = prepared.analysis;
+
+        let (_, spooled_gain) =
+            normalize_one(&input, &spooled_output, &plan(), OutputFormat::Wav).unwrap();
+        let (_, redecoded_gain) = normalize_one_preanalyzed_with_roles(
+            &input,
+            &redecode_output,
+            &plan(),
+            OutputFormat::Wav,
+            None,
+            &preanalyzed,
+        )
+        .unwrap();
+        assert_eq!(spooled_gain.to_bits(), redecoded_gain.to_bits());
+        assert_eq!(
+            std::fs::read(spooled_output).unwrap(),
+            std::fs::read(redecode_output).unwrap()
+        );
+    }
+
+    #[test]
+    fn pcm_capture_policy_avoids_raw_io_for_fast_lossy_decoders() {
+        assert!(should_capture_pcm(Path::new("album.flac"), false));
+        assert!(should_capture_pcm(Path::new("archive.dsf"), false));
+        assert!(!should_capture_pcm(Path::new("track.mp3"), false));
+        assert!(!should_capture_pcm(Path::new("track.m4a"), false));
+        assert!(!should_capture_pcm(Path::new("track.ogg"), false));
+        assert!(should_capture_pcm(Path::new("track.mp3"), true));
+        assert!(should_capture_pcm(Path::new("track.wav"), true));
     }
 }

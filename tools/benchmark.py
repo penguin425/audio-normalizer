@@ -28,9 +28,12 @@ GENERATOR = "forge-benchmark/1"
 DEFAULT_CASES = (
     "wav-stereo-analyze",
     "wav-stereo-normalize",
+    "wav-stereo-resample-normalize",
     "wav-7.1-normalize",
     "flac-stereo-analyze",
+    "flac-stereo-normalize",
     "mp3-stereo-analyze",
+    "mp3-stereo-normalize",
     "pathological-wave-qc",
 )
 MAX_DURATION_SECONDS = 3_600
@@ -232,12 +235,22 @@ def sanitized_command(case_id: str) -> list[str]:
         "wav-stereo-normalize": [
             "forge", "<input.wav>", "--overwrite", "-o", "<output.wav>"
         ],
+        "wav-stereo-resample-normalize": [
+            "forge", "<input.wav>", "--sample-rate", "<alternate-rate>",
+            "--overwrite", "-o", "<output.wav>",
+        ],
         "wav-7.1-normalize": [
             "forge", "<input.wav>", "--channel-layout", "7.1", "--overwrite",
             "-o", "<output.wav>",
         ],
         "flac-stereo-analyze": ["forge", "<input.flac>", "--analyze", "--json"],
+        "flac-stereo-normalize": [
+            "forge", "<input.flac>", "--overwrite", "-o", "<output.wav>"
+        ],
         "mp3-stereo-analyze": ["forge", "<input.mp3>", "--analyze", "--json"],
+        "mp3-stereo-normalize": [
+            "forge", "<input.mp3>", "--overwrite", "-o", "<output.wav>"
+        ],
         "pathological-wave-qc": [
             "forge-container-qc", "<input.wav>", "--compact", "-o", "<report.json>"
         ],
@@ -249,9 +262,12 @@ def case_spec(case_id: str) -> tuple[str, str, int, str]:
     specs = {
         "wav-stereo-analyze": ("lossless", "wav", 2, "analyze"),
         "wav-stereo-normalize": ("lossless", "wav", 2, "normalize"),
+        "wav-stereo-resample-normalize": ("lossless", "wav", 2, "normalize"),
         "wav-7.1-normalize": ("multichannel", "wav", 8, "normalize"),
         "flac-stereo-analyze": ("lossless", "flac", 2, "analyze"),
+        "flac-stereo-normalize": ("lossless", "flac", 2, "normalize"),
         "mp3-stereo-analyze": ("lossy", "mp3", 2, "analyze"),
+        "mp3-stereo-normalize": ("lossy", "mp3", 2, "normalize"),
         "pathological-wave-qc": ("pathological", "wav", 1, "container-qc"),
     }
     return specs[case_id]
@@ -274,6 +290,7 @@ def run_case(
     case_dir = workspace / case_id
     case_dir.mkdir(parents=True, exist_ok=True)
     output_path: Path | None = None
+    output_sample_rate: int | None = None
     expected = [0]
 
     if case_id == "pathological-wave-qc":
@@ -316,6 +333,9 @@ def run_case(
         if operation == "normalize":
             output_path = case_dir / "output.wav"
             command = [str(forge), str(input_path)]
+            if case_id == "wav-stereo-resample-normalize":
+                output_sample_rate = 48_000 if sample_rate != 48_000 else 44_100
+                command += ["--sample-rate", str(output_sample_rate)]
             if channels == 8:
                 command += ["--channel-layout", "7.1"]
             command += ["--overwrite", "-o", str(output_path)]
@@ -359,6 +379,7 @@ def run_case(
         "operation": operation,
         "channels": channels,
         "sample_rate_hz": sample_rate,
+        "output_sample_rate_hz": output_sample_rate,
         "duration_seconds": measured_duration,
         "input_bytes": input_bytes,
         "output_bytes": output_bytes,
@@ -496,7 +517,7 @@ def main() -> int:
     if len(cases) != len(set(cases)):
         raise ValueError("benchmark cases must not be repeated")
     ffmpeg = args.ffmpeg
-    if any(case in cases for case in ("flac-stereo-analyze", "mp3-stereo-analyze")):
+    if any(case_spec(case)[1] in ("flac", "mp3") for case in cases):
         ffmpeg = executable(
             ffmpeg or Path(shutil.which("ffmpeg") or ""), "ffmpeg"
         )

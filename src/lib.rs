@@ -84,6 +84,7 @@ pub mod onnx_provider;
 pub mod opus;
 pub mod opus_tags;
 mod pcm_container_qc;
+mod pcm_spool;
 pub mod presentation_qc;
 pub mod preset;
 pub mod provenance;

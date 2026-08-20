@@ -38,7 +38,7 @@
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
-          "items": {"enum": ["wav-stereo-analyze", "wav-stereo-normalize", "wav-7.1-normalize", "flac-stereo-analyze", "mp3-stereo-analyze", "pathological-wave-qc"]}
+          "items": {"enum": ["wav-stereo-analyze", "wav-stereo-normalize", "wav-stereo-resample-normalize", "wav-7.1-normalize", "flac-stereo-analyze", "flac-stereo-normalize", "mp3-stereo-analyze", "mp3-stereo-normalize", "pathological-wave-qc"]}
         }
       }
     },
@@ -87,6 +87,7 @@
         "operation": {"enum": ["normalize", "analyze", "container-qc"]},
         "channels": {"type": "integer", "minimum": 1},
         "sample_rate_hz": {"type": "integer", "minimum": 8000},
+        "output_sample_rate_hz": {"type": ["integer", "null"], "minimum": 8000},
         "duration_seconds": {"$ref": "#/$defs/nullableNumber"},
         "input_bytes": {"type": "integer", "minimum": 0},
         "output_bytes": {"type": ["integer", "null"], "minimum": 0},
