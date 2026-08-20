@@ -17,6 +17,7 @@ use forge_normalizer::wav::{
 use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
 use lofty::tag::{Accessor, ItemKey, Tag, TagExt, TagType};
+use rayon::ThreadPoolBuilder;
 use std::f64::consts::PI;
 use std::path::PathBuf;
 
@@ -1182,6 +1183,77 @@ fn album_mode_applies_shared_gain() {
     let _ = (album_l,);
     for p in [&i1, &i2, &o1, &o2] {
         let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
+fn album_parallelism_preserves_result_order_and_output_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let inputs = (0..4)
+        .map(|index| {
+            let path = directory.path().join(format!("input-{index}.wav"));
+            let buffer = synth_sine(
+                48_000,
+                1.0,
+                0.04 + index as f32 * 0.02,
+                700.0 + index as f64 * 137.0,
+                2,
+            );
+            WavWriter::write(&path, &buffer, PcmKind::S16, false).unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+    let serial_outputs = (0..inputs.len())
+        .map(|index| directory.path().join(format!("serial-{index}.wav")))
+        .collect::<Vec<_>>();
+    let parallel_outputs = (0..inputs.len())
+        .map(|index| directory.path().join(format!("parallel-{index}.wav")))
+        .collect::<Vec<_>>();
+    let formats = vec![OutputFormat::Wav; inputs.len()];
+    let plan = Plan {
+        mode: Mode::Lufs,
+        target_lufs: -18.0,
+        target_peak_db: -1.0,
+        target_rms_db: -18.0,
+        ceiling_db: -1.0,
+        max_gain_db: None,
+        dither: false,
+        output_kind: None,
+        mp3_bitrate: 192,
+        mp3_quality: 2,
+        limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
+    };
+
+    let serial = ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap()
+        .install(|| normalize::normalize_album(&inputs, &serial_outputs, &plan, &formats))
+        .unwrap();
+    let parallel = ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap()
+        .install(|| normalize::normalize_album(&inputs, &parallel_outputs, &plan, &formats))
+        .unwrap();
+
+    assert_eq!(serial.len(), inputs.len());
+    assert_eq!(parallel.len(), inputs.len());
+    for index in 0..inputs.len() {
+        assert_eq!(serial[index].1.to_bits(), parallel[index].1.to_bits());
+        assert_eq!(
+            serial[index].0.lufs.to_bits(),
+            parallel[index].0.lufs.to_bits()
+        );
+        assert_eq!(
+            std::fs::read(&serial_outputs[index]).unwrap(),
+            std::fs::read(&parallel_outputs[index]).unwrap(),
+            "track {index} changed under file-level parallelism"
+        );
     }
 }
 

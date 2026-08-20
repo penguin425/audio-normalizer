@@ -12,8 +12,8 @@ Forge already provides:
 - ITU-R BS.1770-5 / EBU R 128 integrated, momentary, short-term, LRA, and
   true-peak measurement with official EBU and ITU conformance jobs.
 - Track and duration-weighted album normalization, codec re-verification,
-  limiter, sample-rate conversion, integer PCM dither, ReplayGain, and BWF
-  loudness metadata.
+  work-stealing track parallelism, limiter, sample-rate conversion, integer PCM
+  dither, ReplayGain, and BWF loudness metadata.
 - EBU Tech 3285 v2 BWF `bext` QC for fixed production fields, date/time,
   sample-based TimeReference, version/UMID/reserved-byte consistency, loudness
   metadata ranges, and CodingHistory line structure.

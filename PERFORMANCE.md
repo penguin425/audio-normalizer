@@ -10,6 +10,11 @@ The official EBU v5 and ITU-R BS.2217-2 suites remain release gates.
 - [Amdahl's law](https://doi.org/10.1145/1465482.1465560) makes repeated
   sequential decode, resample, and encode passes the first target: accelerating
   only one DSP kernel cannot remove time spent in the other passes.
+- Blumofe and Leiserson's
+  [work-stealing analysis](https://doi.org/10.1145/324133.324234) supports
+  dynamically scheduling independent track work on one bounded worker pool.
+  Forge still collects indexed results and commits them in caller order so
+  scheduling does not change album semantics or error precedence.
 - The [Roofline model](https://digicoll.lib.berkeley.edu/record/136692/files/EECS-2008-134.pdf)
   motivates removing buffer allocation, copies, and full-signal memory traffic
   before adding more arithmetic parallelism.
@@ -32,9 +37,10 @@ individual implementation is retained.
 
 ## Measured releases
 
-Measurements below are five-run medians on the same Ryzen 9 3950X WSL2 host
-with deterministic inputs. Fixture generation is excluded. They are
-engineering comparisons, not cross-machine performance guarantees.
+Measurements below are five-run medians unless a section notes otherwise, on
+the same Ryzen 9 3950X WSL2 host with deterministic inputs. Fixture generation
+is excluded. They are engineering comparisons, not cross-machine performance
+guarantees.
 
 ### v0.128.0: sample-rate-aware true peak
 
@@ -48,7 +54,7 @@ sample rate. These cases use 1,200-second stereo inputs.
 | 96 kHz | 9.743 s | 8.314 s | -14.7% | 1.17x |
 | 192 kHz | 19.230 s | 8.390 s | -56.4% | 2.29x |
 
-### v0.129.0 candidate: pass and buffer reuse
+### v0.129.0: pass and buffer reuse
 
 Plan-aware analysis now decodes and resamples once instead of first measuring
 the source domain and decoding again for output-domain measurement. For a
@@ -74,10 +80,36 @@ The neutral MP3 result is why same-rate lossy inputs keep the established
 re-decode path. A buffered temporary-file experiment was also rejected because
 it was slower than direct OS-page-cache I/O on the measurement host.
 
+### v0.130.0 candidate: album track parallelism
+
+Independent album analyses, renders, and corrected-output re-analyses now use
+the same Rayon work-stealing pool as channel DSP. `--jobs` remains the single
+in-process concurrency budget. Indexed results are resolved in input order,
+and final destination commits remain serial and occur only after every staged
+track has succeeded.
+
+This case normalizes eight independent 300-second stereo PCM16 WAVE tracks
+(2,400 seconds of programme material total). Both versions used the same
+deterministic generator. The v0.129.0 baseline is a five-run median; the
+candidate uses a fifteen-run median because concurrent filesystem writes
+showed more run-to-run variance.
+
+| Metric | v0.129.0 | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Wall time | 11.362 s | 1.908 s | -83.2% (5.96x) |
+| Child CPU utilization | 164% | 814% | work distributed across tracks |
+| Peak RSS | 16.0 MiB | 29.3 MiB | +13.3 MiB |
+
+The additional live-buffer memory is bounded by active workers and remains
+small in absolute terms. A separate `--jobs 1` versus `--jobs 8` check produced
+byte-identical WAVE files for every track. Album mode continues to avoid
+retaining a raw PCM spool per track, so parallelism does not scale temporary
+PCM storage with album duration.
+
 ## Next implementation order
 
-1. Parallelize independent file and album analysis with explicit CPU, memory,
-   file-descriptor, and temporary-storage budgets.
+1. Stage ordinary non-album batches in bounded waves, then publish progress,
+   checkpoints, catalogue records, and successful outputs in input order.
 2. Fuse gain, ceiling enforcement, quantization, and writer hand-off where
    output semantics permit it.
 3. Tee lossless verification measurements into encoding and remove avoidable

@@ -22,6 +22,7 @@ use crate::metadata;
 use crate::mp3enc;
 use crate::pcm_spool::PcmSpool;
 use crate::wav::{AudioBuffer, ChannelRole, PcmKind, WavContainer, WavStreamWriter, WavWriter};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1975,6 +1976,12 @@ fn normalize_album_with_roles_impl(
     preanalyzed: Option<&[Analysis]>,
     capture_statistics: bool,
 ) -> Result<Vec<(Analysis, f32, Option<RenderStatistics>)>, String> {
+    if inputs.is_empty() {
+        return Err("cannot normalize an empty album".into());
+    }
+    if inputs.len() != outputs.len() {
+        return Err("album input/output count mismatch".into());
+    }
     if preanalyzed.is_some_and(|analyses| analyses.len() != inputs.len()) {
         return Err("album precomputed analysis/input count mismatch".into());
     }
@@ -1985,10 +1992,11 @@ fn normalize_album_with_roles_impl(
         // otherwise exhaust file descriptors or temporary storage before the
         // shared gain is known. The plan-aware analyzer still removes the old
         // extra source-rate analysis pass when resampling.
-        inputs
-            .iter()
+        let measured = inputs
+            .par_iter()
             .map(|path| analyze_file_for_plan(path, channel_roles, plan))
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Vec<_>>();
+        measured.into_iter().collect::<Result<Vec<_>, _>>()?
     };
     let gain = album_gain(&analyses, plan);
     let album_output_lufs = album_lufs(&analyses) + gain_db(gain);
@@ -1996,34 +2004,41 @@ fn normalize_album_with_roles_impl(
         .iter()
         .map(|output| AtomicOutput::new(output))
         .collect::<Result<_, _>>()?;
-    let mut results = Vec::with_capacity(inputs.len());
-    for (i, (input, output)) in inputs.iter().zip(staged.iter()).enumerate() {
-        let fmt = formats.get(i).copied().unwrap_or(OutputFormat::Wav);
-        let render = normalize_stream(
-            StreamSource {
-                path: input,
-                spool: None,
-            },
-            output.path(),
-            &analyses[i],
-            gain,
-            plan,
-            fmt,
-            StreamRenderOptions {
-                opus_album_lufs: Some(album_output_lufs),
-                capture_statistics,
-            },
-        )?;
-        finalize_metadata(
-            input,
-            output.path(),
-            fmt,
-            analyses[i].lufs + gain_db(gain),
-            Some(album_output_lufs),
-            plan,
-        )?;
-        results.push((analyses[i].clone(), gain, render));
-    }
+    let rendered = inputs
+        .par_iter()
+        .zip(staged.par_iter())
+        .enumerate()
+        .map(|(i, (input, output))| {
+            let fmt = formats.get(i).copied().unwrap_or(OutputFormat::Wav);
+            let render = normalize_stream(
+                StreamSource {
+                    path: input,
+                    spool: None,
+                },
+                output.path(),
+                &analyses[i],
+                gain,
+                plan,
+                fmt,
+                StreamRenderOptions {
+                    opus_album_lufs: Some(album_output_lufs),
+                    capture_statistics,
+                },
+            )?;
+            finalize_metadata(
+                input,
+                output.path(),
+                fmt,
+                analyses[i].lufs + gain_db(gain),
+                Some(album_output_lufs),
+                plan,
+            )?;
+            Ok((analyses[i].clone(), gain, render))
+        })
+        .collect::<Vec<Result<_, String>>>();
+    // Indexed collection preserves caller order. Resolve errors serially so
+    // simultaneous failures still report the first input deterministically.
+    let results = rendered.into_iter().collect::<Result<Vec<_>, _>>()?;
     for output in staged {
         output.commit()?;
     }
@@ -2123,10 +2138,11 @@ fn normalize_album_corrected_with_optional_analyses(
     let sources = if let Some(analyses) = preanalyzed {
         analyses.to_vec()
     } else {
-        inputs
-            .iter()
+        let measured = inputs
+            .par_iter()
             .map(|path| analyze_file_for_plan(path, channel_roles, plan))
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Vec<_>>();
+        measured.into_iter().collect::<Result<Vec<_>, _>>()?
     };
     let mut gain = album_gain(&sources, plan);
     let mut intended_album_lufs = None;
@@ -2141,10 +2157,13 @@ fn normalize_album_corrected_with_optional_analyses(
         .collect();
 
     for attempt in 0..=max_retries {
-        let mut renders = Vec::with_capacity(inputs.len());
-        for (index, (input, output)) in inputs.iter().zip(&staged_paths).enumerate() {
-            let format = formats.get(index).copied().unwrap_or(OutputFormat::Wav);
-            renders.push(
+        let album_output_lufs = album_lufs(&sources) + gain_db(gain);
+        let rendered = inputs
+            .par_iter()
+            .zip(staged_paths.par_iter())
+            .enumerate()
+            .map(|(index, (input, output))| {
+                let format = formats.get(index).copied().unwrap_or(OutputFormat::Wav);
                 normalize_stream(
                     StreamSource {
                         path: input,
@@ -2156,13 +2175,16 @@ fn normalize_album_corrected_with_optional_analyses(
                     plan,
                     format,
                     StreamRenderOptions {
-                        opus_album_lufs: Some(album_lufs(&sources) + gain_db(gain)),
+                        opus_album_lufs: Some(album_output_lufs),
                         capture_statistics: true,
                     },
-                )?
-                .expect("corrected album normalization captures render statistics"),
-            );
-        }
+                )
+                .map(|render| {
+                    render.expect("corrected album normalization captures render statistics")
+                })
+            })
+            .collect::<Vec<Result<_, String>>>();
+        let renders = rendered.into_iter().collect::<Result<Vec<_>, _>>()?;
         let expected_album_lufs = *intended_album_lufs.get_or_insert_with(|| {
             album_lufs(
                 &renders
@@ -2177,10 +2199,11 @@ fn normalize_album_corrected_with_optional_analyses(
                 .map(|render| analysis_level(&render.intended, plan.mode))
                 .collect::<Vec<_>>()
         });
-        let decoded: Vec<Analysis> = staged_paths
-            .iter()
+        let measured = staged_paths
+            .par_iter()
             .map(|path| analyze_file_with_roles(path, channel_roles))
-            .collect::<Result<_, _>>()?;
+            .collect::<Vec<_>>();
+        let decoded: Vec<Analysis> = measured.into_iter().collect::<Result<_, _>>()?;
         let actual_album_lufs = album_lufs(&decoded);
         let verifications: Vec<Verification> = decoded
             .iter()

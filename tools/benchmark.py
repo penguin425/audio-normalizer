@@ -29,6 +29,7 @@ DEFAULT_CASES = (
     "wav-stereo-analyze",
     "wav-stereo-normalize",
     "wav-stereo-resample-normalize",
+    "wav-stereo-album-normalize",
     "wav-7.1-normalize",
     "flac-stereo-analyze",
     "flac-stereo-normalize",
@@ -40,6 +41,7 @@ MAX_DURATION_SECONDS = 3_600
 MAX_PATHOLOGICAL_CHUNKS = 100_001
 MAX_ITERATIONS = 100
 CHUNK_FRAMES = 8_192
+ALBUM_TRACKS = 8
 
 
 def positive_int(value: str) -> int:
@@ -239,6 +241,11 @@ def sanitized_command(case_id: str) -> list[str]:
             "forge", "<input.wav>", "--sample-rate", "<alternate-rate>",
             "--overwrite", "-o", "<output.wav>",
         ],
+        "wav-stereo-album-normalize": [
+            "forge",
+            *[f"<input-{index:02d}.wav>" for index in range(1, ALBUM_TRACKS + 1)],
+            "--album", "--overwrite", "-o", "<output-dir>",
+        ],
         "wav-7.1-normalize": [
             "forge", "<input.wav>", "--channel-layout", "7.1", "--overwrite",
             "-o", "<output.wav>",
@@ -263,6 +270,7 @@ def case_spec(case_id: str) -> tuple[str, str, int, str]:
         "wav-stereo-analyze": ("lossless", "wav", 2, "analyze"),
         "wav-stereo-normalize": ("lossless", "wav", 2, "normalize"),
         "wav-stereo-resample-normalize": ("lossless", "wav", 2, "normalize"),
+        "wav-stereo-album-normalize": ("lossless", "wav", 2, "normalize"),
         "wav-7.1-normalize": ("multichannel", "wav", 8, "normalize"),
         "flac-stereo-analyze": ("lossless", "flac", 2, "analyze"),
         "flac-stereo-normalize": ("lossless", "flac", 2, "normalize"),
@@ -289,7 +297,8 @@ def run_case(
     category, input_format, channels, operation = case_spec(case_id)
     case_dir = workspace / case_id
     case_dir.mkdir(parents=True, exist_ok=True)
-    output_path: Path | None = None
+    output_paths: list[Path] = []
+    output_directory: Path | None = None
     output_sample_rate: int | None = None
     expected = [0]
 
@@ -299,55 +308,80 @@ def run_case(
             input_path, pathological_chunks, sample_rate
         )
         output_path = case_dir / "report.json"
+        output_paths.append(output_path)
         command = [
             str(container_qc), str(input_path), "--compact", "-o", str(output_path)
         ]
         expected = [1]
         measured_duration: float | None = None
     else:
-        wave_path = case_dir / "source.wav"
         estimated = pcm_bytes(duration, sample_rate, channels)
-        require_space(case_dir, estimated * (2 if operation == "normalize" else 1))
-        write_pcm16_wave(wave_path, duration, sample_rate, channels)
-        input_path = wave_path
-        if input_format == "flac":
-            if ffmpeg is None:
-                raise RuntimeError("ffmpeg is required for the FLAC benchmark")
-            input_path = case_dir / "input.flac"
-            encode_fixture(
-                ffmpeg, wave_path, input_path, ["-c:a", "flac"], timeout_seconds
+        if case_id == "wav-stereo-album-normalize":
+            require_space(case_dir, estimated * ALBUM_TRACKS * 2)
+            input_directory = case_dir / "inputs"
+            input_paths = [
+                input_directory / f"input-{index:02d}.wav"
+                for index in range(1, ALBUM_TRACKS + 1)
+            ]
+            input_bytes = sum(
+                write_pcm16_wave(path, duration, sample_rate, channels)
+                for path in input_paths
             )
-            wave_path.unlink()
-        elif input_format == "mp3":
-            if ffmpeg is None:
-                raise RuntimeError("ffmpeg is required for the MP3 benchmark")
-            input_path = case_dir / "input.mp3"
-            encode_fixture(
-                ffmpeg, wave_path, input_path,
-                ["-c:a", "libmp3lame", "-b:a", "320k"],
-                timeout_seconds,
-            )
-            wave_path.unlink()
-        input_bytes = input_path.stat().st_size
-        measured_duration = float(duration)
-        if operation == "normalize":
-            output_path = case_dir / "output.wav"
-            command = [str(forge), str(input_path)]
-            if case_id == "wav-stereo-resample-normalize":
-                output_sample_rate = 48_000 if sample_rate != 48_000 else 44_100
-                command += ["--sample-rate", str(output_sample_rate)]
-            if channels == 8:
-                command += ["--channel-layout", "7.1"]
-            command += ["--overwrite", "-o", str(output_path)]
+            output_directory = case_dir / "outputs"
+            output_directory.mkdir()
+            command = [
+                str(forge), *[str(path) for path in input_paths],
+                "--album", "--overwrite", "-o", str(output_directory),
+            ]
+            measured_duration = float(duration * ALBUM_TRACKS)
         else:
-            command = [str(forge), str(input_path), "--analyze", "--json"]
+            wave_path = case_dir / "source.wav"
+            require_space(case_dir, estimated * (2 if operation == "normalize" else 1))
+            write_pcm16_wave(wave_path, duration, sample_rate, channels)
+            input_path = wave_path
+            if input_format == "flac":
+                if ffmpeg is None:
+                    raise RuntimeError("ffmpeg is required for the FLAC benchmark")
+                input_path = case_dir / "input.flac"
+                encode_fixture(
+                    ffmpeg, wave_path, input_path, ["-c:a", "flac"], timeout_seconds
+                )
+                wave_path.unlink()
+            elif input_format == "mp3":
+                if ffmpeg is None:
+                    raise RuntimeError("ffmpeg is required for the MP3 benchmark")
+                input_path = case_dir / "input.mp3"
+                encode_fixture(
+                    ffmpeg, wave_path, input_path,
+                    ["-c:a", "libmp3lame", "-b:a", "320k"],
+                    timeout_seconds,
+                )
+                wave_path.unlink()
+            input_bytes = input_path.stat().st_size
+            measured_duration = float(duration)
+            if operation == "normalize":
+                output_path = case_dir / "output.wav"
+                output_paths.append(output_path)
+                command = [str(forge), str(input_path)]
+                if case_id == "wav-stereo-resample-normalize":
+                    output_sample_rate = 48_000 if sample_rate != 48_000 else 44_100
+                    command += ["--sample-rate", str(output_sample_rate)]
+                if channels == 8:
+                    command += ["--channel-layout", "7.1"]
+                command += ["--overwrite", "-o", str(output_path)]
+            else:
+                command = [str(forge), str(input_path), "--analyze", "--json"]
 
     measurements = []
     for iteration in range(iterations):
         # Measure the same complete write path every time. Outputs live only in
         # the private benchmark workspace, so removing them is deterministic.
-        if output_path is not None:
+        for output_path in output_paths:
             output_path.unlink(missing_ok=True)
+        if output_directory is not None:
+            for output_path in output_directory.iterdir():
+                if output_path.is_file():
+                    output_path.unlink()
         measurements.append(
             run_measured(
                 command,
@@ -367,11 +401,14 @@ def run_case(
         if unexpected_exit_codes
         else measurements[-1]["exit_code"]
     )
-    output_bytes = (
-        output_path.stat().st_size
-        if output_path is not None and output_path.exists()
-        else None
-    )
+    if output_directory is not None:
+        output_bytes = sum(
+            path.stat().st_size for path in output_directory.iterdir() if path.is_file()
+        )
+    elif output_paths:
+        output_bytes = sum(path.stat().st_size for path in output_paths if path.exists())
+    else:
+        output_bytes = None
     result = {
         "id": case_id,
         "category": category,
@@ -386,7 +423,7 @@ def run_case(
         "command": sanitized_command(case_id),
         **metrics,
         "realtime_factor": (
-            round(duration / metrics["wall_seconds"], 3)
+            round(measured_duration / metrics["wall_seconds"], 3)
             if measured_duration is not None and metrics["wall_seconds"] > 0
             else None
         ),
