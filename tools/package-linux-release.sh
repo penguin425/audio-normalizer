@@ -76,7 +76,9 @@ cp integrations/vst3/external/CMakeLists.txt \
 cp integrations/vst3/external/vst3sdk/CMakeLists.txt \
    "$staging/integrations/vst3/external/vst3sdk/"
 mkdir "$staging/tools" "$staging/schema"
-cp tools/benchmark.py tools/test-vst3-adapter.sh tools/test-au-adapter.sh "$staging/tools/"
+cp tools/benchmark.py tools/build-pgo-forge.sh tools/train-pgo.py \
+   tools/canonicalize-pgo-profile.py tools/package-linux-v3-release.sh \
+   tools/test-vst3-adapter.sh tools/test-au-adapter.sh "$staging/tools/"
 cp schema/performance-benchmark-v1.schema.json "$staging/schema/"
 cp schema/multi-delivery-request-v1.schema.json \
    schema/multi-delivery-report-v1.schema.json "$staging/schema/"
@@ -110,7 +112,7 @@ cp schema/audio-anomaly-provider-v1.schema.json \
    schema/service-analysis-v1.schema.json \
    schema/service-error-v1.schema.json \
    schema/service-health-v1.schema.json "$staging/schema/"
-cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md \
+cp README.md PERFORMANCE.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md \
    BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md \
    MPEGH-ADAPTER.md DTS-ADAPTER.md ANOMALY-ADAPTER.md \
    SERVICE-METRICS.md C-API.md HOST-ADAPTERS.md NEXT-GENERATION-PLAN.md \

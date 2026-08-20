@@ -114,9 +114,11 @@ the `-o` extension override this.
   path.
   Standard-input audio is spooled to a temporary file so the same correct
   two-pass algorithm remains available in shell pipelines.
-* Release profile uses `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`,
-  and `-C target-cpu=native` (auto-vectorized scalar fallbacks on top of the
-  hand-written AVX2).
+* Release profile uses `lto = "fat"`, `codegen-units = 1`, and
+  `panic = "abort"`. The published Linux `forge` CLI adds deterministic PGO
+  while retaining a generic x86-64 baseline and runtime-dispatched AVX2/FMA
+  kernels. A supplemental PGO `x86-64-v3` CLI is available for compatible
+  CPUs. Local Cargo builds use `target-cpu=native` and are not portable.
 
 See [PERFORMANCE.md](PERFORMANCE.md) for the primary research basis, measured
 release results, rejected experiments, and implementation order.
@@ -258,6 +260,12 @@ then standard library paths, and prints a clear install hint if it is missing.
 Versioned tags automatically publish GitHub Releases containing portable Forge
 binaries for Linux x86-64, Windows x86-64, macOS Intel, and macOS Apple
 Silicon. Archives also contain the cross-platform `forge-live.clap` plug-in.
+The full `linux-x86_64` archive remains the compatible default and contains a
+generic PGO `forge` CLI. Linux releases also provide a supplemental
+`linux-x86_64-v3` archive containing only a faster PGO `forge` CLI; it requires
+the x86-64-v3 ISA level (including AVX2, BMI2, FMA, and OS AVX state support).
+Use the generic archive if compatibility is uncertain. Other Linux tools,
+shared libraries, wheels, and package-manager installations remain generic.
 Each release includes generated release notes, `SHA256SUMS`, SPDX and
 CycloneDX SBOMs, an offline SLSA provenance bundle, and generated Homebrew,
 Scoop, and WinGet manifests. GitHub artifact attestations provide verifiable
