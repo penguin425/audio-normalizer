@@ -105,6 +105,10 @@ the `-o` extension override this.
   input order.
 * **Rolling block energies** make the 75%-overlapping LUFS gating blocks O(1)
   each while retaining only three seconds of filtered energy.
+* **Specialized stereo streaming analysis** keeps both K-weighting filters and
+  true-peak meters in the hot loop without dynamic channel iteration. The
+  generic channel-layout path remains unchanged, and the optimized path keeps
+  the same floating-point operation order and byte-identical normalized output.
 * **Bounded-memory streaming** decodes analysis and normalization in chunks.
   Normalization uses two sequential passes so gain is known before encoding,
   without retaining the complete audio file in RAM. Single-source render paths

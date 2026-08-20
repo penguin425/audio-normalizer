@@ -131,6 +131,89 @@ impl StreamingAnalyzer {
         let momentary_window = ((self.sample_rate as usize * 4) / 10).max(1);
         let short_term_window = (self.sample_rate as usize * 3).max(1);
         let hop = (self.sample_rate as usize / 10).max(1);
+        // Stereo is the dominant file-delivery layout. Keeping both filters and
+        // true-peak meters borrowed outside the frame loop removes the dynamic
+        // channel iterator and lets LLVM retain their state across samples.
+        // The arithmetic and window-update order intentionally matches the
+        // generic path below; no temporary PCM or energy buffer is introduced.
+        if self.timeline_interval_frames.is_none() && planar.len() == 2 {
+            let weight0 = channel_weight(self.roles[0]);
+            let weight1 = channel_weight(self.roles[1]);
+            let (filter0, filter1) = self.filters.split_at_mut(1);
+            let filter0 = &mut filter0[0];
+            let filter1 = &mut filter1[0];
+            let (meter0, meter1) = self.true_peak_meters.split_at_mut(1);
+            let meter0 = &mut meter0[0];
+            let meter1 = &mut meter1[0];
+            #[allow(
+                clippy::needless_range_loop,
+                reason = "the measured hot path uses one frame index across two fixed channels"
+            )]
+            for frame in 0..chunk_frames {
+                let sample0 = planar[0][frame];
+                let sample1 = planar[1][frame];
+                meter0.process_sample(sample0);
+                meter1.process_sample(sample1);
+                let filtered0 = filter0.process(sample0) as f64;
+                let filtered1 = filter1.process(sample1) as f64;
+                let mut weighted = 0.0;
+                weighted += weight0 * filtered0 * filtered0;
+                weighted += weight1 * filtered1 * filtered1;
+                let raw0 = sample0 as f64;
+                self.raw_sum_squares += raw0 * raw0;
+                self.sample_peak = self.sample_peak.max(sample0.abs());
+                let raw1 = sample1 as f64;
+                self.raw_sum_squares += raw1 * raw1;
+                self.sample_peak = self.sample_peak.max(sample1.abs());
+                self.weighted_sum_squares += weighted;
+                push_window(
+                    &mut self.momentary,
+                    &mut self.momentary_sum,
+                    weighted,
+                    momentary_window,
+                );
+                push_window(
+                    &mut self.short_term,
+                    &mut self.short_term_sum,
+                    weighted,
+                    short_term_window,
+                );
+                self.frames += 1;
+                if self.momentary.len() == momentary_window {
+                    self.max_momentary_ms = self
+                        .max_momentary_ms
+                        .max(self.momentary_sum / momentary_window as f64);
+                }
+                if self.short_term.len() == short_term_window {
+                    self.max_short_term_ms = self
+                        .max_short_term_ms
+                        .max(self.short_term_sum / short_term_window as f64);
+                }
+                if self.momentary.len() == momentary_window
+                    && (self.frames - momentary_window).is_multiple_of(hop)
+                {
+                    if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
+                        return Err(format!(
+                            "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-gating-block limit"
+                        ));
+                    }
+                    self.gating_blocks
+                        .push(self.momentary_sum / momentary_window as f64);
+                }
+                if self.short_term.len() == short_term_window
+                    && (self.frames - short_term_window).is_multiple_of(hop)
+                {
+                    if self.short_term_blocks.len() == MAX_LOUDNESS_BLOCKS {
+                        return Err(format!(
+                            "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-short-term-block limit"
+                        ));
+                    }
+                    self.short_term_blocks
+                        .push(self.short_term_sum / short_term_window as f64);
+                }
+            }
+            return Ok(());
+        }
         for frame in 0..chunk_frames {
             let mut weighted = 0.0;
             for ((index, channel), filter) in planar.iter().enumerate().zip(self.filters.iter_mut())
@@ -636,6 +719,45 @@ mod tests {
             streamed.ebu.integrated_lufs,
             whole_ebu.integrated_lufs
         );
+        assert!((streamed.ebu.max_momentary_lufs - whole_ebu.max_momentary_lufs).abs() < 1e-6);
+        assert!((streamed.ebu.max_short_term_lufs - whole_ebu.max_short_term_lufs).abs() < 1e-6);
+        assert!((streamed.ebu.loudness_range_lu - whole_ebu.loudness_range_lu).abs() < 1e-6);
+        assert!((streamed.rms_db - whole_rms).abs() < 1e-9);
+        assert_eq!(streamed.sample_peak, whole_peak);
+        assert_eq!(streamed.true_peak, whole_true_peak);
+    }
+
+    #[test]
+    fn stereo_streaming_measurement_matches_whole_buffer() {
+        let left: Vec<f32> = (0..192_137)
+            .map(|index| ((index as f64 * 0.071).sin() * 0.3) as f32)
+            .collect();
+        let right: Vec<f32> = (0..192_137)
+            .map(|index| ((index as f64 * 0.113).cos() * 0.2) as f32)
+            .collect();
+        let roles = vec![ChannelRole::Main, ChannelRole::Surround];
+        let buffer = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 2,
+            frames: left.len(),
+            data: vec![left.clone(), right.clone()],
+            channel_roles: roles.clone(),
+            source_kind: PcmKind::F32,
+        };
+        let whole_ebu = measure_ebu(&buffer);
+        let (whole_rms, whole_peak) = measure_rms_peak(&buffer);
+        let whole_true_peak = crate::dsp::truepeak::measure_true_peak(&buffer);
+
+        let mut streaming = StreamingAnalyzer::new(48_000, roles);
+        for start in (0..left.len()).step_by(137) {
+            let end = (start + 137).min(left.len());
+            streaming
+                .process(&[left[start..end].to_vec(), right[start..end].to_vec()])
+                .unwrap();
+        }
+        let streamed = streaming.finish();
+
+        assert!((streamed.ebu.integrated_lufs - whole_ebu.integrated_lufs).abs() < 1e-6);
         assert!((streamed.ebu.max_momentary_lufs - whole_ebu.max_momentary_lufs).abs() < 1e-6);
         assert!((streamed.ebu.max_short_term_lufs - whole_ebu.max_short_term_lufs).abs() < 1e-6);
         assert!((streamed.ebu.loudness_range_lu - whole_ebu.loudness_range_lu).abs() < 1e-6);

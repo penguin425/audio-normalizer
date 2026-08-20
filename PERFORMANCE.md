@@ -18,6 +18,14 @@ The official EBU v5 and ITU-R BS.2217-2 suites remain release gates.
 - The [Roofline model](https://digicoll.lib.berkeley.edu/record/136692/files/EECS-2008-134.pdf)
   motivates removing buffer allocation, copies, and full-signal memory traffic
   before adding more arithmetic parallelism.
+- A 2026 study of
+  [parallel cascaded recursive filtering](https://arxiv.org/abs/2607.14054)
+  shows that block state transforms can expose parallelism across samples in
+  cascaded IIR filters. Its large batched kernels and floating-point reduction
+  order are not directly interchangeable with Forge's exact streaming f64
+  metering, so Forge first specializes the common channel layout without
+  changing arithmetic order. A time-parallel implementation remains a
+  separately measured experiment.
 - Crochiere and Rabiner's
   [multirate-filter design](https://web.ece.ucsb.edu/Faculty/Rabiner/ece259/Reprints/087_optimum%20fir%20digital%20filters.pdf)
   and [interpolation/decimation tutorial](https://web.ece.ucsb.edu/Faculty/Rabiner/ece259/Reprints/179_interpolation_decimation.pdf),
@@ -47,6 +55,16 @@ The official EBU v5 and ITU-R BS.2217-2 suites remain release gates.
   define the optional x86-64-v3 build's CPU contract. The generic release
   remains the fallback rather than executing a v3 binary on an unsupported
   processor.
+- GPU work must include movement and orchestration, not just kernel timing.
+  Gregg and Hazelwood's
+  [data-movement study](https://web.stanford.edu/~cgregg/chris-gregg/pubs/WhereIsTheData.pdf),
+  the NIME paper
+  [There and Back Again](https://www.nime.org/proceedings/2020/nime2020_paper39.pdf),
+  and the DAFx
+  [General-Purpose GPU Audio Benchmark Framework](https://www.dafx.de/paper-archive/2024/papers/DAFx24_paper_56.pdf)
+  all make transfer, launch, buffer size, and CPU/GPU data residency part of a
+  meaningful audio benchmark. Forge therefore will not retain a GPU path based
+  on kernel-only throughput.
 
 These sources guide the architecture; benchmark evidence decides whether an
 individual implementation is retained.
@@ -315,10 +333,48 @@ FORGE_PGO_RUSTFLAGS='-Ctarget-cpu=x86-64' \
 tools/build-pgo-forge.sh x86_64-unknown-linux-gnu
 ```
 
+### v0.136.0: stereo streaming-analyzer specialization
+
+The dominant two-channel, non-timeline analysis path now borrows both
+K-weighting filters and true-peak meters once outside the frame loop. This
+removes the per-frame dynamic channel iterator and exposes the two independent
+filter states to LLVM while retaining the exact operation and window-update
+order. Mono, multichannel, and timeline analysis continue through the generic
+path. No PCM or energy scratch buffer is added.
+
+These measurements use the same deterministic 600-second stereo PCM16 WAVE
+input. Both binaries were built from the v0.135.0 source with Rust 1.97.0,
+`-Ctarget-cpu=x86-64`, fat LTO, and no PGO so the source change is isolated.
+Analysis uses 20 alternating baseline/candidate pairs; normalization uses 15
+alternating pairs. The table reports medians.
+
+| Workload | v0.135.0 | v0.136.0 | Change |
+| --- | ---: | ---: | ---: |
+| WAVE stereo analyze, wall | 2.495 s | 2.385 s | -4.43% |
+| WAVE stereo analyze, user CPU | 2.573 s | 2.503 s | -2.72% |
+| WAVE stereo normalize, wall | 3.077 s | 2.980 s | -3.16% |
+| WAVE stereo normalize, user CPU | 2.946 s | 2.858 s | -3.00% |
+
+The analysis JSON and normalized WAVE output were SHA-256 identical between
+the binaries. A regression test also compares chunked stereo analysis against
+the whole-buffer implementation for integrated, momentary, and short-term
+loudness, LRA, RMS, sample peak, and true peak.
+
+A channel-contiguous scratch-buffer prototype was rejected: although it made
+each recursive filter's input contiguous, copying and the extra pass increased
+analysis wall time from 2.520 seconds to 2.618 seconds (+3.9%). This agrees with
+the Roofline/data-movement basis: compiler visibility without added memory
+traffic was the useful change.
+
 ## Next implementation order
 
-1. Run a GPU proof of concept only after CPU pass/memory optimizations; retain
-   it only if transfer and launch overhead improve realistic long-form and
-   multichannel workloads.
+1. Prototype block-parallel f64 K-weighting and true-peak analysis for a single
+   long track. Retain it only if the full decode-to-result benchmark improves
+   and official EBU/ITU results remain conformant; a faster f32-only kernel is
+   not an acceptable replacement.
+2. Run a GPU proof of concept on long-form stereo and 7.1 inputs, reporting
+   host/device transfer, kernel, reduction, and total wall time separately.
+   Keep the exact CPU path as the fallback and retain GPU dispatch only where
+   the transfer-inclusive median is faster on measured hardware.
 
 Every phase adds a benchmark case or compatible baseline gate before release.

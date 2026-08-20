@@ -241,6 +241,10 @@ Forge already provides:
   byte-reproducible rebuilds, and an optional x86-64-v3 PGO CLI for compatible
   CPUs while package managers, libraries, and the default archive remain on
   the generic CPU baseline.
+- A stereo-specialized streaming analyzer that keeps both K-weighting filters
+  and true-peak meters borrowed across the frame loop, removes dynamic channel
+  iteration for the dominant delivery layout, preserves the generic timeline
+  and multichannel path, and produces byte-identical normalized audio.
 - Versioned multi-delivery optimization for two to 32 codec/profile outputs,
   using one conservative target, ceiling, and iteratively corrected gain;
   staged post-metadata re-decoding, explicit infeasibility, path-alias and
