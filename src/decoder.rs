@@ -13,6 +13,9 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+const MONO_WAV_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+const MULTICHANNEL_WAV_STREAM_CHUNK_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct StreamInfo {
     pub sample_rate: u32,
@@ -687,23 +690,36 @@ where
     })?;
 
     let frame_bytes = info.channels as usize * info.source_kind.bytes_per_sample();
-    let chunk_bytes = (64 * 1024 / frame_bytes).max(1) * frame_bytes;
+    let chunk_bytes = wav_stream_chunk_bytes(info.channels, info.source_kind);
     let mut remaining = data_size;
     let mut bytes = vec![0; chunk_bytes];
+    let mut planar = Vec::new();
     while remaining >= frame_bytes {
         let read_size = remaining.min(chunk_bytes);
         let aligned = read_size - read_size % frame_bytes;
         file.read_exact(&mut bytes[..aligned])
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        let mut planar = crate::dsp::convert::decode_planar(
+        crate::dsp::convert::decode_planar_into(
             &bytes[..aligned],
             info.source_kind,
             info.channels as usize,
+            &mut planar,
         );
         consume(&info, &mut planar)?;
         remaining -= aligned;
     }
     Ok(info)
+}
+
+fn wav_stream_chunk_bytes(channels: u16, kind: PcmKind) -> usize {
+    debug_assert!(channels > 0);
+    let frame_bytes = channels as usize * kind.bytes_per_sample();
+    let target = if channels == 1 {
+        MONO_WAV_STREAM_CHUNK_BYTES
+    } else {
+        MULTICHANNEL_WAV_STREAM_CHUNK_BYTES
+    };
+    (target / frame_bytes).max(1) * frame_bytes
 }
 
 fn source_kind(extension: &str, bits: Option<u32>) -> PcmKind {
@@ -735,6 +751,34 @@ mod tests {
             declared_layout: Some(CHANNEL_LAYOUT_STEREO.clone()),
             channel_roles: default_channel_roles(2),
             source_kind: PcmKind::F32,
+        }
+    }
+
+    #[test]
+    fn wav_stream_chunks_are_adaptive_and_frame_aligned() {
+        assert_eq!(wav_stream_chunk_bytes(1, PcmKind::S16), 64 * 1024);
+        assert_eq!(wav_stream_chunk_bytes(2, PcmKind::S16), 1024 * 1024);
+
+        for kind in [
+            PcmKind::U8,
+            PcmKind::S16,
+            PcmKind::S24,
+            PcmKind::S32,
+            PcmKind::F32,
+            PcmKind::F64,
+        ] {
+            for channels in [1, 2, 8] {
+                let frame_bytes = channels as usize * kind.bytes_per_sample();
+                let chunk_bytes = wav_stream_chunk_bytes(channels, kind);
+                let target = if channels == 1 {
+                    MONO_WAV_STREAM_CHUNK_BYTES
+                } else {
+                    MULTICHANNEL_WAV_STREAM_CHUNK_BYTES
+                };
+                assert_eq!(chunk_bytes % frame_bytes, 0);
+                assert!(chunk_bytes <= target);
+                assert!(target - chunk_bytes < frame_bytes);
+            }
         }
     }
 

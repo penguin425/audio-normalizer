@@ -246,6 +246,11 @@ Forge already provides:
   and true-peak meters borrowed across the frame loop, removes dynamic channel
   iteration for the dominant delivery layout, preserves the generic timeline
   and multichannel path, and produces byte-identical normalized audio.
+- Adaptive native-WAVE streaming chunks: a frame-aligned 1 MiB read/decode
+  buffer for stereo and multichannel inputs, the established 64 KiB buffer for
+  mono, and one reusable planar allocation across the stream. The policy is
+  selected from measured latency, memory, and scheduler evidence rather than
+  file duration, and preserves every supported PCM representation exactly.
 - Versioned multi-delivery optimization for two to 32 codec/profile outputs,
   using one conservative target, ceiling, and iteratively corrected gain;
   staged post-metadata re-decoding, explicit infeasibility, path-alias and

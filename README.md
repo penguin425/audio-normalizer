@@ -109,6 +109,10 @@ the `-o` extension override this.
   true-peak meters in the hot loop without dynamic channel iteration. The
   generic channel-layout path remains unchanged, and the optimized path keeps
   the same floating-point operation order and byte-identical normalized output.
+* **Adaptive WAVE streaming chunks** keep the low-latency 64 KiB read size for
+  mono while using a frame-aligned 1 MiB chunk for stereo and multichannel
+  inputs. The planar decode buffer is reused between reads, reducing allocator,
+  scheduler, and I/O-call overhead without changing decoded samples.
 * **Bounded-memory streaming** decodes analysis and normalization in chunks.
   Normalization uses two sequential passes so gain is known before encoding,
   without retaining the complete audio file in RAM. Single-source render paths
