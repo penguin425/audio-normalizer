@@ -389,13 +389,71 @@ analysis wall time from 2.520 seconds to 2.618 seconds (+3.9%). This agrees with
 the Roofline/data-movement basis: compiler visibility without added memory
 traffic was the useful change.
 
+### v0.137.0: adaptive native-WAVE streaming chunks
+
+Native WAVE analysis and normalization had used one 64 KiB read/decode chunk
+for every layout. On long stereo and multichannel inputs, each chunk enters a
+bounded Rayon channel-decode region; the small fixed size therefore caused
+thousands of avoidable scheduling transitions and I/O calls. The stream now
+reuses one planar decode allocation and selects a frame-aligned 1 MiB chunk for
+two or more channels. Mono retains 64 KiB because increasing it to 1 MiB was
+about 1% slower and provided no parallel channel work to amortize. Both sizes
+remain bounded and independent of file duration.
+
+A chunk-size sweep first measured 256 KiB 9.38% faster than 64 KiB, then 1 MiB
+4.08% faster than 256 KiB. Raising the size again to 4 MiB was 0.92% slower
+than 1 MiB and increased peak RSS from about 13 MiB to 28 MiB, so 1 MiB is the
+retained knee rather than an arbitrary maximum. These comparisons use the same
+source, optimized build settings, and alternating runs.
+
+The long-form cases below compare v0.136.0 with the retained implementation.
+Outputs and analysis reports were compared exactly; fixture generation is
+outside the measured interval.
+
+| Workload | v0.136.0 | v0.137.0 | Change |
+| --- | ---: | ---: | ---: |
+| 600 s stereo WAVE normalize | 2.974 s | 2.381 s | -20.0% |
+| 30 s 7.1 WAVE normalize | 1.009 s | 0.589 s | -41.7% |
+| Eight 30 s stereo files, batch, `--jobs 8` | 0.281 s | 0.186 s | -33.9% |
+| Eight 30 s stereo files, album, `--jobs 8` | 0.278 s | 0.188 s | -32.4% |
+
+In the 600-second stereo case, user CPU fell 21.0%, system CPU fell 81.6%, and
+voluntary context switches fell from 29,728 to 2,247. A one-second stereo case
+was 0.83% slower, which is below the retained benchmark's noise floor. The
+eight-file cases increased peak RSS from 25,344 KiB to 48,640 KiB: a bounded
+22.7 MiB cost from larger buffers being live on several workers. Users can
+continue to lower `--jobs` when memory is the binding resource.
+
+U8, signed 16/24/32-bit, and float 32/64-bit WAVE fixtures produced identical
+analysis and normalized output with the old and new chunk policies. Tests also
+cover mono, stereo, and 7.1 frame alignment for every PCM representation.
+
+A separate true-peak experiment cached a reference to the static polyphase
+coefficient table inside each meter. Twenty CPU-pinned alternating pairs showed
+a -0.05% wall median, a +0.15% paired median, and +0.74% user CPU, with exact
+analysis output. It was rejected as no measurable improvement; a future stereo
+kernel must remove shared coefficient loads or instructions rather than merely
+relocate the lookup.
+
+A fixed f64 energy-ring experiment replaced both streaming `VecDeque` windows
+and their per-sample hop moduli with one three-second circular buffer and two
+countdowns. It preserved the exact add/subtract and block-emission order, and
+the 600-second analysis JSON was byte-identical. Twenty CPU-pinned alternating
+pairs measured 1.482 seconds for the established path and 1.477 seconds for the
+candidate (-0.28%), but the median paired change was only -0.06% and candidate
+user CPU was 0.24% higher. The structural rewrite was rejected as benchmark
+noise rather than retained on the strength of a sub-percent unpaired median.
+
 ## Next implementation order
 
-1. Prototype block-parallel f64 K-weighting and true-peak analysis for a single
+1. Prototype a two-channel true-peak interpolation kernel that shares phase
+   coefficient loads across independent left/right histories while retaining
+   each channel's FMA and maximum-reduction order.
+2. Prototype block-parallel f64 K-weighting and true-peak analysis for a single
    long track. Retain it only if the full decode-to-result benchmark improves
    and official EBU/ITU results remain conformant; a faster f32-only kernel is
    not an acceptable replacement.
-2. Run a GPU proof of concept on long-form stereo and 7.1 inputs, reporting
+3. Run a GPU proof of concept on long-form stereo and 7.1 inputs, reporting
    host/device transfer, kernel, reduction, and total wall time separately.
    Keep the exact CPU path as the fallback and retain GPU dispatch only where
    the transfer-inclusive median is faster on measured hardware.
