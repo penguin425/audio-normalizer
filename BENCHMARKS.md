@@ -20,9 +20,12 @@ the maximum observed RSS so a fast outlier cannot hide a memory regression.
 | --- | --- |
 | `wav-stereo-analyze` | 48 kHz stereo PCM16 WAVE, loudness and true-peak analysis |
 | `wav-stereo-normalize` | 48 kHz stereo PCM16 WAVE, two-pass WAVE normalization |
+| `wav-stereo-resample-normalize` | Stereo PCM16 WAVE, normalization to the alternate 44.1/48 kHz rate with output-domain PCM reuse |
 | `wav-7.1-normalize` | 48 kHz 8-channel PCM16 WAVE, explicit `7.1` layout normalization |
 | `flac-stereo-analyze` | FFmpeg-generated lossless FLAC, JSON analysis |
+| `flac-stereo-normalize` | FFmpeg-generated lossless FLAC, decoded-PCM reuse and WAVE normalization |
 | `mp3-stereo-analyze` | FFmpeg-generated 320 kbit/s MP3, JSON analysis |
+| `mp3-stereo-normalize` | FFmpeg-generated 320 kbit/s MP3, same-rate re-decode control and WAVE normalization |
 | `pathological-wave-qc` | 100,001 empty WAVE chunks, bounded container-QC rejection |
 
 Fixture generation and codec encoding happen before the measured command.

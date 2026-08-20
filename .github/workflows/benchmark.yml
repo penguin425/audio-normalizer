@@ -66,7 +66,7 @@ jobs:
           assert report["$schema"] == schema["$id"]
           assert report["passed"] is True
           assert report["error"] is None
-          assert len(report["results"]) == 6
+          assert len(report["results"]) == 9
           assert all(item["passed"] for item in report["results"])
           assert all(item["iterations"] == 3 for item in report["results"])
           assert all(len(item["samples"]) == 3 for item in report["results"])

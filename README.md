@@ -93,12 +93,19 @@ the `-o` extension override this.
   each while retaining only three seconds of filtered energy.
 * **Bounded-memory streaming** decodes analysis and normalization in chunks.
   Normalization uses two sequential passes so gain is known before encoding,
-  without retaining the complete audio file in RAM.
+  without retaining the complete audio file in RAM. Single-source render paths
+  reuse temporary output-domain PCM for resampled audio and decode-heavy
+  lossless/DSD inputs, avoiding a second decode or resample; fast same-rate
+  inputs and multi-track albums retain the lower-I/O/bounded-resource re-decode
+  path.
   Standard-input audio is spooled to a temporary file so the same correct
   two-pass algorithm remains available in shell pipelines.
 * Release profile uses `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`,
   and `-C target-cpu=native` (auto-vectorized scalar fallbacks on top of the
   hand-written AVX2).
+
+See [PERFORMANCE.md](PERFORMANCE.md) for the primary research basis, measured
+release results, rejected experiments, and implementation order.
 
 ### Benchmark
 
@@ -109,9 +116,10 @@ cargo build --locked --release --bin forge --bin forge-container-qc
 python3 tools/benchmark.py --forge target/release/forge --iterations 5 --output benchmark.json
 ```
 
-The suite covers one-hour stereo WAVE analysis, stereo and 7.1 WAVE
-normalization, lossless FLAC and lossy MP3 analysis, and bounded rejection of a
-pathological WAVE chunk population. Fixture generation is excluded from
+The suite covers one-hour stereo WAVE analysis, same-rate and resampled stereo
+normalization, 7.1 WAVE normalization, lossless FLAC and lossy MP3 analysis and
+normalization, and bounded rejection of a pathological WAVE chunk population.
+Fixture generation is excluded from
 measurement. Reports retain repeated samples and include median wall/CPU time,
 maximum peak RSS, real-time factor, host identity, workload settings, and
 optional same-host regression checks. See [BENCHMARKS.md](BENCHMARKS.md) for
@@ -2182,6 +2190,7 @@ src/
   report_tools.rs    versioned migration and explainable model/compliance findings
   mpegh_adapter.rs  native MHAS framing + bounded conforming decoder adapter
   dts_adapter.rs    native DTS core/HD framing + bounded decoder adapter
+  pcm_spool.rs      temporary output-domain PCM reuse between exact stages
   wavpack_qc.rs     native WavPack block/metadata/checksum structural QC
   monkeys_audio_qc.rs native Monkey's Audio frame-boundary + descriptor-MD5 QC
   alac_qc.rs        ALAC magic-cookie + strict native access-unit decode QC
