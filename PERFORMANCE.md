@@ -18,6 +18,14 @@ The official EBU v5 and ITU-R BS.2217-2 suites remain release gates.
 - The [Roofline model](https://digicoll.lib.berkeley.edu/record/136692/files/EECS-2008-134.pdf)
   motivates removing buffer allocation, copies, and full-signal memory traffic
   before adding more arithmetic parallelism.
+- A 2026 study of
+  [parallel cascaded recursive filtering](https://arxiv.org/abs/2607.14054)
+  shows that block state transforms can expose parallelism across samples in
+  cascaded IIR filters. Its large batched kernels and floating-point reduction
+  order are not directly interchangeable with Forge's exact streaming f64
+  metering, so Forge first specializes the common channel layout without
+  changing arithmetic order. A time-parallel implementation remains a
+  separately measured experiment.
 - Crochiere and Rabiner's
   [multirate-filter design](https://web.ece.ucsb.edu/Faculty/Rabiner/ece259/Reprints/087_optimum%20fir%20digital%20filters.pdf)
   and [interpolation/decimation tutorial](https://web.ece.ucsb.edu/Faculty/Rabiner/ece259/Reprints/179_interpolation_decimation.pdf),
@@ -38,7 +46,11 @@ The official EBU v5 and ITU-R BS.2217-2 suites remain release gates.
   define the instrument, train, merge, and profile-use pipeline. Forge uses
   the exact toolchain-matched `llvm-profdata`, identical code-generation flags
   in both builds, and an explicit target so build scripts do not pollute the
-  profile. Pettis and Hansen's
+  profile. LLVM maintainers also note that
+  [value-profile updates are order-dependent](https://discourse.llvm.org/t/pgo-profile-reproducibility/82861/2),
+  even when ordinary counters use atomic updates; Forge therefore relies on
+  deterministic branch counters rather than indirect-call or memory-size
+  value profiles. Pettis and Hansen's
   [profile-guided code-positioning work](https://pages.cs.wisc.edu/~fischer/cs701.f05/code.positioning.pdf)
   provides the underlying hot-path layout motivation; its historical gains
   are not treated as a Forge performance prediction.
@@ -47,6 +59,16 @@ The official EBU v5 and ITU-R BS.2217-2 suites remain release gates.
   define the optional x86-64-v3 build's CPU contract. The generic release
   remains the fallback rather than executing a v3 binary on an unsupported
   processor.
+- GPU work must include movement and orchestration, not just kernel timing.
+  Gregg and Hazelwood's
+  [data-movement study](https://web.stanford.edu/~cgregg/chris-gregg/pubs/WhereIsTheData.pdf),
+  the NIME paper
+  [There and Back Again](https://www.nime.org/proceedings/2020/nime2020_paper39.pdf),
+  and the DAFx
+  [General-Purpose GPU Audio Benchmark Framework](https://www.dafx.de/paper-archive/2024/papers/DAFx24_paper_56.pdf)
+  all make transfer, launch, buffer size, and CPU/GPU data residency part of a
+  meaningful audio benchmark. Forge therefore will not retain a GPU path based
+  on kernel-only throughput.
 
 These sources guide the architecture; benchmark evidence decides whether an
 individual implementation is retained.
@@ -261,12 +283,14 @@ FLAC analysis/normalization, native verification, resampling, dither, limiting,
 training invocation uses `--jobs 1`; the profile directory must be empty, and
 the profile generator and consumer use identical target/features/Rust flags.
 
-Raw profiles from two independent training runs differed only in three cold
-mutex/registry functions. The canonicalizer zeros an entire function only
-when its maximum counter is below 10,000; hot counters and value profiles are
-left unchanged. The two canonical profiles and their indexed LLVM profiles
-were byte-identical. Release CI independently repeats the complete build and
-requires byte-identical generic and v3 archives before publication.
+Raw profiles from two initial same-host training runs differed only in three
+cold mutex/registry functions. The v0.135.0 canonicalizer zeros an entire
+function only when its maximum counter is below 10,000; hot counters and value
+profiles were left unchanged. Those two canonical profiles and their indexed
+LLVM profiles were byte-identical. A later cross-runner v3 release rebuild
+showed that preserving value profiles was not sufficient; v0.136.0 hardens
+that input as described below. Release CI independently repeats the complete
+build and requires byte-identical generic and v3 archives before publication.
 
 These measurements use 600-second deterministic inputs and seven-run medians.
 The generic PGO column compares a generic x86-64 build with and without PGO.
@@ -315,10 +339,65 @@ FORGE_PGO_RUSTFLAGS='-Ctarget-cpu=x86-64' \
 tools/build-pgo-forge.sh x86_64-unknown-linux-gnu
 ```
 
+### v0.136.0: counter-only PGO and stereo analyzer specialization
+
+LLVM instrumentation value profiles record indirect-call targets and memory
+operation sizes in addition to ordinary branch counters. Their bounded value
+tables depend on runtime insertion order, so two runs can have identical
+counter summaries yet produce different optimized layouts. Forge now passes
+LLVM's `-disable-vp` option in both PGO phases, and the text-profile
+canonicalizer removes any residual value records defensively. Hot branch
+counters, the 10,000-count cold-function rule, training inputs, and the
+independent release rebuild remain unchanged.
+
+On the same 600-second stereo WAVE input, 20 alternating x86-64-v3 analysis
+pairs measured 1.768 seconds with the original full profile and 1.776 seconds
+with the counter-only profile (+0.45%). Fifteen normalization pairs measured
+2.248 seconds for both profiles (counter-only was 0.03% lower before
+rounding). These sub-percent differences are treated as noise rather than a
+speed claim. Analysis JSON and normalized WAVE output were byte-identical,
+while the counter-only CLI was 384 bytes smaller.
+
+The dominant two-channel, non-timeline analysis path now borrows both
+K-weighting filters and true-peak meters once outside the frame loop. This
+removes the per-frame dynamic channel iterator and exposes the two independent
+filter states to LLVM while retaining the exact operation and window-update
+order. Mono, multichannel, and timeline analysis continue through the generic
+path. No PCM or energy scratch buffer is added.
+
+These measurements use the same deterministic 600-second stereo PCM16 WAVE
+input. Both binaries were built from the v0.135.0 source with Rust 1.97.0,
+`-Ctarget-cpu=x86-64`, fat LTO, and no PGO so the source change is isolated.
+Analysis uses 20 alternating baseline/candidate pairs; normalization uses 15
+alternating pairs. The table reports medians.
+
+| Workload | v0.135.0 | v0.136.0 | Change |
+| --- | ---: | ---: | ---: |
+| WAVE stereo analyze, wall | 2.495 s | 2.385 s | -4.43% |
+| WAVE stereo analyze, user CPU | 2.573 s | 2.503 s | -2.72% |
+| WAVE stereo normalize, wall | 3.077 s | 2.980 s | -3.16% |
+| WAVE stereo normalize, user CPU | 2.946 s | 2.858 s | -3.00% |
+
+The analysis JSON and normalized WAVE output were SHA-256 identical between
+the binaries. A regression test also compares chunked stereo analysis against
+the whole-buffer implementation for integrated, momentary, and short-term
+loudness, LRA, RMS, sample peak, and true peak.
+
+A channel-contiguous scratch-buffer prototype was rejected: although it made
+each recursive filter's input contiguous, copying and the extra pass increased
+analysis wall time from 2.520 seconds to 2.618 seconds (+3.9%). This agrees with
+the Roofline/data-movement basis: compiler visibility without added memory
+traffic was the useful change.
+
 ## Next implementation order
 
-1. Run a GPU proof of concept only after CPU pass/memory optimizations; retain
-   it only if transfer and launch overhead improve realistic long-form and
-   multichannel workloads.
+1. Prototype block-parallel f64 K-weighting and true-peak analysis for a single
+   long track. Retain it only if the full decode-to-result benchmark improves
+   and official EBU/ITU results remain conformant; a faster f32-only kernel is
+   not an acceptable replacement.
+2. Run a GPU proof of concept on long-form stereo and 7.1 inputs, reporting
+   host/device transfer, kernel, reduction, and total wall time separately.
+   Keep the exact CPU path as the fallback and retain GPU dispatch only where
+   the transfer-inclusive median is faster on measured hardware.
 
 Every phase adds a benchmark case or compatible baseline gate before release.

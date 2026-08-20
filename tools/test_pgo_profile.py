@@ -35,12 +35,15 @@ hot
 2
 
 """
-        rendered, count = profile.canonicalize(source, 10_000)
+        rendered, count, removed_value_profiles = profile.canonicalize(
+            source, 10_000
+        )
         self.assertEqual(count, 1)
+        self.assertEqual(removed_value_profiles, 0)
         self.assertIn("cold\n# Func Hash:\n1\n# Num Counters:\n3\n# Counter Values:\n0\n0\n0\n", rendered)
         self.assertIn("hot\n# Func Hash:\n2\n# Num Counters:\n3\n# Counter Values:\n4\n10000\n2\n", rendered)
 
-    def test_value_profile_payload_is_preserved(self):
+    def test_value_profile_payload_is_removed(self):
         source = """# IR level Instrumentation Flag
 :ir
 cold
@@ -59,11 +62,25 @@ cold
 1
 8:3
 
+next
+# Func Hash:
+2
+# Num Counters:
+1
+# Counter Values:
+10000
+
 """
-        rendered, count = profile.canonicalize(source, 10_000)
+        rendered, count, removed_value_profiles = profile.canonicalize(
+            source, 10_000
+        )
         self.assertEqual(count, 1)
+        self.assertEqual(removed_value_profiles, 1)
         self.assertIn("# Counter Values:\n0\n", rendered)
-        self.assertIn("# NumValueSites:\n1\n1\n8:3\n", rendered)
+        self.assertNotIn("# Num Value Kinds:", rendered)
+        self.assertNotIn("# NumValueSites:", rendered)
+        self.assertNotIn("8:3", rendered)
+        self.assertIn("next\n# Func Hash:\n2\n", rendered)
 
     def test_rejects_non_ir_and_truncated_profiles(self):
         with self.assertRaises(ValueError):

@@ -46,7 +46,11 @@ if [[ -n "$features" ]]; then
   cargo_args+=(--features "$features")
 fi
 
-generate_flags="${base_rustflags:+${base_rustflags} }-Cprofile-generate=${profile_dir}"
+# LLVM value-profile updates depend on runtime insertion order and are not
+# reproducible across otherwise identical training runs. Branch counters carry
+# the hot-path information Forge needs, so disable value profiling in both
+# phases and let the canonicalizer remove any value records defensively.
+generate_flags="${base_rustflags:+${base_rustflags} }-Cllvm-args=-disable-vp -Cprofile-generate=${profile_dir}"
 CARGO_TARGET_DIR="$instrumented_target" \
 RUSTFLAGS="$generate_flags" \
   cargo "${cargo_args[@]}"
@@ -84,7 +88,7 @@ merged_profile="${pgo_root}/merged.profdata"
 "$llvm_profdata" merge --output="$merged_profile" "$canonical_profile"
 "$llvm_profdata" show --detailed-summary "$merged_profile"
 
-use_flags="${base_rustflags:+${base_rustflags} }-Cprofile-use=${merged_profile} -Cllvm-args=-pgo-warn-missing-function"
+use_flags="${base_rustflags:+${base_rustflags} }-Cllvm-args=-disable-vp -Cprofile-use=${merged_profile} -Cllvm-args=-pgo-warn-missing-function"
 CARGO_TARGET_DIR="$optimized_target" \
 RUSTFLAGS="$use_flags" \
   cargo "${cargo_args[@]}"

@@ -105,6 +105,10 @@ the `-o` extension override this.
   input order.
 * **Rolling block energies** make the 75%-overlapping LUFS gating blocks O(1)
   each while retaining only three seconds of filtered energy.
+* **Specialized stereo streaming analysis** keeps both K-weighting filters and
+  true-peak meters in the hot loop without dynamic channel iteration. The
+  generic channel-layout path remains unchanged, and the optimized path keeps
+  the same floating-point operation order and byte-identical normalized output.
 * **Bounded-memory streaming** decodes analysis and normalization in chunks.
   Normalization uses two sequential passes so gain is known before encoding,
   without retaining the complete audio file in RAM. Single-source render paths
@@ -115,10 +119,11 @@ the `-o` extension override this.
   Standard-input audio is spooled to a temporary file so the same correct
   two-pass algorithm remains available in shell pipelines.
 * Release profile uses `lto = "fat"`, `codegen-units = 1`, and
-  `panic = "abort"`. The published Linux `forge` CLI adds deterministic PGO
-  while retaining a generic x86-64 baseline and runtime-dispatched AVX2/FMA
-  kernels. A supplemental PGO `x86-64-v3` CLI is available for compatible
-  CPUs. Local Cargo builds use `target-cpu=native` and are not portable.
+  `panic = "abort"`. The published Linux `forge` CLI adds deterministic,
+  branch-counter-only PGO while retaining a generic x86-64 baseline and
+  runtime-dispatched AVX2/FMA kernels. A supplemental PGO `x86-64-v3` CLI is
+  available for compatible CPUs. Local Cargo builds use `target-cpu=native`
+  and are not portable.
 
 See [PERFORMANCE.md](PERFORMANCE.md) for the primary research basis, measured
 release results, rejected experiments, and implementation order.
