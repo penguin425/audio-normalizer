@@ -275,7 +275,7 @@ fn parse_fmt(body: &[u8]) -> Result<ParsedFormat, WavReadError> {
     })
 }
 
-fn roles_from_wave_mask(mask: u32, channels: u16) -> Vec<ChannelRole> {
+pub(crate) fn roles_from_wave_mask(mask: u32, channels: u16) -> Vec<ChannelRole> {
     use ChannelRole::{Lfe, Main, Surround};
     let p = ChannelRole::positioned;
     let mut roles = Vec::with_capacity(channels as usize);

@@ -166,14 +166,47 @@ NaNs, infinities, signed zero, half-LSB boundaries, random bit patterns, mono,
 stereo, and non-vector-length tails. Limiter and render-statistics paths retain
 their established sequencing.
 
+### v0.133.0: native lossless verification tee
+
+`--verify` now measures the exact quantized PCM accepted by Forge's native
+WAVE and FLAC writers during the encode pass. WAVE exposes the byte buffer it
+actually wrote; FLAC exposes the signed integer samples handed to its verified
+encoder. A reusable planar scratch buffer feeds the unchanged streaming
+BS.1770 analyzer, eliminating the completed-file probe/read/decode pass while
+preserving quantization, TPDF dither, channel roles, limiter output, and retry
+semantics. Codec-dependent MP3, AAC, ALAC, Opus, and Vorbis outputs still
+re-decode the completed file. Multi-delivery also retains its final re-decode
+after metadata mutation before committing outputs.
+
+A lower-memory experiment decoded interleaved PCM directly inside the
+BS.1770 sample loop. It was rejected: removing the planar scratch also removed
+parallel channel decode, increasing the 1,200-second WAVE verification median
+by 4.4% and user CPU by 3.0%. The retained design follows the measured
+Roofline tradeoff instead of assuming fewer buffers are automatically faster.
+
+These comparisons use 1,200-second stereo PCM16 WAVE sources and seven-run
+medians from identically optimized builds. Fixture generation is excluded.
+
+| Workload / metric | v0.132.0 | v0.133.0 | Change |
+| --- | ---: | ---: | ---: |
+| WAVE verify wall time | 12.893 s | 12.751 s | -1.1% |
+| WAVE verify user CPU | 13.970 s | 13.891 s | -0.6% |
+| WAVE verify system CPU | 5.141 s | 4.975 s | -3.2% |
+| WAVE -> FLAC verify wall time | 16.913 s | 16.548 s | -2.2% |
+| WAVE -> FLAC verify user CPU | 18.622 s | 18.173 s | -2.4% |
+| Peak RSS (both workloads) | 16.0 MiB | 16.0 MiB | unchanged |
+
+Tests compare tee and completed-file decode measurements bit-for-bit for every
+WAVE PCM kind, dithered and undithered PCM16, FLAC 16/24-bit with dither, and
+stereo/5.1/7.1 channel layouts. The benchmark harness adds dedicated WAVE and
+FLAC verification cases so this pass-removal remains a release gate.
+
 ## Next implementation order
 
-1. Tee lossless verification measurements into encoding and remove avoidable
-   post-encode reads without weakening lossy-codec verification.
-2. Reuse content-addressed analyses across identical input/plan requests.
-3. Train and compare profile-guided builds, then publish architecture-specific
+1. Reuse content-addressed analyses across identical input/plan requests.
+2. Train and compare profile-guided builds, then publish architecture-specific
    binaries only where reproducible gains justify the distribution cost.
-4. Run a GPU proof of concept only after CPU pass/memory optimizations; retain
+3. Run a GPU proof of concept only after CPU pass/memory optimizations; retain
    it only if transfer and launch overhead improve realistic long-form and
    multichannel workloads.
 
