@@ -1454,10 +1454,12 @@ forge library/*.flac -o normalized/ \
 The complete input byte stream and all measurement-changing options are
 SHA-256-bound; paths and modification times are not cache identity. Entries
 are atomically committed, schema validated, and invalid entries are visibly
-recomputed. `--analysis-cache-read-only` permits hits without creating,
-repairing, or evicting data. See [ANALYSIS-CACHE.md](ANALYSIS-CACHE.md) for
-scope, eviction and corruption behavior, bounds, measurement provenance, and
-the versioned
+recomputed. Multi-input album and independent-file jobs perform cache hit/miss
+work in the bounded `--jobs` pool, then report observations, failures, and
+commits in input order. `--analysis-cache-read-only` permits hits without
+creating, repairing, or evicting data. See
+[ANALYSIS-CACHE.md](ANALYSIS-CACHE.md) for scope, eviction and corruption
+behavior, bounds, measurement provenance, and the versioned
 [`analysis-cache-v1`](schema/analysis-cache-v1.schema.json) contract.
 
 ### SQLite catalogue

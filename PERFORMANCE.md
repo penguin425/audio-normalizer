@@ -129,8 +129,9 @@ build settings and deterministic fixture generator.
 integration test. The 32-asset cap bounds simultaneous file handles, encoder
 state, memory, and temporary-output count; users can select a smaller
 `--jobs` value when storage throughput or temporary capacity is the limit.
-Post-encode verification, difference reports, and analysis-cache runs retain
-their established serial paths for now.
+At this release, post-encode verification, difference reports, and
+analysis-cache runs retained their established serial paths. v0.134.0 removes
+the analysis-cache exception while preserving the other safety boundaries.
 
 ### v0.132.0: render and writer hot-path fusion
 
@@ -201,12 +202,45 @@ WAVE PCM kind, dithered and undithered PCM16, FLAC 16/24-bit with dither, and
 stereo/5.1/7.1 channel layouts. The benchmark harness adds dedicated WAVE and
 FLAC verification cases so this pass-removal remains a release gate.
 
+### v0.134.0: parallel content-addressed cache integration
+
+The content-addressed analysis cache predates the file-level parallel paths,
+so enabling `--analysis-cache` had forced multi-input normalization back to a
+serial loop. Cache hit validation and miss computation now run in the same
+bounded Rayon pool selected by `--jobs`. Album rendering consumes the ordered
+precomputed analyses, while independent batches stage their outputs in a
+second parallel wave. Cache observations, errors, transactional commits,
+catalogue rows, checkpoints, and progress events remain input ordered. Entry
+commit plus capacity pruning is serialized within one process; hashing and
+BS.1770 analysis remain parallel.
+
+These cases use eight independent 1,200-second stereo PCM16 WAVE tracks (9,600
+seconds total) and seven-run medians from identically optimized builds. Cache
+warming is outside the measured interval for hit cases; miss cases remove the
+cache before every measured invocation. Every invocation writes the complete
+1,843,200,352-byte output set.
+
+| Workload | v0.133.0 | v0.134.0 | Change | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| Independent batch, cache hit | 17.304 s | 4.261 s | -75.4% | 4.06x |
+| Independent batch, cache miss | 22.072 s | 7.197 s | -67.4% | 3.07x |
+| Album, cache hit | 8.247 s | 5.334 s | -35.3% | 1.55x |
+| Album, cache miss | 13.900 s | 8.220 s | -40.9% | 1.69x |
+
+Warm independent batches also reduce user CPU by 46.5% and system CPU by
+80.1%, with peak RSS unchanged at 16.25 MiB. Cold-cache parallelism trades more
+CPU and live analyzer state for latency: independent-batch user CPU rises
+187%, while wall time falls 67.4% and peak RSS remains only 35.6 MiB. The album
+miss case peaks at 37.8 MiB. `--jobs 1` retains the low-resource serial mode.
+Tests exercise concurrent entry publication and bounded eviction, and compare
+serial/parallel cache-hit outputs byte-for-byte while checking deterministic
+cache messages and progress ordering.
+
 ## Next implementation order
 
-1. Reuse content-addressed analyses across identical input/plan requests.
-2. Train and compare profile-guided builds, then publish architecture-specific
+1. Train and compare profile-guided builds, then publish architecture-specific
    binaries only where reproducible gains justify the distribution cost.
-3. Run a GPU proof of concept only after CPU pass/memory optimizations; retain
+2. Run a GPU proof of concept only after CPU pass/memory optimizations; retain
    it only if transfer and launch overhead improve realistic long-form and
    multichannel workloads.
 

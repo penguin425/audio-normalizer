@@ -1397,17 +1397,13 @@ fn run_paths(
         let cached_analyses = analysis_cache
             .as_ref()
             .map(|cache| {
-                cli.inputs
-                    .iter()
-                    .map(|path| {
-                        analyze_for_plan_cached(
-                            Some(cache),
-                            path,
-                            channel_roles_override.as_deref(),
-                            &plan,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()
+                analyze_many_for_plan_cached(
+                    cache,
+                    &cli.inputs,
+                    channel_roles_override.as_deref(),
+                    &plan,
+                )
+                .map_err(|error| error.message)
             })
             .transpose()?;
         if cli.dry_run {
@@ -1701,8 +1697,7 @@ fn run_paths(
         && !cli.gain_only
         && !cli.dry_run
         && !cli.verify
-        && cli.difference_report.is_none()
-        && analysis_cache.is_none();
+        && cli.difference_report.is_none();
     if parallel_batch {
         let wave_width = rayon::current_num_threads().clamp(1, MAX_BATCH_WAVE_ASSETS);
         let mut index = 0_usize;
@@ -1758,18 +1753,61 @@ fn run_paths(
                 }
             }
 
+            let cached_analyses = if let Some(cache) = analysis_cache.as_ref() {
+                match analyze_many_for_plan_cached(
+                    cache,
+                    &cli.inputs[wave_start..wave_end],
+                    channel_roles_override.as_deref(),
+                    &plan,
+                ) {
+                    Ok(analyses) => Some(analyses),
+                    Err(error) => {
+                        let asset_index = wave_start + error.index;
+                        if let Some(writer) = &mut progress {
+                            writer.emit(
+                                "asset_failed",
+                                batch_job
+                                    .as_ref()
+                                    .map_or(completed_without_job, BatchJob::completed_count),
+                                cli.inputs.len(),
+                                Some((
+                                    asset_index,
+                                    &cli.inputs[asset_index],
+                                    &outputs[asset_index],
+                                )),
+                                Some(&error.message),
+                            )?;
+                        }
+                        return Err(error.message);
+                    }
+                }
+            } else {
+                None
+            };
+
             let staged = (wave_start..wave_end)
                 .into_par_iter()
                 .map(|asset_index| {
                     let output = &outputs[asset_index];
                     prepare_output_directories(std::slice::from_ref(output))?;
-                    normalize::normalize_one_staged_with_roles(
-                        &cli.inputs[asset_index],
-                        output,
-                        &plan,
-                        formats[asset_index],
-                        channel_roles_override.as_deref(),
-                    )
+                    if let Some(analyses) = cached_analyses.as_ref() {
+                        normalize::normalize_one_preanalyzed_staged_with_roles(
+                            &cli.inputs[asset_index],
+                            output,
+                            &plan,
+                            formats[asset_index],
+                            channel_roles_override.as_deref(),
+                            &analyses[asset_index - wave_start],
+                        )
+                    } else {
+                        normalize::normalize_one_staged_with_roles(
+                            &cli.inputs[asset_index],
+                            output,
+                            &plan,
+                            formats[asset_index],
+                            channel_roles_override.as_deref(),
+                        )
+                    }
                 })
                 .collect::<Vec<Result<_, String>>>();
 
@@ -2601,6 +2639,32 @@ fn analyze_range_cached(
         duration_seconds,
         timeline_interval_ms,
     )
+}
+
+#[derive(Debug)]
+struct IndexedAnalysisError {
+    index: usize,
+    message: String,
+}
+
+fn analyze_many_for_plan_cached(
+    cache: &AnalysisCache,
+    inputs: &[PathBuf],
+    channel_roles: Option<&[ChannelRole]>,
+    plan: &Plan,
+) -> Result<Vec<Analysis>, IndexedAnalysisError> {
+    let cached = inputs
+        .par_iter()
+        .map(|input| cache.analyze_for_plan(input, channel_roles, plan))
+        .collect::<Vec<_>>();
+    let mut analyses = Vec::with_capacity(inputs.len());
+    for (index, (input, result)) in inputs.iter().zip(cached).enumerate() {
+        match result {
+            Ok(cached) => analyses.push(observe_cache(input, cached)),
+            Err(message) => return Err(IndexedAnalysisError { index, message }),
+        }
+    }
+    Ok(analyses)
 }
 
 fn analyze_for_plan_cached(

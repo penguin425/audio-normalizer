@@ -16,6 +16,7 @@ use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const ANALYSIS_CACHE_SCHEMA_V1: &str =
@@ -72,6 +73,7 @@ pub struct Cached<T> {
 pub struct AnalysisCache {
     root: PathBuf,
     policy: AnalysisCachePolicy,
+    mutation: Arc<Mutex<()>>,
 }
 
 impl AnalysisCache {
@@ -86,7 +88,11 @@ impl AnalysisCache {
                 root.display()
             ));
         }
-        Ok(Self { root, policy })
+        Ok(Self {
+            root,
+            policy,
+            mutation: Arc::new(Mutex::new(())),
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -244,6 +250,10 @@ impl AnalysisCache {
                 ),
             });
         }
+        let _mutation = self
+            .mutation
+            .lock()
+            .map_err(|_| "analysis cache mutation lock is poisoned".to_string())?;
         self.store(&path, &bytes)?;
         self.prune(&path)?;
         Ok(Cached {
@@ -862,6 +872,7 @@ fn is_cache_filename(value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::wav::{AudioBuffer, WavWriter};
+    use rayon::prelude::*;
 
     fn wav(path: &Path, amplitude: f32) {
         let frames = 48_000;
@@ -909,6 +920,70 @@ mod tests {
         let changed = cache.analyze_file(&input, None).unwrap();
         assert_eq!(changed.disposition, CacheDisposition::Stored);
         assert_ne!(first.value.lufs, changed.value.lufs);
+    }
+
+    #[test]
+    fn parallel_unique_inputs_store_complete_entries_and_then_hit() {
+        let directory = tempfile::tempdir().unwrap();
+        let inputs = (0..8)
+            .map(|index| {
+                let input = directory.path().join(format!("tone-{index}.wav"));
+                wav(&input, 0.05 + index as f32 * 0.01);
+                input
+            })
+            .collect::<Vec<_>>();
+        let cache = AnalysisCache::new(
+            directory.path().join("cache"),
+            AnalysisCachePolicy::default(),
+        )
+        .unwrap();
+
+        let stored = inputs
+            .par_iter()
+            .map(|input| cache.analyze_file(input, None).unwrap().disposition)
+            .collect::<Vec<_>>();
+        assert_eq!(stored, vec![CacheDisposition::Stored; inputs.len()]);
+        assert_eq!(cache.recognized_entries().unwrap().len(), inputs.len());
+
+        let hits = inputs
+            .par_iter()
+            .map(|input| cache.analyze_file(input, None).unwrap().disposition)
+            .collect::<Vec<_>>();
+        assert_eq!(hits, vec![CacheDisposition::Hit; inputs.len()]);
+    }
+
+    #[test]
+    fn parallel_writers_respect_a_small_shared_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let inputs = (0..8)
+            .map(|index| {
+                let input = directory.path().join(format!("bounded-{index}.wav"));
+                wav(&input, 0.05 + index as f32 * 0.01);
+                input
+            })
+            .collect::<Vec<_>>();
+        let cache_root = directory.path().join("cache");
+        let sizing = AnalysisCache::new(&cache_root, AnalysisCachePolicy::default()).unwrap();
+        sizing.analyze_file(&inputs[0], None).unwrap();
+        let first_size = sizing.recognized_entries().unwrap()[0].bytes;
+        let max_bytes = first_size + 1024;
+        let bounded = AnalysisCache::new(
+            &cache_root,
+            AnalysisCachePolicy {
+                read_only: false,
+                max_bytes,
+            },
+        )
+        .unwrap();
+
+        let results = inputs[1..]
+            .par_iter()
+            .map(|input| bounded.analyze_file(input, None))
+            .collect::<Vec<_>>();
+        assert!(results.iter().all(Result::is_ok));
+        let entries = bounded.recognized_entries().unwrap();
+        assert!(!entries.is_empty());
+        assert!(entries.iter().map(|entry| entry.bytes).sum::<u64>() <= max_bytes);
     }
 
     #[test]

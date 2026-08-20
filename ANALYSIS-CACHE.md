@@ -52,9 +52,13 @@ DIR/v1/aa/<64-character-input-sha256>/<64-character-request-sha256>.json
 
 Forge creates a sibling temporary file, writes and synchronizes the complete
 entry, then atomically replaces the destination. Concurrent producers of the
-same address therefore publish only complete documents. Separate processes
-may share a cache; eviction is best-effort FIFO by file modification time, so
-a concurrent process can legitimately turn an expected hit into a miss.
+same address therefore publish only complete documents. Multi-input album and
+independent-file jobs hash, validate, or compute cache results in the shared
+`--jobs` pool; observations and failures are resolved in input order. Within
+one Forge process, entry commits and capacity pruning are serialized while the
+expensive hashing and analysis remain parallel. Separate processes may share a
+cache; eviction is best-effort FIFO by file modification time, so a concurrent
+process can legitimately turn an expected hit into a miss.
 Inputs are expected to remain stable while Forge runs. Writable and read-only
 misses hash again after measurement and fail instead of publishing when the
 ordinary start/end content hashes differ.
