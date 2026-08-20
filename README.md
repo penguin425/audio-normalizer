@@ -103,6 +103,9 @@ the `-o` extension override this.
   coefficient loads without changing either channel's FMA or maximum order.
   Multichannel analysis processes adjacent meter pairs in channel-contiguous
   passes while preserving the established K-weighting and channel-sum order.
+  Long four-or-more-channel chunks distribute those independent pairs across
+  the existing `--jobs` pool; short decoder packets remain sequential so task
+  coordination cannot dominate useful work.
 * **Multi-threaded** via rayon — channels, independent album tracks, and
   ordinary multi-file normalization share one work-stealing pool bounded by
   `--jobs`. Independent files render in waves of at most 32, then publish in
