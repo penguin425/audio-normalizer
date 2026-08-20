@@ -444,15 +444,95 @@ candidate (-0.28%), but the median paired change was only -0.06% and candidate
 user CPU was 0.24% higher. The structural rewrite was rejected as benchmark
 noise rather than retained on the strength of a sub-percent unpaired median.
 
+### v0.138.0: paired stereo true-peak processing
+
+The stereo-specialized analyzer had kept both true-peak meters borrowed across
+the frame loop but still called them separately. Each 2×/4× interpolation
+therefore loaded the same immutable 16-row phase table twice, and the compiler
+could not keep both histories and factor branches visible in one unit. The
+stereo path now advances both independent meters together. AVX2/FMA, AArch64
+NEON, and scalar implementations load each coefficient row once, then update a
+separate accumulator for each channel in the established 16-tap order. Sample
+history, frame maximum, and accumulated meter peak remain independent.
+
+These CPU-pinned comparisons use Rust 1.97.0, native host tuning, fat LTO, no
+PGO, and deterministic PCM16 WAVE inputs containing the same 28.8 million
+stereo frames: 600 seconds at 48 kHz, 300 seconds at 96 kHz, and 150 seconds at
+192 kHz. The 48 kHz analysis uses a rotating three-way order across 20 groups;
+normalization and the other rates use 15 alternating pairs. Fixture generation
+is excluded.
+
+| Workload | v0.137.0 | v0.138.0 | Change |
+| --- | ---: | ---: | ---: |
+| 48 kHz stereo analyze, wall | 1.477 s | 1.262 s | -14.60% |
+| 48 kHz stereo analyze, user CPU | 1.439 s | 1.214 s | -15.69% |
+| 48 kHz stereo normalize, wall | 1.745 s | 1.518 s | -13.01% |
+| 48 kHz stereo normalize, user CPU | 1.509 s | 1.284 s | -14.94% |
+| 96 kHz stereo analyze, wall | 1.526 s | 1.306 s | -14.42% |
+| 96 kHz stereo analyze, user CPU | 1.441 s | 1.230 s | -14.63% |
+| 192 kHz stereo analyze, wall | 0.686 s | 0.612 s | -10.73% |
+| 192 kHz stereo analyze, user CPU | 0.525 s | 0.452 s | -13.86% |
+
+The median paired wall changes were -14.32% for 48 kHz analysis, -13.20% for
+48 kHz normalization, -14.21% at 96 kHz, and -10.73% at 192 kHz. Every paired
+48 kHz analysis and normalization comparison improved. The 192 kHz path has no
+FIR interpolation; its result shows the additional benefit of resolving both
+meter control paths together rather than attributing the whole gain to
+coefficient traffic.
+
+Analysis JSON was byte-identical at 48, 96, and 192 kHz, and the normalized
+48 kHz WAVE output was byte-identical. A regression test compares every
+per-frame return and final meter peak bit-for-bit against two independent
+meters at all three rates, exercising 4×, 2×, and direct-sample paths.
+
+A one-line `#[inline]` experiment on the original single-meter method was also
+measured in the same 20-group three-way run. Its wall median changed by -0.38%,
+its paired median by +0.02%, and user CPU by -0.19%. It was rejected as noise;
+the retained improvement comes from the paired state/dataflow, not an inlining
+hint alone.
+
+#### Block-parallel K-weighting feasibility screen
+
+The published block-matrix IIR result is strongest for high-order cascades and
+large batches. Its reference implementation uses AVX2 `Vec8f`, compiles with
+`-ffast-math`, and reports its headline result for a 16th-order cascade on a
+Meteor Lake core. Forge's K-weighting workload is only two biquads, retains f64
+state, rounds the first stage to f32 before the second, and must carry exact
+state across bounded decoder chunks. The per-stage rounding makes the existing
+mapping nonlinear with respect to the state, so a superposition or prefix-scan
+rewrite cannot be bit-identical to the established sample recurrence.
+
+Before investing in a different-arithmetic matrix kernel, Forge measured its
+absolute end-to-end opportunity. An intentionally invalid identity-filter
+build removed both K-weighting biquads completely. Across 20 CPU-pinned,
+alternating 600-second stereo analysis pairs, the established path had 1.255 s
+wall and 1.210 s user-CPU medians; the no-K-weighting upper bound had 1.110 s
+and 1.060 s medians, reductions of 11.55% and 12.40%. No implementable filter
+optimization can exceed that wall-time bound on this workload.
+
+An exact two-lane prototype then updated identically configured left/right
+biquads together without changing either lane's operation order. It matched
+independent filters bit-for-bit at 8, 44.1, 48, 96, and 192 kHz, and the full
+analysis JSON was byte-identical. Nevertheless, its 20-pair wall median rose
+from 1.250 s to 1.280 s (+2.40%), while user CPU rose from 1.215 s to 1.250 s
+(+2.88%; paired median +2.46%). LLVM already exposes this small scalar cascade
+efficiently in the stereo analyzer; the extra shape and coefficient checks
+made it worse.
+
+The paired K-weighting prototype was removed. A block-matrix implementation is
+deferred unless Forge gains a higher-order recursive workload or an explicitly
+non-bit-exact analysis mode. The current exact, low-order K-weighting path does
+not justify altered rounding, block permutation, correction passes, and task
+coordination for an end-to-end opportunity capped at 11.55% before overhead.
+
 ## Next implementation order
 
-1. Prototype a two-channel true-peak interpolation kernel that shares phase
-   coefficient loads across independent left/right histories while retaining
-   each channel's FMA and maximum-reduction order.
-2. Prototype block-parallel f64 K-weighting and true-peak analysis for a single
-   long track. Retain it only if the full decode-to-result benchmark improves
-   and official EBU/ITU results remain conformant; a faster f32-only kernel is
-   not an acceptable replacement.
+1. Extend the measured paired true-peak dataflow to multichannel layouts,
+   retaining independent state and channel-order reductions. Keep it only when
+   long-form 5.1/7.1 end-to-end medians improve without mono/stereo regression.
+2. Prototype bounded per-channel analysis parallelism for one long
+   multichannel asset. Account for scratch traffic and the shared `--jobs`
+   budget; prefer existing file-level work when several assets are available.
 3. Run a GPU proof of concept on long-form stereo and 7.1 inputs, reporting
    host/device transfer, kernel, reduction, and total wall time separately.
    Keep the exact CPU path as the fallback and retain GPU dispatch only where

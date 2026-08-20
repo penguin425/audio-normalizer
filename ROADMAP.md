@@ -251,6 +251,10 @@ Forge already provides:
   mono, and one reusable planar allocation across the stream. The policy is
   selected from measured latency, memory, and scheduler evidence rather than
   file duration, and preserves every supported PCM representation exactly.
+- Paired stereo true-peak processing that shares immutable polyphase
+  coefficient loads and exposes both meter states in one hot loop while
+  retaining separate histories, per-channel FMA/reduction order, runtime SIMD
+  fallbacks, and bit-identical 48/96/192 kHz measurements.
 - Versioned multi-delivery optimization for two to 32 codec/profile outputs,
   using one conservative target, ceiling, and iteratively corrected gain;
   staged post-metadata re-decoding, explicit infeasibility, path-alias and

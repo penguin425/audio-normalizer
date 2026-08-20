@@ -152,8 +152,7 @@ impl StreamingAnalyzer {
             for frame in 0..chunk_frames {
                 let sample0 = planar[0][frame];
                 let sample1 = planar[1][frame];
-                meter0.process_sample(sample0);
-                meter1.process_sample(sample1);
+                TruePeakMeter::process_stereo_sample(meter0, meter1, sample0, sample1);
                 let filtered0 = filter0.process(sample0) as f64;
                 let filtered1 = filter1.process(sample1) as f64;
                 let mut weighted = 0.0;
