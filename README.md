@@ -88,7 +88,8 @@ the `-o` extension override this.
 * **Sample-rate-aware true-peak analysis** uses a copy-free circular history,
   SIMD polyphase interpolation, and the BS.1770 measurement domain: 4× below
   96 kHz, 2× below 192 kHz, and direct samples at 192 kHz and above.
-* **Multi-threaded** via rayon — channels and files are processed in parallel.
+* **Multi-threaded** via rayon — channels and independent album tracks share
+  one work-stealing pool bounded by `--jobs`.
 * **Rolling block energies** make the 75%-overlapping LUFS gating blocks O(1)
   each while retaining only three seconds of filtered energy.
 * **Bounded-memory streaming** decodes analysis and normalization in chunks.
@@ -1252,7 +1253,7 @@ forge program.wav -o out.wav --target=-23
 forge track.wav -o out.wav --mode=peak --target-peak=-1
 
 # Album mode: one shared gain across all tracks (mixed formats allowed)
-forge --album a.wav b.mp3 c.flac -o ./normalized/
+forge --album a.wav b.mp3 c.flac -o ./normalized/ --jobs 8
 
 # Recursively normalize a library while preserving subdirectories
 forge ./library --recursive -o ./normalized
@@ -1563,7 +1564,7 @@ backup behavior.
 | `--bits` | input's | `8`/`16`/`24`/`32`/`32f`/`64f` output format |
 | `--wav-container` | `auto` | `auto`, `riff`, `rf64`, or `bw64` WAV container |
 | `--bwf` | off | Preserve/write BWF v2 metadata and measured loudness fields |
-| `-j, --jobs` | all cores | Worker thread count |
+| `-j, --jobs` | all cores | Shared channel/album-track worker count |
 
 The signal-health checks use bounded, deterministic PCM analysis: dropouts are
 short interior low-level runs, phase reversal is measured over consecutive
