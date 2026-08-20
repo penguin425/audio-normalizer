@@ -237,7 +237,8 @@ Forge already provides:
   scalar/SIMD equivalence coverage for exceptional values and quantizer
   boundaries.
 - Deterministic LLVM instrumentation PGO for the generic Linux `forge` CLI,
-  with bounded serial training, cold-profile canonicalization, independent
+  with bounded serial training, order-independent branch counters, removal of
+  nondeterministic value profiles, cold-profile canonicalization, independent
   byte-reproducible rebuilds, and an optional x86-64-v3 PGO CLI for compatible
   CPUs while package managers, libraries, and the default archive remain on
   the generic CPU baseline.

@@ -46,7 +46,11 @@ The official EBU v5 and ITU-R BS.2217-2 suites remain release gates.
   define the instrument, train, merge, and profile-use pipeline. Forge uses
   the exact toolchain-matched `llvm-profdata`, identical code-generation flags
   in both builds, and an explicit target so build scripts do not pollute the
-  profile. Pettis and Hansen's
+  profile. LLVM maintainers also note that
+  [value-profile updates are order-dependent](https://discourse.llvm.org/t/pgo-profile-reproducibility/82861/2),
+  even when ordinary counters use atomic updates; Forge therefore relies on
+  deterministic branch counters rather than indirect-call or memory-size
+  value profiles. Pettis and Hansen's
   [profile-guided code-positioning work](https://pages.cs.wisc.edu/~fischer/cs701.f05/code.positioning.pdf)
   provides the underlying hot-path layout motivation; its historical gains
   are not treated as a Forge performance prediction.
@@ -279,12 +283,14 @@ FLAC analysis/normalization, native verification, resampling, dither, limiting,
 training invocation uses `--jobs 1`; the profile directory must be empty, and
 the profile generator and consumer use identical target/features/Rust flags.
 
-Raw profiles from two independent training runs differed only in three cold
-mutex/registry functions. The canonicalizer zeros an entire function only
-when its maximum counter is below 10,000; hot counters and value profiles are
-left unchanged. The two canonical profiles and their indexed LLVM profiles
-were byte-identical. Release CI independently repeats the complete build and
-requires byte-identical generic and v3 archives before publication.
+Raw profiles from two initial same-host training runs differed only in three
+cold mutex/registry functions. The v0.135.0 canonicalizer zeros an entire
+function only when its maximum counter is below 10,000; hot counters and value
+profiles were left unchanged. Those two canonical profiles and their indexed
+LLVM profiles were byte-identical. A later cross-runner v3 release rebuild
+showed that preserving value profiles was not sufficient; v0.136.0 hardens
+that input as described below. Release CI independently repeats the complete
+build and requires byte-identical generic and v3 archives before publication.
 
 These measurements use 600-second deterministic inputs and seven-run medians.
 The generic PGO column compares a generic x86-64 build with and without PGO.
@@ -333,7 +339,24 @@ FORGE_PGO_RUSTFLAGS='-Ctarget-cpu=x86-64' \
 tools/build-pgo-forge.sh x86_64-unknown-linux-gnu
 ```
 
-### v0.136.0: stereo streaming-analyzer specialization
+### v0.136.0: counter-only PGO and stereo analyzer specialization
+
+LLVM instrumentation value profiles record indirect-call targets and memory
+operation sizes in addition to ordinary branch counters. Their bounded value
+tables depend on runtime insertion order, so two runs can have identical
+counter summaries yet produce different optimized layouts. Forge now passes
+LLVM's `-disable-vp` option in both PGO phases, and the text-profile
+canonicalizer removes any residual value records defensively. Hot branch
+counters, the 10,000-count cold-function rule, training inputs, and the
+independent release rebuild remain unchanged.
+
+On the same 600-second stereo WAVE input, 20 alternating x86-64-v3 analysis
+pairs measured 1.768 seconds with the original full profile and 1.776 seconds
+with the counter-only profile (+0.45%). Fifteen normalization pairs measured
+2.248 seconds for both profiles (counter-only was 0.03% lower before
+rounding). These sub-percent differences are treated as noise rather than a
+speed claim. Analysis JSON and normalized WAVE output were byte-identical,
+while the counter-only CLI was 384 bytes smaller.
 
 The dominant two-channel, non-timeline analysis path now borrows both
 K-weighting filters and true-peak meters once outside the frame loop. This

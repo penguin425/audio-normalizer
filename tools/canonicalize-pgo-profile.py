@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Canonicalize cold counters in an LLVM instrumentation text profile.
+"""Canonicalize nondeterministic data in an LLVM instrumentation text profile.
 
 Serial training still observes a few randomized registry and runtime-lock
 branches.  Those counters are far below Forge's DSP hot paths but can perturb
 code layout and break release reproducibility.  This tool zeros every counter
 for a function only when that function's maximum counter is below a fixed
-threshold.  Hot-function counters and all value-profile records are preserved.
+threshold.  LLVM value profiles are removed because their update order is not
+reproducible even when ordinary counters are updated atomically.  Hot-function
+counters remain unchanged.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from pathlib import Path
 DEFAULT_COLD_THRESHOLD = 10_000
 COUNTER_COUNT_MARKER = "# Num Counters:"
 COUNTER_VALUES_MARKER = "# Counter Values:"
+VALUE_KIND_COUNT_MARKER = "# Num Value Kinds:"
 
 
 def positive_int(value: str) -> int:
@@ -28,14 +31,23 @@ def positive_int(value: str) -> int:
     return parsed
 
 
-def canonicalize(text: str, threshold: int) -> tuple[str, int]:
+def canonicalize(text: str, threshold: int) -> tuple[str, int, int]:
     if not text.startswith("# IR level Instrumentation Flag\n:ir\n"):
         raise ValueError("input is not an LLVM IR instrumentation text profile")
     lines = text.splitlines(keepends=True)
     canonicalized = 0
+    removed_value_profiles = 0
     index = 0
     while index < len(lines):
-        if lines[index].rstrip("\r\n") != COUNTER_COUNT_MARKER:
+        marker = lines[index].rstrip("\r\n")
+        if marker == VALUE_KIND_COUNT_MARKER:
+            end = index + 1
+            while end < len(lines) and lines[end].strip():
+                end += 1
+            del lines[index:end]
+            removed_value_profiles += 1
+            continue
+        if marker != COUNTER_COUNT_MARKER:
             index += 1
             continue
         if index + 3 >= len(lines):
@@ -60,7 +72,7 @@ def canonicalize(text: str, threshold: int) -> tuple[str, int]:
                 lines[counter_index] = f"0{newline}"
             canonicalized += 1
         index = end
-    return "".join(lines), canonicalized
+    return "".join(lines), canonicalized, removed_value_profiles
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,7 +91,7 @@ def main() -> int:
     destination = args.output.expanduser().resolve()
     if source == destination:
         raise ValueError("input and output must be different files")
-    rendered, count = canonicalize(
+    rendered, count, removed_value_profiles = canonicalize(
         source.read_text(encoding="utf-8"), args.cold_threshold
     )
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -88,7 +100,8 @@ def main() -> int:
     os.replace(temporary, destination)
     print(
         f"forge-pgo-canonicalize: zeroed {count} cold functions "
-        f"(max counter < {args.cold_threshold})",
+        f"(max counter < {args.cold_threshold}); removed "
+        f"{removed_value_profiles} value-profile records",
         file=sys.stderr,
     )
     return 0
