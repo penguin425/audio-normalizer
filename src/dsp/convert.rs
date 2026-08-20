@@ -7,6 +7,8 @@
 
 use crate::wav::PcmKind;
 use rayon::prelude::*;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 
 /// Decode an interleaved PCM byte buffer into planar f32 channels.
 ///
@@ -125,16 +127,52 @@ pub(crate) fn encode_interleaved_with_rngs(
     dither: bool,
     rngs: &mut [u64],
 ) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_interleaved_with_rngs_into(planar, kind, dither, rngs, &mut out);
+    out
+}
+
+/// Encode into caller-owned storage so streaming writers can reuse one buffer.
+pub(crate) fn encode_interleaved_with_rngs_into(
+    planar: &[Vec<f32>],
+    kind: PcmKind,
+    dither: bool,
+    rngs: &mut [u64],
+    out: &mut Vec<u8>,
+) {
     let channels = planar.len();
+    assert!(channels >= 1);
     assert_eq!(rngs.len(), channels);
     let frames = planar[0].len();
     for channel in planar {
         assert_eq!(channel.len(), frames, "channel length mismatch");
     }
     let bpp = kind.bytes_per_sample();
-    let mut out = vec![0u8; frames * channels * bpp];
-    let mut idx = 0usize;
-    for (f, _) in planar[0].iter().enumerate() {
+    out.clear();
+    out.resize(frames * channels * bpp, 0);
+
+    #[cfg(target_arch = "x86_64")]
+    if kind == PcmKind::S16 && !dither && channels <= 2 && is_x86_feature_detected!("avx2") {
+        unsafe { encode_s16_no_dither_avx2(planar, out) };
+        return;
+    }
+
+    encode_interleaved_scalar_from(planar, kind, dither, rngs, out, 0);
+}
+
+fn encode_interleaved_scalar_from(
+    planar: &[Vec<f32>],
+    kind: PcmKind,
+    dither: bool,
+    rngs: &mut [u64],
+    out: &mut [u8],
+    start_frame: usize,
+) {
+    let channels = planar.len();
+    let bpp = kind.bytes_per_sample();
+    let frames = planar[0].len();
+    let mut idx = start_frame * channels * bpp;
+    for f in start_frame..frames {
         for (ch, rng) in planar.iter().zip(rngs.iter_mut()) {
             let s = ch[f];
             let b = encode_sample(s, kind, dither, rng);
@@ -142,7 +180,85 @@ pub(crate) fn encode_interleaved_with_rngs(
             idx += bpp;
         }
     }
-    out
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn encode_s16_no_dither_avx2(planar: &[Vec<f32>], out: &mut [u8]) {
+    let frames = planar[0].len();
+    let channels = planar.len();
+    let mut frame = 0;
+    if channels == 1 {
+        while frame + 8 <= frames {
+            let samples = _mm256_loadu_ps(planar[0].as_ptr().add(frame));
+            let quantized = quantize_s16x8(samples);
+            let packed = _mm_packs_epi32(
+                _mm256_castsi256_si128(quantized),
+                _mm256_extracti128_si256(quantized, 1),
+            );
+            _mm_storeu_si128(out.as_mut_ptr().add(frame * 2).cast(), packed);
+            frame += 8;
+        }
+    } else {
+        while frame + 8 <= frames {
+            let left = quantize_s16x8(_mm256_loadu_ps(planar[0].as_ptr().add(frame)));
+            let right = quantize_s16x8(_mm256_loadu_ps(planar[1].as_ptr().add(frame)));
+            let left = _mm_packs_epi32(
+                _mm256_castsi256_si128(left),
+                _mm256_extracti128_si256(left, 1),
+            );
+            let right = _mm_packs_epi32(
+                _mm256_castsi256_si128(right),
+                _mm256_extracti128_si256(right, 1),
+            );
+            let low = _mm_unpacklo_epi16(left, right);
+            let high = _mm_unpackhi_epi16(left, right);
+            let destination = out.as_mut_ptr().add(frame * 4);
+            _mm_storeu_si128(destination.cast(), low);
+            _mm_storeu_si128(destination.add(16).cast(), high);
+            frame += 8;
+        }
+    }
+    let mut rngs = [0_u64; 2];
+    encode_interleaved_scalar_from(
+        planar,
+        PcmKind::S16,
+        false,
+        &mut rngs[..channels],
+        out,
+        frame,
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_s16x8(samples: __m256) -> __m256i {
+    let ordered = _mm256_cmp_ps::<{ _CMP_ORD_Q }>(samples, samples);
+    let finite_or_infinite = _mm256_and_ps(samples, ordered);
+    let clamped = _mm256_min_ps(
+        _mm256_set1_ps(1.0),
+        _mm256_max_ps(_mm256_set1_ps(-1.0), finite_or_infinite),
+    );
+    let scaled = _mm256_mul_ps(clamped, _mm256_set1_ps(32_768.0));
+    let truncated = _mm256_cvttps_epi32(scaled);
+    let fraction = _mm256_and_ps(
+        _mm256_sub_ps(scaled, _mm256_cvtepi32_ps(truncated)),
+        _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff)),
+    );
+    let crosses_half = _mm256_castps_si256(_mm256_cmp_ps::<{ _CMP_GE_OQ }>(
+        fraction,
+        _mm256_set1_ps(0.5),
+    ));
+    let direction = _mm256_or_si256(
+        _mm256_srai_epi32::<31>(_mm256_castps_si256(scaled)),
+        _mm256_set1_epi32(1),
+    );
+    let rounded = _mm256_add_epi32(truncated, _mm256_and_si256(crosses_half, direction));
+    _mm256_min_epi32(
+        _mm256_set1_epi32(32_767),
+        _mm256_max_epi32(_mm256_set1_epi32(-32_768), rounded),
+    )
 }
 
 #[inline]
@@ -228,6 +344,71 @@ mod tests {
             let plain = encode_interleaved(&samples, kind, false);
             let dithered = encode_interleaved(&samples, kind, true);
             assert_ne!(dithered, plain, "dither was inert for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn s16_simd_encoder_matches_scalar_quantization() {
+        let mut state = 0x243f_6a88_u32;
+        let mut channel = vec![
+            f32::NAN,
+            f32::INFINITY,
+            -f32::INFINITY,
+            -1.0,
+            1.0,
+            -0.0,
+            0.0,
+            0.5 / 32_768.0,
+            -0.5 / 32_768.0,
+            1.5 / 32_768.0,
+            -1.5 / 32_768.0,
+        ];
+        while channel.len() < 4_099 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            channel.push(f32::from_bits(state));
+        }
+        for lower_code in -32_768..32_768 {
+            let sample = (lower_code as f32 + 0.5) / 32_768.0;
+            channel.extend([
+                f32::from_bits(sample.to_bits() - 1),
+                sample,
+                f32::from_bits(sample.to_bits() + 1),
+            ]);
+        }
+
+        for channels in 1..=2 {
+            let planar = if channels == 1 {
+                vec![channel.clone()]
+            } else {
+                let mut other = channel.clone();
+                other.reverse();
+                vec![channel.clone(), other]
+            };
+            let mut expected = vec![0; channel.len() * channels * 2];
+            let mut expected_rngs = dither_rngs(channels);
+            encode_interleaved_scalar_from(
+                &planar,
+                PcmKind::S16,
+                false,
+                &mut expected_rngs,
+                &mut expected,
+                0,
+            );
+
+            let mut actual_rngs = dither_rngs(channels);
+            let mut actual = Vec::new();
+            encode_interleaved_with_rngs_into(
+                &planar,
+                PcmKind::S16,
+                false,
+                &mut actual_rngs,
+                &mut actual,
+            );
+
+            assert_eq!(actual, expected, "channels={channels}");
+            assert_eq!(actual_rngs, expected_rngs, "channels={channels}");
         }
     }
 }

@@ -30,6 +30,27 @@ fn apply_gain_scalar(buf: &mut [f32], gain: f32) {
     }
 }
 
+/// Multiply and hard-limit in one pass while preserving the established
+/// `f32` operation order and exceptional-value behavior.
+#[inline]
+pub fn apply_gain_and_hard_clip(buf: &mut [f32], gain: f32, ceil: f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe { apply_gain_and_hard_clip_avx2(buf, gain, ceil) };
+            return;
+        }
+    }
+    apply_gain_and_hard_clip_scalar(buf, gain, ceil)
+}
+
+#[inline]
+fn apply_gain_and_hard_clip_scalar(buf: &mut [f32], gain: f32, ceil: f32) {
+    for sample in buf {
+        *sample = (*sample * gain).clamp(-ceil, ceil);
+    }
+}
+
 /// Exact sum of `x*x` over the slice, accumulated in **f64** for numerical
 /// stability across very long files. Used for LUFS energy summation.
 #[inline]
@@ -107,6 +128,27 @@ unsafe fn apply_gain_avx2(buf: &mut [f32], gain: f32) {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn apply_gain_and_hard_clip_avx2(buf: &mut [f32], gain: f32, ceil: f32) {
+    let n = buf.len();
+    let gain_vector = _mm256_set1_ps(gain);
+    let lower = _mm256_set1_ps(-ceil);
+    let upper = _mm256_set1_ps(ceil);
+    let mut i = 0;
+    while i + 8 <= n {
+        let samples = _mm256_loadu_ps(buf.as_ptr().add(i));
+        let gained = _mm256_mul_ps(samples, gain_vector);
+        // Put the gained sample in the second operand. MAXPS/MINPS select that
+        // operand for unordered inputs, preserving NaNs for the quantizer's
+        // established NaN-to-silence handling.
+        let protected = _mm256_min_ps(upper, _mm256_max_ps(lower, gained));
+        _mm256_storeu_ps(buf.as_mut_ptr().add(i), protected);
+        i += 8;
+    }
+    apply_gain_and_hard_clip_scalar(&mut buf[i..], gain, ceil);
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn sum_squares_avx2(buf: &[f32]) -> f64 {
     let n = buf.len();
@@ -166,4 +208,50 @@ unsafe fn abs_max_avx2(buf: &[f32]) -> f32 {
         }
     }
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combined_gain_and_clip_matches_separate_passes_bit_for_bit() {
+        let mut expected = vec![
+            -f32::INFINITY,
+            -2.0,
+            -1.0,
+            -0.0,
+            0.0,
+            0.125,
+            0.75,
+            1.0,
+            2.0,
+            f32::INFINITY,
+            f32::from_bits(0x7fc0_1234),
+            -0.333_333_34,
+            0.333_333_34,
+            -f32::MIN_POSITIVE,
+            f32::MIN_POSITIVE,
+            42.0,
+            -42.0,
+        ];
+        let mut actual = expected.clone();
+        let gain = 0.812_345_7_f32;
+        let ceiling = 0.891_250_9_f32;
+
+        apply_gain(&mut expected, gain);
+        hard_clip(&mut expected, ceiling);
+        apply_gain_and_hard_clip(&mut actual, gain, ceiling);
+
+        assert_eq!(
+            actual
+                .iter()
+                .map(|sample| sample.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|sample| sample.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
 }
