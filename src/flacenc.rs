@@ -78,6 +78,17 @@ impl FlacStreamWriter {
     }
 
     pub fn write_chunk(&mut self, planar: &[Vec<f32>]) -> Result<(), String> {
+        self.write_chunk_observed(planar, |_, _| Ok(()))
+    }
+
+    /// Quantize one chunk, expose the exact interleaved integer samples to a
+    /// caller, then encode them. This lets normalization verification share
+    /// the encoder pass instead of reopening a completed lossless file.
+    pub(crate) fn write_chunk_observed(
+        &mut self,
+        planar: &[Vec<f32>],
+        observe: impl FnOnce(&[i32], usize) -> Result<(), String>,
+    ) -> Result<(), String> {
         if planar.len() != self.channels {
             return Err("FLAC chunk channel count changed".into());
         }
@@ -85,6 +96,7 @@ impl FlacStreamWriter {
         if planar.iter().any(|channel| channel.len() != frames) {
             return Err("FLAC chunk has unequal channel lengths".into());
         }
+        let pending_start = self.pending.len();
         self.pending.reserve(frames * self.channels);
         let scale = (1_u32 << (self.bits - 1)) as f32;
         let min = -(1_i32 << (self.bits - 1));
@@ -103,6 +115,7 @@ impl FlacStreamWriter {
                 );
             }
         }
+        observe(&self.pending[pending_start..], self.bits)?;
         self.drain_blocks()
     }
 

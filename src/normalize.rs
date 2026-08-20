@@ -15,7 +15,7 @@ use crate::decoder;
 use crate::downmix;
 use crate::dsp::limiter::{LimiterConfig, LimiterStatistics, TruePeakLimiter};
 use crate::dsp::resample::{ResampleQuality, SampleRateConverter};
-use crate::dsp::{lufs, simd};
+use crate::dsp::{convert, lufs, simd};
 use crate::flacenc::FlacStreamWriter;
 use crate::metadata;
 #[cfg(feature = "mp3-encoding")]
@@ -1654,7 +1654,7 @@ fn normalize_one_staged_with_roles_impl(
     };
     let gain = compute_gain(&an, plan);
     let staged = AtomicOutput::new(output)?;
-    let render = normalize_stream(
+    let rendered = normalize_stream(
         StreamSource {
             path: input,
             spool: source_spool.as_mut(),
@@ -1667,6 +1667,8 @@ fn normalize_one_staged_with_roles_impl(
         StreamRenderOptions {
             opus_album_lufs: None,
             capture_statistics,
+            capture_lossless_verification: false,
+            verification_channel_roles: None,
         },
     )?;
     finalize_metadata(
@@ -1682,14 +1684,16 @@ fn normalize_one_staged_with_roles_impl(
         outcome: NormalizationOutcome {
             source: an,
             gain,
-            render,
+            render: rendered.statistics,
         },
     })
 }
 
-/// Normalize, re-decode, and automatically compensate for post-encode level
-/// drift or a true-peak overshoot. Every correction is rendered again from the
-/// original input, so lossy artifacts are never compounded across retries.
+/// Normalize, verify the exact encoded signal, and automatically compensate
+/// for post-encode level drift or a true-peak overshoot. Native WAVE/FLAC are
+/// measured inside their lossless encoder pass; codec-dependent formats are
+/// re-decoded. Every correction is rendered again from the original input, so
+/// lossy artifacts are never compounded across retries.
 pub fn normalize_one_corrected<P: AsRef<Path>>(
     input: P,
     output: P,
@@ -1771,7 +1775,7 @@ fn normalize_one_corrected_with_optional_analysis(
     let staged = AtomicOutput::new(output)?;
 
     for attempt in 0..=max_retries {
-        let render = normalize_stream(
+        let rendered = normalize_stream(
             StreamSource {
                 path: input,
                 spool: source_spool.as_mut(),
@@ -1784,18 +1788,26 @@ fn normalize_one_corrected_with_optional_analysis(
             StreamRenderOptions {
                 opus_album_lufs: None,
                 capture_statistics: true,
+                capture_lossless_verification: true,
+                verification_channel_roles: channel_roles,
             },
-        )?
-        .expect("corrected normalization captures render statistics");
+        )?;
+        let render = rendered
+            .statistics
+            .expect("corrected normalization captures render statistics");
         let expected_level =
             *intended_level.get_or_insert_with(|| analysis_level(&render.intended, plan.mode));
-        let verification = verify_file_at_level_with_roles(
-            staged.path(),
-            expected_level,
-            plan,
-            tolerance,
-            channel_roles,
-        )?;
+        let verification = if let Some(output) = rendered.lossless_output {
+            verify_analysis_at_level(&output, expected_level, plan, tolerance)
+        } else {
+            verify_file_at_level_with_roles(
+                staged.path(),
+                expected_level,
+                plan,
+                tolerance,
+                channel_roles,
+            )?
+        };
         if verification.passed() {
             finalize_metadata(
                 input,
@@ -1825,10 +1837,10 @@ fn normalize_one_corrected_with_optional_analysis(
     unreachable!("the inclusive retry loop always returns")
 }
 
-/// Render one source to several containers with one shared gain, then
-/// re-decode every output. Corrections are accepted only when a single gain
-/// remains feasible for every output's level tolerance and the common
-/// true-peak ceiling.
+/// Render one source to several containers with one shared gain, then verify
+/// every output. Corrections are accepted only when a single gain remains
+/// feasible for every output's level tolerance and the common true-peak
+/// ceiling. Metadata-finalized outputs are still re-decoded before commit.
 pub(crate) fn normalize_multi_delivery_corrected_with_roles(
     input: &Path,
     outputs: &[PathBuf],
@@ -1865,7 +1877,7 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
         .collect();
 
     for attempt in 0..=max_retries {
-        let renders = staged_paths
+        let rendered = staged_paths
             .iter()
             .zip(formats)
             .map(|(output, format)| {
@@ -1882,11 +1894,22 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
                     StreamRenderOptions {
                         opus_album_lufs: None,
                         capture_statistics: true,
+                        capture_lossless_verification: true,
+                        verification_channel_roles: channel_roles,
                     },
                 )
-                .map(|render| render.expect("corrected multi-delivery captures render statistics"))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let mut renders = Vec::with_capacity(rendered.len());
+        let mut lossless_outputs = Vec::with_capacity(rendered.len());
+        for result in rendered {
+            renders.push(
+                result
+                    .statistics
+                    .expect("corrected multi-delivery captures render statistics"),
+            );
+            lossless_outputs.push(result.lossless_output);
+        }
         let current_intended = analysis_level(&renders[0].intended, plan.mode);
         let expected = *expected_level.get_or_insert(current_intended);
         if renders.iter().any(|render| {
@@ -1899,7 +1922,13 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
         }
         let decoded = staged_paths
             .iter()
-            .map(|path| analyze_file_with_roles(path, channel_roles))
+            .zip(&mut lossless_outputs)
+            .map(|(path, lossless)| {
+                lossless
+                    .take()
+                    .map(Ok)
+                    .unwrap_or_else(|| analyze_file_with_roles(path, channel_roles))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let mut verifications = decoded
             .iter()
@@ -2117,7 +2146,7 @@ fn normalize_album_with_roles_impl(
         .enumerate()
         .map(|(i, (input, output))| {
             let fmt = formats.get(i).copied().unwrap_or(OutputFormat::Wav);
-            let render = normalize_stream(
+            let rendered = normalize_stream(
                 StreamSource {
                     path: input,
                     spool: None,
@@ -2130,6 +2159,8 @@ fn normalize_album_with_roles_impl(
                 StreamRenderOptions {
                     opus_album_lufs: Some(album_output_lufs),
                     capture_statistics,
+                    capture_lossless_verification: false,
+                    verification_channel_roles: None,
                 },
             )?;
             finalize_metadata(
@@ -2140,7 +2171,7 @@ fn normalize_album_with_roles_impl(
                 Some(album_output_lufs),
                 plan,
             )?;
-            Ok((analyses[i].clone(), gain, render))
+            Ok((analyses[i].clone(), gain, rendered.statistics))
         })
         .collect::<Vec<Result<_, String>>>();
     // Indexed collection preserves caller order. Resolve errors serially so
@@ -2284,14 +2315,23 @@ fn normalize_album_corrected_with_optional_analyses(
                     StreamRenderOptions {
                         opus_album_lufs: Some(album_output_lufs),
                         capture_statistics: true,
+                        capture_lossless_verification: true,
+                        verification_channel_roles: channel_roles,
                     },
                 )
-                .map(|render| {
-                    render.expect("corrected album normalization captures render statistics")
-                })
             })
             .collect::<Vec<Result<_, String>>>();
-        let renders = rendered.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let rendered = rendered.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let mut renders = Vec::with_capacity(rendered.len());
+        let mut lossless_outputs = Vec::with_capacity(rendered.len());
+        for result in rendered {
+            renders.push(
+                result
+                    .statistics
+                    .expect("corrected album normalization captures render statistics"),
+            );
+            lossless_outputs.push(result.lossless_output);
+        }
         let expected_album_lufs = *intended_album_lufs.get_or_insert_with(|| {
             album_lufs(
                 &renders
@@ -2308,7 +2348,12 @@ fn normalize_album_corrected_with_optional_analyses(
         });
         let measured = staged_paths
             .par_iter()
-            .map(|path| analyze_file_with_roles(path, channel_roles))
+            .zip(lossless_outputs.into_par_iter())
+            .map(|(path, lossless)| {
+                lossless
+                    .map(Ok)
+                    .unwrap_or_else(|| analyze_file_with_roles(path, channel_roles))
+            })
             .collect::<Vec<_>>();
         let decoded: Vec<Analysis> = measured.into_iter().collect::<Result<_, _>>()?;
         let actual_album_lufs = album_lufs(&decoded);
@@ -2485,14 +2530,21 @@ fn shared_corrected_gain(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct StreamRenderOptions {
+struct StreamRenderOptions<'a> {
     opus_album_lufs: Option<f64>,
     capture_statistics: bool,
+    capture_lossless_verification: bool,
+    verification_channel_roles: Option<&'a [ChannelRole]>,
 }
 
 struct StreamSource<'a> {
     path: &'a Path,
     spool: Option<&'a mut PcmSpool>,
+}
+
+struct StreamRenderResult {
+    statistics: Option<RenderStatistics>,
+    lossless_output: Option<Analysis>,
 }
 
 fn normalize_stream(
@@ -2502,11 +2554,13 @@ fn normalize_stream(
     gain: f32,
     plan: &Plan,
     format: OutputFormat,
-    options: StreamRenderOptions,
-) -> Result<Option<RenderStatistics>, String> {
+    options: StreamRenderOptions<'_>,
+) -> Result<StreamRenderResult, String> {
     let StreamRenderOptions {
         opus_album_lufs: _opus_album_lufs,
         capture_statistics,
+        capture_lossless_verification,
+        verification_channel_roles,
     } = options;
     let input = source.path;
     let ceiling = 10.0_f64.powf(plan.ceiling_db / 20.0) as f32;
@@ -2530,6 +2584,22 @@ fn normalize_stream(
                 &metadata_chunks,
             )
             .map_err(|error| format!("write {}: {error}", output.display()))?;
+            let mut lossless = if capture_lossless_verification {
+                let roles = if let Some(roles) = verification_channel_roles {
+                    roles.to_vec()
+                } else {
+                    crate::wav::writer::persisted_channel_roles(&analysis.channel_roles)
+                        .map_err(|error| format!("write {}: {error}", output.display()))?
+                };
+                Some(LosslessAnalysisBuilder::new(
+                    analysis.sample_rate,
+                    analysis.channels,
+                    roles,
+                    kind,
+                ))
+            } else {
+                None
+            };
             let statistics = process_normalized_stream(
                 source,
                 analysis,
@@ -2540,13 +2610,20 @@ fn normalize_stream(
                 |planar| {
                     writer
                         .write_chunk(planar)
-                        .map_err(|error| format!("write {}: {error}", output.display()))
+                        .map_err(|error| format!("write {}: {error}", output.display()))?;
+                    if let Some(lossless) = lossless.as_mut() {
+                        lossless.observe_wave(writer.last_encoded_chunk(), kind)?;
+                    }
+                    Ok(())
                 },
             )?;
             writer
                 .finish()
                 .map_err(|error| format!("write {}: {error}", output.display()))?;
-            Ok(statistics)
+            Ok(StreamRenderResult {
+                statistics,
+                lossless_output: lossless.map(LosslessAnalysisBuilder::finish),
+            })
         }
         OutputFormat::Flac => {
             let bits = flac_bits(plan.output_kind.unwrap_or(analysis.kind))?;
@@ -2557,6 +2634,20 @@ fn normalize_stream(
                 bits,
                 plan.dither,
             )?;
+            let mut lossless = if capture_lossless_verification {
+                let roles = verification_channel_roles.map_or_else(
+                    || flac_persisted_channel_roles(analysis.channels),
+                    |roles| roles.to_vec(),
+                );
+                Some(LosslessAnalysisBuilder::new(
+                    analysis.sample_rate,
+                    analysis.channels,
+                    roles,
+                    PcmKind::F32,
+                ))
+            } else {
+                None
+            };
             let statistics = process_normalized_stream(
                 source,
                 analysis,
@@ -2564,10 +2655,21 @@ fn normalize_stream(
                 ceiling,
                 plan,
                 capture_statistics,
-                |planar| writer.write_chunk(planar),
+                |planar| {
+                    if let Some(lossless) = lossless.as_mut() {
+                        writer.write_chunk_observed(planar, |interleaved, bits| {
+                            lossless.observe_integer(interleaved, bits)
+                        })
+                    } else {
+                        writer.write_chunk(planar)
+                    }
+                },
             )?;
             writer.finish()?;
-            Ok(statistics)
+            Ok(StreamRenderResult {
+                statistics,
+                lossless_output: lossless.map(LosslessAnalysisBuilder::finish),
+            })
         }
         OutputFormat::Mp3 => {
             #[cfg(feature = "mp3-encoding")]
@@ -2589,7 +2691,10 @@ fn normalize_stream(
                     |planar| writer.write_chunk(planar),
                 )?;
                 writer.finish()?;
-                Ok(statistics)
+                Ok(StreamRenderResult {
+                    statistics,
+                    lossless_output: None,
+                })
             }
             #[cfg(not(feature = "mp3-encoding"))]
             {
@@ -2621,7 +2726,10 @@ fn normalize_stream(
                     |planar| writer.write_chunk(planar),
                 )?;
                 writer.finish()?;
-                Ok(statistics)
+                Ok(StreamRenderResult {
+                    statistics,
+                    lossless_output: None,
+                })
             }
             #[cfg(not(feature = "opus-encoding"))]
             {
@@ -2658,7 +2766,10 @@ fn normalize_stream(
                     |planar| writer.write_chunk(planar),
                 )?;
                 writer.finish()?;
-                Ok(statistics)
+                Ok(StreamRenderResult {
+                    statistics,
+                    lossless_output: None,
+                })
             }
             #[cfg(not(feature = "ffmpeg-encoding"))]
             {
@@ -2823,6 +2934,81 @@ fn process_normalized_chunk(
     Ok(())
 }
 
+/// Streaming measurement of the exact PCM representation accepted by a
+/// lossless writer. The scratch channels are retained across chunks; only the
+/// compact BS.1770 gating-block history grows with programme duration.
+struct LosslessAnalysisBuilder {
+    analyzer: lufs::StreamingAnalyzer,
+    sample_rate: u32,
+    channels: u16,
+    channel_roles: Vec<ChannelRole>,
+    kind: PcmKind,
+    scratch: Vec<Vec<f32>>,
+}
+
+impl LosslessAnalysisBuilder {
+    fn new(
+        sample_rate: u32,
+        channels: u16,
+        channel_roles: Vec<ChannelRole>,
+        kind: PcmKind,
+    ) -> Self {
+        Self {
+            analyzer: lufs::StreamingAnalyzer::new(sample_rate, channel_roles.clone()),
+            sample_rate,
+            channels,
+            channel_roles,
+            kind,
+            scratch: vec![Vec::new(); channels as usize],
+        }
+    }
+
+    fn observe_wave(&mut self, interleaved: &[u8], kind: PcmKind) -> Result<(), String> {
+        debug_assert_eq!(kind, self.kind);
+        convert::decode_planar_into(interleaved, kind, self.channels as usize, &mut self.scratch);
+        self.analyzer.process(&self.scratch)
+    }
+
+    fn observe_integer(&mut self, interleaved: &[i32], bits: usize) -> Result<(), String> {
+        let channels = self.channels as usize;
+        if !interleaved.len().is_multiple_of(channels) {
+            return Err("lossless encoder produced a partial PCM frame".into());
+        }
+        let frames = interleaved.len() / channels;
+        let scale = (1_u32 << (bits - 1)) as f32;
+        for (channel_index, channel) in self.scratch.iter_mut().enumerate() {
+            channel.clear();
+            channel.reserve(frames);
+            channel.extend(
+                interleaved[channel_index..]
+                    .iter()
+                    .step_by(channels)
+                    .map(|sample| *sample as f32 / scale),
+            );
+        }
+        self.analyzer.process(&self.scratch)
+    }
+
+    fn finish(self) -> Analysis {
+        let measured = self.analyzer.finish();
+        Analysis {
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            channel_roles: self.channel_roles,
+            frames: measured.frames,
+            kind: self.kind,
+            lufs: measured.ebu.integrated_lufs,
+            max_momentary_lufs: measured.ebu.max_momentary_lufs,
+            max_short_term_lufs: measured.ebu.max_short_term_lufs,
+            loudness_range_lu: measured.ebu.loudness_range_lu,
+            rms_db: measured.rms_db,
+            sample_peak: measured.sample_peak,
+            true_peak: measured.true_peak,
+            loudness_blocks: measured.ebu.gating_blocks,
+        }
+    }
+}
+
 struct RenderStatisticsBuilder {
     analyzer: lufs::StreamingAnalyzer,
     sample_rate: u32,
@@ -2909,6 +3095,14 @@ fn flac_bits(kind: PcmKind) -> Result<u16, String> {
     }
 }
 
+fn flac_persisted_channel_roles(channels: u16) -> Vec<ChannelRole> {
+    match channels {
+        7 => crate::wav::named_channel_layout("6.1").expect("built-in 6.1 layout"),
+        8 => crate::wav::named_channel_layout("7.1").expect("built-in 7.1 layout"),
+        _ => crate::wav::default_channel_roles(channels),
+    }
+}
+
 fn apply_gain(planar: &mut [Vec<f32>], gain: f32) {
     for channel in planar {
         simd::apply_gain(channel, gain);
@@ -2918,7 +3112,7 @@ fn apply_gain(planar: &mut [Vec<f32>], gain: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wav::default_channel_roles;
+    use crate::wav::{default_channel_roles, named_channel_layout};
 
     fn analysis(level: f64, true_peak_db: f64) -> Analysis {
         Analysis {
@@ -3194,5 +3388,183 @@ mod tests {
         assert!(!should_capture_pcm(Path::new("track.ogg"), false));
         assert!(should_capture_pcm(Path::new("track.mp3"), true));
         assert!(should_capture_pcm(Path::new("track.wav"), true));
+    }
+
+    #[test]
+    fn lossless_encoder_tee_matches_completed_wave_and_flac_decodes() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("source.wav");
+        let frames = 48_000 * 4 + 137;
+        let left = (0..frames)
+            .map(|frame| {
+                0.217 * (2.0 * std::f32::consts::PI * 997.0 * frame as f32 / 48_000.0).sin()
+            })
+            .collect::<Vec<_>>();
+        let right = (0..frames)
+            .map(|frame| {
+                0.133 * (2.0 * std::f32::consts::PI * 1_499.0 * frame as f32 / 48_000.0).sin()
+            })
+            .collect::<Vec<_>>();
+        let input_buffer = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 2,
+            frames,
+            data: vec![left, right],
+            channel_roles: default_channel_roles(2),
+            source_kind: PcmKind::F32,
+        };
+        WavWriter::write(&input, &input_buffer, PcmKind::F32, false).unwrap();
+        let source = analyze_file(&input).unwrap();
+
+        let cases = [
+            (OutputFormat::Wav, PcmKind::U8, true, "u8.wav"),
+            (OutputFormat::Wav, PcmKind::S16, false, "s16.wav"),
+            (OutputFormat::Wav, PcmKind::S16, true, "s16-dither.wav"),
+            (OutputFormat::Wav, PcmKind::S24, true, "s24.wav"),
+            (OutputFormat::Wav, PcmKind::S32, true, "s32.wav"),
+            (OutputFormat::Wav, PcmKind::F32, false, "f32.wav"),
+            (OutputFormat::Wav, PcmKind::F64, false, "f64.wav"),
+            (OutputFormat::Flac, PcmKind::S16, false, "s16.flac"),
+            (OutputFormat::Flac, PcmKind::S16, true, "s16-dither.flac"),
+            (OutputFormat::Flac, PcmKind::S24, true, "s24.flac"),
+        ];
+        for (format, kind, dither, name) in cases {
+            let output = directory.path().join(name);
+            let mut render_plan = plan();
+            render_plan.output_kind = Some(kind);
+            render_plan.dither = dither;
+            let rendered = normalize_stream(
+                StreamSource {
+                    path: &input,
+                    spool: None,
+                },
+                &output,
+                &source,
+                compute_gain(&source, &render_plan),
+                &render_plan,
+                format,
+                StreamRenderOptions {
+                    opus_album_lufs: None,
+                    capture_statistics: false,
+                    capture_lossless_verification: true,
+                    verification_channel_roles: None,
+                },
+            )
+            .unwrap();
+            let tee = rendered.lossless_output.expect("native lossless tee");
+            let decoded = analyze_file(&output).unwrap();
+            assert_analysis_identical(&tee, &decoded, name);
+        }
+    }
+
+    #[test]
+    fn flac_encoder_tee_matches_multichannel_decoder_layouts() {
+        let directory = tempfile::tempdir().unwrap();
+        for (channels, roles, name) in [
+            (6_u16, default_channel_roles(6), "surround-5.1"),
+            (8_u16, named_channel_layout("7.1").unwrap(), "surround-7.1"),
+        ] {
+            let frames = 48_000 * 4 + 31;
+            let data = (0..channels)
+                .map(|channel| {
+                    let frequency = 701.0 + f32::from(channel) * 113.0;
+                    let amplitude = 0.04 + f32::from(channel) * 0.01;
+                    (0..frames)
+                        .map(|frame| {
+                            amplitude
+                                * (2.0 * std::f32::consts::PI * frequency * frame as f32 / 48_000.0)
+                                    .sin()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let input = directory.path().join(format!("{name}-source.wav"));
+            let output = directory.path().join(format!("{name}.flac"));
+            WavWriter::write(
+                &input,
+                &AudioBuffer {
+                    sample_rate: 48_000,
+                    channels,
+                    frames,
+                    data,
+                    channel_roles: roles,
+                    source_kind: PcmKind::F32,
+                },
+                PcmKind::F32,
+                false,
+            )
+            .unwrap();
+            let source = analyze_file(&input).unwrap();
+            let mut render_plan = plan();
+            render_plan.output_kind = Some(PcmKind::S24);
+            let rendered = normalize_stream(
+                StreamSource {
+                    path: &input,
+                    spool: None,
+                },
+                &output,
+                &source,
+                compute_gain(&source, &render_plan),
+                &render_plan,
+                OutputFormat::Flac,
+                StreamRenderOptions {
+                    opus_album_lufs: None,
+                    capture_statistics: false,
+                    capture_lossless_verification: true,
+                    verification_channel_roles: None,
+                },
+            )
+            .unwrap();
+            let tee = rendered.lossless_output.expect("FLAC lossless tee");
+            let decoded = analyze_file(&output).unwrap();
+            assert_analysis_identical(&tee, &decoded, name);
+        }
+    }
+
+    fn assert_analysis_identical(left: &Analysis, right: &Analysis, context: &str) {
+        assert_eq!(left.sample_rate, right.sample_rate, "{context}");
+        assert_eq!(left.channels, right.channels, "{context}");
+        assert_eq!(left.channel_roles, right.channel_roles, "{context}");
+        assert_eq!(left.frames, right.frames, "{context}");
+        assert_eq!(left.kind, right.kind, "{context}");
+        assert_eq!(left.lufs.to_bits(), right.lufs.to_bits(), "{context}");
+        assert_eq!(
+            left.max_momentary_lufs.to_bits(),
+            right.max_momentary_lufs.to_bits(),
+            "{context}"
+        );
+        assert_eq!(
+            left.max_short_term_lufs.to_bits(),
+            right.max_short_term_lufs.to_bits(),
+            "{context}"
+        );
+        assert_eq!(
+            left.loudness_range_lu.to_bits(),
+            right.loudness_range_lu.to_bits(),
+            "{context}"
+        );
+        assert_eq!(left.rms_db.to_bits(), right.rms_db.to_bits(), "{context}");
+        assert_eq!(
+            left.sample_peak.to_bits(),
+            right.sample_peak.to_bits(),
+            "{context}"
+        );
+        assert_eq!(
+            left.true_peak.to_bits(),
+            right.true_peak.to_bits(),
+            "{context}"
+        );
+        assert_eq!(
+            left.loudness_blocks
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            right
+                .loudness_blocks
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "{context}"
+        );
     }
 }

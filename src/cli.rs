@@ -632,7 +632,7 @@ pub struct Cli {
     #[arg(long = "sound-check", requires = "write_tags")]
     pub sound_check: bool,
 
-    /// Decode and measure each completed output to verify level and true peak.
+    /// Verify level/true peak from exact native lossless PCM or a codec re-decode.
     #[arg(
         long,
         conflicts_with_all = ["analyze_only", "gain_only", "write_tags", "dry_run"]

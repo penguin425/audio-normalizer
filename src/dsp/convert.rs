@@ -27,6 +27,32 @@ pub fn decode_planar(bytes: &[u8], kind: PcmKind, channels: usize) -> Vec<Vec<f3
         .collect()
 }
 
+/// Decode into caller-owned channel buffers so streaming verification can
+/// inspect the exact PCM bytes written by a lossless muxer without allocating
+/// one new planar buffer per chunk.
+pub(crate) fn decode_planar_into(
+    bytes: &[u8],
+    kind: PcmKind,
+    channels: usize,
+    output: &mut Vec<Vec<f32>>,
+) {
+    assert!(channels >= 1);
+    let bpp = kind.bytes_per_sample();
+    let frame_bytes = bpp * channels;
+    assert_eq!(bytes.len() % frame_bytes, 0, "partial PCM frame");
+    let frames = bytes.len() / frame_bytes;
+    if output.len() != channels {
+        output.clear();
+        output.resize_with(channels, Vec::new);
+    }
+    output
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(channel, decoded)| {
+            decode_channel_into(bytes, kind, channels, channel, frames, decoded);
+        });
+}
+
 #[inline]
 fn decode_channel(
     bytes: &[u8],
@@ -35,8 +61,23 @@ fn decode_channel(
     c: usize,
     frames: usize,
 ) -> Vec<f32> {
-    let bpp = kind.bytes_per_sample();
     let mut out = Vec::with_capacity(frames);
+    decode_channel_into(bytes, kind, channels, c, frames, &mut out);
+    out
+}
+
+#[inline]
+fn decode_channel_into(
+    bytes: &[u8],
+    kind: PcmKind,
+    channels: usize,
+    c: usize,
+    frames: usize,
+    out: &mut Vec<f32>,
+) {
+    let bpp = kind.bytes_per_sample();
+    out.clear();
+    out.reserve(frames);
     let mut o = c * bpp; // byte offset of the first sample for this channel
     let stride = channels * bpp;
     match kind {
@@ -95,7 +136,6 @@ fn decode_channel(
             }
         }
     }
-    out
 }
 
 /// Encode planar f32 into an interleaved byte buffer of `kind`.
@@ -409,6 +449,58 @@ mod tests {
 
             assert_eq!(actual, expected, "channels={channels}");
             assert_eq!(actual_rngs, expected_rngs, "channels={channels}");
+        }
+    }
+
+    #[test]
+    fn caller_owned_decoder_matches_allocating_path_and_reuses_capacity() {
+        let planar = vec![
+            vec![
+                f32::NAN,
+                f32::INFINITY,
+                -f32::INFINITY,
+                -1.0,
+                -0.5,
+                -0.0,
+                0.0,
+                0.25,
+                0.5,
+                1.0,
+            ],
+            vec![1.0, 0.5, 0.25, 0.0, -0.0, -0.25, -0.5, -1.0, 0.1, -0.1],
+        ];
+        for kind in [
+            PcmKind::U8,
+            PcmKind::S16,
+            PcmKind::S24,
+            PcmKind::S32,
+            PcmKind::F32,
+            PcmKind::F64,
+        ] {
+            let encoded = encode_interleaved(&planar, kind, false);
+            let expected = decode_planar(&encoded, kind, 2);
+            let mut reused = Vec::new();
+            decode_planar_into(&encoded, kind, 2, &mut reused);
+            assert_eq!(
+                reused
+                    .iter()
+                    .flatten()
+                    .map(|sample| sample.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .flatten()
+                    .map(|sample| sample.to_bits())
+                    .collect::<Vec<_>>(),
+                "{kind:?}"
+            );
+            let capacities = reused.iter().map(Vec::capacity).collect::<Vec<_>>();
+            decode_planar_into(&encoded, kind, 2, &mut reused);
+            assert_eq!(
+                reused.iter().map(Vec::capacity).collect::<Vec<_>>(),
+                capacities,
+                "{kind:?}"
+            );
         }
     }
 }

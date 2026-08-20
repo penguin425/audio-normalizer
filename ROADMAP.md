@@ -268,10 +268,10 @@ Forge already provides:
 
 ## P0 — next correctness and interoperability work
 
-No known P0 correctness item remains open. Codec-output verification already
-re-decodes every completed supported output, measures its final true peak, and
-can iteratively re-render from the original input without compounding lossy
-generations.
+No known P0 correctness item remains open. Output verification measures the
+exact quantized PCM accepted by native WAVE/FLAC encoders and re-decodes every
+codec-dependent completed output, measures final true peak, and can iteratively
+re-render from the original input without compounding lossy generations.
 
 ## P1 — professional delivery expansion
 

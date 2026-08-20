@@ -28,6 +28,8 @@ GENERATOR = "forge-benchmark/1"
 DEFAULT_CASES = (
     "wav-stereo-analyze",
     "wav-stereo-normalize",
+    "wav-stereo-verify",
+    "wav-to-flac-verify",
     "wav-stereo-resample-normalize",
     "wav-stereo-batch-normalize",
     "wav-stereo-album-normalize",
@@ -238,6 +240,13 @@ def sanitized_command(case_id: str) -> list[str]:
         "wav-stereo-normalize": [
             "forge", "<input.wav>", "--overwrite", "-o", "<output.wav>"
         ],
+        "wav-stereo-verify": [
+            "forge", "<input.wav>", "--verify", "--overwrite", "-o", "<output.wav>"
+        ],
+        "wav-to-flac-verify": [
+            "forge", "<input.wav>", "--format", "flac", "--verify",
+            "--overwrite", "-o", "<output.flac>",
+        ],
         "wav-stereo-resample-normalize": [
             "forge", "<input.wav>", "--sample-rate", "<alternate-rate>",
             "--overwrite", "-o", "<output.wav>",
@@ -275,6 +284,8 @@ def case_spec(case_id: str) -> tuple[str, str, int, str]:
     specs = {
         "wav-stereo-analyze": ("lossless", "wav", 2, "analyze"),
         "wav-stereo-normalize": ("lossless", "wav", 2, "normalize"),
+        "wav-stereo-verify": ("lossless", "wav", 2, "normalize"),
+        "wav-to-flac-verify": ("lossless", "wav", 2, "normalize"),
         "wav-stereo-resample-normalize": ("lossless", "wav", 2, "normalize"),
         "wav-stereo-batch-normalize": ("lossless", "wav", 2, "normalize"),
         "wav-stereo-album-normalize": ("lossless", "wav", 2, "normalize"),
@@ -374,9 +385,15 @@ def run_case(
             input_bytes = input_path.stat().st_size
             measured_duration = float(duration)
             if operation == "normalize":
-                output_path = case_dir / "output.wav"
+                output_path = case_dir / (
+                    "output.flac" if case_id == "wav-to-flac-verify" else "output.wav"
+                )
                 output_paths.append(output_path)
                 command = [str(forge), str(input_path)]
+                if case_id == "wav-to-flac-verify":
+                    command += ["--format", "flac"]
+                if case_id in ("wav-stereo-verify", "wav-to-flac-verify"):
+                    command.append("--verify")
                 if case_id == "wav-stereo-resample-normalize":
                     output_sample_rate = 48_000 if sample_rate != 48_000 else 44_100
                     command += ["--sample-rate", str(output_sample_rate)]

@@ -203,6 +203,12 @@ impl WavStreamWriter {
         Ok(())
     }
 
+    /// Exact interleaved PCM bytes produced by the most recent successful
+    /// [`Self::write_chunk`] call.
+    pub(crate) fn last_encoded_chunk(&self) -> &[u8] {
+        &self.encoded
+    }
+
     fn validate_chunk(&self, planar: &[Vec<f32>]) -> Result<usize, WavWriteError> {
         let frames = planar.first().map_or(0, Vec::len);
         if frames > self.remaining_frames {
@@ -375,6 +381,20 @@ fn channel_mask(roles: &[ChannelRole]) -> io::Result<u32> {
     ))
 }
 
+/// Channel roles a subsequent Forge WAVE decode will recover from the header
+/// written for `roles`.
+pub(crate) fn persisted_channel_roles(roles: &[ChannelRole]) -> io::Result<Vec<ChannelRole>> {
+    let channels =
+        u16::try_from(roles.len()).map_err(|_| io::Error::other("too many WAVE channels"))?;
+    if channels <= 2 {
+        return Ok(default_channel_roles(channels));
+    }
+    Ok(crate::wav::reader::roles_from_wave_mask(
+        channel_mask(roles)?,
+        channels,
+    ))
+}
+
 fn write_chunk(output: &mut File, id: &[u8; 4], body: &[u8]) -> io::Result<()> {
     let size = u32::try_from(body.len()).map_err(|_| io::Error::other("WAV chunk too large"))?;
     output.write_all(id)?;
@@ -406,6 +426,11 @@ mod tests {
             channel_mask(&named_channel_layout("7.1.4").unwrap()).unwrap(),
             0x0002_d63f
         );
+        let persisted = persisted_channel_roles(&named_channel_layout("7.1").unwrap()).unwrap();
+        assert_eq!(persisted[0], ChannelRole::positioned(-30, 0));
+        assert_eq!(persisted[1], ChannelRole::positioned(30, 0));
+        assert_eq!(persisted[3], ChannelRole::Lfe);
+        assert_eq!(persisted[7], ChannelRole::positioned(90, 0));
     }
 
     #[test]
