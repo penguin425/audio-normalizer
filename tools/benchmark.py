@@ -13,6 +13,7 @@ import json
 import os
 import platform
 import shutil
+import statistics
 import struct
 import subprocess
 import sys
@@ -25,6 +26,7 @@ from typing import Any, Iterable
 SCHEMA = "https://penguin425.github.io/audio-normalizer/schema/performance-benchmark-v1"
 GENERATOR = "forge-benchmark/1"
 DEFAULT_CASES = (
+    "wav-stereo-analyze",
     "wav-stereo-normalize",
     "wav-7.1-normalize",
     "flac-stereo-analyze",
@@ -33,6 +35,7 @@ DEFAULT_CASES = (
 )
 MAX_DURATION_SECONDS = 3_600
 MAX_PATHOLOGICAL_CHUNKS = 100_001
+MAX_ITERATIONS = 100
 CHUNK_FRAMES = 8_192
 
 
@@ -175,6 +178,27 @@ def run_measured(
     }
 
 
+def aggregate_measurements(measurements: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize repeated runs without hiding peak memory consumption."""
+
+    def median(key: str, digits: int) -> float | None:
+        values = [item[key] for item in measurements if item[key] is not None]
+        return round(statistics.median(values), digits) if values else None
+
+    rss_values = [
+        item["peak_rss_bytes"]
+        for item in measurements
+        if item["peak_rss_bytes"] is not None
+    ]
+    return {
+        "wall_seconds": median("wall_seconds", 6),
+        "user_cpu_seconds": median("user_cpu_seconds", 6),
+        "system_cpu_seconds": median("system_cpu_seconds", 6),
+        "cpu_percent": median("cpu_percent", 3),
+        "peak_rss_bytes": max(rss_values) if rss_values else None,
+    }
+
+
 def require_space(directory: Path, required_bytes: int) -> None:
     free = shutil.disk_usage(directory).free
     reserve = 1 << 30
@@ -204,6 +228,7 @@ def encode_fixture(
 
 def sanitized_command(case_id: str) -> list[str]:
     commands = {
+        "wav-stereo-analyze": ["forge", "<input.wav>", "--analyze", "--json"],
         "wav-stereo-normalize": [
             "forge", "<input.wav>", "--overwrite", "-o", "<output.wav>"
         ],
@@ -222,6 +247,7 @@ def sanitized_command(case_id: str) -> list[str]:
 
 def case_spec(case_id: str) -> tuple[str, str, int, str]:
     specs = {
+        "wav-stereo-analyze": ("lossless", "wav", 2, "analyze"),
         "wav-stereo-normalize": ("lossless", "wav", 2, "normalize"),
         "wav-7.1-normalize": ("multichannel", "wav", 8, "normalize"),
         "flac-stereo-analyze": ("lossless", "flac", 2, "analyze"),
@@ -242,12 +268,11 @@ def run_case(
     pathological_chunks: int,
     timeout_seconds: int,
     keep_fixtures: bool,
+    iterations: int,
 ) -> dict[str, Any]:
     category, input_format, channels, operation = case_spec(case_id)
     case_dir = workspace / case_id
     case_dir.mkdir(parents=True, exist_ok=True)
-    stdout_path = case_dir / "stdout.log"
-    stderr_path = case_dir / "stderr.log"
     output_path: Path | None = None
     expected = [0]
 
@@ -297,8 +322,30 @@ def run_case(
         else:
             command = [str(forge), str(input_path), "--analyze", "--json"]
 
-    metrics = run_measured(
-        command, timeout_seconds, stdout_path=stdout_path, stderr_path=stderr_path
+    measurements = []
+    for iteration in range(iterations):
+        # Measure the same complete write path every time. Outputs live only in
+        # the private benchmark workspace, so removing them is deterministic.
+        if output_path is not None:
+            output_path.unlink(missing_ok=True)
+        measurements.append(
+            run_measured(
+                command,
+                timeout_seconds,
+                stdout_path=case_dir / f"stdout-{iteration + 1:03d}.log",
+                stderr_path=case_dir / f"stderr-{iteration + 1:03d}.log",
+            )
+        )
+    metrics = aggregate_measurements(measurements)
+    unexpected_exit_codes = [
+        item["exit_code"]
+        for item in measurements
+        if item["exit_code"] not in expected
+    ]
+    metrics["exit_code"] = (
+        unexpected_exit_codes[0]
+        if unexpected_exit_codes
+        else measurements[-1]["exit_code"]
     )
     output_bytes = (
         output_path.stat().st_size
@@ -323,7 +370,9 @@ def run_case(
             else None
         ),
         "expected_exit_codes": expected,
-        "passed": metrics["exit_code"] in expected,
+        "iterations": iterations,
+        "samples": measurements,
+        "passed": not unexpected_exit_codes,
         "regression": None,
     }
     if not keep_fixtures:
@@ -350,9 +399,16 @@ def compare_baseline(
     identity = ("os", "architecture", "cpu_model", "cpu_count")
     if any(report["system"].get(key) != baseline["system"].get(key) for key in identity):
         raise ValueError("baseline host OS, architecture, CPU model, or CPU count differs")
-    config_keys = ("duration_seconds", "sample_rate_hz", "pathological_chunks", "cases")
+    config_keys = (
+        "duration_seconds",
+        "sample_rate_hz",
+        "pathological_chunks",
+        "iterations",
+        "cases",
+    )
     if any(
-        report["configuration"].get(key) != baseline["configuration"].get(key)
+        report["configuration"].get(key, 1 if key == "iterations" else None)
+        != baseline["configuration"].get(key, 1 if key == "iterations" else None)
         for key in config_keys
     ):
         raise ValueError("baseline benchmark configuration differs")
@@ -400,6 +456,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-rate", type=positive_int, default=48_000)
     parser.add_argument("--pathological-chunks", type=positive_int, default=100_001)
     parser.add_argument("--timeout-seconds", type=positive_int, default=7_200)
+    parser.add_argument("--iterations", type=positive_int, default=1)
     parser.add_argument("--keep-fixtures", action="store_true")
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--max-wall-regression-percent", type=float, default=15.0)
@@ -424,6 +481,8 @@ def main() -> int:
         raise ValueError(
             f"pathological chunk count must not exceed {MAX_PATHOLOGICAL_CHUNKS}"
         )
+    if args.iterations > MAX_ITERATIONS:
+        raise ValueError(f"iterations must not exceed {MAX_ITERATIONS}")
     if args.max_wall_regression_percent < 0 or args.max_rss_regression_percent < 0:
         raise ValueError("regression limits must not be negative")
     forge = executable(args.forge, "forge")
@@ -470,6 +529,7 @@ def main() -> int:
             "sample_rate_hz": args.sample_rate,
             "pathological_chunks": args.pathological_chunks,
             "timeout_seconds": args.timeout_seconds,
+            "iterations": args.iterations,
             "cases": cases,
         },
         "results": [],
@@ -483,7 +543,7 @@ def main() -> int:
                     case_id, workspace, forge, container_qc, ffmpeg,
                     args.duration_seconds, args.sample_rate,
                     args.pathological_chunks, args.timeout_seconds,
-                    args.keep_fixtures,
+                    args.keep_fixtures, args.iterations,
                 )
             )
         passed = all(item["passed"] for item in report["results"])

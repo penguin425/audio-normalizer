@@ -33,11 +33,12 @@
         "sample_rate_hz": {"type": "integer", "minimum": 8000, "maximum": 192000},
         "pathological_chunks": {"type": "integer", "minimum": 1, "maximum": 100001},
         "timeout_seconds": {"type": "integer", "minimum": 1},
+        "iterations": {"type": "integer", "minimum": 1, "maximum": 100, "default": 1},
         "cases": {
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
-          "items": {"enum": ["wav-stereo-normalize", "wav-7.1-normalize", "flac-stereo-analyze", "mp3-stereo-analyze", "pathological-wave-qc"]}
+          "items": {"enum": ["wav-stereo-analyze", "wav-stereo-normalize", "wav-7.1-normalize", "flac-stereo-analyze", "mp3-stereo-analyze", "pathological-wave-qc"]}
         }
       }
     },
@@ -50,6 +51,19 @@
   },
   "$defs": {
     "nullableNumber": {"type": ["number", "null"]},
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exit_code", "wall_seconds", "user_cpu_seconds", "system_cpu_seconds", "cpu_percent", "peak_rss_bytes"],
+      "properties": {
+        "exit_code": {"type": "integer"},
+        "wall_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "user_cpu_seconds": {"$ref": "#/$defs/nullableNumber"},
+        "system_cpu_seconds": {"$ref": "#/$defs/nullableNumber"},
+        "cpu_percent": {"$ref": "#/$defs/nullableNumber"},
+        "peak_rss_bytes": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
     "regression": {
       "type": ["object", "null"],
       "required": ["wall_change_percent", "peak_rss_change_percent", "max_wall_regression_percent", "max_peak_rss_regression_percent", "passed"],
@@ -85,6 +99,8 @@
         "peak_rss_bytes": {"type": ["integer", "null"], "minimum": 0},
         "realtime_factor": {"$ref": "#/$defs/nullableNumber"},
         "expected_exit_codes": {"type": "array", "minItems": 1, "items": {"type": "integer"}},
+        "iterations": {"type": "integer", "minimum": 1, "maximum": 100},
+        "samples": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"$ref": "#/$defs/measurement"}},
         "passed": {"type": "boolean"},
         "regression": {"$ref": "#/$defs/regression"}
       }

@@ -226,9 +226,9 @@ Forge already provides:
   bounded structured provenance, transactional deduplication, and atomic
   per-invocation JSON evidence export.
 - Versioned, standard-library-only performance harness for generated one-hour
-  stereo and 7.1 WAVE normalization, FLAC/MP3 analysis, and bounded
-  pathological WAVE QC, with normalized CPU/RSS evidence and compatible-host
-  baseline regression gates.
+  stereo WAVE analysis, stereo and 7.1 WAVE normalization, FLAC/MP3 analysis,
+  and bounded pathological WAVE QC, with repeated samples, median timing,
+  maximum RSS evidence, and compatible-host baseline regression gates.
 - Versioned multi-delivery optimization for two to 32 codec/profile outputs,
   using one conservative target, ceiling, and iteratively corrected gain;
   staged post-metadata re-decoding, explicit infeasibility, path-alias and

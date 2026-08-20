@@ -9,10 +9,16 @@ Compare results only on a stable, otherwise idle host with the same operating
 system, architecture, CPU model, CPU count, duration, sample rate, and case
 set.
 
+For optimization work, pass `--iterations 5` or more. Fixtures are generated
+once, then every command is run repeatedly against the same input. The report
+retains every sample, uses the median for timing and CPU summaries, and uses
+the maximum observed RSS so a fast outlier cannot hide a memory regression.
+
 ## Workloads
 
 | Case | Input and operation |
 | --- | --- |
+| `wav-stereo-analyze` | 48 kHz stereo PCM16 WAVE, loudness and true-peak analysis |
 | `wav-stereo-normalize` | 48 kHz stereo PCM16 WAVE, two-pass WAVE normalization |
 | `wav-7.1-normalize` | 48 kHz 8-channel PCM16 WAVE, explicit `7.1` layout normalization |
 | `flac-stereo-analyze` | FFmpeg-generated lossless FLAC, JSON analysis |
@@ -33,6 +39,7 @@ Build optimized binaries, then run the complete one-hour suite:
 cargo build --locked --release --bin forge --bin forge-container-qc
 python3 tools/benchmark.py \
   --forge target/release/forge \
+  --iterations 5 \
   --output benchmark.json
 ```
 

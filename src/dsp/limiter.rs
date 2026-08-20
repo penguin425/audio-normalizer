@@ -80,7 +80,9 @@ impl TruePeakLimiter {
             ((sample_rate as f64 * config.lookahead_ms / 1000.0).ceil() as usize).max(16);
         let release_samples = sample_rate as f64 * config.release_ms / 1000.0;
         Ok(Self {
-            meters: (0..channels).map(|_| TruePeakMeter::new()).collect(),
+            meters: (0..channels)
+                .map(|_| TruePeakMeter::for_sample_rate(sample_rate))
+                .collect(),
             delay: (0..channels)
                 .map(|_| VecDeque::with_capacity(lookahead_frames + 1))
                 .collect(),

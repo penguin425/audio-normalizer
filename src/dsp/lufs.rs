@@ -97,7 +97,9 @@ impl StreamingAnalyzer {
             filters: (0..channels)
                 .map(|_| KWeight::for_sample_rate(sample_rate))
                 .collect(),
-            true_peak_meters: (0..channels).map(|_| TruePeakMeter::new()).collect(),
+            true_peak_meters: (0..channels)
+                .map(|_| TruePeakMeter::for_sample_rate(sample_rate))
+                .collect(),
             momentary: VecDeque::new(),
             short_term: VecDeque::new(),
             momentary_sum: 0.0,
