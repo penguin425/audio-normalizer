@@ -593,7 +593,9 @@ fn resumable_batch_skips_verified_outputs_and_recovers_only_missing_or_changed_a
             .arg("--job-state")
             .arg(&state_path)
             .arg("--progress")
-            .arg(&progress_path);
+            .arg(&progress_path)
+            .arg("--jobs")
+            .arg("2");
         if overwrite {
             command.arg("--overwrite");
         }
@@ -644,8 +646,8 @@ fn resumable_batch_skips_verified_outputs_and_recovers_only_missing_or_changed_a
         [
             "job_started",
             "asset_started",
-            "asset_completed",
             "asset_started",
+            "asset_completed",
             "asset_completed",
             "job_completed"
         ]
@@ -726,22 +728,31 @@ fn resumable_batch_checkpoints_before_a_later_asset_fails() {
     let directory = tempfile::tempdir().unwrap();
     let valid_input = directory.path().join("valid.wav");
     let invalid_input = directory.path().join("invalid.wav");
+    let later_input = directory.path().join("later.wav");
     let output_directory = directory.path().join("normalized");
     let state_path = directory.path().join("job.json");
     let progress_path = directory.path().join("progress.ndjson");
     write_batch_test_wav(&valid_input, 440.0);
     std::fs::write(&invalid_input, b"not a WAVE file").unwrap();
+    write_batch_test_wav(&later_input, 880.0);
+    std::fs::create_dir(&output_directory).unwrap();
+    let later_output = output_directory.join("later_normalized.wav");
+    std::fs::write(&later_output, b"preserve later destination").unwrap();
 
     let run = || {
         Command::new(env!("CARGO_BIN_EXE_forge"))
             .arg(&valid_input)
             .arg(&invalid_input)
+            .arg(&later_input)
             .arg("-o")
             .arg(&output_directory)
+            .arg("--overwrite")
             .arg("--job-state")
             .arg(&state_path)
             .arg("--progress")
             .arg(&progress_path)
+            .arg("--jobs")
+            .arg("3")
             .output()
             .unwrap()
     };
@@ -768,10 +779,15 @@ fn resumable_batch_checkpoints_before_a_later_asset_fails() {
         [
             "job_started",
             "asset_started",
-            "asset_completed",
             "asset_started",
+            "asset_started",
+            "asset_completed",
             "asset_failed"
         ]
+    );
+    assert_eq!(
+        std::fs::read(&later_output).unwrap(),
+        b"preserve later destination"
     );
     let valid_output = PathBuf::from(state["assets"][0]["output"].as_str().unwrap());
     let valid_output_bytes = std::fs::read(&valid_output).unwrap();
@@ -785,8 +801,112 @@ fn resumable_batch_checkpoints_before_a_later_asset_fails() {
             "job_started",
             "asset_skipped",
             "asset_started",
+            "asset_started",
             "asset_failed"
         ]
+    );
+    assert_eq!(
+        std::fs::read(later_output).unwrap(),
+        b"preserve later destination"
+    );
+}
+
+#[test]
+fn parallel_batch_matches_serial_bytes_and_reports_ordered_waves() {
+    let directory = tempfile::tempdir().unwrap();
+    let inputs = (0..4)
+        .map(|index| {
+            let path = directory.path().join(format!("track-{index}.wav"));
+            write_batch_test_wav(&path, 330.0 + f64::from(index) * 137.0);
+            path
+        })
+        .collect::<Vec<_>>();
+    let serial_directory = directory.path().join("serial");
+    let parallel_directory = directory.path().join("parallel");
+    let progress_path = directory.path().join("parallel.ndjson");
+
+    let run = |jobs: usize, output: &std::path::Path, progress: Option<&std::path::Path>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_forge"));
+        command
+            .args(&inputs)
+            .arg("-o")
+            .arg(output)
+            .arg("--jobs")
+            .arg(jobs.to_string());
+        if let Some(progress) = progress {
+            command.arg("--progress").arg(progress);
+        }
+        command.output().unwrap()
+    };
+
+    let serial = run(1, &serial_directory, None);
+    assert!(
+        serial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&serial.stderr)
+    );
+    let parallel = run(4, &parallel_directory, Some(&progress_path));
+    assert!(
+        parallel.status.success(),
+        "{}",
+        String::from_utf8_lossy(&parallel.stderr)
+    );
+
+    for input in &inputs {
+        let output_name = format!(
+            "{}_normalized.wav",
+            input.file_stem().unwrap().to_string_lossy()
+        );
+        assert_eq!(
+            std::fs::read(serial_directory.join(&output_name)).unwrap(),
+            std::fs::read(parallel_directory.join(&output_name)).unwrap(),
+            "parallel output differed for {output_name}"
+        );
+    }
+
+    let events = std::fs::read_to_string(&progress_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["event"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "job_started",
+            "asset_started",
+            "asset_started",
+            "asset_started",
+            "asset_started",
+            "asset_completed",
+            "asset_completed",
+            "asset_completed",
+            "asset_completed",
+            "job_completed"
+        ]
+    );
+    assert_eq!(
+        events[1..5]
+            .iter()
+            .map(|event| event["index"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [0, 1, 2, 3]
+    );
+    assert_eq!(
+        events[5..9]
+            .iter()
+            .map(|event| event["index"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [0, 1, 2, 3]
+    );
+    assert_eq!(
+        events[5..9]
+            .iter()
+            .map(|event| event["completed"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4]
     );
 }
 

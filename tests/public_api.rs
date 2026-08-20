@@ -103,6 +103,42 @@ fn documented_public_api_works_from_a_downstream_crate() {
     .expect("normalize with public precomputed-analysis API");
     assert!(preanalyzed_path.is_file());
 
+    let staged_path = temporary.path().join("staged.wav");
+    std::fs::write(&staged_path, b"previous destination").expect("seed staged destination");
+    let staged = forge_normalizer::normalize::normalize_one_staged_with_roles(
+        &wave_path,
+        &staged_path,
+        &plan,
+        OutputFormat::Wav,
+        None,
+    )
+    .expect("render staged public normalization API");
+    assert_eq!(
+        std::fs::read(&staged_path).expect("read preserved staged destination"),
+        b"previous destination"
+    );
+    let outcome = staged.commit().expect("commit staged normalization");
+    assert!(outcome.source.lufs.is_finite());
+    assert!(outcome.gain.is_finite());
+    assert!(WavReader::probe(&staged_path).is_ok());
+
+    let dropped_path = temporary.path().join("dropped-stage.wav");
+    std::fs::write(&dropped_path, b"preserve me").expect("seed dropped destination");
+    let dropped = forge_normalizer::normalize::normalize_one_preanalyzed_staged_with_roles(
+        &wave_path,
+        &dropped_path,
+        &plan,
+        OutputFormat::Wav,
+        None,
+        &cached.value,
+    )
+    .expect("render preanalyzed staged output");
+    drop(dropped);
+    assert_eq!(
+        std::fs::read(&dropped_path).expect("read dropped staged destination"),
+        b"preserve me"
+    );
+
     let watch_input = temporary.path().join("watch-input");
     let watch_output = temporary.path().join("watch-output");
     std::fs::create_dir(&watch_input).expect("create public watch input");

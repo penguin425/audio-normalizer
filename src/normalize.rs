@@ -241,6 +241,41 @@ pub struct CorrectedNormalization {
     pub attempts: usize,
 }
 
+/// Measurements produced by one completed normalization render.
+///
+/// [`StagedNormalization::commit`] returns this value after atomically
+/// publishing the staged destination.
+#[derive(Debug, Clone)]
+pub struct NormalizationOutcome {
+    pub source: Analysis,
+    pub gain: f32,
+    pub render: Option<RenderStatistics>,
+}
+
+/// A fully rendered output that has not replaced its destination yet.
+///
+/// Dropping this value removes the sibling temporary file and leaves any
+/// existing destination untouched. This lets batch callers render bounded
+/// waves concurrently, then publish successful outputs in caller order.
+pub struct StagedNormalization {
+    output: AtomicOutput,
+    outcome: NormalizationOutcome,
+}
+
+impl StagedNormalization {
+    /// Measurements captured while producing the staged output.
+    pub fn outcome(&self) -> &NormalizationOutcome {
+        &self.outcome
+    }
+
+    /// Synchronize and atomically replace the destination with this render.
+    pub fn commit(self) -> Result<NormalizationOutcome, String> {
+        let Self { output, outcome } = self;
+        output.commit()?;
+        Ok(outcome)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CorrectedAlbumNormalization {
     pub sources: Vec<Analysis>,
@@ -1470,6 +1505,28 @@ pub fn normalize_one_with_roles<P: AsRef<Path>>(
     Ok((analysis, gain))
 }
 
+/// Render and finalize one output without replacing its destination.
+///
+/// The caller must invoke [`StagedNormalization::commit`] to publish the
+/// result. Dropping the returned value preserves any existing destination.
+pub fn normalize_one_staged_with_roles<P: AsRef<Path>>(
+    input: P,
+    output: P,
+    plan: &Plan,
+    format: OutputFormat,
+    channel_roles: Option<&[ChannelRole]>,
+) -> Result<StagedNormalization, String> {
+    normalize_one_staged_with_roles_impl(
+        input.as_ref(),
+        output.as_ref(),
+        plan,
+        format,
+        channel_roles,
+        None,
+        false,
+    )
+}
+
 /// Normalize using an analysis already measured for the same input, channel
 /// roles, output sample rate, and resampling quality.
 ///
@@ -1493,6 +1550,29 @@ pub fn normalize_one_preanalyzed_with_roles<P: AsRef<Path>>(
         false,
     )?;
     Ok((analysis, gain))
+}
+
+/// Stage one output using a content-bound analysis supplied by the caller.
+///
+/// The analysis must describe the same input, channel roles, output sample
+/// rate, and resampling quality as the supplied plan.
+pub fn normalize_one_preanalyzed_staged_with_roles<P: AsRef<Path>>(
+    input: P,
+    output: P,
+    plan: &Plan,
+    format: OutputFormat,
+    channel_roles: Option<&[ChannelRole]>,
+    analysis: &Analysis,
+) -> Result<StagedNormalization, String> {
+    normalize_one_staged_with_roles_impl(
+        input.as_ref(),
+        output.as_ref(),
+        plan,
+        format,
+        channel_roles,
+        Some(analysis),
+        false,
+    )
 }
 
 pub fn normalize_one_audited_with_roles<P: AsRef<Path>>(
@@ -1545,17 +1625,39 @@ fn normalize_one_with_roles_impl<P: AsRef<Path>>(
     preanalyzed: Option<&Analysis>,
     capture_statistics: bool,
 ) -> Result<(Analysis, f32, Option<RenderStatistics>), String> {
+    let outcome = normalize_one_staged_with_roles_impl(
+        input.as_ref(),
+        output.as_ref(),
+        plan,
+        format,
+        channel_roles,
+        preanalyzed,
+        capture_statistics,
+    )?
+    .commit()?;
+    Ok((outcome.source, outcome.gain, outcome.render))
+}
+
+fn normalize_one_staged_with_roles_impl(
+    input: &Path,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    channel_roles: Option<&[ChannelRole]>,
+    preanalyzed: Option<&Analysis>,
+    capture_statistics: bool,
+) -> Result<StagedNormalization, String> {
     let (an, mut source_spool) = if let Some(analysis) = preanalyzed {
         (analysis.clone(), None)
     } else {
-        let prepared = prepare_file_for_plan(input.as_ref(), channel_roles, plan, true)?;
+        let prepared = prepare_file_for_plan(input, channel_roles, plan, true)?;
         (prepared.analysis, prepared.spool)
     };
     let gain = compute_gain(&an, plan);
-    let staged = AtomicOutput::new(output.as_ref())?;
+    let staged = AtomicOutput::new(output)?;
     let render = normalize_stream(
         StreamSource {
-            path: input.as_ref(),
+            path: input,
             spool: source_spool.as_mut(),
         },
         staged.path(),
@@ -1569,15 +1671,21 @@ fn normalize_one_with_roles_impl<P: AsRef<Path>>(
         },
     )?;
     finalize_metadata(
-        input.as_ref(),
+        input,
         staged.path(),
         format,
         an.lufs + gain_db(gain),
         None,
         plan,
     )?;
-    staged.commit()?;
-    Ok((an, gain, render))
+    Ok(StagedNormalization {
+        output: staged,
+        outcome: NormalizationOutcome {
+            source: an,
+            gain,
+            render,
+        },
+    })
 }
 
 /// Normalize, re-decode, and automatically compensate for post-encode level

@@ -12,8 +12,9 @@ Forge already provides:
 - ITU-R BS.1770-5 / EBU R 128 integrated, momentary, short-term, LRA, and
   true-peak measurement with official EBU and ITU conformance jobs.
 - Track and duration-weighted album normalization, codec re-verification,
-  work-stealing track parallelism, limiter, sample-rate conversion, integer PCM
-  dither, ReplayGain, and BWF loudness metadata.
+  bounded work-stealing parallelism across album tracks and independent batch
+  files, limiter, sample-rate conversion, integer PCM dither, ReplayGain, and
+  BWF loudness metadata.
 - EBU Tech 3285 v2 BWF `bext` QC for fixed production fields, date/time,
   sample-based TimeReference, version/UMID/reserved-byte consistency, loudness
   metadata ranges, and CodingHistory line structure.
@@ -226,9 +227,9 @@ Forge already provides:
   bounded structured provenance, transactional deduplication, and atomic
   per-invocation JSON evidence export.
 - Versioned, standard-library-only performance harness for generated one-hour
-  stereo WAVE analysis, same-rate/resampled stereo and 7.1 WAVE normalization,
-  FLAC/MP3 analysis and normalization, and bounded pathological WAVE QC, with
-  repeated samples, median timing,
+  stereo WAVE analysis, same-rate/resampled stereo, independent eight-file
+  batch, album, and 7.1 WAVE normalization, FLAC/MP3 analysis and normalization,
+  and bounded pathological WAVE QC, with repeated samples, median timing,
   maximum RSS evidence, and compatible-host baseline regression gates.
 - Versioned multi-delivery optimization for two to 32 codec/profile outputs,
   using one conservative target, ceiling, and iteratively corrected gain;

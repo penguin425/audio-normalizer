@@ -21,6 +21,7 @@ the maximum observed RSS so a fast outlier cannot hide a memory regression.
 | `wav-stereo-analyze` | 48 kHz stereo PCM16 WAVE, loudness and true-peak analysis |
 | `wav-stereo-normalize` | 48 kHz stereo PCM16 WAVE, two-pass WAVE normalization |
 | `wav-stereo-resample-normalize` | Stereo PCM16 WAVE, normalization to the alternate 44.1/48 kHz rate with output-domain PCM reuse |
+| `wav-stereo-batch-normalize` | Eight independent stereo PCM16 WAVE tracks normalized with one bounded eight-worker batch wave |
 | `wav-stereo-album-normalize` | Eight stereo PCM16 WAVE tracks, one shared album gain with parallel track analysis and rendering |
 | `wav-7.1-normalize` | 48 kHz 8-channel PCM16 WAVE, explicit `7.1` layout normalization |
 | `flac-stereo-analyze` | FFmpeg-generated lossless FLAC, JSON analysis |
@@ -61,8 +62,8 @@ Repeat `--case NAME` to select cases. The maximum duration is 3,600 seconds,
 the sample-rate range is 8–192 kHz, and each measured process has a default
 two-hour timeout. The harness checks disk capacity before large WAVE fixtures
 and retains a 1 GiB reserve. A full 7.1 normalization needs roughly 5.6 GB at
-48 kHz because its input and output coexist; the eight-track stereo album case
-needs roughly 11.1 GB under the one-hour default.
+48 kHz because its input and output coexist; each eight-track stereo batch or
+album case needs roughly 11.1 GB under the one-hour default.
 
 ## Report and regression checks
 
