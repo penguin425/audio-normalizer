@@ -25,7 +25,7 @@ use forge_normalizer::report::{
 };
 use forge_normalizer::watch::{WatchCandidate, WatchFolder};
 use forge_normalizer::wav::{named_channel_layout, ChannelRole, PcmKind, WavContainer};
-use rayon::ThreadPoolBuilder;
+use rayon::{prelude::*, ThreadPoolBuilder};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
@@ -33,6 +33,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 use tempfile::{Builder, NamedTempFile, TempDir};
+
+const MAX_BATCH_WAVE_ASSETS: usize = 32;
 
 #[derive(Debug, Default)]
 struct BatchOptions {
@@ -1693,6 +1695,156 @@ fn run_paths(
             None,
             None,
         )?;
+    }
+
+    let parallel_batch = cli.inputs.len() > 1
+        && !cli.gain_only
+        && !cli.dry_run
+        && !cli.verify
+        && cli.difference_report.is_none()
+        && analysis_cache.is_none();
+    if parallel_batch {
+        let wave_width = rayon::current_num_threads().clamp(1, MAX_BATCH_WAVE_ASSETS);
+        let mut index = 0_usize;
+        let mut completed_without_job = 0_usize;
+        while index < cli.inputs.len() {
+            if batch_job
+                .as_ref()
+                .is_some_and(|job| job.is_completed(index))
+            {
+                if let Some(writer) = &mut progress {
+                    writer.emit(
+                        "asset_skipped",
+                        batch_job
+                            .as_ref()
+                            .expect("checked batch job")
+                            .completed_count(),
+                        cli.inputs.len(),
+                        Some((index, &cli.inputs[index], &outputs[index])),
+                        None,
+                    )?;
+                }
+                index += 1;
+                continue;
+            }
+
+            let wave_start = index;
+            let mut wave_end = wave_start;
+            while wave_end < cli.inputs.len()
+                && wave_end - wave_start < wave_width
+                && !batch_job
+                    .as_ref()
+                    .is_some_and(|job| job.is_completed(wave_end))
+            {
+                wave_end += 1;
+            }
+            let completed_before_wave = batch_job
+                .as_ref()
+                .map_or(completed_without_job, BatchJob::completed_count);
+            if let Some(writer) = &mut progress {
+                for (offset, (input, output)) in cli.inputs[wave_start..wave_end]
+                    .iter()
+                    .zip(&outputs[wave_start..wave_end])
+                    .enumerate()
+                {
+                    let asset_index = wave_start + offset;
+                    writer.emit(
+                        "asset_started",
+                        completed_before_wave,
+                        cli.inputs.len(),
+                        Some((asset_index, input, output)),
+                        None,
+                    )?;
+                }
+            }
+
+            let staged = (wave_start..wave_end)
+                .into_par_iter()
+                .map(|asset_index| {
+                    let output = &outputs[asset_index];
+                    prepare_output_directories(std::slice::from_ref(output))?;
+                    normalize::normalize_one_staged_with_roles(
+                        &cli.inputs[asset_index],
+                        output,
+                        &plan,
+                        formats[asset_index],
+                        channel_roles_override.as_deref(),
+                    )
+                })
+                .collect::<Vec<Result<_, String>>>();
+
+            for (asset_index, staged) in (wave_start..wave_end).zip(staged) {
+                let input = &cli.inputs[asset_index];
+                let output = &outputs[asset_index];
+                let outcome = match staged.and_then(normalize::StagedNormalization::commit) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        if let Some(writer) = &mut progress {
+                            writer.emit(
+                                "asset_failed",
+                                batch_job
+                                    .as_ref()
+                                    .map_or(completed_without_job, BatchJob::completed_count),
+                                cli.inputs.len(),
+                                Some((asset_index, input, output)),
+                                Some(&error),
+                            )?;
+                        }
+                        return Err(error);
+                    }
+                };
+                print_analysis(input, &outcome.source, Some(outcome.gain));
+                record_catalogue_asset(
+                    catalogue.as_mut(),
+                    &mut catalogue_records,
+                    CatalogueAsset {
+                        source: input,
+                        expected_source_sha256: catalogue_source_hashes
+                            .get(input)
+                            .map_or("", String::as_str),
+                        output: Some(output),
+                        measurement: &outcome.source,
+                        operation: "normalization",
+                        profile: &catalogue_profile(&cli, &plan),
+                        provenance: catalogue_provenance(&cli, &plan, "normalization"),
+                    },
+                )?;
+                if let Some(job) = &mut batch_job {
+                    job.mark_completed(asset_index)?;
+                } else {
+                    completed_without_job += 1;
+                }
+                if let Some(writer) = &mut progress {
+                    writer.emit(
+                        "asset_completed",
+                        batch_job
+                            .as_ref()
+                            .map_or(completed_without_job, BatchJob::completed_count),
+                        cli.inputs.len(),
+                        Some((asset_index, input, output)),
+                        None,
+                    )?;
+                }
+            }
+            index = wave_end;
+        }
+        if let Some(writer) = &mut progress {
+            writer.emit(
+                "job_completed",
+                batch_job
+                    .as_ref()
+                    .map_or(completed_without_job, BatchJob::completed_count),
+                cli.inputs.len(),
+                None,
+                None,
+            )?;
+        }
+        write_catalogue_report(
+            catalogue.as_ref(),
+            catalogue_options.report.as_deref(),
+            catalogue_records,
+        )?;
+        return Ok(());
     }
 
     for (index, ((input, output), fmt)) in cli

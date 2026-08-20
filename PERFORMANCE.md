@@ -68,7 +68,7 @@ The FFT resampler also fills a bounded input block without `Vec::drain`, keeps
 its output buffers, and supports streams whose final duration is known only at
 end-of-stream. These cases use 600-second stereo inputs.
 
-| Workload | v0.128.0 | Candidate | Change | Speedup |
+| Workload | v0.128.0 | v0.129.0 | Change | Speedup |
 | --- | ---: | ---: | ---: | ---: |
 | WAVE 48→44.1 kHz normalize | 5.575 s | 3.145 s | -43.6% | 1.77x |
 | WAVE 44.1→48 kHz normalize | 5.390 s | 3.342 s | -38.0% | 1.61x |
@@ -80,7 +80,7 @@ The neutral MP3 result is why same-rate lossy inputs keep the established
 re-decode path. A buffered temporary-file experiment was also rejected because
 it was slower than direct OS-page-cache I/O on the measurement host.
 
-### v0.130.0 candidate: album track parallelism
+### v0.130.0: album track parallelism
 
 Independent album analyses, renders, and corrected-output re-analyses now use
 the same Rayon work-stealing pool as channel DSP. `--jobs` remains the single
@@ -91,10 +91,10 @@ track has succeeded.
 This case normalizes eight independent 300-second stereo PCM16 WAVE tracks
 (2,400 seconds of programme material total). Both versions used the same
 deterministic generator. The v0.129.0 baseline is a five-run median; the
-candidate uses a fifteen-run median because concurrent filesystem writes
+v0.130.0 result uses a fifteen-run median because concurrent filesystem writes
 showed more run-to-run variance.
 
-| Metric | v0.129.0 | Candidate | Change |
+| Metric | v0.129.0 | v0.130.0 | Change |
 | --- | ---: | ---: | ---: |
 | Wall time | 11.362 s | 1.908 s | -83.2% (5.96x) |
 | Child CPU utilization | 164% | 814% | work distributed across tracks |
@@ -106,18 +106,42 @@ byte-identical WAVE files for every track. Album mode continues to avoid
 retaining a raw PCM spool per track, so parallelism does not scale temporary
 PCM storage with album duration.
 
+### v0.131.0: independent-file batch parallelism
+
+Ordinary multi-file normalization now uses the same bounded work-stealing pool
+without weakening per-asset transactions. Up to `min(--jobs, 32)` assets render
+to sibling temporary files in one wave. Forge then atomically publishes
+outputs, catalogue rows, resumable checkpoints, and progress completions in
+input order. A failure discards all later unpublished stages in that wave.
+
+This case normalizes eight independent 300-second stereo PCM16 WAVE tracks
+(2,400 seconds total) with `--jobs 8`. The v0.130.0 baseline is a five-run
+median; the v0.131.0 result is a fifteen-run median. Both use the same optimized
+build settings and deterministic fixture generator.
+
+| Metric | v0.130.0 | v0.131.0 | Change |
+| --- | ---: | ---: | ---: |
+| Wall time | 11.620 s | 2.375 s | -79.6% (4.89x) |
+| Child CPU utilization | 151% | 463% | work distributed across files |
+| Peak RSS | 15.8 MiB | 25.5 MiB | +9.8 MiB |
+
+`--jobs 1` and `--jobs 4` produced byte-identical WAVE outputs in the
+integration test. The 32-asset cap bounds simultaneous file handles, encoder
+state, memory, and temporary-output count; users can select a smaller
+`--jobs` value when storage throughput or temporary capacity is the limit.
+Post-encode verification, difference reports, and analysis-cache runs retain
+their established serial paths for now.
+
 ## Next implementation order
 
-1. Stage ordinary non-album batches in bounded waves, then publish progress,
-   checkpoints, catalogue records, and successful outputs in input order.
-2. Fuse gain, ceiling enforcement, quantization, and writer hand-off where
+1. Fuse gain, ceiling enforcement, quantization, and writer hand-off where
    output semantics permit it.
-3. Tee lossless verification measurements into encoding and remove avoidable
+2. Tee lossless verification measurements into encoding and remove avoidable
    post-encode reads without weakening lossy-codec verification.
-4. Reuse content-addressed analyses across identical input/plan requests.
-5. Train and compare profile-guided builds, then publish architecture-specific
+3. Reuse content-addressed analyses across identical input/plan requests.
+4. Train and compare profile-guided builds, then publish architecture-specific
    binaries only where reproducible gains justify the distribution cost.
-6. Run a GPU proof of concept only after CPU pass/memory optimizations; retain
+5. Run a GPU proof of concept only after CPU pass/memory optimizations; retain
    it only if transfer and launch overhead improve realistic long-form and
    multichannel workloads.
 

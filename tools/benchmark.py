@@ -29,6 +29,7 @@ DEFAULT_CASES = (
     "wav-stereo-analyze",
     "wav-stereo-normalize",
     "wav-stereo-resample-normalize",
+    "wav-stereo-batch-normalize",
     "wav-stereo-album-normalize",
     "wav-7.1-normalize",
     "flac-stereo-analyze",
@@ -241,6 +242,11 @@ def sanitized_command(case_id: str) -> list[str]:
             "forge", "<input.wav>", "--sample-rate", "<alternate-rate>",
             "--overwrite", "-o", "<output.wav>",
         ],
+        "wav-stereo-batch-normalize": [
+            "forge",
+            *[f"<input-{index:02d}.wav>" for index in range(1, ALBUM_TRACKS + 1)],
+            "--jobs", str(ALBUM_TRACKS), "--overwrite", "-o", "<output-dir>",
+        ],
         "wav-stereo-album-normalize": [
             "forge",
             *[f"<input-{index:02d}.wav>" for index in range(1, ALBUM_TRACKS + 1)],
@@ -270,6 +276,7 @@ def case_spec(case_id: str) -> tuple[str, str, int, str]:
         "wav-stereo-analyze": ("lossless", "wav", 2, "analyze"),
         "wav-stereo-normalize": ("lossless", "wav", 2, "normalize"),
         "wav-stereo-resample-normalize": ("lossless", "wav", 2, "normalize"),
+        "wav-stereo-batch-normalize": ("lossless", "wav", 2, "normalize"),
         "wav-stereo-album-normalize": ("lossless", "wav", 2, "normalize"),
         "wav-7.1-normalize": ("multichannel", "wav", 8, "normalize"),
         "flac-stereo-analyze": ("lossless", "flac", 2, "analyze"),
@@ -316,7 +323,10 @@ def run_case(
         measured_duration: float | None = None
     else:
         estimated = pcm_bytes(duration, sample_rate, channels)
-        if case_id == "wav-stereo-album-normalize":
+        if case_id in (
+            "wav-stereo-batch-normalize",
+            "wav-stereo-album-normalize",
+        ):
             require_space(case_dir, estimated * ALBUM_TRACKS * 2)
             input_directory = case_dir / "inputs"
             input_paths = [
@@ -331,8 +341,12 @@ def run_case(
             output_directory.mkdir()
             command = [
                 str(forge), *[str(path) for path in input_paths],
-                "--album", "--overwrite", "-o", str(output_directory),
             ]
+            if case_id == "wav-stereo-album-normalize":
+                command.append("--album")
+            else:
+                command += ["--jobs", str(ALBUM_TRACKS)]
+            command += ["--overwrite", "-o", str(output_directory)]
             measured_duration = float(duration * ALBUM_TRACKS)
         else:
             wave_path = case_dir / "source.wav"

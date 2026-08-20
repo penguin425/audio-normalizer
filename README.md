@@ -88,8 +88,10 @@ the `-o` extension override this.
 * **Sample-rate-aware true-peak analysis** uses a copy-free circular history,
   SIMD polyphase interpolation, and the BS.1770 measurement domain: 4× below
   96 kHz, 2× below 192 kHz, and direct samples at 192 kHz and above.
-* **Multi-threaded** via rayon — channels and independent album tracks share
-  one work-stealing pool bounded by `--jobs`.
+* **Multi-threaded** via rayon — channels, independent album tracks, and
+  ordinary multi-file normalization share one work-stealing pool bounded by
+  `--jobs`. Independent files render in waves of at most 32, then publish in
+  input order.
 * **Rolling block energies** make the 75%-overlapping LUFS gating blocks O(1)
   each while retaining only three seconds of filtered energy.
 * **Bounded-memory streaming** decodes analysis and normalization in chunks.
@@ -1393,6 +1395,11 @@ changed outputs unless `--overwrite` explicitly authorizes rebuilding them.
 Inputs, ordered paths, output formats, and normalization settings are bound to
 the state with SHA-256 evidence.
 
+Independent files render concurrently in bounded waves selected by `--jobs`.
+Outputs, catalogue rows, checkpoints, and completion events are still
+published in input order; a failed asset cannot expose a later staged output.
+Use `--jobs 1` when temporary-disk pressure matters more than throughput.
+
 `--progress PATH` writes schema-validated lifecycle NDJSON with job start,
 asset start/completion/skip/failure, and job completion events; use `-` for
 stdout. See [BATCH-JOBS.md](BATCH-JOBS.md) for recovery rules, limits, event
@@ -1564,7 +1571,7 @@ backup behavior.
 | `--bits` | input's | `8`/`16`/`24`/`32`/`32f`/`64f` output format |
 | `--wav-container` | `auto` | `auto`, `riff`, `rf64`, or `bw64` WAV container |
 | `--bwf` | off | Preserve/write BWF v2 metadata and measured loudness fields |
-| `-j, --jobs` | all cores | Shared channel/album-track worker count |
+| `-j, --jobs` | all cores | Shared channel, album-track, and independent-file worker count |
 
 The signal-health checks use bounded, deterministic PCM analysis: dropouts are
 short interior low-level runs, phase reversal is measured over consecutive

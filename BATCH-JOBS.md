@@ -45,6 +45,18 @@ same command skips those hash-verified outputs and retries the first pending
 asset. If a process stops while encoding, Forge's transactional audio output
 keeps any previous destination intact and the asset remains pending.
 
+Independent normalization uses the worker budget selected by `--jobs` in
+bounded waves of at most 32 assets. Each worker renders to a sibling temporary
+file. Forge then publishes successful outputs, catalogue records, and
+checkpoints in input order. If asset `n` fails, already published earlier
+assets remain resumable, asset `n` reports the failure, and every later staged
+asset in that wave is discarded without replacing its destination. `--jobs 1`
+selects one-at-a-time processing.
+
+Workflows that need post-encode verification or difference evidence, and runs
+that use the shared analysis cache, remain serial so their existing
+publication and cache contracts are unchanged.
+
 ## Machine-readable progress
 
 `--progress PATH` writes one
@@ -58,7 +70,7 @@ Events are ordered as follows:
 | Event | Meaning |
 |---|---|
 | `job_started` | Invocation began after state validation |
-| `asset_started` | One pending asset is about to run |
+| `asset_started` | One pending asset is about to run; all starts in a parallel wave precede its completions |
 | `asset_completed` | Output succeeded and its checkpoint was committed |
 | `asset_skipped` | Existing output matched its checkpoint hash |
 | `asset_failed` | Asset failed; includes a non-empty `error` |
@@ -68,6 +80,11 @@ Asset events include zero-based `index`, `input`, and `output`. Every event
 contains `completed`, `total`, a monotonic per-invocation `sequence`, the
 schema identifier, and generator version. `job_completed` is not emitted after
 an asset failure.
+
+Within a parallel wave, `asset_started` events are emitted in input order
+before the workers start. `asset_completed` events are emitted in input order
+after each atomic publication and checkpoint. This makes progress consumers
+deterministic even when the corresponding renders finish in another order.
 
 Example shell monitoring:
 
