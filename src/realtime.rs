@@ -54,7 +54,9 @@ impl RealtimeMeter {
             filters: (0..channels)
                 .map(|_| KWeight::for_sample_rate(sample_rate))
                 .collect(),
-            true_peak: (0..channels).map(|_| TruePeakMeter::new()).collect(),
+            true_peak: (0..channels)
+                .map(|_| TruePeakMeter::for_sample_rate(sample_rate))
+                .collect(),
             energy: vec![0.0; short_term_window],
             position: 0,
             filled: 0,
@@ -171,7 +173,9 @@ impl RealtimeMeter {
         self.filters = (0..self.channels())
             .map(|_| KWeight::for_sample_rate(self.sample_rate))
             .collect();
-        self.true_peak = (0..self.channels()).map(|_| TruePeakMeter::new()).collect();
+        self.true_peak = (0..self.channels())
+            .map(|_| TruePeakMeter::for_sample_rate(self.sample_rate))
+            .collect();
         self.energy.fill(0.0);
         self.position = 0;
         self.filled = 0;
@@ -258,7 +262,9 @@ impl RealtimeGainProcessor {
             ceiling: db_amplitude(config.ceiling_dbfs),
             attack_coefficient: smoothing_coefficient(sample_rate, config.attack_ms),
             release_coefficient: smoothing_coefficient(sample_rate, config.release_ms),
-            true_peak: (0..channels).map(|_| TruePeakMeter::new()).collect(),
+            true_peak: (0..channels)
+                .map(|_| TruePeakMeter::for_sample_rate(sample_rate))
+                .collect(),
             delay: vec![0.0; lookahead_frames * channels],
             delay_frame: 0,
             lookahead_frames,

@@ -20,6 +20,7 @@ fn base_report() -> Value {
             "sample_rate_hz": 48000,
             "pathological_chunks": 100001,
             "timeout_seconds": 7200,
+            "iterations": 3,
             "cases": ["wav-stereo-normalize"]
         },
         "results": [{
@@ -41,6 +42,33 @@ fn base_report() -> Value {
             "peak_rss_bytes": 100000000,
             "realtime_factor": 288.0,
             "expected_exit_codes": [0],
+            "iterations": 3,
+            "samples": [
+                {
+                    "exit_code": 0,
+                    "wall_seconds": 12.4,
+                    "user_cpu_seconds": 17.8,
+                    "system_cpu_seconds": 1.0,
+                    "cpu_percent": 151.6,
+                    "peak_rss_bytes": 100000000
+                },
+                {
+                    "exit_code": 0,
+                    "wall_seconds": 12.5,
+                    "user_cpu_seconds": 18.0,
+                    "system_cpu_seconds": 1.0,
+                    "cpu_percent": 152.0,
+                    "peak_rss_bytes": 100000000
+                },
+                {
+                    "exit_code": 0,
+                    "wall_seconds": 12.6,
+                    "user_cpu_seconds": 18.2,
+                    "system_cpu_seconds": 1.0,
+                    "cpu_percent": 152.4,
+                    "peak_rss_bytes": 100000000
+                }
+            ],
             "passed": true,
             "regression": null
         }],

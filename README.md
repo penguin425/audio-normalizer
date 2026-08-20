@@ -85,6 +85,9 @@ the `-o` extension override this.
 * **AVX2 + FMA SIMD** for the gain and energy-summation hot loops, with
   runtime feature detection and a portable scalar fallback (so the binary runs
   anywhere but flies on modern x86-64).
+* **Sample-rate-aware true-peak analysis** uses a copy-free circular history,
+  SIMD polyphase interpolation, and the BS.1770 measurement domain: 4× below
+  96 kHz, 2× below 192 kHz, and direct samples at 192 kHz and above.
 * **Multi-threaded** via rayon — channels and files are processed in parallel.
 * **Rolling block energies** make the 75%-overlapping LUFS gating blocks O(1)
   each while retaining only three seconds of filtered energy.
@@ -103,15 +106,16 @@ Forge includes a reproducible, versioned CPU/memory benchmark harness:
 
 ```sh
 cargo build --locked --release --bin forge --bin forge-container-qc
-python3 tools/benchmark.py --forge target/release/forge --output benchmark.json
+python3 tools/benchmark.py --forge target/release/forge --iterations 5 --output benchmark.json
 ```
 
-The suite covers one-hour stereo and 7.1 WAVE normalization, lossless FLAC and
-lossy MP3 analysis, and bounded rejection of a pathological WAVE chunk
-population. Fixture generation is excluded from measurement. Reports include
-wall/CPU time, peak RSS, real-time factor, host identity, workload settings,
-and optional same-host regression checks. See [BENCHMARKS.md](BENCHMARKS.md)
-for the contract, safety limits, and short smoke command.
+The suite covers one-hour stereo WAVE analysis, stereo and 7.1 WAVE
+normalization, lossless FLAC and lossy MP3 analysis, and bounded rejection of a
+pathological WAVE chunk population. Fixture generation is excluded from
+measurement. Reports retain repeated samples and include median wall/CPU time,
+maximum peak RSS, real-time factor, host identity, workload settings, and
+optional same-host regression checks. See [BENCHMARKS.md](BENCHMARKS.md) for
+the contract, safety limits, and short smoke command.
 
 ### Multi-delivery optimization
 
@@ -1544,7 +1548,7 @@ backup behavior.
 | `--verify-tolerance` | `0.5` | Allowed post-encode deviation in LU/dB |
 | `--verify-retries` | `0` | Automatically correct gain and re-encode up to N times |
 | `--difference-report` | none | Versioned JSON gain/limiting/clipping/codec-drift evidence |
-| `--limiter` | off | Look-ahead 4× oversampled true-peak limiter |
+| `--limiter` | off | Look-ahead, sample-rate-aware oversampled true-peak limiter |
 | `--limiter-lookahead` | `5` | Limiter look-ahead in milliseconds |
 | `--limiter-release` | `100` | Limiter release time in milliseconds |
 | `--dither` | off | TPDF dither for integer PCM output |
@@ -2196,7 +2200,7 @@ src/
     kwfilter.rs     BS.1770 K-weighting (two biquads, sample-rate independent)
     lufs.rs         gated integrated loudness + RMS/peak
     limiter.rs      streaming look-ahead true-peak limiter
-    truepeak.rs     4x polyphase FIR true-peak meter
+    truepeak.rs     sample-rate-aware SIMD polyphase FIR true-peak meter
   downmix.rs        explicit WAVE-order stereo/5.1/7.1.4 matrices
   downmix_qc.rs     bounded immersive downmix evidence and clip-risk reports
   binaural_qc.rs    external renderer/model evidence and binaural drift gates

@@ -14,6 +14,30 @@ SPEC.loader.exec_module(benchmark)
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_repeated_measurements_use_medians_and_maximum_rss(self):
+        summary = benchmark.aggregate_measurements([
+            {
+                "wall_seconds": 3.0, "user_cpu_seconds": 2.7,
+                "system_cpu_seconds": 0.3, "cpu_percent": 100.0,
+                "peak_rss_bytes": 90,
+            },
+            {
+                "wall_seconds": 1.0, "user_cpu_seconds": 0.8,
+                "system_cpu_seconds": 0.2, "cpu_percent": 100.0,
+                "peak_rss_bytes": 120,
+            },
+            {
+                "wall_seconds": 2.0, "user_cpu_seconds": 1.7,
+                "system_cpu_seconds": 0.3, "cpu_percent": 100.0,
+                "peak_rss_bytes": 100,
+            },
+        ])
+        self.assertEqual(summary["wall_seconds"], 2.0)
+        self.assertEqual(summary["user_cpu_seconds"], 1.7)
+        self.assertEqual(summary["system_cpu_seconds"], 0.3)
+        self.assertEqual(summary["cpu_percent"], 100.0)
+        self.assertEqual(summary["peak_rss_bytes"], 120)
+
     def test_pcm_wave_size_and_header(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "fixture.wav"
@@ -38,7 +62,8 @@ class BenchmarkTests(unittest.TestCase):
             },
             "configuration": {
                 "duration_seconds": 1, "sample_rate_hz": 48_000,
-                "pathological_chunks": 100_001, "cases": ["case"],
+                "pathological_chunks": 100_001, "iterations": 3,
+                "cases": ["case"],
             },
             "results": [{
                 "id": "case", "wall_seconds": 1.1, "peak_rss_bytes": 110,
