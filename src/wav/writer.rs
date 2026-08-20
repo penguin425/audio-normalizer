@@ -52,6 +52,7 @@ pub struct WavStreamWriter {
     kind: PcmKind,
     dither: bool,
     rngs: Vec<u64>,
+    encoded: Vec<u8>,
     remaining_frames: usize,
 }
 
@@ -183,22 +184,33 @@ impl WavStreamWriter {
             kind,
             dither,
             rngs: convert::dither_rngs(channels as usize),
+            encoded: Vec::new(),
             remaining_frames: frames,
         })
     }
 
     pub fn write_chunk(&mut self, planar: &[Vec<f32>]) -> Result<(), WavWriteError> {
+        let frames = self.validate_chunk(planar)?;
+        convert::encode_interleaved_with_rngs_into(
+            planar,
+            self.kind,
+            self.dither,
+            &mut self.rngs,
+            &mut self.encoded,
+        );
+        self.file.write_all(&self.encoded)?;
+        self.remaining_frames -= frames;
+        Ok(())
+    }
+
+    fn validate_chunk(&self, planar: &[Vec<f32>]) -> Result<usize, WavWriteError> {
         let frames = planar.first().map_or(0, Vec::len);
         if frames > self.remaining_frames {
             return Err(WavWriteError::Io(io::Error::other(
                 "more frames decoded than expected",
             )));
         }
-        let bytes =
-            convert::encode_interleaved_with_rngs(planar, self.kind, self.dither, &mut self.rngs);
-        self.file.write_all(&bytes)?;
-        self.remaining_frames -= frames;
-        Ok(())
+        Ok(frames)
     }
 
     pub fn finish(mut self) -> Result<(), WavWriteError> {
@@ -427,5 +439,22 @@ mod tests {
             let decoded = WavReader::open(file.path()).unwrap();
             assert_eq!((decoded.channels, decoded.frames), (2, 480));
         }
+    }
+
+    #[test]
+    fn stream_writer_reuses_encoded_chunk_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("stream.wav");
+        let chunk = vec![vec![0.25; 257], vec![-0.25; 257]];
+        let mut writer =
+            WavStreamWriter::create(&output, 48_000, 2, chunk[0].len() * 2, PcmKind::S16, false)
+                .unwrap();
+
+        writer.write_chunk(&chunk).unwrap();
+        let first_capacity = writer.encoded.capacity();
+        assert!(first_capacity >= chunk[0].len() * chunk.len() * 2);
+        writer.write_chunk(&chunk).unwrap();
+        assert_eq!(writer.encoded.capacity(), first_capacity);
+        writer.finish().unwrap();
     }
 }

@@ -798,8 +798,7 @@ pub fn apply_gain_and_protect(buf: &mut AudioBuffer, gain: f32, plan: &Plan) {
     }
     let ceil_lin = 10.0_f64.powf(plan.ceiling_db / 20.0) as f32;
     for ch in buf.data.iter_mut() {
-        simd::apply_gain(ch, gain);
-        simd::hard_clip(ch, ceil_lin);
+        simd::apply_gain_and_hard_clip(ch, gain, ceil_lin);
     }
 }
 
@@ -2791,6 +2790,12 @@ fn process_normalized_chunk(
     statistics: &mut Option<RenderStatisticsBuilder>,
     write: &mut impl FnMut(&[Vec<f32>]) -> Result<(), String>,
 ) -> Result<(), String> {
+    if limiter.is_none() && statistics.is_none() {
+        for channel in planar.iter_mut() {
+            simd::apply_gain_and_hard_clip(channel, gain, ceiling);
+        }
+        return write(planar);
+    }
     if let Some(statistics) = statistics.as_mut() {
         statistics.observe_input(planar);
     }

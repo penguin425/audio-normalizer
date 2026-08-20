@@ -85,6 +85,11 @@ the `-o` extension override this.
 * **AVX2 + FMA SIMD** for the gain and energy-summation hot loops, with
   runtime feature detection and a portable scalar fallback (so the binary runs
   anywhere but flies on modern x86-64).
+* **Fused render/write hot path** applies gain and the safety ceiling in one
+  channel-contiguous SIMD pass, vectorizes byte-exact PCM16 mono/stereo
+  quantization and interleaving, and reuses the WAVE writer's chunk storage.
+  Dither, exceptional samples, limiter processing, and verification retain
+  their established semantics.
 * **Sample-rate-aware true-peak analysis** uses a copy-free circular history,
   SIMD polyphase interpolation, and the BS.1770 measurement domain: 4× below
   96 kHz, 2× below 192 kHz, and direct samples at 192 kHz and above.

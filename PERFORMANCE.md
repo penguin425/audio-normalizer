@@ -132,16 +132,48 @@ state, memory, and temporary-output count; users can select a smaller
 Post-encode verification, difference reports, and analysis-cache runs retain
 their established serial paths for now.
 
+### v0.132.0: render and writer hot-path fusion
+
+The ordinary non-limiter, non-statistics render path now applies gain and the
+hard ceiling in one channel-contiguous AVX2 pass. Default 16-bit mono/stereo
+WAVE output uses a byte-exact AVX2 quantize/interleave kernel, and the streaming
+writer reuses one encoded-byte buffer instead of allocating it for every
+decoded chunk. Runtime detection retains scalar fallbacks on x86-64 hosts
+without AVX2; other PCM kinds and dithered output keep the established scalar
+quantizer.
+
+A first experiment moved gain and ceiling arithmetic into the frame-major
+scalar quantizer. It was rejected after a fifteen-run 300-second benchmark was
+2.1% slower: removing memory passes did not offset losing the channel-contiguous
+SIMD kernel. The retained design follows the Roofline motivation without
+trading away vector throughput.
+
+The release comparison uses one 1,200-second stereo PCM16 WAVE input and
+seven-run medians from identically optimized builds. Fixture generation is
+excluded.
+
+| Metric | v0.131.0 | v0.132.0 | Change |
+| --- | ---: | ---: | ---: |
+| Wall time | 5.746 s | 5.186 s | -9.7% (1.11x) |
+| User CPU time | 6.063 s | 5.407 s | -10.8% |
+| Child CPU utilization | 165% | 172% | more work retained in vector kernels |
+| Peak RSS | 15.8 MiB | 15.8 MiB | unchanged |
+
+Normal and dithered end-to-end WAVE outputs were byte-identical to v0.131.0.
+Unit tests also compare the combined gain/ceiling kernel bit-for-bit and the
+S16 SIMD quantizer byte-for-byte against their scalar predecessors across
+NaNs, infinities, signed zero, half-LSB boundaries, random bit patterns, mono,
+stereo, and non-vector-length tails. Limiter and render-statistics paths retain
+their established sequencing.
+
 ## Next implementation order
 
-1. Fuse gain, ceiling enforcement, quantization, and writer hand-off where
-   output semantics permit it.
-2. Tee lossless verification measurements into encoding and remove avoidable
+1. Tee lossless verification measurements into encoding and remove avoidable
    post-encode reads without weakening lossy-codec verification.
-3. Reuse content-addressed analyses across identical input/plan requests.
-4. Train and compare profile-guided builds, then publish architecture-specific
+2. Reuse content-addressed analyses across identical input/plan requests.
+3. Train and compare profile-guided builds, then publish architecture-specific
    binaries only where reproducible gains justify the distribution cost.
-5. Run a GPU proof of concept only after CPU pass/memory optimizations; retain
+4. Run a GPU proof of concept only after CPU pass/memory optimizations; retain
    it only if transfer and launch overhead improve realistic long-form and
    multichannel workloads.
 
