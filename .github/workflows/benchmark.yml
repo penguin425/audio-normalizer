@@ -9,6 +9,10 @@ on:
       - "src/**"
       - "tools/benchmark.py"
       - "tools/test_benchmark.py"
+      - "tools/train-pgo.py"
+      - "tools/test_pgo_training.py"
+      - "tools/canonicalize-pgo-profile.py"
+      - "tools/test_pgo_profile.py"
       - "schema/performance-benchmark-v1.schema.json"
   workflow_dispatch:
     inputs:
@@ -41,7 +45,11 @@ jobs:
           sudo apt-get install --yes --no-install-recommends ffmpeg
 
       - name: Test benchmark contract
-        run: python3 -m unittest tools/test_benchmark.py
+        run: >-
+          python3 -m unittest
+          tools/test_benchmark.py
+          tools/test_pgo_training.py
+          tools/test_pgo_profile.py
 
       - name: Build measured binaries
         run: cargo build --locked --release --bin forge --bin forge-container-qc

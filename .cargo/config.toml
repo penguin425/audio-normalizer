@@ -1,6 +1,7 @@
 # Build configuration for Forge.
-# Compile for the host CPU so LLVM can emit AVX2/AVX-512/FMA and auto-vectorize
-# the DSP hot loops. The SIMD module still does runtime feature detection, so the
-# binary remains portable (it falls back to scalar on older CPUs).
+# Local developer builds target the host CPU so LLVM can auto-vectorize around
+# the hand-written runtime-dispatched SIMD kernels. Such builds are host-specific
+# and are not portable. Release CI overrides RUSTFLAGS with the baseline target;
+# its AVX2/FMA kernels retain explicit runtime detection and scalar fallbacks.
 [target.'cfg(not(target_arch = "wasm32"))']
 rustflags = ["-C", "target-cpu=native"]

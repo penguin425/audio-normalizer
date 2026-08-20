@@ -31,6 +31,22 @@ The official EBU v5 and ITU-R BS.2217-2 suites remain release gates.
   constrain what may be fused or parallelized. In particular, complete 400 ms
   gating blocks and the combined gated-block population cannot be approximated
   by short windows or per-track averages.
+- Rust's
+  [profile-guided optimization procedure](https://doc.rust-lang.org/nightly/rustc/profile-guided-optimization.html)
+  and LLVM's
+  [instrumentation profile format](https://www.llvm.org/docs/InstrProfileFormat.html)
+  define the instrument, train, merge, and profile-use pipeline. Forge uses
+  the exact toolchain-matched `llvm-profdata`, identical code-generation flags
+  in both builds, and an explicit target so build scripts do not pollute the
+  profile. Pettis and Hansen's
+  [profile-guided code-positioning work](https://pages.cs.wisc.edu/~fischer/cs701.f05/code.positioning.pdf)
+  provides the underlying hot-path layout motivation; its historical gains
+  are not treated as a Forge performance prediction.
+- The x86-64 psABI
+  [micro-architecture levels](https://gitlab.com/x86-psABIs/x86-64-ABI/-/raw/master/x86-64-ABI/low-level-sys-info.tex)
+  define the optional x86-64-v3 build's CPU contract. The generic release
+  remains the fallback rather than executing a v3 binary on an unsupported
+  processor.
 
 These sources guide the architecture; benchmark evidence decides whether an
 individual implementation is retained.
@@ -236,11 +252,72 @@ Tests exercise concurrent entry publication and bounded eviction, and compare
 serial/parallel cache-hit outputs byte-for-byte while checking deterministic
 cache messages and progress ordering.
 
+### v0.135.0: deterministic PGO and an optional x86-64-v3 CLI
+
+The Linux normalizer CLI now uses an LLVM instrumentation-PGO build. A bounded,
+deterministic 12-second training corpus exercises 14 serial paths: WAVE and
+FLAC analysis/normalization, native verification, resampling, dither, limiting,
+7.1 audio, batch and album work, and analysis-cache hit/miss behavior. Every
+training invocation uses `--jobs 1`; the profile directory must be empty, and
+the profile generator and consumer use identical target/features/Rust flags.
+
+Raw profiles from two independent training runs differed only in three cold
+mutex/registry functions. The canonicalizer zeros an entire function only
+when its maximum counter is below 10,000; hot counters and value profiles are
+left unchanged. The two canonical profiles and their indexed LLVM profiles
+were byte-identical. Release CI independently repeats the complete build and
+requires byte-identical generic and v3 archives before publication.
+
+These measurements use 600-second deterministic inputs and seven-run medians.
+The generic PGO column compares a generic x86-64 build with and without PGO.
+The v3+PGO column compares a contemporary generic non-PGO build with the
+optional `-Ctarget-cpu=x86-64-v3` PGO build on the same Ryzen 9 3950X host.
+
+| Workload | Generic PGO wall change | v3+PGO wall change |
+| --- | ---: | ---: |
+| WAVE stereo analyze | -3.92% | -18.64% |
+| WAVE stereo normalize | -5.54% | -14.92% |
+| WAVE stereo verify | -6.30% | -19.69% |
+| WAVE to FLAC verify | -3.50% | -46.75% |
+| WAVE resample + normalize | -3.19% | -11.89% |
+| WAVE 7.1 normalize | -4.84% | -11.67% |
+| FLAC stereo analyze | -6.27% | -14.57% |
+| FLAC stereo normalize | -5.37% | -11.20% |
+| MP3 stereo analyze | -2.58% | -18.85% |
+| MP3 stereo normalize | -4.89% | -11.88% |
+| **Ten-case aggregate** | **-4.61%** | **-21.55%** |
+
+Generic PGO reduced aggregate user CPU by 3.77% and the CLI size by 11.46%.
+The v3+PGO build reduced aggregate user CPU by 22.02% versus generic and,
+compared with v3 without PGO, reduced wall time by another 4.94%, user CPU by
+6.48%, and binary size by 12.07%. All 17 benchmark cases passed, and SHA-256
+comparison found all 55 generated audio files byte-identical to the generic
+build.
+
+Parallel wall time remains scheduler/storage sensitive: across six 600-second
+batch/album cases with 15-run medians, generic PGO reduced aggregate user CPU
+by 3.95% but wall time by only 0.72%. Twenty alternating album pairs produced a
+median paired wall change of -0.017%, with large individual variation. The
+release therefore claims the measured serial/CPU reduction, not a stable
+parallel latency gain.
+
+Only the Linux `forge` CLI receives PGO in this release. The full Linux archive
+uses the generic CPU baseline; the supplemental `linux-x86_64-v3` archive
+contains only the v3 CLI. Other Forge executables, shared libraries, wheels,
+macOS, and Windows remain portable non-PGO builds until separately measured.
+Developers can reproduce the generic pipeline with the toolchain-matched LLVM
+component:
+
+```sh
+rustup component add llvm-tools-preview
+FORGE_PGO_ROOT="$PWD/target/forge-pgo-generic" \
+FORGE_PGO_RUSTFLAGS='-Ctarget-cpu=x86-64' \
+tools/build-pgo-forge.sh x86_64-unknown-linux-gnu
+```
+
 ## Next implementation order
 
-1. Train and compare profile-guided builds, then publish architecture-specific
-   binaries only where reproducible gains justify the distribution cost.
-2. Run a GPU proof of concept only after CPU pass/memory optimizations; retain
+1. Run a GPU proof of concept only after CPU pass/memory optimizations; retain
    it only if transfer and launch overhead improve realistic long-form and
    multichannel workloads.
 

@@ -6,7 +6,11 @@ on:
       - "v*.*.*"
   pull_request:
     paths:
+      - ".cargo/config.toml"
       - ".github/workflows/release.yml"
+      - "README.md"
+      - "PERFORMANCE.md"
+      - "LICENSE"
       - "include/forge_normalizer.h"
       - "C-API.md"
       - "HOST-ADAPTERS.md"
@@ -29,6 +33,9 @@ on:
       - "MPEGH-ADAPTER.md"
       - "DTS-ADAPTER.md"
       - "tools/benchmark.py"
+      - "tools/build-pgo-forge.sh"
+      - "tools/train-pgo.py"
+      - "tools/canonicalize-pgo-profile.py"
       - "schema/performance-benchmark-v1.schema.json"
       - "schema/multi-delivery-request-v1.schema.json"
       - "schema/multi-delivery-report-v1.schema.json"
@@ -113,6 +120,7 @@ on:
       - "tools/build-python-wheel.py"
       - "tools/build-wasm-package.sh"
       - "tools/package-linux-release.sh"
+      - "tools/package-linux-v3-release.sh"
       - "tools/generate-package-metadata.sh"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -208,6 +216,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install matching LLVM PGO tools
+        if: matrix.asset == 'linux-x86_64'
+        run: rustup component add llvm-tools-preview
+
       - name: Install Python 3.14
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -221,6 +233,20 @@ jobs:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace ${{ matrix.rustflags }}
         run: cargo build --locked --release --target ${{ matrix.target }} --features opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service
+
+      - name: Apply reproducible PGO to the Linux normalizer CLI
+        if: matrix.asset == 'linux-x86_64'
+        shell: bash
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+          FORGE_PGO_FEATURES: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service
+          FORGE_PGO_RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace
+        run: |
+          set -euo pipefail
+          tools/build-pgo-forge.sh "${{ matrix.target }}"
+          cp \
+            "target/forge-pgo-${{ matrix.target }}/optimized/${{ matrix.target }}/release/forge" \
+            "target/${{ matrix.target }}/release/forge"
 
       - name: Build the self-contained Python platform wheel
         env:
@@ -345,7 +371,7 @@ jobs:
              schema/service-analysis-v1.schema.json \
              schema/service-error-v1.schema.json \
              schema/service-health-v1.schema.json "$staging/schema/"
-          cp README.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md MPEGH-ADAPTER.md DTS-ADAPTER.md ANOMALY-ADAPTER.md SERVICE-METRICS.md C-API.md HOST-ADAPTERS.md VST3-ADAPTER.md AU-ADAPTER.md IMMERSIVE-DOWNMIX.md BINAURAL-QC.md REMEDIATION.md METADATA-REPAIR.md NEXT-GENERATION-PLAN.md ROADMAP.md LICENSE "$staging/"
+          cp README.md PERFORMANCE.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md MPEGH-ADAPTER.md DTS-ADAPTER.md ANOMALY-ADAPTER.md SERVICE-METRICS.md C-API.md HOST-ADAPTERS.md VST3-ADAPTER.md AU-ADAPTER.md IMMERSIVE-DOWNMIX.md BINAURAL-QC.md REMEDIATION.md METADATA-REPAIR.md NEXT-GENERATION-PLAN.md ROADMAP.md LICENSE "$staging/"
           tar -czf "${staging}.tar.gz" "$staging"
 
       - name: Package Windows binary
@@ -385,7 +411,7 @@ jobs:
           Copy-Item "schema/remediation-request-v1.schema.json","schema/remediation-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/metadata-repair-request-v1.schema.json","schema/metadata-repair-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/audio-anomaly-provider-v1.schema.json","schema/anomaly-provider-audit-v1.schema.json","schema/model-qc-v1.schema.json","schema/onnx-anomaly-model-v1.schema.json","schema/onnx-feature-frames-v1.schema.json","schema/remote-range-v1.schema.json","schema/remote-qc-v1.schema.json","schema/service-analysis-v1.schema.json","schema/service-error-v1.schema.json","schema/service-health-v1.schema.json" "$staging/schema/"
-          Copy-Item "README.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","MULTI-DELIVERY.md","SEGMENT-NORMALIZATION.md","AC4-ADAPTER.md","MPEGH-ADAPTER.md","DTS-ADAPTER.md","ANOMALY-ADAPTER.md","SERVICE-METRICS.md","C-API.md","HOST-ADAPTERS.md","VST3-ADAPTER.md","AU-ADAPTER.md","IMMERSIVE-DOWNMIX.md","BINAURAL-QC.md","REMEDIATION.md","METADATA-REPAIR.md","NEXT-GENERATION-PLAN.md","ROADMAP.md","LICENSE" $staging
+          Copy-Item "README.md","PERFORMANCE.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","MULTI-DELIVERY.md","SEGMENT-NORMALIZATION.md","AC4-ADAPTER.md","MPEGH-ADAPTER.md","DTS-ADAPTER.md","ANOMALY-ADAPTER.md","SERVICE-METRICS.md","C-API.md","HOST-ADAPTERS.md","VST3-ADAPTER.md","AU-ADAPTER.md","IMMERSIVE-DOWNMIX.md","BINAURAL-QC.md","REMEDIATION.md","METADATA-REPAIR.md","NEXT-GENERATION-PLAN.md","ROADMAP.md","LICENSE" $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
 
       - name: Upload packaged binary
@@ -398,9 +424,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  reproducible-linux:
-    name: Reproduce Linux release
-    needs: [validate, build]
+  build-linux-v3:
+    name: Build linux-x86_64-v3
+    needs: validate
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
@@ -409,6 +435,48 @@ jobs:
         uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
         with:
           targets: x86_64-unknown-linux-gnu
+          components: llvm-tools-preview
+
+      - name: Build the reproducible PGO x86-64-v3 CLI
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+          FORGE_PGO_FEATURES: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service
+          FORGE_PGO_ROOT: ${{ github.workspace }}/target/forge-pgo-x86_64-v3
+          FORGE_PGO_RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace -Ctarget-cpu=x86-64-v3
+        shell: bash
+        run: tools/build-pgo-forge.sh x86_64-unknown-linux-gnu
+
+      - name: Package the supplemental x86-64-v3 CLI
+        shell: bash
+        run: >-
+          tools/package-linux-v3-release.sh
+          "${{ needs.validate.outputs.version }}"
+          target/forge-pgo-x86_64-v3/optimized/x86_64-unknown-linux-gnu/release/forge
+          "${{ needs.validate.outputs.source-date-epoch }}"
+          .
+
+      - name: Upload the x86-64-v3 CLI
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: forge-linux-x86_64-v3
+          path: forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  reproducible-linux:
+    name: Reproduce Linux release
+    needs: [validate, build, build-linux-v3]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install matching LLVM PGO tools
+        run: rustup component add llvm-tools-preview
 
       - name: Install Python 3.14
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -424,17 +492,39 @@ jobs:
           name: forge-linux-x86_64
           path: actual
 
+      - name: Download published x86-64-v3 candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-linux-x86_64-v3
+          path: actual
+
       - name: Independently rebuild and compare
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+          FORGE_PGO_FEATURES: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service
+          FORGE_PGO_RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace
+          FORGE_PGO_V3_ROOT: ${{ github.workspace }}/target/forge-pgo-x86_64-v3
+          FORGE_PGO_V3_RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace -Ctarget-cpu=x86-64-v3
           RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace
           SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
         shell: bash
         run: |
           set -euo pipefail
           cargo build --locked --release --target x86_64-unknown-linux-gnu --features opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service
+          tools/build-pgo-forge.sh x86_64-unknown-linux-gnu
+          cp \
+            target/forge-pgo-x86_64-unknown-linux-gnu/optimized/x86_64-unknown-linux-gnu/release/forge \
+            target/x86_64-unknown-linux-gnu/release/forge
+          FORGE_PGO_ROOT="$FORGE_PGO_V3_ROOT" \
+            FORGE_PGO_RUSTFLAGS="$FORGE_PGO_V3_RUSTFLAGS" \
+            tools/build-pgo-forge.sh x86_64-unknown-linux-gnu
           mkdir reproduced
           tools/package-linux-release.sh "${{ needs.validate.outputs.version }}" x86_64-unknown-linux-gnu "${{ needs.validate.outputs.source-date-epoch }}" reproduced
+          tools/package-linux-v3-release.sh \
+            "${{ needs.validate.outputs.version }}" \
+            target/forge-pgo-x86_64-v3/optimized/x86_64-unknown-linux-gnu/release/forge \
+            "${{ needs.validate.outputs.source-date-epoch }}" \
+            reproduced
           python tools/build-python-wheel.py \
             --library target/x86_64-unknown-linux-gnu/release/libforge_normalizer.so \
             --library-name libforge_normalizer.so \
@@ -447,9 +537,14 @@ jobs:
           cmp \
             "actual/forge_normalizer-${{ needs.validate.outputs.version }}-py3-none-manylinux_2_34_x86_64.whl" \
             "reproduced/forge_normalizer-${{ needs.validate.outputs.version }}-py3-none-manylinux_2_34_x86_64.whl"
+          cmp \
+            "actual/forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.tar.gz" \
+            "reproduced/forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.tar.gz"
           sha256sum \
             "actual/forge-v${{ needs.validate.outputs.version }}-linux-x86_64.tar.gz" \
             "reproduced/forge-v${{ needs.validate.outputs.version }}-linux-x86_64.tar.gz" \
+            "actual/forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.tar.gz" \
+            "reproduced/forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.tar.gz" \
             "actual/forge_normalizer-${{ needs.validate.outputs.version }}-py3-none-manylinux_2_34_x86_64.whl" \
             "reproduced/forge_normalizer-${{ needs.validate.outputs.version }}-py3-none-manylinux_2_34_x86_64.whl"
 
@@ -491,7 +586,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [validate, build, reproducible-linux, wasm]
+    needs: [validate, build, build-linux-v3, reproducible-linux, wasm]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     permissions:

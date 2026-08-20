@@ -236,6 +236,11 @@ Forge already provides:
   mono/stereo quantization and interleaving, reusable WAVE chunk storage, and
   scalar/SIMD equivalence coverage for exceptional values and quantizer
   boundaries.
+- Deterministic LLVM instrumentation PGO for the generic Linux `forge` CLI,
+  with bounded serial training, cold-profile canonicalization, independent
+  byte-reproducible rebuilds, and an optional x86-64-v3 PGO CLI for compatible
+  CPUs while package managers, libraries, and the default archive remain on
+  the generic CPU baseline.
 - Versioned multi-delivery optimization for two to 32 codec/profile outputs,
   using one conservative target, ceiling, and iteratively corrected gain;
   staged post-metadata re-decoding, explicit infeasibility, path-alias and
