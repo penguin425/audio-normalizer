@@ -202,6 +202,84 @@ impl TruePeakMeter {
         frame_peak
     }
 
+    /// Process one stereo frame while sharing the immutable phase-coefficient
+    /// loads. Each channel keeps its own history, FMA accumulator, maximum
+    /// reduction, and meter peak, so the result is bit-identical to two
+    /// consecutive [`Self::process_sample`] calls.
+    #[inline]
+    pub(crate) fn process_stereo_sample(
+        left: &mut Self,
+        right: &mut Self,
+        left_sample: f32,
+        right_sample: f32,
+    ) -> (f32, f32) {
+        if left.factor != right.factor {
+            return (
+                left.process_sample(left_sample),
+                right.process_sample(right_sample),
+            );
+        }
+
+        let mut left_frame_peak = left_sample.abs();
+        let mut right_frame_peak = right_sample.abs();
+        if left.factor > 1 {
+            let left_value = left_sample as f64;
+            if left.initialized {
+                left.cursor = left.cursor.wrapping_sub(1) & (TAPS_PER_PHASE - 1);
+                left.history[left.cursor] = left_value;
+                left.history[left.cursor + TAPS_PER_PHASE] = left_value;
+            } else {
+                left.history.fill(left_value);
+                left.initialized = true;
+            }
+            let right_value = right_sample as f64;
+            if right.initialized {
+                right.cursor = right.cursor.wrapping_sub(1) & (TAPS_PER_PHASE - 1);
+                right.history[right.cursor] = right_value;
+                right.history[right.cursor + TAPS_PER_PHASE] = right_value;
+            } else {
+                right.history.fill(right_value);
+                right.initialized = true;
+            }
+
+            let left_history: &[f64; TAPS_PER_PHASE] = left.history
+                [left.cursor..left.cursor + TAPS_PER_PHASE]
+                .try_into()
+                .expect("true-peak history window has a fixed length");
+            let right_history: &[f64; TAPS_PER_PHASE] = right.history
+                [right.cursor..right.cursor + TAPS_PER_PHASE]
+                .try_into()
+                .expect("true-peak history window has a fixed length");
+            let table = phase_table(left.factor);
+            #[cfg(target_arch = "x86_64")]
+            let (left_interpolated, right_interpolated) = if left.use_avx2_fma {
+                // SAFETY: both meters run on this process and the constructor
+                // performed runtime AVX2/FMA detection.
+                unsafe { interpolate_stereo_avx2_fma(left_history, right_history, table) }
+            } else {
+                interpolate_stereo_scalar(left_history, right_history, table, left.factor)
+            };
+            #[cfg(target_arch = "aarch64")]
+            let (left_interpolated, right_interpolated) = {
+                // SAFETY: Advanced SIMD is part of the AArch64 architecture.
+                unsafe { interpolate_stereo_neon(left_history, right_history, table) }
+            };
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            let (left_interpolated, right_interpolated) =
+                interpolate_stereo_scalar(left_history, right_history, table, left.factor);
+
+            for value in &left_interpolated[..left.factor] {
+                left_frame_peak = left_frame_peak.max(value.abs() as f32);
+            }
+            for value in &right_interpolated[..right.factor] {
+                right_frame_peak = right_frame_peak.max(value.abs() as f32);
+            }
+        }
+        left.peak = left.peak.max(left_frame_peak);
+        right.peak = right.peak.max(right_frame_peak);
+        (left_frame_peak, right_frame_peak)
+    }
+
     pub const fn peak(&self) -> f32 {
         self.peak
     }
@@ -233,6 +311,25 @@ fn interpolate_scalar(
     output
 }
 
+#[inline]
+fn interpolate_stereo_scalar(
+    left_history: &[f64; TAPS_PER_PHASE],
+    right_history: &[f64; TAPS_PER_PHASE],
+    table: &PhaseTable,
+    factor: usize,
+) -> ([f64; MAX_PHASES], [f64; MAX_PHASES]) {
+    let mut left_output = [0.0; MAX_PHASES];
+    let mut right_output = [0.0; MAX_PHASES];
+    for tap in 0..TAPS_PER_PHASE {
+        for phase in 0..factor {
+            let coefficient = table[tap][phase];
+            left_output[phase] += coefficient * left_history[tap];
+            right_output[phase] += coefficient * right_history[tap];
+        }
+    }
+    (left_output, right_output)
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn interpolate_avx2_fma(
@@ -248,6 +345,29 @@ unsafe fn interpolate_avx2_fma(
     let mut output = [0.0; MAX_PHASES];
     _mm256_storeu_pd(output.as_mut_ptr(), accumulator);
     output
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn interpolate_stereo_avx2_fma(
+    left_history: &[f64; TAPS_PER_PHASE],
+    right_history: &[f64; TAPS_PER_PHASE],
+    table: &PhaseTable,
+) -> ([f64; MAX_PHASES], [f64; MAX_PHASES]) {
+    let mut left_accumulator = _mm256_setzero_pd();
+    let mut right_accumulator = _mm256_setzero_pd();
+    for tap in 0..TAPS_PER_PHASE {
+        let coefficients = _mm256_loadu_pd(table.get_unchecked(tap).as_ptr());
+        let left_sample = _mm256_set1_pd(*left_history.get_unchecked(tap));
+        let right_sample = _mm256_set1_pd(*right_history.get_unchecked(tap));
+        left_accumulator = _mm256_fmadd_pd(left_sample, coefficients, left_accumulator);
+        right_accumulator = _mm256_fmadd_pd(right_sample, coefficients, right_accumulator);
+    }
+    let mut left_output = [0.0; MAX_PHASES];
+    let mut right_output = [0.0; MAX_PHASES];
+    _mm256_storeu_pd(left_output.as_mut_ptr(), left_accumulator);
+    _mm256_storeu_pd(right_output.as_mut_ptr(), right_accumulator);
+    (left_output, right_output)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -268,6 +388,37 @@ unsafe fn interpolate_neon(
     vst1q_f64(output.as_mut_ptr(), low);
     vst1q_f64(output.as_mut_ptr().add(2), high);
     output
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn interpolate_stereo_neon(
+    left_history: &[f64; TAPS_PER_PHASE],
+    right_history: &[f64; TAPS_PER_PHASE],
+    table: &PhaseTable,
+) -> ([f64; MAX_PHASES], [f64; MAX_PHASES]) {
+    let mut left_low = vdupq_n_f64(0.0);
+    let mut left_high = vdupq_n_f64(0.0);
+    let mut right_low = vdupq_n_f64(0.0);
+    let mut right_high = vdupq_n_f64(0.0);
+    for tap in 0..TAPS_PER_PHASE {
+        let coefficients = table.get_unchecked(tap);
+        let low_coefficients = vld1q_f64(coefficients.as_ptr());
+        let high_coefficients = vld1q_f64(coefficients.as_ptr().add(2));
+        let left_sample = vdupq_n_f64(*left_history.get_unchecked(tap));
+        let right_sample = vdupq_n_f64(*right_history.get_unchecked(tap));
+        left_low = vfmaq_f64(left_low, left_sample, low_coefficients);
+        left_high = vfmaq_f64(left_high, left_sample, high_coefficients);
+        right_low = vfmaq_f64(right_low, right_sample, low_coefficients);
+        right_high = vfmaq_f64(right_high, right_sample, high_coefficients);
+    }
+    let mut left_output = [0.0; MAX_PHASES];
+    let mut right_output = [0.0; MAX_PHASES];
+    vst1q_f64(left_output.as_mut_ptr(), left_low);
+    vst1q_f64(left_output.as_mut_ptr().add(2), left_high);
+    vst1q_f64(right_output.as_mut_ptr(), right_low);
+    vst1q_f64(right_output.as_mut_ptr().add(2), right_high);
+    (left_output, right_output)
 }
 
 #[cfg(test)]
@@ -318,6 +469,41 @@ mod tests {
             chunked.process(chunk);
         }
         assert_eq!(whole.peak(), chunked.peak());
+    }
+
+    #[test]
+    fn stereo_pair_matches_independent_meters_bit_for_bit() {
+        let left: Vec<f32> = (0..10_000)
+            .map(|index| ((index as f64 * 0.173).sin() * 0.83) as f32)
+            .collect();
+        let right: Vec<f32> = (0..10_000)
+            .map(|index| ((index as f64 * 0.071 + 0.4).cos() * 0.61) as f32)
+            .collect();
+        for sample_rate in [48_000, 96_000, 192_000] {
+            let mut expected_left = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut expected_right = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut paired_left = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut paired_right = TruePeakMeter::for_sample_rate(sample_rate);
+            for (&left_sample, &right_sample) in left.iter().zip(&right) {
+                let expected = (
+                    expected_left.process_sample(left_sample),
+                    expected_right.process_sample(right_sample),
+                );
+                let actual = TruePeakMeter::process_stereo_sample(
+                    &mut paired_left,
+                    &mut paired_right,
+                    left_sample,
+                    right_sample,
+                );
+                assert_eq!(actual.0.to_bits(), expected.0.to_bits());
+                assert_eq!(actual.1.to_bits(), expected.1.to_bits());
+            }
+            assert_eq!(paired_left.peak().to_bits(), expected_left.peak().to_bits());
+            assert_eq!(
+                paired_right.peak().to_bits(),
+                expected_right.peak().to_bits()
+            );
+        }
     }
 
     #[test]

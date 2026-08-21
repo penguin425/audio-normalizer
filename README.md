@@ -98,7 +98,9 @@ the `-o` extension override this.
   multi-delivery still re-decodes after final metadata mutation.
 * **Sample-rate-aware true-peak analysis** uses a copy-free circular history,
   SIMD polyphase interpolation, and the BS.1770 measurement domain: 4× below
-  96 kHz, 2× below 192 kHz, and direct samples at 192 kHz and above.
+  96 kHz, 2× below 192 kHz, and direct samples at 192 kHz and above. The common
+  stereo path advances both independent meters together, sharing immutable FIR
+  coefficient loads without changing either channel's FMA or maximum order.
 * **Multi-threaded** via rayon — channels, independent album tracks, and
   ordinary multi-file normalization share one work-stealing pool bounded by
   `--jobs`. Independent files render in waves of at most 32, then publish in
