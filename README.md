@@ -86,10 +86,15 @@ the `-o` extension override this.
   runtime feature detection and a portable scalar fallback (so the binary runs
   anywhere but flies on modern x86-64).
 * **Fused render/write hot path** applies gain and the safety ceiling in one
-  channel-contiguous SIMD pass, vectorizes byte-exact PCM16 mono/stereo
-  quantization and interleaving, and reuses the WAVE writer's chunk storage.
-  Dither, exceptional samples, limiter processing, and verification retain
-  their established semantics.
+  channel-contiguous SIMD pass, vectorizes byte-exact PCM16 mono/stereo plus
+  multichannel PCM16/PCM24 quantization and interleaving, and reuses the WAVE
+  writer's chunk storage. Dither, exceptional samples, limiter processing, and
+  verification retain their established semantics.
+* **Allocation-stable look-ahead limiting** reuses caller-owned planar output
+  channels for every decoded chunk and for the final delayed tail. Adjacent
+  True Peak meters advance through the paired SIMD kernel, with a direct stereo
+  path and ordered channel-pair reduction for surround layouts. The allocating
+  library methods remain available as compatibility wrappers.
 * **Lossless verification tee** measures the exact quantized PCM accepted by
   the native WAVE and FLAC writers during encoding, avoiding an otherwise
   redundant completed-file read. PCM scratch is reused between chunks and
@@ -106,6 +111,19 @@ the `-o` extension override this.
   Long four-or-more-channel chunks distribute those independent pairs across
   the existing `--jobs` pool; short decoder packets remain sequential so task
   coordination cannot dominate useful work.
+* **Persistent multichannel K-weighting lanes** keep four independent shelf and
+  RLB filter states in AVX2 f64 vectors across chunks, with explicit f32 rounding
+  between stages. A 7.1 analyzer owns two fixed banks and needs no per-chunk
+  energy scratch; channel weights and sums remain in their exact scalar order.
+  Non-AVX2, stereo, and timeline paths retain the portable scalar filters.
+* **Optional CUDA true-peak analysis** is available in Linux and Windows builds
+  compiled with `cuda-truepeak`. `--true-peak-backend cuda` dynamically loads
+  the NVIDIA driver and queues planar transfers plus the f64-FMA polyphase
+  kernel before CPU K-weighting, then returns only one peak per channel. One
+  process-wide worker bounds device memory; missing devices and runtime errors
+  recover through the retained CPU meter state. CPU remains the default because
+  startup cost and Forge's existing multichannel CPU parallelism can make CUDA
+  slower for short files or 7.1 material on some hosts.
 * **Multi-threaded** via rayon — channels, independent album tracks, and
   ordinary multi-file normalization share one work-stealing pool bounded by
   `--jobs`. Independent files render in waves of at most 32, then publish in
@@ -252,6 +270,10 @@ cargo build --release --features opus-encoding
 # Optional AAC-LC, ALAC, and Vorbis output (`ffmpeg` on PATH at runtime):
 cargo build --release --features ffmpeg-encoding
 
+# Optional NVIDIA CUDA true-peak worker (Linux/Windows; driver-only at runtime):
+cargo build --release --features cuda-truepeak
+target/release/forge input.wav --analyze --true-peak-backend cuda
+
 # Optional cross-platform CLAP and Linux LV2 plug-ins:
 cargo build --release --features clap-plugin,lv2-plugin
 
@@ -263,6 +285,16 @@ tools/test-au-adapter.sh
 
 cargo test
 ```
+
+Published Linux and Windows archives include `cuda-truepeak`; macOS keeps the
+CPU implementation because current NVIDIA CUDA drivers are unavailable there.
+The embedded PTX was generated for `compute_52` with CUDA 11.8 and is loaded
+through the Driver API, so neither NVRTC nor a CUDA toolkit is needed at run
+time. Exact CUDA/CPU equivalence also requires AVX2 and FMA on x86-64; older
+hosts stay on the scalar CPU path. Files whose first decoded packet is shorter
+than 16,384 frames, mono signals, timeline analysis, and rates at or above
+192 kHz stay on CPU. If CUDA initialization fails, Forge reports the reason on
+stderr and continues on CPU.
 
 The VST3 and Audio Unit adapters are optional source integrations. See
 [VST3-ADAPTER.md](VST3-ADAPTER.md) and [AU-ADAPTER.md](AU-ADAPTER.md) for
@@ -1605,6 +1637,7 @@ backup behavior.
 | `--limiter` | off | Look-ahead, sample-rate-aware oversampled true-peak limiter |
 | `--limiter-lookahead` | `5` | Limiter look-ahead in milliseconds |
 | `--limiter-release` | `100` | Limiter release time in milliseconds |
+| `--true-peak-backend` | `cpu` | `cpu`, or optional `cuda` with automatic CPU fallback |
 | `--dither` | off | TPDF dither for integer PCM output |
 | `--bits` | input's | `8`/`16`/`24`/`32`/`32f`/`64f` output format |
 | `--wav-container` | `auto` | `auto`, `riff`, `rf64`, or `bw64` WAV container |

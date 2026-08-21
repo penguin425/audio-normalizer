@@ -263,6 +263,29 @@ Forge already provides:
   channel pairs, using the existing global `--jobs` work-stealing pool and a
   measured packet-size threshold while retaining the sequential low-overhead
   path for short chunks and single-worker runs.
+- Optional bounded CUDA true-peak analysis for published Linux and Windows
+  builds: dynamically loaded Driver API and checked-in PTX, transfer/kernel
+  overlap with exact CPU K-weighting, one process-wide device worker, retained
+  history for runtime CPU recovery, explicit opt-in, and byte-identical CPU/GPU
+  measurements and WAVE output. Context/JIT-inclusive benchmarks keep the
+  already-faster 7.1 CPU path as the default instead of claiming a universal
+  GPU advantage.
+- Allocation-stable streaming look-ahead limiting: caller-owned output channels
+  are reused for every decoded chunk and the delayed tail, while adjacent True
+  Peak meters share the paired SIMD kernel through dedicated stereo and ordered
+  multichannel paths. Stereo and 7.1 WAVE plus difference-report hashes remain
+  byte-identical to the allocating scalar-detector pipeline.
+- Allocation-free multichannel K-weighting through persistent four-channel AVX2
+  f64 state banks, explicit inter-stage f32 rounding, scalar-order energy and
+  role reductions, fixed sub-kilobyte 7.1 state, and unchanged scalar fallbacks.
+  CPU/CUDA 7.1 JSON remains byte-identical while measured analysis wall time
+  falls on both backends; slower AoS pair and per-frame gather prototypes were
+  measured and rejected.
+- Byte-exact multichannel PCM16/PCM24 AVX2 quantization and frame-major
+  interleaving for full and partial channel groups, with ordered scalar tails,
+  unchanged TPDF RNG behavior, exceptional-value/half-LSB coverage, portable
+  fallbacks, and matching lossless verification reports. Measured 5.1 and 7.1
+  WAVE renders improve at both integer depths.
 - Versioned multi-delivery optimization for two to 32 codec/profile outputs,
   using one conservative target, ceiling, and iteratively corrected gain;
   staged post-metadata re-decoding, explicit infeasibility, path-alias and

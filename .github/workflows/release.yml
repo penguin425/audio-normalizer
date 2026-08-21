@@ -185,6 +185,7 @@ jobs:
             archive: tar
             library: libforge_normalizer.so
             wheel-platform: manylinux_2_34_x86_64
+            features: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service,cuda-truepeak
             rustflags: ""
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
@@ -192,6 +193,7 @@ jobs:
             archive: zip
             library: forge_normalizer.dll
             wheel-platform: win_amd64
+            features: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service,cuda-truepeak
             rustflags: ""
           - runner: macos-15-intel
             target: x86_64-apple-darwin
@@ -199,6 +201,7 @@ jobs:
             archive: tar
             library: libforge_normalizer.dylib
             wheel-platform: macosx_10_12_x86_64
+            features: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service
             rustflags: ""
           - runner: macos-latest
             target: aarch64-apple-darwin
@@ -206,6 +209,7 @@ jobs:
             archive: tar
             library: libforge_normalizer.dylib
             wheel-platform: macosx_11_0_arm64
+            features: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service
             rustflags: -Ctarget-feature=+neon,+aes,+sha2
     runs-on: ${{ matrix.runner }}
     steps:
@@ -232,14 +236,14 @@ jobs:
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace ${{ matrix.rustflags }}
-        run: cargo build --locked --release --target ${{ matrix.target }} --features opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service
+        run: cargo build --locked --release --target ${{ matrix.target }} --features ${{ matrix.features }}
 
       - name: Apply reproducible PGO to the Linux normalizer CLI
         if: matrix.asset == 'linux-x86_64'
         shell: bash
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-          FORGE_PGO_FEATURES: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service
+          FORGE_PGO_FEATURES: ${{ matrix.features }}
           FORGE_PGO_RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace
         run: |
           set -euo pipefail
@@ -440,7 +444,7 @@ jobs:
       - name: Build the reproducible PGO x86-64-v3 CLI
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-          FORGE_PGO_FEATURES: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service
+          FORGE_PGO_FEATURES: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service,cuda-truepeak
           FORGE_PGO_ROOT: ${{ github.workspace }}/target/forge-pgo-x86_64-v3
           FORGE_PGO_RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace -Ctarget-cpu=x86-64-v3
         shell: bash
@@ -501,7 +505,7 @@ jobs:
       - name: Independently rebuild and compare
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-          FORGE_PGO_FEATURES: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service
+          FORGE_PGO_FEATURES: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service,cuda-truepeak
           FORGE_PGO_RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace
           FORGE_PGO_V3_ROOT: ${{ github.workspace }}/target/forge-pgo-x86_64-v3
           FORGE_PGO_V3_RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace -Ctarget-cpu=x86-64-v3
@@ -510,7 +514,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --locked --release --target x86_64-unknown-linux-gnu --features opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service
+          cargo build --locked --release --target x86_64-unknown-linux-gnu --features opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service,cuda-truepeak
           tools/build-pgo-forge.sh x86_64-unknown-linux-gnu
           cp \
             target/forge-pgo-x86_64-unknown-linux-gnu/optimized/x86_64-unknown-linux-gnu/release/forge \

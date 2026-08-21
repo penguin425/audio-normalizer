@@ -13,12 +13,25 @@
 //!     energy an O(1) difference — no redundant work despite 75% overlap.
 //!   * Squared-sample summation uses the SIMD `sum_squares_f64` primitive.
 
+#[cfg(all(
+    feature = "cuda-truepeak",
+    any(target_os = "linux", target_os = "windows")
+))]
+use crate::dsp::cuda_truepeak::CudaTruePeakWorker;
 use crate::dsp::kwfilter::KWeight;
+#[cfg(target_arch = "x86_64")]
+use crate::dsp::kwfilter::KWeightQuad;
 use crate::dsp::simd;
 use crate::dsp::truepeak::TruePeakMeter;
 use crate::wav::{AudioBuffer, ChannelRole};
 use rayon::prelude::*;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(all(
+    feature = "cuda-truepeak",
+    any(target_os = "linux", target_os = "windows")
+))]
+use std::sync::Mutex;
 
 /// Maximum retained 400 ms gating or short-term blocks per analysis.
 pub const MAX_LOUDNESS_BLOCKS: usize = 1_000_000;
@@ -27,6 +40,137 @@ pub const MAX_LOUDNESS_TIMELINE_POINTS: usize = 1_000_000;
 /// Avoid scheduling channel-pair tasks for short decoder packets where task
 /// coordination costs more than the true-peak interpolation work.
 const MIN_PARALLEL_TRUE_PEAK_FRAMES: usize = 16_384;
+
+const TRUE_PEAK_BACKEND_CPU: u8 = 0;
+#[cfg(all(
+    feature = "cuda-truepeak",
+    any(target_os = "linux", target_os = "windows")
+))]
+const TRUE_PEAK_BACKEND_CUDA: u8 = 1;
+static TRUE_PEAK_BACKEND: AtomicU8 = AtomicU8::new(TRUE_PEAK_BACKEND_CPU);
+#[cfg(all(
+    feature = "cuda-truepeak",
+    any(target_os = "linux", target_os = "windows")
+))]
+static CUDA_RUNTIME_FALLBACK: Mutex<Option<String>> = Mutex::new(None);
+
+/// Process-wide backend preference captured when a streaming analyzer is
+/// constructed. CPU remains the default; CUDA must be requested explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TruePeakBackend {
+    Cpu,
+    Cuda,
+}
+
+/// Select the backend used by subsequently constructed analyzers.
+///
+/// CUDA is probed immediately. On an unavailable driver, unsupported platform,
+/// or binary built without `cuda-truepeak`, the preference is reset to CPU and
+/// the reason is returned. Runtime CUDA failures also recover through CPU meter
+/// state without changing loudness analysis results.
+pub fn configure_true_peak_backend(backend: TruePeakBackend) -> Result<String, String> {
+    clear_cuda_runtime_fallback();
+    match backend {
+        TruePeakBackend::Cpu => {
+            TRUE_PEAK_BACKEND.store(TRUE_PEAK_BACKEND_CPU, Ordering::Release);
+            Ok("CPU".into())
+        }
+        TruePeakBackend::Cuda => configure_cuda_true_peak_backend(),
+    }
+}
+
+/// First CUDA error that caused an analyzer to recover through the CPU after a
+/// successful initial runtime probe. Expected contention for the one bounded
+/// worker is not an error and is not reported here.
+pub fn cuda_runtime_fallback_reason() -> Option<String> {
+    cuda_runtime_fallback_reason_impl()
+}
+
+#[cfg(all(
+    feature = "cuda-truepeak",
+    any(target_os = "linux", target_os = "windows")
+))]
+fn cuda_runtime_fallback_reason_impl() -> Option<String> {
+    CUDA_RUNTIME_FALLBACK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+#[cfg(not(all(
+    feature = "cuda-truepeak",
+    any(target_os = "linux", target_os = "windows")
+)))]
+fn cuda_runtime_fallback_reason_impl() -> Option<String> {
+    None
+}
+
+#[cfg(all(
+    feature = "cuda-truepeak",
+    any(target_os = "linux", target_os = "windows")
+))]
+fn clear_cuda_runtime_fallback() {
+    *CUDA_RUNTIME_FALLBACK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+#[cfg(not(all(
+    feature = "cuda-truepeak",
+    any(target_os = "linux", target_os = "windows")
+)))]
+fn clear_cuda_runtime_fallback() {}
+
+#[cfg(all(
+    feature = "cuda-truepeak",
+    any(target_os = "linux", target_os = "windows")
+))]
+fn record_cuda_runtime_fallback(error: String) {
+    if !error.contains("bounded CUDA true-peak worker is already in use") {
+        let mut fallback = CUDA_RUNTIME_FALLBACK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if fallback.is_none() {
+            *fallback = Some(error);
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "cuda-truepeak",
+    any(target_os = "linux", target_os = "windows")
+))]
+fn configure_cuda_true_peak_backend() -> Result<String, String> {
+    match crate::dsp::cuda_truepeak::probe() {
+        Ok(device) => {
+            TRUE_PEAK_BACKEND.store(TRUE_PEAK_BACKEND_CUDA, Ordering::Release);
+            Ok(device)
+        }
+        Err(error) => {
+            TRUE_PEAK_BACKEND.store(TRUE_PEAK_BACKEND_CPU, Ordering::Release);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(not(all(
+    feature = "cuda-truepeak",
+    any(target_os = "linux", target_os = "windows")
+)))]
+fn configure_cuda_true_peak_backend() -> Result<String, String> {
+    TRUE_PEAK_BACKEND.store(TRUE_PEAK_BACKEND_CPU, Ordering::Release);
+    Err("this binary was built without CUDA true-peak support".into())
+}
+
+#[cfg(all(
+    feature = "cuda-truepeak",
+    any(target_os = "linux", target_os = "windows")
+))]
+enum CudaTruePeakState {
+    Disabled,
+    Pending,
+    Active(Box<CudaTruePeakWorker>),
+}
 
 #[derive(Debug, Clone)]
 pub struct EbuMeasurements {
@@ -63,7 +207,14 @@ pub struct StreamingAnalyzer {
     sample_rate: u32,
     roles: Vec<ChannelRole>,
     filters: Vec<KWeight>,
+    #[cfg(target_arch = "x86_64")]
+    kweight_quads: Option<Vec<KWeightQuad>>,
     true_peak_meters: Vec<TruePeakMeter>,
+    #[cfg(all(
+        feature = "cuda-truepeak",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    cuda_true_peak: CudaTruePeakState,
     momentary: VecDeque<f64>,
     short_term: VecDeque<f64>,
     momentary_sum: f64,
@@ -94,15 +245,49 @@ impl StreamingAnalyzer {
         interval_frames: Option<usize>,
     ) -> Self {
         let channels = roles.len();
+        #[cfg(all(
+            feature = "cuda-truepeak",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        let cuda_true_peak = if interval_frames.is_none()
+            && TRUE_PEAK_BACKEND.load(Ordering::Acquire) == TRUE_PEAK_BACKEND_CUDA
+        {
+            CudaTruePeakState::Pending
+        } else {
+            CudaTruePeakState::Disabled
+        };
+        #[cfg(target_arch = "x86_64")]
+        let kweight_quads = if interval_frames.is_none() && channels >= 4 {
+            KWeightQuad::for_sample_rate(sample_rate).map(|first| {
+                let mut quads = Vec::with_capacity(channels / 4);
+                quads.push(first);
+                for _ in 1..channels / 4 {
+                    quads.push(
+                        KWeightQuad::for_sample_rate(sample_rate)
+                            .expect("AVX2 availability cannot change within one process"),
+                    );
+                }
+                quads
+            })
+        } else {
+            None
+        };
         Self {
             sample_rate,
             roles,
             filters: (0..channels)
                 .map(|_| KWeight::for_sample_rate(sample_rate))
                 .collect(),
+            #[cfg(target_arch = "x86_64")]
+            kweight_quads,
             true_peak_meters: (0..channels)
                 .map(|_| TruePeakMeter::for_sample_rate(sample_rate))
                 .collect(),
+            #[cfg(all(
+                feature = "cuda-truepeak",
+                any(target_os = "linux", target_os = "windows")
+            ))]
+            cuda_true_peak,
             momentary: VecDeque::new(),
             short_term: VecDeque::new(),
             momentary_sum: 0.0,
@@ -134,6 +319,24 @@ impl StreamingAnalyzer {
         let momentary_window = ((self.sample_rate as usize * 4) / 10).max(1);
         let short_term_window = (self.sample_rate as usize * 3).max(1);
         let hop = (self.sample_rate as usize / 10).max(1);
+        #[cfg(all(
+            feature = "cuda-truepeak",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        if self.begin_cuda_true_peak(planar, chunk_frames) {
+            // Transfers and the CUDA kernel are already queued. Preserve the
+            // exact CPU K-weighting/reduction order while that independent work
+            // runs, then synchronize the tiny per-channel peak result.
+            let result = self.process_without_true_peak(
+                planar,
+                chunk_frames,
+                momentary_window,
+                short_term_window,
+                hop,
+            );
+            self.finish_cuda_true_peak(planar);
+            return result;
+        }
         // Stereo is the dominant file-delivery layout. Keeping both filters and
         // true-peak meters borrowed outside the frame loop removes the dynamic
         // channel iterator and lets LLVM retain their state across samples.
@@ -238,17 +441,16 @@ impl StreamingAnalyzer {
                     });
             }
             for frame in 0..chunk_frames {
-                let mut weighted = 0.0;
-                for ((index, channel), filter) in
-                    planar.iter().enumerate().zip(self.filters.iter_mut())
-                {
-                    let sample = channel[frame];
-                    let filtered = filter.process(sample) as f64;
-                    weighted += channel_weight(self.roles[index]) * filtered * filtered;
-                    let raw = sample as f64;
-                    self.raw_sum_squares += raw * raw;
-                    self.sample_peak = self.sample_peak.max(sample.abs());
-                }
+                let weighted = process_kweighted_frame_multichannel(
+                    &mut self.filters,
+                    #[cfg(target_arch = "x86_64")]
+                    &mut self.kweight_quads,
+                    &self.roles,
+                    planar,
+                    frame,
+                    &mut self.raw_sum_squares,
+                    &mut self.sample_peak,
+                );
                 self.weighted_sum_squares += weighted;
                 push_window(
                     &mut self.momentary,
@@ -374,6 +576,236 @@ impl StreamingAnalyzer {
         Ok(())
     }
 
+    #[cfg(all(
+        feature = "cuda-truepeak",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    fn begin_cuda_true_peak(&mut self, planar: &[Vec<f32>], frames: usize) -> bool {
+        let state = std::mem::replace(&mut self.cuda_true_peak, CudaTruePeakState::Disabled);
+        match state {
+            CudaTruePeakState::Disabled => false,
+            CudaTruePeakState::Pending => {
+                if frames == 0 {
+                    self.cuda_true_peak = CudaTruePeakState::Pending;
+                    return false;
+                }
+                if !CudaTruePeakWorker::eligible(self.sample_rate, planar.len(), frames) {
+                    return false;
+                }
+                match CudaTruePeakWorker::new(self.sample_rate, planar.len(), frames) {
+                    Ok(mut worker) => match worker.begin_chunk(planar) {
+                        Ok(()) => {
+                            self.cuda_true_peak = CudaTruePeakState::Active(Box::new(worker));
+                            true
+                        }
+                        Err(error) => {
+                            record_cuda_runtime_fallback(error);
+                            self.true_peak_meters = worker.into_cpu_meters();
+                            false
+                        }
+                    },
+                    Err(error) => {
+                        record_cuda_runtime_fallback(error);
+                        false
+                    }
+                }
+            }
+            CudaTruePeakState::Active(mut worker) => match worker.begin_chunk(planar) {
+                Ok(()) => {
+                    self.cuda_true_peak = CudaTruePeakState::Active(worker);
+                    true
+                }
+                Err(error) => {
+                    record_cuda_runtime_fallback(error);
+                    self.true_peak_meters = (*worker).into_cpu_meters();
+                    false
+                }
+            },
+        }
+    }
+
+    #[cfg(all(
+        feature = "cuda-truepeak",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    fn finish_cuda_true_peak(&mut self, planar: &[Vec<f32>]) {
+        let state = std::mem::replace(&mut self.cuda_true_peak, CudaTruePeakState::Disabled);
+        let CudaTruePeakState::Active(mut worker) = state else {
+            return;
+        };
+        match worker.finish_chunk(planar) {
+            Ok(()) => self.cuda_true_peak = CudaTruePeakState::Active(worker),
+            Err(error) => {
+                record_cuda_runtime_fallback(error);
+                self.true_peak_meters = (*worker).into_cpu_meters();
+                process_true_peak_cpu(&mut self.true_peak_meters, planar);
+            }
+        }
+    }
+
+    #[cfg(all(
+        feature = "cuda-truepeak",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    fn process_without_true_peak(
+        &mut self,
+        planar: &[Vec<f32>],
+        chunk_frames: usize,
+        momentary_window: usize,
+        short_term_window: usize,
+        hop: usize,
+    ) -> Result<(), String> {
+        if planar.len() == 2 {
+            let weight0 = channel_weight(self.roles[0]);
+            let weight1 = channel_weight(self.roles[1]);
+            let (filter0, filter1) = self.filters.split_at_mut(1);
+            let filter0 = &mut filter0[0];
+            let filter1 = &mut filter1[0];
+            #[allow(
+                clippy::needless_range_loop,
+                reason = "the measured hot path uses one frame index across two fixed channels"
+            )]
+            for frame in 0..chunk_frames {
+                let sample0 = planar[0][frame];
+                let sample1 = planar[1][frame];
+                let filtered0 = filter0.process(sample0) as f64;
+                let filtered1 = filter1.process(sample1) as f64;
+                let mut weighted = 0.0;
+                weighted += weight0 * filtered0 * filtered0;
+                weighted += weight1 * filtered1 * filtered1;
+                let raw0 = sample0 as f64;
+                self.raw_sum_squares += raw0 * raw0;
+                self.sample_peak = self.sample_peak.max(sample0.abs());
+                let raw1 = sample1 as f64;
+                self.raw_sum_squares += raw1 * raw1;
+                self.sample_peak = self.sample_peak.max(sample1.abs());
+                self.weighted_sum_squares += weighted;
+                push_window(
+                    &mut self.momentary,
+                    &mut self.momentary_sum,
+                    weighted,
+                    momentary_window,
+                );
+                push_window(
+                    &mut self.short_term,
+                    &mut self.short_term_sum,
+                    weighted,
+                    short_term_window,
+                );
+                self.frames += 1;
+                if self.momentary.len() == momentary_window {
+                    self.max_momentary_ms = self
+                        .max_momentary_ms
+                        .max(self.momentary_sum / momentary_window as f64);
+                }
+                if self.short_term.len() == short_term_window {
+                    self.max_short_term_ms = self
+                        .max_short_term_ms
+                        .max(self.short_term_sum / short_term_window as f64);
+                }
+                if self.momentary.len() == momentary_window
+                    && (self.frames - momentary_window).is_multiple_of(hop)
+                {
+                    if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
+                        return Err(format!(
+                            "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-gating-block limit"
+                        ));
+                    }
+                    self.gating_blocks
+                        .push(self.momentary_sum / momentary_window as f64);
+                }
+                if self.short_term.len() == short_term_window
+                    && (self.frames - short_term_window).is_multiple_of(hop)
+                {
+                    if self.short_term_blocks.len() == MAX_LOUDNESS_BLOCKS {
+                        return Err(format!(
+                            "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-short-term-block limit"
+                        ));
+                    }
+                    self.short_term_blocks
+                        .push(self.short_term_sum / short_term_window as f64);
+                }
+            }
+            return Ok(());
+        }
+
+        for frame in 0..chunk_frames {
+            let weighted = process_kweighted_frame_multichannel(
+                &mut self.filters,
+                #[cfg(target_arch = "x86_64")]
+                &mut self.kweight_quads,
+                &self.roles,
+                planar,
+                frame,
+                &mut self.raw_sum_squares,
+                &mut self.sample_peak,
+            );
+            self.push_weighted_frame(weighted, momentary_window, short_term_window, hop)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "cuda-truepeak",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    #[inline(always)]
+    fn push_weighted_frame(
+        &mut self,
+        weighted: f64,
+        momentary_window: usize,
+        short_term_window: usize,
+        hop: usize,
+    ) -> Result<(), String> {
+        self.weighted_sum_squares += weighted;
+        push_window(
+            &mut self.momentary,
+            &mut self.momentary_sum,
+            weighted,
+            momentary_window,
+        );
+        push_window(
+            &mut self.short_term,
+            &mut self.short_term_sum,
+            weighted,
+            short_term_window,
+        );
+        self.frames += 1;
+        if self.momentary.len() == momentary_window {
+            self.max_momentary_ms = self
+                .max_momentary_ms
+                .max(self.momentary_sum / momentary_window as f64);
+        }
+        if self.short_term.len() == short_term_window {
+            self.max_short_term_ms = self
+                .max_short_term_ms
+                .max(self.short_term_sum / short_term_window as f64);
+        }
+        if self.momentary.len() == momentary_window
+            && (self.frames - momentary_window).is_multiple_of(hop)
+        {
+            if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
+                return Err(format!(
+                    "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-gating-block limit"
+                ));
+            }
+            self.gating_blocks
+                .push(self.momentary_sum / momentary_window as f64);
+        }
+        if self.short_term.len() == short_term_window
+            && (self.frames - short_term_window).is_multiple_of(hop)
+        {
+            if self.short_term_blocks.len() == MAX_LOUDNESS_BLOCKS {
+                return Err(format!(
+                    "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-short-term-block limit"
+                ));
+            }
+            self.short_term_blocks
+                .push(self.short_term_sum / short_term_window as f64);
+        }
+        Ok(())
+    }
+
     pub fn finish(mut self) -> StreamingMeasurements {
         if self.timeline_interval_frames.is_some() && self.timeline_start_frame < self.frames {
             let momentary_window = ((self.sample_rate as usize * 4) / 10).max(1);
@@ -387,6 +819,24 @@ impl StreamingAnalyzer {
         } else {
             (self.raw_sum_squares / total_samples as f64).sqrt()
         };
+        let cpu_true_peak = self
+            .true_peak_meters
+            .iter()
+            .map(TruePeakMeter::peak)
+            .fold(0.0, f32::max);
+        #[cfg(all(
+            feature = "cuda-truepeak",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        let true_peak = match &self.cuda_true_peak {
+            CudaTruePeakState::Active(worker) => worker.peak(),
+            CudaTruePeakState::Disabled | CudaTruePeakState::Pending => cpu_true_peak,
+        };
+        #[cfg(not(all(
+            feature = "cuda-truepeak",
+            any(target_os = "linux", target_os = "windows")
+        )))]
+        let true_peak = cpu_true_peak;
         let mut ebu = measurements_from_blocks(self.gating_blocks, &self.short_term_blocks);
         ebu.max_momentary_lufs = maximum_loudness(&[self.max_momentary_ms]);
         ebu.max_short_term_lufs = maximum_loudness(&[self.max_short_term_ms]);
@@ -404,11 +854,7 @@ impl StreamingAnalyzer {
                 f64::NEG_INFINITY
             },
             sample_peak: self.sample_peak,
-            true_peak: self
-                .true_peak_meters
-                .iter()
-                .map(TruePeakMeter::peak)
-                .fold(0.0, f32::max),
+            true_peak,
             timeline: self.timeline,
         }
     }
@@ -451,6 +897,88 @@ fn process_true_peak_channel_group(meters: &mut [TruePeakMeter], channels: &[Vec
         }
     } else if let (Some(meter), Some(channel)) = (meters.first_mut(), channels.first()) {
         meter.process(channel);
+    }
+}
+
+/// Advance four channel-contiguous K-weighting states without a planar scratch
+/// pass. Filter states are independent, while weighted and raw reductions
+/// retain the established left-to-right channel order exactly.
+#[inline(always)]
+fn process_kweighted_frame_multichannel(
+    filters: &mut [KWeight],
+    #[cfg(target_arch = "x86_64")] kweight_quads: &mut Option<Vec<KWeightQuad>>,
+    roles: &[ChannelRole],
+    planar: &[Vec<f32>],
+    frame: usize,
+    raw_sum_squares: &mut f64,
+    sample_peak: &mut f32,
+) -> f64 {
+    debug_assert_eq!(filters.len(), roles.len());
+    debug_assert_eq!(filters.len(), planar.len());
+    let mut weighted = 0.0;
+    #[cfg(target_arch = "x86_64")]
+    if let Some(quads) = kweight_quads.as_mut() {
+        let mut channel = 0;
+        for quad in quads {
+            let input = [
+                planar[channel][frame],
+                planar[channel + 1][frame],
+                planar[channel + 2][frame],
+                planar[channel + 3][frame],
+            ];
+            let filtered = quad.process(input);
+            for lane in 0..4 {
+                let lane_filtered = filtered[lane] as f64;
+                weighted += channel_weight(roles[channel + lane]) * lane_filtered * lane_filtered;
+                let raw = input[lane] as f64;
+                *raw_sum_squares += raw * raw;
+                *sample_peak = sample_peak.max(input[lane].abs());
+            }
+            channel += 4;
+        }
+        for index in channel..filters.len() {
+            let sample = planar[index][frame];
+            let filtered = filters[index].process(sample) as f64;
+            weighted += channel_weight(roles[index]) * filtered * filtered;
+            let raw = sample as f64;
+            *raw_sum_squares += raw * raw;
+            *sample_peak = sample_peak.max(sample.abs());
+        }
+        return weighted;
+    }
+    for ((index, channel), filter) in planar.iter().enumerate().zip(filters.iter_mut()) {
+        let sample = channel[frame];
+        let filtered = filter.process(sample) as f64;
+        weighted += channel_weight(roles[index]) * filtered * filtered;
+        let raw = sample as f64;
+        *raw_sum_squares += raw * raw;
+        *sample_peak = sample_peak.max(sample.abs());
+    }
+    weighted
+}
+
+#[cfg(all(
+    feature = "cuda-truepeak",
+    any(target_os = "linux", target_os = "windows")
+))]
+fn process_true_peak_cpu(meters: &mut [TruePeakMeter], planar: &[Vec<f32>]) {
+    let frames = planar.first().map_or(0, Vec::len);
+    if meters.len() >= 4
+        && frames >= MIN_PARALLEL_TRUE_PEAK_FRAMES
+        && rayon::current_num_threads() > 1
+    {
+        meters.par_chunks_mut(2).zip(planar.par_chunks(2)).for_each(
+            |(meter_group, channel_group)| {
+                process_true_peak_channel_group(meter_group, channel_group);
+            },
+        );
+    } else {
+        meters
+            .chunks_mut(2)
+            .zip(planar.chunks(2))
+            .for_each(|(meter_group, channel_group)| {
+                process_true_peak_channel_group(meter_group, channel_group);
+            });
     }
 }
 

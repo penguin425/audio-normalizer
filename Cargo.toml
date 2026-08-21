@@ -1,6 +1,6 @@
 [package]
 name = "forge-normalizer"
-version = "0.140.0"
+version = "0.141.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer (WAV/MP3/FLAC/Opus/AAC/Vorbis)"
@@ -45,6 +45,7 @@ lv2-plugin = []
 clap-plugin = ["dep:clack-plugin", "dep:clack-extensions"]
 onnx-provider = ["dep:ndarray", "dep:ort"]
 grpc-service = ["dep:prost", "dep:tokio", "dep:tonic", "dep:tonic-prost"]
+cuda-truepeak = ["dep:cudarc"]
 
 [[bin]]
 name = "forge"
@@ -201,6 +202,9 @@ prost = { version = "0.14.4", optional = true }
 tokio = { version = "1.53.1", optional = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tonic = { version = "0.14.6", optional = true, default-features = false, features = ["codegen", "router", "transport"] }
 tonic-prost = { version = "0.14.6", optional = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+cudarc = { version = "=0.19.9", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-11040"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"

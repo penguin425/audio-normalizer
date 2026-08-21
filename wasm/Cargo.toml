@@ -1,6 +1,6 @@
 [package]
 name = "forge-normalizer-wasm"
-version = "0.140.0"
+version = "0.141.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Local browser analysis bindings for Forge"
@@ -10,6 +10,11 @@ publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[features]
+# Shared DSP sources reference the native crate's optional CUDA feature. Keep
+# the cfg name known to Cargo/check-cfg while leaving CUDA unavailable in WASM.
+cuda-truepeak = []
 
 [dependencies]
 rayon = "1.10"
