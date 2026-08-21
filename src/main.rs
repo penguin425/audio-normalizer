@@ -88,6 +88,16 @@ impl CacheOptions {
 fn main() -> ExitCode {
     let matches = cli::Cli::command()
         .arg(
+            Arg::new("true_peak_backend")
+                .long("true-peak-backend")
+                .value_name("BACKEND")
+                .value_parser(["cpu", "cuda"])
+                .default_value("cpu")
+                .help(
+                    "True-peak analysis backend: cpu, or optional CUDA with automatic CPU fallback",
+                ),
+        )
+        .arg(
             Arg::new("job_state")
                 .long("job-state")
                 .value_name("PATH")
@@ -236,6 +246,24 @@ fn main() -> ExitCode {
                 ),
         )
         .get_matches();
+    let true_peak_backend = matches
+        .get_one::<String>("true_peak_backend")
+        .map(String::as_str)
+        .unwrap_or("cpu");
+    let backend = if true_peak_backend == "cuda" {
+        forge_normalizer::dsp::lufs::TruePeakBackend::Cuda
+    } else {
+        forge_normalizer::dsp::lufs::TruePeakBackend::Cpu
+    };
+    match forge_normalizer::dsp::lufs::configure_true_peak_backend(backend) {
+        Ok(device) if backend == forge_normalizer::dsp::lufs::TruePeakBackend::Cuda => {
+            eprintln!("true-peak backend: CUDA ({device})");
+        }
+        Ok(_) => {}
+        Err(reason) => {
+            eprintln!("true-peak backend: CUDA unavailable ({reason}); using CPU");
+        }
+    }
     let batch_options = BatchOptions {
         job_state: matches.get_one::<PathBuf>("job_state").cloned(),
         progress: matches.get_one::<PathBuf>("progress").cloned(),
@@ -268,14 +296,20 @@ fn main() -> ExitCode {
         .get_many::<PathBuf>("anomaly_audit")
         .map(|values| values.cloned().collect::<Vec<_>>())
         .unwrap_or_default();
-    if let Err(e) = run(
+    let result = run(
         cli,
         batch_options,
         cache_options,
         watch_options,
         catalogue_options,
         anomaly_audits,
-    ) {
+    );
+    if backend == forge_normalizer::dsp::lufs::TruePeakBackend::Cuda {
+        if let Some(reason) = forge_normalizer::dsp::lufs::cuda_runtime_fallback_reason() {
+            eprintln!("true-peak backend: CUDA runtime failed ({reason}); continued on CPU");
+        }
+    }
+    if let Err(e) = result {
         eprintln!("forge: error: {e}");
         return ExitCode::from(1);
     }

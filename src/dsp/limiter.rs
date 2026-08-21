@@ -116,6 +116,22 @@ impl TruePeakLimiter {
     }
 
     pub fn process(&mut self, planar: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, String> {
+        let mut output = vec![Vec::new(); self.delay.len()];
+        self.process_into(planar, &mut output)?;
+        Ok(output)
+    }
+
+    /// Process one chunk into caller-owned planar storage.
+    ///
+    /// Every output channel is cleared before use but retains its allocation,
+    /// so a streaming caller can reuse the same buffers for all chunks. The
+    /// first call may reserve enough space for the emitted frames; subsequent
+    /// calls of the same or smaller size do not allocate.
+    pub fn process_into(
+        &mut self,
+        planar: &[Vec<f32>],
+        output: &mut [Vec<f32>],
+    ) -> Result<(), String> {
         if planar.len() != self.delay.len() {
             return Err("limiter channel count changed".into());
         }
@@ -123,42 +139,66 @@ impl TruePeakLimiter {
         if planar.iter().any(|channel| channel.len() != frames) {
             return Err("limiter input has unequal channel lengths".into());
         }
+        if output.len() != self.delay.len() {
+            return Err("limiter output channel count changed".into());
+        }
         let emit = frames.saturating_sub(self.lookahead_frames.saturating_sub(self.delay[0].len()));
-        let mut output = (0..self.delay.len())
-            .map(|_| Vec::with_capacity(emit))
-            .collect::<Vec<_>>();
+        for channel in output.iter_mut() {
+            channel.clear();
+            channel.reserve(emit);
+        }
         for (frame, _) in planar[0].iter().enumerate() {
-            let mut detected = 0.0_f32;
-            for (channel, samples) in planar.iter().enumerate() {
-                let sample = samples[frame];
-                self.last_samples[channel] = sample;
-                self.delay[channel].push_back(sample);
-                detected = detected.max(self.meters[channel].process_sample(sample));
-            }
+            let detected = push_and_detect_frame(
+                &mut self.meters,
+                &mut self.delay,
+                &mut self.last_samples,
+                planar,
+                frame,
+            );
             self.update_envelope(detected);
             if self.delay[0].len() > self.lookahead_frames {
-                self.emit_one(&mut output);
+                self.emit_one(output);
             }
         }
-        Ok(output)
+        Ok(())
     }
 
     pub fn finish(self) -> Vec<Vec<f32>> {
         self.finish_with_statistics().0
     }
 
-    pub fn finish_with_statistics(mut self) -> (Vec<Vec<f32>>, LimiterStatistics) {
-        let mut output = (0..self.delay.len())
-            .map(|_| Vec::with_capacity(self.delay[0].len()))
-            .collect::<Vec<_>>();
+    /// Flush delayed samples into caller-owned planar storage.
+    pub fn finish_into(self, output: &mut [Vec<f32>]) -> Result<(), String> {
+        self.finish_with_statistics_into(output).map(|_| ())
+    }
+
+    pub fn finish_with_statistics(self) -> (Vec<Vec<f32>>, LimiterStatistics) {
+        let channels = self.delay.len();
+        let mut output = vec![Vec::new(); channels];
+        let statistics = self
+            .finish_with_statistics_into(&mut output)
+            .expect("internally allocated limiter output has the expected channel count");
+        (output, statistics)
+    }
+
+    /// Flush delayed samples and return statistics while retaining the caller's
+    /// output allocation for later pipeline reuse.
+    pub fn finish_with_statistics_into(
+        mut self,
+        output: &mut [Vec<f32>],
+    ) -> Result<LimiterStatistics, String> {
+        if output.len() != self.delay.len() {
+            return Err("limiter output channel count changed".into());
+        }
+        let remaining = self.delay[0].len();
+        for channel in output.iter_mut() {
+            channel.clear();
+            channel.reserve(remaining);
+        }
         while !self.delay[0].is_empty() {
-            let mut detected = 0.0_f32;
-            for channel in 0..self.delay.len() {
-                detected =
-                    detected.max(self.meters[channel].process_sample(self.last_samples[channel]));
-            }
+            let detected = detect_repeated_frame(&mut self.meters, &self.last_samples);
             self.update_envelope(detected);
-            self.emit_one(&mut output);
+            self.emit_one(output);
         }
         if self.statistics_enabled {
             self.finish_statistics_interval();
@@ -175,7 +215,7 @@ impl TruePeakLimiter {
             envelope_interval_frames: self.statistics_interval_frames,
             envelope: self.statistics_envelope,
         };
-        (output, statistics)
+        Ok(statistics)
     }
 
     pub fn max_reduction_db(&self) -> f64 {
@@ -247,6 +287,96 @@ impl TruePeakLimiter {
     }
 }
 
+/// Advance meters in adjacent pairs so both channels share immutable true-peak
+/// coefficient loads. The detected maximum is still reduced in channel order,
+/// preserving the scalar limiter's exceptional-value and rounding behavior.
+#[inline]
+fn push_and_detect_frame(
+    meters: &mut [TruePeakMeter],
+    delay: &mut [VecDeque<f32>],
+    last_samples: &mut [f32],
+    planar: &[Vec<f32>],
+    frame: usize,
+) -> f32 {
+    if meters.len() == 2 {
+        let left_sample = planar[0][frame];
+        let right_sample = planar[1][frame];
+        last_samples[0] = left_sample;
+        last_samples[1] = right_sample;
+        delay[0].push_back(left_sample);
+        delay[1].push_back(right_sample);
+        let (left, right) = meters.split_at_mut(1);
+        let (left_peak, right_peak) = TruePeakMeter::process_stereo_sample(
+            &mut left[0],
+            &mut right[0],
+            left_sample,
+            right_sample,
+        );
+        return 0.0_f32.max(left_peak).max(right_peak);
+    }
+
+    let mut detected = 0.0_f32;
+    for (((meter_pair, delay_pair), last_pair), sample_pair) in meters
+        .chunks_mut(2)
+        .zip(delay.chunks_mut(2))
+        .zip(last_samples.chunks_mut(2))
+        .zip(planar.chunks(2))
+    {
+        let left_sample = sample_pair[0][frame];
+        last_pair[0] = left_sample;
+        delay_pair[0].push_back(left_sample);
+        if meter_pair.len() == 2 {
+            let right_sample = sample_pair[1][frame];
+            last_pair[1] = right_sample;
+            delay_pair[1].push_back(right_sample);
+            let (left, right) = meter_pair.split_at_mut(1);
+            let (left_peak, right_peak) = TruePeakMeter::process_stereo_sample(
+                &mut left[0],
+                &mut right[0],
+                left_sample,
+                right_sample,
+            );
+            detected = detected.max(left_peak);
+            detected = detected.max(right_peak);
+        } else {
+            detected = detected.max(meter_pair[0].process_sample(left_sample));
+        }
+    }
+    detected
+}
+
+#[inline]
+fn detect_repeated_frame(meters: &mut [TruePeakMeter], last_samples: &[f32]) -> f32 {
+    if meters.len() == 2 {
+        let (left, right) = meters.split_at_mut(1);
+        let (left_peak, right_peak) = TruePeakMeter::process_stereo_sample(
+            &mut left[0],
+            &mut right[0],
+            last_samples[0],
+            last_samples[1],
+        );
+        return 0.0_f32.max(left_peak).max(right_peak);
+    }
+
+    let mut detected = 0.0_f32;
+    for (meter_pair, sample_pair) in meters.chunks_mut(2).zip(last_samples.chunks(2)) {
+        if meter_pair.len() == 2 {
+            let (left, right) = meter_pair.split_at_mut(1);
+            let (left_peak, right_peak) = TruePeakMeter::process_stereo_sample(
+                &mut left[0],
+                &mut right[0],
+                sample_pair[0],
+                sample_pair[1],
+            );
+            detected = detected.max(left_peak);
+            detected = detected.max(right_peak);
+        } else {
+            detected = detected.max(meter_pair[0].process_sample(sample_pair[0]));
+        }
+    }
+    detected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +425,64 @@ mod tests {
         assert_eq!(statistics.envelope.len(), 5);
         assert_eq!(statistics.envelope.last().unwrap().end_frame, 4_800);
         assert_eq!(output[0].len(), input[0].len());
+    }
+
+    #[test]
+    fn caller_owned_output_matches_allocating_api_and_reuses_capacity() {
+        let sample_rate = 48_000;
+        let mut allocating =
+            TruePeakLimiter::new(sample_rate, 3, -2.0, LimiterConfig::default()).unwrap();
+        let mut reusing =
+            TruePeakLimiter::new(sample_rate, 3, -2.0, LimiterConfig::default()).unwrap();
+        let mut expected = vec![Vec::new(); 3];
+        let mut actual = (0..3)
+            .map(|_| Vec::with_capacity(1_024))
+            .collect::<Vec<_>>();
+        let initial_pointers = actual
+            .iter()
+            .map(|channel| channel.as_ptr())
+            .collect::<Vec<_>>();
+
+        for chunk_index in 0..12 {
+            let input = (0..3)
+                .map(|channel| {
+                    (0..1_024)
+                        .map(|frame| {
+                            let phase = (chunk_index * 1_024 + frame) as f64
+                                * (0.017 + channel as f64 * 0.003);
+                            (phase.sin() * (0.7 + channel as f64 * 0.2)) as f32
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let allocated = allocating.process(&input).unwrap();
+            reusing.process_into(&input, &mut actual).unwrap();
+            for channel in 0..3 {
+                expected[channel].extend_from_slice(&allocated[channel]);
+                assert_eq!(actual[channel], allocated[channel]);
+                assert_eq!(actual[channel].as_ptr(), initial_pointers[channel]);
+            }
+        }
+
+        let allocated_tail = allocating.finish();
+        reusing.finish_into(&mut actual).unwrap();
+        for channel in 0..3 {
+            expected[channel].extend_from_slice(&allocated_tail[channel]);
+            assert_eq!(actual[channel], allocated_tail[channel]);
+            assert_eq!(actual[channel].as_ptr(), initial_pointers[channel]);
+            assert_eq!(expected[channel].len(), 12 * 1_024);
+        }
+    }
+
+    #[test]
+    fn caller_owned_output_rejects_wrong_channel_count_without_mutation() {
+        let mut limiter = TruePeakLimiter::new(48_000, 2, -1.0, LimiterConfig::default()).unwrap();
+        let input = vec![vec![0.0; 512], vec![0.0; 512]];
+        let mut output = vec![vec![7.0]];
+        assert_eq!(
+            limiter.process_into(&input, &mut output).unwrap_err(),
+            "limiter output channel count changed"
+        );
+        assert_eq!(output, [vec![7.0]]);
     }
 }

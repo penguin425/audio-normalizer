@@ -2815,6 +2815,13 @@ fn process_normalized_stream(
             limiter.set_statistics_interval_frames(minimum_interval.max(bounded_interval));
         }
     }
+    let mut limiter_output = if limiter.is_some() {
+        (0..analysis.channels)
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut statistics = capture_statistics.then(|| RenderStatisticsBuilder::new(analysis));
     if let Some(spool) = source_spool {
         spool.replay(|planar| {
@@ -2823,6 +2830,7 @@ fn process_normalized_stream(
                 gain,
                 ceiling,
                 &mut limiter,
+                &mut limiter_output,
                 &mut statistics,
                 &mut write,
             )
@@ -2836,6 +2844,7 @@ fn process_normalized_stream(
                     gain,
                     ceiling,
                     &mut limiter,
+                    &mut limiter_output,
                     &mut statistics,
                     &mut write,
                 );
@@ -2855,6 +2864,7 @@ fn process_normalized_stream(
                     gain,
                     ceiling,
                     &mut limiter,
+                    &mut limiter_output,
                     &mut statistics,
                     &mut write,
                 )
@@ -2867,6 +2877,7 @@ fn process_normalized_stream(
                     gain,
                     ceiling,
                     &mut limiter,
+                    &mut limiter_output,
                     &mut statistics,
                     &mut write,
                 )
@@ -2874,17 +2885,20 @@ fn process_normalized_stream(
         }
     }
     let limiter_statistics = if let Some(limiter) = limiter {
-        let (tail, limiter_statistics) = if capture_statistics {
-            let (tail, statistics) = limiter.finish_with_statistics();
-            (tail, Some(statistics))
+        let limiter_statistics = if capture_statistics {
+            Some(limiter.finish_with_statistics_into(&mut limiter_output)?)
         } else {
-            (limiter.finish(), None)
+            limiter.finish_into(&mut limiter_output)?;
+            None
         };
-        if tail.first().is_some_and(|channel| !channel.is_empty()) {
+        if limiter_output
+            .first()
+            .is_some_and(|channel| !channel.is_empty())
+        {
             if let Some(statistics) = statistics.as_mut() {
-                statistics.observe_protected(&tail)?;
+                statistics.observe_protected(&limiter_output)?;
             }
-            write(&tail)?;
+            write(&limiter_output)?;
         }
         limiter_statistics
     } else {
@@ -2898,6 +2912,7 @@ fn process_normalized_chunk(
     gain: f32,
     ceiling: f32,
     limiter: &mut Option<TruePeakLimiter>,
+    limiter_output: &mut [Vec<f32>],
     statistics: &mut Option<RenderStatisticsBuilder>,
     write: &mut impl FnMut(&[Vec<f32>]) -> Result<(), String>,
 ) -> Result<(), String> {
@@ -2915,12 +2930,15 @@ fn process_normalized_chunk(
         statistics.observe_post_gain(planar, ceiling);
     }
     if let Some(limiter) = limiter.as_mut() {
-        let output = limiter.process(planar)?;
-        if output.first().is_some_and(|channel| !channel.is_empty()) {
+        limiter.process_into(planar, limiter_output)?;
+        if limiter_output
+            .first()
+            .is_some_and(|channel| !channel.is_empty())
+        {
             if let Some(statistics) = statistics.as_mut() {
-                statistics.observe_protected(&output)?;
+                statistics.observe_protected(limiter_output)?;
             }
-            write(&output)?;
+            write(limiter_output)?;
         }
     } else {
         for channel in planar.iter_mut() {

@@ -192,9 +192,19 @@ pub(crate) fn encode_interleaved_with_rngs_into(
     out.resize(frames * channels * bpp, 0);
 
     #[cfg(target_arch = "x86_64")]
-    if kind == PcmKind::S16 && !dither && channels <= 2 && is_x86_feature_detected!("avx2") {
-        unsafe { encode_s16_no_dither_avx2(planar, out) };
-        return;
+    if !dither && is_x86_feature_detected!("avx2") {
+        if kind == PcmKind::S16 {
+            if channels <= 2 {
+                unsafe { encode_s16_no_dither_avx2(planar, out) };
+            } else {
+                unsafe { encode_multichannel_no_dither_avx2(planar, kind, out) };
+            }
+            return;
+        }
+        if kind == PcmKind::S24 && channels >= 3 {
+            unsafe { encode_multichannel_no_dither_avx2(planar, kind, out) };
+            return;
+        }
     }
 
     encode_interleaved_scalar_from(planar, kind, dither, rngs, out, 0);
@@ -271,16 +281,135 @@ unsafe fn encode_s16_no_dither_avx2(planar: &[Vec<f32>], out: &mut [u8]) {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn encode_multichannel_no_dither_avx2(planar: &[Vec<f32>], kind: PcmKind, out: &mut [u8]) {
+    debug_assert!(matches!(kind, PcmKind::S16 | PcmKind::S24));
+    debug_assert!(planar.len() >= 3);
+    let channels = planar.len();
+    let frames = planar[0].len();
+    let bytes_per_sample = kind.bytes_per_sample();
+    for frame in 0..frames {
+        let mut channel = 0;
+        while channel + 8 <= channels {
+            let samples = load_planar_frame_x8(planar, channel, frame, 8);
+            let destination = out
+                .as_mut_ptr()
+                .add((frame * channels + channel) * bytes_per_sample);
+            match kind {
+                PcmKind::S16 => store_s16x8(quantize_s16x8(samples), destination, 8),
+                PcmKind::S24 => store_s24x8(quantize_s24x8(samples), destination, 8),
+                _ => unreachable!(),
+            }
+            channel += 8;
+        }
+        let remaining = channels - channel;
+        if remaining >= 3 {
+            let samples = load_planar_frame_x8(planar, channel, frame, remaining);
+            let destination = out
+                .as_mut_ptr()
+                .add((frame * channels + channel) * bytes_per_sample);
+            match kind {
+                PcmKind::S16 => store_s16x8(quantize_s16x8(samples), destination, remaining),
+                PcmKind::S24 => store_s24x8(quantize_s24x8(samples), destination, remaining),
+                _ => unreachable!(),
+            }
+            channel = channels;
+        }
+        let mut rng = 0;
+        while channel < channels {
+            let encoded = encode_sample(planar[channel][frame], kind, false, &mut rng);
+            let destination = (frame * channels + channel) * bytes_per_sample;
+            out[destination..destination + bytes_per_sample]
+                .copy_from_slice(&encoded[..bytes_per_sample]);
+            channel += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn load_planar_frame_x8(
+    planar: &[Vec<f32>],
+    channel: usize,
+    frame: usize,
+    count: usize,
+) -> __m256 {
+    debug_assert!((1..=8).contains(&count));
+    if count == 8 {
+        return _mm256_set_ps(
+            planar[channel + 7][frame],
+            planar[channel + 6][frame],
+            planar[channel + 5][frame],
+            planar[channel + 4][frame],
+            planar[channel + 3][frame],
+            planar[channel + 2][frame],
+            planar[channel + 1][frame],
+            planar[channel][frame],
+        );
+    }
+    let mut samples = [0.0; 8];
+    for lane in 0..count {
+        samples[lane] = planar[channel + lane][frame];
+    }
+    _mm256_loadu_ps(samples.as_ptr())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn store_s16x8(quantized: __m256i, destination: *mut u8, count: usize) {
+    let packed = _mm_packs_epi32(
+        _mm256_castsi256_si128(quantized),
+        _mm256_extracti128_si256(quantized, 1),
+    );
+    if count == 8 {
+        _mm_storeu_si128(destination.cast(), packed);
+        return;
+    }
+    let mut samples = [0_i16; 8];
+    _mm_storeu_si128(samples.as_mut_ptr().cast(), packed);
+    std::ptr::copy_nonoverlapping(samples.as_ptr().cast::<u8>(), destination, count * 2);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn store_s24x8(quantized: __m256i, destination: *mut u8, count: usize) {
+    let mut samples = [0_i32; 8];
+    _mm256_storeu_si256(samples.as_mut_ptr().cast(), quantized);
+    for (lane, sample) in samples[..count].iter().copied().enumerate() {
+        let bytes = sample.to_le_bytes();
+        let output = std::slice::from_raw_parts_mut(destination.add(lane * 3), 3);
+        output.copy_from_slice(&bytes[..3]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn quantize_s16x8(samples: __m256) -> __m256i {
+    quantize_signedx8(samples, 32_768.0, -32_768, 32_767)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_s24x8(samples: __m256) -> __m256i {
+    quantize_signedx8(samples, 8_388_608.0, -8_388_608, 8_388_607)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_signedx8(samples: __m256, scale: f32, minimum: i32, maximum: i32) -> __m256i {
     let ordered = _mm256_cmp_ps::<{ _CMP_ORD_Q }>(samples, samples);
     let finite_or_infinite = _mm256_and_ps(samples, ordered);
     let clamped = _mm256_min_ps(
         _mm256_set1_ps(1.0),
         _mm256_max_ps(_mm256_set1_ps(-1.0), finite_or_infinite),
     );
-    let scaled = _mm256_mul_ps(clamped, _mm256_set1_ps(32_768.0));
+    let scaled = _mm256_mul_ps(clamped, _mm256_set1_ps(scale));
     let truncated = _mm256_cvttps_epi32(scaled);
     let fraction = _mm256_and_ps(
         _mm256_sub_ps(scaled, _mm256_cvtepi32_ps(truncated)),
@@ -296,8 +425,8 @@ unsafe fn quantize_s16x8(samples: __m256) -> __m256i {
     );
     let rounded = _mm256_add_epi32(truncated, _mm256_and_si256(crosses_half, direction));
     _mm256_min_epi32(
-        _mm256_set1_epi32(32_767),
-        _mm256_max_epi32(_mm256_set1_epi32(-32_768), rounded),
+        _mm256_set1_epi32(maximum),
+        _mm256_max_epi32(_mm256_set1_epi32(minimum), rounded),
     )
 }
 
@@ -388,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn s16_simd_encoder_matches_scalar_quantization() {
+    fn s16_simd_encoder_matches_scalar_quantization_for_multichannel_layouts() {
         let mut state = 0x243f_6a88_u32;
         let mut channel = vec![
             f32::NAN,
@@ -418,14 +547,8 @@ mod tests {
             ]);
         }
 
-        for channels in 1..=2 {
-            let planar = if channels == 1 {
-                vec![channel.clone()]
-            } else {
-                let mut other = channel.clone();
-                other.reverse();
-                vec![channel.clone(), other]
-            };
+        for channels in [1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 16] {
+            let planar = channel_variants(&channel, channels);
             let mut expected = vec![0; channel.len() * channels * 2];
             let mut expected_rngs = dither_rngs(channels);
             encode_interleaved_scalar_from(
@@ -450,6 +573,80 @@ mod tests {
             assert_eq!(actual, expected, "channels={channels}");
             assert_eq!(actual_rngs, expected_rngs, "channels={channels}");
         }
+    }
+
+    #[test]
+    fn s24_simd_encoder_matches_scalar_quantization_for_multichannel_layouts() {
+        let mut state = 0x517c_c1b7_u32;
+        let mut channel = vec![
+            f32::NAN,
+            f32::INFINITY,
+            -f32::INFINITY,
+            -1.0,
+            1.0,
+            -0.0,
+            0.0,
+            f32::from_bits(1),
+            0.5 / 8_388_608.0,
+            -0.5 / 8_388_608.0,
+            1.5 / 8_388_608.0,
+            -1.5 / 8_388_608.0,
+        ];
+        while channel.len() < 50_003 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            channel.push(f32::from_bits(state));
+        }
+        for lower_code in (-8_388_608..8_388_607).step_by(4_093) {
+            let sample = (lower_code as f32 + 0.5) / 8_388_608.0;
+            channel.extend([
+                f32::from_bits(sample.to_bits() - 1),
+                sample,
+                f32::from_bits(sample.to_bits() + 1),
+            ]);
+        }
+
+        for channels in [3, 5, 6, 7, 8, 9, 10, 11, 12, 16] {
+            let planar = channel_variants(&channel, channels);
+            let mut expected = vec![0; channel.len() * channels * 3];
+            let mut expected_rngs = dither_rngs(channels);
+            encode_interleaved_scalar_from(
+                &planar,
+                PcmKind::S24,
+                false,
+                &mut expected_rngs,
+                &mut expected,
+                0,
+            );
+
+            let mut actual_rngs = dither_rngs(channels);
+            let mut actual = Vec::new();
+            encode_interleaved_with_rngs_into(
+                &planar,
+                PcmKind::S24,
+                false,
+                &mut actual_rngs,
+                &mut actual,
+            );
+
+            assert_eq!(actual, expected, "channels={channels}");
+            assert_eq!(actual_rngs, expected_rngs, "channels={channels}");
+        }
+    }
+
+    fn channel_variants(channel: &[f32], channels: usize) -> Vec<Vec<f32>> {
+        (0..channels)
+            .map(|index| {
+                let mut variant = channel.to_vec();
+                let length = variant.len();
+                variant.rotate_left((index * 7_919) % length);
+                if index % 2 == 1 {
+                    variant.reverse();
+                }
+                variant
+            })
+            .collect()
     }
 
     #[test]

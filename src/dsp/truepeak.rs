@@ -22,12 +22,12 @@ use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-const MAX_PHASES: usize = 4;
-const TAPS_PER_PHASE: usize = 16;
+pub(super) const MAX_PHASES: usize = 4;
+pub(super) const TAPS_PER_PHASE: usize = 16;
 const HISTORY_SAMPLES: usize = TAPS_PER_PHASE * 2;
-type PhaseTable = [[f64; MAX_PHASES]; TAPS_PER_PHASE];
+pub(super) type PhaseTable = [[f64; MAX_PHASES]; TAPS_PER_PHASE];
 
-fn phase_table(factor: usize) -> &'static PhaseTable {
+pub(super) fn phase_table(factor: usize) -> &'static PhaseTable {
     static X2: OnceLock<PhaseTable> = OnceLock::new();
     static X4: OnceLock<PhaseTable> = OnceLock::new();
     match factor {
@@ -152,6 +152,26 @@ impl TruePeakMeter {
             use_avx2_fma: is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
             peak: 0.0,
         }
+    }
+
+    /// Rebuild the FIR history needed for the next sample after an optional
+    /// accelerator hands a streaming measurement back to the CPU. At most the
+    /// preceding 15 samples are required because the next 16-tap window starts
+    /// with the new sample. `peak_floor` retains all earlier completed chunks.
+    #[cfg(all(
+        feature = "cuda-truepeak",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    pub(super) fn from_recent_samples(sample_rate: u32, recent: &[f32], peak_floor: f32) -> Self {
+        debug_assert!(recent.len() < TAPS_PER_PHASE);
+        let mut meter = Self::for_sample_rate(sample_rate);
+        meter.process(recent);
+        // Replaying only the retained suffix seeds the exact 16-tap history for
+        // the *next* sample, but its artificial repeated first sample is not a
+        // real part of the stream. CUDA already measured the complete prefix,
+        // so discard any warm-up peak and restore that authoritative value.
+        meter.peak = peak_floor;
+        meter
     }
 
     pub fn process(&mut self, samples: &[f32]) {
@@ -286,7 +306,7 @@ impl TruePeakMeter {
 }
 
 #[inline]
-fn oversample_factor(sample_rate: u32) -> usize {
+pub(super) fn oversample_factor(sample_rate: u32) -> usize {
     if sample_rate < 96_000 {
         4
     } else if sample_rate < 192_000 {
@@ -469,6 +489,61 @@ mod tests {
             chunked.process(chunk);
         }
         assert_eq!(whole.peak(), chunked.peak());
+    }
+
+    #[cfg(all(
+        feature = "cuda-truepeak",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    #[test]
+    fn cuda_cpu_recovery_discards_synthetic_warmup_peak() {
+        let prefix = [
+            0.928947738,
+            -0.444463895,
+            0.531343035,
+            0.0869211069,
+            -0.0373190996,
+            -0.919440805,
+            -0.521659074,
+            -0.0713924204,
+            -0.143955913,
+            -0.794127755,
+            -0.0113511079,
+            0.81902389,
+            0.242345226,
+            0.243654488,
+            0.570452889,
+            0.953598437,
+        ];
+        let recent = [
+            -0.73747328,
+            -0.613953811,
+            -0.960254987,
+            0.918875278,
+            -0.855194621,
+            0.0757231787,
+            -0.0394378373,
+            0.253150232,
+            -0.417878514,
+            0.864959347,
+            -0.35141978,
+            -0.215435538,
+            0.255568276,
+            -0.602383278,
+            0.244405988,
+        ];
+        let mut complete = TruePeakMeter::for_sample_rate(48_000);
+        complete.process(&prefix);
+        complete.process(&recent);
+
+        // Starting the retained suffix in isolation repeats its first sample
+        // and creates a larger, synthetic transient for this fixture.
+        let mut suffix_only = TruePeakMeter::for_sample_rate(48_000);
+        suffix_only.process(&recent);
+        assert!(suffix_only.peak() > complete.peak());
+
+        let recovered = TruePeakMeter::from_recent_samples(48_000, &recent, complete.peak());
+        assert_eq!(recovered.peak().to_bits(), complete.peak().to_bits());
     }
 
     #[test]

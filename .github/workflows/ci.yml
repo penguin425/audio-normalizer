@@ -29,6 +29,12 @@ jobs:
       - name: Run tests without LAME
         run: cargo test --no-default-features
 
+      - name: Check optional CUDA true-peak build and CPU fallback
+        run: |
+          cargo clippy --locked --features cuda-truepeak --lib --bin forge -- -D warnings
+          cargo test --locked --features cuda-truepeak --lib cuda_truepeak::tests
+          cargo test --locked --features cuda-truepeak --lib cuda_cpu_recovery
+
       - name: Run immersive downmix QC contract tests
         run: |
           cargo test --locked --no-default-features --lib downmix --bin forge-downmix-qc
