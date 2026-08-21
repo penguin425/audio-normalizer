@@ -259,6 +259,10 @@ Forge already provides:
   channel-contiguous decoder chunk, share immutable polyphase coefficients for
   adjacent channels, handle odd channel counts with the scalar tail, and leave
   K-weighting, energy, gating, channel order, and reported results unchanged.
+- Bounded long-chunk multichannel true-peak parallelism over those independent
+  channel pairs, using the existing global `--jobs` work-stealing pool and a
+  measured packet-size threshold while retaining the sequential low-overhead
+  path for short chunks and single-worker runs.
 - Versioned multi-delivery optimization for two to 32 codec/profile outputs,
   using one conservative target, ceiling, and iteratively corrected gain;
   staged post-metadata re-decoding, explicit infeasibility, path-alias and

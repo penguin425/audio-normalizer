@@ -24,6 +24,9 @@ use std::collections::VecDeque;
 pub const MAX_LOUDNESS_BLOCKS: usize = 1_000_000;
 /// Maximum retained points in an explicitly requested loudness timeline.
 pub const MAX_LOUDNESS_TIMELINE_POINTS: usize = 1_000_000;
+/// Avoid scheduling channel-pair tasks for short decoder packets where task
+/// coordination costs more than the true-peak interpolation work.
+const MIN_PARALLEL_TRUE_PEAK_FRAMES: usize = 16_384;
 
 #[derive(Debug, Clone)]
 pub struct EbuMeasurements {
@@ -219,24 +222,20 @@ impl StreamingAnalyzer {
         // K-weighted energy keeps the established frame/channel reduction
         // order below, so every reported value remains bit-identical.
         if self.timeline_interval_frames.is_none() && planar.len() >= 4 {
-            let complete_pairs = planar.len() / 2;
-            for pair in 0..complete_pairs {
-                let index = pair * 2;
-                let (before_right, from_right) = self.true_peak_meters.split_at_mut(index + 1);
-                let left_meter = &mut before_right[index];
-                let right_meter = &mut from_right[0];
-                for (&left_sample, &right_sample) in planar[index].iter().zip(&planar[index + 1]) {
-                    TruePeakMeter::process_stereo_sample(
-                        left_meter,
-                        right_meter,
-                        left_sample,
-                        right_sample,
-                    );
-                }
-            }
-            if planar.len() % 2 == 1 {
-                let index = planar.len() - 1;
-                self.true_peak_meters[index].process(&planar[index]);
+            if chunk_frames >= MIN_PARALLEL_TRUE_PEAK_FRAMES && rayon::current_num_threads() > 1 {
+                self.true_peak_meters
+                    .par_chunks_mut(2)
+                    .zip(planar.par_chunks(2))
+                    .for_each(|(meters, channels)| {
+                        process_true_peak_channel_group(meters, channels);
+                    });
+            } else {
+                self.true_peak_meters
+                    .chunks_mut(2)
+                    .zip(planar.chunks(2))
+                    .for_each(|(meters, channels)| {
+                        process_true_peak_channel_group(meters, channels);
+                    });
             }
             for frame in 0..chunk_frames {
                 let mut weighted = 0.0;
@@ -434,6 +433,24 @@ impl StreamingAnalyzer {
         self.timeline_start_frame = self.frames;
         self.interval_sample_peak = 0.0;
         self.interval_true_peak = 0.0;
+    }
+}
+
+#[inline]
+fn process_true_peak_channel_group(meters: &mut [TruePeakMeter], channels: &[Vec<f32>]) {
+    debug_assert_eq!(meters.len(), channels.len());
+    if meters.len() == 2 {
+        let (left_meter, right_meter) = meters.split_at_mut(1);
+        for (&left_sample, &right_sample) in channels[0].iter().zip(&channels[1]) {
+            TruePeakMeter::process_stereo_sample(
+                &mut left_meter[0],
+                &mut right_meter[0],
+                left_sample,
+                right_sample,
+            );
+        }
+    } else if let (Some(meter), Some(channel)) = (meters.first_mut(), channels.first()) {
+        meter.process(channel);
     }
 }
 
@@ -886,26 +903,38 @@ mod tests {
             let (whole_rms, whole_peak) = measure_rms_peak(&buffer);
             let whole_true_peak = crate::dsp::truepeak::measure_true_peak(&buffer);
 
-            let mut streaming = StreamingAnalyzer::new(48_000, roles);
-            for start in (0..frames).step_by(137) {
-                let end = (start + 137).min(frames);
-                let chunk = data
-                    .iter()
-                    .map(|channel| channel[start..end].to_vec())
-                    .collect::<Vec<_>>();
-                streaming.process(&chunk).unwrap();
-            }
-            let streamed = streaming.finish();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap();
+            for chunk_frames in [137, 20_000] {
+                let streamed = pool.install(|| {
+                    let mut streaming = StreamingAnalyzer::new(48_000, roles.clone());
+                    for start in (0..frames).step_by(chunk_frames) {
+                        let end = (start + chunk_frames).min(frames);
+                        let chunk = data
+                            .iter()
+                            .map(|channel| channel[start..end].to_vec())
+                            .collect::<Vec<_>>();
+                        streaming.process(&chunk).unwrap();
+                    }
+                    streaming.finish()
+                });
 
-            assert!((streamed.ebu.integrated_lufs - whole_ebu.integrated_lufs).abs() < 1e-6);
-            assert!((streamed.ebu.max_momentary_lufs - whole_ebu.max_momentary_lufs).abs() < 1e-6);
-            assert!(
-                (streamed.ebu.max_short_term_lufs - whole_ebu.max_short_term_lufs).abs() < 1e-6
-            );
-            assert!((streamed.ebu.loudness_range_lu - whole_ebu.loudness_range_lu).abs() < 1e-6);
-            assert!((streamed.rms_db - whole_rms).abs() < 1e-9);
-            assert_eq!(streamed.sample_peak, whole_peak);
-            assert_eq!(streamed.true_peak, whole_true_peak);
+                assert!((streamed.ebu.integrated_lufs - whole_ebu.integrated_lufs).abs() < 1e-6);
+                assert!(
+                    (streamed.ebu.max_momentary_lufs - whole_ebu.max_momentary_lufs).abs() < 1e-6
+                );
+                assert!(
+                    (streamed.ebu.max_short_term_lufs - whole_ebu.max_short_term_lufs).abs() < 1e-6
+                );
+                assert!(
+                    (streamed.ebu.loudness_range_lu - whole_ebu.loudness_range_lu).abs() < 1e-6
+                );
+                assert!((streamed.rms_db - whole_rms).abs() < 1e-9);
+                assert_eq!(streamed.sample_peak, whole_peak);
+                assert_eq!(streamed.true_peak, whole_true_peak);
+            }
         }
     }
 

@@ -26,6 +26,14 @@ The official EBU v5 and ITU-R BS.2217-2 suites remain release gates.
   metering, so Forge first specializes the common channel layout without
   changing arithmetic order. A time-parallel implementation remains a
   separately measured experiment.
+- Its multicore/GPU follow-up,
+  [Parallel Cascaded Recursive Filtering on Multi-Core CPUs and GPUs](https://arxiv.org/abs/2607.23763),
+  reports 3.95x scaling on six performance cores and 38.2 GS/s on an RTX 3060
+  for high-order batched filters. The authors'
+  [reference implementation](https://github.com/Haotian-RA/matrix_form_recursive_filtering/tree/2026_07_15_arxiv)
+  uses AVX2/FMA vector batches and fast floating-point transformations. Those
+  results motivate a feasibility bound, not a direct speed forecast for two
+  exact biquads with an intervening f32 rounding point.
 - Crochiere and Rabiner's
   [multirate-filter design](https://web.ece.ucsb.edu/Faculty/Rabiner/ece259/Reprints/087_optimum%20fir%20digital%20filters.pdf)
   and [interpolation/decimation tutorial](https://web.ece.ucsb.edu/Faculty/Rabiner/ece259/Reprints/179_interpolation_decimation.pdf),
@@ -566,14 +574,106 @@ wall median from 1.280 s to 1.300 s (+1.56%) and user CPU from 1.240 s to
 pressure to repay the extra PCM pass, so the experiment was removed and the
 v0.138.0 fused stereo loop remains in place.
 
+### v0.140.0: bounded multichannel true-peak parallelism
+
+The channel-contiguous passes introduced in v0.139.0 make adjacent true-peak
+meter pairs independent within a decoder chunk. For chunks of at least 16,384
+frames and four or more channels, Forge now schedules those pairs on the
+existing Rayon pool bounded by `--jobs`. It does not create a nested pool or
+additional signal buffers. Short codec packets and `--jobs 1` retain the
+sequential path, while K-weighting, energy accumulation, gating, and every
+cross-channel reduction keep their established order.
+
+These comparisons reuse the deterministic 300-second, eight-channel PCM16 WAVE
+fixture from v0.139.0, native host tuning, fat LTO, and no PGO. Analysis uses 15
+alternating pairs; normalization uses ten pairs and writes the complete
+230,400,068-byte output every time. The baseline is v0.139.0, and fixture
+generation is excluded.
+
+| Workload / metric | v0.139.0 | v0.140.0 | Change |
+| --- | ---: | ---: | ---: |
+| 7.1 analyze, default jobs, wall | 2.540 s | 1.590 s | -37.40% |
+| 7.1 analyze, default jobs, user CPU | 3.210 s | 4.150 s | +29.28% |
+| 7.1 analyze, `--jobs 4`, wall | 2.720 s | 1.730 s | -36.40% |
+| 7.1 analyze, `--jobs 4`, user CPU | 2.960 s | 3.330 s | +12.50% |
+| 7.1 normalize, default jobs, wall | 3.950 s | 2.990 s | -24.30% |
+| 7.1 normalize, default jobs, user CPU | 5.005 s | 6.160 s | +23.08% |
+
+The paired wall medians improved by 37.45% for default-job analysis, 36.53%
+with four jobs, and 24.07% for normalization. Peak RSS was effectively
+unchanged: about 13 MiB for analysis and 11 MiB for normalization. Analysis
+JSON and normalized WAVE output were SHA-256 identical to v0.139.0. A
+regression test compares both a 137-frame sequential stream and a 20,000-frame
+parallel stream for seven- and eight-channel layouts against the whole-buffer
+implementation across all reported measurements.
+
+This optimization exchanges aggregate CPU time for lower elapsed time. With
+`--jobs 1`, 15 analysis pairs showed a -0.79% paired wall change and no paired
+user-CPU change, both within benchmark noise. Users prioritizing battery,
+thermal headroom, or concurrent workloads can therefore select one job; the
+default prioritizes completion latency. When several independent files are
+available, Rayon work stealing still shares one bounded pool rather than
+oversubscribing it with per-file thread pools.
+
+#### GPU true-peak feasibility result (not shipped)
+
+A transfer-inclusive CUDA proof of concept mapped one 48 kHz true-peak output
+sample per thread, evaluated the same four 16-tap polyphase rows with ordered
+f64 fused multiply-adds, reduced block maxima on-device, and returned one
+peak. It was measured on an NVIDIA RTX 2080 Ti under WSL2. Runtime compilation,
+fixture construction, and CUDA-context startup were excluded; ordinary
+pageable host memory was used with CuPy 13.6.0, CUDA runtime 12.9, and driver
+591.86. The timing fixture is constant f32 PCM, for which the kernel's memory
+and instruction counts are signal-independent. The PoC transfers one contiguous
+planar allocation; Forge's streaming decoder owns one `Vec` per channel, so a
+production implementation must separately measure multiple DMA operations or
+registered staging rather than assuming this transfer result. The bounded form
+retained 15 samples of history per channel and used Forge's 65,536-frame 7.1
+decoder chunk size for both layouts as a conservative common packet size.
+
+| Input / GPU stage | Whole buffer | Bounded chunks |
+| --- | ---: | ---: |
+| 600 s stereo, host-to-device | 20.38 ms | 20.61 ms |
+| 600 s stereo, kernel/reduction | 25.99 ms kernel | 31.50 ms |
+| 600 s stereo, transfer-through-result total | 44.73 ms | 79.96 ms |
+| 300 s 7.1, host-to-device | 40.81 ms | 52.64 ms |
+| 300 s 7.1, kernel/reduction | 51.30 ms kernel | 54.90 ms |
+| 300 s 7.1, transfer-through-result total | 89.84 ms | 103.09 ms |
+
+The whole-buffer cases use seven-run medians. Bounded stereo uses 440 chunks
+and bounded 7.1 uses 220 chunks, each with five-run medians. The latter moves
+about 461 MB of decoded f32 samples, so the reported 103.09 ms includes the
+data-movement cost that a kernel-only benchmark would hide. Small deterministic
+finite-signal checks for two, seven, and eight channels produced the same final
+f32 peak bits as a CPU reference using the same f64 FMA order.
+
+This is a promising feasibility result, not an end-to-end Forge speed claim.
+The current v0.140.0 7.1 analysis takes 1.590 seconds and also performs decode,
+K-weighting, exact frame/channel reductions, rolling windows, and gating. Amdahl
+back-solving from the measured four-pair CPU result estimates about 1.27
+seconds in the old sequential true-peak portion, but that estimate ignores
+parallel overhead and is not a substitute for an integrated comparison. A
+production candidate still needs asynchronous overlap with CPU K-weighting,
+context-startup and short-file thresholds, exact chunk-tail handling,
+NaN/infinity/subnormal tests, multiple GPU generations, a dynamically detected
+optional runtime, and an unchanged CPU fallback. No GPU dependency or product
+path is added by v0.140.0.
+
 ## Next implementation order
 
-1. Prototype bounded per-channel analysis parallelism for one long
-   multichannel asset. Account for scratch traffic and the shared `--jobs`
-   budget; prefer existing file-level work when several assets are available.
-2. Run a GPU proof of concept on long-form stereo and 7.1 inputs, reporting
-   host/device transfer, kernel, reduction, and total wall time separately.
-   Keep the exact CPU path as the fallback and retain GPU dispatch only where
-   the transfer-inclusive median is faster on measured hardware.
+1. Prototype an optional, bounded CUDA true-peak worker that overlaps device
+   work with CPU K-weighting and falls back before allocating when no compatible
+   runtime is available. Measure context startup, pageable versus registered
+   planar buffers, one-file thresholds, batches, and total Forge wall time.
+2. Reuse caller-owned limiter output storage and apply the paired true-peak
+   kernel inside the look-ahead limiter. Benchmark limiter-heavy stereo and
+   7.1 renders separately; require byte-identical audio and statistics.
+3. Prototype an allocation-free paired multichannel K-weighting loop before
+   considering a per-channel scratch buffer. A previous stereo scratch pass
+   was 3.9% slower, so any 7.1 channel-parallel form must include its extra
+   memory traffic and retain the exact frame/channel reduction order.
+4. Extend byte-exact SIMD quantization/interleaving beyond undithered mono and
+   stereo PCM16, starting with multichannel PCM16 and PCM24. Keep scalar tails,
+   dither state, exceptional-value behavior, and non-x86 fallbacks covered.
 
 Every phase adds a benchmark case or compatible baseline gate before release.
