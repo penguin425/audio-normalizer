@@ -525,15 +525,53 @@ non-bit-exact analysis mode. The current exact, low-order K-weighting path does
 not justify altered rounding, block permutation, correction passes, and task
 coordination for an end-to-end opportunity capped at 11.55% before overhead.
 
+### v0.139.0: channel-contiguous multichannel true peak
+
+The generic multichannel analyzer had interleaved one true-peak meter call and
+one K-weighting call for every channel of every frame. With 5.1, 6.1, 7.1, and
+immersive layouts this repeatedly displaced several recursive histories and
+loaded the same immutable interpolation coefficients for each channel. The
+multichannel path now walks each adjacent channel pair contiguously for true
+peak, using the paired SIMD/scalar kernel introduced in v0.138.0, then performs
+K-weighting, energy accumulation, and gating in the original frame/channel
+order. Odd layouts retain one independent tail meter. Timeline analysis keeps
+the established generic path because it needs per-interval reconstructed
+peaks.
+
+These comparisons use a deterministic 300-second, eight-channel PCM16 WAVE
+input at 48 kHz and native host tuning with fat LTO and no PGO. The analysis
+case uses 15 alternating pairs; normalization uses ten pairs and writes the
+complete 230,400,068-byte output every time. Fixture generation is excluded.
+
+| Workload / metric | v0.138.0 | v0.139.0 | Change |
+| --- | ---: | ---: | ---: |
+| 7.1 analyze, wall | 3.490 s | 2.550 s | -26.93% |
+| 7.1 analyze, user CPU | 4.190 s | 3.220 s | -23.15% |
+| 7.1 normalize, wall | 4.900 s | 3.920 s | -20.00% |
+| 7.1 normalize, user CPU | 5.995 s | 5.365 s | -10.51% |
+
+The paired wall medians improved by 27.30% for analysis and 19.23% for
+normalization. Every analysis user-CPU pair improved by at least 18.3%, and
+every normalization user-CPU pair improved by at least 8.3%. Peak RSS was
+unchanged at about 13 MiB for analysis and 11 MiB for normalization. Analysis
+JSON and normalized WAVE output were SHA-256 identical to v0.138.0. A
+regression test compares chunked seven- and eight-channel streaming
+measurements with the whole-buffer implementation across integrated,
+momentary, and short-term loudness, LRA, RMS, sample peak, and true peak.
+
+The same channel-contiguous split was tested on the fused stereo path. It was
+also byte-identical, but 20 CPU-pinned alternating analysis pairs changed the
+wall median from 1.280 s to 1.300 s (+1.56%) and user CPU from 1.240 s to
+1.270 s (+2.42%; paired median +2.43%). Two channels do not create enough state
+pressure to repay the extra PCM pass, so the experiment was removed and the
+v0.138.0 fused stereo loop remains in place.
+
 ## Next implementation order
 
-1. Extend the measured paired true-peak dataflow to multichannel layouts,
-   retaining independent state and channel-order reductions. Keep it only when
-   long-form 5.1/7.1 end-to-end medians improve without mono/stereo regression.
-2. Prototype bounded per-channel analysis parallelism for one long
+1. Prototype bounded per-channel analysis parallelism for one long
    multichannel asset. Account for scratch traffic and the shared `--jobs`
    budget; prefer existing file-level work when several assets are available.
-3. Run a GPU proof of concept on long-form stereo and 7.1 inputs, reporting
+2. Run a GPU proof of concept on long-form stereo and 7.1 inputs, reporting
    host/device transfer, kernel, reduction, and total wall time separately.
    Keep the exact CPU path as the fallback and retain GPU dispatch only where
    the transfer-inclusive median is faster on measured hardware.

@@ -213,6 +213,92 @@ impl StreamingAnalyzer {
             }
             return Ok(());
         }
+        // Multichannel delivery has enough independent true-peak states to
+        // amortize a separate, channel-contiguous pass. Advancing adjacent
+        // meters in pairs shares their immutable interpolation coefficients;
+        // K-weighted energy keeps the established frame/channel reduction
+        // order below, so every reported value remains bit-identical.
+        if self.timeline_interval_frames.is_none() && planar.len() >= 4 {
+            let complete_pairs = planar.len() / 2;
+            for pair in 0..complete_pairs {
+                let index = pair * 2;
+                let (before_right, from_right) = self.true_peak_meters.split_at_mut(index + 1);
+                let left_meter = &mut before_right[index];
+                let right_meter = &mut from_right[0];
+                for (&left_sample, &right_sample) in planar[index].iter().zip(&planar[index + 1]) {
+                    TruePeakMeter::process_stereo_sample(
+                        left_meter,
+                        right_meter,
+                        left_sample,
+                        right_sample,
+                    );
+                }
+            }
+            if planar.len() % 2 == 1 {
+                let index = planar.len() - 1;
+                self.true_peak_meters[index].process(&planar[index]);
+            }
+            for frame in 0..chunk_frames {
+                let mut weighted = 0.0;
+                for ((index, channel), filter) in
+                    planar.iter().enumerate().zip(self.filters.iter_mut())
+                {
+                    let sample = channel[frame];
+                    let filtered = filter.process(sample) as f64;
+                    weighted += channel_weight(self.roles[index]) * filtered * filtered;
+                    let raw = sample as f64;
+                    self.raw_sum_squares += raw * raw;
+                    self.sample_peak = self.sample_peak.max(sample.abs());
+                }
+                self.weighted_sum_squares += weighted;
+                push_window(
+                    &mut self.momentary,
+                    &mut self.momentary_sum,
+                    weighted,
+                    momentary_window,
+                );
+                push_window(
+                    &mut self.short_term,
+                    &mut self.short_term_sum,
+                    weighted,
+                    short_term_window,
+                );
+                self.frames += 1;
+                if self.momentary.len() == momentary_window {
+                    self.max_momentary_ms = self
+                        .max_momentary_ms
+                        .max(self.momentary_sum / momentary_window as f64);
+                }
+                if self.short_term.len() == short_term_window {
+                    self.max_short_term_ms = self
+                        .max_short_term_ms
+                        .max(self.short_term_sum / short_term_window as f64);
+                }
+                if self.momentary.len() == momentary_window
+                    && (self.frames - momentary_window).is_multiple_of(hop)
+                {
+                    if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
+                        return Err(format!(
+                            "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-gating-block limit"
+                        ));
+                    }
+                    self.gating_blocks
+                        .push(self.momentary_sum / momentary_window as f64);
+                }
+                if self.short_term.len() == short_term_window
+                    && (self.frames - short_term_window).is_multiple_of(hop)
+                {
+                    if self.short_term_blocks.len() == MAX_LOUDNESS_BLOCKS {
+                        return Err(format!(
+                            "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-short-term-block limit"
+                        ));
+                    }
+                    self.short_term_blocks
+                        .push(self.short_term_sum / short_term_window as f64);
+                }
+            }
+            return Ok(());
+        }
         for frame in 0..chunk_frames {
             let mut weighted = 0.0;
             for ((index, channel), filter) in planar.iter().enumerate().zip(self.filters.iter_mut())
@@ -763,6 +849,64 @@ mod tests {
         assert!((streamed.rms_db - whole_rms).abs() < 1e-9);
         assert_eq!(streamed.sample_peak, whole_peak);
         assert_eq!(streamed.true_peak, whole_true_peak);
+    }
+
+    #[test]
+    fn multichannel_streaming_measurement_matches_whole_buffer() {
+        let frames = 192_137;
+        for channels in [7, 8] {
+            let data: Vec<Vec<f32>> = (0..channels)
+                .map(|channel| {
+                    (0..frames)
+                        .map(|index| {
+                            ((index as f64 * (0.041 + channel as f64 * 0.013)
+                                + channel as f64 * 0.17)
+                                .sin()
+                                * (0.08 + channel as f64 * 0.02)) as f32
+                        })
+                        .collect()
+                })
+                .collect();
+            let roles = (0..channels)
+                .map(|channel| match channel {
+                    3 => ChannelRole::Lfe,
+                    4 | 5 => ChannelRole::Surround,
+                    _ => ChannelRole::Main,
+                })
+                .collect::<Vec<_>>();
+            let buffer = AudioBuffer {
+                sample_rate: 48_000,
+                channels: channels as u16,
+                frames,
+                data: data.clone(),
+                channel_roles: roles.clone(),
+                source_kind: PcmKind::F32,
+            };
+            let whole_ebu = measure_ebu(&buffer);
+            let (whole_rms, whole_peak) = measure_rms_peak(&buffer);
+            let whole_true_peak = crate::dsp::truepeak::measure_true_peak(&buffer);
+
+            let mut streaming = StreamingAnalyzer::new(48_000, roles);
+            for start in (0..frames).step_by(137) {
+                let end = (start + 137).min(frames);
+                let chunk = data
+                    .iter()
+                    .map(|channel| channel[start..end].to_vec())
+                    .collect::<Vec<_>>();
+                streaming.process(&chunk).unwrap();
+            }
+            let streamed = streaming.finish();
+
+            assert!((streamed.ebu.integrated_lufs - whole_ebu.integrated_lufs).abs() < 1e-6);
+            assert!((streamed.ebu.max_momentary_lufs - whole_ebu.max_momentary_lufs).abs() < 1e-6);
+            assert!(
+                (streamed.ebu.max_short_term_lufs - whole_ebu.max_short_term_lufs).abs() < 1e-6
+            );
+            assert!((streamed.ebu.loudness_range_lu - whole_ebu.loudness_range_lu).abs() < 1e-6);
+            assert!((streamed.rms_db - whole_rms).abs() < 1e-9);
+            assert_eq!(streamed.sample_peak, whole_peak);
+            assert_eq!(streamed.true_peak, whole_true_peak);
+        }
     }
 
     #[test]

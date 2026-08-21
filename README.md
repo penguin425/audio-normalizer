@@ -101,6 +101,8 @@ the `-o` extension override this.
   96 kHz, 2× below 192 kHz, and direct samples at 192 kHz and above. The common
   stereo path advances both independent meters together, sharing immutable FIR
   coefficient loads without changing either channel's FMA or maximum order.
+  Multichannel analysis processes adjacent meter pairs in channel-contiguous
+  passes while preserving the established K-weighting and channel-sum order.
 * **Multi-threaded** via rayon — channels, independent album tracks, and
   ordinary multi-file normalization share one work-stealing pool bounded by
   `--jobs`. Independent files render in waves of at most 32, then publish in
