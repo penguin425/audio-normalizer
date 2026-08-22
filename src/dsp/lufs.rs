@@ -358,7 +358,7 @@ impl StreamingAnalyzer {
             for frame in 0..chunk_frames {
                 let sample0 = planar[0][frame];
                 let sample1 = planar[1][frame];
-                TruePeakMeter::process_stereo_sample(meter0, meter1, sample0, sample1);
+                TruePeakMeter::process_stereo_peak_only_sample(meter0, meter1, sample0, sample1);
                 let filtered0 = filter0.process(sample0) as f64;
                 let filtered1 = filter1.process(sample1) as f64;
                 let mut weighted = 0.0;
@@ -888,7 +888,7 @@ fn process_true_peak_channel_group(meters: &mut [TruePeakMeter], channels: &[Vec
     if meters.len() == 2 {
         let (left_meter, right_meter) = meters.split_at_mut(1);
         for (&left_sample, &right_sample) in channels[0].iter().zip(&channels[1]) {
-            TruePeakMeter::process_stereo_sample(
+            TruePeakMeter::process_stereo_peak_only_sample(
                 &mut left_meter[0],
                 &mut right_meter[0],
                 left_sample,

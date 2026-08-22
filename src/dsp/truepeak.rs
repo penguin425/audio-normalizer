@@ -37,6 +37,32 @@ pub(super) fn phase_table(factor: usize) -> &'static PhaseTable {
     }
 }
 
+fn interpolation_bound_scale(factor: usize) -> f64 {
+    static X2: OnceLock<f64> = OnceLock::new();
+    static X4: OnceLock<f64> = OnceLock::new();
+    let build = || {
+        let table = phase_table(factor);
+        let mut maximum_l1 = 0.0_f64;
+        for phase in 0..factor {
+            let phase_l1 = table
+                .iter()
+                .map(|coefficients| coefficients[phase].abs())
+                .sum::<f64>();
+            maximum_l1 = maximum_l1.max(phase_l1);
+        }
+        // The coefficients and samples are exactly representable f64 values,
+        // but the L1 sum, product, and 16 chained FMAs still round. Inflate the
+        // triangle-inequality bound well beyond their worst-case error before
+        // using it to skip interpolation.
+        maximum_l1 * (1.0 + 64.0 * f64::EPSILON)
+    };
+    match factor {
+        2 => *X2.get_or_init(build),
+        4 => *X4.get_or_init(build),
+        _ => unreachable!("true-peak interpolation factor must be 2 or 4"),
+    }
+}
+
 fn build_phase_table(factor: usize) -> PhaseTable {
     debug_assert!(matches!(factor, 2 | 4));
     let coefficients = {
@@ -115,6 +141,11 @@ pub struct TruePeakMeter {
     cursor: usize,
     initialized: bool,
     factor: usize,
+    interpolation_bound_scale: f64,
+    pruning_active: bool,
+    pruning_probe_max: f32,
+    pruning_probe_len: u8,
+    pruning_probe_delay: u8,
     #[cfg(target_arch = "x86_64")]
     use_avx2_fma: bool,
     peak: f32,
@@ -148,6 +179,15 @@ impl TruePeakMeter {
             cursor: 0,
             initialized: false,
             factor,
+            interpolation_bound_scale: if factor > 1 {
+                interpolation_bound_scale(factor)
+            } else {
+                0.0
+            },
+            pruning_active: false,
+            pruning_probe_max: 0.0,
+            pruning_probe_len: 0,
+            pruning_probe_delay: 0,
             #[cfg(target_arch = "x86_64")]
             use_avx2_fma: is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
             peak: 0.0,
@@ -179,26 +219,86 @@ impl TruePeakMeter {
             return;
         }
         for &sample in samples {
-            self.process_sample(sample);
+            self.process_peak_only_sample(sample);
+        }
+    }
+
+    #[inline(always)]
+    fn push_history(&mut self, sample: f32) {
+        let sample = sample as f64;
+        if self.initialized {
+            self.cursor = self.cursor.wrapping_sub(1) & (TAPS_PER_PHASE - 1);
+            self.history[self.cursor] = sample;
+            self.history[self.cursor + TAPS_PER_PHASE] = sample;
+        } else {
+            self.history.fill(sample);
+            self.initialized = true;
+        }
+    }
+
+    #[inline(always)]
+    fn history_window(&self) -> &[f64; TAPS_PER_PHASE] {
+        self.history[self.cursor..self.cursor + TAPS_PER_PHASE]
+            .try_into()
+            .expect("true-peak history window has a fixed length")
+    }
+
+    #[inline(always)]
+    fn sample_within_pruning_bound(&self, sample: f32, peak_floor: f32) -> bool {
+        f64::from(sample).abs() * self.interpolation_bound_scale <= f64::from(peak_floor)
+    }
+
+    #[inline(always)]
+    fn invalidate_pruning_probe(&mut self) {
+        // Limiter and timeline meters stay exact for their entire lifetime.
+        // Keep that hot path to one predictable false branch instead of four
+        // stores per sample; only meters switching from peak-only mode carry
+        // non-default probe state that must be cleared.
+        if self.pruning_active || self.pruning_probe_len != 0 || self.pruning_probe_delay != 0 {
+            self.pruning_active = false;
+            self.pruning_probe_max = 0.0;
+            self.pruning_probe_len = 0;
+            self.pruning_probe_delay = 0;
+        }
+    }
+
+    #[inline(always)]
+    fn record_exact_pruning_sample(&mut self, sample: f32) {
+        self.pruning_active = false;
+        if self.pruning_probe_len == 0 {
+            // Exact interpolation remains the fast path for dense material.
+            // Probe only once per 256 samples; including the 16-sample proof,
+            // after a transient this delays activation by at most about 5.7 ms
+            // at 48 kHz while avoiding a max reduction on every dense frame.
+            self.pruning_probe_delay = self.pruning_probe_delay.wrapping_add(1);
+            if self.pruning_probe_delay != 0 {
+                return;
+            }
+            self.pruning_probe_max = sample.abs();
+            self.pruning_probe_len = 1;
+            return;
+        }
+        self.pruning_probe_max = self.pruning_probe_max.max(sample.abs());
+        self.pruning_probe_len += 1;
+        if self.pruning_probe_len as usize == TAPS_PER_PHASE {
+            self.pruning_active = f64::from(self.pruning_probe_max)
+                * self.interpolation_bound_scale
+                <= f64::from(self.peak);
+            self.pruning_probe_max = 0.0;
+            self.pruning_probe_len = 0;
+            self.pruning_probe_delay = 0;
         }
     }
 
     pub(crate) fn process_sample(&mut self, sample: f32) -> f32 {
         let mut frame_peak = sample.abs();
         if self.factor > 1 {
-            let sample = sample as f64;
-            if self.initialized {
-                self.cursor = self.cursor.wrapping_sub(1) & (TAPS_PER_PHASE - 1);
-                self.history[self.cursor] = sample;
-                self.history[self.cursor + TAPS_PER_PHASE] = sample;
-            } else {
-                self.history.fill(sample);
-                self.initialized = true;
-            }
-            let history: &[f64; TAPS_PER_PHASE] = self.history
-                [self.cursor..self.cursor + TAPS_PER_PHASE]
-                .try_into()
-                .expect("true-peak history window has a fixed length");
+            self.push_history(sample);
+            // Exact frame-level callers may be interleaved with peak-only
+            // callers. Restart the probe so a later peak-only call cannot rely
+            // on samples it did not classify.
+            self.invalidate_pruning_probe();
+            let history = self.history_window();
             let table = phase_table(self.factor);
             #[cfg(target_arch = "x86_64")]
             let interpolated = if self.use_avx2_fma {
@@ -222,6 +322,47 @@ impl TruePeakMeter {
         frame_peak
     }
 
+    /// Advance one sample when only the all-time maximum is needed. Once a
+    /// previous peak exceeds a conservative triangle-inequality bound for the
+    /// current 16-sample FIR window, interpolation cannot change the result.
+    /// The history is still advanced exactly, so later frames are unaffected.
+    #[inline]
+    pub(crate) fn process_peak_only_sample(&mut self, sample: f32) -> bool {
+        let mut frame_peak = sample.abs();
+        if self.factor > 1 {
+            self.push_history(sample);
+            let peak_floor = self.peak.max(frame_peak);
+            if self.pruning_active && self.sample_within_pruning_bound(sample, peak_floor) {
+                self.peak = peak_floor;
+                return true;
+            }
+            let history = self.history_window();
+            let table = phase_table(self.factor);
+            #[cfg(target_arch = "x86_64")]
+            let interpolated = if self.use_avx2_fma {
+                // SAFETY: the constructor performed runtime AVX2/FMA detection.
+                unsafe { interpolate_avx2_fma(history, table) }
+            } else {
+                interpolate_scalar(history, table, self.factor)
+            };
+            #[cfg(target_arch = "aarch64")]
+            let interpolated = {
+                // SAFETY: Advanced SIMD is part of the AArch64 architecture.
+                unsafe { interpolate_neon(history, table) }
+            };
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            let interpolated = interpolate_scalar(history, table, self.factor);
+            for value in &interpolated[..self.factor] {
+                frame_peak = frame_peak.max(value.abs() as f32);
+            }
+        }
+        self.peak = self.peak.max(frame_peak);
+        if self.factor > 1 {
+            self.record_exact_pruning_sample(sample);
+        }
+        false
+    }
+
     /// Process one stereo frame while sharing the immutable phase-coefficient
     /// loads. Each channel keeps its own history, FMA accumulator, maximum
     /// reduction, and meter peak, so the result is bit-identical to two
@@ -243,33 +384,12 @@ impl TruePeakMeter {
         let mut left_frame_peak = left_sample.abs();
         let mut right_frame_peak = right_sample.abs();
         if left.factor > 1 {
-            let left_value = left_sample as f64;
-            if left.initialized {
-                left.cursor = left.cursor.wrapping_sub(1) & (TAPS_PER_PHASE - 1);
-                left.history[left.cursor] = left_value;
-                left.history[left.cursor + TAPS_PER_PHASE] = left_value;
-            } else {
-                left.history.fill(left_value);
-                left.initialized = true;
-            }
-            let right_value = right_sample as f64;
-            if right.initialized {
-                right.cursor = right.cursor.wrapping_sub(1) & (TAPS_PER_PHASE - 1);
-                right.history[right.cursor] = right_value;
-                right.history[right.cursor + TAPS_PER_PHASE] = right_value;
-            } else {
-                right.history.fill(right_value);
-                right.initialized = true;
-            }
-
-            let left_history: &[f64; TAPS_PER_PHASE] = left.history
-                [left.cursor..left.cursor + TAPS_PER_PHASE]
-                .try_into()
-                .expect("true-peak history window has a fixed length");
-            let right_history: &[f64; TAPS_PER_PHASE] = right.history
-                [right.cursor..right.cursor + TAPS_PER_PHASE]
-                .try_into()
-                .expect("true-peak history window has a fixed length");
+            left.push_history(left_sample);
+            right.push_history(right_sample);
+            left.invalidate_pruning_probe();
+            right.invalidate_pruning_probe();
+            let left_history = left.history_window();
+            let right_history = right.history_window();
             let table = phase_table(left.factor);
             #[cfg(target_arch = "x86_64")]
             let (left_interpolated, right_interpolated) = if left.use_avx2_fma {
@@ -298,6 +418,118 @@ impl TruePeakMeter {
         left.peak = left.peak.max(left_frame_peak);
         right.peak = right.peak.max(right_frame_peak);
         (left_frame_peak, right_frame_peak)
+    }
+
+    /// Stereo counterpart of [`Self::process_peak_only_sample`]. Coefficient
+    /// loads remain shared when both channels require interpolation; if only
+    /// one can exceed its retained peak, only that channel is reconstructed.
+    #[inline]
+    pub(crate) fn process_stereo_peak_only_sample(
+        left: &mut Self,
+        right: &mut Self,
+        left_sample: f32,
+        right_sample: f32,
+    ) -> (bool, bool) {
+        if left.factor != right.factor {
+            return (
+                left.process_peak_only_sample(left_sample),
+                right.process_peak_only_sample(right_sample),
+            );
+        }
+
+        let mut left_frame_peak = left_sample.abs();
+        let mut right_frame_peak = right_sample.abs();
+        if left.factor == 1 {
+            left.peak = left.peak.max(left_frame_peak);
+            right.peak = right.peak.max(right_frame_peak);
+            return (false, false);
+        }
+
+        left.push_history(left_sample);
+        right.push_history(right_sample);
+        let left_floor = left.peak.max(left_frame_peak);
+        let right_floor = right.peak.max(right_frame_peak);
+        let skip_left =
+            left.pruning_active && left.sample_within_pruning_bound(left_sample, left_floor);
+        let skip_right =
+            right.pruning_active && right.sample_within_pruning_bound(right_sample, right_floor);
+        if skip_left && skip_right {
+            left.peak = left_floor;
+            right.peak = right_floor;
+            return (true, true);
+        }
+
+        let left_history = left.history_window();
+        let right_history = right.history_window();
+        let table = phase_table(left.factor);
+        if !skip_left && !skip_right {
+            #[cfg(target_arch = "x86_64")]
+            let (left_interpolated, right_interpolated) = if left.use_avx2_fma {
+                // SAFETY: both constructors performed runtime AVX2/FMA detection.
+                unsafe { interpolate_stereo_avx2_fma(left_history, right_history, table) }
+            } else {
+                interpolate_stereo_scalar(left_history, right_history, table, left.factor)
+            };
+            #[cfg(target_arch = "aarch64")]
+            let (left_interpolated, right_interpolated) = {
+                // SAFETY: Advanced SIMD is part of the AArch64 architecture.
+                unsafe { interpolate_stereo_neon(left_history, right_history, table) }
+            };
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            let (left_interpolated, right_interpolated) =
+                interpolate_stereo_scalar(left_history, right_history, table, left.factor);
+            for value in &left_interpolated[..left.factor] {
+                left_frame_peak = left_frame_peak.max(value.abs() as f32);
+            }
+            for value in &right_interpolated[..right.factor] {
+                right_frame_peak = right_frame_peak.max(value.abs() as f32);
+            }
+        } else if !skip_left {
+            #[cfg(target_arch = "x86_64")]
+            let interpolated = if left.use_avx2_fma {
+                // SAFETY: the constructor performed runtime AVX2/FMA detection.
+                unsafe { interpolate_avx2_fma(left_history, table) }
+            } else {
+                interpolate_scalar(left_history, table, left.factor)
+            };
+            #[cfg(target_arch = "aarch64")]
+            let interpolated = {
+                // SAFETY: Advanced SIMD is part of the AArch64 architecture.
+                unsafe { interpolate_neon(left_history, table) }
+            };
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            let interpolated = interpolate_scalar(left_history, table, left.factor);
+            for value in &interpolated[..left.factor] {
+                left_frame_peak = left_frame_peak.max(value.abs() as f32);
+            }
+        } else {
+            #[cfg(target_arch = "x86_64")]
+            let interpolated = if right.use_avx2_fma {
+                // SAFETY: the constructor performed runtime AVX2/FMA detection.
+                unsafe { interpolate_avx2_fma(right_history, table) }
+            } else {
+                interpolate_scalar(right_history, table, right.factor)
+            };
+            #[cfg(target_arch = "aarch64")]
+            let interpolated = {
+                // SAFETY: Advanced SIMD is part of the AArch64 architecture.
+                unsafe { interpolate_neon(right_history, table) }
+            };
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            let interpolated = interpolate_scalar(right_history, table, right.factor);
+            for value in &interpolated[..right.factor] {
+                right_frame_peak = right_frame_peak.max(value.abs() as f32);
+            }
+        }
+        left.peak = left.peak.max(left_frame_peak);
+        right.peak = right.peak.max(right_frame_peak);
+        if !skip_left {
+            left.record_exact_pruning_sample(left_sample);
+        }
+        if !skip_right {
+            right.record_exact_pruning_sample(right_sample);
+        }
+        (skip_left, skip_right)
     }
 
     pub const fn peak(&self) -> f32 {
@@ -489,6 +721,173 @@ mod tests {
             chunked.process(chunk);
         }
         assert_eq!(whole.peak(), chunked.peak());
+    }
+
+    #[test]
+    fn peak_only_pruning_matches_exact_interpolation_bit_for_bit() {
+        let mut samples = Vec::with_capacity(20_001);
+        samples.push(0.99_f32);
+        samples.extend((0..20_000).map(|index| {
+            let first = (index as f64 * 0.173).sin();
+            let second = (index as f64 * 0.071 + 0.4).cos();
+            (0.008 * first + 0.003 * second) as f32
+        }));
+
+        for sample_rate in [48_000, 96_000, 192_000] {
+            let mut exact = TruePeakMeter::for_sample_rate(sample_rate);
+            for &sample in &samples {
+                exact.process_sample(sample);
+            }
+
+            let mut pruned = TruePeakMeter::for_sample_rate(sample_rate);
+            for chunk in samples.chunks(37) {
+                pruned.process(chunk);
+            }
+            assert_eq!(
+                pruned.peak().to_bits(),
+                exact.peak().to_bits(),
+                "{sample_rate} Hz"
+            );
+        }
+    }
+
+    #[test]
+    fn peak_only_pruning_skips_quiet_windows_after_a_transient() {
+        for sample_rate in [48_000, 96_000] {
+            let mut exact = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut pruned = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut skipped = 0_usize;
+            let samples = std::iter::once(0.99_f32)
+                .chain((0..20_000).map(|index| ((index as f64 * 0.19).sin() * 0.001) as f32));
+            for sample in samples {
+                exact.process_sample(sample);
+                skipped += usize::from(pruned.process_peak_only_sample(sample));
+            }
+            assert_eq!(pruned.peak().to_bits(), exact.peak().to_bits());
+            assert!(
+                skipped > 19_000,
+                "{sample_rate} Hz skipped only {skipped} windows"
+            );
+        }
+    }
+
+    #[test]
+    fn peak_only_pruning_matches_exact_across_dynamic_random_blocks() {
+        let mut state = 0x6a09_e667_f3bc_c909_u64;
+        let samples: Vec<f32> = (0..100_000)
+            .map(|index| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let unit = ((state >> 40) as f64 / (1_u64 << 24) as f64) * 2.0 - 1.0;
+                let amplitude = match (index / 4096) % 3 {
+                    0 => 0.92,
+                    1 => 0.015,
+                    _ => 0.31,
+                };
+                (unit * amplitude) as f32
+            })
+            .collect();
+
+        for sample_rate in [48_000, 96_000, 192_000] {
+            let mut exact = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut pruned = TruePeakMeter::for_sample_rate(sample_rate);
+            for &sample in &samples {
+                exact.process_sample(sample);
+                pruned.process_peak_only_sample(sample);
+            }
+            assert_eq!(
+                pruned.peak().to_bits(),
+                exact.peak().to_bits(),
+                "{sample_rate} Hz"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_calls_safely_reset_peak_only_probe_state() {
+        let samples: Vec<f32> = std::iter::once(0.99_f32)
+            .chain((0..20_000).map(|index| ((index as f64 * 0.127).sin() * 0.002) as f32))
+            .collect();
+        for sample_rate in [48_000, 96_000, 192_000] {
+            let mut exact = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut mixed = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut skipped = 0_usize;
+            for (index, &sample) in samples.iter().enumerate() {
+                exact.process_sample(sample);
+                if index.is_multiple_of(521) {
+                    mixed.process_sample(sample);
+                } else {
+                    skipped += usize::from(mixed.process_peak_only_sample(sample));
+                }
+            }
+            assert_eq!(mixed.peak().to_bits(), exact.peak().to_bits());
+            if sample_rate < 192_000 {
+                assert!(skipped > 0, "{sample_rate} Hz never reactivated pruning");
+            }
+        }
+    }
+
+    #[test]
+    fn stereo_peak_only_pruning_matches_exact_meters() {
+        let left: Vec<f32> = std::iter::once(0.98_f32)
+            .chain((0..20_000).map(|index| ((index as f64 * 0.173).sin() * 0.004) as f32))
+            .collect();
+        let right: Vec<f32> = std::iter::once(-0.97_f32)
+            .chain((0..20_000).map(|index| ((index as f64 * 0.071 + 0.4).cos() * 0.006) as f32))
+            .collect();
+        for sample_rate in [48_000, 96_000, 192_000] {
+            let mut exact_left = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut exact_right = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut pruned_left = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut pruned_right = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut skipped = [0_usize; 2];
+            for (&left_sample, &right_sample) in left.iter().zip(&right) {
+                exact_left.process_sample(left_sample);
+                exact_right.process_sample(right_sample);
+                let result = TruePeakMeter::process_stereo_peak_only_sample(
+                    &mut pruned_left,
+                    &mut pruned_right,
+                    left_sample,
+                    right_sample,
+                );
+                skipped[0] += usize::from(result.0);
+                skipped[1] += usize::from(result.1);
+            }
+            assert_eq!(pruned_left.peak().to_bits(), exact_left.peak().to_bits());
+            assert_eq!(pruned_right.peak().to_bits(), exact_right.peak().to_bits());
+            if sample_rate < 192_000 {
+                assert!(skipped[0] > 19_000, "left {sample_rate} Hz: {skipped:?}");
+                assert!(skipped[1] > 19_000, "right {sample_rate} Hz: {skipped:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn peak_only_pruning_preserves_exceptional_sample_result() {
+        let samples = [
+            f32::NAN,
+            f32::MIN_POSITIVE / 2.0,
+            -f32::MIN_POSITIVE / 4.0,
+            0.75,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -0.25,
+        ];
+        for sample_rate in [48_000, 96_000, 192_000] {
+            let mut exact = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut pruned = TruePeakMeter::for_sample_rate(sample_rate);
+            for sample in samples {
+                exact.process_sample(sample);
+                pruned.process_peak_only_sample(sample);
+            }
+            assert_eq!(
+                pruned.peak().to_bits(),
+                exact.peak().to_bits(),
+                "{sample_rate} Hz"
+            );
+        }
     }
 
     #[cfg(all(

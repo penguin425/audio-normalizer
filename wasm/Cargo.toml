@@ -1,6 +1,6 @@
 [package]
 name = "forge-normalizer-wasm"
-version = "0.144.0"
+version = "0.145.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Local browser analysis bindings for Forge"
