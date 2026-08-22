@@ -29,6 +29,9 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
 * Optional MP3 encoding uses **LAME** (the reference MP3 encoder) through a
   tiny FFI. Enable it with the `mp3-encoding` Cargo feature.
 * FLAC encoding is pure Rust, streaming, and available in the default build.
+  Independent 4096-sample frames are encoded through the existing bounded
+  `--jobs` pool, with at most eight active tasks and 1 MiB of retained
+  quantized samples; frame order, STREAMINFO, and MD5 remain deterministic.
 * Optional Ogg Opus input/output uses statically linked libopus, bounded-memory
   sinc resampling to 48 kHz, and a pure-Rust Ogg container. Release binaries
   include it; source builds enable it with the `opus-encoding` feature.
@@ -108,6 +111,11 @@ the `-o` extension override this.
   same protected chunks to every requested writer. Each codec keeps its own
   quantizer, dither state, and encoder state, while staged verification and
   atomic publication remain per output.
+* **Bounded parallel FLAC encoding** coalesces short decoder packets, encodes
+  independent fixed-size frames and their bitstreams on up to eight tasks in
+  the global worker pool, then updates MD5/STREAMINFO and writes bytes in source
+  order. `--jobs 1` retains the low-overhead serial path, and encoded files are
+  byte-identical across worker counts.
 * **Sample-rate-aware true-peak analysis** uses a copy-free circular history,
   SIMD polyphase interpolation, and the BS.1770 measurement domain: 4× below
   96 kHz, 2× below 192 kHz, and direct samples at 192 kHz and above. The common

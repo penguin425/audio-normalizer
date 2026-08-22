@@ -265,6 +265,12 @@ Forge already provides:
   bound, with sparse complete-window probes, bit-identical 48/96/192 kHz and
   chunked results, unchanged timeline/limiter frame detection, and a measured
   dense-signal fallback cost disclosed alongside the dynamic-signal gain.
+- Bounded pure-Rust FLAC frame parallelism through the existing global
+  `--jobs` pool, with short-packet coalescing, at most eight active encoder
+  tasks, a 1 MiB quantized-sample bound, parallel frame serialization, ordered
+  MD5/STREAMINFO/file finalization, a serial one-worker path, and byte-identical
+  16/24-bit dithered and undithered output. Existing file-level Rayon work keeps
+  the inner encoder serial to avoid nested fan-out.
 - Multichannel true-peak pair passes that retain meter state across each
   channel-contiguous decoder chunk, share immutable polyphase coefficients for
   adjacent channels, handle odd channel counts with the scalar tail, and leave
