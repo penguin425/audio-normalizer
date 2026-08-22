@@ -437,7 +437,10 @@ fn bw64_output_preserves_bext_and_writes_measured_loudness() {
         output_sample_rate: None,
         resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
     };
-    normalize::normalize_one(&input, &output, &plan, OutputFormat::Wav).unwrap();
+    let corrected =
+        normalize::normalize_one_corrected(&input, &output, &plan, OutputFormat::Wav, 0.05, 1)
+            .unwrap();
+    assert!(corrected.verification.passed());
 
     assert_eq!(&std::fs::read(&output).unwrap()[..4], b"BW64");
     let output_bext = forge_normalizer::metadata::read_bext(&output)

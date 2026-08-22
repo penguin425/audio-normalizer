@@ -15,6 +15,9 @@ Forge already provides:
   bounded work-stealing parallelism across album tracks and independent batch
   files, limiter, sample-rate conversion, integer PCM dither, ReplayGain, and
   BWF loudness metadata.
+- Corrected BWF and ReplayGain finalization reuses the already-verified output
+  analysis under container-default channel roles, while explicit custom roles
+  retain the independent container re-analysis needed for compatibility.
 - EBU Tech 3285 v2 BWF `bext` QC for fixed production fields, date/time,
   sample-based TimeReference, version/UMID/reserved-byte consistency, loudness
   metadata ranges, and CodingHistory line structure.

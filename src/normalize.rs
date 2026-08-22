@@ -24,6 +24,7 @@ use crate::pcm_spool::PcmSpool;
 use crate::wav::{AudioBuffer, ChannelRole, PcmKind, WavContainer, WavStreamWriter, WavWriter};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -1675,6 +1676,7 @@ fn normalize_one_staged_with_roles_impl(
         input,
         staged.path(),
         format,
+        None,
         an.lufs + gain_db(gain),
         None,
         plan,
@@ -1813,6 +1815,7 @@ fn normalize_one_corrected_with_optional_analysis(
                 input,
                 staged.path(),
                 format,
+                channel_roles.is_none().then_some(&verification.output),
                 verification.output.lufs,
                 None,
                 plan,
@@ -1936,7 +1939,15 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
             .collect::<Vec<_>>();
         if verifications.iter().all(Verification::passed) {
             for ((output, format), decoded) in staged_paths.iter().zip(formats).zip(&decoded) {
-                finalize_metadata(input, output, *format, decoded.lufs, None, plan)?;
+                finalize_metadata(
+                    input,
+                    output,
+                    *format,
+                    channel_roles.is_none().then_some(decoded),
+                    decoded.lufs,
+                    None,
+                    plan,
+                )?;
             }
             // Metadata writers may rewrite a container. Verify the exact
             // staged bytes that will become visible, not only the encodes
@@ -2167,6 +2178,7 @@ fn normalize_album_with_roles_impl(
                 input,
                 output.path(),
                 fmt,
+                None,
                 analyses[i].lufs + gain_db(gain),
                 Some(album_output_lufs),
                 plan,
@@ -2377,6 +2389,7 @@ fn normalize_album_corrected_with_optional_analyses(
                     input,
                     output,
                     format,
+                    channel_roles.is_none().then_some(&decoded[index]),
                     decoded[index].lufs,
                     Some(actual_album_lufs),
                     plan,
@@ -2432,13 +2445,14 @@ fn finalize_metadata(
     input: &Path,
     output: &Path,
     format: OutputFormat,
+    measured_output: Option<&Analysis>,
     _track_lufs: f64,
     _album_lufs: Option<f64>,
     plan: &Plan,
 ) -> Result<(), String> {
     metadata::copy_metadata(input, output)?;
     if format == OutputFormat::Wav && plan.bwf {
-        let measured = analyze_file(output)?;
+        let measured = known_or_analyze_output(output, measured_output)?;
         metadata::update_bwf_loudness(output, &measured)?;
     }
     if format == OutputFormat::Opus {
@@ -2451,10 +2465,22 @@ fn finalize_metadata(
         format,
         OutputFormat::M4a | OutputFormat::Alac | OutputFormat::Vorbis
     ) {
-        let measured = analyze_file(output)?;
+        let measured = known_or_analyze_output(output, measured_output)?;
         metadata::write_replaygain(output, measured.lufs, measured.true_peak, None)?;
     }
     Ok(())
+}
+
+/// Reuse a PCM-derived measurement when its channel-role interpretation is
+/// known to match the container defaults; otherwise measure the final file.
+fn known_or_analyze_output<'a>(
+    output: &Path,
+    measured_output: Option<&'a Analysis>,
+) -> Result<Cow<'a, Analysis>, String> {
+    measured_output.map_or_else(
+        || analyze_file(output).map(Cow::Owned),
+        |analysis| Ok(Cow::Borrowed(analysis)),
+    )
 }
 
 fn corrected_gain(
@@ -3168,6 +3194,19 @@ mod tests {
             output_sample_rate: None,
             resample_quality: ResampleQuality::Balanced,
         }
+    }
+
+    #[test]
+    fn known_output_analysis_avoids_reopening_the_completed_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing_output = directory.path().join("not-written.wav");
+        let known = analysis(-16.0, -1.0);
+
+        let measured = known_or_analyze_output(&missing_output, Some(&known)).unwrap();
+
+        assert!(matches!(measured, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(measured.as_ref(), &known));
+        assert!(known_or_analyze_output(&missing_output, None).is_err());
     }
 
     #[test]
