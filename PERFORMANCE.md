@@ -941,6 +941,48 @@ WAVE, FLAC, and Opus outputs matched v0.143.0 byte for byte. A dedicated unit
 test also compares separate and fan-out WAVE/FLAC encodes, exact lossless
 verification measurements, and render statistics.
 
+### v0.145.0: exact adaptive analysis true-peak pruning
+
+Analysis previously reconstructed every oversampled FIR phase even after an
+earlier peak was already impossible to exceed. The all-time-maximum paths now
+use the triangle inequality
+`abs(sum(c[i] * x[i])) <= max(abs(x[i])) * sum(abs(c[i]))`. The maximum phase
+L1 coefficient norm is conservatively inflated for floating-point rounding.
+After an exact 16-sample probe proves the complete history window is below that
+bound, subsequent windows skip interpolation until a new sample invalidates
+the proof. Failed probes are spaced 256 samples apart so dense material retains
+the established paired SIMD path with little monitoring cost.
+
+This shortcut is exact and limited to callers that need only the retained
+maximum. Timeline interval peaks, true-peak limiter detection, and other
+frame-level callers continue to reconstruct every phase. Tests compare exact
+and pruned meters bit for bit at 48, 96, and 192 kHz across chunk boundaries,
+stereo pairing, transients, quiet tails, NaN, infinities, and subnormal inputs.
+
+Alternating comparisons used deterministic 600-second, 48 kHz stereo PCM16
+WAVE fixtures and native-host fat-LTO builds without PGO. The pink-noise case
+represents a common distribution where an early retained peak dominates later
+windows. The rising two-tone case deliberately keeps challenging the retained
+peak and is the disclosed dense worst case. Analysis used seven pairs; complete
+normalization with `--verify` used five pink-noise pairs and a separate
+seven-pair dense rerun. Values are medians.
+
+| Workload / metric | v0.144.0 | v0.145.0 | Change |
+| --- | ---: | ---: | ---: |
+| Pink-noise analysis, wall | 1.50 s | 0.93 s | -38.00% |
+| Pink-noise analysis, user CPU | 1.66 s | 1.10 s | -33.73% |
+| Pink-noise normalize + verify, wall | 4.71 s | 3.22 s | -31.63% |
+| Pink-noise normalize + verify, user CPU | 4.34 s | 2.66 s | -38.71% |
+| Rising two-tone analysis, wall | 1.50 s | 1.53 s | +2.00% |
+| Rising two-tone analysis, user CPU | 1.65 s | 1.66 s | +0.61% |
+| Rising two-tone normalize + verify, wall | 4.67 s | 4.79 s | +2.57% |
+| Rising two-tone normalize + verify, user CPU | 4.31 s | 4.38 s | +1.62% |
+
+The analysis JSON and normalized WAVE files matched v0.144.0 byte for byte for
+both fixtures. Median peak RSS changed by less than 0.25%. The small dense-case
+cost is retained and documented because common peak distributions save roughly
+one third of end-to-end CPU without changing BS.1770 results or output bytes.
+
 ## Final integration gate
 
 The measured implementation sequence is complete. Before release, run the full

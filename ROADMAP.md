@@ -261,6 +261,10 @@ Forge already provides:
   coefficient loads and exposes both meter states in one hot loop while
   retaining separate histories, per-channel FMA/reduction order, runtime SIMD
   fallbacks, and bit-identical 48/96/192 kHz measurements.
+- Exact analysis-only true-peak pruning based on the polyphase FIR triangle
+  bound, with sparse complete-window probes, bit-identical 48/96/192 kHz and
+  chunked results, unchanged timeline/limiter frame detection, and a measured
+  dense-signal fallback cost disclosed alongside the dynamic-signal gain.
 - Multichannel true-peak pair passes that retain meter state across each
   channel-contiguous decoder chunk, share immutable polyphase coefficients for
   adjacent channels, handle odd channel counts with the scalar tail, and leave
