@@ -823,6 +823,54 @@ for 3, 5, 6, 7, 8, 9, 10, 11, 12, and 16 channels over arbitrary f32 bit
 patterns, half-LSB boundaries, subnormals, NaN, infinities, full-scale endpoints,
 partial vectors, and scalar channel tails; RNG state is also asserted unchanged.
 
+### v0.142.0: allocation-stable MP3 and Opus feeds
+
+MP3 encoding now passes Forge's existing planar f32 channels directly to
+LAME's planar IEEE-float API. The streaming writer no longer allocates and
+fills an interleaved stereo vector for every decoder chunk, and the compatible
+whole-buffer API no longer allocates a duration-sized interleaved copy. LAME
+settings, chunk boundaries, input values, and tag backpatching are unchanged.
+
+Opus resampling now advances through its retained planar input with Rubato's
+input offset instead of draining and shifting every channel after each 1,024
+frame resampler call. One retained planar output buffer is resized without
+releasing capacity. The interleaved Opus queue likewise advances an offset
+rather than allocating a 960-frame vector and shifting the remaining queue for
+every packet; at each decoder boundary it compacts fewer than two packets once.
+Ogg packet ownership and page assembly remain unchanged.
+
+Alternating seven-pair comparisons used deterministic stereo f32 WAVE inputs,
+a native-host fat-LTO build without PGO, ordinary -16 LUFS normalization, and
+192 kb/s output. The 48 kHz cases are 600 seconds; the resampling case is 300
+seconds at 44.1 kHz. Times include decode, analysis, gain, encoding, metadata,
+and file I/O. Total CPU is the median of user plus system time for each run.
+
+| Workload / median | v0.141.0 | v0.142.0 | Change |
+| --- | ---: | ---: | ---: |
+| MP3 48 kHz, wall | 15.70 s | 15.54 s | -1.02% |
+| MP3 48 kHz, total CPU | 17.25 s | 17.16 s | -0.52% |
+| MP3 48 kHz, peak RSS | 25,616 KiB | 24,724 KiB | -3.48% |
+| Opus 48 kHz, wall | 7.41 s | 7.10 s | -4.18% |
+| Opus 48 kHz, user CPU | 8.14 s | 7.73 s | -5.04% |
+| Opus 48 kHz, total CPU | 8.55 s | 8.18 s | -4.33% |
+| Opus 44.1→48 kHz, wall | 3.89 s | 3.87 s | -0.51% |
+| Opus 44.1→48 kHz, user CPU | 4.36 s | 4.25 s | -2.52% |
+| Opus 44.1→48 kHz, total CPU | 4.55 s | 4.45 s | -2.20% |
+
+All seven paired total-CPU comparisons improved for both Opus fixtures. Peak
+RSS rose by 524 KiB (2.38%) for the 600-second same-rate case and 440 KiB
+(2.56%) for the 300-second resampling case, remaining bounded by the largest
+stream chunk rather than programme duration. MP3, same-rate Opus, and
+resampled Opus outputs matched their v0.141.0 SHA-256 hashes byte for byte.
+Tests also assert that the pending Opus queue and resampler input/output
+allocations remain stable across unequal writes.
+
+Two measured variants were rejected. Retaining FLAC's large pending allocation
+changed a 600-second render by +0.74% total CPU and +0.74% peak RSS, so the
+existing small-tail allocation remains. Reusing a libopus output scratch and
+copying each owned Ogg packet reduced CPU but raised Opus peak RSS by 10.55%;
+the accepted path therefore retains the encoder's owned-packet API.
+
 ## Final integration gate
 
 The measured implementation sequence is complete. Before release, run the full

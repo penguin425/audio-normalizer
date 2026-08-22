@@ -62,7 +62,10 @@ pub struct OpusStreamWriter {
     resampler_delay: usize,
     encoded_frames: u64,
     input_pending: Vec<Vec<f32>>,
+    input_offset: usize,
+    resample_output: Vec<Vec<f32>>,
     encode_pending: Vec<f32>,
+    encode_offset: usize,
     resampler: Option<AssertUnwindSafe<Async<f32>>>,
 }
 
@@ -145,7 +148,10 @@ impl OpusStreamWriter {
             resampler_delay,
             encoded_frames: 0,
             input_pending: vec![Vec::new(); channels as usize],
+            input_offset: 0,
+            resample_output: vec![Vec::new(); channels as usize],
             encode_pending: Vec::new(),
+            encode_offset: 0,
             resampler,
         })
     }
@@ -155,42 +161,46 @@ impl OpusStreamWriter {
         if self.resampler.is_none() {
             return self.queue_for_encoding(planar);
         }
+        self.compact_input_pending();
         for (pending, channel) in self.input_pending.iter_mut().zip(planar) {
             pending.extend_from_slice(channel);
         }
         let input_frames = self.resampler.as_ref().unwrap().input_frames_next();
-        while self.input_pending[0].len() >= input_frames {
-            let output = self.resample(None, "resample for Opus")?;
-            for channel in &mut self.input_pending {
-                channel.drain(..input_frames);
-            }
-            self.queue_for_encoding(&output)?;
+        while self.input_pending[0].len() - self.input_offset >= input_frames {
+            self.resample_into_output(None, "resample for Opus")?;
+            self.input_offset += input_frames;
+            self.queue_resample_output()?;
         }
+        self.compact_input_pending();
         Ok(())
     }
 
     pub fn finish(mut self) -> Result<(), String> {
         if self.resampler.is_some() {
-            let pending_frames = self.input_pending[0].len();
+            self.compact_input_pending();
+            let pending_frames = self.input_pending[0].len() - self.input_offset;
             if pending_frames > 0 {
-                let output = self.resample(Some(pending_frames), "finish Opus resampling")?;
+                self.resample_into_output(Some(pending_frames), "finish Opus resampling")?;
+                self.input_offset += pending_frames;
+                self.queue_resample_output()?;
                 for channel in &mut self.input_pending {
                     channel.clear();
                 }
-                self.queue_for_encoding(&output)?;
+                self.input_offset = 0;
             }
             for _ in 0..MAX_RESAMPLE_FLUSH_PASSES {
                 if self.queued_signal_frames == self.expected_output_frames {
                     break;
                 }
-                let output = self.resample(Some(0), "flush Opus resampling")?;
-                if output.first().map_or(0, Vec::len) == 0 {
+                let produced = self.resample_into_output(Some(0), "flush Opus resampling")?;
+                if produced == 0 {
                     break;
                 }
-                self.queue_for_encoding(&output)?;
+                self.queue_resample_output()?;
             }
         }
 
+        self.compact_encode_pending();
         self.encode_pending.resize(
             self.encode_pending.len() + self.pre_skip * self.channels,
             0.0,
@@ -204,7 +214,7 @@ impl OpusStreamWriter {
         if self.encode_pending.is_empty() {
             self.encode_pending.resize(frame_samples, 0.0);
         }
-        while self.encode_pending.len() > frame_samples {
+        while self.encode_pending.len() - self.encode_offset > frame_samples {
             self.encode_one(PacketWriteEndInfo::NormalPacket, None)?;
         }
         if self.queued_signal_frames != self.expected_output_frames {
@@ -221,39 +231,76 @@ impl OpusStreamWriter {
             .map_err(|error| format!("flush Ogg Opus: {error}"))
     }
 
-    fn resample(
+    fn resample_into_output(
         &mut self,
         partial_len: Option<usize>,
         operation: &str,
-    ) -> Result<Vec<Vec<f32>>, String> {
+    ) -> Result<usize, String> {
+        let input_offset = self.input_offset;
         let resampler = self
             .resampler
             .as_mut()
             .ok_or_else(|| "Opus resampler is not configured".to_string())?;
         let input_frames = partial_len.unwrap_or_else(|| resampler.input_frames_next());
         let output_frames = resampler.output_frames_next();
-        let input =
-            SequentialSliceOfVecs::new(self.input_pending.as_slice(), self.channels, input_frames)
-                .map_err(|error| format!("prepare Opus resampler input: {error}"))?;
-        let mut output = vec![vec![0.0_f32; output_frames]; self.channels];
-        let indexing = partial_len.map(|frames| Indexing::new().partial_len(frames));
+        let input = SequentialSliceOfVecs::new(
+            self.input_pending.as_slice(),
+            self.channels,
+            input_offset + input_frames,
+        )
+        .map_err(|error| format!("prepare Opus resampler input: {error}"))?;
+        for channel in &mut self.resample_output {
+            channel.resize(output_frames, 0.0);
+        }
+        let indexing = if input_offset > 0 || partial_len.is_some() {
+            let mut indexing = Indexing::new().input_offset(input_offset);
+            if let Some(frames) = partial_len {
+                indexing = indexing.partial_len(frames);
+            }
+            Some(indexing)
+        } else {
+            None
+        };
         let produced = {
-            let mut output_adapter =
-                SequentialSliceOfVecs::new_mut(output.as_mut_slice(), self.channels, output_frames)
-                    .map_err(|error| format!("prepare Opus resampler output: {error}"))?;
+            let mut output_adapter = SequentialSliceOfVecs::new_mut(
+                self.resample_output.as_mut_slice(),
+                self.channels,
+                output_frames,
+            )
+            .map_err(|error| format!("prepare Opus resampler output: {error}"))?;
             resampler
                 .process_into_buffer(&input, &mut output_adapter, indexing.as_ref())
                 .map_err(|error| format!("{operation}: {error}"))?
                 .1
         };
-        for channel in &mut output {
+        for channel in &mut self.resample_output {
             channel.truncate(produced);
         }
-        Ok(output)
+        Ok(produced)
+    }
+
+    fn queue_resample_output(&mut self) -> Result<(), String> {
+        let output = std::mem::take(&mut self.resample_output);
+        let result = self.queue_for_encoding(&output);
+        self.resample_output = output;
+        result
+    }
+
+    fn compact_input_pending(&mut self) {
+        if self.input_offset == 0 {
+            return;
+        }
+        for channel in &mut self.input_pending {
+            let remaining = channel.len() - self.input_offset;
+            channel.copy_within(self.input_offset.., 0);
+            channel.truncate(remaining);
+        }
+        self.input_offset = 0;
     }
 
     fn queue_for_encoding(&mut self, planar: &[Vec<f32>]) -> Result<(), String> {
         validate_planar(planar, self.channels)?;
+        self.compact_encode_pending();
         let frames = planar.first().map_or(0, Vec::len);
         let start = self.resampler_delay.min(frames);
         self.resampler_delay -= start;
@@ -273,19 +320,35 @@ impl OpusStreamWriter {
                 .map(move |&channel| planar[channel][frame])
         }));
         let frame_samples = FRAME_SIZE * self.channels;
-        while self.encode_pending.len() >= frame_samples * 2 {
+        while self.encode_pending.len() - self.encode_offset >= frame_samples * 2 {
             self.encode_one(PacketWriteEndInfo::NormalPacket, None)?;
         }
+        self.compact_encode_pending();
         Ok(())
+    }
+
+    fn compact_encode_pending(&mut self) {
+        if self.encode_offset == 0 {
+            return;
+        }
+        let remaining = self.encode_pending.len() - self.encode_offset;
+        self.encode_pending.copy_within(self.encode_offset.., 0);
+        self.encode_pending.truncate(remaining);
+        self.encode_offset = 0;
     }
 
     fn encode_one(&mut self, end: PacketWriteEndInfo, granule: Option<u64>) -> Result<(), String> {
         let samples = FRAME_SIZE * self.channels;
-        let frame: Vec<f32> = self.encode_pending.drain(..samples).collect();
+        let start = self.encode_offset;
+        let frame_end = start + samples;
         let packet = self
             .encoder
-            .encode_vec_float(&frame, self.max_packet_bytes)
+            .encode_vec_float(
+                &self.encode_pending[start..frame_end],
+                self.max_packet_bytes,
+            )
             .map_err(|error| format!("encode Opus packet: {error}"))?;
+        self.encode_offset = frame_end;
         self.encoded_frames += FRAME_SIZE as u64;
         self.packets
             .write_packet(
@@ -958,5 +1021,78 @@ mod tests {
         let inspection = inspect(&path).unwrap();
         assert_eq!(inspection.chain_count, 1);
         assert_eq!(inspection.total_frames, expected_frames);
+    }
+
+    #[test]
+    fn stream_writer_reuses_pending_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reuse.opus");
+        let large_frames = FRAME_SIZE * 8 + 137;
+        let small_frames = FRAME_SIZE + 137;
+        let total_frames = large_frames + small_frames;
+        let mut writer = OpusStreamWriter::create(
+            &path,
+            OPUS_RATE,
+            total_frames,
+            2,
+            &default_channel_roles(2),
+            128,
+            -18.0,
+            None,
+        )
+        .unwrap();
+
+        let large = vec![vec![0.0; large_frames]; 2];
+        writer.write_chunk(&large).unwrap();
+        let pending_allocation = writer.encode_pending.as_ptr();
+        let pending_capacity = writer.encode_pending.capacity();
+
+        let small = vec![vec![0.0; small_frames]; 2];
+        writer.write_chunk(&small).unwrap();
+        assert_eq!(writer.encode_offset, 0);
+        assert_eq!(writer.encode_pending.as_ptr(), pending_allocation);
+        assert_eq!(writer.encode_pending.capacity(), pending_capacity);
+        writer.finish().unwrap();
+
+        assert_eq!(inspect(&path).unwrap().total_frames, total_frames as u64);
+    }
+
+    #[test]
+    fn resampler_reuses_input_and_output_allocations() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("resample-reuse.opus");
+        let input_rate = 44_100;
+        let large_frames = RESAMPLE_CHUNK * 8 + 31;
+        let small_frames = RESAMPLE_CHUNK + 31;
+        let total_frames = large_frames + small_frames;
+        let mut writer = OpusStreamWriter::create(
+            &path,
+            input_rate,
+            total_frames,
+            1,
+            &default_channel_roles(1),
+            64,
+            -18.0,
+            None,
+        )
+        .unwrap();
+
+        writer.write_chunk(&[vec![0.0; large_frames]]).unwrap();
+        let input_allocation = writer.input_pending[0].as_ptr();
+        let input_capacity = writer.input_pending[0].capacity();
+        let output_allocation = writer.resample_output[0].as_ptr();
+        let output_capacity = writer.resample_output[0].capacity();
+
+        writer.write_chunk(&[vec![0.0; small_frames]]).unwrap();
+        assert_eq!(writer.input_offset, 0);
+        assert_eq!(writer.input_pending[0].as_ptr(), input_allocation);
+        assert_eq!(writer.input_pending[0].capacity(), input_capacity);
+        assert_eq!(writer.resample_output[0].as_ptr(), output_allocation);
+        assert_eq!(writer.resample_output[0].capacity(), output_capacity);
+        writer.finish().unwrap();
+
+        let expected_frames = ((total_frames as u128 * OPUS_RATE as u128 + input_rate as u128 / 2)
+            / input_rate as u128) as u64;
+        assert_eq!(inspect(&path).unwrap().total_frames, expected_frames);
     }
 }
