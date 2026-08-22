@@ -103,6 +103,11 @@ the `-o` extension override this.
   match the persisted container layout. MP3, AAC, ALAC, Opus, and Vorbis
   outputs retain completed-file codec re-decode, and multi-delivery retains one
   final re-decode after metadata mutation.
+* **Single-pass multi-delivery rendering** decodes, resamples, applies gain and
+  the true-peak ceiling, and measures render statistics once before feeding the
+  same protected chunks to every requested writer. Each codec keeps its own
+  quantizer, dither state, and encoder state, while staged verification and
+  atomic publication remain per output.
 * **Sample-rate-aware true-peak analysis** uses a copy-free circular history,
   SIMD polyphase interpolation, and the BS.1770 measurement domain: 4× below
   96 kHz, 2× below 192 kHz, and direct samples at 192 kHz and above. The common
@@ -182,7 +187,8 @@ the contract, safety limits, and short smoke command.
 
 `forge-multi-delivery` derives one conservative target and true-peak ceiling
 from two to 32 versioned delivery profiles, renders every requested codec with
-the same linear gain, and re-decodes every staged output before publishing it.
+the same linear gain from one shared decode/DSP pass, and re-decodes every
+staged output before publishing it.
 It emits schema-validated JSON evidence with hashes, measurements, resolved
 profile provenance, and per-profile headroom:
 

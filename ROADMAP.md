@@ -18,6 +18,9 @@ Forge already provides:
 - Corrected BWF and ReplayGain finalization reuses the already-verified output
   analysis under container-default channel roles, while explicit custom roles
   retain the independent container re-analysis needed for compatibility.
+- Multi-delivery fans one decoded, resampled, gained, true-peak-protected
+  stream into every requested codec writer while retaining independent encoder
+  state, staged post-metadata verification, and atomic publication.
 - EBU Tech 3285 v2 BWF `bext` QC for fixed production fields, date/time,
   sample-based TimeReference, version/UMID/reserved-byte consistency, loudness
   metadata ranges, and CodingHistory line structure.
@@ -296,8 +299,9 @@ Forge already provides:
   and higher-RSS Opus packet-scratch variants were measured and rejected.
 - Versioned multi-delivery optimization for two to 32 codec/profile outputs,
   using one conservative target, ceiling, and iteratively corrected gain;
-  staged post-metadata re-decoding, explicit infeasibility, path-alias and
-  overwrite safety, and schema-validated hash/measurement/profile evidence.
+  one shared decode/DSP/statistics pass per correction attempt, staged
+  post-metadata re-decoding, explicit infeasibility, path-alias and overwrite
+  safety, and schema-validated hash/measurement/profile evidence.
 - Versioned two-pass segment-aware catalogue normalization for two to 4096
   ordered sources, with SHA-256-bound plans, identical adjacent boundary
   gains, capped cubic smoothstep dB ramps, per-segment memory limits,

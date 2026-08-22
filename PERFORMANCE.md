@@ -903,6 +903,44 @@ fields written from the borrowed verification result. Targeted tests cover the
 borrowed/owned analysis paths, corrected BWF metadata, corrected album output,
 and final multi-delivery verification.
 
+### v0.144.0: single-pass multi-delivery fan-out
+
+Multi-delivery previously invoked the complete decode, optional resample,
+gain/ceiling or limiter, and render-statistics pipeline once per requested
+container. It now creates every codec writer first and feeds each protected
+planar chunk to all writers from one shared processing pass. Writer-specific
+quantization, dither RNGs, codec state, finalization, lossless verification
+tees, completed-codec re-decodes, metadata mutation checks, and atomic commit
+remain independent. Every reported delivery receives a clone of the one
+render-statistics result because its pre-codec signal is now identical by
+construction.
+
+Alternating comparisons used a deterministic 600-second, 48 kHz, stereo PCM16
+pink-noise WAVE source and native-host fat-LTO builds without PGO. Seven pairs
+were used for WAVE+FLAC and the single-output control; five pairs were used for
+WAVE+FLAC+Opus. Each run includes source analysis, rendering, exact lossless or
+decoded-codec verification, final post-metadata re-decode, and atomic output
+replacement. Values are medians, including the per-run peak-RSS samples.
+
+| Workload / metric | v0.143.0 | v0.144.0 | Change |
+| --- | ---: | ---: | ---: |
+| WAVE+FLAC multi-delivery, wall | 14.40 s | 12.65 s | -12.15% |
+| WAVE+FLAC multi-delivery, user CPU | 13.93 s | 11.86 s | -14.86% |
+| WAVE+FLAC multi-delivery, system CPU | 1.40 s | 1.31 s | -6.43% |
+| WAVE+FLAC multi-delivery, peak RSS | 129,680 KiB | 137,132 KiB | +5.75% |
+| WAVE+FLAC+Opus multi-delivery, wall | 26.83 s | 24.30 s | -9.43% |
+| WAVE+FLAC+Opus multi-delivery, user CPU | 25.71 s | 23.21 s | -9.72% |
+| WAVE+FLAC+Opus multi-delivery, system CPU | 1.66 s | 1.59 s | -4.22% |
+| WAVE+FLAC+Opus multi-delivery, peak RSS | 134,076 KiB | 133,484 KiB | -0.44% |
+| Single corrected WAVE control, wall | 4.97 s | 4.92 s | -1.01% |
+| Single corrected WAVE control, user CPU | 4.76 s | 4.81 s | +1.05% |
+| Single corrected WAVE control, peak RSS | 124,644 KiB | 124,696 KiB | +0.04% |
+
+The single-output differences are noise-level and show no material regression.
+WAVE, FLAC, and Opus outputs matched v0.143.0 byte for byte. A dedicated unit
+test also compares separate and fan-out WAVE/FLAC encodes, exact lossless
+verification measurements, and render statistics.
+
 ## Final integration gate
 
 The measured implementation sequence is complete. Before release, run the full
