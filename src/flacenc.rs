@@ -127,23 +127,13 @@ impl FlacStreamWriter {
         }
         let pending_start = self.pending.len();
         self.pending.reserve(frames * self.channels);
-        let scale = (1_u32 << (self.bits - 1)) as f32;
-        let min = -(1_i32 << (self.bits - 1));
-        let max = (1_i32 << (self.bits - 1)) - 1;
-        for frame in 0..frames {
-            for (channel, samples) in planar.iter().enumerate() {
-                let noise = if self.dither {
-                    convert::tpdf(&mut self.rngs[channel]) as f32
-                } else {
-                    0.0
-                };
-                self.pending.push(
-                    (samples[frame] * scale + noise)
-                        .round()
-                        .clamp(min as f32, max as f32) as i32,
-                );
-            }
-        }
+        convert::append_quantized_interleaved_i32(
+            planar,
+            self.bits,
+            self.dither,
+            &mut self.rngs,
+            &mut self.pending,
+        );
         observe(&self.pending[pending_start..], self.bits)?;
         self.drain_blocks(false)
     }

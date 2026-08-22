@@ -1,6 +1,6 @@
 [package]
 name = "forge-normalizer"
-version = "0.146.0"
+version = "0.147.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer (WAV/MP3/FLAC/Opus/AAC/Vorbis)"

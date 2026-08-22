@@ -271,6 +271,10 @@ Forge already provides:
   MD5/STREAMINFO/file finalization, a serial one-worker path, and byte-identical
   16/24-bit dithered and undithered output. Existing file-level Rayon work keeps
   the inner encoder serial to avoid nested fan-out.
+- Runtime-dispatched AVX2 FLAC sample staging for undithered 16/24-bit output,
+  with eight-frame mono/stereo quantization, lane-correct stereo interleaving,
+  vectorized 3-to-8-channel frame groups, exact exceptional-value and half-LSB
+  behavior, unchanged dither RNG sequencing, and portable scalar fallbacks.
 - Multichannel true-peak pair passes that retain meter state across each
   channel-contiguous decoder chunk, share immutable polyphase coefficients for
   adjacent channels, handle odd channel counts with the scalar tail, and leave

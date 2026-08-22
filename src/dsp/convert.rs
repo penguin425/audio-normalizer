@@ -161,6 +161,129 @@ pub(crate) fn dither_rngs(channels: usize) -> Vec<u64> {
         .collect()
 }
 
+/// Append the interleaved signed integer representation consumed by the FLAC
+/// writer. The undithered path uses the same byte-exact AVX2 quantizer as WAVE
+/// output while preserving the established f32 multiply/round/clamp result.
+pub(crate) fn append_quantized_interleaved_i32(
+    planar: &[Vec<f32>],
+    bits: usize,
+    dither: bool,
+    rngs: &mut [u64],
+    output: &mut Vec<i32>,
+) {
+    let channels = planar.len();
+    assert!(channels >= 1);
+    assert!(matches!(bits, 16 | 24));
+    assert_eq!(rngs.len(), channels);
+    let frames = planar[0].len();
+    for channel in planar {
+        assert_eq!(channel.len(), frames, "channel length mismatch");
+    }
+
+    let start = output.len();
+    output.resize(start + frames * channels, 0);
+    let appended = &mut output[start..];
+
+    #[cfg(target_arch = "x86_64")]
+    if !dither && is_x86_feature_detected!("avx2") {
+        unsafe { append_quantized_interleaved_i32_avx2(planar, bits, rngs, appended) };
+        return;
+    }
+
+    append_quantized_interleaved_i32_scalar_from(planar, bits, dither, rngs, appended, 0);
+}
+
+fn append_quantized_interleaved_i32_scalar_from(
+    planar: &[Vec<f32>],
+    bits: usize,
+    dither: bool,
+    rngs: &mut [u64],
+    output: &mut [i32],
+    start_frame: usize,
+) {
+    let channels = planar.len();
+    let frames = planar[0].len();
+    let scale = (1_u32 << (bits - 1)) as f32;
+    let minimum = -(1_i32 << (bits - 1));
+    let maximum = (1_i32 << (bits - 1)) - 1;
+    for frame in start_frame..frames {
+        for (channel, (samples, rng)) in planar.iter().zip(rngs.iter_mut()).enumerate() {
+            let noise = if dither { tpdf(rng) as f32 } else { 0.0 };
+            output[frame * channels + channel] = (samples[frame] * scale + noise)
+                .round()
+                .clamp(minimum as f32, maximum as f32)
+                as i32;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn append_quantized_interleaved_i32_avx2(
+    planar: &[Vec<f32>],
+    bits: usize,
+    rngs: &mut [u64],
+    output: &mut [i32],
+) {
+    let channels = planar.len();
+    let frames = planar[0].len();
+    let mut frame = 0;
+
+    if channels == 1 {
+        while frame + 8 <= frames {
+            let samples = _mm256_loadu_ps(planar[0].as_ptr().add(frame));
+            let quantized = quantize_flacx8(samples, bits);
+            _mm256_storeu_si256(output.as_mut_ptr().add(frame).cast(), quantized);
+            frame += 8;
+        }
+    } else if channels == 2 {
+        while frame + 8 <= frames {
+            let left = quantize_flacx8(_mm256_loadu_ps(planar[0].as_ptr().add(frame)), bits);
+            let right = quantize_flacx8(_mm256_loadu_ps(planar[1].as_ptr().add(frame)), bits);
+            let low_pairs = _mm256_unpacklo_epi32(left, right);
+            let high_pairs = _mm256_unpackhi_epi32(left, right);
+            let first = _mm256_permute2x128_si256::<0x20>(low_pairs, high_pairs);
+            let second = _mm256_permute2x128_si256::<0x31>(low_pairs, high_pairs);
+            let destination = output.as_mut_ptr().add(frame * 2);
+            _mm256_storeu_si256(destination.cast(), first);
+            _mm256_storeu_si256(destination.add(8).cast(), second);
+            frame += 8;
+        }
+    } else {
+        for frame in 0..frames {
+            let mut channel = 0;
+            while channel < channels {
+                let count = (channels - channel).min(8);
+                let samples = load_planar_frame_x8(planar, channel, frame, count);
+                let quantized = quantize_flacx8(samples, bits);
+                let destination = output.as_mut_ptr().add(frame * channels + channel);
+                if count == 8 {
+                    _mm256_storeu_si256(destination.cast(), quantized);
+                } else {
+                    let mut values = [0_i32; 8];
+                    _mm256_storeu_si256(values.as_mut_ptr().cast(), quantized);
+                    std::ptr::copy_nonoverlapping(values.as_ptr(), destination, count);
+                }
+                channel += count;
+            }
+        }
+        return;
+    }
+
+    append_quantized_interleaved_i32_scalar_from(planar, bits, false, rngs, output, frame);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_flacx8(samples: __m256, bits: usize) -> __m256i {
+    match bits {
+        16 => quantize_s16x8(samples),
+        24 => quantize_s24x8(samples),
+        _ => unreachable!(),
+    }
+}
+
 pub(crate) fn encode_interleaved_with_rngs(
     planar: &[Vec<f32>],
     kind: PcmKind,
@@ -513,6 +636,103 @@ mod tests {
             let plain = encode_interleaved(&samples, kind, false);
             let dithered = encode_interleaved(&samples, kind, true);
             assert_ne!(dithered, plain, "dither was inert for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn flac_i32_simd_quantizer_matches_scalar_and_preserves_prefix() {
+        let mut state = 0xa409_3822_u32;
+        let mut channel = vec![
+            f32::NAN,
+            f32::INFINITY,
+            -f32::INFINITY,
+            -1.25,
+            -1.0,
+            1.0,
+            1.25,
+            -0.0,
+            0.0,
+            f32::from_bits(1),
+            0.5 / 32_768.0,
+            -0.5 / 32_768.0,
+            1.5 / 8_388_608.0,
+            -1.5 / 8_388_608.0,
+        ];
+        while channel.len() < 4_099 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            channel.push(f32::from_bits(state));
+        }
+
+        for bits in [16, 24] {
+            for channels in [1, 2, 3, 5, 8] {
+                let planar = channel_variants(&channel, channels);
+                let prefix = [i32::MIN, -17, 0, 42, i32::MAX];
+                let mut expected = prefix.to_vec();
+                let expected_start = expected.len();
+                expected.resize(expected_start + channel.len() * channels, 0);
+                let mut expected_rngs = dither_rngs(channels);
+                append_quantized_interleaved_i32_scalar_from(
+                    &planar,
+                    bits,
+                    false,
+                    &mut expected_rngs,
+                    &mut expected[expected_start..],
+                    0,
+                );
+
+                let mut actual = prefix.to_vec();
+                let mut actual_rngs = dither_rngs(channels);
+                append_quantized_interleaved_i32(
+                    &planar,
+                    bits,
+                    false,
+                    &mut actual_rngs,
+                    &mut actual,
+                );
+
+                assert_eq!(actual, expected, "bits={bits}, channels={channels}");
+                assert_eq!(
+                    actual_rngs, expected_rngs,
+                    "bits={bits}, channels={channels}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flac_i32_dither_keeps_scalar_rng_sequence_across_chunks() {
+        let first = vec![
+            (0..257)
+                .map(|frame| (frame as f32 * 0.017_31).sin() * 0.9)
+                .collect::<Vec<_>>(),
+            (0..257)
+                .map(|frame| (frame as f32 * 0.011_93).cos() * 0.8)
+                .collect::<Vec<_>>(),
+        ];
+        let second = vec![first[0][91..].to_vec(), first[1][91..].to_vec()];
+
+        for bits in [16, 24] {
+            let mut expected = vec![11, 22, 33];
+            let mut actual = expected.clone();
+            let mut expected_rngs = dither_rngs(2);
+            let mut actual_rngs = expected_rngs.clone();
+            for chunk in [&first, &second] {
+                let start = expected.len();
+                expected.resize(start + chunk[0].len() * 2, 0);
+                append_quantized_interleaved_i32_scalar_from(
+                    chunk,
+                    bits,
+                    true,
+                    &mut expected_rngs,
+                    &mut expected[start..],
+                    0,
+                );
+                append_quantized_interleaved_i32(chunk, bits, true, &mut actual_rngs, &mut actual);
+            }
+            assert_eq!(actual, expected, "bits={bits}");
+            assert_eq!(actual_rngs, expected_rngs, "bits={bits}");
         }
     }
 
