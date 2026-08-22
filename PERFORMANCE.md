@@ -1034,6 +1034,46 @@ FLAC-input, 16-bit dithered, and 24-bit outputs matched v0.145.0 byte for byte.
 Tests also cover uneven caller chunks, a partial final frame, coalescing at the
 memory boundary, and serial/parallel equality.
 
+### v0.147.0: byte-exact SIMD FLAC sample staging
+
+Before frame encoding, the FLAC writer converted planar f32 chunks into its
+frame-major signed-integer queue with a scalar frame/channel loop. Undithered
+16-bit and 24-bit output now uses runtime-dispatched AVX2: mono quantizes eight
+frames per vector, stereo quantizes two vectors and interleaves their i32 lanes,
+and three-to-eight-channel layouts quantize one frame's channel group at a time.
+Scalar tails retain the same operation order. Dithered output remains on the
+established scalar path so its per-channel TPDF RNG sequence cannot change.
+Non-AVX2 targets retain the complete scalar implementation.
+
+Tests compare the SIMD and scalar i32 queues for both depths and 1/2/3/5/8
+channels across random f32 bit patterns, NaN, infinities, out-of-range values,
+signed zero, subnormals, and quantizer boundaries. Separate tests cover caller
+prefix preservation, unequal chunks, dither state across chunks, partial FLAC
+tails, and serial/parallel encoded-file equality.
+
+Alternating five-pair comparisons used the exact final v0.146.0 commit and the
+v0.147.0 candidate, each built separately with native-host fat LTO and no PGO.
+The deterministic input is 600 seconds of stereo 48 kHz f32 WAVE. Every run
+includes LUFS analysis, gain, FLAC encoding, exact lossless verification,
+metadata finalization, and atomic replacement. Values are medians.
+
+| Workload / metric | v0.146.0 | v0.147.0 | Change |
+| --- | ---: | ---: | ---: |
+| 24-bit, `--jobs 32`, wall | 5.75 s | 5.57 s | -3.13% |
+| 24-bit, `--jobs 32`, total CPU | 8.82 s | 8.71 s | -1.25% |
+| 24-bit, `--jobs 32`, peak RSS | 94,104 KiB | 94,088 KiB | -0.02% |
+| 16-bit, `--jobs 32`, wall | 5.33 s | 5.26 s | -1.31% |
+| 16-bit, `--jobs 32`, total CPU | 8.25 s | 8.15 s | -1.21% |
+| 16-bit, `--jobs 32`, peak RSS | 40,312 KiB | 40,312 KiB | unchanged |
+| 24-bit, `--jobs 1`, wall | 6.79 s | 6.65 s | -2.06% |
+| 24-bit, `--jobs 1`, total CPU | 6.92 s | 6.93 s | +0.14% |
+| 24-bit, `--jobs 1`, peak RSS | 83,724 KiB | 83,724 KiB | unchanged |
+
+All measured 16-bit and 24-bit FLAC files matched v0.146.0 byte for byte and
+all verification runs passed. The one-worker CPU difference is noise-level;
+the retained implementation improves end-to-end latency without material CPU
+or memory cost.
+
 ## Final integration gate
 
 The measured implementation sequence is complete. Before release, run the full

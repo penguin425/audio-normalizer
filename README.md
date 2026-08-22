@@ -32,6 +32,8 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
   Independent 4096-sample frames are encoded through the existing bounded
   `--jobs` pool, with at most eight active tasks and 1 MiB of retained
   quantized samples; frame order, STREAMINFO, and MD5 remain deterministic.
+  Undithered 16/24-bit sample staging uses runtime-dispatched byte-exact AVX2
+  quantization and interleaving, with a portable scalar fallback.
 * Optional Ogg Opus input/output uses statically linked libopus, bounded-memory
   sinc resampling to 48 kHz, and a pure-Rust Ogg container. Release binaries
   include it; source builds enable it with the `opus-encoding` feature.
@@ -116,6 +118,10 @@ the `-o` extension override this.
   the global worker pool, then updates MD5/STREAMINFO and writes bytes in source
   order. `--jobs 1` retains the low-overhead serial path, and encoded files are
   byte-identical across worker counts.
+* **SIMD FLAC sample staging** converts planar f32 chunks directly into the
+  encoder's frame-major signed integers eight values at a time. Dedicated mono,
+  stereo-interleave, and multichannel AVX2 paths retain scalar rounding and
+  clamping exactly; dither keeps the established scalar RNG sequence.
 * **Sample-rate-aware true-peak analysis** uses a copy-free circular history,
   SIMD polyphase interpolation, and the BS.1770 measurement domain: 4× below
   96 kHz, 2× below 192 kHz, and direct samples at 192 kHz and above. The common
