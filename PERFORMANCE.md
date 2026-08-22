@@ -871,6 +871,38 @@ existing small-tail allocation remains. Reusing a libopus output scratch and
 copying each owned Ogg packet reduced CPU but raised Opus peak RSS by 10.55%;
 the accepted path therefore retains the encoder's owned-packet API.
 
+### v0.143.0: verified output analysis reuse
+
+Corrected normalization already owns the completed output measurement used to
+accept or reject an encode. BWF and ReplayGain finalization now borrow that
+measurement instead of opening, decoding, and analyzing the same output again.
+The optimization applies to single-file, album, and multi-delivery correction
+when container-default channel roles are in use. Explicit custom roles retain
+the previous independent container analysis so the interpretation and written
+metadata cannot change. Multi-delivery also retains its final post-metadata
+decode and verification before any destination is committed.
+
+Alternating seven-pair comparisons used one deterministic 600-second, 48 kHz,
+stereo PCM16 WAVE source, a native-host fat-LTO build without PGO, and
+`--verify --bwf`. Times include source analysis, normalization, exact quantized
+PCM verification, BWF copying and update, and atomic output replacement. The
+ordinary `--verify` control used five alternating pairs. Medians are reported
+except that peak RSS is the maximum of all runs.
+
+| Workload / metric | v0.142.0 | v0.143.0 | Change |
+| --- | ---: | ---: | ---: |
+| Corrected BWF WAVE, wall | 6.75 s | 5.22 s | -22.67% |
+| Corrected BWF WAVE, user CPU | 6.85 s | 5.12 s | -25.26% |
+| Corrected BWF WAVE, system CPU | 0.84 s | 0.79 s | -5.95% |
+| Corrected BWF WAVE, peak RSS | 124,656 KiB | 124,656 KiB | unchanged |
+| Ordinary corrected WAVE, wall | 4.79 s | 4.75 s | -0.84% |
+
+The v0.142.0 and v0.143.0 corrected BWF outputs matched byte for byte. The
+completed file's independently measured LUFS and true peak also match the BWF
+fields written from the borrowed verification result. Targeted tests cover the
+borrowed/owned analysis paths, corrected BWF metadata, corrected album output,
+and final multi-delivery verification.
+
 ## Final integration gate
 
 The measured implementation sequence is complete. Before release, run the full

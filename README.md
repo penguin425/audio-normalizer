@@ -97,10 +97,12 @@ the `-o` extension override this.
   library methods remain available as compatibility wrappers.
 * **Lossless verification tee** measures the exact quantized PCM accepted by
   the native WAVE and FLAC writers during encoding, avoiding an otherwise
-  redundant completed-file read. PCM scratch is reused between chunks and
-  implicit multichannel roles match the persisted container layout. MP3, AAC,
-  ALAC, Opus, and Vorbis outputs retain completed-file codec re-decode, and
-  multi-delivery still re-decodes after final metadata mutation.
+  redundant completed-file read. Corrected BWF and ReplayGain finalization
+  reuses that verified output measurement when container-default channel roles
+  apply. PCM scratch is reused between chunks and implicit multichannel roles
+  match the persisted container layout. MP3, AAC, ALAC, Opus, and Vorbis
+  outputs retain completed-file codec re-decode, and multi-delivery retains one
+  final re-decode after metadata mutation.
 * **Sample-rate-aware true-peak analysis** uses a copy-free circular history,
   SIMD polyphase interpolation, and the BS.1770 measurement domain: 4× below
   96 kHz, 2× below 192 kHz, and direct samples at 192 kHz and above. The common
