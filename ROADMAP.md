@@ -265,6 +265,11 @@ Forge already provides:
   bound, with sparse complete-window probes, bit-identical 48/96/192 kHz and
   chunked results, unchanged timeline/limiter frame detection, and a measured
   dense-signal fallback cost disclosed alongside the dynamic-signal gain.
+- SIMD block-level true-peak pruning after that exact proof is active, with
+  one maximum/NaN reduction per safe decoder chunk, direct reconstruction of
+  the final 16-sample FIR history, independent stereo-channel decisions, and
+  byte-identical analysis/normalization evidence. Unsafe and dense chunks
+  retain the established per-sample paired interpolation path.
 - Bounded pure-Rust FLAC frame parallelism through the existing global
   `--jobs` pool, with short-packet coalescing, at most eight active encoder
   tasks, a 1 MiB quantized-sample bound, parallel frame serialization, ordered

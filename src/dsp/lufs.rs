@@ -351,6 +351,8 @@ impl StreamingAnalyzer {
             let (meter0, meter1) = self.true_peak_meters.split_at_mut(1);
             let meter0 = &mut meter0[0];
             let meter1 = &mut meter1[0];
+            let skip_meter0 = meter0.try_skip_peak_only_block(&planar[0]);
+            let skip_meter1 = meter1.try_skip_peak_only_block(&planar[1]);
             #[allow(
                 clippy::needless_range_loop,
                 reason = "the measured hot path uses one frame index across two fixed channels"
@@ -358,7 +360,20 @@ impl StreamingAnalyzer {
             for frame in 0..chunk_frames {
                 let sample0 = planar[0][frame];
                 let sample1 = planar[1][frame];
-                TruePeakMeter::process_stereo_peak_only_sample(meter0, meter1, sample0, sample1);
+                match (skip_meter0, skip_meter1) {
+                    (false, false) => {
+                        TruePeakMeter::process_stereo_peak_only_sample(
+                            meter0, meter1, sample0, sample1,
+                        );
+                    }
+                    (false, true) => {
+                        meter0.process_peak_only_sample(sample0);
+                    }
+                    (true, false) => {
+                        meter1.process_peak_only_sample(sample1);
+                    }
+                    (true, true) => {}
+                }
                 let filtered0 = filter0.process(sample0) as f64;
                 let filtered1 = filter1.process(sample1) as f64;
                 let mut weighted = 0.0;
@@ -887,13 +902,26 @@ fn process_true_peak_channel_group(meters: &mut [TruePeakMeter], channels: &[Vec
     debug_assert_eq!(meters.len(), channels.len());
     if meters.len() == 2 {
         let (left_meter, right_meter) = meters.split_at_mut(1);
+        let skip_left = left_meter[0].try_skip_peak_only_block(&channels[0]);
+        let skip_right = right_meter[0].try_skip_peak_only_block(&channels[1]);
         for (&left_sample, &right_sample) in channels[0].iter().zip(&channels[1]) {
-            TruePeakMeter::process_stereo_peak_only_sample(
-                &mut left_meter[0],
-                &mut right_meter[0],
-                left_sample,
-                right_sample,
-            );
+            match (skip_left, skip_right) {
+                (false, false) => {
+                    TruePeakMeter::process_stereo_peak_only_sample(
+                        &mut left_meter[0],
+                        &mut right_meter[0],
+                        left_sample,
+                        right_sample,
+                    );
+                }
+                (false, true) => {
+                    left_meter[0].process_peak_only_sample(left_sample);
+                }
+                (true, false) => {
+                    right_meter[0].process_peak_only_sample(right_sample);
+                }
+                (true, true) => {}
+            }
         }
     } else if let (Some(meter), Some(channel)) = (meters.first_mut(), channels.first()) {
         meter.process(channel);

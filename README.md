@@ -136,9 +136,12 @@ the `-o` extension override this.
 * **Exact adaptive true-peak pruning** uses a conservative FIR coefficient L1
   bound to recognize analysis windows that cannot exceed the retained maximum.
   A sparse 16-sample exact probe activates the shortcut only after proving the
-  complete interpolation window is safe; dense material stays on the SIMD
-  path. Timeline peaks, limiter detection, and every frame-level caller retain
-  exact interpolation because they need more than the all-time maximum.
+  complete interpolation window is safe. Once active, one SIMD maximum
+  reduction can prove a complete decoder chunk safe, advance the FIR history
+  directly to its final 16 samples, and independently skip either stereo
+  channel. Dense material stays on the paired SIMD interpolation path.
+  Timeline peaks, limiter detection, and every frame-level caller retain exact
+  interpolation because they need more than the all-time maximum.
 * **Persistent multichannel K-weighting lanes** keep four independent shelf and
   RLB filter states in AVX2 f64 vectors across chunks, with explicit f32 rounding
   between stages. A 7.1 analyzer owns two fixed banks and needs no per-chunk

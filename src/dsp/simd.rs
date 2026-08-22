@@ -85,6 +85,22 @@ pub fn abs_max(buf: &[f32]) -> f32 {
     abs_max_scalar(buf)
 }
 
+/// Maximum absolute value plus an explicit NaN observation in one pass.
+///
+/// True-peak block pruning must reject a block containing NaN even though the
+/// established sample-peak reduction ignores unordered comparisons. Keeping
+/// both observations in one SIMD pass avoids rescanning long audio chunks.
+#[inline]
+pub(crate) fn abs_max_and_has_nan(buf: &[f32]) -> (f32, bool) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { abs_max_and_has_nan_avx2(buf) };
+        }
+    }
+    abs_max_and_has_nan_scalar(buf)
+}
+
 #[inline]
 fn abs_max_scalar(buf: &[f32]) -> f32 {
     let mut m = 0.0f32;
@@ -95,6 +111,20 @@ fn abs_max_scalar(buf: &[f32]) -> f32 {
         }
     }
     m
+}
+
+#[inline]
+fn abs_max_and_has_nan_scalar(buf: &[f32]) -> (f32, bool) {
+    let mut maximum = 0.0_f32;
+    let mut has_nan = false;
+    for &sample in buf {
+        if sample.is_nan() {
+            has_nan = true;
+        } else {
+            maximum = maximum.max(sample.abs());
+        }
+    }
+    (maximum, has_nan)
 }
 
 /// Hard-limit (brick-wall clip) every sample to `[-ceil, ceil]`. Used only as a
@@ -210,6 +240,44 @@ unsafe fn abs_max_avx2(buf: &[f32]) -> f32 {
     m
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn abs_max_and_has_nan_avx2(buf: &[f32]) -> (f32, bool) {
+    let n = buf.len();
+    let zero = _mm256_setzero_ps();
+    let sign = _mm256_set1_ps(-0.0);
+    let mut maximum = zero;
+    let mut nan_mask = 0_i32;
+    let mut index = 0;
+    let pointer = buf.as_ptr();
+    while index + 8 <= n {
+        let samples = _mm256_loadu_ps(pointer.add(index));
+        let unordered = _mm256_cmp_ps(samples, samples, _CMP_UNORD_Q);
+        nan_mask |= _mm256_movemask_ps(unordered);
+        let absolute = _mm256_andnot_ps(sign, samples);
+        let finite_absolute = _mm256_blendv_ps(absolute, zero, unordered);
+        maximum = _mm256_max_ps(maximum, finite_absolute);
+        index += 8;
+    }
+
+    let high = _mm256_extractf128_ps(maximum, 1);
+    let low = _mm256_castps256_ps128(maximum);
+    let lanes = _mm_max_ps(low, high);
+    let shuffled = _mm_shuffle_ps(lanes, lanes, 0b01_00_11_10);
+    let pairs = _mm_max_ps(lanes, shuffled);
+    let shuffled_pairs = _mm_shuffle_ps(pairs, pairs, 0b00_01_10_11);
+    let mut scalar_maximum = _mm_cvtss_f32(_mm_max_ps(pairs, shuffled_pairs));
+    let mut has_nan = nan_mask != 0;
+    for &sample in &buf[index..] {
+        if sample.is_nan() {
+            has_nan = true;
+        } else {
+            scalar_maximum = scalar_maximum.max(sample.abs());
+        }
+    }
+    (scalar_maximum, has_nan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +320,63 @@ mod tests {
                 .iter()
                 .map(|sample| sample.to_bits())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn combined_absolute_maximum_reports_nan_without_losing_finite_peak() {
+        let samples = [
+            f32::NAN,
+            -0.25,
+            0.75,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(1),
+            -1.5,
+            f32::NAN,
+            0.5,
+        ];
+        let (maximum, has_nan) = abs_max_and_has_nan(&samples);
+        assert!(maximum.is_infinite());
+        assert!(has_nan);
+
+        let (maximum, has_nan) = abs_max_and_has_nan(&[-0.25, 0.75, -1.5, 0.5]);
+        assert_eq!(maximum.to_bits(), 1.5_f32.to_bits());
+        assert!(!has_nan);
+    }
+
+    #[test]
+    fn combined_absolute_maximum_matches_scalar_across_vector_lanes() {
+        for peak_index in 0..24 {
+            let mut samples = (0..24)
+                .map(|index| (index as f32 - 12.0) / 16.0)
+                .collect::<Vec<_>>();
+            let nan_index = (peak_index + 7) % samples.len();
+            samples[nan_index] = f32::NAN;
+            samples[peak_index] = if peak_index.is_multiple_of(2) {
+                3.25
+            } else {
+                -3.25
+            };
+            assert_eq!(
+                abs_max_and_has_nan(&samples),
+                abs_max_and_has_nan_scalar(&samples),
+                "peak lane {peak_index}"
+            );
+        }
+
+        let mut state = 0x6a09_e667_f3bc_c909_u64;
+        let samples = (0..4099)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                f32::from_bits((state >> 32) as u32)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            abs_max_and_has_nan(&samples),
+            abs_max_and_has_nan_scalar(&samples)
         );
     }
 }
