@@ -1880,39 +1880,28 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
         .collect();
 
     for attempt in 0..=max_retries {
-        let rendered = staged_paths
-            .iter()
-            .zip(formats)
-            .map(|(output, format)| {
-                normalize_stream(
-                    StreamSource {
-                        path: input,
-                        spool: source_spool.as_mut(),
-                    },
-                    output,
-                    &source,
-                    gain,
-                    plan,
-                    *format,
-                    StreamRenderOptions {
-                        opus_album_lufs: None,
-                        capture_statistics: true,
-                        capture_lossless_verification: true,
-                        verification_channel_roles: channel_roles,
-                    },
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut renders = Vec::with_capacity(rendered.len());
-        let mut lossless_outputs = Vec::with_capacity(rendered.len());
-        for result in rendered {
-            renders.push(
-                result
-                    .statistics
-                    .expect("corrected multi-delivery captures render statistics"),
-            );
-            lossless_outputs.push(result.lossless_output);
-        }
+        let rendered = normalize_streams(
+            StreamSource {
+                path: input,
+                spool: source_spool.as_mut(),
+            },
+            &staged_paths,
+            &source,
+            gain,
+            plan,
+            formats,
+            StreamRenderOptions {
+                opus_album_lufs: None,
+                capture_statistics: true,
+                capture_lossless_verification: true,
+                verification_channel_roles: channel_roles,
+            },
+        )?;
+        let render = rendered
+            .statistics
+            .expect("corrected multi-delivery captures render statistics");
+        let renders = vec![render; formats.len()];
+        let mut lossless_outputs = rendered.lossless_outputs;
         let current_intended = analysis_level(&renders[0].intended, plan.mode);
         let expected = *expected_level.get_or_insert(current_intended);
         if renders.iter().any(|render| {
@@ -2573,6 +2562,254 @@ struct StreamRenderResult {
     lossless_output: Option<Analysis>,
 }
 
+struct MultiStreamRenderResult {
+    statistics: Option<RenderStatistics>,
+    lossless_outputs: Vec<Option<Analysis>>,
+}
+
+// Multi-delivery bounds this enum to 32 heap-resident Vec entries. Keeping the
+// concrete writers inline avoids another allocation and indirection on every
+// streamed chunk; even 32 largest variants occupy less than 28 KiB.
+#[allow(clippy::large_enum_variant)]
+enum NormalizedStreamWriter {
+    Wav {
+        output: PathBuf,
+        kind: PcmKind,
+        writer: WavStreamWriter,
+        lossless: Option<LosslessAnalysisBuilder>,
+    },
+    Flac {
+        writer: FlacStreamWriter,
+        lossless: Option<LosslessAnalysisBuilder>,
+    },
+    #[cfg(feature = "mp3-encoding")]
+    Mp3(mp3enc::Mp3StreamWriter),
+    #[cfg(feature = "opus-encoding")]
+    Opus(crate::opus::OpusStreamWriter),
+    #[cfg(feature = "ffmpeg-encoding")]
+    Ffmpeg(crate::aac::AacStreamWriter),
+}
+
+impl NormalizedStreamWriter {
+    fn create(
+        input: &Path,
+        output: &Path,
+        analysis: &Analysis,
+        gain: f32,
+        plan: &Plan,
+        format: OutputFormat,
+        options: StreamRenderOptions<'_>,
+    ) -> Result<Self, String> {
+        #[cfg(not(feature = "opus-encoding"))]
+        let _ = (gain, options.opus_album_lufs);
+        match format {
+            OutputFormat::Wav => {
+                let kind = plan.output_kind.unwrap_or(analysis.kind);
+                let metadata_chunks = if plan.bwf {
+                    metadata::prepare_broadcast_chunks(input)?
+                } else {
+                    Vec::new()
+                };
+                let writer = WavStreamWriter::create_with_metadata(
+                    output,
+                    analysis.sample_rate,
+                    analysis.channels,
+                    analysis.frames,
+                    kind,
+                    plan.dither,
+                    plan.wav_container,
+                    &analysis.channel_roles,
+                    &metadata_chunks,
+                )
+                .map_err(|error| format!("write {}: {error}", output.display()))?;
+                let lossless = if options.capture_lossless_verification {
+                    let roles = if let Some(roles) = options.verification_channel_roles {
+                        roles.to_vec()
+                    } else {
+                        crate::wav::writer::persisted_channel_roles(&analysis.channel_roles)
+                            .map_err(|error| format!("write {}: {error}", output.display()))?
+                    };
+                    Some(LosslessAnalysisBuilder::new(
+                        analysis.sample_rate,
+                        analysis.channels,
+                        roles,
+                        kind,
+                    ))
+                } else {
+                    None
+                };
+                Ok(Self::Wav {
+                    output: output.to_owned(),
+                    kind,
+                    writer,
+                    lossless,
+                })
+            }
+            OutputFormat::Flac => {
+                let bits = flac_bits(plan.output_kind.unwrap_or(analysis.kind))?;
+                let writer = FlacStreamWriter::create(
+                    output,
+                    analysis.sample_rate,
+                    analysis.channels,
+                    bits,
+                    plan.dither,
+                )?;
+                let lossless = if options.capture_lossless_verification {
+                    let roles = options.verification_channel_roles.map_or_else(
+                        || flac_persisted_channel_roles(analysis.channels),
+                        <[ChannelRole]>::to_vec,
+                    );
+                    Some(LosslessAnalysisBuilder::new(
+                        analysis.sample_rate,
+                        analysis.channels,
+                        roles,
+                        PcmKind::F32,
+                    ))
+                } else {
+                    None
+                };
+                Ok(Self::Flac { writer, lossless })
+            }
+            OutputFormat::Mp3 => {
+                #[cfg(feature = "mp3-encoding")]
+                {
+                    mp3enc::Mp3StreamWriter::create(
+                        output,
+                        analysis.sample_rate,
+                        analysis.channels,
+                        plan.mp3_bitrate,
+                        plan.mp3_quality,
+                    )
+                    .map(Self::Mp3)
+                }
+                #[cfg(not(feature = "mp3-encoding"))]
+                {
+                    Err("MP3 output is unavailable; rebuild with `--features mp3-encoding`".into())
+                }
+            }
+            OutputFormat::Opus => {
+                #[cfg(feature = "opus-encoding")]
+                {
+                    let output_lufs = analysis.lufs + gain_db(gain);
+                    crate::opus::OpusStreamWriter::create(
+                        output,
+                        analysis.sample_rate,
+                        analysis.frames,
+                        analysis.channels,
+                        &analysis.channel_roles,
+                        plan.mp3_bitrate,
+                        output_lufs,
+                        options.opus_album_lufs,
+                    )
+                    .map(Self::Opus)
+                }
+                #[cfg(not(feature = "opus-encoding"))]
+                {
+                    Err(
+                        "Ogg Opus output is unavailable; rebuild with `--features opus-encoding`"
+                            .into(),
+                    )
+                }
+            }
+            OutputFormat::M4a | OutputFormat::Alac | OutputFormat::Vorbis => {
+                #[cfg(feature = "ffmpeg-encoding")]
+                {
+                    let codec = match format {
+                        OutputFormat::M4a => crate::aac::FfmpegCodec::Aac,
+                        OutputFormat::Alac => crate::aac::FfmpegCodec::Alac,
+                        OutputFormat::Vorbis => crate::aac::FfmpegCodec::Vorbis,
+                        _ => unreachable!(),
+                    };
+                    crate::aac::AacStreamWriter::create_codec(
+                        output,
+                        analysis.sample_rate,
+                        analysis.channels,
+                        plan.mp3_bitrate,
+                        codec,
+                    )
+                    .map(Self::Ffmpeg)
+                }
+                #[cfg(not(feature = "ffmpeg-encoding"))]
+                {
+                    Err(
+                        "AAC/ALAC/Vorbis output is unavailable; rebuild with `--features ffmpeg-encoding`"
+                            .into(),
+                    )
+                }
+            }
+        }
+    }
+
+    fn write_chunk(&mut self, planar: &[Vec<f32>]) -> Result<(), String> {
+        match self {
+            Self::Wav {
+                output,
+                kind,
+                writer,
+                lossless,
+            } => {
+                writer
+                    .write_chunk(planar)
+                    .map_err(|error| format!("write {}: {error}", output.display()))?;
+                if let Some(lossless) = lossless.as_mut() {
+                    lossless.observe_wave(writer.last_encoded_chunk(), *kind)?;
+                }
+                Ok(())
+            }
+            Self::Flac { writer, lossless } => {
+                if let Some(lossless) = lossless.as_mut() {
+                    writer.write_chunk_observed(planar, |interleaved, bits| {
+                        lossless.observe_integer(interleaved, bits)
+                    })
+                } else {
+                    writer.write_chunk(planar)
+                }
+            }
+            #[cfg(feature = "mp3-encoding")]
+            Self::Mp3(writer) => writer.write_chunk(planar),
+            #[cfg(feature = "opus-encoding")]
+            Self::Opus(writer) => writer.write_chunk(planar),
+            #[cfg(feature = "ffmpeg-encoding")]
+            Self::Ffmpeg(writer) => writer.write_chunk(planar),
+        }
+    }
+
+    fn finish(self) -> Result<Option<Analysis>, String> {
+        match self {
+            Self::Wav {
+                output,
+                writer,
+                lossless,
+                ..
+            } => {
+                writer
+                    .finish()
+                    .map_err(|error| format!("write {}: {error}", output.display()))?;
+                Ok(lossless.map(LosslessAnalysisBuilder::finish))
+            }
+            Self::Flac { writer, lossless } => {
+                writer.finish()?;
+                Ok(lossless.map(LosslessAnalysisBuilder::finish))
+            }
+            #[cfg(feature = "mp3-encoding")]
+            Self::Mp3(writer) => {
+                writer.finish()?;
+                Ok(None)
+            }
+            #[cfg(feature = "opus-encoding")]
+            Self::Opus(writer) => {
+                writer.finish()?;
+                Ok(None)
+            }
+            #[cfg(feature = "ffmpeg-encoding")]
+            Self::Ffmpeg(writer) => {
+                writer.finish()?;
+                Ok(None)
+            }
+        }
+    }
+}
+
 fn normalize_stream(
     source: StreamSource<'_>,
     output: &Path,
@@ -2582,231 +2819,74 @@ fn normalize_stream(
     format: OutputFormat,
     options: StreamRenderOptions<'_>,
 ) -> Result<StreamRenderResult, String> {
-    let StreamRenderOptions {
-        opus_album_lufs: _opus_album_lufs,
-        capture_statistics,
-        capture_lossless_verification,
-        verification_channel_roles,
-    } = options;
-    let input = source.path;
     let ceiling = 10.0_f64.powf(plan.ceiling_db / 20.0) as f32;
-    match format {
-        OutputFormat::Wav => {
-            let kind = plan.output_kind.unwrap_or(analysis.kind);
-            let metadata_chunks = if plan.bwf {
-                metadata::prepare_broadcast_chunks(input)?
-            } else {
-                Vec::new()
-            };
-            let mut writer = WavStreamWriter::create_with_metadata(
-                output,
-                analysis.sample_rate,
-                analysis.channels,
-                analysis.frames,
-                kind,
-                plan.dither,
-                plan.wav_container,
-                &analysis.channel_roles,
-                &metadata_chunks,
-            )
-            .map_err(|error| format!("write {}: {error}", output.display()))?;
-            let mut lossless = if capture_lossless_verification {
-                let roles = if let Some(roles) = verification_channel_roles {
-                    roles.to_vec()
-                } else {
-                    crate::wav::writer::persisted_channel_roles(&analysis.channel_roles)
-                        .map_err(|error| format!("write {}: {error}", output.display()))?
-                };
-                Some(LosslessAnalysisBuilder::new(
-                    analysis.sample_rate,
-                    analysis.channels,
-                    roles,
-                    kind,
-                ))
-            } else {
-                None
-            };
-            let statistics = process_normalized_stream(
-                source,
-                analysis,
-                gain,
-                ceiling,
-                plan,
-                capture_statistics,
-                |planar| {
-                    writer
-                        .write_chunk(planar)
-                        .map_err(|error| format!("write {}: {error}", output.display()))?;
-                    if let Some(lossless) = lossless.as_mut() {
-                        lossless.observe_wave(writer.last_encoded_chunk(), kind)?;
-                    }
-                    Ok(())
-                },
-            )?;
-            writer
-                .finish()
-                .map_err(|error| format!("write {}: {error}", output.display()))?;
-            Ok(StreamRenderResult {
-                statistics,
-                lossless_output: lossless.map(LosslessAnalysisBuilder::finish),
-            })
-        }
-        OutputFormat::Flac => {
-            let bits = flac_bits(plan.output_kind.unwrap_or(analysis.kind))?;
-            let mut writer = FlacStreamWriter::create(
-                output,
-                analysis.sample_rate,
-                analysis.channels,
-                bits,
-                plan.dither,
-            )?;
-            let mut lossless = if capture_lossless_verification {
-                let roles = verification_channel_roles.map_or_else(
-                    || flac_persisted_channel_roles(analysis.channels),
-                    |roles| roles.to_vec(),
-                );
-                Some(LosslessAnalysisBuilder::new(
-                    analysis.sample_rate,
-                    analysis.channels,
-                    roles,
-                    PcmKind::F32,
-                ))
-            } else {
-                None
-            };
-            let statistics = process_normalized_stream(
-                source,
-                analysis,
-                gain,
-                ceiling,
-                plan,
-                capture_statistics,
-                |planar| {
-                    if let Some(lossless) = lossless.as_mut() {
-                        writer.write_chunk_observed(planar, |interleaved, bits| {
-                            lossless.observe_integer(interleaved, bits)
-                        })
-                    } else {
-                        writer.write_chunk(planar)
-                    }
-                },
-            )?;
-            writer.finish()?;
-            Ok(StreamRenderResult {
-                statistics,
-                lossless_output: lossless.map(LosslessAnalysisBuilder::finish),
-            })
-        }
-        OutputFormat::Mp3 => {
-            #[cfg(feature = "mp3-encoding")]
-            {
-                let mut writer = mp3enc::Mp3StreamWriter::create(
-                    output,
-                    analysis.sample_rate,
-                    analysis.channels,
-                    plan.mp3_bitrate,
-                    plan.mp3_quality,
-                )?;
-                let statistics = process_normalized_stream(
-                    source,
-                    analysis,
-                    gain,
-                    ceiling,
-                    plan,
-                    capture_statistics,
-                    |planar| writer.write_chunk(planar),
-                )?;
-                writer.finish()?;
-                Ok(StreamRenderResult {
-                    statistics,
-                    lossless_output: None,
-                })
-            }
-            #[cfg(not(feature = "mp3-encoding"))]
-            {
-                let _ = (input, output, analysis, gain, plan, ceiling);
-                Err("MP3 output is unavailable; rebuild with `--features mp3-encoding`".into())
-            }
-        }
-        OutputFormat::Opus => {
-            #[cfg(feature = "opus-encoding")]
-            {
-                let output_lufs = analysis.lufs + gain_db(gain);
-                let mut writer = crate::opus::OpusStreamWriter::create(
-                    output,
-                    analysis.sample_rate,
-                    analysis.frames,
-                    analysis.channels,
-                    &analysis.channel_roles,
-                    plan.mp3_bitrate,
-                    output_lufs,
-                    _opus_album_lufs,
-                )?;
-                let statistics = process_normalized_stream(
-                    source,
-                    analysis,
-                    gain,
-                    ceiling,
-                    plan,
-                    capture_statistics,
-                    |planar| writer.write_chunk(planar),
-                )?;
-                writer.finish()?;
-                Ok(StreamRenderResult {
-                    statistics,
-                    lossless_output: None,
-                })
-            }
-            #[cfg(not(feature = "opus-encoding"))]
-            {
-                let _ = (input, output, analysis, gain, plan, ceiling);
-                Err(
-                    "Ogg Opus output is unavailable; rebuild with `--features opus-encoding`"
-                        .into(),
-                )
-            }
-        }
-        OutputFormat::M4a | OutputFormat::Alac | OutputFormat::Vorbis => {
-            #[cfg(feature = "ffmpeg-encoding")]
-            {
-                let codec = match format {
-                    OutputFormat::M4a => crate::aac::FfmpegCodec::Aac,
-                    OutputFormat::Alac => crate::aac::FfmpegCodec::Alac,
-                    OutputFormat::Vorbis => crate::aac::FfmpegCodec::Vorbis,
-                    _ => unreachable!(),
-                };
-                let mut writer = crate::aac::AacStreamWriter::create_codec(
-                    output,
-                    analysis.sample_rate,
-                    analysis.channels,
-                    plan.mp3_bitrate,
-                    codec,
-                )?;
-                let statistics = process_normalized_stream(
-                    source,
-                    analysis,
-                    gain,
-                    ceiling,
-                    plan,
-                    capture_statistics,
-                    |planar| writer.write_chunk(planar),
-                )?;
-                writer.finish()?;
-                Ok(StreamRenderResult {
-                    statistics,
-                    lossless_output: None,
-                })
-            }
-            #[cfg(not(feature = "ffmpeg-encoding"))]
-            {
-                let _ = (input, output, analysis, gain, plan, ceiling);
-                Err(
-                    "AAC/ALAC/Vorbis output is unavailable; rebuild with `--features ffmpeg-encoding`"
-                        .into(),
-                )
-            }
-        }
+    let mut writer =
+        NormalizedStreamWriter::create(source.path, output, analysis, gain, plan, format, options)?;
+    let statistics = process_normalized_stream(
+        source,
+        analysis,
+        gain,
+        ceiling,
+        plan,
+        options.capture_statistics,
+        |planar| writer.write_chunk(planar),
+    )?;
+    Ok(StreamRenderResult {
+        statistics,
+        lossless_output: writer.finish()?,
+    })
+}
+
+fn normalize_streams(
+    source: StreamSource<'_>,
+    outputs: &[PathBuf],
+    analysis: &Analysis,
+    gain: f32,
+    plan: &Plan,
+    formats: &[OutputFormat],
+    options: StreamRenderOptions<'_>,
+) -> Result<MultiStreamRenderResult, String> {
+    if outputs.len() != formats.len() {
+        return Err("stream output/format count mismatch".into());
     }
+    let mut writers = outputs
+        .iter()
+        .zip(formats)
+        .map(|(output, format)| {
+            NormalizedStreamWriter::create(
+                source.path,
+                output,
+                analysis,
+                gain,
+                plan,
+                *format,
+                options,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let ceiling = 10.0_f64.powf(plan.ceiling_db / 20.0) as f32;
+    let statistics = process_normalized_stream(
+        source,
+        analysis,
+        gain,
+        ceiling,
+        plan,
+        options.capture_statistics,
+        |planar| {
+            for writer in &mut writers {
+                writer.write_chunk(planar)?;
+            }
+            Ok(())
+        },
+    )?;
+    let lossless_outputs = writers
+        .into_iter()
+        .map(NormalizedStreamWriter::finish)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(MultiStreamRenderResult {
+        statistics,
+        lossless_outputs,
+    })
 }
 
 fn process_normalized_stream(
@@ -3511,6 +3591,128 @@ mod tests {
             let tee = rendered.lossless_output.expect("native lossless tee");
             let decoded = analyze_file(&output).unwrap();
             assert_analysis_identical(&tee, &decoded, name);
+        }
+    }
+
+    #[test]
+    fn multi_stream_fanout_matches_separate_lossless_encodes() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("source.wav");
+        let frames = 48_000 * 4 + 137;
+        let left = (0..frames)
+            .map(|frame| {
+                0.217 * (2.0 * std::f32::consts::PI * 997.0 * frame as f32 / 48_000.0).sin()
+            })
+            .collect::<Vec<_>>();
+        let right = (0..frames)
+            .map(|frame| {
+                0.133 * (2.0 * std::f32::consts::PI * 1_499.0 * frame as f32 / 48_000.0).sin()
+            })
+            .collect::<Vec<_>>();
+        WavWriter::write(
+            &input,
+            &AudioBuffer {
+                sample_rate: 48_000,
+                channels: 2,
+                frames,
+                data: vec![left, right],
+                channel_roles: default_channel_roles(2),
+                source_kind: PcmKind::F32,
+            },
+            PcmKind::F32,
+            false,
+        )
+        .unwrap();
+        let source = analyze_file(&input).unwrap();
+        let gain = compute_gain(&source, &plan());
+        let options = StreamRenderOptions {
+            opus_album_lufs: None,
+            capture_statistics: true,
+            capture_lossless_verification: true,
+            verification_channel_roles: None,
+        };
+        let separate_paths = [
+            directory.path().join("separate.wav"),
+            directory.path().join("separate.flac"),
+        ];
+        let formats = [OutputFormat::Wav, OutputFormat::Flac];
+        let separate = separate_paths
+            .iter()
+            .zip(formats)
+            .map(|(output, format)| {
+                normalize_stream(
+                    StreamSource {
+                        path: &input,
+                        spool: None,
+                    },
+                    output,
+                    &source,
+                    gain,
+                    &plan(),
+                    format,
+                    options,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let fanout_paths = [
+            directory.path().join("fanout.wav"),
+            directory.path().join("fanout.flac"),
+        ];
+        let fanout = normalize_streams(
+            StreamSource {
+                path: &input,
+                spool: None,
+            },
+            &fanout_paths,
+            &source,
+            gain,
+            &plan(),
+            &formats,
+            options,
+        )
+        .unwrap();
+
+        for ((separate_path, fanout_path), format) in
+            separate_paths.iter().zip(&fanout_paths).zip(formats)
+        {
+            assert_eq!(
+                std::fs::read(separate_path).unwrap(),
+                std::fs::read(fanout_path).unwrap(),
+                "{format:?} fan-out output changed"
+            );
+        }
+        let fanout_statistics = fanout.statistics.unwrap();
+        for result in &separate {
+            let statistics = result.statistics.as_ref().unwrap();
+            assert_analysis_identical(
+                &statistics.intended,
+                &fanout_statistics.intended,
+                "fan-out render statistics",
+            );
+            assert_eq!(
+                statistics.input_full_scale_exceeding_samples,
+                fanout_statistics.input_full_scale_exceeding_samples
+            );
+            assert_eq!(
+                statistics.post_gain_full_scale_exceeding_samples,
+                fanout_statistics.post_gain_full_scale_exceeding_samples
+            );
+            assert_eq!(
+                statistics.post_gain_ceiling_exceeding_samples,
+                fanout_statistics.post_gain_ceiling_exceeding_samples
+            );
+            assert_eq!(
+                statistics.protected_full_scale_exceeding_samples,
+                fanout_statistics.protected_full_scale_exceeding_samples
+            );
+        }
+        for (index, measured) in fanout.lossless_outputs.into_iter().enumerate() {
+            assert_analysis_identical(
+                separate[index].lossless_output.as_ref().unwrap(),
+                measured.as_ref().unwrap(),
+                "fan-out lossless verification",
+            );
         }
     }
 
