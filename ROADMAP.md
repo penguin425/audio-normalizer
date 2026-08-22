@@ -286,6 +286,11 @@ Forge already provides:
   unchanged TPDF RNG behavior, exceptional-value/half-LSB coverage, portable
   fallbacks, and matching lossless verification reports. Measured 5.1 and 7.1
   WAVE renders improve at both integer depths.
+- Allocation-stable MP3 and Opus encoder feeds: LAME consumes existing planar
+  f32 channels without a stereo interleave allocation, while Opus resampler
+  input and interleaved packet queues use bounded cursors and one retained
+  resampler output buffer. Codec bytes remain identical; slower FLAC retention
+  and higher-RSS Opus packet-scratch variants were measured and rejected.
 - Versioned multi-delivery optimization for two to 32 codec/profile outputs,
   using one conservative target, ceiling, and iteratively corrected gain;
   staged post-metadata re-decoding, explicit infeasibility, path-alias and

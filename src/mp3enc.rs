@@ -3,9 +3,9 @@
 //! There is no mature pure-Rust MP3 encoder, so Forge links to LAME — the
 //! reference MP3 encoder — through a tiny, hand-written FFI surface (just the
 //! handful of C functions we need). `build.rs` locates `libmp3lame`. We feed
-//! LAME planar mono or interleaved stereo IEEE-f32 samples directly (no integer
-//! conversion), so the full float precision of the gained signal reaches the
-//! encoder.
+//! LAME planar mono or stereo IEEE-f32 samples directly (no interleaving or
+//! integer conversion), so the full float precision of the gained signal
+//! reaches the encoder.
 //!
 //! The encoding is CBR by default (transparent and predictable for loudness
 //! work); quality and bitrate are configurable.
@@ -32,13 +32,6 @@ extern "C" {
     fn lame_set_quality(gfp: LameT, v: c_int) -> c_int;
     fn lame_set_bWriteVbrTag(gfp: LameT, v: c_int) -> c_int;
     fn lame_init_params(gfp: LameT) -> c_int;
-    fn lame_encode_buffer_interleaved_ieee_float(
-        gfp: LameT,
-        pcm: *const c_float,
-        nsamples: c_int,
-        mp3buf: *mut u8,
-        mp3buf_size: c_int,
-    ) -> c_int;
     fn lame_encode_buffer_ieee_float(
         gfp: LameT,
         pcm_l: *const c_float,
@@ -111,40 +104,24 @@ impl Mp3StreamWriter {
         if planar.iter().any(|channel| channel.len() != frames) {
             return Err("MP3 stream channel length mismatch".into());
         }
-        let interleaved = if self.channels == 2 {
-            let mut samples = Vec::with_capacity(frames * self.channels);
-            for frame in 0..frames {
-                for channel in planar {
-                    samples.push(channel[frame]);
-                }
-            }
-            samples
-        } else {
-            Vec::new()
-        };
         let required = (1.25 * (frames * self.channels) as f64 + 7200.0) as usize + 16;
         if self.encoded.len() < required {
             self.encoded.resize(required, 0);
         }
         let written = unsafe {
-            if self.channels == 1 {
-                lame_encode_buffer_ieee_float(
-                    self.gfp,
-                    planar[0].as_ptr(),
-                    planar[0].as_ptr(),
-                    frames as c_int,
-                    self.encoded.as_mut_ptr(),
-                    self.encoded.len() as c_int,
-                )
+            let right = if self.channels == 1 {
+                planar[0].as_ptr()
             } else {
-                lame_encode_buffer_interleaved_ieee_float(
-                    self.gfp,
-                    interleaved.as_ptr(),
-                    frames as c_int,
-                    self.encoded.as_mut_ptr(),
-                    self.encoded.len() as c_int,
-                )
-            }
+                planar[1].as_ptr()
+            };
+            lame_encode_buffer_ieee_float(
+                self.gfp,
+                planar[0].as_ptr(),
+                right,
+                frames as c_int,
+                self.encoded.as_mut_ptr(),
+                self.encoded.len() as c_int,
+            )
         };
         if written < 0 {
             return Err(format!("lame_encode_buffer error code {written}"));
@@ -207,17 +184,12 @@ pub fn encode_mp3(buf: &AudioBuffer, bitrate_kbps: i32, quality: i32) -> Result<
     if channels == 0 || buf.frames == 0 {
         return Err("no audio to encode".into());
     }
+    if channels > 2 {
+        return Err("MP3 output supports only mono or stereo".into());
+    }
     for ch in &buf.data {
         if ch.len() != buf.frames {
             return Err("channel length mismatch".into());
-        }
-    }
-
-    // Interleave planar -> flat f32 (LAME's interleaved API needs L,R,L,R,...).
-    let mut inter = vec![0.0f32; buf.frames * channels];
-    for f in 0..buf.frames {
-        for c in 0..channels {
-            inter[f * channels + c] = buf.data[c][f];
         }
     }
 
@@ -255,26 +227,20 @@ pub fn encode_mp3(buf: &AudioBuffer, bitrate_kbps: i32, quality: i32) -> Result<
         let total = buf.frames as i32;
         while (pos as i32) < total {
             let n = CHUNK_FRAMES.min(total - pos as i32);
-            let written = if channels == 1 {
-                let ptr = buf.data[0].as_ptr().add(pos);
-                lame_encode_buffer_ieee_float(
-                    gfp,
-                    ptr,
-                    ptr,
-                    n,
-                    mp3buf.as_mut_ptr(),
-                    mp3buf.len() as c_int,
-                )
+            let left = buf.data[0].as_ptr().add(pos);
+            let right = if channels == 1 {
+                left
             } else {
-                let ptr = inter.as_ptr().add(pos * channels);
-                lame_encode_buffer_interleaved_ieee_float(
-                    gfp,
-                    ptr,
-                    n,
-                    mp3buf.as_mut_ptr(),
-                    mp3buf.len() as c_int,
-                )
+                buf.data[1].as_ptr().add(pos)
             };
+            let written = lame_encode_buffer_ieee_float(
+                gfp,
+                left,
+                right,
+                n,
+                mp3buf.as_mut_ptr(),
+                mp3buf.len() as c_int,
+            );
             if written < 0 {
                 lame_close(gfp);
                 return Err(format!("lame_encode_buffer error code {written}"));
