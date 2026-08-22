@@ -18,6 +18,13 @@ The official EBU v5 and ITU-R BS.2217-2 suites remain release gates.
 - The [Roofline model](https://digicoll.lib.berkeley.edu/record/136692/files/EECS-2008-134.pdf)
   motivates removing buffer allocation, copies, and full-signal memory traffic
   before adding more arithmetic parallelism.
+- [FLAC 1.5.0](https://xiph.org/flac/changelog.html) made independent-frame
+  encoding multithreaded, and its
+  [stream encoder API](https://www.xiph.org/flac/api/group__flac__stream__encoder.html)
+  documents distributing filled blocks to workers while preserving ordered
+  output callbacks. Forge applies that frame-level model to its pure-Rust
+  writer through the existing bounded work-stealing pool instead of creating a
+  second codec-owned thread pool.
 - A 2026 study of
   [parallel cascaded recursive filtering](https://arxiv.org/abs/2607.14054)
   shows that block state transforms can expose parallelism across samples in
@@ -982,6 +989,50 @@ The analysis JSON and normalized WAVE files matched v0.144.0 byte for byte for
 both fixtures. Median peak RSS changed by less than 0.25%. The small dense-case
 cost is retained and documented because common peak distributions save roughly
 one third of end-to-end CPU without changing BS.1770 results or output bytes.
+
+### v0.146.0: bounded parallel FLAC frames
+
+FLAC fixed-size frames are independent once their ordinal and immutable stream
+format are known. The writer now coalesces short decoder packets into a bounded
+batch, encodes each 4096-sample frame and its bitstream in the existing global
+Rayon pool, and writes the completed bytes in ordinal order. Input MD5,
+STREAMINFO extrema, total samples, frame numbering, dither state, verification,
+and error observation remain serial and deterministic.
+
+The batch retains at most 256 Ki signed sample values (1 MiB) and exposes at
+most eight active tasks, regardless of the global `--jobs` value. Worker-local
+frame and byte sinks are reused. One-worker runs bypass coalescing and keep the
+previous serial path. This avoids oversubscribing album/batch work with a
+second codec-owned pool: a writer created inside existing file-level Rayon work
+also stays serial. Storage remains bounded by configuration rather than
+programme duration.
+
+Alternating five-pair comparisons used deterministic 600-second, 48 kHz,
+stereo PCM16 sources, native-host fat-LTO builds without PGO, `--verify`, and
+`--jobs 32`. The WAVE case exercises long native decoder chunks; the FLAC case
+exercises small-packet coalescing. Times include analysis, gain, encoding,
+lossless verification, metadata finalization, and atomic replacement. Values
+are medians.
+
+| Workload / metric | v0.145.0 | v0.146.0 | Change |
+| --- | ---: | ---: | ---: |
+| WAVE to FLAC verify, wall | 7.25 s | 5.76 s | -20.55% |
+| WAVE to FLAC verify, user CPU | 7.30 s | 7.80 s | +6.85% |
+| WAVE to FLAC verify, total CPU | 7.96 s | 8.88 s | +11.56% |
+| WAVE to FLAC verify, peak RSS | 83,620 KiB | 94,572 KiB | +13.10% |
+| FLAC to FLAC verify, wall | 7.70 s | 6.02 s | -21.82% |
+| FLAC to FLAC verify, user CPU | 6.70 s | 7.16 s | +6.87% |
+| FLAC to FLAC verify, total CPU | 7.61 s | 8.49 s | +11.56% |
+| FLAC to FLAC verify, peak RSS | 79,060 KiB | 84,884 KiB | +7.37% |
+| One-worker WAVE control, total CPU | 7.22 s | 7.19 s | -0.42% |
+| One-worker WAVE control, peak RSS | 83,440 KiB | 83,700 KiB | +0.31% |
+
+The latency improvement intentionally spends about 12% more aggregate CPU on
+the measured multicore host; users prioritizing energy or concurrent unrelated
+work can select a smaller `--jobs` value or `--jobs 1`. WAVE-input,
+FLAC-input, 16-bit dithered, and 24-bit outputs matched v0.145.0 byte for byte.
+Tests also cover uneven caller chunks, a partial final frame, coalescing at the
+memory boundary, and serial/parallel equality.
 
 ## Final integration gate
 
