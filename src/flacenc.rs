@@ -191,35 +191,52 @@ impl FlacStreamWriter {
         {
             let config = &self.config;
             let info = &self.info;
-            self.parallel_slots[..block_count]
-                .par_iter_mut()
-                .zip(samples.par_chunks_exact(block_len))
-                .with_min_len(minimum_task_length)
-                .enumerate()
-                .for_each(|(offset, (slot, block))| {
-                    slot.sink.clear();
-                    slot.error = None;
-                    if let Err(error) = slot.frame_buf.fill_interleaved(block) {
-                        slot.error = Some(error.to_string());
-                        return;
-                    }
-                    match flacenc::encode_fixed_size_frame(
-                        config,
-                        &slot.frame_buf,
-                        first_frame_number + offset,
-                        info,
-                    ) {
-                        Ok(frame) => {
-                            if let Err(error) = frame.write(&mut slot.sink) {
+            let slots = &mut self.parallel_slots[..block_count];
+            let context = &mut self.context;
+            let (_, context_result) = rayon::join(
+                || {
+                    slots
+                        .par_iter_mut()
+                        .zip(samples.par_chunks_exact(block_len))
+                        .with_min_len(minimum_task_length)
+                        .enumerate()
+                        .for_each(|(offset, (slot, block))| {
+                            slot.sink.clear();
+                            slot.error = None;
+                            if let Err(error) = slot.frame_buf.fill_interleaved(block) {
                                 slot.error = Some(error.to_string());
+                                return;
                             }
-                        }
-                        Err(error) => slot.error = Some(error.to_string()),
-                    }
-                });
+                            match flacenc::encode_fixed_size_frame(
+                                config,
+                                &slot.frame_buf,
+                                first_frame_number + offset,
+                                info,
+                            ) {
+                                Ok(frame) => {
+                                    if let Err(error) = frame.write(&mut slot.sink) {
+                                        slot.error = Some(error.to_string());
+                                    }
+                                }
+                                Err(error) => slot.error = Some(error.to_string()),
+                            }
+                        });
+                },
+                || {
+                    // Preserve Context's established block boundaries and
+                    // source order while overlapping its serial MD5 pass with
+                    // independent frame encoding.
+                    samples.chunks_exact(block_len).try_for_each(|block| {
+                        context
+                            .fill_interleaved(block)
+                            .map_err(|error| error.to_string())
+                    })
+                },
+            );
+            context_result?;
         }
 
-        for (index, block) in samples.chunks_exact(block_len).enumerate() {
+        for index in 0..block_count {
             let encoded = {
                 let slot = &mut self.parallel_slots[index];
                 if let Some(error) = slot.error.take() {
@@ -227,9 +244,6 @@ impl FlacStreamWriter {
                 }
                 slot.sink.as_slice()
             };
-            self.context
-                .fill_interleaved(block)
-                .map_err(|error| error.to_string())?;
             let minimum = self.info.min_frame_size().min(encoded.len());
             let maximum = self.info.max_frame_size().max(encoded.len());
             self.info
