@@ -218,9 +218,51 @@ impl TruePeakMeter {
         if samples.is_empty() {
             return;
         }
+        if self.try_skip_peak_only_block(samples) {
+            return;
+        }
         for &sample in samples {
             self.process_peak_only_sample(sample);
         }
+    }
+
+    /// Advance a complete peak-only block after one conservative SIMD
+    /// reduction proves that no FIR phase can exceed the retained maximum.
+    /// Only the final 16 samples can affect a future window, so the circular
+    /// history can be replaced directly instead of being advanced per sample.
+    #[inline]
+    pub(crate) fn try_skip_peak_only_block(&mut self, samples: &[f32]) -> bool {
+        if samples.is_empty() || self.factor <= 1 || !self.pruning_active {
+            return false;
+        }
+        let (block_maximum, has_nan) = crate::dsp::simd::abs_max_and_has_nan(samples);
+        if has_nan {
+            return false;
+        }
+        let peak_floor = self.peak.max(block_maximum);
+        if f64::from(block_maximum) * self.interpolation_bound_scale > f64::from(peak_floor) {
+            return false;
+        }
+
+        self.peak = peak_floor;
+        if samples.len() < TAPS_PER_PHASE {
+            for &sample in samples {
+                self.push_history(sample);
+            }
+        } else {
+            let tail = &samples[samples.len() - TAPS_PER_PHASE..];
+            self.cursor = 0;
+            for (destination, &sample) in self.history[..TAPS_PER_PHASE]
+                .iter_mut()
+                .zip(tail.iter().rev())
+            {
+                *destination = f64::from(sample);
+            }
+            let (first, second) = self.history.split_at_mut(TAPS_PER_PHASE);
+            second.copy_from_slice(first);
+            self.initialized = true;
+        }
+        true
     }
 
     #[inline(always)]
@@ -769,6 +811,71 @@ mod tests {
                 "{sample_rate} Hz skipped only {skipped} windows"
             );
         }
+    }
+
+    #[test]
+    fn block_pruning_matches_sample_updates_and_preserves_future_history() {
+        let quiet: Vec<f32> = (0..32_768)
+            .map(|index| ((index as f64 * 0.173).sin() * 0.001) as f32)
+            .collect();
+        let future: Vec<f32> = (0..4096)
+            .map(|index| {
+                let first = (index as f64 * 0.371).sin();
+                let second = (index as f64 * 0.113 + 0.7).cos();
+                (0.73 * first + 0.19 * second) as f32
+            })
+            .collect();
+
+        for sample_rate in [48_000, 96_000] {
+            let mut sample_path = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut block_path = TruePeakMeter::for_sample_rate(sample_rate);
+            for sample in std::iter::once(0.99_f32).chain(quiet.iter().copied().take(1024)) {
+                sample_path.process_peak_only_sample(sample);
+                block_path.process_peak_only_sample(sample);
+            }
+            assert!(
+                block_path.pruning_active,
+                "{sample_rate} Hz did not arm pruning"
+            );
+            for &sample in &quiet[1024..] {
+                sample_path.process_peak_only_sample(sample);
+            }
+            assert!(block_path.try_skip_peak_only_block(&quiet[1024..]));
+            assert_eq!(
+                block_path.peak().to_bits(),
+                sample_path.peak().to_bits(),
+                "{sample_rate} Hz quiet block"
+            );
+
+            for &sample in &future {
+                sample_path.process_peak_only_sample(sample);
+                block_path.process_peak_only_sample(sample);
+            }
+            assert_eq!(
+                block_path.peak().to_bits(),
+                sample_path.peak().to_bits(),
+                "{sample_rate} Hz future exact windows"
+            );
+        }
+    }
+
+    #[test]
+    fn block_pruning_rejects_nan_and_retains_sample_semantics() {
+        let prefix = std::iter::once(0.99_f32)
+            .chain((0..1024).map(|index| ((index as f64 * 0.1).sin() * 0.001) as f32));
+        let mut sample_path = TruePeakMeter::for_sample_rate(48_000);
+        let mut block_path = TruePeakMeter::for_sample_rate(48_000);
+        for sample in prefix {
+            sample_path.process_peak_only_sample(sample);
+            block_path.process_peak_only_sample(sample);
+        }
+        let block = [0.0001_f32, f32::NAN, -0.0002, 0.0003];
+        assert!(!block_path.try_skip_peak_only_block(&block));
+        for sample in block {
+            sample_path.process_peak_only_sample(sample);
+            block_path.process_peak_only_sample(sample);
+        }
+        assert_eq!(block_path.peak().to_bits(), sample_path.peak().to_bits());
     }
 
     #[test]

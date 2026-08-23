@@ -1124,6 +1124,51 @@ while peak RSS rose by up to 1.9%. An AVX2 byte-shuffle variant reduced the
 variants produced byte-identical files, but the extra buffer and code were
 rejected because they did not improve both integer depths.
 
+### v0.149.0: SIMD block true-peak pruning
+
+The exact v0.145.0 true-peak shortcut still advanced the circular FIR history
+and checked the conservative coefficient bound for every sample after its
+16-sample proof became active. The analyzer now first reduces a complete
+decoder channel to its absolute maximum and NaN flag in one runtime-dispatched
+AVX2 pass. If that maximum satisfies the same triangle-inequality proof, every
+interpolation window in the chunk is safe: the meter retains its peak and
+reconstructs only the final 16-sample history needed by the next chunk.
+
+Stereo channels make that decision independently. If neither block is safe,
+the established paired interpolation loop remains unchanged; if only one is
+safe, the other retains its exact scalar meter updates. NaN blocks, dense
+material, timeline measurement, limiter detection, and sample rates that do
+not require interpolation retain their previous paths. Tests compare block
+skips against every sample update before and after future transients, cover
+NaN/infinity/subnormal history, and retain the existing chunk-boundary and
+exact-interpolation equivalence suites.
+
+CPU-pinned alternating comparisons used 600-second, 48 kHz stereo PCM16 WAVE
+fixtures and native-host fat-LTO builds without PGO. The quiet-tail fixture has
+an early near-full-scale event followed by low-level two-tone material, where
+the retained maximum makes complete chunks provably safe. The rising dense
+fixture continually challenges that maximum. Analysis uses 15 pairs and full
+WAVE normalization with exact lossless `--verify` uses seven pairs. Values are
+medians; total CPU is user plus system time.
+
+| Workload / metric | v0.148.0 | v0.149.0 | Change |
+| --- | ---: | ---: | ---: |
+| Quiet-tail analysis, wall | 0.65 s | 0.52 s | -20.00% |
+| Quiet-tail analysis, total CPU | 0.66 s | 0.54 s | -18.18% |
+| Quiet-tail normalize + verify, wall | 2.32 s | 1.92 s | -17.24% |
+| Quiet-tail normalize + verify, total CPU | 2.36 s | 1.98 s | -16.10% |
+| Rising dense analysis, wall | 1.36 s | 1.33 s | -2.21% |
+| Rising dense analysis, total CPU | 1.40 s | 1.37 s | -2.14% |
+| Rising dense normalize + verify, wall | 4.37 s | 4.37 s | unchanged |
+| Rising dense normalize + verify, total CPU | 4.47 s | 4.46 s | -0.22% |
+
+Analysis peak RSS was unchanged at 13,056 KiB for both fixtures. Normalize and
+verify peak RSS changed by less than 0.05%. Candidate analysis JSON and
+normalized WAVE SHA-256 hashes matched v0.148.0 for both fixtures. A separate
+15-pair deterministic sawtooth control improved by 0.74%, which is treated as
+noise rather than a broad workload claim; the retained gain is specifically
+for chunks made safe by an already-established peak.
+
 ## Final integration gate
 
 The measured implementation sequence is complete. Before release, run the full
