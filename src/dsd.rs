@@ -935,22 +935,58 @@ fn push_dsd_bytes(
     pipeline: &mut DsdPipeline,
     output: &mut Vec<f32>,
 ) {
-    for &byte in bytes {
+    match order {
+        DsdBitOrder::LeastSignificantFirst => {
+            push_dsd_bytes_ordered::<true>(bytes, limit, consumed, pipeline, output);
+        }
+        DsdBitOrder::MostSignificantFirst => {
+            push_dsd_bytes_ordered::<false>(bytes, limit, consumed, pipeline, output);
+        }
+    }
+}
+
+fn push_dsd_bytes_ordered<const LEAST_SIGNIFICANT_FIRST: bool>(
+    bytes: &[u8],
+    limit: u64,
+    consumed: &mut u64,
+    pipeline: &mut DsdPipeline,
+    output: &mut Vec<f32>,
+) {
+    let remaining = limit.saturating_sub(*consumed);
+    let complete_bytes = usize::try_from(remaining / 8)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    for &byte in &bytes[..complete_bytes] {
         for bit in 0..8 {
-            if *consumed == limit {
-                return;
-            }
-            let shift = match order {
-                DsdBitOrder::LeastSignificantFirst => bit,
-                DsdBitOrder::MostSignificantFirst => 7 - bit,
+            let shift = if LEAST_SIGNIFICANT_FIRST {
+                bit
+            } else {
+                7 - bit
             };
             let sample = if byte & (1 << shift) == 0 { -1.0 } else { 1.0 };
             if let Some(value) = pipeline.push(sample) {
                 output.push(value as f32);
             }
-            *consumed += 1;
         }
     }
+    *consumed += complete_bytes as u64 * 8;
+    if complete_bytes == bytes.len() {
+        return;
+    }
+    let tail_bits = limit.saturating_sub(*consumed).min(7) as usize;
+    let byte = bytes[complete_bytes];
+    for bit in 0..tail_bits {
+        let shift = if LEAST_SIGNIFICANT_FIRST {
+            bit
+        } else {
+            7 - bit
+        };
+        let sample = if byte & (1 << shift) == 0 { -1.0 } else { 1.0 };
+        if let Some(value) = pipeline.push(sample) {
+            output.push(value as f32);
+        }
+    }
+    *consumed += tail_bits as u64;
 }
 
 fn flush_pending<F>(
@@ -1009,14 +1045,12 @@ impl DsdPipeline {
     }
 
     fn push(&mut self, sample: f64) -> Option<f64> {
-        let mut value = Some(sample);
+        let mut value = sample;
         for decimator in &mut self.decimators {
-            value = value.and_then(|sample| decimator.push(sample));
+            value = decimator.push(value)?;
         }
-        value.map(|sample| {
-            self.produced += 1;
-            self.low_pass.push(sample)
-        })
+        self.produced += 1;
+        Some(self.low_pass.push(value))
     }
 }
 
@@ -1294,6 +1328,53 @@ mod tests {
                     reference_cursor = 0;
                 }
                 assert_eq!(candidate.push(sample).to_bits(), reference.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_byte_batches_match_per_bit_reference_for_every_tail() {
+        let bytes = [0x00, 0xff, 0xa5, 0x3c, 0x81];
+        for order in [
+            DsdBitOrder::LeastSignificantFirst,
+            DsdBitOrder::MostSignificantFirst,
+        ] {
+            for limit in 0..=bytes.len() as u64 * 8 + 1 {
+                let mut candidate_pipeline = DsdPipeline::new(2, 88_200);
+                let mut candidate_consumed = 0;
+                let mut candidate_output = Vec::new();
+                push_dsd_bytes(
+                    &bytes,
+                    order,
+                    limit,
+                    &mut candidate_consumed,
+                    &mut candidate_pipeline,
+                    &mut candidate_output,
+                );
+
+                let mut reference_pipeline = DsdPipeline::new(2, 88_200);
+                let mut reference_consumed = 0;
+                let mut reference_output = Vec::new();
+                'bytes: for &byte in &bytes {
+                    for bit in 0..8 {
+                        if reference_consumed == limit {
+                            break 'bytes;
+                        }
+                        let shift = match order {
+                            DsdBitOrder::LeastSignificantFirst => bit,
+                            DsdBitOrder::MostSignificantFirst => 7 - bit,
+                        };
+                        let sample = if byte & (1 << shift) == 0 { -1.0 } else { 1.0 };
+                        if let Some(value) = reference_pipeline.push(sample) {
+                            reference_output.push(value as f32);
+                        }
+                        reference_consumed += 1;
+                    }
+                }
+
+                assert_eq!(candidate_consumed, reference_consumed);
+                assert_eq!(candidate_pipeline.produced, reference_pipeline.produced);
+                assert_eq!(candidate_output, reference_output);
             }
         }
     }
