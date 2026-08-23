@@ -1,0 +1,201 @@
+name: AArch64 SIMD primitive candidate benchmark
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/aarch64-simd-benchmark.yml"
+      - "examples/aarch64_simd_benchmark.rs"
+      - "src/dsp/simd.rs"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aarch64-simd-benchmark-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+
+      - name: Check out exact pull-request base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: baseline
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+
+      - name: Add the identical primitive harness to the baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p baseline/examples
+          cp candidate/examples/aarch64_simd_benchmark.rs baseline/examples/
+
+      - name: Prove candidate SIMD output against the scalar reference
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_TARGET_DIR: ${{ runner.temp }}/target-candidate-tests
+          RUSTFLAGS: -Ctarget-feature=+neon,+aes,+sha2
+        run: >-
+          cargo test --locked --manifest-path candidate/Cargo.toml
+          --lib dsp::simd::tests -- --nocapture
+
+      - name: Build baseline and candidate after tests
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "0"
+          RUSTFLAGS: -Ctarget-feature=+neon,+aes,+sha2
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/target-baseline" \
+            cargo build --locked --release --manifest-path baseline/Cargo.toml \
+              --bin forge \
+              --example aarch64_simd_benchmark
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/target-candidate" \
+            cargo build --locked --release --manifest-path candidate/Cargo.toml \
+              --bin forge \
+              --example aarch64_simd_benchmark
+
+      - name: Run primitive benchmarks in both orders
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${RUNNER_TEMP}/target-baseline/release/examples/aarch64_simd_benchmark" 9 > primitive-base-first.json
+          "${RUNNER_TEMP}/target-candidate/release/examples/aarch64_simd_benchmark" 9 > primitive-candidate-first.json
+          "${RUNNER_TEMP}/target-candidate/release/examples/aarch64_simd_benchmark" 9 > primitive-candidate-second.json
+          "${RUNNER_TEMP}/target-baseline/release/examples/aarch64_simd_benchmark" 9 > primitive-base-second.json
+
+      - name: Run end-to-end benchmarks in both orders
+        shell: bash
+        run: |
+          set -euo pipefail
+          common=(
+            --duration-seconds 300
+            --iterations 5
+            --case wav-stereo-analyze
+            --case wav-stereo-normalize
+            --case wav-stereo-verify
+            --case wav-7.1-normalize
+          )
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-baseline/release/forge" \
+            --container-qc "${RUNNER_TEMP}/target-baseline/release/forge" \
+            --work-dir "${RUNNER_TEMP}/bench-base-first" \
+            --output normalize-base-first.json "${common[@]}"
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-candidate/release/forge" \
+            --container-qc "${RUNNER_TEMP}/target-candidate/release/forge" \
+            --work-dir "${RUNNER_TEMP}/bench-candidate-first" \
+            --output normalize-candidate-first.json "${common[@]}"
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-candidate/release/forge" \
+            --container-qc "${RUNNER_TEMP}/target-candidate/release/forge" \
+            --work-dir "${RUNNER_TEMP}/bench-candidate-second" \
+            --output normalize-candidate-second.json "${common[@]}"
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-baseline/release/forge" \
+            --container-qc "${RUNNER_TEMP}/target-baseline/release/forge" \
+            --work-dir "${RUNNER_TEMP}/bench-base-second" \
+            --output normalize-base-second.json "${common[@]}"
+
+      - name: Verify byte-identical normalized output
+        shell: bash
+        run: |
+          set -euo pipefail
+          for case_id in wav-stereo-normalize wav-stereo-verify wav-7.1-normalize; do
+            reference="${RUNNER_TEMP}/bench-base-first/${case_id}/output.wav"
+            cmp "${reference}" "${RUNNER_TEMP}/bench-candidate-first/${case_id}/output.wav"
+            cmp "${reference}" "${RUNNER_TEMP}/bench-candidate-second/${case_id}/output.wav"
+            cmp "${reference}" "${RUNNER_TEMP}/bench-base-second/${case_id}/output.wav"
+          done
+
+      - name: Summarize pooled medians and verify checksums
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import statistics
+          from pathlib import Path
+
+          primitive_files = {
+              "baseline": [Path("primitive-base-first.json"), Path("primitive-base-second.json")],
+              "candidate": [Path("primitive-candidate-first.json"), Path("primitive-candidate-second.json")],
+          }
+          normalize_files = {
+              "baseline": [Path("normalize-base-first.json"), Path("normalize-base-second.json")],
+              "candidate": [Path("normalize-candidate-first.json"), Path("normalize-candidate-second.json")],
+          }
+
+          def indexed(paths):
+              documents = [json.loads(path.read_text()) for path in paths]
+              return [{item["id"]: item for item in document["results"]} for document in documents]
+
+          primitives = {name: indexed(paths) for name, paths in primitive_files.items()}
+          normalization = {name: indexed(paths) for name, paths in normalize_files.items()}
+          summary = {"primitives": [], "normalization": []}
+
+          for case_id in primitives["baseline"][0]:
+              base_items = [document[case_id] for document in primitives["baseline"]]
+              candidate_items = [document[case_id] for document in primitives["candidate"]]
+              checksums = {item["checksum"] for item in base_items + candidate_items}
+              assert len(checksums) == 1, (case_id, checksums)
+              base = statistics.median(value for item in base_items for value in item["seconds"])
+              candidate = statistics.median(value for item in candidate_items for value in item["seconds"])
+              summary["primitives"].append({
+                  "id": case_id,
+                  "baseline_seconds": base,
+                  "candidate_seconds": candidate,
+                  "wall_change_percent": (candidate / base - 1.0) * 100.0,
+                  "checksum": checksums.pop(),
+              })
+
+          for case_id in normalization["baseline"][0]:
+              base_items = [document[case_id] for document in normalization["baseline"]]
+              candidate_items = [document[case_id] for document in normalization["candidate"]]
+              base_samples = [sample for item in base_items for sample in item["samples"]]
+              candidate_samples = [sample for item in candidate_items for sample in item["samples"]]
+              base_wall = statistics.median(sample["wall_seconds"] for sample in base_samples)
+              candidate_wall = statistics.median(sample["wall_seconds"] for sample in candidate_samples)
+              base_cpu = statistics.median(
+                  sample["user_cpu_seconds"] + sample["system_cpu_seconds"]
+                  for sample in base_samples
+              )
+              candidate_cpu = statistics.median(
+                  sample["user_cpu_seconds"] + sample["system_cpu_seconds"]
+                  for sample in candidate_samples
+              )
+              summary["normalization"].append({
+                  "id": case_id,
+                  "baseline_wall_seconds": base_wall,
+                  "candidate_wall_seconds": candidate_wall,
+                  "wall_change_percent": (candidate_wall / base_wall - 1.0) * 100.0,
+                  "baseline_cpu_seconds": base_cpu,
+                  "candidate_cpu_seconds": candidate_cpu,
+                  "cpu_change_percent": (candidate_cpu / base_cpu - 1.0) * 100.0,
+              })
+
+          Path("aarch64-simd-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+          print(json.dumps(summary, indent=2))
+          PY
+
+      - name: Upload benchmark evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: aarch64-simd-benchmark
+          path: |
+            primitive-*.json
+            normalize-*.json
+            aarch64-simd-summary.json
+          if-no-files-found: error
+          retention-days: 30
