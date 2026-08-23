@@ -321,6 +321,12 @@ Forge already provides:
   input and interleaved packet queues use bounded cursors and one retained
   resampler output buffer. Codec bytes remain identical; slower FLAC retention
   and higher-RSS Opus packet-scratch variants were measured and rejected.
+- Bounded zero-copy MP3/Opus render pipelines that create host-bound writers on
+  one global-pool worker, transfer two recycled planar channel allocations by
+  ownership, and overlap encoding with the next decode/DSP chunk. Synchronous
+  one-worker and nested-file paths remain unchanged; limiter and uncached
+  converter output retain a bounded copy fallback. Encoder errors preserve
+  source-order precedence, and codec bytes remain identical.
 - Versioned multi-delivery optimization for two to 32 codec/profile outputs,
   using one conservative target, ceiling, and iteratively corrected gain;
   one shared decode/DSP/statistics pass per correction attempt, staged

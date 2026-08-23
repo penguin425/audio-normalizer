@@ -27,6 +27,9 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -2567,6 +2570,19 @@ struct MultiStreamRenderResult {
     lossless_outputs: Vec<Option<Analysis>>,
 }
 
+const STREAM_WRITER_PIPELINE_DEPTH: usize = 2;
+
+enum StreamWriterMessage {
+    Chunk(Vec<Vec<f32>>),
+    Finish,
+    Abort,
+}
+
+enum StreamWriterOutcome {
+    Finished(Vec<Option<Analysis>>),
+    Aborted,
+}
+
 // Multi-delivery bounds this enum to 32 heap-resident Vec entries. Keeping the
 // concrete writers inline avoids another allocation and indirection on every
 // streamed chunk; even 32 largest variants occupy less than 28 KiB.
@@ -2810,6 +2826,273 @@ impl NormalizedStreamWriter {
     }
 }
 
+fn stream_writer_pipeline_enabled(formats: &[OutputFormat]) -> bool {
+    rayon::current_num_threads() > 1
+        && rayon::current_thread_index().is_none()
+        && formats
+            .iter()
+            .any(|format| matches!(format, OutputFormat::Mp3 | OutputFormat::Opus))
+}
+
+fn copy_pipeline_chunk(destination: &mut Vec<Vec<f32>>, source: &[Vec<f32>]) {
+    destination.resize_with(source.len(), Vec::new);
+    destination.truncate(source.len());
+    for (output, input) in destination.iter_mut().zip(source) {
+        output.resize(input.len(), 0.0);
+        output.copy_from_slice(input);
+    }
+}
+
+fn run_stream_writer_pipeline(
+    mut writers: Vec<NormalizedStreamWriter>,
+    input: Receiver<StreamWriterMessage>,
+    recycled: SyncSender<Vec<Vec<f32>>>,
+    failed: &AtomicBool,
+) -> Result<StreamWriterOutcome, String> {
+    let mut first_error = None;
+    while let Ok(message) = input.recv() {
+        match message {
+            StreamWriterMessage::Chunk(chunk) => {
+                if first_error.is_none() {
+                    for writer in &mut writers {
+                        if let Err(error) = writer.write_chunk(&chunk) {
+                            failed.store(true, Ordering::Release);
+                            first_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+                // The producer owns exactly STREAM_WRITER_PIPELINE_DEPTH slots,
+                // so this bounded return channel cannot fill beyond capacity.
+                let _ = recycled.send(chunk);
+            }
+            StreamWriterMessage::Finish => {
+                if let Some(error) = first_error {
+                    return Err(error);
+                }
+                let outputs = writers
+                    .into_iter()
+                    .map(NormalizedStreamWriter::finish)
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(StreamWriterOutcome::Finished(outputs));
+            }
+            StreamWriterMessage::Abort => {
+                return first_error.map_or(Ok(StreamWriterOutcome::Aborted), Err);
+            }
+        }
+    }
+    first_error.map_or(Ok(StreamWriterOutcome::Aborted), Err)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_normalized_stream_pipelined(
+    source: StreamSource<'_>,
+    analysis: &Analysis,
+    gain: f32,
+    ceiling: f32,
+    plan: &Plan,
+    capture_statistics: bool,
+    make_writers: impl FnOnce() -> Result<Vec<NormalizedStreamWriter>, String> + Send,
+) -> Result<(Option<RenderStatistics>, Vec<Option<Analysis>>), String> {
+    let (input_sender, input_receiver) = sync_channel(STREAM_WRITER_PIPELINE_DEPTH);
+    let (recycle_sender, recycle_receiver) = sync_channel(STREAM_WRITER_PIPELINE_DEPTH);
+    let (ready_sender, ready_receiver) = sync_channel(1);
+    let (result_sender, result_receiver) = sync_channel(1);
+    let failed = Arc::new(AtomicBool::new(false));
+    let producer_failed = Arc::clone(&failed);
+    let writer_failed = Arc::clone(&failed);
+    let channels = usize::from(analysis.channels);
+    let transfer_owned_chunks =
+        plan.limiter.is_none() && (source.spool.is_some() || plan.output_sample_rate.is_none());
+
+    let processing = rayon::scope(move |scope| {
+        scope.spawn(move |_| {
+            let writers = match make_writers() {
+                Ok(writers) => {
+                    if ready_sender.send(Ok(())).is_err() {
+                        let _ = result_sender.send(Ok(StreamWriterOutcome::Aborted));
+                        return;
+                    }
+                    writers
+                }
+                Err(error) => {
+                    let _ = ready_sender.send(Err(error.clone()));
+                    let _ = result_sender.send(Err(error));
+                    return;
+                }
+            };
+            let result = run_stream_writer_pipeline(
+                writers,
+                input_receiver,
+                recycle_sender,
+                writer_failed.as_ref(),
+            );
+            let _ = result_sender.send(result);
+        });
+
+        match ready_receiver.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err("stream writer pipeline failed during setup".into()),
+        }
+        let processed = if transfer_owned_chunks {
+            // The decoder or spool owns the first slot. One spare allocation
+            // lets it continue immediately while the writer consumes that slot.
+            let mut available = (1..STREAM_WRITER_PIPELINE_DEPTH)
+                .map(|_| (0..channels).map(|_| Vec::new()).collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            process_normalized_stream_owned(
+                source,
+                analysis,
+                gain,
+                ceiling,
+                capture_statistics,
+                |chunk| {
+                    if producer_failed.load(Ordering::Acquire) {
+                        return Err("stream writer pipeline stopped after an encoder error".into());
+                    }
+                    loop {
+                        match recycle_receiver.try_recv() {
+                            Ok(chunk) => available.push(chunk),
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => {
+                                return Err("stream writer pipeline stopped unexpectedly".into());
+                            }
+                        }
+                    }
+                    input_sender
+                        .send(StreamWriterMessage::Chunk(chunk))
+                        .map_err(|_| "stream writer pipeline stopped unexpectedly")?;
+                    if producer_failed.load(Ordering::Acquire) {
+                        return Err("stream writer pipeline stopped after an encoder error".into());
+                    }
+                    let recycled = if let Some(chunk) = available.pop() {
+                        chunk
+                    } else {
+                        recycle_receiver
+                            .recv()
+                            .map_err(|_| "stream writer pipeline stopped unexpectedly")?
+                    };
+                    if producer_failed.load(Ordering::Acquire) {
+                        return Err("stream writer pipeline stopped after an encoder error".into());
+                    }
+                    Ok(recycled)
+                },
+            )
+        } else {
+            let mut available = (0..STREAM_WRITER_PIPELINE_DEPTH)
+                .map(|_| (0..channels).map(|_| Vec::new()).collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            process_normalized_stream(
+                source,
+                analysis,
+                gain,
+                ceiling,
+                plan,
+                capture_statistics,
+                |planar| {
+                    if producer_failed.load(Ordering::Acquire) {
+                        return Err("stream writer pipeline stopped after an encoder error".into());
+                    }
+                    loop {
+                        match recycle_receiver.try_recv() {
+                            Ok(chunk) => available.push(chunk),
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => {
+                                return Err("stream writer pipeline stopped unexpectedly".into());
+                            }
+                        }
+                    }
+                    let mut chunk = if let Some(chunk) = available.pop() {
+                        chunk
+                    } else {
+                        recycle_receiver
+                            .recv()
+                            .map_err(|_| "stream writer pipeline stopped unexpectedly")?
+                    };
+                    copy_pipeline_chunk(&mut chunk, planar);
+                    input_sender
+                        .send(StreamWriterMessage::Chunk(chunk))
+                        .map_err(|_| "stream writer pipeline stopped unexpectedly")?;
+                    if producer_failed.load(Ordering::Acquire) {
+                        return Err("stream writer pipeline stopped after an encoder error".into());
+                    }
+                    Ok(())
+                },
+            )
+        };
+        let terminal = if processed.is_ok() {
+            StreamWriterMessage::Finish
+        } else {
+            StreamWriterMessage::Abort
+        };
+        if input_sender.send(terminal).is_err() && processed.is_ok() {
+            return Err("stream writer pipeline stopped unexpectedly".into());
+        }
+        processed
+    });
+    let writing = result_receiver
+        .recv()
+        .map_err(|_| "stream writer pipeline stopped without a result")?;
+
+    match writing {
+        // A writer handling an earlier chunk precedes any processing failure
+        // observed while later chunks were in flight.
+        Err(error) => Err(error),
+        Ok(StreamWriterOutcome::Finished(outputs)) => Ok((processing?, outputs)),
+        Ok(StreamWriterOutcome::Aborted) => match processing {
+            Err(error) => Err(error),
+            Ok(_) => Err("stream writer pipeline aborted unexpectedly".into()),
+        },
+    }
+}
+
+fn process_normalized_stream_owned(
+    source: StreamSource<'_>,
+    analysis: &Analysis,
+    gain: f32,
+    ceiling: f32,
+    capture_statistics: bool,
+    mut write: impl FnMut(Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, String>,
+) -> Result<Option<RenderStatistics>, String> {
+    let StreamSource {
+        path: input,
+        spool: source_spool,
+    } = source;
+    let mut statistics = capture_statistics.then(|| RenderStatisticsBuilder::new(analysis));
+    let mut process = |mut planar: Vec<Vec<f32>>| {
+        if statistics.is_none() {
+            for channel in &mut planar {
+                simd::apply_gain_and_hard_clip(channel, gain, ceiling);
+            }
+            return write(planar);
+        }
+        let observed = statistics.as_mut().unwrap();
+        observed.observe_input(&planar);
+        apply_gain(&mut planar, gain);
+        observed.observe_post_gain(&planar, ceiling);
+        for channel in &mut planar {
+            simd::hard_clip(channel, ceiling);
+        }
+        observed.observe_protected(&planar)?;
+        write(planar)
+    };
+    if let Some(spool) = source_spool {
+        spool.replay_owned(&mut process)?;
+    } else {
+        decoder::decode_stream_owned(input, |info, planar| {
+            if info.sample_rate != analysis.sample_rate {
+                return Err(format!(
+                    "owned stream pipeline expected {} Hz input, got {} Hz",
+                    analysis.sample_rate, info.sample_rate
+                ));
+            }
+            process(planar)
+        })?;
+    }
+    Ok(statistics.map(|statistics| statistics.finish(None)))
+}
+
 fn normalize_stream(
     source: StreamSource<'_>,
     output: &Path,
@@ -2820,6 +3103,27 @@ fn normalize_stream(
     options: StreamRenderOptions<'_>,
 ) -> Result<StreamRenderResult, String> {
     let ceiling = 10.0_f64.powf(plan.ceiling_db / 20.0) as f32;
+    if stream_writer_pipeline_enabled(&[format]) {
+        let input = source.path;
+        let (statistics, mut lossless_outputs) = process_normalized_stream_pipelined(
+            source,
+            analysis,
+            gain,
+            ceiling,
+            plan,
+            options.capture_statistics,
+            move || {
+                NormalizedStreamWriter::create(input, output, analysis, gain, plan, format, options)
+                    .map(|writer| vec![writer])
+            },
+        )?;
+        return Ok(StreamRenderResult {
+            statistics,
+            lossless_output: lossless_outputs
+                .pop()
+                .ok_or_else(|| "stream writer pipeline omitted its output".to_string())?,
+        });
+    }
     let mut writer =
         NormalizedStreamWriter::create(source.path, output, analysis, gain, plan, format, options)?;
     let statistics = process_normalized_stream(
@@ -2849,6 +3153,33 @@ fn normalize_streams(
     if outputs.len() != formats.len() {
         return Err("stream output/format count mismatch".into());
     }
+    let ceiling = 10.0_f64.powf(plan.ceiling_db / 20.0) as f32;
+    if stream_writer_pipeline_enabled(formats) {
+        let input = source.path;
+        let (statistics, lossless_outputs) = process_normalized_stream_pipelined(
+            source,
+            analysis,
+            gain,
+            ceiling,
+            plan,
+            options.capture_statistics,
+            move || {
+                outputs
+                    .iter()
+                    .zip(formats)
+                    .map(|(output, format)| {
+                        NormalizedStreamWriter::create(
+                            input, output, analysis, gain, plan, *format, options,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            },
+        )?;
+        return Ok(MultiStreamRenderResult {
+            statistics,
+            lossless_outputs,
+        });
+    }
     let mut writers = outputs
         .iter()
         .zip(formats)
@@ -2864,7 +3195,6 @@ fn normalize_streams(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let ceiling = 10.0_f64.powf(plan.ceiling_db / 20.0) as f32;
     let statistics = process_normalized_stream(
         source,
         analysis,
@@ -3595,7 +3925,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_stream_fanout_matches_separate_lossless_encodes() {
+    fn multi_stream_fanout_and_bounded_pipeline_match_separate_lossless_encodes() {
         let directory = tempfile::tempdir().unwrap();
         let input = directory.path().join("source.wav");
         let frames = 48_000 * 4 + 137;
@@ -3672,6 +4002,40 @@ mod tests {
             options,
         )
         .unwrap();
+        let pipeline_paths = [
+            directory.path().join("pipeline.wav"),
+            directory.path().join("pipeline.flac"),
+        ];
+        let ceiling = 10.0_f64.powf(plan().ceiling_db / 20.0) as f32;
+        let (pipeline_statistics, pipeline_lossless_outputs) = process_normalized_stream_pipelined(
+            StreamSource {
+                path: &input,
+                spool: None,
+            },
+            &source,
+            gain,
+            ceiling,
+            &plan(),
+            options.capture_statistics,
+            || {
+                pipeline_paths
+                    .iter()
+                    .zip(formats)
+                    .map(|(output, format)| {
+                        NormalizedStreamWriter::create(
+                            &input,
+                            output,
+                            &source,
+                            gain,
+                            &plan(),
+                            format,
+                            options,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            },
+        )
+        .unwrap();
 
         for ((separate_path, fanout_path), format) in
             separate_paths.iter().zip(&fanout_paths).zip(formats)
@@ -3682,7 +4046,38 @@ mod tests {
                 "{format:?} fan-out output changed"
             );
         }
+        for ((separate_path, pipeline_path), format) in
+            separate_paths.iter().zip(&pipeline_paths).zip(formats)
+        {
+            assert_eq!(
+                std::fs::read(separate_path).unwrap(),
+                std::fs::read(pipeline_path).unwrap(),
+                "{format:?} pipelined output changed"
+            );
+        }
         let fanout_statistics = fanout.statistics.unwrap();
+        let pipeline_statistics = pipeline_statistics.unwrap();
+        assert_analysis_identical(
+            &fanout_statistics.intended,
+            &pipeline_statistics.intended,
+            "pipelined render statistics",
+        );
+        assert_eq!(
+            fanout_statistics.input_full_scale_exceeding_samples,
+            pipeline_statistics.input_full_scale_exceeding_samples
+        );
+        assert_eq!(
+            fanout_statistics.post_gain_full_scale_exceeding_samples,
+            pipeline_statistics.post_gain_full_scale_exceeding_samples
+        );
+        assert_eq!(
+            fanout_statistics.post_gain_ceiling_exceeding_samples,
+            pipeline_statistics.post_gain_ceiling_exceeding_samples
+        );
+        assert_eq!(
+            fanout_statistics.protected_full_scale_exceeding_samples,
+            pipeline_statistics.protected_full_scale_exceeding_samples
+        );
         for result in &separate {
             let statistics = result.statistics.as_ref().unwrap();
             assert_analysis_identical(
@@ -3714,6 +4109,113 @@ mod tests {
                 "fan-out lossless verification",
             );
         }
+        for (index, measured) in pipeline_lossless_outputs.into_iter().enumerate() {
+            assert_analysis_identical(
+                separate[index].lossless_output.as_ref().unwrap(),
+                measured.as_ref().unwrap(),
+                "pipelined lossless verification",
+            );
+        }
+    }
+
+    #[cfg(feature = "mp3-encoding")]
+    #[test]
+    fn bounded_pipeline_preserves_mp3_bytes_and_writer_chunk_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("source.wav");
+        let synchronous_output = directory.path().join("synchronous.mp3");
+        let pipelined_output = directory.path().join("pipelined.mp3");
+        let frames = 48_000 * 4 + 137;
+        let data = (0..2)
+            .map(|channel| {
+                let frequency = 997.0 + channel as f32 * 502.0;
+                (0..frames)
+                    .map(|frame| {
+                        0.17 * (std::f32::consts::TAU * frequency * frame as f32 / 48_000.0).sin()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        WavWriter::write(
+            &input,
+            &AudioBuffer {
+                sample_rate: 48_000,
+                channels: 2,
+                frames,
+                data,
+                channel_roles: default_channel_roles(2),
+                source_kind: PcmKind::F32,
+            },
+            PcmKind::F32,
+            false,
+        )
+        .unwrap();
+        let source = analyze_file(&input).unwrap();
+        let render_plan = plan();
+        let gain = compute_gain(&source, &render_plan);
+        let ceiling = 10.0_f64.powf(render_plan.ceiling_db / 20.0) as f32;
+        let options = StreamRenderOptions {
+            opus_album_lufs: None,
+            capture_statistics: false,
+            capture_lossless_verification: false,
+            verification_channel_roles: None,
+        };
+
+        let mut writer = NormalizedStreamWriter::create(
+            &input,
+            &synchronous_output,
+            &source,
+            gain,
+            &render_plan,
+            OutputFormat::Mp3,
+            options,
+        )
+        .unwrap();
+        process_normalized_stream(
+            StreamSource {
+                path: &input,
+                spool: None,
+            },
+            &source,
+            gain,
+            ceiling,
+            &render_plan,
+            false,
+            |planar| writer.write_chunk(planar),
+        )
+        .unwrap();
+        writer.finish().unwrap();
+
+        let (_, outputs) = process_normalized_stream_pipelined(
+            StreamSource {
+                path: &input,
+                spool: None,
+            },
+            &source,
+            gain,
+            ceiling,
+            &render_plan,
+            false,
+            || {
+                NormalizedStreamWriter::create(
+                    &input,
+                    &pipelined_output,
+                    &source,
+                    gain,
+                    &render_plan,
+                    OutputFormat::Mp3,
+                    options,
+                )
+                .map(|writer| vec![writer])
+            },
+        )
+        .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].is_none());
+        assert_eq!(
+            std::fs::read(synchronous_output).unwrap(),
+            std::fs::read(pipelined_output).unwrap()
+        );
     }
 
     #[test]
