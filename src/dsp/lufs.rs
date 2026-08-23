@@ -27,7 +27,6 @@ use crate::dsp::simd;
 use crate::dsp::truepeak::TruePeakMeter;
 use crate::wav::{AudioBuffer, ChannelRole};
 use rayon::prelude::*;
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, Ordering};
 #[cfg(all(
     feature = "cuda-truepeak",
@@ -205,6 +204,44 @@ pub struct LoudnessTimelinePoint {
     pub true_peak_dbtp: f64,
 }
 
+struct RunningWindow {
+    values: Vec<f64>,
+    cursor: usize,
+    limit: usize,
+}
+
+impl RunningWindow {
+    fn new(limit: usize) -> Self {
+        debug_assert_ne!(limit, 0);
+        Self {
+            values: Vec::with_capacity(limit),
+            cursor: 0,
+            limit,
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, sum: &mut f64, value: f64) {
+        if self.values.len() < self.limit {
+            self.values.push(value);
+            *sum += value;
+            return;
+        }
+        let expired = self.values[self.cursor];
+        self.values[self.cursor] = value;
+        *sum += value;
+        *sum -= expired;
+        self.cursor += 1;
+        if self.cursor == self.limit {
+            self.cursor = 0;
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+}
+
 pub struct StreamingAnalyzer {
     sample_rate: u32,
     roles: Vec<ChannelRole>,
@@ -219,10 +256,12 @@ pub struct StreamingAnalyzer {
         any(target_os = "linux", target_os = "windows")
     ))]
     cuda_true_peak: CudaTruePeakState,
-    momentary: VecDeque<f64>,
-    short_term: VecDeque<f64>,
+    momentary: RunningWindow,
+    short_term: RunningWindow,
     momentary_sum: f64,
     short_term_sum: f64,
+    next_momentary_block_frame: usize,
+    next_short_term_block_frame: usize,
     gating_blocks: Vec<f64>,
     short_term_blocks: Vec<f64>,
     max_momentary_ms: f64,
@@ -249,6 +288,8 @@ impl StreamingAnalyzer {
         interval_frames: Option<usize>,
     ) -> Self {
         let channels = roles.len();
+        let next_momentary_block_frame = ((sample_rate as usize * 4) / 10).max(1);
+        let next_short_term_block_frame = (sample_rate as usize * 3).max(1);
         #[cfg(all(
             feature = "cuda-truepeak",
             any(target_os = "linux", target_os = "windows")
@@ -297,10 +338,12 @@ impl StreamingAnalyzer {
                 any(target_os = "linux", target_os = "windows")
             ))]
             cuda_true_peak,
-            momentary: VecDeque::new(),
-            short_term: VecDeque::new(),
+            momentary: RunningWindow::new(next_momentary_block_frame),
+            short_term: RunningWindow::new(next_short_term_block_frame),
             momentary_sum: 0.0,
             short_term_sum: 0.0,
+            next_momentary_block_frame,
+            next_short_term_block_frame,
             gating_blocks: Vec::new(),
             short_term_blocks: Vec::new(),
             max_momentary_ms: 0.0,
@@ -464,9 +507,7 @@ impl StreamingAnalyzer {
                         .max_short_term_ms
                         .max(self.short_term_sum / short_term_window as f64);
                 }
-                if self.momentary.len() == momentary_window
-                    && (self.frames - momentary_window).is_multiple_of(hop)
-                {
+                if self.frames == self.next_momentary_block_frame {
                     if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
                         return Err(format!(
                             "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-gating-block limit"
@@ -474,10 +515,10 @@ impl StreamingAnalyzer {
                     }
                     self.gating_blocks
                         .push(self.momentary_sum / momentary_window as f64);
+                    self.next_momentary_block_frame =
+                        self.next_momentary_block_frame.saturating_add(hop);
                 }
-                if self.short_term.len() == short_term_window
-                    && (self.frames - short_term_window).is_multiple_of(hop)
-                {
+                if self.frames == self.next_short_term_block_frame {
                     if self.short_term_blocks.len() == MAX_LOUDNESS_BLOCKS {
                         return Err(format!(
                             "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-short-term-block limit"
@@ -485,6 +526,8 @@ impl StreamingAnalyzer {
                     }
                     self.short_term_blocks
                         .push(self.short_term_sum / short_term_window as f64);
+                    self.next_short_term_block_frame =
+                        self.next_short_term_block_frame.saturating_add(hop);
                 }
             }
             return Ok(());
@@ -545,9 +588,7 @@ impl StreamingAnalyzer {
                         .max_short_term_ms
                         .max(self.short_term_sum / short_term_window as f64);
                 }
-                if self.momentary.len() == momentary_window
-                    && (self.frames - momentary_window).is_multiple_of(hop)
-                {
+                if self.frames == self.next_momentary_block_frame {
                     if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
                         return Err(format!(
                             "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-gating-block limit"
@@ -555,10 +596,10 @@ impl StreamingAnalyzer {
                     }
                     self.gating_blocks
                         .push(self.momentary_sum / momentary_window as f64);
+                    self.next_momentary_block_frame =
+                        self.next_momentary_block_frame.saturating_add(hop);
                 }
-                if self.short_term.len() == short_term_window
-                    && (self.frames - short_term_window).is_multiple_of(hop)
-                {
+                if self.frames == self.next_short_term_block_frame {
                     if self.short_term_blocks.len() == MAX_LOUDNESS_BLOCKS {
                         return Err(format!(
                             "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-short-term-block limit"
@@ -566,6 +607,8 @@ impl StreamingAnalyzer {
                     }
                     self.short_term_blocks
                         .push(self.short_term_sum / short_term_window as f64);
+                    self.next_short_term_block_frame =
+                        self.next_short_term_block_frame.saturating_add(hop);
                 }
             }
             return Ok(());
@@ -608,9 +651,7 @@ impl StreamingAnalyzer {
                     .max_short_term_ms
                     .max(self.short_term_sum / short_term_window as f64);
             }
-            if self.momentary.len() == momentary_window
-                && (self.frames - momentary_window).is_multiple_of(hop)
-            {
+            if self.frames == self.next_momentary_block_frame {
                 if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
                     return Err(format!(
                         "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-gating-block limit"
@@ -618,10 +659,10 @@ impl StreamingAnalyzer {
                 }
                 self.gating_blocks
                     .push(self.momentary_sum / momentary_window as f64);
+                self.next_momentary_block_frame =
+                    self.next_momentary_block_frame.saturating_add(hop);
             }
-            if self.short_term.len() == short_term_window
-                && (self.frames - short_term_window).is_multiple_of(hop)
-            {
+            if self.frames == self.next_short_term_block_frame {
                 if self.short_term_blocks.len() == MAX_LOUDNESS_BLOCKS {
                     return Err(format!(
                         "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-short-term-block limit"
@@ -629,6 +670,8 @@ impl StreamingAnalyzer {
                 }
                 self.short_term_blocks
                     .push(self.short_term_sum / short_term_window as f64);
+                self.next_short_term_block_frame =
+                    self.next_short_term_block_frame.saturating_add(hop);
             }
             if self
                 .timeline_interval_frames
@@ -785,9 +828,7 @@ impl StreamingAnalyzer {
                         .max_short_term_ms
                         .max(self.short_term_sum / short_term_window as f64);
                 }
-                if self.momentary.len() == momentary_window
-                    && (self.frames - momentary_window).is_multiple_of(hop)
-                {
+                if self.frames == self.next_momentary_block_frame {
                     if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
                         return Err(format!(
                             "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-gating-block limit"
@@ -795,10 +836,10 @@ impl StreamingAnalyzer {
                     }
                     self.gating_blocks
                         .push(self.momentary_sum / momentary_window as f64);
+                    self.next_momentary_block_frame =
+                        self.next_momentary_block_frame.saturating_add(hop);
                 }
-                if self.short_term.len() == short_term_window
-                    && (self.frames - short_term_window).is_multiple_of(hop)
-                {
+                if self.frames == self.next_short_term_block_frame {
                     if self.short_term_blocks.len() == MAX_LOUDNESS_BLOCKS {
                         return Err(format!(
                             "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-short-term-block limit"
@@ -806,6 +847,8 @@ impl StreamingAnalyzer {
                     }
                     self.short_term_blocks
                         .push(self.short_term_sum / short_term_window as f64);
+                    self.next_short_term_block_frame =
+                        self.next_short_term_block_frame.saturating_add(hop);
                 }
             }
             return Ok(());
@@ -859,9 +902,7 @@ impl StreamingAnalyzer {
                 .max_short_term_ms
                 .max(self.short_term_sum / short_term_window as f64);
         }
-        if self.momentary.len() == momentary_window
-            && (self.frames - momentary_window).is_multiple_of(hop)
-        {
+        if self.frames == self.next_momentary_block_frame {
             if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
                 return Err(format!(
                     "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-gating-block limit"
@@ -869,10 +910,9 @@ impl StreamingAnalyzer {
             }
             self.gating_blocks
                 .push(self.momentary_sum / momentary_window as f64);
+            self.next_momentary_block_frame = self.next_momentary_block_frame.saturating_add(hop);
         }
-        if self.short_term.len() == short_term_window
-            && (self.frames - short_term_window).is_multiple_of(hop)
-        {
+        if self.frames == self.next_short_term_block_frame {
             if self.short_term_blocks.len() == MAX_LOUDNESS_BLOCKS {
                 return Err(format!(
                     "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-short-term-block limit"
@@ -880,6 +920,7 @@ impl StreamingAnalyzer {
             }
             self.short_term_blocks
                 .push(self.short_term_sum / short_term_window as f64);
+            self.next_short_term_block_frame = self.next_short_term_block_frame.saturating_add(hop);
         }
         Ok(())
     }
@@ -1085,12 +1126,9 @@ fn amplitude_db(amplitude: f32) -> f64 {
     }
 }
 
-fn push_window(queue: &mut VecDeque<f64>, sum: &mut f64, value: f64, limit: usize) {
-    queue.push_back(value);
-    *sum += value;
-    if queue.len() > limit {
-        *sum -= queue.pop_front().unwrap();
-    }
+fn push_window(queue: &mut RunningWindow, sum: &mut f64, value: f64, limit: usize) {
+    debug_assert_eq!(queue.limit, limit);
+    queue.push(sum, value);
 }
 
 /// Per-channel loudness weight (BS.1770).
@@ -1347,6 +1385,7 @@ pub fn measure_rms_peak(buf: &AudioBuffer) -> (f64, f32) {
 mod tests {
     use super::*;
     use crate::wav::PcmKind;
+    use std::collections::VecDeque;
 
     fn mono(samples: Vec<f32>, sample_rate: u32) -> AudioBuffer {
         AudioBuffer {
@@ -1356,6 +1395,28 @@ mod tests {
             data: vec![samples],
             channel_roles: vec![ChannelRole::Main],
             source_kind: PcmKind::F32,
+        }
+    }
+
+    #[test]
+    fn fixed_running_window_matches_vecdeque_sum_bit_exactly() {
+        for limit in [1, 2, 7, 31, 127] {
+            let mut candidate = RunningWindow::new(limit);
+            let mut candidate_sum = 0.0;
+            let mut reference = VecDeque::new();
+            let mut reference_sum = 0.0;
+            for index in 0_usize..4_097 {
+                let value =
+                    ((index.wrapping_mul(97).wrapping_add(31) % 1_009) as f64 - 504.0) / 1_009.0;
+                candidate.push(&mut candidate_sum, value);
+                reference.push_back(value);
+                reference_sum += value;
+                if reference.len() > limit {
+                    reference_sum -= reference.pop_front().unwrap();
+                }
+                assert_eq!(candidate.len(), reference.len());
+                assert_eq!(candidate_sum.to_bits(), reference_sum.to_bits());
+            }
         }
     }
 
