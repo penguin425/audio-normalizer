@@ -1,0 +1,220 @@
+name: Stereo True Peak overlap candidate benchmark
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/stereo-truepeak-benchmark.yml"
+      - "src/dsp/lufs.rs"
+      - "src/dsp/truepeak.rs"
+      - "tools/benchmark.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stereo-truepeak-benchmark-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: benchmark (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+
+      - name: Check out exact pull-request base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: baseline
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+
+      - name: Prove the parallel and fused analyzers are bit-exact
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_TARGET_DIR: ${{ runner.temp }}/target-candidate-tests
+          RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-Ctarget-feature=+neon,+aes,+sha2' || '' }}
+        run: >-
+          cargo test --locked --manifest-path candidate/Cargo.toml
+          --no-default-features --lib
+          stereo_parallel_true_peak_matches_fused_path_bit_exactly -- --nocapture
+
+      - name: Build exact baseline and candidate
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "0"
+          RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-Ctarget-feature=+neon,+aes,+sha2' || '' }}
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/target-baseline" \
+            cargo build --locked --release --manifest-path baseline/Cargo.toml \
+              --no-default-features --bin forge
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/target-candidate" \
+            cargo build --locked --release --manifest-path candidate/Cargo.toml \
+              --no-default-features --bin forge
+
+      - name: Verify byte-exact analysis and output
+        shell: bash
+        run: |
+          set -euo pipefail
+          exact_dir="${RUNNER_TEMP}/exact-output"
+          mkdir "${exact_dir}"
+          EXACT_DIR="${exact_dir}" python3 - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "candidate/tools")
+          from benchmark import write_pcm16_wave
+
+          write_pcm16_wave(Path(os.environ["EXACT_DIR"]) / "stereo.wav", 30, 48_000, 2)
+          PY
+
+          baseline="${RUNNER_TEMP}/target-baseline/release/forge"
+          candidate="${RUNNER_TEMP}/target-candidate/release/forge"
+          "${baseline}" "${exact_dir}/stereo.wav" --analyze --json > "${exact_dir}/base.json"
+          "${candidate}" "${exact_dir}/stereo.wav" --analyze --json > "${exact_dir}/candidate.json"
+          cmp "${exact_dir}/base.json" "${exact_dir}/candidate.json"
+
+          "${baseline}" "${exact_dir}/stereo.wav" --overwrite -o "${exact_dir}/base.wav"
+          "${candidate}" "${exact_dir}/stereo.wav" --overwrite -o "${exact_dir}/candidate.wav"
+          cmp "${exact_dir}/base.wav" "${exact_dir}/candidate.wav"
+
+          "${baseline}" "${exact_dir}/stereo.wav" --verify --overwrite -o "${exact_dir}/base-verify.wav"
+          "${candidate}" "${exact_dir}/stereo.wav" --verify --overwrite -o "${exact_dir}/candidate-verify.wav"
+          cmp "${exact_dir}/base-verify.wav" "${exact_dir}/candidate-verify.wav"
+
+      - name: Run default-worker benchmarks in both orders
+        shell: bash
+        run: |
+          set -euo pipefail
+          common=(
+            --duration-seconds 300
+            --iterations 5
+            --case wav-stereo-analyze
+            --case wav-stereo-normalize
+            --case wav-stereo-verify
+          )
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-baseline/release/forge" \
+            --work-dir "${RUNNER_TEMP}/default-base-first" \
+            --output default-base-first.json "${common[@]}"
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-candidate/release/forge" \
+            --work-dir "${RUNNER_TEMP}/default-candidate-first" \
+            --output default-candidate-first.json "${common[@]}"
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-candidate/release/forge" \
+            --work-dir "${RUNNER_TEMP}/default-candidate-second" \
+            --output default-candidate-second.json "${common[@]}"
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-baseline/release/forge" \
+            --work-dir "${RUNNER_TEMP}/default-base-second" \
+            --output default-base-second.json "${common[@]}"
+
+      - name: Run one-worker control benchmarks in both orders
+        shell: bash
+        env:
+          RAYON_NUM_THREADS: "1"
+        run: |
+          set -euo pipefail
+          common=(
+            --duration-seconds 300
+            --iterations 5
+            --case wav-stereo-analyze
+            --case wav-stereo-normalize
+            --case wav-stereo-verify
+          )
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-baseline/release/forge" \
+            --work-dir "${RUNNER_TEMP}/one-base-first" \
+            --output one-base-first.json "${common[@]}"
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-candidate/release/forge" \
+            --work-dir "${RUNNER_TEMP}/one-candidate-first" \
+            --output one-candidate-first.json "${common[@]}"
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-candidate/release/forge" \
+            --work-dir "${RUNNER_TEMP}/one-candidate-second" \
+            --output one-candidate-second.json "${common[@]}"
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-baseline/release/forge" \
+            --work-dir "${RUNNER_TEMP}/one-base-second" \
+            --output one-base-second.json "${common[@]}"
+
+      - name: Summarize pooled and per-order medians
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import statistics
+          from pathlib import Path
+
+          summary = {"system": {}, "modes": {}}
+          for mode in ("default", "one"):
+              paths = {
+                  "base_first": Path(f"{mode}-base-first.json"),
+                  "base_second": Path(f"{mode}-base-second.json"),
+                  "candidate_first": Path(f"{mode}-candidate-first.json"),
+                  "candidate_second": Path(f"{mode}-candidate-second.json"),
+              }
+              documents = {name: json.loads(path.read_text()) for name, path in paths.items()}
+              assert all(document["passed"] for document in documents.values())
+              if not summary["system"]:
+                  summary["system"] = documents["base_first"]["system"]
+              indexed = {
+                  name: {item["id"]: item for item in document["results"]}
+                  for name, document in documents.items()
+              }
+              rows = []
+              for case_id in indexed["base_first"]:
+                  row = {"id": case_id, "samples_per_binary": 10}
+                  for metric, key in (("wall", "wall_seconds"), ("cpu", None)):
+                      values = {}
+                      for name, cases in indexed.items():
+                          values[name] = [
+                              sample[key] if key else sample["user_cpu_seconds"] + sample["system_cpu_seconds"]
+                              for sample in cases[case_id]["samples"]
+                          ]
+                      baseline = values["base_first"] + values["base_second"]
+                      candidate = values["candidate_first"] + values["candidate_second"]
+                      base_median = statistics.median(baseline)
+                      candidate_median = statistics.median(candidate)
+                      row[metric] = {
+                          "base_first_median": statistics.median(values["base_first"]),
+                          "candidate_first_median": statistics.median(values["candidate_first"]),
+                          "candidate_second_median": statistics.median(values["candidate_second"]),
+                          "base_second_median": statistics.median(values["base_second"]),
+                          "baseline_pooled_median": base_median,
+                          "candidate_pooled_median": candidate_median,
+                          "change_percent": (candidate_median / base_median - 1.0) * 100.0,
+                      }
+                  rows.append(row)
+              summary["modes"]["default" if mode == "default" else "jobs_1"] = rows
+
+          Path("stereo-truepeak-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+          print(json.dumps(summary, indent=2))
+          PY
+
+      - name: Upload benchmark evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: stereo-truepeak-benchmark-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            default-*.json
+            one-*.json
+            stereo-truepeak-summary.json
+          if-no-files-found: error
+          retention-days: 30
