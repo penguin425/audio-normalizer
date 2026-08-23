@@ -18,6 +18,20 @@ The official EBU v5 and ITU-R BS.2217-2 suites remain release gates.
 - The [Roofline model](https://digicoll.lib.berkeley.edu/record/136692/files/EECS-2008-134.pdf)
   motivates removing buffer allocation, copies, and full-signal memory traffic
   before adding more arithmetic parallelism.
+- A 2026
+  [zero-copy streaming pipeline study](https://doi.org/10.1016/j.ins.2026.123171)
+  identifies redundant copies, contention, and unbounded storage as separate
+  costs, and combines ownership-like frame reuse with a bounded processing
+  pipeline. Forge applies the architectural principle to two planar PCM slots;
+  its codec-specific result is established by the measurements below rather
+  than inferred from that broader edge-streaming workload.
+- Research on
+  [ordered shared-memory stream processing](https://arxiv.org/abs/1803.11328)
+  distinguishes pipeline, task, and data parallelism, while measured
+  [batch-pipelining](https://doi.org/10.1016/j.jvcir.2012.03.009) shows that
+  synchronization overhead can erase gains in an already optimized codec.
+  Forge therefore activates its writer overlap only outside existing
+  file-level Rayon work and keeps a one-worker bypass.
 - [FLAC 1.5.0](https://xiph.org/flac/changelog.html) made independent-frame
   encoding multithreaded, and its
   [stream encoder API](https://www.xiph.org/flac/api/group__flac__stream__encoder.html)
@@ -1168,6 +1182,96 @@ normalized WAVE SHA-256 hashes matched v0.148.0 for both fixtures. A separate
 15-pair deterministic sawtooth control improved by 0.74%, which is treated as
 noise rather than a broad workload claim; the retained gain is specifically
 for chunks made safe by an already-established peak.
+
+### v0.150.0: bounded zero-copy lossy render pipeline
+
+MP3 and Opus encoding can now run on one worker from Forge's existing global
+Rayon pool while the caller decodes and applies the next normalization chunk.
+The decoder or output-domain PCM spool transfers its channel allocations to the
+writer by ownership and receives a recycled allocation in return. Pipeline
+depth is fixed at two chunks: storage is bounded by channel count and decoder
+chunk geometry rather than programme duration, and no PCM payload is copied.
+
+The writer is constructed inside its worker, so LAME's native handle never
+crosses threads. Setup failures are reported before DSP begins; an encoder
+failure stops the producer and retains earlier-chunk error precedence; finish
+and codec metadata remain ordered. `--jobs 1`, nested file-level work, and
+formats without a measured gain remain synchronous. A look-ahead limiter or an
+uncached caller-owned resampler output uses the established bounded-copy path.
+Normal plan-aware resampling is eligible for zero-copy replay because its
+already-required output-domain spool owns recyclable channel buffers.
+
+CPU-pinned alternating comparisons used deterministic 600-second, 48 kHz
+stereo PCM16 WAVE fixtures and native-host fat-LTO builds without PGO. MP3
+quiet-tail uses five pairs; the dense MP3, Opus, and one-worker control use
+seven. The shared host produced visible scheduler-preemption outliers, so
+values are medians and execution order alternates on every pair. Total CPU is
+user plus system time.
+
+| Workload / metric | v0.149.0 | v0.150.0 | Change |
+| --- | ---: | ---: | ---: |
+| Quiet-tail MP3, wall | 21.35 s | 20.24 s | -5.20% |
+| Quiet-tail MP3, total CPU | 22.07 s | 20.65 s | -6.43% |
+| Quiet-tail MP3, peak RSS | 22,888 KiB | 29,296 KiB | +28.00% |
+| Rising-dense MP3, wall | 16.77 s | 15.16 s | -9.60% |
+| Rising-dense MP3, total CPU | 16.74 s | 15.97 s | -4.60% |
+| Rising-dense MP3, peak RSS | 22,544 KiB | 29,024 KiB | +28.74% |
+| Quiet-tail Opus, wall | 5.16 s | 4.57 s | -11.43% |
+| Quiet-tail Opus, total CPU | 5.46 s | 5.45 s | -0.18% |
+| Quiet-tail Opus, peak RSS | 26,752 KiB | 29,308 KiB | +9.55% |
+| Opus `--jobs 1`, wall | 4.28 s | 4.29 s | +0.23% |
+| Opus `--jobs 1`, total CPU | 4.44 s | 4.45 s | +0.23% |
+| Opus `--jobs 1`, peak RSS | 26,948 KiB | 26,948 KiB | unchanged |
+| MP3 input to MP3, wall | 17.53 s | 16.28 s | -7.13% |
+| MP3 input to MP3, total CPU | 17.01 s | 17.99 s | +5.76% |
+| MP3 input to MP3, peak RSS | 22,480 KiB | 22,600 KiB | +0.53% |
+
+The compressed-input case uses five Latin-square-ordered triples and the MP3
+produced from the quiet-tail fixture. It exercises Symphonia packet decode,
+gain/ceiling DSP, and LAME encode in the same command. Its wall-time improvement
+comes with a disclosed aggregate-CPU cost; file-level parallel workloads can
+retain the established path by nesting work in the shared Rayon pool, while
+latency-sensitive single-file work receives the overlap.
+
+Every measured MP3 and Opus file matched v0.149.0 byte for byte. Dedicated
+tests also compare synchronous and pipelined MP3 bytes, writer chunk
+boundaries, multi-delivery WAVE/FLAC output, render statistics, and exact
+lossless verification. The additional live buffer is fixed at one decoder
+chunk beyond the serial path; it buys lower single-file latency without a
+programme-length queue or extra thread pool.
+
+Two broader pipeline variants were measured and rejected. A full
+decode-to-DSP-to-encode three-stage candidate preserved output bytes and
+statistics, but moved the compressed-input median from 16.28 s to 16.49 s
+(+1.29%) and total CPU from 17.99 s to 19.39 s (+7.78%): synchronization on
+every small codec packet outweighed the added overlap. An eight-packet bounded
+handoff reduced system CPU by about 72%, but two order-reversed probes regressed
+wall time from 15.82/15.77 s to 17.04/17.42 s. Returning allocations only after
+a complete batch removed the fine-grained producer/encoder overlap. Both
+experiments were byte-identical and were removed because elapsed time, not a
+kernel or synchronization counter, is the release criterion.
+
+A follow-up replaced the standard bounded channels with Crossbeam 0.5.16 to
+test whether a more lightly locked queue could preserve per-packet overlap
+while lowering coordination cost. Two order-reversed compressed-input probes
+were byte-identical, but the aggregate wall midpoint changed by only -0.15%,
+total CPU rose 1.34%, and system CPU rose about 9.8%. The generic MPMC channel
+was removed. The cache-optimized SPSC result in
+[FastForward](https://doi.org/10.1145/1345206.1345215) still motivates a
+specialized ring experiment, but only with a separately reviewed memory-order
+proof and the same end-to-end acceptance gate.
+
+Render-statistics scans were screened as another memory-traffic candidate. An
+explicit AVX2 implementation counted threshold exceedances in eight-sample
+groups and combined the post-gain full-scale and ceiling counters into one
+pass. Across 15 alternating WAVE normalize-and-verify pairs, its paired wall
+median regressed 2.16% despite 1.02% lower total CPU; only three pairs were
+faster. A scalar-only follow-up removed the extra SIMD dispatch and retained
+only the two-threshold pass fusion, but regressed paired wall and CPU medians by
+1.07% and 1.04%, respectively, with six of 15 wall-time wins. Both outputs were
+byte-identical and verified exactly. The prototypes were removed: LLVM already
+optimizes the established counts sufficiently, and the counters are not a
+material end-to-end bottleneck on this workload.
 
 ## Final integration gate
 

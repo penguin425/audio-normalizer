@@ -90,6 +90,35 @@ impl PcmSpool {
         }
         Ok(())
     }
+
+    /// Replay by handing each channel allocation to the consumer and accepting
+    /// a recycled set for the next record. This avoids a PCM copy when replay is
+    /// connected to a bounded writer pipeline.
+    pub(crate) fn replay_owned(
+        &mut self,
+        mut consume: impl FnMut(Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, String>,
+    ) -> Result<(), String> {
+        let mut handoff = Vec::new();
+        let channels = self.channels;
+        self.replay(|planar| {
+            handoff.reserve(planar.len());
+            for channel in planar.iter_mut() {
+                handoff.push(std::mem::take(channel));
+            }
+            let mut recycled = consume(std::mem::take(&mut handoff))?;
+            if recycled.len() != channels {
+                return Err(format!(
+                    "PCM spool consumer returned {} channels, expected {channels}",
+                    recycled.len()
+                ));
+            }
+            for (slot, channel) in planar.iter_mut().zip(recycled.drain(..)) {
+                *slot = channel;
+            }
+            handoff = recycled;
+            Ok(())
+        })
+    }
 }
 
 fn read_record_frames(file: &mut File) -> Result<Option<usize>, String> {
@@ -173,6 +202,53 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(replayed, expected);
         }
+    }
+
+    #[test]
+    fn owned_replay_refills_recycled_channel_allocations() {
+        let chunks = [
+            vec![vec![0.25, -0.5, 0.75], vec![-0.25, 0.5, -0.75]],
+            vec![vec![1.0, -1.0], vec![0.125, -0.125]],
+        ];
+        let mut spool = PcmSpool::new(2).unwrap();
+        for chunk in &chunks {
+            spool.write_chunk(chunk).unwrap();
+        }
+
+        let replacement = vec![Vec::with_capacity(8), Vec::with_capacity(8)];
+        let replacement_pointers = [replacement[0].as_ptr(), replacement[1].as_ptr()];
+        let mut replacement = Some(replacement);
+        let mut observed = Vec::new();
+        spool
+            .replay_owned(|chunk| {
+                observed.push(
+                    chunk
+                        .iter()
+                        .map(|channel| channel.iter().map(|sample| sample.to_bits()).collect())
+                        .collect::<Vec<Vec<u32>>>(),
+                );
+                if observed.len() == 1 {
+                    Ok(replacement.take().unwrap())
+                } else {
+                    assert_eq!(chunk[0].as_ptr(), replacement_pointers[0]);
+                    assert_eq!(chunk[1].as_ptr(), replacement_pointers[1]);
+                    Ok(chunk)
+                }
+            })
+            .unwrap();
+        let expected = chunks
+            .iter()
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|channel| channel.iter().map(|sample| sample.to_bits()).collect())
+                    .collect::<Vec<Vec<u32>>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observed, expected);
+
+        let error = spool.replay_owned(|_| Ok(vec![Vec::new()])).unwrap_err();
+        assert!(error.contains("returned 1 channels, expected 2"));
     }
 
     #[test]

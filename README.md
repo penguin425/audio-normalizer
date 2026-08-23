@@ -113,6 +113,13 @@ the `-o` extension override this.
   same protected chunks to every requested writer. Each codec keeps its own
   quantizer, dither state, and encoder state, while staged verification and
   atomic publication remain per output.
+* **Bounded zero-copy lossy rendering** overlaps MP3 or Opus encoding with the
+  next decode/DSP chunk when `--jobs` permits. Two recycled planar buffers move
+  by ownership between stages, so the PCM payload is neither cloned nor kept
+  for the programme duration. Encoder setup, errors, finalization, and output
+  order remain deterministic; `--jobs 1` and nested file-level work retain the
+  synchronous path. Limiter and uncached conversion paths use the established
+  copy fallback when their output storage cannot be transferred safely.
 * **Bounded parallel FLAC encoding** coalesces short decoder packets, encodes
   independent fixed-size frames and their bitstreams on up to eight tasks in
   the global worker pool, overlaps the serial source-order MD5 update with that
