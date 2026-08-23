@@ -1,0 +1,221 @@
+name: Stereo PCM16 decode candidate benchmark
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/pcm16-decode-benchmark.yml"
+      - "examples/pcm16_decode_benchmark.rs"
+      - "src/dsp/convert.rs"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pcm16-decode-benchmark-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: benchmark (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+
+      - name: Check out exact pull-request base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: baseline
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+
+      - name: Prove SIMD decode against the scalar path
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_TARGET_DIR: ${{ runner.temp }}/target-candidate-tests
+          RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-Ctarget-feature=+neon,+aes,+sha2' || '' }}
+        run: >-
+          cargo test --locked --manifest-path candidate/Cargo.toml
+          --no-default-features --lib
+          s16_stereo_simd_decoder_matches_scalar_for_all_codes_and_tails -- --nocapture
+
+      - name: Build exact baseline and candidate
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "0"
+          RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-Ctarget-feature=+neon,+aes,+sha2' || '' }}
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/target-baseline" \
+            cargo build --locked --release --manifest-path baseline/Cargo.toml \
+              --no-default-features --bin forge
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/target-candidate" \
+            cargo build --locked --release --manifest-path candidate/Cargo.toml \
+              --no-default-features --bin forge --example pcm16_decode_benchmark
+
+      - name: Run isolated PCM16 decode A/B
+        shell: bash
+        run: >-
+          "${RUNNER_TEMP}/target-candidate/release/examples/pcm16_decode_benchmark"
+          18 > pcm16-decode.json
+
+      - name: Run end-to-end benchmarks in both orders
+        shell: bash
+        run: |
+          set -euo pipefail
+          common=(
+            --duration-seconds 300
+            --iterations 5
+            --case wav-stereo-analyze
+            --case wav-stereo-normalize
+            --case wav-stereo-verify
+          )
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-baseline/release/forge" \
+            --container-qc "${RUNNER_TEMP}/target-baseline/release/forge" \
+            --work-dir "${RUNNER_TEMP}/bench-base-first" \
+            --output normalize-base-first.json "${common[@]}"
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-candidate/release/forge" \
+            --container-qc "${RUNNER_TEMP}/target-candidate/release/forge" \
+            --work-dir "${RUNNER_TEMP}/bench-candidate-first" \
+            --output normalize-candidate-first.json "${common[@]}"
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-candidate/release/forge" \
+            --container-qc "${RUNNER_TEMP}/target-candidate/release/forge" \
+            --work-dir "${RUNNER_TEMP}/bench-candidate-second" \
+            --output normalize-candidate-second.json "${common[@]}"
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-baseline/release/forge" \
+            --container-qc "${RUNNER_TEMP}/target-baseline/release/forge" \
+            --work-dir "${RUNNER_TEMP}/bench-base-second" \
+            --output normalize-base-second.json "${common[@]}"
+
+      - name: Verify exact analysis and normalized output
+        shell: bash
+        run: |
+          set -euo pipefail
+          exact_dir="${RUNNER_TEMP}/exact-output"
+          mkdir -p "${exact_dir}"
+          EXACT_DIR="${exact_dir}" python3 - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "candidate/tools")
+          from benchmark import write_pcm16_wave
+
+          root = Path(os.environ["EXACT_DIR"])
+          write_pcm16_wave(root / "stereo.wav", 30, 48_000, 2)
+          PY
+
+          baseline="${RUNNER_TEMP}/target-baseline/release/forge"
+          candidate="${RUNNER_TEMP}/target-candidate/release/forge"
+          "${baseline}" "${exact_dir}/stereo.wav" --analyze --json > "${exact_dir}/base.json"
+          "${candidate}" "${exact_dir}/stereo.wav" --analyze --json > "${exact_dir}/candidate.json"
+          cmp "${exact_dir}/base.json" "${exact_dir}/candidate.json"
+
+          "${baseline}" "${exact_dir}/stereo.wav" --overwrite -o "${exact_dir}/base.wav"
+          "${candidate}" "${exact_dir}/stereo.wav" --overwrite -o "${exact_dir}/candidate.wav"
+          cmp "${exact_dir}/base.wav" "${exact_dir}/candidate.wav"
+
+          "${baseline}" "${exact_dir}/stereo.wav" --verify --overwrite -o "${exact_dir}/base-verify.wav"
+          "${candidate}" "${exact_dir}/stereo.wav" --verify --overwrite -o "${exact_dir}/candidate-verify.wav"
+          cmp "${exact_dir}/base-verify.wav" "${exact_dir}/candidate-verify.wav"
+
+      - name: Summarize pooled medians
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import platform
+          import statistics
+          from pathlib import Path
+
+          micro = json.loads(Path("pcm16-decode.json").read_text())
+          scalar = statistics.median(micro["scalar_seconds"])
+          simd = statistics.median(micro["simd_seconds"])
+          files = {
+              "baseline": [Path("normalize-base-first.json"), Path("normalize-base-second.json")],
+              "candidate": [Path("normalize-candidate-first.json"), Path("normalize-candidate-second.json")],
+          }
+
+          def indexed(paths):
+              documents = [json.loads(path.read_text()) for path in paths]
+              assert all(document["passed"] for document in documents)
+              return [{item["id"]: item for item in document["results"]} for document in documents]
+
+          results = {name: indexed(paths) for name, paths in files.items()}
+          summary = {
+              "system": {
+                  "os": platform.system(),
+                  "architecture": platform.machine(),
+              },
+              "isolated": {
+                  "frames": micro["frames"],
+                  "samples": len(micro["scalar_seconds"]),
+                  "scalar_seconds": scalar,
+                  "simd_seconds": simd,
+                  "wall_change_percent": (simd / scalar - 1.0) * 100.0,
+                  "checksum": micro["checksum"],
+              },
+              "normalization": [],
+          }
+
+          for case_id in results["baseline"][0]:
+              base_samples = [
+                  sample
+                  for document in results["baseline"]
+                  for sample in document[case_id]["samples"]
+              ]
+              candidate_samples = [
+                  sample
+                  for document in results["candidate"]
+                  for sample in document[case_id]["samples"]
+              ]
+              base_wall = statistics.median(sample["wall_seconds"] for sample in base_samples)
+              candidate_wall = statistics.median(sample["wall_seconds"] for sample in candidate_samples)
+              base_cpu = statistics.median(
+                  sample["user_cpu_seconds"] + sample["system_cpu_seconds"]
+                  for sample in base_samples
+              )
+              candidate_cpu = statistics.median(
+                  sample["user_cpu_seconds"] + sample["system_cpu_seconds"]
+                  for sample in candidate_samples
+              )
+              summary["normalization"].append({
+                  "id": case_id,
+                  "samples": len(base_samples),
+                  "baseline_wall_seconds": base_wall,
+                  "candidate_wall_seconds": candidate_wall,
+                  "wall_change_percent": (candidate_wall / base_wall - 1.0) * 100.0,
+                  "baseline_cpu_seconds": base_cpu,
+                  "candidate_cpu_seconds": candidate_cpu,
+                  "cpu_change_percent": (candidate_cpu / base_cpu - 1.0) * 100.0,
+              })
+
+          Path("pcm16-decode-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+          print(json.dumps(summary, indent=2))
+          PY
+
+      - name: Upload benchmark evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: pcm16-decode-benchmark-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            pcm16-decode.json
+            normalize-*.json
+            pcm16-decode-summary.json
+          if-no-files-found: error
+          retention-days: 30

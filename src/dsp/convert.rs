@@ -40,7 +40,8 @@ pub fn decode_planar(bytes: &[u8], kind: PcmKind, channels: usize) -> Vec<Vec<f3
 /// Decode into caller-owned channel buffers so streaming verification can
 /// inspect the exact PCM bytes written by a lossless muxer without allocating
 /// one new planar buffer per chunk.
-pub(crate) fn decode_planar_into(
+#[doc(hidden)]
+pub fn decode_planar_into(
     bytes: &[u8],
     kind: PcmKind,
     channels: usize,
