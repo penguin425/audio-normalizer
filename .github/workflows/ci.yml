@@ -213,6 +213,15 @@ jobs:
           --no-default-features --lib
           pair_kweight_is_bit_exact_including_exceptional_samples
 
+      - name: Check AArch64 stereo PCM16 decode equivalence
+        if: matrix.os == 'macos-latest'
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: >-
+          cargo test --locked --target ${{ matrix.target }}
+          --no-default-features --lib
+          s16_stereo_streaming_simd_matches_scalar_for_all_codes_and_tails
+
       - name: Link and run a C consumer
         if: runner.os != 'Windows'
         shell: bash

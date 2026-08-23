@@ -11,6 +11,7 @@ use rayon::prelude::*;
 use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+use std::mem::MaybeUninit;
 
 /// Decode an interleaved PCM byte buffer into planar f32 channels.
 ///
@@ -46,6 +47,10 @@ pub(crate) fn decode_planar_into(
     if output.len() != channels {
         output.clear();
         output.resize_with(channels, Vec::new);
+    }
+    if kind == PcmKind::S16 && channels == 2 && s16_stereo_simd_available() {
+        decode_s16_stereo_into(bytes, frames, output);
+        return;
     }
     output
         .par_iter_mut()
@@ -138,6 +143,155 @@ fn decode_channel_into(
             }
         }
     }
+}
+
+#[inline]
+fn s16_stereo_simd_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx2")
+    }
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    {
+        true
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little")
+    )))]
+    {
+        false
+    }
+}
+
+/// Decode and deinterleave the default stereo PCM16 layout in one pass. The
+/// caller-owned vectors expose spare capacity during the write so reuse does
+/// not pay for a zero-fill pass before every decoder chunk.
+fn decode_s16_stereo_into(bytes: &[u8], frames: usize, output: &mut [Vec<f32>]) {
+    debug_assert_eq!(output.len(), 2);
+    debug_assert!(bytes.len() >= frames * 4);
+    let (left, right) = output.split_at_mut(1);
+    let left = &mut left[0];
+    let right = &mut right[0];
+    left.clear();
+    right.clear();
+    left.reserve(frames);
+    right.reserve(frames);
+
+    {
+        let left_spare = &mut left.spare_capacity_mut()[..frames];
+        let right_spare = &mut right.spare_capacity_mut()[..frames];
+
+        #[cfg(target_arch = "x86_64")]
+        let frame = if is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 is checked at runtime. Both spare slices have
+            // `frames` writable elements and the byte slice contains every
+            // complete interleaved frame passed to this helper.
+            unsafe { decode_s16_stereo_avx2(bytes, left_spare, right_spare) }
+        } else {
+            0
+        };
+
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        let frame = {
+            // SAFETY: Advanced SIMD is mandatory on AArch64. The slice bounds
+            // are established above and WAVE PCM is little-endian.
+            unsafe { decode_s16_stereo_neon(bytes, left_spare, right_spare) }
+        };
+
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_endian = "little")
+        )))]
+        let frame = 0;
+
+        decode_s16_stereo_scalar_from(bytes, left_spare, right_spare, frame);
+    }
+
+    // SAFETY: the SIMD prefix and scalar tail above initialize every element
+    // in both spare-capacity slices before either length becomes observable.
+    unsafe {
+        left.set_len(frames);
+        right.set_len(frames);
+    }
+}
+
+fn decode_s16_stereo_scalar_from(
+    bytes: &[u8],
+    left: &mut [MaybeUninit<f32>],
+    right: &mut [MaybeUninit<f32>],
+    start_frame: usize,
+) {
+    debug_assert_eq!(left.len(), right.len());
+    for frame in start_frame..left.len() {
+        let offset = frame * 4;
+        let left_sample = i16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+        let right_sample = i16::from_le_bytes([bytes[offset + 2], bytes[offset + 3]]);
+        left[frame].write(left_sample as f32 / 32_768.0);
+        right[frame].write(right_sample as f32 / 32_768.0);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn decode_s16_stereo_avx2(
+    bytes: &[u8],
+    left: &mut [MaybeUninit<f32>],
+    right: &mut [MaybeUninit<f32>],
+) -> usize {
+    debug_assert_eq!(left.len(), right.len());
+    let frames = left.len();
+    let shuffle = _mm_setr_epi8(0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15);
+    let scale = _mm256_set1_ps(1.0 / 32_768.0);
+    let left_output = left.as_mut_ptr().cast::<f32>();
+    let right_output = right.as_mut_ptr().cast::<f32>();
+    let mut frame = 0;
+    while frame + 8 <= frames {
+        let source = bytes.as_ptr().add(frame * 4);
+        let interleaved = _mm256_loadu_si256(source.cast());
+        let first = _mm_shuffle_epi8(_mm256_castsi256_si128(interleaved), shuffle);
+        let second = _mm_shuffle_epi8(_mm256_extracti128_si256(interleaved, 1), shuffle);
+        let left_i16 = _mm_unpacklo_epi64(first, second);
+        let right_i16 = _mm_unpackhi_epi64(first, second);
+        let left_f32 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(left_i16)), scale);
+        let right_f32 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(right_i16)), scale);
+        _mm256_storeu_ps(left_output.add(frame), left_f32);
+        _mm256_storeu_ps(right_output.add(frame), right_f32);
+        frame += 8;
+    }
+    frame
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+unsafe fn decode_s16_stereo_neon(
+    bytes: &[u8],
+    left: &mut [MaybeUninit<f32>],
+    right: &mut [MaybeUninit<f32>],
+) -> usize {
+    debug_assert_eq!(left.len(), right.len());
+    let frames = left.len();
+    let scale = vdupq_n_f32(1.0 / 32_768.0);
+    let left_output = left.as_mut_ptr().cast::<f32>();
+    let right_output = right.as_mut_ptr().cast::<f32>();
+    let mut frame = 0;
+    while frame + 8 <= frames {
+        let source = bytes.as_ptr().add(frame * 4).cast::<i16>();
+        let first = vld1q_s16(source);
+        let second = vld1q_s16(source.add(8));
+        let left_i16 = vuzp1q_s16(first, second);
+        let right_i16 = vuzp2q_s16(first, second);
+        let left_low = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(left_i16))), scale);
+        let left_high = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(left_i16)), scale);
+        let right_low = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(right_i16))), scale);
+        let right_high = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(right_i16)), scale);
+        vst1q_f32(left_output.add(frame), left_low);
+        vst1q_f32(left_output.add(frame + 4), left_high);
+        vst1q_f32(right_output.add(frame), right_low);
+        vst1q_f32(right_output.add(frame + 4), right_high);
+        frame += 8;
+    }
+    frame
 }
 
 /// Encode planar f32 into an interleaved byte buffer of `kind`.
@@ -1137,6 +1291,50 @@ mod tests {
                 reused.iter().map(Vec::capacity).collect::<Vec<_>>(),
                 capacities,
                 "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn s16_stereo_streaming_simd_matches_scalar_for_all_codes_and_tails() {
+        let mut bytes = Vec::with_capacity((u16::MAX as usize + 4) * 4);
+        for code in i16::MIN..=i16::MAX {
+            bytes.extend_from_slice(&code.to_le_bytes());
+            bytes.extend_from_slice(&code.wrapping_neg().wrapping_sub(1).to_le_bytes());
+        }
+        for frame in 0_i16..4 {
+            bytes.extend_from_slice(&frame.to_le_bytes());
+            bytes.extend_from_slice(&(-frame).to_le_bytes());
+        }
+
+        for frames in (0..=33).chain([4_099, u16::MAX as usize + 1, u16::MAX as usize + 4]) {
+            let input = &bytes[..frames * 4];
+            let expected = [
+                decode_channel(input, PcmKind::S16, 2, 0, frames),
+                decode_channel(input, PcmKind::S16, 2, 1, frames),
+            ];
+            let actual = decode_planar(input, PcmKind::S16, 2);
+            assert_eq!(
+                actual.as_slice(),
+                expected.as_slice(),
+                "allocating path, frames={frames}"
+            );
+
+            let mut reused = vec![
+                Vec::with_capacity(bytes.len()),
+                Vec::with_capacity(bytes.len()),
+            ];
+            let capacities = reused.iter().map(Vec::capacity).collect::<Vec<_>>();
+            decode_planar_into(input, PcmKind::S16, 2, &mut reused);
+            assert_eq!(
+                reused.as_slice(),
+                expected.as_slice(),
+                "caller-owned path, frames={frames}"
+            );
+            assert_eq!(
+                reused.iter().map(Vec::capacity).collect::<Vec<_>>(),
+                capacities,
+                "caller-owned capacity, frames={frames}"
             );
         }
     }
