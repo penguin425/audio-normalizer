@@ -48,7 +48,7 @@ jobs:
         run: >-
           cargo test --locked --manifest-path candidate/Cargo.toml
           --no-default-features --lib
-          s16_stereo_simd_decoder_matches_scalar_for_all_codes_and_tails -- --nocapture
+          s16_stereo_streaming_simd_matches_scalar_for_all_codes_and_tails -- --nocapture
 
       - name: Build exact baseline and candidate
         shell: bash

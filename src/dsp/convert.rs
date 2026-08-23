@@ -15,8 +15,7 @@ use std::mem::MaybeUninit;
 
 /// Decode an interleaved PCM byte buffer into planar f32 channels.
 ///
-/// Default stereo PCM16 is decoded and deinterleaved in one SIMD pass. Other
-/// layouts are decoded independently and in parallel (one rayon task per
+/// Channels are decoded independently and in parallel (one rayon task per
 /// channel), which scales well on multi-core hosts and keeps each task's output
 /// buffer contiguous for the hardware prefetcher.
 pub fn decode_planar(bytes: &[u8], kind: PcmKind, channels: usize) -> Vec<Vec<f32>> {
@@ -24,12 +23,6 @@ pub fn decode_planar(bytes: &[u8], kind: PcmKind, channels: usize) -> Vec<Vec<f3
     let bpp = kind.bytes_per_sample();
     let frame_bytes = bpp * channels;
     let frames = bytes.len() / frame_bytes;
-
-    if kind == PcmKind::S16 && channels == 2 && s16_stereo_simd_available() {
-        let mut output = vec![Vec::with_capacity(frames), Vec::with_capacity(frames)];
-        decode_s16_stereo_into(bytes, frames, &mut output);
-        return output;
-    }
 
     (0..channels)
         .into_par_iter()
@@ -1304,7 +1297,7 @@ mod tests {
     }
 
     #[test]
-    fn s16_stereo_simd_decoder_matches_scalar_for_all_codes_and_tails() {
+    fn s16_stereo_streaming_simd_matches_scalar_for_all_codes_and_tails() {
         let mut bytes = Vec::with_capacity((u16::MAX as usize + 4) * 4);
         for code in i16::MIN..=i16::MAX {
             bytes.extend_from_slice(&code.to_le_bytes());
