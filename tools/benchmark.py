@@ -3,7 +3,7 @@
 
 Fixtures are generated outside the measured interval and are removed after
 each case unless --keep-fixtures is used. The script only uses Python's
-standard library; ffmpeg is required for the FLAC and MP3 cases.
+standard library; ffmpeg is required for the FLAC, MP3, and Opus cases.
 """
 
 from __future__ import annotations
@@ -44,10 +44,12 @@ DEFAULT_CASES = (
     "mp3-stereo-normalize",
     "pathological-wave-qc",
 )
-OPTIONAL_CASES = (
+DSD_CASES = (
     "dsf-stereo-analyze",
     "dsdiff-stereo-analyze",
 )
+OPUS_CASES = ("opus-stereo-analyze",)
+OPTIONAL_CASES = (*DSD_CASES, *OPUS_CASES)
 ALL_CASES = (*DEFAULT_CASES, *OPTIONAL_CASES)
 MAX_DURATION_SECONDS = 3_600
 MAX_PATHOLOGICAL_CHUNKS = 100_001
@@ -413,6 +415,7 @@ def sanitized_command(case_id: str) -> list[str]:
         "mp3-stereo-normalize": [
             "forge", "<input.mp3>", "--overwrite", "-o", "<output.wav>"
         ],
+        "opus-stereo-analyze": ["forge", "<input.opus>", "--analyze", "--json"],
         "dsf-stereo-analyze": ["forge", "<input.dsf>", "--analyze", "--json"],
         "dsdiff-stereo-analyze": ["forge", "<input.dff>", "--analyze", "--json"],
         "pathological-wave-qc": [
@@ -440,6 +443,7 @@ def case_spec(case_id: str) -> tuple[str, str, int, str]:
         "flac-stereo-normalize": ("lossless", "flac", 2, "normalize"),
         "mp3-stereo-analyze": ("lossy", "mp3", 2, "analyze"),
         "mp3-stereo-normalize": ("lossy", "mp3", 2, "normalize"),
+        "opus-stereo-analyze": ("lossy", "opus", 2, "analyze"),
         "dsf-stereo-analyze": ("lossless", "dsf", 2, "analyze"),
         "dsdiff-stereo-analyze": ("lossless", "dsdiff", 2, "analyze"),
         "pathological-wave-qc": ("pathological", "wav", 1, "container-qc"),
@@ -484,7 +488,7 @@ def run_case(
         measured_duration: float | None = None
     else:
         estimated = pcm_bytes(duration, sample_rate, channels)
-        if case_id in OPTIONAL_CASES:
+        if case_id in DSD_CASES:
             estimated = duration * DSD_SAMPLE_RATE * channels // 8
             require_space(case_dir, estimated)
             if input_format == "dsf":
@@ -563,6 +567,25 @@ def run_case(
                 encode_fixture(
                     ffmpeg, wave_path, input_path,
                     ["-c:a", "libmp3lame", "-b:a", "320k"],
+                    timeout_seconds,
+                )
+                wave_path.unlink()
+            elif input_format == "opus":
+                if ffmpeg is None:
+                    raise RuntimeError("ffmpeg is required for the Opus benchmark")
+                input_path = case_dir / "input.opus"
+                encode_fixture(
+                    ffmpeg,
+                    wave_path,
+                    input_path,
+                    [
+                        "-map_metadata", "-1",
+                        "-c:a", "libopus",
+                        "-b:a", "128k",
+                        "-vbr", "off",
+                        "-application", "audio",
+                        "-frame_duration", "20",
+                    ],
                     timeout_seconds,
                 )
                 wave_path.unlink()
@@ -775,7 +798,7 @@ def main() -> int:
     if len(cases) != len(set(cases)):
         raise ValueError("benchmark cases must not be repeated")
     ffmpeg = args.ffmpeg
-    if any(case_spec(case)[1] in ("flac", "mp3") for case in cases):
+    if any(case_spec(case)[1] in ("flac", "mp3", "opus") for case in cases):
         ffmpeg = executable(
             ffmpeg or Path(shutil.which("ffmpeg") or ""), "ffmpeg"
         )
