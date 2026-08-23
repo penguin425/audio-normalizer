@@ -1393,6 +1393,48 @@ scalar filters at 8, 44.1, 48, 96, 192, and 384 kHz, including subnormal,
 quiet/signaling NaN, and positive/negative infinity inputs. Both execution
 orders improved for every end-to-end workload.
 
+### v0.154.0: one-pass stereo PCM16 streaming decode
+
+The reusable native-WAVE decoder path now loads one interleaved stereo PCM16
+chunk and writes both planar f32 channels in the same pass. x86-64 uses an
+AVX2 byte shuffle, signed widening, conversion, and scale for eight frames at
+a time. Little-endian AArch64 uses Advanced SIMD unzip, signed widening,
+conversion, and scale for the same eight-frame group. Both kernels write into
+the vectors' spare capacity, avoiding a preceding zero-fill pass, and finish
+arbitrary tails with the established scalar decoder. Unsupported CPUs and all
+other PCM layouts retain the portable channel-parallel path.
+
+Only the caller-owned streaming decoder uses this dispatch. A prototype also
+replaced the allocating decoder's independent per-channel Rayon work, but its
+one-shot isolated measurement regressed, so that path was restored before the
+end-to-end comparison. This keeps the change on repeated 1 MiB WAVE chunks,
+where buffer reuse and the removed duplicate input read are both useful.
+
+The exact v0.153.0 base and candidate were built independently with Rust
+1.97.0 on GitHub-hosted x86-64 Linux and Apple Silicon runners. Isolated values
+are medians of 18 alternating measurements over 16,777,216 stereo frames.
+End-to-end values pool ten measurements per binary from both execution orders
+over a deterministic 300-second, 48 kHz PCM16 WAVE fixture. Total CPU is user
+plus system time.
+
+| Platform / workload | v0.153.0 | v0.154.0 | Wall change | CPU change |
+| --- | ---: | ---: | ---: | ---: |
+| Linux x86-64 isolated decode | 55.42 ms | 5.22 ms | -90.59% | n/a |
+| Linux x86-64 analysis | 0.895 s | 0.819 s | -8.51% | -16.68% |
+| Linux x86-64 normalization | 0.948 s | 0.824 s | -13.05% | -23.55% |
+| Linux x86-64 normalization with verification | 2.582 s | 2.423 s | -6.15% | -13.38% |
+| Apple Silicon isolated decode | 49.39 ms | 5.55 ms | -88.77% | n/a |
+| Apple Silicon analysis | 0.729 s | 0.599 s | -17.82% | -19.99% |
+| Apple Silicon normalization | 0.815 s | 0.665 s | -18.40% | -24.24% |
+| Apple Silicon normalization with verification | 2.247 s | 1.968 s | -12.40% | -15.85% |
+
+The isolated checksum was `69ddf3186b7a2325` on both architectures. Analysis
+JSON, ordinary normalized WAVE bytes, and verified normalized WAVE bytes were
+identical to v0.153.0. Per-order medians improved for every end-to-end row.
+Unit tests compare every one of the 65,536 signed PCM16 codes, inverse channel
+values, SIMD and scalar tails, zero-length input, reused capacities, and
+multi-chunk boundaries against independent scalar channel decoding.
+
 ## Final integration gate
 
 Before each release, run the full feature matrix, official conformance jobs

@@ -181,6 +181,11 @@ the `-o` extension override this.
   mono while using a frame-aligned 1 MiB chunk for stereo and multichannel
   inputs. The planar decode buffer is reused between reads, reducing allocator,
   scheduler, and I/O-call overhead without changing decoded samples.
+* **One-pass stereo PCM16 streaming decode** uses AVX2 or little-endian AArch64
+  Advanced SIMD to sign-extend, scale, and deinterleave each reusable decoder
+  chunk directly into its planar channel buffers. Every PCM16 code and scalar
+  tail is bit-identical to the portable decoder. The allocating library path
+  retains its lower-overhead parallel per-channel implementation.
 * **Bounded-memory streaming** decodes analysis and normalization in chunks.
   Normalization uses two sequential passes so gain is known before encoding,
   without retaining the complete audio file in RAM. Single-source render paths
