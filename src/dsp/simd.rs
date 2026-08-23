@@ -6,6 +6,8 @@
 //! target-cpu=native` the scalar fallbacks are themselves auto-vectorized by
 //! LLVM (SSE2 baseline on x86-64), so even the "slow" path is fast.
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
@@ -20,6 +22,11 @@ pub fn apply_gain(buf: &mut [f32], gain: f32) {
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { apply_gain_neon(buf, gain) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     apply_gain_scalar(buf, gain)
 }
 
@@ -41,6 +48,11 @@ pub fn apply_gain_and_hard_clip(buf: &mut [f32], gain: f32, ceil: f32) {
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { apply_gain_and_hard_clip_neon(buf, gain, ceil) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     apply_gain_and_hard_clip_scalar(buf, gain, ceil)
 }
 
@@ -82,6 +94,11 @@ pub fn abs_max(buf: &[f32]) -> f32 {
             return unsafe { abs_max_avx2(buf) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        abs_max_neon(buf)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     abs_max_scalar(buf)
 }
 
@@ -98,6 +115,11 @@ pub(crate) fn abs_max_and_has_nan(buf: &[f32]) -> (f32, bool) {
             return unsafe { abs_max_and_has_nan_avx2(buf) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        abs_max_and_has_nan_neon(buf)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     abs_max_and_has_nan_scalar(buf)
 }
 
@@ -132,6 +154,11 @@ fn abs_max_and_has_nan_scalar(buf: &[f32]) -> (f32, bool) {
 /// global gain so this should never engage in practice.
 #[inline]
 pub fn hard_clip(buf: &mut [f32], ceil: f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { hard_clip_neon(buf, ceil) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     for x in buf.iter_mut() {
         *x = x.clamp(-ceil, ceil);
     }
@@ -278,6 +305,111 @@ unsafe fn abs_max_and_has_nan_avx2(buf: &[f32]) -> (f32, bool) {
     (scalar_maximum, has_nan)
 }
 
+// ---------------------------------------------------------------------------
+// AArch64 Advanced SIMD implementations
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn apply_gain_neon(buf: &mut [f32], gain: f32) {
+    let gain_vector = vdupq_n_f32(gain);
+    let mut index = 0;
+    while index + 4 <= buf.len() {
+        let samples = vld1q_f32(buf.as_ptr().add(index));
+        vst1q_f32(buf.as_mut_ptr().add(index), vmulq_f32(samples, gain_vector));
+        index += 4;
+    }
+    apply_gain_scalar(&mut buf[index..], gain);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn apply_gain_and_hard_clip_neon(buf: &mut [f32], gain: f32, ceil: f32) {
+    let gain_vector = vdupq_n_f32(gain);
+    let lower = vdupq_n_f32(-ceil);
+    let upper = vdupq_n_f32(ceil);
+    let mut index = 0;
+    while index + 4 <= buf.len() {
+        let samples = vld1q_f32(buf.as_ptr().add(index));
+        let gained = vmulq_f32(samples, gain_vector);
+        // Comparisons are false for NaN, so the gained NaN (including its
+        // payload) remains selected just as it does in f32::clamp.
+        let lower_clipped = vbslq_f32(vcltq_f32(gained, lower), lower, gained);
+        let protected = vbslq_f32(vcltq_f32(upper, gained), upper, lower_clipped);
+        vst1q_f32(buf.as_mut_ptr().add(index), protected);
+        index += 4;
+    }
+    apply_gain_and_hard_clip_scalar(&mut buf[index..], gain, ceil);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn hard_clip_neon(buf: &mut [f32], ceil: f32) {
+    let lower = vdupq_n_f32(-ceil);
+    let upper = vdupq_n_f32(ceil);
+    let mut index = 0;
+    while index + 4 <= buf.len() {
+        let samples = vld1q_f32(buf.as_ptr().add(index));
+        let lower_clipped = vbslq_f32(vcltq_f32(samples, lower), lower, samples);
+        let protected = vbslq_f32(vcltq_f32(upper, samples), upper, lower_clipped);
+        vst1q_f32(buf.as_mut_ptr().add(index), protected);
+        index += 4;
+    }
+    for sample in &mut buf[index..] {
+        *sample = sample.clamp(-ceil, ceil);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn abs_max_neon(buf: &[f32]) -> f32 {
+    let zero = vdupq_n_f32(0.0);
+    let mut maximum = zero;
+    let mut index = 0;
+    while index + 4 <= buf.len() {
+        let samples = vld1q_f32(buf.as_ptr().add(index));
+        let ordered = vceqq_f32(samples, samples);
+        let finite_absolute = vbslq_f32(ordered, vabsq_f32(samples), zero);
+        maximum = vmaxq_f32(maximum, finite_absolute);
+        index += 4;
+    }
+    let mut scalar_maximum = vmaxvq_f32(maximum);
+    for &sample in &buf[index..] {
+        let absolute = sample.abs();
+        if absolute > scalar_maximum {
+            scalar_maximum = absolute;
+        }
+    }
+    scalar_maximum
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn abs_max_and_has_nan_neon(buf: &[f32]) -> (f32, bool) {
+    let zero = vdupq_n_f32(0.0);
+    let mut maximum = zero;
+    let mut unordered = vdupq_n_u32(0);
+    let mut index = 0;
+    while index + 4 <= buf.len() {
+        let samples = vld1q_f32(buf.as_ptr().add(index));
+        let ordered = vceqq_f32(samples, samples);
+        unordered = vorrq_u32(unordered, vmvnq_u32(ordered));
+        let finite_absolute = vbslq_f32(ordered, vabsq_f32(samples), zero);
+        maximum = vmaxq_f32(maximum, finite_absolute);
+        index += 4;
+    }
+    let mut scalar_maximum = vmaxvq_f32(maximum);
+    let mut has_nan = vmaxvq_u32(unordered) != 0;
+    for &sample in &buf[index..] {
+        if sample.is_nan() {
+            has_nan = true;
+        } else {
+            scalar_maximum = scalar_maximum.max(sample.abs());
+        }
+    }
+    (scalar_maximum, has_nan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,5 +510,79 @@ mod tests {
             abs_max_and_has_nan(&samples),
             abs_max_and_has_nan_scalar(&samples)
         );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_gain_clip_and_peak_primitives_match_scalar_bits() {
+        let mut samples = vec![
+            -f32::INFINITY,
+            -2.0,
+            -1.0,
+            -0.0,
+            0.0,
+            f32::from_bits(1),
+            -f32::from_bits(1),
+            0.125,
+            0.75,
+            1.0,
+            2.0,
+            f32::INFINITY,
+            f32::from_bits(0x7fc0_1234),
+        ];
+        let mut state = 0x510e_527f_ade6_82d1_u64;
+        for _ in 0..4099 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            samples.push(f32::from_bits((state >> 32) as u32));
+        }
+
+        for length in [0, 1, 3, 4, 5, 31, 32, 33, 1027, samples.len()] {
+            let input = &samples[..length];
+
+            let mut expected = input.to_vec();
+            let mut actual = input.to_vec();
+            apply_gain_scalar(&mut expected, 0.812_345_7);
+            apply_gain(&mut actual, 0.812_345_7);
+            assert_eq!(
+                sample_bits(&actual),
+                sample_bits(&expected),
+                "gain len={length}"
+            );
+
+            let mut expected = input.to_vec();
+            let mut actual = input.to_vec();
+            apply_gain_and_hard_clip_scalar(&mut expected, 0.812_345_7, 0.891_250_9);
+            apply_gain_and_hard_clip(&mut actual, 0.812_345_7, 0.891_250_9);
+            assert_eq!(
+                sample_bits(&actual),
+                sample_bits(&expected),
+                "gain+clip len={length}"
+            );
+
+            let mut expected = input.to_vec();
+            for sample in &mut expected {
+                *sample = sample.clamp(-0.891_250_9, 0.891_250_9);
+            }
+            let mut actual = input.to_vec();
+            hard_clip(&mut actual, 0.891_250_9);
+            assert_eq!(
+                sample_bits(&actual),
+                sample_bits(&expected),
+                "clip len={length}"
+            );
+
+            assert_eq!(abs_max(input).to_bits(), abs_max_scalar(input).to_bits());
+            assert_eq!(
+                abs_max_and_has_nan(input),
+                abs_max_and_has_nan_scalar(input)
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn sample_bits(samples: &[f32]) -> Vec<u32> {
+        samples.iter().map(|sample| sample.to_bits()).collect()
     }
 }
