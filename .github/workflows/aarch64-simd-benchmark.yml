@@ -110,16 +110,42 @@ jobs:
             --work-dir "${RUNNER_TEMP}/bench-base-second" \
             --output normalize-base-second.json "${common[@]}"
 
-      - name: Verify byte-identical normalized output
+      - name: Verify exact analysis and normalized output
         shell: bash
         run: |
           set -euo pipefail
-          for case_id in wav-stereo-normalize wav-stereo-verify wav-7.1-normalize; do
-            reference="${RUNNER_TEMP}/bench-base-first/${case_id}/output.wav"
-            cmp "${reference}" "${RUNNER_TEMP}/bench-candidate-first/${case_id}/output.wav"
-            cmp "${reference}" "${RUNNER_TEMP}/bench-candidate-second/${case_id}/output.wav"
-            cmp "${reference}" "${RUNNER_TEMP}/bench-base-second/${case_id}/output.wav"
-          done
+          exact_dir="${RUNNER_TEMP}/exact-output"
+          mkdir -p "${exact_dir}"
+          EXACT_DIR="${exact_dir}" python3 - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "candidate/tools")
+          from benchmark import write_pcm16_wave
+
+          root = Path(os.environ["EXACT_DIR"])
+          write_pcm16_wave(root / "stereo.wav", 30, 48_000, 2)
+          write_pcm16_wave(root / "surround.wav", 30, 48_000, 8)
+          PY
+
+          baseline="${RUNNER_TEMP}/target-baseline/release/forge"
+          candidate="${RUNNER_TEMP}/target-candidate/release/forge"
+          "${baseline}" "${exact_dir}/stereo.wav" --analyze --json > "${exact_dir}/base.json"
+          "${candidate}" "${exact_dir}/stereo.wav" --analyze --json > "${exact_dir}/candidate.json"
+          cmp "${exact_dir}/base.json" "${exact_dir}/candidate.json"
+
+          "${baseline}" "${exact_dir}/stereo.wav" --overwrite -o "${exact_dir}/base.wav"
+          "${candidate}" "${exact_dir}/stereo.wav" --overwrite -o "${exact_dir}/candidate.wav"
+          cmp "${exact_dir}/base.wav" "${exact_dir}/candidate.wav"
+
+          "${baseline}" "${exact_dir}/stereo.wav" --verify --overwrite -o "${exact_dir}/base-verify.wav"
+          "${candidate}" "${exact_dir}/stereo.wav" --verify --overwrite -o "${exact_dir}/candidate-verify.wav"
+          cmp "${exact_dir}/base-verify.wav" "${exact_dir}/candidate-verify.wav"
+
+          "${baseline}" "${exact_dir}/surround.wav" --channel-layout 7.1 --overwrite -o "${exact_dir}/base-7.1.wav"
+          "${candidate}" "${exact_dir}/surround.wav" --channel-layout 7.1 --overwrite -o "${exact_dir}/candidate-7.1.wav"
+          cmp "${exact_dir}/base-7.1.wav" "${exact_dir}/candidate-7.1.wav"
 
       - name: Summarize pooled medians and verify checksums
         shell: bash
