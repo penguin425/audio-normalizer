@@ -204,6 +204,15 @@ jobs:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo test --locked --target ${{ matrix.target }} --test c_api --test c_header
 
+      - name: Check AArch64 stereo K-weighting equivalence
+        if: matrix.os == 'macos-latest'
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: >-
+          cargo test --locked --target ${{ matrix.target }}
+          --no-default-features --lib
+          pair_kweight_is_bit_exact_including_exceptional_samples
+
       - name: Link and run a C consumer
         if: runner.os != 'Windows'
         shell: bash
