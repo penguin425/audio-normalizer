@@ -2826,12 +2826,31 @@ impl NormalizedStreamWriter {
     }
 }
 
-fn stream_writer_pipeline_enabled(formats: &[OutputFormat]) -> bool {
-    rayon::current_num_threads() > 1
-        && rayon::current_thread_index().is_none()
-        && formats
+fn stream_writer_work_can_overlap(
+    formats: &[OutputFormat],
+    options: StreamRenderOptions<'_>,
+) -> bool {
+    !formats.is_empty()
+        && (formats
             .iter()
             .any(|format| matches!(format, OutputFormat::Mp3 | OutputFormat::Opus))
+            || (options.capture_statistics
+                && options.capture_lossless_verification
+                && formats
+                    .iter()
+                    .all(|format| matches!(format, OutputFormat::Wav))))
+}
+
+fn stream_writer_pipeline_enabled(
+    formats: &[OutputFormat],
+    options: StreamRenderOptions<'_>,
+) -> bool {
+    // Nested file/album work already owns the shared worker budget. FLAC also
+    // keeps its existing frame-parallel writer: putting that writer behind
+    // this outer handoff reduces its measured parallelism rather than helping.
+    rayon::current_num_threads() > 1
+        && rayon::current_thread_index().is_none()
+        && stream_writer_work_can_overlap(formats, options)
 }
 
 fn copy_pipeline_chunk(destination: &mut Vec<Vec<f32>>, source: &[Vec<f32>]) {
@@ -3103,7 +3122,7 @@ fn normalize_stream(
     options: StreamRenderOptions<'_>,
 ) -> Result<StreamRenderResult, String> {
     let ceiling = 10.0_f64.powf(plan.ceiling_db / 20.0) as f32;
-    if stream_writer_pipeline_enabled(&[format]) {
+    if stream_writer_pipeline_enabled(&[format], options) {
         let input = source.path;
         let (statistics, mut lossless_outputs) = process_normalized_stream_pipelined(
             source,
@@ -3154,7 +3173,7 @@ fn normalize_streams(
         return Err("stream output/format count mismatch".into());
     }
     let ceiling = 10.0_f64.powf(plan.ceiling_db / 20.0) as f32;
-    if stream_writer_pipeline_enabled(formats) {
+    if stream_writer_pipeline_enabled(formats, options) {
         let input = source.path;
         let (statistics, lossless_outputs) = process_normalized_stream_pipelined(
             source,
@@ -3604,6 +3623,60 @@ mod tests {
             output_sample_rate: None,
             resample_quality: ResampleQuality::Balanced,
         }
+    }
+
+    #[test]
+    fn lossless_writer_overlap_is_limited_to_expensive_wave_verification() {
+        let verified = StreamRenderOptions {
+            opus_album_lufs: None,
+            capture_statistics: true,
+            capture_lossless_verification: true,
+            verification_channel_roles: None,
+        };
+        assert!(stream_writer_work_can_overlap(
+            &[OutputFormat::Wav],
+            verified
+        ));
+        assert!(stream_writer_work_can_overlap(
+            &[OutputFormat::Wav, OutputFormat::Wav],
+            verified,
+        ));
+        assert!(!stream_writer_work_can_overlap(&[], verified));
+        assert!(!stream_writer_work_can_overlap(
+            &[OutputFormat::Flac],
+            verified
+        ));
+        assert!(!stream_writer_work_can_overlap(
+            &[OutputFormat::Wav, OutputFormat::Flac],
+            verified,
+        ));
+
+        let without_statistics = StreamRenderOptions {
+            capture_statistics: false,
+            ..verified
+        };
+        let without_verification = StreamRenderOptions {
+            capture_lossless_verification: false,
+            ..verified
+        };
+        assert!(!stream_writer_work_can_overlap(
+            &[OutputFormat::Wav],
+            without_statistics,
+        ));
+        assert!(!stream_writer_work_can_overlap(
+            &[OutputFormat::Wav],
+            without_verification,
+        ));
+
+        // Lossy codecs retain the v0.150.0 encoder-overlap eligibility.
+        assert!(stream_writer_work_can_overlap(
+            &[OutputFormat::Mp3],
+            verified
+        ));
+        assert!(stream_writer_work_can_overlap(
+            &[OutputFormat::Opus],
+            verified
+        ));
     }
 
     #[test]
