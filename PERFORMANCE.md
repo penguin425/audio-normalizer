@@ -1317,22 +1317,22 @@ the NEON staging kernel to FLAC; its exact-output run regressed wall time by
 keeps the change restricted to the measured WAVE win instead of extrapolating a
 fast microkernel to a codec whose parallel encoder has different bottlenecks.
 
-### v0.152.0 candidate: byte-exact AArch64 NEON peak reductions
+### v0.152.0: byte-exact AArch64 NEON peak reductions
 
 Sample-peak reduction and the combined peak/NaN observation now use Advanced
-SIMD on AArch64. The loops reduce four independent vectors per iteration and
+SIMD on AArch64. The loops reduce four vectors per iteration and
 mask NaNs before the maximum operation, preserving the established scalar
 result and the True Peak pruning rule that a block containing NaN is never
 skipped. Scalar tails retain exact behavior for every slice length.
 
-The candidate was measured against the exact v0.151.0 commit on an Apple
+The release was measured against the exact v0.151.0 commit on an Apple
 Silicon GitHub runner with Rust 1.97.0. Primitive values are pooled medians of
 18 measurements per binary over 16,777,216 samples. End-to-end values are
 pooled medians of ten measurements per binary over deterministic 300-second,
 48 kHz fixtures. Both orders were run. Primitive checksums, analysis JSON, and
 normal and verification WAVE bytes all matched exactly.
 
-| Workload / median wall | v0.151.0 | candidate | Change |
+| Workload / median wall | v0.151.0 | v0.152.0 | Change |
 | --- | ---: | ---: | ---: |
 | Absolute-peak kernel | 23.30 ms | 2.68 ms | -88.52% |
 | Peak plus NaN kernel | 34.13 ms | 2.66 ms | -92.21% |
@@ -1347,7 +1347,7 @@ and -4.62% for the five end-to-end rows. Earlier prototypes also added explicit
 NEON gain, combined gain/clip, and hard-clip loops. The combined path was
 neutral to regressive in the first order-reversed run, while 7.1 wall time
 regressed 0.58%, so all three were removed before the final measurement. This
-keeps the candidate limited to the reductions with both a large isolated win
+keeps the release limited to the reductions with both a large isolated win
 and consistent end-to-end benefit.
 
 ## Final integration gate

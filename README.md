@@ -87,9 +87,10 @@ the `-o` extension override this.
 
 ## Why it's fast
 
-* **AVX2 + FMA SIMD** for the gain and energy-summation hot loops, with
-  runtime feature detection and a portable scalar fallback (so the binary runs
-  anywhere but flies on modern x86-64).
+* **Architecture-specific SIMD reductions** use AVX2 + FMA for the gain and
+  energy-summation hot loops on x86-64, and Advanced SIMD for sample peak and
+  combined peak/NaN observation on AArch64. Other targets retain portable
+  scalar fallbacks.
 * **Fused render/write hot path** applies gain and the safety ceiling in one
   channel-contiguous SIMD pass, vectorizes byte-exact PCM16 mono/stereo plus
   multichannel PCM16/PCM24 quantization and interleaving with AVX2, adds full
