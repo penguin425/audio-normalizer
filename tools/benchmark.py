@@ -44,6 +44,7 @@ DEFAULT_CASES = (
     "mp3-stereo-normalize",
     "pathological-wave-qc",
 )
+OPTIONAL_CASES = ("wav-stereo-quiet-tail-analyze",)
 MAX_DURATION_SECONDS = 3_600
 MAX_PATHOLOGICAL_CHUNKS = 100_001
 MAX_ITERATIONS = 100
@@ -121,6 +122,52 @@ def write_pcm16_wave(
         while frames_left:
             count = min(frames_left, CHUNK_FRAMES)
             output.write(block if count == CHUNK_FRAMES else block[: count * frame_bytes])
+            frames_left -= count
+    return path.stat().st_size
+
+
+def write_quiet_tail_pcm16_wave(
+    path: Path, duration_seconds: int, sample_rate: int
+) -> int:
+    channels = 2
+    data_bytes = pcm_bytes(duration_seconds, sample_rate, channels)
+    riff_size = 36 + data_bytes
+    if riff_size > 0xFFFF_FFFF:
+        raise ValueError("fixture exceeds the RIFF/WAVE 32-bit size limit")
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    loud_frames = min(sample_rate, duration_seconds * sample_rate)
+    loud = bytearray()
+    quiet = bytearray()
+    for frame_index in range(CHUNK_FRAMES):
+        loud.extend(struct.pack(
+            "<hh",
+            (frame_index * 977 % 56_000) - 28_000,
+            (frame_index * 1_229 % 54_000) - 27_000,
+        ))
+        quiet.extend(struct.pack(
+            "<hh",
+            (frame_index * 97 % 200) - 100,
+            (frame_index * 131 % 180) - 90,
+        ))
+
+    frames_left = duration_seconds * sample_rate
+    with path.open("wb") as output:
+        output.write(b"RIFF")
+        output.write(struct.pack("<I", riff_size))
+        output.write(b"WAVEfmt ")
+        output.write(struct.pack(
+            "<IHHIIHH", 16, 1, channels, sample_rate,
+            sample_rate * channels * 2, channels * 2, 16,
+        ))
+        output.write(b"data")
+        output.write(struct.pack("<I", data_bytes))
+        written = 0
+        while frames_left:
+            count = min(frames_left, CHUNK_FRAMES)
+            block = loud if written < loud_frames else quiet
+            output.write(block if count == CHUNK_FRAMES else block[: count * 4])
+            written += count
             frames_left -= count
     return path.stat().st_size
 
@@ -260,6 +307,9 @@ def encode_fixture(
 def sanitized_command(case_id: str) -> list[str]:
     commands = {
         "wav-stereo-analyze": ["forge", "<input.wav>", "--analyze", "--json"],
+        "wav-stereo-quiet-tail-analyze": [
+            "forge", "<input.wav>", "--analyze", "--json"
+        ],
         "wav-stereo-normalize": [
             "forge", "<input.wav>", "--overwrite", "-o", "<output.wav>"
         ],
@@ -330,6 +380,7 @@ def sanitized_command(case_id: str) -> list[str]:
 def case_spec(case_id: str) -> tuple[str, str, int, str]:
     specs = {
         "wav-stereo-analyze": ("lossless", "wav", 2, "analyze"),
+        "wav-stereo-quiet-tail-analyze": ("lossless", "wav", 2, "analyze"),
         "wav-stereo-normalize": ("lossless", "wav", 2, "normalize"),
         "wav-stereo-verify": ("lossless", "wav", 2, "normalize"),
         "wav-to-flac-verify": ("lossless", "wav", 2, "normalize"),
@@ -435,7 +486,10 @@ def run_case(
         else:
             wave_path = case_dir / "source.wav"
             require_space(case_dir, estimated * (2 if operation == "normalize" else 1))
-            write_pcm16_wave(wave_path, duration, sample_rate, channels)
+            if case_id == "wav-stereo-quiet-tail-analyze":
+                write_quiet_tail_pcm16_wave(wave_path, duration, sample_rate)
+            else:
+                write_pcm16_wave(wave_path, duration, sample_rate, channels)
             input_path = wave_path
             if input_format == "flac":
                 if ffmpeg is None:
@@ -619,7 +673,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ffmpeg", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path)
-    parser.add_argument("--case", choices=DEFAULT_CASES, action="append", dest="cases")
+    parser.add_argument(
+        "--case", choices=(*DEFAULT_CASES, *OPTIONAL_CASES),
+        action="append", dest="cases",
+    )
     parser.add_argument("--duration-seconds", type=positive_int, default=3_600)
     parser.add_argument("--sample-rate", type=positive_int, default=48_000)
     parser.add_argument("--pathological-chunks", type=positive_int, default=100_001)

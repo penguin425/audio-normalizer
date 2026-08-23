@@ -84,6 +84,7 @@ jobs:
             --duration-seconds 300
             --iterations 5
             --case wav-stereo-analyze
+            --case wav-stereo-quiet-tail-analyze
             --case wav-stereo-normalize
             --case wav-stereo-verify
             --case wav-7.1-normalize
