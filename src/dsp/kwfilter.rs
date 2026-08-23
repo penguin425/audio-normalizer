@@ -11,6 +11,8 @@
 //! The filter is a transposed direct-form-II biquad, the most numerically
 //! stable structure for cascaded IIR filtering in floating point.
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 use std::f64::consts::PI;
@@ -87,6 +89,158 @@ impl KWeight {
         for (i, &x) in inp.iter().enumerate() {
             out[i] = self.process(x);
         }
+    }
+}
+
+/// Two persistent K-weighting states held in f64 SIMD lanes for the dominant
+/// stereo delivery path. Each lane is one channel; reductions remain outside
+/// this type so callers can preserve their established left-to-right order.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) struct KWeightPair {
+    stage1: PairBiquad,
+    stage2: PairBiquad,
+}
+
+#[cfg(target_arch = "x86_64")]
+type PairF64 = __m128d;
+#[cfg(target_arch = "aarch64")]
+type PairF64 = float64x2_t;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+struct PairBiquad {
+    b0: PairF64,
+    b1: PairF64,
+    b2: PairF64,
+    a1: PairF64,
+    a2: PairF64,
+    z1: PairF64,
+    z2: PairF64,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl KWeightPair {
+    pub(crate) fn for_sample_rate(sample_rate: u32) -> Self {
+        let scalar = KWeight::for_sample_rate(sample_rate);
+        // SAFETY: SSE2 is part of the x86-64 architecture baseline.
+        unsafe { Self::from_scalar_sse2(&scalar) }
+    }
+
+    #[inline]
+    pub(crate) fn process(&mut self, input: [f32; 2]) -> [f32; 2] {
+        // SAFETY: SSE2 is part of the x86-64 architecture baseline.
+        unsafe { self.process_sse2(input) }
+    }
+
+    #[target_feature(enable = "sse2")]
+    unsafe fn from_scalar_sse2(scalar: &KWeight) -> Self {
+        Self {
+            stage1: PairBiquad::from_scalar_sse2(&scalar.stage1),
+            stage2: PairBiquad::from_scalar_sse2(&scalar.stage2),
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    unsafe fn process_sse2(&mut self, input: [f32; 2]) -> [f32; 2] {
+        let input = _mm_cvtps_pd(_mm_set_ps(0.0, 0.0, input[1], input[0]));
+        let stage1 = self.stage1.process_sse2(input);
+        // Scalar KWeight rounds stage 1 to f32 before entering stage 2.
+        let stage1 = _mm_cvtps_pd(_mm_cvtpd_ps(stage1));
+        let stage2 = _mm_cvtpd_ps(self.stage2.process_sse2(stage1));
+        [
+            _mm_cvtss_f32(stage2),
+            _mm_cvtss_f32(_mm_shuffle_ps(stage2, stage2, 0x55)),
+        ]
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl PairBiquad {
+    #[target_feature(enable = "sse2")]
+    unsafe fn from_scalar_sse2(scalar: &Biquad) -> Self {
+        Self {
+            b0: _mm_set1_pd(scalar.b0),
+            b1: _mm_set1_pd(scalar.b1),
+            b2: _mm_set1_pd(scalar.b2),
+            a1: _mm_set1_pd(scalar.a1),
+            a2: _mm_set1_pd(scalar.a2),
+            z1: _mm_setzero_pd(),
+            z2: _mm_setzero_pd(),
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn process_sse2(&mut self, input: __m128d) -> __m128d {
+        let output = _mm_add_pd(_mm_mul_pd(self.b0, input), self.z1);
+        self.z1 = _mm_add_pd(
+            _mm_sub_pd(_mm_mul_pd(self.b1, input), _mm_mul_pd(self.a1, output)),
+            self.z2,
+        );
+        self.z2 = _mm_sub_pd(_mm_mul_pd(self.b2, input), _mm_mul_pd(self.a2, output));
+        output
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl KWeightPair {
+    pub(crate) fn for_sample_rate(sample_rate: u32) -> Self {
+        let scalar = KWeight::for_sample_rate(sample_rate);
+        // SAFETY: Advanced SIMD is part of the AArch64 architecture baseline.
+        unsafe { Self::from_scalar_neon(&scalar) }
+    }
+
+    #[inline]
+    pub(crate) fn process(&mut self, input: [f32; 2]) -> [f32; 2] {
+        // SAFETY: Advanced SIMD is part of the AArch64 architecture baseline.
+        unsafe { self.process_neon(input) }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn from_scalar_neon(scalar: &KWeight) -> Self {
+        Self {
+            stage1: PairBiquad::from_scalar_neon(&scalar.stage1),
+            stage2: PairBiquad::from_scalar_neon(&scalar.stage2),
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn process_neon(&mut self, input: [f32; 2]) -> [f32; 2] {
+        let input = vcvt_f64_f32(vld1_f32(input.as_ptr()));
+        let stage1 = self.stage1.process_neon(input);
+        // Scalar KWeight rounds stage 1 to f32 before entering stage 2.
+        let stage1 = vcvt_f64_f32(vcvt_f32_f64(stage1));
+        let stage2 = vcvt_f32_f64(self.stage2.process_neon(stage1));
+        let mut output = [0.0; 2];
+        vst1_f32(output.as_mut_ptr(), stage2);
+        output
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl PairBiquad {
+    #[target_feature(enable = "neon")]
+    unsafe fn from_scalar_neon(scalar: &Biquad) -> Self {
+        Self {
+            b0: vdupq_n_f64(scalar.b0),
+            b1: vdupq_n_f64(scalar.b1),
+            b2: vdupq_n_f64(scalar.b2),
+            a1: vdupq_n_f64(scalar.a1),
+            a2: vdupq_n_f64(scalar.a2),
+            z1: vdupq_n_f64(0.0),
+            z2: vdupq_n_f64(0.0),
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn process_neon(&mut self, input: float64x2_t) -> float64x2_t {
+        let output = vaddq_f64(vmulq_f64(self.b0, input), self.z1);
+        self.z1 = vaddq_f64(
+            vsubq_f64(vmulq_f64(self.b1, input), vmulq_f64(self.a1, output)),
+            self.z2,
+        );
+        self.z2 = vsubq_f64(vmulq_f64(self.b2, input), vmulq_f64(self.a2, output));
+        output
     }
 }
 
@@ -317,6 +471,76 @@ mod tests {
                         actual_output[channel].to_bits(),
                         expected_output[channel].to_bits(),
                         "sample rate {sample_rate}, frame {frame}, channel {channel}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn pair_kweight_is_bit_exact_including_exceptional_samples() {
+        for sample_rate in [8_000, 44_100, 48_000, 96_000, 192_000, 384_000] {
+            let mut expected = (0..2)
+                .map(|_| KWeight::for_sample_rate(sample_rate))
+                .collect::<Vec<_>>();
+            let mut actual = KWeightPair::for_sample_rate(sample_rate);
+            for frame in 0..20_003 {
+                let mut input = [0.0; 2];
+                for (channel, sample) in input.iter_mut().enumerate() {
+                    *sample = ((frame as f64 * (0.011 + channel as f64 * 0.004) + channel as f64)
+                        .sin()
+                        * (0.7 + channel as f64 * 0.13)) as f32;
+                }
+                if frame == 101 {
+                    input[0] = f32::from_bits(1);
+                } else if frame == 307 {
+                    input[1] = -f32::from_bits(1);
+                }
+                let expected_output =
+                    [expected[0].process(input[0]), expected[1].process(input[1])];
+                let actual_output = actual.process(input);
+                for channel in 0..2 {
+                    assert_eq!(
+                        actual_output[channel].to_bits(),
+                        expected_output[channel].to_bits(),
+                        "sample rate {sample_rate}, frame {frame}, channel {channel}"
+                    );
+                }
+            }
+
+            for exceptional in [
+                [f32::NAN, 0.0],
+                [0.0, f32::from_bits(0x7fa0_1234)],
+                [f32::INFINITY, 0.0],
+                [0.0, f32::INFINITY],
+                [f32::NEG_INFINITY, 0.0],
+                [0.0, f32::NEG_INFINITY],
+            ] {
+                let mut expected = [
+                    KWeight::for_sample_rate(sample_rate),
+                    KWeight::for_sample_rate(sample_rate),
+                ];
+                let mut actual = KWeightPair::for_sample_rate(sample_rate);
+                for frame in 0..32 {
+                    let input = [
+                        (frame as f32 * 0.017).sin() * 0.71,
+                        (frame as f32 * 0.023 + 0.4).sin() * 0.83,
+                    ];
+                    let expected_output =
+                        [expected[0].process(input[0]), expected[1].process(input[1])];
+                    assert_eq!(actual.process(input), expected_output);
+                }
+                let expected_output = [
+                    expected[0].process(exceptional[0]),
+                    expected[1].process(exceptional[1]),
+                ];
+                let actual_output = actual.process(exceptional);
+                for channel in 0..2 {
+                    assert_eq!(
+                        actual_output[channel].to_bits(),
+                        expected_output[channel].to_bits(),
+                        "exceptional sample rate {sample_rate}, channel {channel}, input {exceptional:?}"
                     );
                 }
             }

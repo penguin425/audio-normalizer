@@ -19,6 +19,8 @@
 ))]
 use crate::dsp::cuda_truepeak::CudaTruePeakWorker;
 use crate::dsp::kwfilter::KWeight;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use crate::dsp::kwfilter::KWeightPair;
 #[cfg(target_arch = "x86_64")]
 use crate::dsp::kwfilter::KWeightQuad;
 use crate::dsp::simd;
@@ -207,6 +209,8 @@ pub struct StreamingAnalyzer {
     sample_rate: u32,
     roles: Vec<ChannelRole>,
     filters: Vec<KWeight>,
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    kweight_pair: Option<KWeightPair>,
     #[cfg(target_arch = "x86_64")]
     kweight_quads: Option<Vec<KWeightQuad>>,
     true_peak_meters: Vec<TruePeakMeter>,
@@ -272,12 +276,17 @@ impl StreamingAnalyzer {
         } else {
             None
         };
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        let kweight_pair = (interval_frames.is_none() && channels == 2)
+            .then(|| KWeightPair::for_sample_rate(sample_rate));
         Self {
             sample_rate,
             roles,
             filters: (0..channels)
                 .map(|_| KWeight::for_sample_rate(sample_rate))
                 .collect(),
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            kweight_pair,
             #[cfg(target_arch = "x86_64")]
             kweight_quads,
             true_peak_meters: (0..channels)
@@ -337,16 +346,25 @@ impl StreamingAnalyzer {
             self.finish_cuda_true_peak(planar);
             return result;
         }
-        // Stereo is the dominant file-delivery layout. Keeping both filters and
-        // true-peak meters borrowed outside the frame loop removes the dynamic
-        // channel iterator and lets LLVM retain their state across samples.
+        // Stereo is the dominant file-delivery layout. Keeping both filters in
+        // persistent SIMD lanes and both true-peak meters borrowed outside the
+        // frame loop removes the dynamic channel iterator and per-frame state
+        // packing.
         // The arithmetic and window-update order intentionally matches the
         // generic path below; no temporary PCM or energy buffer is introduced.
         if self.timeline_interval_frames.is_none() && planar.len() == 2 {
             let weight0 = channel_weight(self.roles[0]);
             let weight1 = channel_weight(self.roles[1]);
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            let kweight_pair = self
+                .kweight_pair
+                .as_mut()
+                .expect("non-timeline stereo analyzer owns paired K-weighting state");
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             let (filter0, filter1) = self.filters.split_at_mut(1);
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             let filter0 = &mut filter0[0];
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             let filter1 = &mut filter1[0];
             let (meter0, meter1) = self.true_peak_meters.split_at_mut(1);
             let meter0 = &mut meter0[0];
@@ -374,7 +392,15 @@ impl StreamingAnalyzer {
                     }
                     (true, true) => {}
                 }
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                let filtered = kweight_pair.process([sample0, sample1]);
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                let filtered0 = filtered[0] as f64;
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                let filtered1 = filtered[1] as f64;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let filtered0 = filter0.process(sample0) as f64;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let filtered1 = filter1.process(sample1) as f64;
                 let mut weighted = 0.0;
                 weighted += weight0 * filtered0 * filtered0;
@@ -673,8 +699,16 @@ impl StreamingAnalyzer {
         if planar.len() == 2 {
             let weight0 = channel_weight(self.roles[0]);
             let weight1 = channel_weight(self.roles[1]);
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            let kweight_pair = self
+                .kweight_pair
+                .as_mut()
+                .expect("CUDA stereo analyzer owns paired K-weighting state");
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             let (filter0, filter1) = self.filters.split_at_mut(1);
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             let filter0 = &mut filter0[0];
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             let filter1 = &mut filter1[0];
             #[allow(
                 clippy::needless_range_loop,
@@ -683,7 +717,15 @@ impl StreamingAnalyzer {
             for frame in 0..chunk_frames {
                 let sample0 = planar[0][frame];
                 let sample1 = planar[1][frame];
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                let filtered = kweight_pair.process([sample0, sample1]);
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                let filtered0 = filtered[0] as f64;
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                let filtered1 = filtered[1] as f64;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let filtered0 = filter0.process(sample0) as f64;
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let filtered1 = filter1.process(sample1) as f64;
                 let mut weighted = 0.0;
                 weighted += weight0 * filtered0 * filtered0;
