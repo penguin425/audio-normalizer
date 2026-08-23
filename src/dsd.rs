@@ -15,6 +15,7 @@
 
 use crate::container_qc::{check, finish_audit, ContainerAudit};
 use crate::wav::{default_channel_roles, ChannelRole, PcmKind};
+use rayon::prelude::*;
 use serde_json::json;
 use std::f64::consts::PI;
 use std::fs::File;
@@ -793,22 +794,25 @@ where
         DsdLayout::Dsdiff => return Err("internal DSD layout mismatch".into()),
     };
     let block_size = block_size_per_channel as usize;
-    let mut block = vec![0_u8; block_size];
+    let channels = info.channels as usize;
+    let mut blocks = (0..channels)
+        .map(|_| vec![0_u8; block_size])
+        .collect::<Vec<_>>();
     let bytes_per_channel = info.source_samples_per_channel.div_ceil(8);
     let rounds = bytes_per_channel.div_ceil(u64::from(block_size_per_channel));
     for _ in 0..rounds {
-        for channel in 0..info.channels as usize {
-            file.read_exact(&mut block)
+        for block in &mut blocks {
+            file.read_exact(block)
                 .map_err(|error| format!("read DSF channel block: {error}"))?;
-            push_dsd_bytes(
-                &block,
-                info.bit_order,
-                info.source_samples_per_channel,
-                &mut source_samples[channel],
-                &mut pipelines[channel],
-                &mut pending[channel],
-            );
         }
+        push_dsd_channel_blocks(
+            &blocks,
+            info.bit_order,
+            info.source_samples_per_channel,
+            source_samples,
+            pipelines,
+            pending,
+        );
         flush_pending(pending, stream_info, consume, false)?;
     }
     Ok(())
@@ -830,27 +834,97 @@ where
     let frame_bytes = channels;
     let chunk_frames = (64 * 1024 / frame_bytes).max(1);
     let mut bytes = vec![0_u8; chunk_frames * frame_bytes];
+    let mut channel_bytes = (0..channels)
+        .map(|_| Vec::with_capacity(chunk_frames))
+        .collect::<Vec<_>>();
     let mut remaining = info.data_size;
     while remaining != 0 {
         let read_size = usize::try_from(remaining.min(bytes.len() as u64)).unwrap();
         file.read_exact(&mut bytes[..read_size])
             .map_err(|error| format!("read DSDIFF sound data: {error}"))?;
+        for channel in &mut channel_bytes {
+            channel.clear();
+        }
+        // DSDIFF interleaves one byte at a time. Deinterleave the bounded read
+        // once so each channel can enter its FIR pipeline as one contiguous
+        // call instead of dispatching for every byte.
         for frame in bytes[..read_size].chunks_exact(channels) {
-            for channel in 0..channels {
-                push_dsd_bytes(
-                    &frame[channel..channel + 1],
-                    DsdBitOrder::MostSignificantFirst,
-                    info.source_samples_per_channel,
-                    &mut source_samples[channel],
-                    &mut pipelines[channel],
-                    &mut pending[channel],
-                );
+            for (channel, &byte) in channel_bytes.iter_mut().zip(frame) {
+                channel.push(byte);
             }
         }
+        push_dsd_channel_blocks(
+            &channel_bytes,
+            DsdBitOrder::MostSignificantFirst,
+            info.source_samples_per_channel,
+            source_samples,
+            pipelines,
+            pending,
+        );
         remaining -= read_size as u64;
         flush_pending(pending, stream_info, consume, false)?;
     }
     Ok(())
+}
+
+fn push_dsd_channel_blocks(
+    blocks: &[Vec<u8>],
+    order: DsdBitOrder,
+    limit: u64,
+    source_samples: &mut [u64],
+    pipelines: &mut [DsdPipeline],
+    pending: &mut [Vec<f32>],
+) {
+    // Channel pipelines share no filter or output state. Preserve every
+    // channel's byte, bit, and floating-point operation order while using the
+    // existing worker budget for a latency-sensitive top-level decode. Nested
+    // album/file work retains its established asset-level scheduling.
+    let parallel = blocks.len() > 1
+        && rayon::current_num_threads() > 1
+        && rayon::current_thread_index().is_none();
+    push_dsd_channel_blocks_with_mode(
+        blocks,
+        order,
+        limit,
+        source_samples,
+        pipelines,
+        pending,
+        parallel,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_dsd_channel_blocks_with_mode(
+    blocks: &[Vec<u8>],
+    order: DsdBitOrder,
+    limit: u64,
+    source_samples: &mut [u64],
+    pipelines: &mut [DsdPipeline],
+    pending: &mut [Vec<f32>],
+    parallel: bool,
+) {
+    debug_assert_eq!(blocks.len(), source_samples.len());
+    debug_assert_eq!(blocks.len(), pipelines.len());
+    debug_assert_eq!(blocks.len(), pending.len());
+    if parallel {
+        blocks
+            .par_iter()
+            .zip(source_samples.par_iter_mut())
+            .zip(pipelines.par_iter_mut())
+            .zip(pending.par_iter_mut())
+            .for_each(|(((bytes, consumed), pipeline), output)| {
+                push_dsd_bytes(bytes, order, limit, consumed, pipeline, output);
+            });
+    } else {
+        blocks
+            .iter()
+            .zip(source_samples)
+            .zip(pipelines)
+            .zip(pending)
+            .for_each(|(((bytes, consumed), pipeline), output)| {
+                push_dsd_bytes(bytes, order, limit, consumed, pipeline, output);
+            });
+    }
 }
 
 fn push_dsd_bytes(
@@ -1275,6 +1349,88 @@ mod tests {
             / settled.len() as f64)
             .sqrt();
         assert!((rms - 0.25 / 2.0_f64.sqrt()).abs() < 0.01, "{rms}");
+    }
+
+    #[test]
+    fn parallel_channel_blocks_match_serial_processing_bit_exactly() {
+        let channels = 4_usize;
+        let make_blocks = |salt: usize| {
+            (0..channels)
+                .map(|channel| {
+                    (0_usize..8_193)
+                        .map(|index| {
+                            index
+                                .wrapping_mul(97 + channel * 31)
+                                .wrapping_add(channel * 53)
+                                .wrapping_add(salt) as u8
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = make_blocks(7);
+        let second = make_blocks(193);
+        let limit = (first[0].len() + second[0].len()) as u64 * 8 - 3;
+        let mut serial_pipelines = (0..channels)
+            .map(|_| DsdPipeline::new(5, 88_200))
+            .collect::<Vec<_>>();
+        let mut parallel_pipelines = (0..channels)
+            .map(|_| DsdPipeline::new(5, 88_200))
+            .collect::<Vec<_>>();
+        let mut serial_pending = vec![Vec::new(); channels];
+        let mut parallel_pending = vec![Vec::new(); channels];
+        let mut serial_samples = vec![0_u64; channels];
+        let mut parallel_samples = vec![0_u64; channels];
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(channels)
+            .build()
+            .unwrap();
+        for blocks in [&first, &second] {
+            push_dsd_channel_blocks_with_mode(
+                blocks,
+                DsdBitOrder::LeastSignificantFirst,
+                limit,
+                &mut serial_samples,
+                &mut serial_pipelines,
+                &mut serial_pending,
+                false,
+            );
+            pool.install(|| {
+                push_dsd_channel_blocks_with_mode(
+                    blocks,
+                    DsdBitOrder::LeastSignificantFirst,
+                    limit,
+                    &mut parallel_samples,
+                    &mut parallel_pipelines,
+                    &mut parallel_pending,
+                    true,
+                );
+            });
+        }
+
+        assert_eq!(serial_samples, parallel_samples);
+        assert_eq!(
+            serial_pipelines
+                .iter()
+                .map(|pipeline| pipeline.produced)
+                .collect::<Vec<_>>(),
+            parallel_pipelines
+                .iter()
+                .map(|pipeline| pipeline.produced)
+                .collect::<Vec<_>>()
+        );
+        for (serial, parallel) in serial_pending.iter().zip(&parallel_pending) {
+            assert_eq!(
+                serial
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                parallel
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
