@@ -1043,33 +1043,37 @@ impl FirDecimator2 {
 struct Fir {
     coefficients: Vec<f64>,
     delay: Vec<f64>,
+    period: usize,
     cursor: usize,
 }
 
 impl Fir {
     fn new(coefficients: Vec<f64>) -> Self {
-        let delay = vec![0.0; coefficients.len()];
+        let period = coefficients.len();
+        debug_assert_ne!(period, 0);
+        // Mirror each ring entry one period later. The newest-to-oldest
+        // history is then one contiguous reverse slice for every cursor,
+        // removing a wrap branch from every FIR tap without changing the
+        // coefficient or accumulation order.
+        let delay = vec![0.0; period * 2];
         Self {
             coefficients,
             delay,
+            period,
             cursor: 0,
         }
     }
 
     fn push(&mut self, sample: f64) -> f64 {
         self.delay[self.cursor] = sample;
-        let mut index = self.cursor;
+        self.delay[self.cursor + self.period] = sample;
+        let history = &self.delay[self.cursor + 1..self.cursor + self.period + 1];
         let mut output = 0.0;
-        for coefficient in &self.coefficients {
-            output += coefficient * self.delay[index];
-            index = if index == 0 {
-                self.delay.len() - 1
-            } else {
-                index - 1
-            };
+        for (coefficient, delayed) in self.coefficients.iter().zip(history.iter().rev()) {
+            output += coefficient * delayed;
         }
         self.cursor += 1;
-        if self.cursor == self.delay.len() {
+        if self.cursor == self.period {
             self.cursor = 0;
         }
         output
@@ -1256,6 +1260,42 @@ mod tests {
         assert_eq!(output_geometry(5_644_800).unwrap(), (88_200, 64));
         assert_eq!(output_geometry(3_072_000).unwrap(), (96_000, 32));
         assert!(output_geometry(2_000_000).is_err());
+    }
+
+    #[test]
+    fn mirrored_fir_history_matches_wrapping_reference_bit_exactly() {
+        let coefficient_sets = [
+            low_pass_coefficients(HALF_BAND_TAPS, 0.25),
+            low_pass_coefficients(OUTPUT_LOW_PASS_TAPS, OUTPUT_LOW_PASS_CUTOFF_HZ / 88_200.0),
+        ];
+        for coefficients in coefficient_sets {
+            let mut candidate = Fir::new(coefficients.clone());
+            let mut reference_delay = vec![0.0; coefficients.len()];
+            let mut reference_cursor = 0_usize;
+            for index in 0_usize..131_071 {
+                let sample = if (index.wrapping_mul(97).wrapping_add(53) & 1) == 0 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                reference_delay[reference_cursor] = sample;
+                let mut delay_index = reference_cursor;
+                let mut reference = 0.0;
+                for coefficient in &coefficients {
+                    reference += coefficient * reference_delay[delay_index];
+                    delay_index = if delay_index == 0 {
+                        reference_delay.len() - 1
+                    } else {
+                        delay_index - 1
+                    };
+                }
+                reference_cursor += 1;
+                if reference_cursor == reference_delay.len() {
+                    reference_cursor = 0;
+                }
+                assert_eq!(candidate.push(sample).to_bits(), reference.to_bits());
+            }
+        }
     }
 
     #[test]
