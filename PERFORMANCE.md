@@ -1273,11 +1273,55 @@ byte-identical and verified exactly. The prototypes were removed: LLVM already
 optimizes the established counts sufficiently, and the counters are not a
 material end-to-end bottleneck on this workload.
 
+### v0.151.0: byte-exact AArch64 NEON WAVE quantization
+
+Undithered PCM16 and PCM24 WAVE output now uses Advanced SIMD (NEON) on
+little-endian AArch64. PCM16 mono and stereo process eight frames per iteration;
+the stereo path interleaves narrowed lanes with NEON zip operations. PCM24 mono
+and stereo process four frames per iteration and pack the low three bytes of
+each signed code directly into the output buffer. Wider layouts quantize four
+channels at a time for both depths. Scalar tails preserve partial frames, and
+dithered output retains the established scalar RNG order.
+
+The vector quantizer deliberately matches the scalar contract: NaN becomes
+zero, infinities and out-of-range samples clamp to the signed endpoints, the
+power-of-two f32 scale is exact, halfway values round away from zero, and the
+positive endpoint saturates one code below the negative magnitude. Equivalence
+tests exercise random f32 bit patterns and boundary values at 1, 2, 3, 5, 6, 7,
+8, 9, 10, 11, 12, and 16 channels. Other architectures and big-endian AArch64
+retain the scalar or existing AVX2 paths.
+
+The final comparison ran natively on an Apple Silicon GitHub runner with Rust
+1.97.0. The exact v0.150.0 commit and candidate were built separately in release
+mode. Kernel values are pooled medians of 18 measurements per binary over
+16,777,216 frames; normalization values are pooled medians of ten measurements
+per binary over deterministic 300-second, 48 kHz fixtures. Each experiment ran
+in both orders. The kernel checksum matched the scalar build in every case.
+
+| Workload / median wall | v0.150.0 scalar | v0.151.0 NEON | Change |
+| --- | ---: | ---: | ---: |
+| PCM16 mono kernel | 72.38 ms | 3.97 ms | -94.51% |
+| PCM16 stereo kernel | 71.42 ms | 4.04 ms | -94.34% |
+| PCM16 7.1 kernel | 76.35 ms | 14.87 ms | -80.53% |
+| PCM24 mono kernel | 89.14 ms | 9.73 ms | -89.08% |
+| PCM24 stereo kernel | 95.48 ms | 9.26 ms | -90.30% |
+| PCM24 7.1 kernel | 87.88 ms | 20.54 ms | -76.62% |
+| Stereo WAVE normalization | 0.897 s | 0.850 s | -5.21% |
+| 7.1 WAVE normalization | 2.745 s | 2.410 s | -12.22% |
+
+A WAVE-to-FLAC verification control moved from 3.041 to 2.943 seconds
+(-3.21%), but no retained candidate path changes FLAC sample staging, so that
+variation is not claimed as an optimization. An earlier prototype did apply
+the NEON staging kernel to FLAC; its exact-output run regressed wall time by
+0.72% and total CPU by about 1.1%. That path was removed before release. This
+keeps the change restricted to the measured WAVE win instead of extrapolating a
+fast microkernel to a codec whose parallel encoder has different bottlenecks.
+
 ## Final integration gate
 
-The measured implementation sequence is complete. Before release, run the full
-feature matrix, official conformance jobs available in the checkout, end-to-end
-CPU/CUDA and scalar/SIMD equivalence checks, benchmark regression gates, package
-reproducibility checks, and the protected-branch release audit.
+Before each release, run the full feature matrix, official conformance jobs
+available in the checkout, end-to-end CPU/CUDA and scalar/SIMD equivalence
+checks, benchmark regression gates, package reproducibility checks, and the
+protected-branch release audit.
 
 Every phase adds a benchmark case or compatible baseline gate before release.

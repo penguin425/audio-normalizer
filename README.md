@@ -92,9 +92,10 @@ the `-o` extension override this.
   anywhere but flies on modern x86-64).
 * **Fused render/write hot path** applies gain and the safety ceiling in one
   channel-contiguous SIMD pass, vectorizes byte-exact PCM16 mono/stereo plus
-  multichannel PCM16/PCM24 quantization and interleaving, and reuses the WAVE
-  writer's chunk storage. Dither, exceptional samples, limiter processing, and
-  verification retain their established semantics.
+  multichannel PCM16/PCM24 quantization and interleaving with AVX2, adds full
+  PCM16/PCM24 WAVE coverage with NEON on little-endian AArch64, and reuses the
+  WAVE writer's chunk storage. Dither, exceptional samples, limiter processing,
+  and verification retain their established semantics.
 * **Allocation-stable look-ahead limiting** reuses caller-owned planar output
   channels for every decoded chunk and for the final delayed tail. Adjacent
   True Peak meters advance through the paired SIMD kernel, with a direct stereo
