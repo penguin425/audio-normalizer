@@ -60,10 +60,10 @@ jobs:
           set -euo pipefail
           CARGO_TARGET_DIR="${RUNNER_TEMP}/target-baseline" \
             cargo build --locked --release --manifest-path baseline/Cargo.toml \
-              --no-default-features --bin forge
+              --no-default-features --bin forge --bin forge-container-qc
           CARGO_TARGET_DIR="${RUNNER_TEMP}/target-candidate" \
             cargo build --locked --release --manifest-path candidate/Cargo.toml \
-              --no-default-features --bin forge
+              --no-default-features --bin forge --bin forge-container-qc
 
       - name: Verify byte-exact analysis and output
         shell: bash
