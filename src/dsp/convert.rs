@@ -7,7 +7,7 @@
 
 use crate::wav::PcmKind;
 use rayon::prelude::*;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -164,7 +164,7 @@ pub(crate) fn dither_rngs(channels: usize) -> Vec<u64> {
 }
 
 /// Append the interleaved signed integer representation consumed by the FLAC
-/// writer. The undithered path uses the same byte-exact SIMD quantizer as WAVE
+/// writer. The undithered path uses the same byte-exact AVX2 quantizer as WAVE
 /// output while preserving the established f32 multiply/round/clamp result.
 pub(crate) fn append_quantized_interleaved_i32(
     planar: &[Vec<f32>],
@@ -189,12 +189,6 @@ pub(crate) fn append_quantized_interleaved_i32(
     #[cfg(target_arch = "x86_64")]
     if !dither && is_x86_feature_detected!("avx2") {
         unsafe { append_quantized_interleaved_i32_avx2(planar, bits, rngs, appended) };
-        return;
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    if !dither {
-        unsafe { append_quantized_interleaved_i32_neon(planar, bits, rngs, appended) };
         return;
     }
 
@@ -292,69 +286,6 @@ unsafe fn quantize_flacx8(samples: __m256, bits: usize) -> __m256i {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn append_quantized_interleaved_i32_neon(
-    planar: &[Vec<f32>],
-    bits: usize,
-    rngs: &mut [u64],
-    output: &mut [i32],
-) {
-    let channels = planar.len();
-    let frames = planar[0].len();
-    let mut frame = 0;
-
-    if channels == 1 {
-        while frame + 4 <= frames {
-            let samples = vld1q_f32(planar[0].as_ptr().add(frame));
-            let quantized = quantize_flacx4(samples, bits);
-            vst1q_s32(output.as_mut_ptr().add(frame), quantized);
-            frame += 4;
-        }
-    } else if channels == 2 {
-        while frame + 4 <= frames {
-            let left = quantize_flacx4(vld1q_f32(planar[0].as_ptr().add(frame)), bits);
-            let right = quantize_flacx4(vld1q_f32(planar[1].as_ptr().add(frame)), bits);
-            let destination = output.as_mut_ptr().add(frame * 2);
-            vst1q_s32(destination, vzip1q_s32(left, right));
-            vst1q_s32(destination.add(4), vzip2q_s32(left, right));
-            frame += 4;
-        }
-    } else {
-        for frame in 0..frames {
-            let mut channel = 0;
-            while channel < channels {
-                let count = (channels - channel).min(4);
-                let samples = load_planar_frame_x4(planar, channel, frame, count);
-                let quantized = quantize_flacx4(samples, bits);
-                let destination = output.as_mut_ptr().add(frame * channels + channel);
-                if count == 4 {
-                    vst1q_s32(destination, quantized);
-                } else {
-                    let mut values = [0_i32; 4];
-                    vst1q_s32(values.as_mut_ptr(), quantized);
-                    std::ptr::copy_nonoverlapping(values.as_ptr(), destination, count);
-                }
-                channel += count;
-            }
-        }
-        return;
-    }
-
-    append_quantized_interleaved_i32_scalar_from(planar, bits, false, rngs, output, frame);
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "neon")]
-unsafe fn quantize_flacx4(samples: float32x4_t, bits: usize) -> int32x4_t {
-    match bits {
-        16 => quantize_s16x4(samples),
-        24 => quantize_s24x4(samples),
-        _ => unreachable!(),
-    }
-}
-
 pub(crate) fn encode_interleaved_with_rngs(
     planar: &[Vec<f32>],
     kind: PcmKind,
@@ -411,8 +342,12 @@ pub(crate) fn encode_interleaved_with_rngs_into(
             }
             return;
         }
-        if kind == PcmKind::S24 && channels >= 3 {
-            unsafe { encode_multichannel_no_dither_neon(planar, kind, out) };
+        if kind == PcmKind::S24 {
+            if channels <= 2 {
+                unsafe { encode_s24_no_dither_neon(planar, out) };
+            } else {
+                unsafe { encode_multichannel_no_dither_neon(planar, kind, out) };
+            }
             return;
         }
     }
@@ -577,6 +512,39 @@ unsafe fn encode_s16_no_dither_neon(planar: &[Vec<f32>], out: &mut [u8]) {
 
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[target_feature(enable = "neon")]
+unsafe fn encode_s24_no_dither_neon(planar: &[Vec<f32>], out: &mut [u8]) {
+    let frames = planar[0].len();
+    let channels = planar.len();
+    let mut frame = 0;
+    if channels == 1 {
+        while frame + 4 <= frames {
+            let quantized = quantize_s24x4(vld1q_f32(planar[0].as_ptr().add(frame)));
+            store_s24x4(quantized, out.as_mut_ptr().add(frame * 3), 4);
+            frame += 4;
+        }
+    } else {
+        while frame + 4 <= frames {
+            let left = quantize_s24x4(vld1q_f32(planar[0].as_ptr().add(frame)));
+            let right = quantize_s24x4(vld1q_f32(planar[1].as_ptr().add(frame)));
+            let destination = out.as_mut_ptr().add(frame * 6);
+            store_s24x4(vzip1q_s32(left, right), destination, 4);
+            store_s24x4(vzip2q_s32(left, right), destination.add(12), 4);
+            frame += 4;
+        }
+    }
+    let mut rngs = [0_u64; 2];
+    encode_interleaved_scalar_from(
+        planar,
+        PcmKind::S24,
+        false,
+        &mut rngs[..channels],
+        out,
+        frame,
+    );
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
 unsafe fn encode_multichannel_no_dither_neon(planar: &[Vec<f32>], kind: PcmKind, out: &mut [u8]) {
     debug_assert!(matches!(kind, PcmKind::S16 | PcmKind::S24));
     debug_assert!(planar.len() >= 3);
@@ -650,7 +618,7 @@ unsafe fn load_planar_frame_x8(
     _mm256_loadu_ps(samples.as_ptr())
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[inline]
 #[target_feature(enable = "neon")]
 unsafe fn load_planar_frame_x4(
@@ -769,21 +737,21 @@ unsafe fn quantize_signedx8(samples: __m256, scale: f32, minimum: i32, maximum: 
     )
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[inline]
 #[target_feature(enable = "neon")]
 unsafe fn quantize_s16x4(samples: float32x4_t) -> int32x4_t {
     quantize_signedx4(samples, 32_768.0, -32_768, 32_767)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[inline]
 #[target_feature(enable = "neon")]
 unsafe fn quantize_s24x4(samples: float32x4_t) -> int32x4_t {
     quantize_signedx4(samples, 8_388_608.0, -8_388_608, 8_388_607)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[inline]
 #[target_feature(enable = "neon")]
 unsafe fn quantize_signedx4(
@@ -1079,7 +1047,7 @@ mod tests {
             ]);
         }
 
-        for channels in [3, 5, 6, 7, 8, 9, 10, 11, 12, 16] {
+        for channels in [1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 16] {
             let planar = channel_variants(&channel, channels);
             let mut expected = vec![0; channel.len() * channels * 3];
             let mut expected_rngs = dither_rngs(channels);

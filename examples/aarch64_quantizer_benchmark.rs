@@ -47,6 +47,8 @@ fn main() {
         ("s16-mono", 1, PcmKind::S16),
         ("s16-stereo", 2, PcmKind::S16),
         ("s16-7.1", 8, PcmKind::S16),
+        ("s24-mono", 1, PcmKind::S24),
+        ("s24-stereo", 2, PcmKind::S24),
         ("s24-7.1", 8, PcmKind::S24),
     ] {
         let planar = planar_fixture(channels);

@@ -48,7 +48,7 @@ jobs:
           CARGO_TARGET_DIR: ${{ runner.temp }}/target-candidate-tests
           RUSTFLAGS: -Ctarget-feature=+neon,+aes,+sha2
         run: >-
-          cargo test --locked --release --manifest-path candidate/Cargo.toml
+          cargo test --locked --manifest-path candidate/Cargo.toml
           --lib dsp::convert::tests -- --nocapture
 
       - name: Build baseline and candidate after tests
@@ -60,11 +60,11 @@ jobs:
           set -euo pipefail
           CARGO_TARGET_DIR="${RUNNER_TEMP}/target-baseline" \
             cargo build --locked --release --manifest-path baseline/Cargo.toml \
-              --bin forge --bin forge-container-qc \
+              --bin forge \
               --example aarch64_quantizer_benchmark
           CARGO_TARGET_DIR="${RUNNER_TEMP}/target-candidate" \
             cargo build --locked --release --manifest-path candidate/Cargo.toml \
-              --bin forge --bin forge-container-qc \
+              --bin forge \
               --example aarch64_quantizer_benchmark
 
       - name: Run quantizer benchmarks in both orders
@@ -89,22 +89,22 @@ jobs:
           )
           python3 candidate/tools/benchmark.py \
             --forge "${RUNNER_TEMP}/target-baseline/release/forge" \
-            --container-qc "${RUNNER_TEMP}/target-baseline/release/forge-container-qc" \
+            --container-qc "${RUNNER_TEMP}/target-baseline/release/forge" \
             --work-dir "${RUNNER_TEMP}/bench-base-first" \
             --output normalize-base-first.json "${common[@]}"
           python3 candidate/tools/benchmark.py \
             --forge "${RUNNER_TEMP}/target-candidate/release/forge" \
-            --container-qc "${RUNNER_TEMP}/target-candidate/release/forge-container-qc" \
+            --container-qc "${RUNNER_TEMP}/target-candidate/release/forge" \
             --work-dir "${RUNNER_TEMP}/bench-candidate-first" \
             --output normalize-candidate-first.json "${common[@]}"
           python3 candidate/tools/benchmark.py \
             --forge "${RUNNER_TEMP}/target-candidate/release/forge" \
-            --container-qc "${RUNNER_TEMP}/target-candidate/release/forge-container-qc" \
+            --container-qc "${RUNNER_TEMP}/target-candidate/release/forge" \
             --work-dir "${RUNNER_TEMP}/bench-candidate-second" \
             --output normalize-candidate-second.json "${common[@]}"
           python3 candidate/tools/benchmark.py \
             --forge "${RUNNER_TEMP}/target-baseline/release/forge" \
-            --container-qc "${RUNNER_TEMP}/target-baseline/release/forge-container-qc" \
+            --container-qc "${RUNNER_TEMP}/target-baseline/release/forge" \
             --work-dir "${RUNNER_TEMP}/bench-base-second" \
             --output normalize-base-second.json "${common[@]}"
 
