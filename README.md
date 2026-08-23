@@ -87,10 +87,11 @@ the `-o` extension override this.
 
 ## Why it's fast
 
-* **Architecture-specific SIMD reductions** use AVX2 + FMA for the gain and
-  energy-summation hot loops on x86-64, and Advanced SIMD for sample peak and
-  combined peak/NaN observation on AArch64. Other targets retain portable
-  scalar fallbacks.
+* **Architecture-specific SIMD kernels** use AVX2 + FMA for the gain and
+  energy-summation hot loops and SSE2 for persistent stereo K-weighting on
+  x86-64. AArch64 uses Advanced SIMD for sample peak, combined peak/NaN
+  observation, and persistent stereo K-weighting. Other targets retain
+  portable scalar fallbacks.
 * **Fused render/write hot path** applies gain and the safety ceiling in one
   channel-contiguous SIMD pass, vectorizes byte-exact PCM16 mono/stereo plus
   multichannel PCM16/PCM24 quantization and interleaving with AVX2, adds full
@@ -151,11 +152,12 @@ the `-o` extension override this.
   channel. Dense material stays on the paired SIMD interpolation path.
   Timeline peaks, limiter detection, and every frame-level caller retain exact
   interpolation because they need more than the all-time maximum.
-* **Persistent multichannel K-weighting lanes** keep four independent shelf and
-  RLB filter states in AVX2 f64 vectors across chunks, with explicit f32 rounding
-  between stages. A 7.1 analyzer owns two fixed banks and needs no per-chunk
-  energy scratch; channel weights and sums remain in their exact scalar order.
-  Non-AVX2, stereo, and timeline paths retain the portable scalar filters.
+* **Persistent K-weighting lanes** keep the dominant stereo shelf and RLB
+  states in two-lane SSE2 or AArch64 Advanced SIMD f64 vectors across chunks.
+  Multichannel analysis keeps four independent states per AVX2 bank. The
+  required f32 rounding between stages is explicit, while channel weights and
+  sums retain their exact scalar order. Timeline analysis and unsupported
+  architectures retain the portable scalar filters.
 * **Optional CUDA true-peak analysis** is available in Linux and Windows builds
   compiled with `cuda-truepeak`. `--true-peak-backend cuda` dynamically loads
   the NVIDIA driver and queues planar transfers plus the f64-FMA polyphase
@@ -170,10 +172,11 @@ the `-o` extension override this.
   input order.
 * **Rolling block energies** make the 75%-overlapping LUFS gating blocks O(1)
   each while retaining only three seconds of filtered energy.
-* **Specialized stereo streaming analysis** keeps both K-weighting filters and
-  true-peak meters in the hot loop without dynamic channel iteration. The
-  generic channel-layout path remains unchanged, and the optimized path keeps
-  the same floating-point operation order and byte-identical normalized output.
+* **Specialized stereo streaming analysis** selects the paired K-weighting
+  state once, keeps both true-peak meters in the hot loop, and avoids dynamic
+  channel iteration. The generic channel-layout path remains unchanged, and
+  the optimized path keeps the same floating-point operation order and
+  byte-identical normalized output.
 * **Adaptive WAVE streaming chunks** keep the low-latency 64 KiB read size for
   mono while using a frame-aligned 1 MiB chunk for stereo and multichannel
   inputs. The planar decode buffer is reused between reads, reducing allocator,

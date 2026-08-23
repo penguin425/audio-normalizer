@@ -1350,6 +1350,49 @@ regressed 0.58%, so all three were removed before the final measurement. This
 keeps the release limited to the reductions with both a large isolated win
 and consistent end-to-end benefit.
 
+### v0.153.0: persistent stereo K-weighting SIMD lanes
+
+The dominant two-channel, non-timeline analyzer now retains both independent
+K-weighting states in one f64 SIMD vector across decoder chunks. x86-64 uses
+baseline SSE2 and AArch64 uses baseline Advanced SIMD. Both biquad stages keep
+their broadcast coefficients and delay state in registers; the required f32
+rounding between the shelf and RLB stages remains explicit. Weighted energy,
+raw energy, sample peak, channel weights, rolling windows, and gating retain
+their established left-to-right order. Timeline analysis and other
+architectures continue through the scalar filters.
+
+This differs from the rejected v0.136.0 pair experiment: it performs no
+per-frame coefficient checks or temporary scalar-state packing. The analyzer
+selects the architecture-specific pair once at construction and carries that
+state for the complete stream. The separate block-matrix/time-parallel design
+remains deferred because it would still alter the recurrence and rounding
+contract.
+
+The exact v0.152.0 base and candidate were built independently with Rust
+1.97.0 on GitHub-hosted x86-64 Linux and Apple Silicon runners. Isolated values
+are medians of 18 alternating measurements over 16,777,216 stereo frames.
+End-to-end values pool ten measurements per binary from both execution orders
+over a deterministic 300-second, 48 kHz PCM16 WAVE fixture. Total CPU is user
+plus system time.
+
+| Platform / workload | v0.152.0 | v0.153.0 | Wall change | CPU change |
+| --- | ---: | ---: | ---: | ---: |
+| Linux x86-64 isolated filter | 166.45 ms | 69.10 ms | -58.49% | n/a |
+| Linux x86-64 analysis | 1.001 s | 0.923 s | -7.80% | -6.80% |
+| Linux x86-64 normalization | 1.123 s | 0.980 s | -12.68% | -14.60% |
+| Linux x86-64 normalization with verification | 2.988 s | 2.539 s | -15.05% | -19.58% |
+| Apple Silicon isolated filter | 78.67 ms | 72.53 ms | -7.80% | n/a |
+| Apple Silicon analysis | 0.595 s | 0.558 s | -6.22% | -5.47% |
+| Apple Silicon normalization | 0.681 s | 0.624 s | -8.35% | -7.43% |
+| Apple Silicon normalization with verification | 1.802 s | 1.719 s | -4.61% | -4.62% |
+
+Every isolated checksum matched. Analysis JSON, ordinary normalized WAVE
+bytes, and verified normalized WAVE bytes were identical to v0.152.0 on both
+architectures. Unit tests compare both SIMD lanes bit for bit with independent
+scalar filters at 8, 44.1, 48, 96, 192, and 384 kHz, including subnormal,
+quiet/signaling NaN, and positive/negative infinity inputs. Both execution
+orders improved for every end-to-end workload.
+
 ## Final integration gate
 
 Before each release, run the full feature matrix, official conformance jobs
