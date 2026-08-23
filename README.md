@@ -115,9 +115,10 @@ the `-o` extension override this.
   atomic publication remain per output.
 * **Bounded parallel FLAC encoding** coalesces short decoder packets, encodes
   independent fixed-size frames and their bitstreams on up to eight tasks in
-  the global worker pool, then updates MD5/STREAMINFO and writes bytes in source
-  order. `--jobs 1` retains the low-overhead serial path, and encoded files are
-  byte-identical across worker counts.
+  the global worker pool, overlaps the serial source-order MD5 update with that
+  work, then updates STREAMINFO and writes bytes in source order. `--jobs 1`
+  retains the low-overhead serial path, and encoded files are byte-identical
+  across worker counts.
 * **SIMD FLAC sample staging** converts planar f32 chunks directly into the
   encoder's frame-major signed integers eight values at a time. Dedicated mono,
   stereo-interleave, and multichannel AVX2 paths retain scalar rounding and

@@ -275,6 +275,11 @@ Forge already provides:
   with eight-frame mono/stereo quantization, lane-correct stereo interleaving,
   vectorized 3-to-8-channel frame groups, exact exceptional-value and half-LSB
   behavior, unchanged dither RNG sequencing, and portable scalar fallbacks.
+- Pipelined FLAC source-context processing that overlaps the serial ordered MD5
+  pass with bounded independent-frame encoding in the existing worker pool,
+  retains the exact per-frame `Context` update boundaries and STREAMINFO bytes,
+  adds no sample copy or codec-owned pool, and leaves one-worker/nested-file
+  encoding on the established serial path.
 - Multichannel true-peak pair passes that retain meter state across each
   channel-contiguous decoder chunk, share immutable polyphase coefficients for
   adjacent channels, handle odd channel counts with the scalar tail, and leave

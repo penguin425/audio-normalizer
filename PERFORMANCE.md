@@ -1074,6 +1074,56 @@ all verification runs passed. The one-worker CPU difference is noise-level;
 the retained implementation improves end-to-end latency without material CPU
 or memory cost.
 
+### v0.148.0: pipelined FLAC source context
+
+Parallel FLAC batches previously waited for every independent frame and its
+bitstream to finish before updating the serial source `Context` used for the
+mandatory STREAMINFO MD5 and total-sample count. The writer now executes those
+two independent stages with `rayon::join`: one branch uses the existing bounded
+frame tasks, while the other visits the same interleaved samples in source
+order and calls `Context::fill_interleaved` at the same 4096-frame boundaries.
+Frame bytes are still checked and written in ordinal order after both branches
+finish. No sample copy, extra thread pool, persistent queue, or new allocation
+is introduced.
+
+The pipeline is active only in the bounded multi-frame path. `--jobs 1`, short
+tails, and writers created inside existing file-level Rayon work retain the
+established serial implementation. The design follows the same overlap used by
+flacenc's own parallel source-context worker while keeping Forge's single global
+concurrency budget.
+
+Alternating five-pair comparisons used the exact final v0.147.0 commit and the
+v0.148.0 candidate, separately built with native-host fat LTO and no PGO. Both
+deterministic inputs contain 600 seconds of stereo 48 kHz audio; the WAVE case
+uses long native chunks and the FLAC case exercises short-packet coalescing.
+Every run used `--bits 24 --verify --jobs 32` and includes analysis, gain,
+encoding, exact lossless verification, metadata finalization, and atomic
+replacement. Values are medians.
+
+| Workload / metric | v0.147.0 | v0.148.0 | Change |
+| --- | ---: | ---: | ---: |
+| WAVE to FLAC verify, wall | 5.65 s | 5.29 s | -6.37% |
+| WAVE to FLAC verify, total CPU | 8.77 s | 8.86 s | +1.03% |
+| WAVE to FLAC verify, peak RSS | 94,092 KiB | 95,300 KiB | +1.28% |
+| FLAC to FLAC verify, wall | 5.85 s | 5.56 s | -4.96% |
+| FLAC to FLAC verify, total CPU | 8.36 s | 8.63 s | +3.23% |
+| FLAC to FLAC verify, peak RSS | 86,064 KiB | 86,792 KiB | +0.85% |
+
+All ten candidate runs passed output verification, and both completed FLAC
+files matched v0.147.0 byte for byte. The measured latency reduction is retained
+with the disclosed small aggregate-CPU cost; lower `--jobs` values remain
+available when concurrent unrelated work or energy is more important than
+single-file completion time.
+
+A follow-up experiment packed the retained i32 queue into one reusable PCM-byte
+buffer and called the source `Context` once per FLAC block instead of once per
+sample. It reduced total CPU by 1.6% for 24-bit output and 2.2% for 16-bit
+output, but end-to-end wall time changed by only -1.0% and +0.6%, respectively,
+while peak RSS rose by up to 1.9%. An AVX2 byte-shuffle variant reduced the
+24-bit wall-time difference to -0.2% rather than making it material. Both
+variants produced byte-identical files, but the extra buffer and code were
+rejected because they did not improve both integer depths.
+
 ## Final integration gate
 
 The measured implementation sequence is complete. Before release, run the full
