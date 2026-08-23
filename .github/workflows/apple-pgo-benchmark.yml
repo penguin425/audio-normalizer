@@ -49,12 +49,14 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --locked --release --target aarch64-apple-darwin \
-            --features "$FORGE_PGO_FEATURES" --bin forge
+            --features "$FORGE_PGO_FEATURES" --bin forge --bin forge-container-qc
           tools/build-pgo-forge.sh aarch64-apple-darwin
           baseline="${RUNNER_TEMP}/target-baseline/aarch64-apple-darwin/release/forge"
           candidate="${RUNNER_TEMP}/forge-pgo/optimized/aarch64-apple-darwin/release/forge"
+          container_qc="${RUNNER_TEMP}/target-baseline/aarch64-apple-darwin/release/forge-container-qc"
           test -x "$baseline"
           test -x "$candidate"
+          test -x "$container_qc"
           shasum -a 256 "$baseline" "$candidate"
           size "$baseline" "$candidate"
 
@@ -95,6 +97,7 @@ jobs:
           set -euo pipefail
           baseline="${RUNNER_TEMP}/target-baseline/aarch64-apple-darwin/release/forge"
           candidate="${RUNNER_TEMP}/forge-pgo/optimized/aarch64-apple-darwin/release/forge"
+          container_qc="${RUNNER_TEMP}/target-baseline/aarch64-apple-darwin/release/forge-container-qc"
           common=(
             --duration-seconds 300
             --iterations 5
@@ -107,18 +110,22 @@ jobs:
           )
           python3 tools/benchmark.py \
             --forge "$baseline" \
+            --container-qc "$container_qc" \
             --work-dir "${RUNNER_TEMP}/bench-base-first" \
             --output apple-pgo-base-first.json "${common[@]}"
           python3 tools/benchmark.py \
             --forge "$candidate" \
+            --container-qc "$container_qc" \
             --work-dir "${RUNNER_TEMP}/bench-candidate-first" \
             --output apple-pgo-candidate-first.json "${common[@]}"
           python3 tools/benchmark.py \
             --forge "$candidate" \
+            --container-qc "$container_qc" \
             --work-dir "${RUNNER_TEMP}/bench-candidate-second" \
             --output apple-pgo-candidate-second.json "${common[@]}"
           python3 tools/benchmark.py \
             --forge "$baseline" \
+            --container-qc "$container_qc" \
             --work-dir "${RUNNER_TEMP}/bench-base-second" \
             --output apple-pgo-base-second.json "${common[@]}"
 
