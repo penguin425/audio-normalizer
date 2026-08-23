@@ -314,6 +314,29 @@ unsafe fn abs_max_and_has_nan_avx2(buf: &[f32]) -> (f32, bool) {
 unsafe fn apply_gain_neon(buf: &mut [f32], gain: f32) {
     let gain_vector = vdupq_n_f32(gain);
     let mut index = 0;
+    while index + 16 <= buf.len() {
+        let samples0 = vld1q_f32(buf.as_ptr().add(index));
+        let samples1 = vld1q_f32(buf.as_ptr().add(index + 4));
+        let samples2 = vld1q_f32(buf.as_ptr().add(index + 8));
+        let samples3 = vld1q_f32(buf.as_ptr().add(index + 12));
+        vst1q_f32(
+            buf.as_mut_ptr().add(index),
+            vmulq_f32(samples0, gain_vector),
+        );
+        vst1q_f32(
+            buf.as_mut_ptr().add(index + 4),
+            vmulq_f32(samples1, gain_vector),
+        );
+        vst1q_f32(
+            buf.as_mut_ptr().add(index + 8),
+            vmulq_f32(samples2, gain_vector),
+        );
+        vst1q_f32(
+            buf.as_mut_ptr().add(index + 12),
+            vmulq_f32(samples3, gain_vector),
+        );
+        index += 16;
+    }
     while index + 4 <= buf.len() {
         let samples = vld1q_f32(buf.as_ptr().add(index));
         vst1q_f32(buf.as_mut_ptr().add(index), vmulq_f32(samples, gain_vector));
@@ -329,6 +352,16 @@ unsafe fn apply_gain_and_hard_clip_neon(buf: &mut [f32], gain: f32, ceil: f32) {
     let lower = vdupq_n_f32(-ceil);
     let upper = vdupq_n_f32(ceil);
     let mut index = 0;
+    while index + 16 <= buf.len() {
+        for offset in [0, 4, 8, 12] {
+            let samples = vld1q_f32(buf.as_ptr().add(index + offset));
+            let gained = vmulq_f32(samples, gain_vector);
+            let lower_clipped = vbslq_f32(vcltq_f32(gained, lower), lower, gained);
+            let protected = vbslq_f32(vcltq_f32(upper, gained), upper, lower_clipped);
+            vst1q_f32(buf.as_mut_ptr().add(index + offset), protected);
+        }
+        index += 16;
+    }
     while index + 4 <= buf.len() {
         let samples = vld1q_f32(buf.as_ptr().add(index));
         let gained = vmulq_f32(samples, gain_vector);
@@ -348,6 +381,15 @@ unsafe fn hard_clip_neon(buf: &mut [f32], ceil: f32) {
     let lower = vdupq_n_f32(-ceil);
     let upper = vdupq_n_f32(ceil);
     let mut index = 0;
+    while index + 16 <= buf.len() {
+        for offset in [0, 4, 8, 12] {
+            let samples = vld1q_f32(buf.as_ptr().add(index + offset));
+            let lower_clipped = vbslq_f32(vcltq_f32(samples, lower), lower, samples);
+            let protected = vbslq_f32(vcltq_f32(upper, samples), upper, lower_clipped);
+            vst1q_f32(buf.as_mut_ptr().add(index + offset), protected);
+        }
+        index += 16;
+    }
     while index + 4 <= buf.len() {
         let samples = vld1q_f32(buf.as_ptr().add(index));
         let lower_clipped = vbslq_f32(vcltq_f32(samples, lower), lower, samples);
@@ -366,6 +408,15 @@ unsafe fn abs_max_neon(buf: &[f32]) -> f32 {
     let zero = vdupq_n_f32(0.0);
     let mut maximum = zero;
     let mut index = 0;
+    while index + 16 <= buf.len() {
+        for offset in [0, 4, 8, 12] {
+            let samples = vld1q_f32(buf.as_ptr().add(index + offset));
+            let ordered = vceqq_f32(samples, samples);
+            let finite_absolute = vbslq_f32(ordered, vabsq_f32(samples), zero);
+            maximum = vmaxq_f32(maximum, finite_absolute);
+        }
+        index += 16;
+    }
     while index + 4 <= buf.len() {
         let samples = vld1q_f32(buf.as_ptr().add(index));
         let ordered = vceqq_f32(samples, samples);
@@ -390,6 +441,16 @@ unsafe fn abs_max_and_has_nan_neon(buf: &[f32]) -> (f32, bool) {
     let mut maximum = zero;
     let mut unordered = vdupq_n_u32(0);
     let mut index = 0;
+    while index + 16 <= buf.len() {
+        for offset in [0, 4, 8, 12] {
+            let samples = vld1q_f32(buf.as_ptr().add(index + offset));
+            let ordered = vceqq_f32(samples, samples);
+            unordered = vorrq_u32(unordered, vmvnq_u32(ordered));
+            let finite_absolute = vbslq_f32(ordered, vabsq_f32(samples), zero);
+            maximum = vmaxq_f32(maximum, finite_absolute);
+        }
+        index += 16;
+    }
     while index + 4 <= buf.len() {
         let samples = vld1q_f32(buf.as_ptr().add(index));
         let ordered = vceqq_f32(samples, samples);
