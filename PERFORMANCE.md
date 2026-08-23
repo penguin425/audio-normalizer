@@ -1317,6 +1317,39 @@ the NEON staging kernel to FLAC; its exact-output run regressed wall time by
 keeps the change restricted to the measured WAVE win instead of extrapolating a
 fast microkernel to a codec whose parallel encoder has different bottlenecks.
 
+### v0.152.0: byte-exact AArch64 NEON peak reductions
+
+Sample-peak reduction and the combined peak/NaN observation now use Advanced
+SIMD on AArch64. The loops reduce four vectors per iteration and
+mask NaNs before the maximum operation, preserving the established scalar
+result and the True Peak pruning rule that a block containing NaN is never
+skipped. Scalar tails retain exact behavior for every slice length.
+
+The release was measured against the exact v0.151.0 commit on an Apple
+Silicon GitHub runner with Rust 1.97.0. Primitive values are pooled medians of
+18 measurements per binary over 16,777,216 samples. End-to-end values are
+pooled medians of ten measurements per binary over deterministic 300-second,
+48 kHz fixtures. Both orders were run. Primitive checksums, analysis JSON, and
+normal and verification WAVE bytes all matched exactly.
+
+| Workload / median wall | v0.151.0 | v0.152.0 | Change |
+| --- | ---: | ---: | ---: |
+| Absolute-peak kernel | 23.30 ms | 2.68 ms | -88.52% |
+| Peak plus NaN kernel | 34.13 ms | 2.66 ms | -92.21% |
+| Stereo WAVE analysis | 0.627 s | 0.603 s | -3.80% |
+| Stereo quiet-tail analysis | 0.308 s | 0.263 s | -14.78% |
+| Stereo WAVE normalization | 0.687 s | 0.663 s | -3.46% |
+| Stereo WAVE normalization with verification | 1.963 s | 1.820 s | -7.27% |
+| 7.1 WAVE normalization | 1.678 s | 1.580 s | -5.84% |
+
+The corresponding total-CPU changes were -4.64%, -14.45%, -3.24%, -6.32%,
+and -4.62% for the five end-to-end rows. Earlier prototypes also added explicit
+NEON gain, combined gain/clip, and hard-clip loops. The combined path was
+neutral to regressive in the first order-reversed run, while 7.1 wall time
+regressed 0.58%, so all three were removed before the final measurement. This
+keeps the release limited to the reductions with both a large isolated win
+and consistent end-to-end benefit.
+
 ## Final integration gate
 
 Before each release, run the full feature matrix, official conformance jobs

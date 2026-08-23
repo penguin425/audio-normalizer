@@ -6,6 +6,8 @@
 //! target-cpu=native` the scalar fallbacks are themselves auto-vectorized by
 //! LLVM (SSE2 baseline on x86-64), so even the "slow" path is fast.
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
@@ -82,6 +84,11 @@ pub fn abs_max(buf: &[f32]) -> f32 {
             return unsafe { abs_max_avx2(buf) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        abs_max_neon(buf)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     abs_max_scalar(buf)
 }
 
@@ -98,6 +105,11 @@ pub(crate) fn abs_max_and_has_nan(buf: &[f32]) -> (f32, bool) {
             return unsafe { abs_max_and_has_nan_avx2(buf) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        abs_max_and_has_nan_neon(buf)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     abs_max_and_has_nan_scalar(buf)
 }
 
@@ -278,6 +290,79 @@ unsafe fn abs_max_and_has_nan_avx2(buf: &[f32]) -> (f32, bool) {
     (scalar_maximum, has_nan)
 }
 
+// ---------------------------------------------------------------------------
+// AArch64 Advanced SIMD implementations
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn abs_max_neon(buf: &[f32]) -> f32 {
+    let zero = vdupq_n_f32(0.0);
+    let mut maximum = zero;
+    let mut index = 0;
+    while index + 16 <= buf.len() {
+        for offset in [0, 4, 8, 12] {
+            let samples = vld1q_f32(buf.as_ptr().add(index + offset));
+            let ordered = vceqq_f32(samples, samples);
+            let finite_absolute = vbslq_f32(ordered, vabsq_f32(samples), zero);
+            maximum = vmaxq_f32(maximum, finite_absolute);
+        }
+        index += 16;
+    }
+    while index + 4 <= buf.len() {
+        let samples = vld1q_f32(buf.as_ptr().add(index));
+        let ordered = vceqq_f32(samples, samples);
+        let finite_absolute = vbslq_f32(ordered, vabsq_f32(samples), zero);
+        maximum = vmaxq_f32(maximum, finite_absolute);
+        index += 4;
+    }
+    let mut scalar_maximum = vmaxvq_f32(maximum);
+    for &sample in &buf[index..] {
+        let absolute = sample.abs();
+        if absolute > scalar_maximum {
+            scalar_maximum = absolute;
+        }
+    }
+    scalar_maximum
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn abs_max_and_has_nan_neon(buf: &[f32]) -> (f32, bool) {
+    let zero = vdupq_n_f32(0.0);
+    let mut maximum = zero;
+    let mut unordered = vdupq_n_u32(0);
+    let mut index = 0;
+    while index + 16 <= buf.len() {
+        for offset in [0, 4, 8, 12] {
+            let samples = vld1q_f32(buf.as_ptr().add(index + offset));
+            let ordered = vceqq_f32(samples, samples);
+            unordered = vorrq_u32(unordered, vmvnq_u32(ordered));
+            let finite_absolute = vbslq_f32(ordered, vabsq_f32(samples), zero);
+            maximum = vmaxq_f32(maximum, finite_absolute);
+        }
+        index += 16;
+    }
+    while index + 4 <= buf.len() {
+        let samples = vld1q_f32(buf.as_ptr().add(index));
+        let ordered = vceqq_f32(samples, samples);
+        unordered = vorrq_u32(unordered, vmvnq_u32(ordered));
+        let finite_absolute = vbslq_f32(ordered, vabsq_f32(samples), zero);
+        maximum = vmaxq_f32(maximum, finite_absolute);
+        index += 4;
+    }
+    let mut scalar_maximum = vmaxvq_f32(maximum);
+    let mut has_nan = vmaxvq_u32(unordered) != 0;
+    for &sample in &buf[index..] {
+        if sample.is_nan() {
+            has_nan = true;
+        } else {
+            scalar_maximum = scalar_maximum.max(sample.abs());
+        }
+    }
+    (scalar_maximum, has_nan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,5 +463,46 @@ mod tests {
             abs_max_and_has_nan(&samples),
             abs_max_and_has_nan_scalar(&samples)
         );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_peak_primitives_match_scalar() {
+        let mut samples = vec![
+            -f32::INFINITY,
+            -2.0,
+            -1.0,
+            -0.0,
+            0.0,
+            f32::from_bits(1),
+            -f32::from_bits(1),
+            0.125,
+            0.75,
+            1.0,
+            2.0,
+            f32::INFINITY,
+            f32::from_bits(0x7fc0_1234),
+        ];
+        let mut state = 0x510e_527f_ade6_82d1_u64;
+        for _ in 0..4099 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            samples.push(f32::from_bits((state >> 32) as u32));
+        }
+
+        for length in [0, 1, 3, 4, 5, 31, 32, 33, 1027, samples.len()] {
+            let input = &samples[..length];
+            assert_eq!(
+                abs_max(input).to_bits(),
+                abs_max_scalar(input).to_bits(),
+                "peak len={length}"
+            );
+            assert_eq!(
+                abs_max_and_has_nan(input),
+                abs_max_and_has_nan_scalar(input),
+                "peak+nan len={length}"
+            );
+        }
     }
 }
