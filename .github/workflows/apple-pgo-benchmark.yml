@@ -36,6 +36,11 @@ jobs:
           targets: aarch64-apple-darwin
           components: llvm-tools-preview
 
+      - name: Test deterministic PGO helpers
+        run: |
+          python3 tools/test_pgo_profile.py
+          python3 tools/test_pgo_training.py
+
       - name: Build the portable baseline and PGO candidate
         shell: bash
         env:
