@@ -38,7 +38,7 @@
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
-          "items": {"enum": ["wav-stereo-analyze", "wav-stereo-normalize", "wav-stereo-verify", "wav-to-flac-verify", "wav-stereo-resample-normalize", "wav-stereo-batch-normalize", "wav-stereo-batch-cache-hit-normalize", "wav-stereo-batch-cache-miss-normalize", "wav-stereo-album-normalize", "wav-stereo-album-cache-hit-normalize", "wav-stereo-album-cache-miss-normalize", "wav-7.1-normalize", "flac-stereo-analyze", "flac-stereo-normalize", "mp3-stereo-analyze", "mp3-stereo-normalize", "pathological-wave-qc"]}
+          "items": {"enum": ["wav-stereo-analyze", "wav-stereo-normalize", "wav-stereo-verify", "wav-to-flac-verify", "wav-stereo-resample-normalize", "wav-stereo-batch-normalize", "wav-stereo-batch-cache-hit-normalize", "wav-stereo-batch-cache-miss-normalize", "wav-stereo-album-normalize", "wav-stereo-album-cache-hit-normalize", "wav-stereo-album-cache-miss-normalize", "wav-7.1-normalize", "flac-stereo-analyze", "flac-stereo-normalize", "mp3-stereo-analyze", "mp3-stereo-normalize", "pathological-wave-qc", "dsf-stereo-analyze", "dsdiff-stereo-analyze"]}
         }
       }
     },
