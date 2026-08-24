@@ -1068,9 +1068,12 @@ impl FirDecimator2 {
     }
 
     fn push(&mut self, sample: f64) -> Option<f64> {
-        let value = self.fir.push(sample);
         self.phase = !self.phase;
-        (!self.phase).then_some(value)
+        // Every input still enters the delay line, but only one phase survives
+        // the 2:1 decimator. Avoid evaluating the 31-tap dot product for the
+        // discarded phase; retained outputs use the same coefficient and
+        // accumulation order as the full-rate FIR.
+        self.fir.push_if(sample, !self.phase)
     }
 }
 
@@ -1099,13 +1102,21 @@ impl Fir {
     }
 
     fn push(&mut self, sample: f64) -> f64 {
+        self.push_if(sample, true)
+            .expect("an unconditional FIR output cannot be absent")
+    }
+
+    fn push_if(&mut self, sample: f64, emit: bool) -> Option<f64> {
         self.delay[self.cursor] = sample;
         self.delay[self.cursor + self.period] = sample;
-        let history = &self.delay[self.cursor + 1..self.cursor + self.period + 1];
-        let mut output = 0.0;
-        for (coefficient, delayed) in self.coefficients.iter().zip(history.iter().rev()) {
-            output += coefficient * delayed;
-        }
+        let output = emit.then(|| {
+            let history = &self.delay[self.cursor + 1..self.cursor + self.period + 1];
+            let mut output = 0.0;
+            for (coefficient, delayed) in self.coefficients.iter().zip(history.iter().rev()) {
+                output += coefficient * delayed;
+            }
+            output
+        });
         self.cursor += 1;
         if self.cursor == self.period {
             self.cursor = 0;
@@ -1329,6 +1340,30 @@ mod tests {
                 }
                 assert_eq!(candidate.push(sample).to_bits(), reference.to_bits());
             }
+        }
+    }
+
+    #[test]
+    fn decimator_retained_phases_match_full_rate_fir_bit_exactly() {
+        let coefficients = low_pass_coefficients(HALF_BAND_TAPS, 0.25);
+        let mut candidate = FirDecimator2::new(coefficients.clone());
+        let mut reference = Fir::new(coefficients);
+        let mut reference_phase = false;
+        for index in 0_usize..131_071 {
+            let sample = if (index.wrapping_mul(193).wrapping_add(17) & 1) == 0 {
+                -1.0
+            } else {
+                1.0
+            };
+            let full_rate = reference.push(sample);
+            reference_phase = !reference_phase;
+            let expected = (!reference_phase).then_some(full_rate);
+            let observed = candidate.push(sample);
+            assert_eq!(
+                observed.map(f64::to_bits),
+                expected.map(f64::to_bits),
+                "sample {index}"
+            );
         }
     }
 
