@@ -122,8 +122,9 @@ on:
       - "tools/package-linux-release.sh"
       - "tools/package-linux-v3-release.sh"
       - "tools/generate-package-metadata.sh"
-      - "Cargo.toml"
-      - "Cargo.lock"
+      # Cargo-only dependency updates are covered by the full-feature CI jobs.
+      # Release dry-runs still run whenever packaging, public interfaces,
+      # release documentation, or release tooling changes.
   workflow_dispatch:
 
 permissions:
@@ -131,7 +132,9 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  # Never interrupt an immutable tag release. A newer pull-request head makes
+  # an older dry-run obsolete, so release its scarce macOS runners promptly.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   validate:
