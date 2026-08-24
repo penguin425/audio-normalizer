@@ -2,7 +2,6 @@
 
 use super::truepeak::TruePeakMeter;
 use serde::Serialize;
-use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LimiterEnvelopePoint {
@@ -39,7 +38,10 @@ impl Default for LimiterConfig {
 
 pub struct TruePeakLimiter {
     meters: Vec<TruePeakMeter>,
-    delay: Vec<VecDeque<f32>>,
+    delay: Vec<Vec<f32>>,
+    delay_start: usize,
+    delay_len: usize,
+    delay_capacity: usize,
     lookahead_frames: usize,
     release_coeff: f32,
     ceiling: f32,
@@ -84,8 +86,11 @@ impl TruePeakLimiter {
                 .map(|_| TruePeakMeter::for_sample_rate(sample_rate))
                 .collect(),
             delay: (0..channels)
-                .map(|_| VecDeque::with_capacity(lookahead_frames + 1))
+                .map(|_| vec![0.0; lookahead_frames + 1])
                 .collect(),
+            delay_start: 0,
+            delay_len: 0,
+            delay_capacity: lookahead_frames + 1,
             lookahead_frames,
             release_coeff: (-1.0 / release_samples).exp() as f32,
             ceiling: 10.0_f64.powf(ceiling_db / 20.0) as f32,
@@ -142,21 +147,27 @@ impl TruePeakLimiter {
         if output.len() != self.delay.len() {
             return Err("limiter output channel count changed".into());
         }
-        let emit = frames.saturating_sub(self.lookahead_frames.saturating_sub(self.delay[0].len()));
+        let emit = frames.saturating_sub(self.lookahead_frames.saturating_sub(self.delay_len));
         for channel in output.iter_mut() {
             channel.clear();
             channel.reserve(emit);
         }
         for (frame, _) in planar[0].iter().enumerate() {
+            let mut delay_write = self.delay_start + self.delay_len;
+            if delay_write >= self.delay_capacity {
+                delay_write -= self.delay_capacity;
+            }
             let detected = push_and_detect_frame(
                 &mut self.meters,
                 &mut self.delay,
                 &mut self.last_samples,
                 planar,
                 frame,
+                delay_write,
             );
+            self.delay_len += 1;
             self.update_envelope(detected);
-            if self.delay[0].len() > self.lookahead_frames {
+            if self.delay_len > self.lookahead_frames {
                 self.emit_one(output);
             }
         }
@@ -190,12 +201,12 @@ impl TruePeakLimiter {
         if output.len() != self.delay.len() {
             return Err("limiter output channel count changed".into());
         }
-        let remaining = self.delay[0].len();
+        let remaining = self.delay_len;
         for channel in output.iter_mut() {
             channel.clear();
             channel.reserve(remaining);
         }
-        while !self.delay[0].is_empty() {
+        while self.delay_len != 0 {
             let detected = detect_repeated_frame(&mut self.meters, &self.last_samples);
             self.update_envelope(detected);
             self.emit_one(output);
@@ -257,11 +268,14 @@ impl TruePeakLimiter {
             self.interval_reduction_sum_db += reduction_db;
             self.interval_max_reduction_db = self.interval_max_reduction_db.max(reduction_db);
         }
-        for (channel, queue) in self.delay.iter_mut().enumerate() {
-            if let Some(sample) = queue.pop_front() {
-                output[channel].push(sample * self.envelope);
-            }
+        for (channel, delay) in self.delay.iter().enumerate() {
+            output[channel].push(delay[self.delay_start] * self.envelope);
         }
+        self.delay_start += 1;
+        if self.delay_start == self.delay_capacity {
+            self.delay_start = 0;
+        }
+        self.delay_len -= 1;
         if self.statistics_enabled && self.interval_frames == self.statistics_interval_frames {
             self.finish_statistics_interval();
         }
@@ -304,18 +318,19 @@ fn reduction_db(envelope: f32) -> f64 {
 #[inline]
 fn push_and_detect_frame(
     meters: &mut [TruePeakMeter],
-    delay: &mut [VecDeque<f32>],
+    delay: &mut [Vec<f32>],
     last_samples: &mut [f32],
     planar: &[Vec<f32>],
     frame: usize,
+    delay_write: usize,
 ) -> f32 {
     if meters.len() == 2 {
         let left_sample = planar[0][frame];
         let right_sample = planar[1][frame];
         last_samples[0] = left_sample;
         last_samples[1] = right_sample;
-        delay[0].push_back(left_sample);
-        delay[1].push_back(right_sample);
+        delay[0][delay_write] = left_sample;
+        delay[1][delay_write] = right_sample;
         let (left, right) = meters.split_at_mut(1);
         let (left_peak, right_peak) = TruePeakMeter::process_stereo_sample(
             &mut left[0],
@@ -335,11 +350,11 @@ fn push_and_detect_frame(
     {
         let left_sample = sample_pair[0][frame];
         last_pair[0] = left_sample;
-        delay_pair[0].push_back(left_sample);
+        delay_pair[0][delay_write] = left_sample;
         if meter_pair.len() == 2 {
             let right_sample = sample_pair[1][frame];
             last_pair[1] = right_sample;
-            delay_pair[1].push_back(right_sample);
+            delay_pair[1][delay_write] = right_sample;
             let (left, right) = meter_pair.split_at_mut(1);
             let (left_peak, right_peak) = TruePeakMeter::process_stereo_sample(
                 &mut left[0],
