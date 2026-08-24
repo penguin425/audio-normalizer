@@ -18,6 +18,7 @@ pub use crate::opus_tags::{read_r128_tags, rewrite_r128_tags};
 
 const OPUS_RATE: u32 = 48_000;
 const FRAME_SIZE: usize = 960;
+const MAX_PACKET_FRAMES: usize = 5760;
 const RESAMPLE_CHUNK: usize = 1024;
 const MAX_RESAMPLE_FLUSH_PASSES: usize = 8;
 static NEXT_SERIAL: AtomicU32 = AtomicU32::new(0x464f_5247);
@@ -457,6 +458,10 @@ where
     let mut skip = parsed.pre_skip as usize;
     let mut raw_frames = 0_u64;
     let mut audio_packets = 0_u64;
+    let mut interleaved = vec![0.0_f32; MAX_PACKET_FRAMES * channels];
+    let mut planar = (0..channels)
+        .map(|_| Vec::with_capacity(MAX_PACKET_FRAMES))
+        .collect::<Vec<_>>();
     loop {
         let packet = read_ogg_packet(packets, path, "Ogg Opus packet")?.ok_or_else(|| {
             format!(
@@ -472,7 +477,6 @@ where
             ));
         }
         audio_packets += 1;
-        let mut interleaved = vec![0.0_f32; 5760 * channels];
         let frames = decoder
             .decode_float(&packet.data, &mut interleaved, false)
             .map_err(|error| {
@@ -499,7 +503,11 @@ where
             end = end.min(target_raw_frames.saturating_sub(packet_start) as usize);
         }
         if end > start {
-            let mut planar = vec![Vec::with_capacity(end - start); channels];
+            let output_frames = end - start;
+            for channel in &mut planar {
+                channel.clear();
+                channel.reserve(output_frames);
+            }
             for frame in start..end {
                 for (internal, &opus_channel) in from_opus_order.iter().enumerate() {
                     planar[internal]
@@ -1094,5 +1102,47 @@ mod tests {
         let expected_frames = ((total_frames as u128 * OPUS_RATE as u128 + input_rate as u128 / 2)
             / input_rate as u128) as u64;
         assert_eq!(inspect(&path).unwrap().total_frames, expected_frames);
+    }
+
+    #[test]
+    fn decoder_reuses_packet_and_planar_allocations() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("decode-reuse.opus");
+        let input_frames = FRAME_SIZE * 20;
+        let mut writer = OpusStreamWriter::create(
+            &path,
+            OPUS_RATE,
+            input_frames,
+            2,
+            &default_channel_roles(2),
+            128,
+            -18.0,
+            None,
+        )
+        .unwrap();
+        let samples = (0..input_frames)
+            .map(|frame| (TAU * 997.0 * frame as f32 / OPUS_RATE as f32).sin() * 0.1)
+            .collect::<Vec<_>>();
+        writer.write_chunk(&[samples.clone(), samples]).unwrap();
+        writer.finish().unwrap();
+
+        let mut allocations: Option<Vec<*const f32>> = None;
+        let mut callbacks = 0;
+        let mut decoded_frames = 0;
+        decode_stream(&path, |_, planar| {
+            callbacks += 1;
+            decoded_frames += planar[0].len();
+            let current = planar.iter().map(Vec::as_ptr).collect::<Vec<_>>();
+            if let Some(expected) = &allocations {
+                assert_eq!(&current, expected);
+            } else {
+                allocations = Some(current);
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(callbacks > 1);
+        assert_eq!(decoded_frames, input_frames);
     }
 }

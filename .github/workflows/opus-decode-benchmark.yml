@@ -1,0 +1,263 @@
+name: Opus decode buffer benchmark
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/opus-decode-benchmark.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "schema/performance-benchmark-v1.schema.json"
+      - "src/opus.rs"
+      - "tools/benchmark.py"
+      - "tools/test_benchmark.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opus-decode-benchmark-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: benchmark (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+
+      - name: Check out exact pull-request base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: baseline
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+
+      - name: Install ffmpeg
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_OS}" == "Linux" ]]; then
+            sudo apt-get update
+            sudo apt-get install --yes ffmpeg
+          elif ! command -v ffmpeg >/dev/null; then
+            brew install ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+
+      - name: Test benchmark and Opus allocation contracts
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_TARGET_DIR: ${{ runner.temp }}/target-candidate-tests
+        run: |
+          set -euo pipefail
+          python3 candidate/tools/test_benchmark.py
+          cargo test --locked --manifest-path candidate/Cargo.toml \
+            --features opus-encoding --lib \
+            decoder_reuses_packet_and_planar_allocations -- --nocapture
+
+      - name: Build exact baseline and candidate
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/target-baseline" \
+            cargo build --locked --release --manifest-path baseline/Cargo.toml \
+              --features opus-encoding --bin forge --bin forge-container-qc
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/target-candidate" \
+            cargo build --locked --release --manifest-path candidate/Cargo.toml \
+              --features opus-encoding --bin forge --bin forge-container-qc
+
+      - name: Verify byte-exact analysis and normalized output
+        shell: bash
+        run: |
+          set -euo pipefail
+          exact_dir="${RUNNER_TEMP}/exact-output"
+          mkdir "${exact_dir}"
+          EXACT_DIR="${exact_dir}" python3 - <<'PY'
+          import os
+          import shutil
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "candidate/tools")
+          from benchmark import encode_fixture, write_pcm16_wave
+
+          root = Path(os.environ["EXACT_DIR"])
+          source = root / "source.wav"
+          write_pcm16_wave(source, 300, 48_000, 2)
+          encode_fixture(
+              Path(shutil.which("ffmpeg")),
+              source,
+              root / "input.opus",
+              [
+                  "-map_metadata", "-1",
+                  "-c:a", "libopus",
+                  "-b:a", "128k",
+                  "-vbr", "off",
+                  "-application", "audio",
+                  "-frame_duration", "20",
+              ],
+              1_800,
+          )
+          source.unlink()
+          PY
+
+          baseline="${RUNNER_TEMP}/target-baseline/release/forge"
+          candidate="${RUNNER_TEMP}/target-candidate/release/forge"
+          "${baseline}" "${exact_dir}/input.opus" --analyze --json \
+            > "${exact_dir}/base.json"
+          "${candidate}" "${exact_dir}/input.opus" --analyze --json \
+            > "${exact_dir}/candidate.json"
+          "${candidate}" "${exact_dir}/input.opus" --jobs 1 --analyze --json \
+            > "${exact_dir}/candidate-one.json"
+          cmp "${exact_dir}/base.json" "${exact_dir}/candidate.json"
+          cmp "${exact_dir}/candidate.json" "${exact_dir}/candidate-one.json"
+
+          "${baseline}" "${exact_dir}/input.opus" --overwrite \
+            -o "${exact_dir}/base.wav"
+          "${candidate}" "${exact_dir}/input.opus" --overwrite \
+            -o "${exact_dir}/candidate.wav"
+          cmp "${exact_dir}/base.wav" "${exact_dir}/candidate.wav"
+
+      - name: Run thermally balanced interleaved benchmarks
+        shell: bash
+        env:
+          BENCHMARK_INPUT: ${{ runner.temp }}/exact-output/input.opus
+          BASELINE_FORGE: ${{ runner.temp }}/target-baseline/release/forge
+          CANDIDATE_FORGE: ${{ runner.temp }}/target-candidate/release/forge
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import statistics
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "candidate/tools")
+          from benchmark import cpu_model, run_measured
+
+          input_path = Path(os.environ["BENCHMARK_INPUT"])
+          binaries = {
+              "baseline": Path(os.environ["BASELINE_FORGE"]),
+              "candidate": Path(os.environ["CANDIDATE_FORGE"]),
+          }
+          logs = Path("opus-interleaved-logs")
+          logs.mkdir()
+          result = {
+              "method": "12-round ABBA/BAAB on one pre-encoded 300-second Opus fixture",
+              "system": {
+                  "platform": sys.platform,
+                  "cpu_model": cpu_model(),
+                  "cpu_count": os.cpu_count(),
+              },
+              "modes": {},
+          }
+
+          for mode, extra_args in (("default", []), ("jobs_1", ["--jobs", "1"])):
+              samples = {"baseline": [], "candidate": []}
+              rounds = []
+
+              # Warm instruction/data caches symmetrically. These runs are not measured.
+              for name in ("baseline", "candidate"):
+                  warm = run_measured(
+                      [str(binaries[name]), str(input_path), *extra_args, "--analyze", "--json"],
+                      300,
+                      logs / f"{mode}-warm-{name}.out",
+                      logs / f"{mode}-warm-{name}.err",
+                  )
+                  assert warm["exit_code"] == 0, warm
+
+              for round_index in range(12):
+                  order = (
+                      ("baseline", "candidate", "candidate", "baseline")
+                      if round_index % 2 == 0
+                      else ("candidate", "baseline", "baseline", "candidate")
+                  )
+                  round_samples = {"baseline": [], "candidate": []}
+                  for position, name in enumerate(order):
+                      sample = run_measured(
+                          [
+                              str(binaries[name]), str(input_path), *extra_args,
+                              "--analyze", "--json",
+                          ],
+                          300,
+                          logs / f"{mode}-{round_index:02d}-{position}-{name}.out",
+                          logs / f"{mode}-{round_index:02d}-{position}-{name}.err",
+                      )
+                      assert sample["exit_code"] == 0, sample
+                      samples[name].append(sample)
+                      round_samples[name].append(sample)
+                  rounds.append({"order": order, "samples": round_samples})
+
+              summary = {"samples_per_binary": len(samples["baseline"])}
+              for label, getter in (
+                  ("wall", lambda sample: sample["wall_seconds"]),
+                  (
+                      "cpu",
+                      lambda sample: sample["user_cpu_seconds"]
+                      + sample["system_cpu_seconds"],
+                  ),
+              ):
+                  baseline = [getter(sample) for sample in samples["baseline"]]
+                  candidate = [getter(sample) for sample in samples["candidate"]]
+                  round_changes = []
+                  for round_result in rounds:
+                      base_round = statistics.median(
+                          getter(sample)
+                          for sample in round_result["samples"]["baseline"]
+                      )
+                      candidate_round = statistics.median(
+                          getter(sample)
+                          for sample in round_result["samples"]["candidate"]
+                      )
+                      round_changes.append((candidate_round / base_round - 1.0) * 100.0)
+                  baseline_median = statistics.median(baseline)
+                  candidate_median = statistics.median(candidate)
+                  summary[label] = {
+                      "baseline_median": baseline_median,
+                      "candidate_median": candidate_median,
+                      "pooled_change_percent": (
+                          candidate_median / baseline_median - 1.0
+                      ) * 100.0,
+                      "median_paired_round_change_percent": statistics.median(round_changes),
+                      "paired_round_changes_percent": round_changes,
+                  }
+              summary["peak_rss_bytes"] = {
+                  name: max(sample["peak_rss_bytes"] for sample in values)
+                  for name, values in samples.items()
+              }
+              result["modes"][mode] = {
+                  "summary": summary,
+                  "rounds": rounds,
+              }
+
+          Path("opus-decode-interleaved.json").write_text(
+              json.dumps(result, indent=2) + "\n"
+          )
+          print(json.dumps({
+              mode: value["summary"] for mode, value in result["modes"].items()
+          }, indent=2))
+          PY
+
+      - name: Upload benchmark evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: opus-decode-benchmark-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            opus-decode-interleaved.json
+          if-no-files-found: error
+          retention-days: 30
