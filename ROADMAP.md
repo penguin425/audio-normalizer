@@ -253,6 +253,11 @@ Forge already provides:
   and true-peak meters borrowed across the frame loop, removes dynamic channel
   iteration for the dominant delivery layout, preserves the generic timeline
   and multichannel path, and produces byte-identical normalized audio.
+- Bounded stereo analysis overlap that advances the exact paired True Peak
+  meters concurrently with the unchanged K-weighting, RMS, sample-peak, and
+  gating pass for long non-timeline chunks, retains the fused path for short
+  packets and one-worker runs, and preserves every reported bit and output
+  byte.
 - Adaptive native-WAVE streaming chunks: a frame-aligned 1 MiB read/decode
   buffer for stereo and multichannel inputs, the established 64 KiB buffer for
   mono, and one reusable planar allocation across the stream. The policy is

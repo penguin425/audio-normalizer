@@ -346,6 +346,35 @@ impl StreamingAnalyzer {
             self.finish_cuda_true_peak(planar);
             return result;
         }
+        // True-peak interpolation and loudness/RMS accumulation have no
+        // shared mutable state. For a long stereo chunk, let the global pool
+        // advance both exact peak meters while this worker retains the
+        // established K-weighting, window, and gating order. Short decoder
+        // packets keep the fused loop so task coordination cannot dominate.
+        // At 192 kHz and above True Peak is the sample peak already collected
+        // by the loudness pass, so a second task would only duplicate work.
+        if self.timeline_interval_frames.is_none()
+            && planar.len() == 2
+            && self.sample_rate < 192_000
+            && chunk_frames >= MIN_PARALLEL_TRUE_PEAK_FRAMES
+            && rayon::current_num_threads() > 1
+        {
+            let mut true_peak_meters = std::mem::take(&mut self.true_peak_meters);
+            let ((), result) = rayon::join(
+                || process_true_peak_channel_group(&mut true_peak_meters, planar),
+                || {
+                    self.process_without_true_peak(
+                        planar,
+                        chunk_frames,
+                        momentary_window,
+                        short_term_window,
+                        hop,
+                    )
+                },
+            );
+            self.true_peak_meters = true_peak_meters;
+            return result;
+        }
         // Stereo is the dominant file-delivery layout. Keeping both filters in
         // persistent SIMD lanes and both true-peak meters borrowed outside the
         // frame loop removes the dynamic channel iterator and per-frame state
@@ -684,10 +713,6 @@ impl StreamingAnalyzer {
         }
     }
 
-    #[cfg(all(
-        feature = "cuda-truepeak",
-        any(target_os = "linux", target_os = "windows")
-    ))]
     fn process_without_true_peak(
         &mut self,
         planar: &[Vec<f32>],
@@ -703,7 +728,7 @@ impl StreamingAnalyzer {
             let kweight_pair = self
                 .kweight_pair
                 .as_mut()
-                .expect("CUDA stereo analyzer owns paired K-weighting state");
+                .expect("non-timeline stereo analyzer owns paired K-weighting state");
             #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             let (filter0, filter1) = self.filters.split_at_mut(1);
             #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -802,10 +827,6 @@ impl StreamingAnalyzer {
         Ok(())
     }
 
-    #[cfg(all(
-        feature = "cuda-truepeak",
-        any(target_os = "linux", target_os = "windows")
-    ))]
     #[inline(always)]
     fn push_weighted_frame(
         &mut self,
@@ -1464,6 +1485,61 @@ mod tests {
         assert!((streamed.rms_db - whole_rms).abs() < 1e-9);
         assert_eq!(streamed.sample_peak, whole_peak);
         assert_eq!(streamed.true_peak, whole_true_peak);
+    }
+
+    #[test]
+    fn stereo_parallel_true_peak_matches_fused_path_bit_exactly() {
+        let frames = 192_137;
+        let planar = vec![
+            (0..frames)
+                .map(|index| {
+                    (((index as f64 * 0.071).sin() * 0.31)
+                        + ((index as f64 * 0.000_31).cos() * 0.07)) as f32
+                })
+                .collect::<Vec<_>>(),
+            (0..frames)
+                .map(|index| {
+                    (((index as f64 * 0.113).cos() * 0.23)
+                        - ((index as f64 * 0.000_47).sin() * 0.05)) as f32
+                })
+                .collect::<Vec<_>>(),
+        ];
+        let roles = vec![ChannelRole::Main, ChannelRole::Surround];
+        let measure = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    let mut analyzer = StreamingAnalyzer::new(48_000, roles.clone());
+                    analyzer.process(&planar).unwrap();
+                    analyzer.finish()
+                })
+        };
+
+        // One worker forces the established fused loop; two workers meet the
+        // long-chunk threshold and split True Peak from the loudness pass.
+        let fused = measure(1);
+        let parallel = measure(2);
+
+        assert_eq!(parallel.ebu.integrated_lufs, fused.ebu.integrated_lufs);
+        assert_eq!(
+            parallel.ebu.max_momentary_lufs,
+            fused.ebu.max_momentary_lufs
+        );
+        assert_eq!(
+            parallel.ebu.max_short_term_lufs,
+            fused.ebu.max_short_term_lufs
+        );
+        assert_eq!(parallel.ebu.loudness_range_lu, fused.ebu.loudness_range_lu);
+        assert_eq!(parallel.ebu.gating_blocks, fused.ebu.gating_blocks);
+        assert_eq!(parallel.frames, fused.frames);
+        assert_eq!(parallel.weighted_mean_square, fused.weighted_mean_square);
+        assert_eq!(parallel.rms_db, fused.rms_db);
+        assert_eq!(parallel.sample_peak, fused.sample_peak);
+        assert_eq!(parallel.true_peak, fused.true_peak);
+        assert!(parallel.timeline.is_empty());
+        assert!(fused.timeline.is_empty());
     }
 
     #[test]

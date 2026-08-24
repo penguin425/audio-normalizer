@@ -177,6 +177,12 @@ the `-o` extension override this.
   channel iteration. The generic channel-layout path remains unchanged, and
   the optimized path keeps the same floating-point operation order and
   byte-identical normalized output.
+* **Overlapped stereo True Peak analysis** assigns the two independent exact
+  True Peak meters to one worker while the caller advances K-weighting, RMS,
+  sample peak, and BS.1770 gating. It is enabled only for long non-timeline
+  chunks below 192 kHz when `--jobs` provides another worker; short packets and
+  `--jobs 1` keep the fused path. Analysis fields and normalized bytes remain
+  bit-identical.
 * **Adaptive WAVE streaming chunks** keep the low-latency 64 KiB read size for
   mono while using a frame-aligned 1 MiB chunk for stereo and multichannel
   inputs. The planar decode buffer is reused between reads, reducing allocator,
