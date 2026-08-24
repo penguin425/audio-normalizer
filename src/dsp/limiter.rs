@@ -46,7 +46,7 @@ pub struct TruePeakLimiter {
     envelope: f32,
     hold_frames: usize,
     last_samples: Vec<f32>,
-    max_reduction_db: f64,
+    minimum_envelope: f32,
     emitted_frames: usize,
     limited_frames: usize,
     reduction_sum_db: f64,
@@ -92,7 +92,7 @@ impl TruePeakLimiter {
             envelope: 1.0,
             hold_frames: 0,
             last_samples: vec![0.0; channels as usize],
-            max_reduction_db: 0.0,
+            minimum_envelope: 1.0,
             emitted_frames: 0,
             limited_frames: 0,
             reduction_sum_db: 0.0,
@@ -206,7 +206,7 @@ impl TruePeakLimiter {
         let statistics = LimiterStatistics {
             processed_frames: self.emitted_frames,
             limited_frames: self.limited_frames,
-            maximum_reduction_db: self.max_reduction_db,
+            maximum_reduction_db: reduction_db(self.minimum_envelope),
             mean_reduction_db: if self.emitted_frames == 0 {
                 0.0
             } else {
@@ -219,10 +219,16 @@ impl TruePeakLimiter {
     }
 
     pub fn max_reduction_db(&self) -> f64 {
-        self.max_reduction_db
+        reduction_db(self.minimum_envelope)
     }
 
     fn update_envelope(&mut self, detected: f32) {
+        // The common defensive-limiter case never reaches the ceiling. With a
+        // fully released envelope, the complete update below is an identity;
+        // avoid its release arithmetic and dB bookkeeping on every frame.
+        if self.envelope == 1.0 && self.hold_frames == 0 && detected <= self.ceiling {
+            return;
+        }
         let required = if detected > self.ceiling {
             (self.ceiling / detected) * 0.9999
         } else {
@@ -236,20 +242,12 @@ impl TruePeakLimiter {
         } else {
             self.envelope = 1.0 - (1.0 - self.envelope) * self.release_coeff;
         }
-        if self.envelope > 0.0 {
-            self.max_reduction_db = self
-                .max_reduction_db
-                .max(-20.0 * (self.envelope as f64).log10());
-        }
+        self.minimum_envelope = self.minimum_envelope.min(self.envelope);
     }
 
     fn emit_one(&mut self, output: &mut [Vec<f32>]) {
         if self.statistics_enabled {
-            let reduction_db = if self.envelope > 0.0 {
-                -20.0 * (self.envelope as f64).log10()
-            } else {
-                f64::INFINITY
-            };
+            let reduction_db = reduction_db(self.envelope);
             if reduction_db > 1e-6 {
                 self.limited_frames += 1;
             }
@@ -284,6 +282,19 @@ impl TruePeakLimiter {
         self.interval_frames = 0;
         self.interval_reduction_sum_db = 0.0;
         self.interval_max_reduction_db = 0.0;
+    }
+}
+
+#[inline]
+fn reduction_db(envelope: f32) -> f64 {
+    if envelope == 1.0 {
+        // Preserve the established `-20 * log10(1.0)` sign bit in serialized
+        // difference evidence while avoiding the transcendental call.
+        -0.0
+    } else if envelope > 0.0 {
+        -20.0 * (envelope as f64).log10()
+    } else {
+        f64::INFINITY
     }
 }
 
