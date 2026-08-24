@@ -187,6 +187,11 @@ the `-o` extension override this.
   input order.
 * **Rolling block energies** make the 75%-overlapping LUFS gating blocks O(1)
   each while retaining only three seconds of filtered energy.
+* **Fixed streaming loudness windows** keep the 400 ms momentary and three-second
+  short-term histories in preallocated circular arrays. Monotonic block-frame
+  deadlines replace a division/remainder check on every sample, while the
+  established f64 addition/subtraction order, BS.1770 block boundaries, gating
+  population, analysis JSON, and normalized output remain exact.
 * **Specialized stereo streaming analysis** selects the paired K-weighting
   state once, keeps both true-peak meters in the hot loop, and avoids dynamic
   channel iteration. The generic channel-layout path remains unchanged, and

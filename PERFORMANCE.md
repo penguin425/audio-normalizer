@@ -1624,6 +1624,44 @@ as well: Linux DSF/DSDIFF wall time fell 46.05%/45.80%, and Apple Silicon fell
 parallel work, so batch scheduling gains the lower CPU cost without creating a
 nested pool.
 
+### v0.160.0: fixed streaming loudness windows
+
+Streaming BS.1770 analysis now retains the 400 ms momentary and three-second
+short-term energy histories in fixed-capacity circular arrays instead of
+`VecDeque`. The full-window update deliberately keeps the established
+`sum += incoming` followed by `sum -= expired` arithmetic order. Monotonic
+frame deadlines also replace the per-sample remainder operations used to find
+the first complete block and each following 100 ms hop. Consequently the
+gating population, floating-point block energies, analysis fields, and rendered
+output are unchanged.
+
+The exact v0.159.0 pull-request base and candidate were built separately with
+Rust 1.97.0. Each platform analyzed a deterministic 300-second, 48 kHz stereo
+PCM16 WAVE, normalized an eight-file batch of that fixture, and repeated the
+analysis with `--jobs 1`. Ten measurements per binary were pooled across both
+execution orders. The workflow first proved that ordinary and one-worker
+analysis JSON, normalized WAVE bytes, and verified normalized WAVE bytes were
+identical. A focused test additionally compares every circular-window sum at
+the f64 bit level with the former `VecDeque` implementation. Versioned evidence
+is retained by
+[Actions run 32752084350](https://github.com/penguin425/audio-normalizer/actions/runs/32752084350).
+
+| Platform / pooled median | Workload | v0.159.0 wall | v0.160.0 wall | Wall change | CPU change |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Linux x86-64, 4-vCPU AMD EPYC | Stereo analysis | 0.599 s | 0.596 s | -0.38% | -2.45% |
+| Linux x86-64, 4-vCPU AMD EPYC | Eight-file normalization | 2.919 s | 2.905 s | -0.50% | -0.33% |
+| Linux x86-64, one worker | Stereo analysis | 1.604 s | 1.482 s | -7.59% | -7.62% |
+| Apple Silicon arm64, 3-vCPU runner | Stereo analysis | 0.281 s | 0.277 s | -1.48% | -15.29% |
+| Apple Silicon arm64, 3-vCPU runner | Eight-file normalization | 1.571 s | 1.487 s | -5.37% | -13.57% |
+| Apple Silicon arm64, one worker | Stereo analysis | 1.042 s | 0.709 s | -31.95% | -32.28% |
+
+Default-worker stereo analysis already overlaps exact True Peak measurement
+with loudness work, so elapsed time is partly bounded by that independent
+worker. The one-worker control isolates the lower loudness-window cost without
+that overlap. Peak RSS changed by -0.87% and -11.11% in the Linux and Apple
+Silicon one-worker cases respectively; the default eight-file workload changed
+by -16.63% and -20.13%.
+
 ## Final integration gate
 
 Before each release, run the full feature matrix, official conformance jobs
