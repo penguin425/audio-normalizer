@@ -1474,6 +1474,50 @@ measurements, floating-point operation order, codec settings, and output bytes
 are unchanged. Intel macOS remains on its portable non-PGO build because the
 measured evidence and reproducibility proof are specific to Apple Silicon.
 
+### v0.156.0: overlapped stereo True Peak and loudness
+
+Long, non-timeline stereo decoder chunks now advance both exact True Peak
+meters on one worker while the calling worker preserves the established
+K-weighting, RMS, sample-peak, window, and gating order. The split is limited
+to chunks of at least 16,384 frames below 192 kHz and requires more than one
+configured worker. Short packets, timeline analysis, direct-sample True Peak
+at 192 kHz and above, and `--jobs 1` retain the fused low-overhead path.
+
+The exact v0.155.0 base and candidate were built separately with Rust 1.97.0
+on a four-vCPU GitHub-hosted Linux runner (AMD EPYC 7763). Each workload used a
+deterministic 300-second, 48 kHz stereo PCM16 WAVE. Ten measurements per binary
+were pooled from both execution orders. Analysis JSON, ordinary normalized
+WAVE bytes, and verified normalized WAVE bytes were identical; a focused unit
+test also compares every reported floating-point field and gating block.
+
+| Workload / pooled median | v0.155.0 wall | v0.156.0 wall | Wall change | CPU change |
+| --- | ---: | ---: | ---: | ---: |
+| Stereo WAVE analysis | 0.772 s | 0.541 s | -29.99% | +4.88% |
+| Stereo WAVE normalization | 0.788 s | 0.537 s | -31.81% | +2.33% |
+| Stereo WAVE normalization with verification | 2.271 s | 1.517 s | -33.21% | +1.25% |
+
+Total CPU can rise slightly because the optimization intentionally exchanges
+otherwise idle cores and task coordination for lower elapsed time. The
+one-worker control stayed within +0.72% for analysis, -0.04% for normalization,
+and -0.58% for verification wall time, confirming that the existing serial
+path remains the fallback rather than paying parallel coordination overhead.
+
+The same source revisions, fixture, operation order, and ten-sample pooling
+were independently exercised on a three-vCPU GitHub-hosted Apple Silicon
+runner (arm64, Darwin 25.5.0). The exact-output checks also passed there.
+
+| Workload / pooled median | v0.155.0 wall | v0.156.0 wall | Wall change | CPU change |
+| --- | ---: | ---: | ---: | ---: |
+| Stereo WAVE analysis | 0.655 s | 0.353 s | -46.17% | -6.07% |
+| Stereo WAVE normalization | 0.782 s | 0.416 s | -46.87% | -15.02% |
+| Stereo WAVE normalization with verification | 2.096 s | 1.086 s | -48.19% | -13.88% |
+
+The macOS one-worker control changed by -14.67%, -11.78%, and -0.21% wall
+time respectively even though the new parallel branch is disabled. Those
+serial changes are retained as evidence but are not attributed to overlap;
+comparing the candidate's default-worker and one-worker medians still shows
+42.45%, 39.03%, and 43.31% lower wall time when overlap is available.
+
 ## Final integration gate
 
 Before each release, run the full feature matrix, official conformance jobs
