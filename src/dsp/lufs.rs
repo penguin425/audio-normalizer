@@ -204,40 +204,64 @@ pub struct LoudnessTimelinePoint {
     pub true_peak_dbtp: f64,
 }
 
-struct RunningWindow {
+struct LoudnessWindows {
     values: Vec<f64>,
-    cursor: usize,
-    limit: usize,
+    momentary_cursor: usize,
+    short_term_cursor: usize,
+    momentary_limit: usize,
+    short_term_limit: usize,
 }
 
-impl RunningWindow {
-    fn new(limit: usize) -> Self {
-        debug_assert_ne!(limit, 0);
+impl LoudnessWindows {
+    fn new(momentary_limit: usize, short_term_limit: usize) -> Self {
+        debug_assert_ne!(momentary_limit, 0);
+        debug_assert!(momentary_limit <= short_term_limit);
         Self {
-            values: Vec::with_capacity(limit),
-            cursor: 0,
-            limit,
+            values: Vec::with_capacity(short_term_limit),
+            momentary_cursor: 0,
+            short_term_cursor: 0,
+            momentary_limit,
+            short_term_limit,
         }
     }
 
     #[inline(always)]
-    fn push(&mut self, sum: &mut f64, value: f64) {
-        if self.values.len() < self.limit {
-            self.values.push(value);
-            *sum += value;
-            return;
+    fn push(&mut self, momentary_sum: &mut f64, short_term_sum: &mut f64, value: f64) {
+        let length = self.values.len();
+        let expired_momentary =
+            (length >= self.momentary_limit).then(|| self.values[self.momentary_cursor]);
+        let expired_short_term =
+            (length == self.short_term_limit).then(|| self.values[self.short_term_cursor]);
+
+        // Retain the previous two-window arithmetic order exactly: add the new
+        // value first, then subtract the expired value from each independent
+        // running sum.
+        *momentary_sum += value;
+        if let Some(expired) = expired_momentary {
+            *momentary_sum -= expired;
+            self.momentary_cursor += 1;
+            if self.momentary_cursor == self.short_term_limit {
+                self.momentary_cursor = 0;
+            }
         }
-        let expired = self.values[self.cursor];
-        self.values[self.cursor] = value;
-        *sum += value;
-        *sum -= expired;
-        self.cursor += 1;
-        if self.cursor == self.limit {
-            self.cursor = 0;
+        *short_term_sum += value;
+        if let Some(expired) = expired_short_term {
+            *short_term_sum -= expired;
+            self.values[self.short_term_cursor] = value;
+            self.short_term_cursor += 1;
+            if self.short_term_cursor == self.short_term_limit {
+                self.short_term_cursor = 0;
+            }
+        } else {
+            self.values.push(value);
         }
     }
 
-    fn len(&self) -> usize {
+    fn momentary_len(&self) -> usize {
+        self.values.len().min(self.momentary_limit)
+    }
+
+    fn short_term_len(&self) -> usize {
         self.values.len()
     }
 }
@@ -256,8 +280,7 @@ pub struct StreamingAnalyzer {
         any(target_os = "linux", target_os = "windows")
     ))]
     cuda_true_peak: CudaTruePeakState,
-    momentary: RunningWindow,
-    short_term: RunningWindow,
+    windows: LoudnessWindows,
     momentary_sum: f64,
     short_term_sum: f64,
     next_momentary_block_frame: usize,
@@ -340,8 +363,7 @@ impl StreamingAnalyzer {
                 any(target_os = "linux", target_os = "windows")
             ))]
             cuda_true_peak,
-            momentary: RunningWindow::new(next_momentary_block_frame),
-            short_term: RunningWindow::new(next_short_term_block_frame),
+            windows: LoudnessWindows::new(next_momentary_block_frame, next_short_term_block_frame),
             momentary_sum: 0.0,
             short_term_sum: 0.0,
             next_momentary_block_frame,
@@ -486,23 +508,13 @@ impl StreamingAnalyzer {
                 self.raw_sum_squares += raw1 * raw1;
                 self.sample_peak = self.sample_peak.max(sample1.abs());
                 self.weighted_sum_squares += weighted;
-                push_window(
-                    &mut self.momentary,
-                    &mut self.momentary_sum,
-                    weighted,
-                    momentary_window,
-                );
-                push_window(
-                    &mut self.short_term,
-                    &mut self.short_term_sum,
-                    weighted,
-                    short_term_window,
-                );
+                self.windows
+                    .push(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
                 self.frames += 1;
-                if self.momentary.len() == momentary_window {
+                if self.windows.momentary_len() == momentary_window {
                     self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum);
                 }
-                if self.short_term.len() == short_term_window {
+                if self.windows.short_term_len() == short_term_window {
                     self.max_short_term_sum = self.max_short_term_sum.max(self.short_term_sum);
                 }
                 if self.frames == self.next_momentary_block_frame {
@@ -563,23 +575,13 @@ impl StreamingAnalyzer {
                     &mut self.sample_peak,
                 );
                 self.weighted_sum_squares += weighted;
-                push_window(
-                    &mut self.momentary,
-                    &mut self.momentary_sum,
-                    weighted,
-                    momentary_window,
-                );
-                push_window(
-                    &mut self.short_term,
-                    &mut self.short_term_sum,
-                    weighted,
-                    short_term_window,
-                );
+                self.windows
+                    .push(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
                 self.frames += 1;
-                if self.momentary.len() == momentary_window {
+                if self.windows.momentary_len() == momentary_window {
                     self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum);
                 }
-                if self.short_term.len() == short_term_window {
+                if self.windows.short_term_len() == short_term_window {
                     self.max_short_term_sum = self.max_short_term_sum.max(self.short_term_sum);
                 }
                 if self.frames == self.next_momentary_block_frame {
@@ -622,23 +624,13 @@ impl StreamingAnalyzer {
                 self.sample_peak = self.sample_peak.max(sample.abs());
             }
             self.weighted_sum_squares += weighted;
-            push_window(
-                &mut self.momentary,
-                &mut self.momentary_sum,
-                weighted,
-                momentary_window,
-            );
-            push_window(
-                &mut self.short_term,
-                &mut self.short_term_sum,
-                weighted,
-                short_term_window,
-            );
+            self.windows
+                .push(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
             self.frames += 1;
-            if self.momentary.len() == momentary_window {
+            if self.windows.momentary_len() == momentary_window {
                 self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum);
             }
-            if self.short_term.len() == short_term_window {
+            if self.windows.short_term_len() == short_term_window {
                 self.max_short_term_sum = self.max_short_term_sum.max(self.short_term_sum);
             }
             if self.frames == self.next_momentary_block_frame {
@@ -795,23 +787,13 @@ impl StreamingAnalyzer {
                 self.raw_sum_squares += raw1 * raw1;
                 self.sample_peak = self.sample_peak.max(sample1.abs());
                 self.weighted_sum_squares += weighted;
-                push_window(
-                    &mut self.momentary,
-                    &mut self.momentary_sum,
-                    weighted,
-                    momentary_window,
-                );
-                push_window(
-                    &mut self.short_term,
-                    &mut self.short_term_sum,
-                    weighted,
-                    short_term_window,
-                );
+                self.windows
+                    .push(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
                 self.frames += 1;
-                if self.momentary.len() == momentary_window {
+                if self.windows.momentary_len() == momentary_window {
                     self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum);
                 }
-                if self.short_term.len() == short_term_window {
+                if self.windows.short_term_len() == short_term_window {
                     self.max_short_term_sum = self.max_short_term_sum.max(self.short_term_sum);
                 }
                 if self.frames == self.next_momentary_block_frame {
@@ -865,23 +847,13 @@ impl StreamingAnalyzer {
         hop: usize,
     ) -> Result<(), String> {
         self.weighted_sum_squares += weighted;
-        push_window(
-            &mut self.momentary,
-            &mut self.momentary_sum,
-            weighted,
-            momentary_window,
-        );
-        push_window(
-            &mut self.short_term,
-            &mut self.short_term_sum,
-            weighted,
-            short_term_window,
-        );
+        self.windows
+            .push(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
         self.frames += 1;
-        if self.momentary.len() == momentary_window {
+        if self.windows.momentary_len() == momentary_window {
             self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum);
         }
-        if self.short_term.len() == short_term_window {
+        if self.windows.short_term_len() == short_term_window {
             self.max_short_term_sum = self.max_short_term_sum.max(self.short_term_sum);
         }
         if self.frames == self.next_momentary_block_frame {
@@ -970,12 +942,12 @@ impl StreamingAnalyzer {
             end_seconds: self.frames as f64 / self.sample_rate as f64,
             momentary_lufs: complete_window_loudness(
                 self.momentary_sum,
-                self.momentary.len(),
+                self.windows.momentary_len(),
                 momentary_window,
             ),
             short_term_lufs: complete_window_loudness(
                 self.short_term_sum,
-                self.short_term.len(),
+                self.windows.short_term_len(),
                 short_term_window,
             ),
             sample_peak_dbfs: amplitude_db(self.interval_sample_peak),
@@ -1110,11 +1082,6 @@ fn amplitude_db(amplitude: f32) -> f64 {
     } else {
         f64::NEG_INFINITY
     }
-}
-
-fn push_window(queue: &mut RunningWindow, sum: &mut f64, value: f64, limit: usize) {
-    debug_assert_eq!(queue.limit, limit);
-    queue.push(sum, value);
 }
 
 /// Per-channel loudness weight (BS.1770).
@@ -1385,23 +1352,43 @@ mod tests {
     }
 
     #[test]
-    fn fixed_running_window_matches_vecdeque_sum_bit_exactly() {
-        for limit in [1, 2, 7, 31, 127] {
-            let mut candidate = RunningWindow::new(limit);
-            let mut candidate_sum = 0.0;
-            let mut reference = VecDeque::new();
-            let mut reference_sum = 0.0;
+    fn shared_loudness_windows_match_two_vecdeque_sums_bit_exactly() {
+        for (momentary_limit, short_term_limit) in [(1, 1), (1, 7), (2, 7), (7, 31), (31, 127)] {
+            let mut candidate = LoudnessWindows::new(momentary_limit, short_term_limit);
+            let mut candidate_momentary_sum = 0.0;
+            let mut candidate_short_term_sum = 0.0;
+            let mut reference_momentary = VecDeque::new();
+            let mut reference_short_term = VecDeque::new();
+            let mut reference_momentary_sum = 0.0;
+            let mut reference_short_term_sum = 0.0;
             for index in 0_usize..4_097 {
                 let value =
                     ((index.wrapping_mul(97).wrapping_add(31) % 1_009) as f64 - 504.0) / 1_009.0;
-                candidate.push(&mut candidate_sum, value);
-                reference.push_back(value);
-                reference_sum += value;
-                if reference.len() > limit {
-                    reference_sum -= reference.pop_front().unwrap();
+                candidate.push(
+                    &mut candidate_momentary_sum,
+                    &mut candidate_short_term_sum,
+                    value,
+                );
+                reference_momentary.push_back(value);
+                reference_momentary_sum += value;
+                if reference_momentary.len() > momentary_limit {
+                    reference_momentary_sum -= reference_momentary.pop_front().unwrap();
                 }
-                assert_eq!(candidate.len(), reference.len());
-                assert_eq!(candidate_sum.to_bits(), reference_sum.to_bits());
+                reference_short_term.push_back(value);
+                reference_short_term_sum += value;
+                if reference_short_term.len() > short_term_limit {
+                    reference_short_term_sum -= reference_short_term.pop_front().unwrap();
+                }
+                assert_eq!(candidate.momentary_len(), reference_momentary.len());
+                assert_eq!(candidate.short_term_len(), reference_short_term.len());
+                assert_eq!(
+                    candidate_momentary_sum.to_bits(),
+                    reference_momentary_sum.to_bits()
+                );
+                assert_eq!(
+                    candidate_short_term_sum.to_bits(),
+                    reference_short_term_sum.to_bits()
+                );
             }
         }
     }
