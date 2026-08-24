@@ -44,11 +44,18 @@ DEFAULT_CASES = (
     "mp3-stereo-normalize",
     "pathological-wave-qc",
 )
+OPTIONAL_CASES = (
+    "dsf-stereo-analyze",
+    "dsdiff-stereo-analyze",
+)
+ALL_CASES = (*DEFAULT_CASES, *OPTIONAL_CASES)
 MAX_DURATION_SECONDS = 3_600
 MAX_PATHOLOGICAL_CHUNKS = 100_001
 MAX_ITERATIONS = 100
 CHUNK_FRAMES = 8_192
 ALBUM_TRACKS = 8
+DSD_SAMPLE_RATE = 2_822_400
+DSF_BLOCK_BYTES = 4_096
 ALBUM_CASES = (
     "wav-stereo-album-normalize",
     "wav-stereo-album-cache-hit-normalize",
@@ -122,6 +129,92 @@ def write_pcm16_wave(
             count = min(frames_left, CHUNK_FRAMES)
             output.write(block if count == CHUNK_FRAMES else block[: count * frame_bytes])
             frames_left -= count
+    return path.stat().st_size
+
+
+def dsd_pattern(channels: int, frames: int) -> bytes:
+    return bytes(
+        (frame * (97 + channel * 31) + channel * 53) & 0xff
+        for frame in range(frames)
+        for channel in range(channels)
+    )
+
+
+def write_dsf(path: Path, duration_seconds: int, channels: int) -> int:
+    if channels not in (1, 2):
+        raise ValueError("the deterministic DSF fixture supports mono or stereo")
+    samples = duration_seconds * DSD_SAMPLE_RATE
+    bytes_per_channel = samples // 8
+    rounds = (bytes_per_channel + DSF_BLOCK_BYTES - 1) // DSF_BLOCK_BYTES
+    data_bytes = rounds * DSF_BLOCK_BYTES * channels
+    path.parent.mkdir(parents=True, exist_ok=True)
+    patterns = [
+        bytes(
+            (frame * (97 + channel * 31) + channel * 53) & 0xff
+            for frame in range(DSF_BLOCK_BYTES)
+        )
+        for channel in range(channels)
+    ]
+    with path.open("wb") as output:
+        output.write(b"DSD ")
+        output.write(struct.pack("<QQQ", 28, 92 + data_bytes, 0))
+        output.write(b"fmt ")
+        output.write(struct.pack("<Q", 52))
+        channel_type = 1 if channels == 1 else 2
+        output.write(struct.pack(
+            "<IIIIIIQII", 1, 0, channel_type, channels, DSD_SAMPLE_RATE, 1,
+            samples, DSF_BLOCK_BYTES, 0,
+        ))
+        output.write(b"data")
+        output.write(struct.pack("<Q", data_bytes + 12))
+        for round_index in range(rounds):
+            valid = min(
+                DSF_BLOCK_BYTES,
+                bytes_per_channel - round_index * DSF_BLOCK_BYTES,
+            )
+            for pattern in patterns:
+                output.write(pattern[:valid])
+                if valid < DSF_BLOCK_BYTES:
+                    output.write(bytes(DSF_BLOCK_BYTES - valid))
+    return path.stat().st_size
+
+
+def dsdiff_chunk(identifier: bytes, body: bytes) -> bytes:
+    value = identifier + struct.pack(">Q", len(body)) + body
+    return value + (b"\0" if len(body) % 2 else b"")
+
+
+def write_dsdiff(path: Path, duration_seconds: int, channels: int) -> int:
+    if channels not in (1, 2):
+        raise ValueError("the deterministic DSDIFF fixture supports mono or stereo")
+    bytes_per_channel = duration_seconds * DSD_SAMPLE_RATE // 8
+    data_bytes = bytes_per_channel * channels
+    properties = b"SND "
+    properties += dsdiff_chunk(b"FS  ", struct.pack(">I", DSD_SAMPLE_RATE))
+    channel_ids = b"SLFTSRGT"[:channels * 4]
+    properties += dsdiff_chunk(
+        b"CHNL", struct.pack(">H", channels) + channel_ids
+    )
+    properties += dsdiff_chunk(b"CMPR", b"DSD \x03DSD")
+    prefix = b"DSD "
+    prefix += dsdiff_chunk(b"FVER", struct.pack(">I", 0x0105_0000))
+    prefix += dsdiff_chunk(b"PROP", properties)
+    body_bytes = len(prefix) + 12 + data_bytes + data_bytes % 2
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pattern_frames = DSF_BLOCK_BYTES
+    pattern = dsd_pattern(channels, pattern_frames)
+    full_patterns, remaining_frames = divmod(bytes_per_channel, pattern_frames)
+    with path.open("wb") as output:
+        output.write(b"FRM8")
+        output.write(struct.pack(">Q", body_bytes))
+        output.write(prefix)
+        output.write(b"DSD ")
+        output.write(struct.pack(">Q", data_bytes))
+        for _ in range(full_patterns):
+            output.write(pattern)
+        output.write(pattern[:remaining_frames * channels])
+        if data_bytes % 2:
+            output.write(b"\0")
     return path.stat().st_size
 
 
@@ -320,6 +413,8 @@ def sanitized_command(case_id: str) -> list[str]:
         "mp3-stereo-normalize": [
             "forge", "<input.mp3>", "--overwrite", "-o", "<output.wav>"
         ],
+        "dsf-stereo-analyze": ["forge", "<input.dsf>", "--analyze", "--json"],
+        "dsdiff-stereo-analyze": ["forge", "<input.dff>", "--analyze", "--json"],
         "pathological-wave-qc": [
             "forge-container-qc", "<input.wav>", "--compact", "-o", "<report.json>"
         ],
@@ -345,6 +440,8 @@ def case_spec(case_id: str) -> tuple[str, str, int, str]:
         "flac-stereo-normalize": ("lossless", "flac", 2, "normalize"),
         "mp3-stereo-analyze": ("lossy", "mp3", 2, "analyze"),
         "mp3-stereo-normalize": ("lossy", "mp3", 2, "normalize"),
+        "dsf-stereo-analyze": ("lossless", "dsf", 2, "analyze"),
+        "dsdiff-stereo-analyze": ("lossless", "dsdiff", 2, "analyze"),
         "pathological-wave-qc": ("pathological", "wav", 1, "container-qc"),
     }
     return specs[case_id]
@@ -370,6 +467,7 @@ def run_case(
     output_directory: Path | None = None
     cache_directory: Path | None = None
     output_sample_rate: int | None = None
+    result_sample_rate = sample_rate
     expected = [0]
 
     if case_id == "pathological-wave-qc":
@@ -386,7 +484,20 @@ def run_case(
         measured_duration: float | None = None
     else:
         estimated = pcm_bytes(duration, sample_rate, channels)
-        if case_id in MULTI_INPUT_CASES:
+        if case_id in OPTIONAL_CASES:
+            estimated = duration * DSD_SAMPLE_RATE * channels // 8
+            require_space(case_dir, estimated)
+            if input_format == "dsf":
+                input_path = case_dir / "input.dsf"
+                input_bytes = write_dsf(input_path, duration, channels)
+            else:
+                input_path = case_dir / "input.dff"
+                input_bytes = write_dsdiff(input_path, duration, channels)
+            measured_duration = float(duration)
+            result_sample_rate = DSD_SAMPLE_RATE
+            output_sample_rate = 88_200
+            command = [str(forge), str(input_path), "--analyze", "--json"]
+        elif case_id in MULTI_INPUT_CASES:
             require_space(case_dir, estimated * ALBUM_TRACKS * 2)
             input_directory = case_dir / "inputs"
             input_paths = [
@@ -525,7 +636,7 @@ def run_case(
         "input_format": input_format,
         "operation": operation,
         "channels": channels,
-        "sample_rate_hz": sample_rate,
+        "sample_rate_hz": result_sample_rate,
         "output_sample_rate_hz": output_sample_rate,
         "duration_seconds": measured_duration,
         "input_bytes": input_bytes,
@@ -619,7 +730,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ffmpeg", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path)
-    parser.add_argument("--case", choices=DEFAULT_CASES, action="append", dest="cases")
+    parser.add_argument("--case", choices=ALL_CASES, action="append", dest="cases")
     parser.add_argument("--duration-seconds", type=positive_int, default=3_600)
     parser.add_argument("--sample-rate", type=positive_int, default=48_000)
     parser.add_argument("--pathological-chunks", type=positive_int, default=100_001)

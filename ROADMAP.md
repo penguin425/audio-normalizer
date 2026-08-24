@@ -263,6 +263,10 @@ Forge already provides:
   to all-WAVE outputs with captured statistics and verification, leaves FLAC's
   existing frame parallelism and nested file work untouched, and preserves
   output bytes plus verification evidence exactly.
+- Top-level DSF/DSDIFF channel parallelism that advances independent FIR
+  pipelines on the configured Rayon pool, preserves each channel's byte, bit,
+  and floating-point operation order, avoids nested file-level scheduling,
+  and retains an exact serial fallback for one-worker execution.
 - Adaptive native-WAVE streaming chunks: a frame-aligned 1 MiB read/decode
   buffer for stereo and multichannel inputs, the established 64 KiB buffer for
   mono, and one reusable planar allocation across the stream. The policy is

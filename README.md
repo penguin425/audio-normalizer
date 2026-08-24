@@ -61,6 +61,10 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
   layout. Forge maps 1-bit samples to ±1, applies cascaded 31-tap
   Blackman-windowed half-band filters to 88.2/96 kHz, then a 127-tap
   Blackman-sinc low-pass with a 21 kHz cutoff before BS.1770 measurement.
+  At the top level, independent channel FIR pipelines share the configured
+  worker pool while retaining each channel's byte, bit, and floating-point
+  operation order. One-worker and already-nested file processing remain
+  serial, and produce byte-identical analysis evidence.
   `forge-dsd-pcm-v1` is an explicit, non-normative engineering policy; it is
   recorded in container and delivery-manifest evidence. DST-compressed DSDIFF
   is rejected rather than decoded approximately.

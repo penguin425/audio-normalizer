@@ -45,6 +45,20 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual(size, 44 + 8_000 * 2 * 2)
             self.assertEqual(path.read_bytes()[:12], b"RIFF$}\x00\x00WAVE")
 
+    def test_dsd_fixtures_have_bounded_deterministic_wrappers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dsf = root / "fixture.dsf"
+            dff = root / "fixture.dff"
+            dsf_size = benchmark.write_dsf(dsf, 1, 2)
+            dff_size = benchmark.write_dsdiff(dff, 1, 2)
+            self.assertEqual(dsf.read_bytes()[:4], b"DSD ")
+            self.assertEqual(dff.read_bytes()[:4], b"FRM8")
+            self.assertEqual(dsf_size, dsf.stat().st_size)
+            self.assertEqual(dff_size, dff.stat().st_size)
+            self.assertLess(dsf_size, 1_000_000)
+            self.assertLess(dff_size, 1_000_000)
+
     def test_pathological_wave_is_bounded(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pathological.wav"
@@ -94,8 +108,8 @@ class BenchmarkTests(unittest.TestCase):
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
         self.assertEqual(schema["$id"], benchmark.SCHEMA)
         schema_cases = schema["properties"]["configuration"]["properties"]["cases"]["items"]["enum"]
-        self.assertEqual(schema_cases, list(benchmark.DEFAULT_CASES))
-        for case_id in benchmark.DEFAULT_CASES:
+        self.assertEqual(schema_cases, list(benchmark.ALL_CASES))
+        for case_id in benchmark.ALL_CASES:
             self.assertTrue(benchmark.sanitized_command(case_id))
             self.assertEqual(len(benchmark.case_spec(case_id)), 4)
 
