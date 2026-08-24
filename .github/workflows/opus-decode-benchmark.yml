@@ -132,127 +132,125 @@ jobs:
             -o "${exact_dir}/candidate.wav"
           cmp "${exact_dir}/base.wav" "${exact_dir}/candidate.wav"
 
-      - name: Run default-worker benchmarks in both orders
-        shell: bash
-        run: |
-          set -euo pipefail
-          common=(
-            --ffmpeg "$(command -v ffmpeg)"
-            --duration-seconds 600
-            --iterations 5
-            --case opus-stereo-analyze
-          )
-          python3 candidate/tools/benchmark.py \
-            --forge "${RUNNER_TEMP}/target-baseline/release/forge" \
-            --work-dir "${RUNNER_TEMP}/default-base-first" \
-            --output default-base-first.json "${common[@]}"
-          python3 candidate/tools/benchmark.py \
-            --forge "${RUNNER_TEMP}/target-candidate/release/forge" \
-            --work-dir "${RUNNER_TEMP}/default-candidate-second" \
-            --output default-candidate-second.json "${common[@]}"
-          python3 candidate/tools/benchmark.py \
-            --forge "${RUNNER_TEMP}/target-candidate/release/forge" \
-            --work-dir "${RUNNER_TEMP}/default-candidate-first" \
-            --output default-candidate-first.json "${common[@]}"
-          python3 candidate/tools/benchmark.py \
-            --forge "${RUNNER_TEMP}/target-baseline/release/forge" \
-            --work-dir "${RUNNER_TEMP}/default-base-second" \
-            --output default-base-second.json "${common[@]}"
-
-      - name: Run one-worker controls in both orders
+      - name: Run thermally balanced interleaved benchmarks
         shell: bash
         env:
-          RAYON_NUM_THREADS: "1"
+          BENCHMARK_INPUT: ${{ runner.temp }}/exact-output/input.opus
+          BASELINE_FORGE: ${{ runner.temp }}/target-baseline/release/forge
+          CANDIDATE_FORGE: ${{ runner.temp }}/target-candidate/release/forge
         run: |
           set -euo pipefail
-          common=(
-            --ffmpeg "$(command -v ffmpeg)"
-            --duration-seconds 600
-            --iterations 5
-            --case opus-stereo-analyze
-          )
-          python3 candidate/tools/benchmark.py \
-            --forge "${RUNNER_TEMP}/target-baseline/release/forge" \
-            --work-dir "${RUNNER_TEMP}/one-base-first" \
-            --output one-base-first.json "${common[@]}"
-          python3 candidate/tools/benchmark.py \
-            --forge "${RUNNER_TEMP}/target-candidate/release/forge" \
-            --work-dir "${RUNNER_TEMP}/one-candidate-second" \
-            --output one-candidate-second.json "${common[@]}"
-          python3 candidate/tools/benchmark.py \
-            --forge "${RUNNER_TEMP}/target-candidate/release/forge" \
-            --work-dir "${RUNNER_TEMP}/one-candidate-first" \
-            --output one-candidate-first.json "${common[@]}"
-          python3 candidate/tools/benchmark.py \
-            --forge "${RUNNER_TEMP}/target-baseline/release/forge" \
-            --work-dir "${RUNNER_TEMP}/one-base-second" \
-            --output one-base-second.json "${common[@]}"
-
-      - name: Summarize pooled and per-order medians
-        shell: bash
-        run: |
           python3 - <<'PY'
           import json
+          import os
           import statistics
+          import sys
           from pathlib import Path
 
-          summary = {"system": {}, "modes": {}}
-          for mode in ("default", "one"):
-              paths = {
-                  "base_first": Path(f"{mode}-base-first.json"),
-                  "candidate_second": Path(f"{mode}-candidate-second.json"),
-                  "candidate_first": Path(f"{mode}-candidate-first.json"),
-                  "base_second": Path(f"{mode}-base-second.json"),
-              }
-              documents = {
-                  name: json.loads(path.read_text())
-                  for name, path in paths.items()
-              }
-              assert all(document["passed"] for document in documents.values())
-              if not summary["system"]:
-                  summary["system"] = documents["base_first"]["system"]
-              indexed = {
-                  name: {item["id"]: item for item in document["results"]}
-                  for name, document in documents.items()
-              }
-              rows = []
-              for case_id in indexed["base_first"]:
-                  row = {"id": case_id, "samples_per_binary": 10}
-                  for metric, key in (("wall", "wall_seconds"), ("cpu", None)):
-                      values = {
-                          name: [
-                              sample[key] if key else (
-                                  sample["user_cpu_seconds"]
-                                  + sample["system_cpu_seconds"]
-                              )
-                              for sample in cases[case_id]["samples"]
-                          ]
-                          for name, cases in indexed.items()
-                      }
-                      baseline_values = values["base_first"] + values["base_second"]
-                      candidate_values = values["candidate_first"] + values["candidate_second"]
-                      base_median = statistics.median(baseline_values)
-                      candidate_median = statistics.median(candidate_values)
-                      row[metric] = {
-                          "base_first_median": statistics.median(values["base_first"]),
-                          "candidate_second_median": statistics.median(values["candidate_second"]),
-                          "candidate_first_median": statistics.median(values["candidate_first"]),
-                          "base_second_median": statistics.median(values["base_second"]),
-                          "baseline_pooled_median": base_median,
-                          "candidate_pooled_median": candidate_median,
-                          "change_percent": (
-                              candidate_median / base_median - 1.0
-                          ) * 100.0,
-                      }
-                  rows.append(row)
-              summary["modes"][
-                  "default" if mode == "default" else "jobs_1"
-              ] = rows
+          sys.path.insert(0, "candidate/tools")
+          from benchmark import cpu_model, run_measured
 
-          Path("opus-decode-summary.json").write_text(
-              json.dumps(summary, indent=2) + "\n"
+          input_path = Path(os.environ["BENCHMARK_INPUT"])
+          binaries = {
+              "baseline": Path(os.environ["BASELINE_FORGE"]),
+              "candidate": Path(os.environ["CANDIDATE_FORGE"]),
+          }
+          logs = Path("opus-interleaved-logs")
+          logs.mkdir()
+          result = {
+              "method": "12-round ABBA/BAAB on one pre-encoded 300-second Opus fixture",
+              "system": {
+                  "platform": sys.platform,
+                  "cpu_model": cpu_model(),
+                  "cpu_count": os.cpu_count(),
+              },
+              "modes": {},
+          }
+
+          for mode, extra_args in (("default", []), ("jobs_1", ["--jobs", "1"])):
+              samples = {"baseline": [], "candidate": []}
+              rounds = []
+
+              # Warm instruction/data caches symmetrically. These runs are not measured.
+              for name in ("baseline", "candidate"):
+                  warm = run_measured(
+                      [str(binaries[name]), str(input_path), *extra_args, "--analyze", "--json"],
+                      300,
+                      logs / f"{mode}-warm-{name}.out",
+                      logs / f"{mode}-warm-{name}.err",
+                  )
+                  assert warm["exit_code"] == 0, warm
+
+              for round_index in range(12):
+                  order = (
+                      ("baseline", "candidate", "candidate", "baseline")
+                      if round_index % 2 == 0
+                      else ("candidate", "baseline", "baseline", "candidate")
+                  )
+                  round_samples = {"baseline": [], "candidate": []}
+                  for position, name in enumerate(order):
+                      sample = run_measured(
+                          [
+                              str(binaries[name]), str(input_path), *extra_args,
+                              "--analyze", "--json",
+                          ],
+                          300,
+                          logs / f"{mode}-{round_index:02d}-{position}-{name}.out",
+                          logs / f"{mode}-{round_index:02d}-{position}-{name}.err",
+                      )
+                      assert sample["exit_code"] == 0, sample
+                      samples[name].append(sample)
+                      round_samples[name].append(sample)
+                  rounds.append({"order": order, "samples": round_samples})
+
+              summary = {"samples_per_binary": len(samples["baseline"])}
+              for label, getter in (
+                  ("wall", lambda sample: sample["wall_seconds"]),
+                  (
+                      "cpu",
+                      lambda sample: sample["user_cpu_seconds"]
+                      + sample["system_cpu_seconds"],
+                  ),
+              ):
+                  baseline = [getter(sample) for sample in samples["baseline"]]
+                  candidate = [getter(sample) for sample in samples["candidate"]]
+                  round_changes = []
+                  for round_result in rounds:
+                      base_round = statistics.median(
+                          getter(sample)
+                          for sample in round_result["samples"]["baseline"]
+                      )
+                      candidate_round = statistics.median(
+                          getter(sample)
+                          for sample in round_result["samples"]["candidate"]
+                      )
+                      round_changes.append((candidate_round / base_round - 1.0) * 100.0)
+                  baseline_median = statistics.median(baseline)
+                  candidate_median = statistics.median(candidate)
+                  summary[label] = {
+                      "baseline_median": baseline_median,
+                      "candidate_median": candidate_median,
+                      "pooled_change_percent": (
+                          candidate_median / baseline_median - 1.0
+                      ) * 100.0,
+                      "median_paired_round_change_percent": statistics.median(round_changes),
+                      "paired_round_changes_percent": round_changes,
+                  }
+              summary["peak_rss_bytes"] = {
+                  name: max(sample["peak_rss_bytes"] for sample in values)
+                  for name, values in samples.items()
+              }
+              result["modes"][mode] = {
+                  "summary": summary,
+                  "rounds": rounds,
+              }
+
+          Path("opus-decode-interleaved.json").write_text(
+              json.dumps(result, indent=2) + "\n"
           )
-          print(json.dumps(summary, indent=2))
+          print(json.dumps({
+              mode: value["summary"] for mode, value in result["modes"].items()
+          }, indent=2))
           PY
 
       - name: Upload benchmark evidence
@@ -260,8 +258,6 @@ jobs:
         with:
           name: opus-decode-benchmark-${{ runner.os }}-${{ runner.arch }}
           path: |
-            default-*.json
-            one-*.json
-            opus-decode-summary.json
+            opus-decode-interleaved.json
           if-no-files-found: error
           retention-days: 30
