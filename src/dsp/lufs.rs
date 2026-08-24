@@ -264,8 +264,10 @@ pub struct StreamingAnalyzer {
     next_short_term_block_frame: usize,
     gating_blocks: Vec<f64>,
     short_term_blocks: Vec<f64>,
-    max_momentary_ms: f64,
-    max_short_term_ms: f64,
+    // Division by each fixed window length is monotonic. Retain the maximum
+    // sums in the hot loop and convert them to mean square once in `finish`.
+    max_momentary_sum: f64,
+    max_short_term_sum: f64,
     frames: usize,
     raw_sum_squares: f64,
     weighted_sum_squares: f64,
@@ -346,8 +348,8 @@ impl StreamingAnalyzer {
             next_short_term_block_frame,
             gating_blocks: Vec::new(),
             short_term_blocks: Vec::new(),
-            max_momentary_ms: 0.0,
-            max_short_term_ms: 0.0,
+            max_momentary_sum: 0.0,
+            max_short_term_sum: 0.0,
             frames: 0,
             raw_sum_squares: 0.0,
             weighted_sum_squares: 0.0,
@@ -498,14 +500,10 @@ impl StreamingAnalyzer {
                 );
                 self.frames += 1;
                 if self.momentary.len() == momentary_window {
-                    self.max_momentary_ms = self
-                        .max_momentary_ms
-                        .max(self.momentary_sum / momentary_window as f64);
+                    self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum);
                 }
                 if self.short_term.len() == short_term_window {
-                    self.max_short_term_ms = self
-                        .max_short_term_ms
-                        .max(self.short_term_sum / short_term_window as f64);
+                    self.max_short_term_sum = self.max_short_term_sum.max(self.short_term_sum);
                 }
                 if self.frames == self.next_momentary_block_frame {
                     if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
@@ -579,14 +577,10 @@ impl StreamingAnalyzer {
                 );
                 self.frames += 1;
                 if self.momentary.len() == momentary_window {
-                    self.max_momentary_ms = self
-                        .max_momentary_ms
-                        .max(self.momentary_sum / momentary_window as f64);
+                    self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum);
                 }
                 if self.short_term.len() == short_term_window {
-                    self.max_short_term_ms = self
-                        .max_short_term_ms
-                        .max(self.short_term_sum / short_term_window as f64);
+                    self.max_short_term_sum = self.max_short_term_sum.max(self.short_term_sum);
                 }
                 if self.frames == self.next_momentary_block_frame {
                     if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
@@ -642,14 +636,10 @@ impl StreamingAnalyzer {
             );
             self.frames += 1;
             if self.momentary.len() == momentary_window {
-                self.max_momentary_ms = self
-                    .max_momentary_ms
-                    .max(self.momentary_sum / momentary_window as f64);
+                self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum);
             }
             if self.short_term.len() == short_term_window {
-                self.max_short_term_ms = self
-                    .max_short_term_ms
-                    .max(self.short_term_sum / short_term_window as f64);
+                self.max_short_term_sum = self.max_short_term_sum.max(self.short_term_sum);
             }
             if self.frames == self.next_momentary_block_frame {
                 if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
@@ -819,14 +809,10 @@ impl StreamingAnalyzer {
                 );
                 self.frames += 1;
                 if self.momentary.len() == momentary_window {
-                    self.max_momentary_ms = self
-                        .max_momentary_ms
-                        .max(self.momentary_sum / momentary_window as f64);
+                    self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum);
                 }
                 if self.short_term.len() == short_term_window {
-                    self.max_short_term_ms = self
-                        .max_short_term_ms
-                        .max(self.short_term_sum / short_term_window as f64);
+                    self.max_short_term_sum = self.max_short_term_sum.max(self.short_term_sum);
                 }
                 if self.frames == self.next_momentary_block_frame {
                     if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
@@ -893,14 +879,10 @@ impl StreamingAnalyzer {
         );
         self.frames += 1;
         if self.momentary.len() == momentary_window {
-            self.max_momentary_ms = self
-                .max_momentary_ms
-                .max(self.momentary_sum / momentary_window as f64);
+            self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum);
         }
         if self.short_term.len() == short_term_window {
-            self.max_short_term_ms = self
-                .max_short_term_ms
-                .max(self.short_term_sum / short_term_window as f64);
+            self.max_short_term_sum = self.max_short_term_sum.max(self.short_term_sum);
         }
         if self.frames == self.next_momentary_block_frame {
             if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
@@ -957,8 +939,12 @@ impl StreamingAnalyzer {
         )))]
         let true_peak = cpu_true_peak;
         let mut ebu = measurements_from_blocks(self.gating_blocks, &self.short_term_blocks);
-        ebu.max_momentary_lufs = maximum_loudness(&[self.max_momentary_ms]);
-        ebu.max_short_term_lufs = maximum_loudness(&[self.max_short_term_ms]);
+        let momentary_window = ((self.sample_rate as usize * 4) / 10).max(1);
+        let short_term_window = (self.sample_rate as usize * 3).max(1);
+        ebu.max_momentary_lufs =
+            maximum_loudness(&[self.max_momentary_sum / momentary_window as f64]);
+        ebu.max_short_term_lufs =
+            maximum_loudness(&[self.max_short_term_sum / short_term_window as f64]);
         StreamingMeasurements {
             ebu,
             frames: self.frames,
@@ -1224,7 +1210,7 @@ fn maximum_window_loudness(
     if window == 0 || frames < window {
         return f64::NEG_INFINITY;
     }
-    let mut maximum = 0.0_f64;
+    let mut maximum_sum = 0.0_f64;
     for start in 0..=frames - window {
         let mut total = 0.0;
         for channel in 0..prefixes.len() {
@@ -1233,9 +1219,9 @@ fn maximum_window_loudness(
                     * (prefixes[channel][start + window] - prefixes[channel][start]);
             }
         }
-        maximum = maximum.max(total / window as f64);
+        maximum_sum = maximum_sum.max(total);
     }
-    maximum_loudness(&[maximum])
+    maximum_loudness(&[maximum_sum / window as f64])
 }
 
 fn measurements_from_blocks(gating_blocks: Vec<f64>, short_term_blocks: &[f64]) -> EbuMeasurements {
@@ -1417,6 +1403,31 @@ mod tests {
                 assert_eq!(candidate.len(), reference.len());
                 assert_eq!(candidate_sum.to_bits(), reference_sum.to_bits());
             }
+        }
+    }
+
+    #[test]
+    fn deferred_maximum_division_is_bit_exact() {
+        for window in [1_usize, 400, 19_200, 144_000, 576_000] {
+            let divisor = window as f64;
+            let mut state = 0x6a09_e667_f3bc_c909_u64;
+            let mut divided_maximum = 0.0_f64;
+            let mut sum_maximum = 0.0_f64;
+            for index in 0..100_000_u64 {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let mantissa = state >> 11;
+                let scale = f64::from(((index % 23) + 1) as u32);
+                let sum = mantissa as f64 * scale / (1_u64 << 30) as f64;
+                divided_maximum = divided_maximum.max(sum / divisor);
+                sum_maximum = sum_maximum.max(sum);
+            }
+            assert_eq!(
+                divided_maximum.to_bits(),
+                (sum_maximum / divisor).to_bits(),
+                "window {window}"
+            );
         }
     }
 
