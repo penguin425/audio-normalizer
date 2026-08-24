@@ -49,7 +49,11 @@ DSD_CASES = (
     "dsdiff-stereo-analyze",
 )
 OPUS_CASES = ("opus-stereo-analyze",)
-OPTIONAL_CASES = (*DSD_CASES, *OPUS_CASES)
+LIMITER_CASES = (
+    "wav-stereo-limiter-idle",
+    "wav-stereo-limiter-active",
+)
+OPTIONAL_CASES = (*DSD_CASES, *OPUS_CASES, *LIMITER_CASES)
 ALL_CASES = (*DEFAULT_CASES, *OPTIONAL_CASES)
 MAX_DURATION_SECONDS = 3_600
 MAX_PATHOLOGICAL_CHUNKS = 100_001
@@ -361,6 +365,13 @@ def sanitized_command(case_id: str) -> list[str]:
         "wav-stereo-verify": [
             "forge", "<input.wav>", "--verify", "--overwrite", "-o", "<output.wav>"
         ],
+        "wav-stereo-limiter-idle": [
+            "forge", "<input.wav>", "--limiter", "--overwrite", "-o", "<output.wav>"
+        ],
+        "wav-stereo-limiter-active": [
+            "forge", "<input.wav>", "--target=-6", "--ceiling=-3", "--limiter",
+            "--overwrite", "-o", "<output.wav>",
+        ],
         "wav-to-flac-verify": [
             "forge", "<input.wav>", "--format", "flac", "--verify",
             "--overwrite", "-o", "<output.flac>",
@@ -430,6 +441,8 @@ def case_spec(case_id: str) -> tuple[str, str, int, str]:
         "wav-stereo-analyze": ("lossless", "wav", 2, "analyze"),
         "wav-stereo-normalize": ("lossless", "wav", 2, "normalize"),
         "wav-stereo-verify": ("lossless", "wav", 2, "normalize"),
+        "wav-stereo-limiter-idle": ("lossless", "wav", 2, "normalize"),
+        "wav-stereo-limiter-active": ("lossless", "wav", 2, "normalize"),
         "wav-to-flac-verify": ("lossless", "wav", 2, "normalize"),
         "wav-stereo-resample-normalize": ("lossless", "wav", 2, "normalize"),
         "wav-stereo-batch-normalize": ("lossless", "wav", 2, "normalize"),
@@ -601,6 +614,10 @@ def run_case(
                     command += ["--format", "flac"]
                 if case_id in ("wav-stereo-verify", "wav-to-flac-verify"):
                     command.append("--verify")
+                if case_id in LIMITER_CASES:
+                    if case_id == "wav-stereo-limiter-active":
+                        command += ["--target=-6", "--ceiling=-3"]
+                    command.append("--limiter")
                 if case_id == "wav-stereo-resample-normalize":
                     output_sample_rate = 48_000 if sample_rate != 48_000 else 44_100
                     command += ["--sample-rate", str(output_sample_rate)]
