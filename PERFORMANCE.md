@@ -1550,6 +1550,41 @@ though the overlap branch was disabled. Those serial-run differences are not
 attributed to the optimization. All candidate output, verification evidence,
 and one-worker fallback bytes remained identical to the v0.156.0 base.
 
+### v0.158.0: parallel DSD channel pipelines
+
+Top-level DSF and uncompressed DSDIFF analysis now advances independent
+channel FIR/decimation pipelines on the configured Rayon worker pool. Each
+channel retains its original byte, bit, filter-state, and floating-point
+operation order. One-worker execution and analysis already nested inside
+file-level Rayon work remain serial, avoiding a second scheduler layer.
+
+The exact v0.157.0 pull-request base and candidate were built separately with
+Rust 1.97.0. The workflow analyzed deterministic 10-second DSD64 stereo DSF
+and DSDIFF fixtures, pooled ten measurements per binary across both execution
+orders, and first proved that baseline, candidate, and candidate one-worker
+JSON were byte-identical. Versioned evidence is retained by
+[Actions run 32708220765](https://github.com/penguin425/audio-normalizer/actions/runs/32708220765).
+
+| Platform / pooled median | Workload | v0.157.0 wall | v0.158.0 wall | Wall change | CPU change |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Linux x86-64, 4-vCPU AMD EPYC 7763 | DSF stereo analysis | 3.606 s | 2.197 s | -39.07% | +21.69% |
+| Linux x86-64, 4-vCPU AMD EPYC 7763 | DSDIFF stereo analysis | 3.670 s | 2.002 s | -45.44% | +6.13% |
+| Apple Silicon arm64, 3-vCPU runner | DSF stereo analysis | 3.778 s | 2.578 s | -31.76% | +20.77% |
+| Apple Silicon arm64, 3-vCPU runner | DSDIFF stereo analysis | 3.486 s | 2.444 s | -29.89% | +27.76% |
+
+The optimization deliberately spends otherwise idle channel-level capacity
+to reduce elapsed time; aggregate CPU therefore rises and is reported rather
+than presented as a free throughput gain. In the one-worker control, DSF wall
+time changed by +0.28% and DSDIFF by -0.95%, confirming that the established
+serial fallback does not pay parallel scheduling overhead.
+
+The Apple Silicon one-worker wall controls changed by -1.61% for DSF and
+-6.41% for DSDIFF even though the parallel branch was disabled. Those serial
+changes are retained as environmental evidence and are not attributed to the
+optimization. Comparing the candidate's default-worker and one-worker pooled
+medians still shows 23.05% and 24.56% lower wall time respectively when the
+parallel branch is available.
+
 ## Final integration gate
 
 Before each release, run the full feature matrix, official conformance jobs
