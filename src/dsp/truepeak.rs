@@ -63,6 +63,26 @@ fn interpolation_bound_scale(factor: usize) -> f64 {
     }
 }
 
+/// Conservative upper bound for the True Peak of a signal whose largest
+/// discrete sample magnitude is `sample_peak`.
+///
+/// This uses the triangle inequality for every FIR phase and includes a wide
+/// floating-point safety margin in [`interpolation_bound_scale`]. Callers can
+/// therefore use the result to prove that an exact True Peak meter cannot
+/// cross a ceiling without running the meter over the signal again.
+pub(crate) fn upper_bound_from_sample_peak(sample_rate: u32, sample_peak: f32) -> f64 {
+    if !sample_peak.is_finite() || sample_peak < 0.0 {
+        return f64::INFINITY;
+    }
+    let factor = oversample_factor(sample_rate);
+    let sample_peak = f64::from(sample_peak);
+    if factor > 1 {
+        sample_peak * interpolation_bound_scale(factor).max(1.0)
+    } else {
+        sample_peak
+    }
+}
+
 fn build_phase_table(factor: usize) -> PhaseTable {
     debug_assert!(matches!(factor, 2 | 4));
     let coefficients = {
@@ -1106,6 +1126,53 @@ mod tests {
                 meter.peak()
             );
         }
+    }
+
+    #[test]
+    fn sample_peak_bound_contains_exact_meter_after_f32_gain() {
+        let mut state = 0x4d59_5df4_d0f3_3173_u64;
+        let mut samples = Vec::with_capacity(32_779);
+        for index in 0..samples.capacity() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let noise = ((state >> 40) as i32 - (1 << 23)) as f32 / (1 << 23) as f32;
+            let transient = if index.is_multiple_of(997) {
+                if index.is_multiple_of(2) {
+                    1.0
+                } else {
+                    -1.0
+                }
+            } else {
+                0.0
+            };
+            samples.push((noise * 0.81 + transient * 0.19).clamp(-1.0, 1.0));
+        }
+        let source_peak = samples
+            .iter()
+            .fold(0.0_f32, |maximum, sample| maximum.max(sample.abs()));
+
+        for sample_rate in [44_100, 48_000, 96_000, 191_999, 192_000, 384_000] {
+            for gain in [f32::MIN_POSITIVE, 0.000_123, 0.37, 1.0, 3.75, 65_536.0] {
+                let scaled = samples
+                    .iter()
+                    .map(|sample| *sample * gain)
+                    .collect::<Vec<_>>();
+                let mut meter = TruePeakMeter::for_sample_rate(sample_rate);
+                meter.process(&scaled);
+                let rounded_sample_peak_bound = source_peak * gain;
+                let upper = upper_bound_from_sample_peak(sample_rate, rounded_sample_peak_bound);
+                assert!(
+                    f64::from(meter.peak()) <= upper,
+                    "{sample_rate} Hz, gain {gain}: {} > {upper}",
+                    meter.peak()
+                );
+            }
+        }
+
+        assert!(upper_bound_from_sample_peak(48_000, f32::NAN).is_infinite());
+        assert!(upper_bound_from_sample_peak(48_000, f32::INFINITY).is_infinite());
+        assert!(upper_bound_from_sample_peak(48_000, -0.5).is_infinite());
     }
 
     #[test]

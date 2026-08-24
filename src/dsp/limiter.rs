@@ -21,6 +21,37 @@ pub struct LimiterStatistics {
     pub envelope: Vec<LimiterEnvelopePoint>,
 }
 
+impl LimiterStatistics {
+    /// Reproduce the evidence emitted by a limiter whose envelope remained at
+    /// unity for the entire programme. This is used only after a conservative
+    /// True Peak bound has proved that the limiter cannot engage.
+    pub(crate) fn proven_idle(processed_frames: usize, interval_frames: usize) -> Self {
+        let interval_frames = interval_frames.max(1);
+        let mut envelope = Vec::with_capacity(processed_frames.div_ceil(interval_frames));
+        let mut start_frame = 0;
+        while start_frame < processed_frames {
+            let end_frame = start_frame
+                .saturating_add(interval_frames)
+                .min(processed_frames);
+            envelope.push(LimiterEnvelopePoint {
+                start_frame,
+                end_frame,
+                mean_reduction_db: 0.0,
+                maximum_reduction_db: -0.0,
+            });
+            start_frame = end_frame;
+        }
+        Self {
+            processed_frames,
+            limited_frames: 0,
+            maximum_reduction_db: -0.0,
+            mean_reduction_db: 0.0,
+            envelope_interval_frames: interval_frames,
+            envelope,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct LimiterConfig {
     pub lookahead_ms: f64,
@@ -507,6 +538,35 @@ mod tests {
             point.mean_reduction_db.to_bits() == 0.0_f64.to_bits()
                 && point.maximum_reduction_db.to_bits() == (-0.0_f64).to_bits()
         }));
+
+        let proven = LimiterStatistics::proven_idle(frames, 257);
+        assert_eq!(proven.processed_frames, statistics.processed_frames);
+        assert_eq!(proven.limited_frames, statistics.limited_frames);
+        assert_eq!(
+            proven.maximum_reduction_db.to_bits(),
+            statistics.maximum_reduction_db.to_bits()
+        );
+        assert_eq!(
+            proven.mean_reduction_db.to_bits(),
+            statistics.mean_reduction_db.to_bits()
+        );
+        assert_eq!(
+            proven.envelope_interval_frames,
+            statistics.envelope_interval_frames
+        );
+        assert_eq!(proven.envelope.len(), statistics.envelope.len());
+        for (left, right) in proven.envelope.iter().zip(&statistics.envelope) {
+            assert_eq!(left.start_frame, right.start_frame);
+            assert_eq!(left.end_frame, right.end_frame);
+            assert_eq!(
+                left.mean_reduction_db.to_bits(),
+                right.mean_reduction_db.to_bits()
+            );
+            assert_eq!(
+                left.maximum_reduction_db.to_bits(),
+                right.maximum_reduction_db.to_bits()
+            );
+        }
     }
 
     #[test]
