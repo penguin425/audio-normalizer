@@ -1435,6 +1435,45 @@ Unit tests compare every one of the 65,536 signed PCM16 codes, inverse channel
 values, SIMD and scalar tails, zero-length input, reused capacities, and
 multi-chunk boundaries against independent scalar channel decoding.
 
+### v0.155.0: reproducible PGO for the Apple Silicon CLI
+
+The Apple Silicon release now applies the same bounded, branch-counter-only
+LLVM instrumentation PGO used by the Linux normalizer CLI. Both profile phases
+retain the portable release contract (`+neon,+aes,+sha2` rather than a runner
+specific CPU), use Rust 1.97.0's matching `llvm-profdata`, remove value profiles
+and unexecuted function records, and copy only the optimized `forge` executable
+into the otherwise ordinary macOS ARM64 build. The shared library, plug-in,
+Python wheel, and other command-line tools remain non-PGO builds.
+
+Two independent jobs built and trained the same commit from clean Apple
+Silicon runners. Their canonical text profiles, merged profiles, portable
+baseline executables, and PGO executables had identical SHA-256 values. Each
+job also produced byte-identical baseline/PGO analysis JSON, normal WAVE, and
+verified WAVE output. Release CI now uploads the canonical profile and requires
+a second macOS runner to reproduce both that profile and the `forge` executable
+extracted from the packaged archive before a tag can be published.
+
+The table pools twenty measurements per binary from both independent jobs and
+both execution orders. Every case uses a deterministic 300-second, 48 kHz
+fixture; total CPU is user plus system time. The two jobs independently reduced
+aggregate wall time by 8.86% and 16.37%; pooling them avoids presenting either
+runner's scheduling conditions as the sole result.
+
+| Workload | Portable wall | PGO wall | Wall change | CPU change |
+| --- | ---: | ---: | ---: | ---: |
+| Stereo WAVE analysis | 0.630 s | 0.525 s | -16.69% | -15.45% |
+| Stereo WAVE normalization | 0.637 s | 0.561 s | -11.86% | -12.55% |
+| Stereo WAVE normalization with verification | 1.825 s | 1.602 s | -12.18% | -12.40% |
+| WAVE-to-FLAC normalization with verification | 2.516 s | 2.094 s | -16.78% | -11.89% |
+| Stereo 48 to 44.1 kHz normalization | 1.175 s | 1.124 s | -4.26% | -3.48% |
+| 7.1 WAVE normalization | 1.884 s | 1.742 s | -7.52% | -11.42% |
+| **Aggregate** | **8.666 s** | **7.649 s** | **-11.74%** | **-11.15%** |
+
+This is a packaging optimization rather than a DSP approximation: source
+measurements, floating-point operation order, codec settings, and output bytes
+are unchanged. Intel macOS remains on its portable non-PGO build because the
+measured evidence and reproducibility proof are specific to Apple Silicon.
+
 ## Final integration gate
 
 Before each release, run the full feature matrix, official conformance jobs
