@@ -61,6 +61,10 @@ jobs:
             -- --nocapture
           cargo test --locked --manifest-path candidate/Cargo.toml \
             --no-default-features --lib \
+            decimator_retained_phases_match_full_rate_fir_bit_exactly \
+            -- --nocapture
+          cargo test --locked --manifest-path candidate/Cargo.toml \
+            --no-default-features --lib \
             ordered_byte_batches_match_per_bit_reference_for_every_tail \
             -- --nocapture
           cargo test --locked --manifest-path candidate/Cargo.toml \
