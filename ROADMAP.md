@@ -258,6 +258,11 @@ Forge already provides:
   gating pass for long non-timeline chunks, retains the fused path for short
   packets and one-worker runs, and preserves every reported bit and output
   byte.
+- Bounded verified-WAVE writer overlap that transfers quantization and the
+  lossless-verification tee to one worker while decode/DSP advances, is gated
+  to all-WAVE outputs with captured statistics and verification, leaves FLAC's
+  existing frame parallelism and nested file work untouched, and preserves
+  output bytes plus verification evidence exactly.
 - Adaptive native-WAVE streaming chunks: a frame-aligned 1 MiB read/decode
   buffer for stereo and multichannel inputs, the established 64 KiB buffer for
   mono, and one reusable planar allocation across the stream. The policy is
