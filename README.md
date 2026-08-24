@@ -111,6 +111,13 @@ the `-o` extension override this.
   match the persisted container layout. MP3, AAC, ALAC, Opus, and Vorbis
   outputs retain completed-file codec re-decode, and multi-delivery retains one
   final re-decode after metadata mutation.
+* **Overlapped verified WAVE writing** moves native WAVE quantization and the
+  lossless-verification tee onto one worker while the caller advances the next
+  decode/DSP chunk. It is enabled only when statistics and lossless
+  verification are both required, every output is WAVE, more than one worker
+  is available, and the call is outside file-level parallel work. Ordinary
+  WAVE output, `--jobs 1`, mixed/FLAC delivery, and nested work retain their
+  established paths; output bytes and verification evidence are identical.
 * **Single-pass multi-delivery rendering** decodes, resamples, applies gain and
   the true-peak ceiling, and measures render statistics once before feeding the
   same protected chunks to every requested writer. Each codec keeps its own

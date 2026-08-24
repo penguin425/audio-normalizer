@@ -1518,6 +1518,38 @@ serial changes are retained as evidence but are not attributed to overlap;
 comparing the candidate's default-worker and one-worker medians still shows
 42.45%, 39.03%, and 43.31% lower wall time when overlap is available.
 
+### v0.157.0: overlapped verified WAVE writing
+
+Verified native-WAVE output now transfers quantization, streaming container
+writing, and the lossless-verification tee to one worker while the caller
+decodes and processes the next bounded planar chunk. The path is enabled only
+when render statistics and lossless verification are both requested, every
+destination is WAVE, more than one worker is configured, and the operation is
+not already nested inside file-level Rayon work. FLAC retains its established
+frame-parallel writer; ordinary WAVE output, mixed formats, and `--jobs 1`
+remain synchronous.
+
+The exact v0.156.0 base and candidate were built separately with Rust 1.97.0.
+Each platform normalized the same deterministic 300-second, 48 kHz stereo
+PCM16 WAVE with verification. Ten measurements per binary were pooled across
+both execution orders. The workflow first proved the eligibility boundaries,
+then compared baseline, overlapped, and one-worker output byte for byte. The
+versioned evidence is retained by
+[Actions run 32685706888](https://github.com/penguin425/audio-normalizer/actions/runs/32685706888).
+
+| Platform / pooled median | v0.156.0 wall | v0.157.0 wall | Wall change | CPU change |
+| --- | ---: | ---: | ---: | ---: |
+| Linux x86-64, 4-vCPU AMD EPYC 7763 | 1.528 s | 1.317 s | -13.86% | +46.62% |
+| Apple Silicon arm64, 3-vCPU runner | 0.901 s | 0.769 s | -14.69% | +1.88% |
+
+The Linux result intentionally spends otherwise idle cores to shorten elapsed
+time; its larger aggregate-CPU increase is therefore disclosed rather than
+treated as free throughput. On the one-worker control the Linux wall/CPU
+changes were +0.04%/+0.07%, while the macOS control changed -2.92%/-2.90% even
+though the overlap branch was disabled. Those serial-run differences are not
+attributed to the optimization. All candidate output, verification evidence,
+and one-worker fallback bytes remained identical to the v0.156.0 base.
+
 ## Final integration gate
 
 Before each release, run the full feature matrix, official conformance jobs
