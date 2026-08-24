@@ -935,22 +935,58 @@ fn push_dsd_bytes(
     pipeline: &mut DsdPipeline,
     output: &mut Vec<f32>,
 ) {
-    for &byte in bytes {
+    match order {
+        DsdBitOrder::LeastSignificantFirst => {
+            push_dsd_bytes_ordered::<true>(bytes, limit, consumed, pipeline, output);
+        }
+        DsdBitOrder::MostSignificantFirst => {
+            push_dsd_bytes_ordered::<false>(bytes, limit, consumed, pipeline, output);
+        }
+    }
+}
+
+fn push_dsd_bytes_ordered<const LEAST_SIGNIFICANT_FIRST: bool>(
+    bytes: &[u8],
+    limit: u64,
+    consumed: &mut u64,
+    pipeline: &mut DsdPipeline,
+    output: &mut Vec<f32>,
+) {
+    let remaining = limit.saturating_sub(*consumed);
+    let complete_bytes = usize::try_from(remaining / 8)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    for &byte in &bytes[..complete_bytes] {
         for bit in 0..8 {
-            if *consumed == limit {
-                return;
-            }
-            let shift = match order {
-                DsdBitOrder::LeastSignificantFirst => bit,
-                DsdBitOrder::MostSignificantFirst => 7 - bit,
+            let shift = if LEAST_SIGNIFICANT_FIRST {
+                bit
+            } else {
+                7 - bit
             };
             let sample = if byte & (1 << shift) == 0 { -1.0 } else { 1.0 };
             if let Some(value) = pipeline.push(sample) {
                 output.push(value as f32);
             }
-            *consumed += 1;
         }
     }
+    *consumed += complete_bytes as u64 * 8;
+    if complete_bytes == bytes.len() {
+        return;
+    }
+    let tail_bits = limit.saturating_sub(*consumed).min(7) as usize;
+    let byte = bytes[complete_bytes];
+    for bit in 0..tail_bits {
+        let shift = if LEAST_SIGNIFICANT_FIRST {
+            bit
+        } else {
+            7 - bit
+        };
+        let sample = if byte & (1 << shift) == 0 { -1.0 } else { 1.0 };
+        if let Some(value) = pipeline.push(sample) {
+            output.push(value as f32);
+        }
+    }
+    *consumed += tail_bits as u64;
 }
 
 fn flush_pending<F>(
@@ -1009,14 +1045,12 @@ impl DsdPipeline {
     }
 
     fn push(&mut self, sample: f64) -> Option<f64> {
-        let mut value = Some(sample);
+        let mut value = sample;
         for decimator in &mut self.decimators {
-            value = value.and_then(|sample| decimator.push(sample));
+            value = decimator.push(value)?;
         }
-        value.map(|sample| {
-            self.produced += 1;
-            self.low_pass.push(sample)
-        })
+        self.produced += 1;
+        Some(self.low_pass.push(value))
     }
 }
 
@@ -1034,42 +1068,57 @@ impl FirDecimator2 {
     }
 
     fn push(&mut self, sample: f64) -> Option<f64> {
-        let value = self.fir.push(sample);
         self.phase = !self.phase;
-        (!self.phase).then_some(value)
+        // Every input still enters the delay line, but only one phase survives
+        // the 2:1 decimator. Avoid evaluating the 31-tap dot product for the
+        // discarded phase; retained outputs use the same coefficient and
+        // accumulation order as the full-rate FIR.
+        self.fir.push_if(sample, !self.phase)
     }
 }
 
 struct Fir {
     coefficients: Vec<f64>,
     delay: Vec<f64>,
+    period: usize,
     cursor: usize,
 }
 
 impl Fir {
     fn new(coefficients: Vec<f64>) -> Self {
-        let delay = vec![0.0; coefficients.len()];
+        let period = coefficients.len();
+        debug_assert_ne!(period, 0);
+        // Mirror each ring entry one period later. The newest-to-oldest
+        // history is then one contiguous reverse slice for every cursor,
+        // removing a wrap branch from every FIR tap without changing the
+        // coefficient or accumulation order.
+        let delay = vec![0.0; period * 2];
         Self {
             coefficients,
             delay,
+            period,
             cursor: 0,
         }
     }
 
     fn push(&mut self, sample: f64) -> f64 {
+        self.push_if(sample, true)
+            .expect("an unconditional FIR output cannot be absent")
+    }
+
+    fn push_if(&mut self, sample: f64, emit: bool) -> Option<f64> {
         self.delay[self.cursor] = sample;
-        let mut index = self.cursor;
-        let mut output = 0.0;
-        for coefficient in &self.coefficients {
-            output += coefficient * self.delay[index];
-            index = if index == 0 {
-                self.delay.len() - 1
-            } else {
-                index - 1
-            };
-        }
+        self.delay[self.cursor + self.period] = sample;
+        let output = emit.then(|| {
+            let history = &self.delay[self.cursor + 1..self.cursor + self.period + 1];
+            let mut output = 0.0;
+            for (coefficient, delayed) in self.coefficients.iter().zip(history.iter().rev()) {
+                output += coefficient * delayed;
+            }
+            output
+        });
         self.cursor += 1;
-        if self.cursor == self.delay.len() {
+        if self.cursor == self.period {
             self.cursor = 0;
         }
         output
@@ -1256,6 +1305,113 @@ mod tests {
         assert_eq!(output_geometry(5_644_800).unwrap(), (88_200, 64));
         assert_eq!(output_geometry(3_072_000).unwrap(), (96_000, 32));
         assert!(output_geometry(2_000_000).is_err());
+    }
+
+    #[test]
+    fn mirrored_fir_history_matches_wrapping_reference_bit_exactly() {
+        let coefficient_sets = [
+            low_pass_coefficients(HALF_BAND_TAPS, 0.25),
+            low_pass_coefficients(OUTPUT_LOW_PASS_TAPS, OUTPUT_LOW_PASS_CUTOFF_HZ / 88_200.0),
+        ];
+        for coefficients in coefficient_sets {
+            let mut candidate = Fir::new(coefficients.clone());
+            let mut reference_delay = vec![0.0; coefficients.len()];
+            let mut reference_cursor = 0_usize;
+            for index in 0_usize..131_071 {
+                let sample = if (index.wrapping_mul(97).wrapping_add(53) & 1) == 0 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                reference_delay[reference_cursor] = sample;
+                let mut delay_index = reference_cursor;
+                let mut reference = 0.0;
+                for coefficient in &coefficients {
+                    reference += coefficient * reference_delay[delay_index];
+                    delay_index = if delay_index == 0 {
+                        reference_delay.len() - 1
+                    } else {
+                        delay_index - 1
+                    };
+                }
+                reference_cursor += 1;
+                if reference_cursor == reference_delay.len() {
+                    reference_cursor = 0;
+                }
+                assert_eq!(candidate.push(sample).to_bits(), reference.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn decimator_retained_phases_match_full_rate_fir_bit_exactly() {
+        let coefficients = low_pass_coefficients(HALF_BAND_TAPS, 0.25);
+        let mut candidate = FirDecimator2::new(coefficients.clone());
+        let mut reference = Fir::new(coefficients);
+        let mut reference_phase = false;
+        for index in 0_usize..131_071 {
+            let sample = if (index.wrapping_mul(193).wrapping_add(17) & 1) == 0 {
+                -1.0
+            } else {
+                1.0
+            };
+            let full_rate = reference.push(sample);
+            reference_phase = !reference_phase;
+            let expected = (!reference_phase).then_some(full_rate);
+            let observed = candidate.push(sample);
+            assert_eq!(
+                observed.map(f64::to_bits),
+                expected.map(f64::to_bits),
+                "sample {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_byte_batches_match_per_bit_reference_for_every_tail() {
+        let bytes = [0x00, 0xff, 0xa5, 0x3c, 0x81];
+        for order in [
+            DsdBitOrder::LeastSignificantFirst,
+            DsdBitOrder::MostSignificantFirst,
+        ] {
+            for limit in 0..=bytes.len() as u64 * 8 + 1 {
+                let mut candidate_pipeline = DsdPipeline::new(2, 88_200);
+                let mut candidate_consumed = 0;
+                let mut candidate_output = Vec::new();
+                push_dsd_bytes(
+                    &bytes,
+                    order,
+                    limit,
+                    &mut candidate_consumed,
+                    &mut candidate_pipeline,
+                    &mut candidate_output,
+                );
+
+                let mut reference_pipeline = DsdPipeline::new(2, 88_200);
+                let mut reference_consumed = 0;
+                let mut reference_output = Vec::new();
+                'bytes: for &byte in &bytes {
+                    for bit in 0..8 {
+                        if reference_consumed == limit {
+                            break 'bytes;
+                        }
+                        let shift = match order {
+                            DsdBitOrder::LeastSignificantFirst => bit,
+                            DsdBitOrder::MostSignificantFirst => 7 - bit,
+                        };
+                        let sample = if byte & (1 << shift) == 0 { -1.0 } else { 1.0 };
+                        if let Some(value) = reference_pipeline.push(sample) {
+                            reference_output.push(value as f32);
+                        }
+                        reference_consumed += 1;
+                    }
+                }
+
+                assert_eq!(candidate_consumed, reference_consumed);
+                assert_eq!(candidate_pipeline.produced, reference_pipeline.produced);
+                assert_eq!(candidate_output, reference_output);
+            }
+        }
     }
 
     #[test]

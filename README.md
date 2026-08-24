@@ -61,6 +61,10 @@ Forge reads and writes a wide range of formats through a format-agnostic engine:
   layout. Forge maps 1-bit samples to ±1, applies cascaded 31-tap
   Blackman-windowed half-band filters to 88.2/96 kHz, then a 127-tap
   Blackman-sinc low-pass with a 21 kHz cutoff before BS.1770 measurement.
+  Each 2:1 stage updates its FIR delay for every source sample but evaluates
+  the 31-tap dot product only for the phase retained by the downsampler.
+  Mirrored histories make retained dot products contiguous, while bit-order
+  specialization and complete-byte batching remove per-bit control work.
   At the top level, independent channel FIR pipelines share the configured
   worker pool while retaining each channel's byte, bit, and floating-point
   operation order. One-worker and already-nested file processing remain

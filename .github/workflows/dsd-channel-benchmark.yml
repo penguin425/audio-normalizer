@@ -1,4 +1,4 @@
-name: DSD channel-parallel candidate benchmark
+name: DSD decode candidate benchmark
 
 on:
   pull_request:
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: dsd-channel-benchmark-${{ github.event.pull_request.number }}
+  group: dsd-decode-benchmark-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
@@ -42,7 +42,7 @@ jobs:
       - name: Install Rust 1.97.0
         uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
 
-      - name: Test the DSD fixture and exact channel contract
+      - name: Test the DSD fixture and exact decode contracts
         shell: bash
         env:
           CARGO_INCREMENTAL: "0"
@@ -54,6 +54,18 @@ jobs:
           cargo test --locked --manifest-path candidate/Cargo.toml \
             --no-default-features --lib \
             parallel_channel_blocks_match_serial_processing_bit_exactly \
+            -- --nocapture
+          cargo test --locked --manifest-path candidate/Cargo.toml \
+            --no-default-features --lib \
+            mirrored_fir_history_matches_wrapping_reference_bit_exactly \
+            -- --nocapture
+          cargo test --locked --manifest-path candidate/Cargo.toml \
+            --no-default-features --lib \
+            decimator_retained_phases_match_full_rate_fir_bit_exactly \
+            -- --nocapture
+          cargo test --locked --manifest-path candidate/Cargo.toml \
+            --no-default-features --lib \
+            ordered_byte_batches_match_per_bit_reference_for_every_tail \
             -- --nocapture
           cargo test --locked --manifest-path candidate/Cargo.toml \
             --no-default-features --lib dsf_and_dsdiff_decode_the_same_signal \
@@ -214,7 +226,7 @@ jobs:
                   rows.append(row)
               summary["modes"]["default" if mode == "default" else "jobs_1"] = rows
 
-          Path("dsd-channel-summary.json").write_text(
+          Path("dsd-decode-summary.json").write_text(
               json.dumps(summary, indent=2) + "\n"
           )
           print(json.dumps(summary, indent=2))
@@ -223,10 +235,10 @@ jobs:
       - name: Upload benchmark evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
-          name: dsd-channel-benchmark-${{ runner.os }}-${{ runner.arch }}
+          name: dsd-decode-benchmark-${{ runner.os }}-${{ runner.arch }}
           path: |
             default-*.json
             one-*.json
-            dsd-channel-summary.json
+            dsd-decode-summary.json
           if-no-files-found: error
           retention-days: 30

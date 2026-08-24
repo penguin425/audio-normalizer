@@ -1585,6 +1585,45 @@ optimization. Comparing the candidate's default-worker and one-worker pooled
 medians still shows 23.05% and 24.56% lower wall time respectively when the
 parallel branch is available.
 
+### v0.159.0: retained-phase DSD FIR decimation
+
+The DSD hot path now updates every half-band delay state while evaluating its
+31-tap dot product only on the phase retained by each 2:1 decimator. This is
+the computationally efficient decimator form: discarded full-rate outputs are
+never observed by the next stage. Retained outputs preserve the established
+coefficient, multiplication, and left-to-right accumulation order exactly.
+
+Two supporting changes reduce the remaining inner-loop control work. Every FIR
+history is mirrored one period later, so its newest-to-oldest samples form one
+contiguous reverse slice for every cursor. Bit order is selected once per byte
+block, and complete bytes advance without checking the source-sample limit on
+each of their eight bits; only the final partial byte retains the bounded tail
+check.
+
+The exact v0.158.0 pull-request base and candidate were built separately with
+Rust 1.97.0. Each platform analyzed deterministic 10-second DSD64 stereo DSF
+and DSDIFF fixtures, pooled ten measurements per binary across both execution
+orders, and first proved that baseline, candidate, and candidate one-worker
+JSON were byte-identical. Focused tests also compare every retained decimator
+output at the `f64` bit level with the former full-rate FIR. Versioned evidence
+is retained by
+[Actions run 32744771805](https://github.com/penguin425/audio-normalizer/actions/runs/32744771805).
+
+| Platform / pooled median | Workload | v0.158.0 wall | v0.159.0 wall | Wall change | CPU change |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Linux x86-64, 4-vCPU AMD EPYC 9V74 | DSF stereo analysis | 2.139 s | 1.413 s | -33.94% | -36.70% |
+| Linux x86-64, 4-vCPU AMD EPYC 9V74 | DSDIFF stereo analysis | 2.056 s | 1.247 s | -39.35% | -43.31% |
+| Apple Silicon arm64, 3-vCPU runner | DSF stereo analysis | 2.813 s | 1.339 s | -52.41% | -53.64% |
+| Apple Silicon arm64, 3-vCPU runner | DSDIFF stereo analysis | 2.436 s | 1.211 s | -50.29% | -53.32% |
+
+Unlike channel parallelism, retained-phase evaluation removes work rather than
+moving it to otherwise idle cores. The one-worker controls therefore improved
+as well: Linux DSF/DSDIFF wall time fell 46.05%/45.80%, and Apple Silicon fell
+57.32%/57.83%. Corresponding aggregate-CPU changes were -46.05%/-45.80% and
+-57.60%/-58.03%. The same serial path remains the fallback inside file-level
+parallel work, so batch scheduling gains the lower CPU cost without creating a
+nested pool.
+
 ## Final integration gate
 
 Before each release, run the full feature matrix, official conformance jobs
