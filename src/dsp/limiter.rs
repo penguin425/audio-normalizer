@@ -454,6 +454,62 @@ mod tests {
     }
 
     #[test]
+    fn idle_limiter_is_bit_exact_and_preserves_signed_zero_statistics() {
+        let frames = 4_097;
+        let input = [
+            (0..frames)
+                .map(|frame| {
+                    if frame == 0 {
+                        -0.0
+                    } else {
+                        (0.01 * (frame as f32 * 0.017).sin()) as f32
+                    }
+                })
+                .collect::<Vec<_>>(),
+            (0..frames)
+                .map(|frame| (0.008 * (frame as f32 * 0.023).cos()) as f32)
+                .collect::<Vec<_>>(),
+        ];
+        let mut limiter = TruePeakLimiter::new(48_000, 2, -1.0, LimiterConfig::default()).unwrap();
+        limiter.set_statistics_interval_frames(257);
+        let mut output = [Vec::new(), Vec::new()];
+
+        for range in [0..1, 1..239, 239..481, 481..frames] {
+            let chunk = input
+                .iter()
+                .map(|channel| channel[range.clone()].to_vec())
+                .collect::<Vec<_>>();
+            let emitted = limiter.process(&chunk).unwrap();
+            for (destination, source) in output.iter_mut().zip(emitted) {
+                destination.extend(source);
+            }
+        }
+        let (tail, statistics) = limiter.finish_with_statistics();
+        for (destination, source) in output.iter_mut().zip(tail) {
+            destination.extend(source);
+        }
+
+        for (actual, expected) in output.iter().zip(&input) {
+            assert_eq!(actual.len(), expected.len());
+            assert!(actual
+                .iter()
+                .zip(expected)
+                .all(|(left, right)| left.to_bits() == right.to_bits()));
+        }
+        assert_eq!(statistics.processed_frames, frames);
+        assert_eq!(statistics.limited_frames, 0);
+        assert_eq!(
+            statistics.maximum_reduction_db.to_bits(),
+            (-0.0_f64).to_bits()
+        );
+        assert_eq!(statistics.mean_reduction_db.to_bits(), 0.0_f64.to_bits());
+        assert!(statistics.envelope.iter().all(|point| {
+            point.mean_reduction_db.to_bits() == 0.0_f64.to_bits()
+                && point.maximum_reduction_db.to_bits() == (-0.0_f64).to_bits()
+        }));
+    }
+
+    #[test]
     fn caller_owned_output_matches_allocating_api_and_reuses_capacity() {
         let sample_rate = 48_000;
         let mut allocating =
