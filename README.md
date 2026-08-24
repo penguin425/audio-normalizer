@@ -196,11 +196,11 @@ the `-o` extension override this.
   Standard-input audio is spooled to a temporary file so the same correct
   two-pass algorithm remains available in shell pipelines.
 * Release profile uses `lto = "fat"`, `codegen-units = 1`, and
-  `panic = "abort"`. The published Linux `forge` CLI adds deterministic,
-  branch-counter-only PGO while retaining a generic x86-64 baseline and
-  runtime-dispatched AVX2/FMA kernels. A supplemental PGO `x86-64-v3` CLI is
-  available for compatible CPUs. Local Cargo builds use `target-cpu=native`
-  and are not portable.
+  `panic = "abort"`. The published Linux and Apple Silicon `forge` CLIs add
+  deterministic, branch-counter-only PGO while retaining portable ISA
+  baselines and runtime-dispatched kernels. Linux also provides a supplemental
+  PGO `x86-64-v3` CLI for compatible CPUs. Local Cargo builds use
+  `target-cpu=native` and are not portable.
 
 See [PERFORMANCE.md](PERFORMANCE.md) for the primary research basis, measured
 release results, rejected experiments, and implementation order.
@@ -361,8 +361,10 @@ The full `linux-x86_64` archive remains the compatible default and contains a
 generic PGO `forge` CLI. Linux releases also provide a supplemental
 `linux-x86_64-v3` archive containing only a faster PGO `forge` CLI; it requires
 the x86-64-v3 ISA level (including AVX2, BMI2, FMA, and OS AVX state support).
-Use the generic archive if compatibility is uncertain. Other Linux tools,
-shared libraries, wheels, and package-manager installations remain generic.
+Use the generic archive if compatibility is uncertain. The Apple Silicon
+archive likewise PGO-optimizes only `forge` while retaining its documented
+ARM64 feature baseline. Other tools, shared libraries, wheels, and
+package-manager installations remain portable non-PGO builds.
 Each release includes generated release notes, `SHA256SUMS`, SPDX and
 CycloneDX SBOMs, an offline SLSA provenance bundle, and generated Homebrew,
 Scoop, and WinGet manifests. GitHub artifact attestations provide verifiable

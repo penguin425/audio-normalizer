@@ -221,7 +221,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install matching LLVM PGO tools
-        if: matrix.asset == 'linux-x86_64'
+        if: matrix.asset == 'linux-x86_64' || matrix.asset == 'macos-aarch64'
         run: rustup component add llvm-tools-preview
 
       - name: Install Python 3.14
@@ -238,19 +238,30 @@ jobs:
           RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace ${{ matrix.rustflags }}
         run: cargo build --locked --release --target ${{ matrix.target }} --features ${{ matrix.features }}
 
-      - name: Apply reproducible PGO to the Linux normalizer CLI
-        if: matrix.asset == 'linux-x86_64'
+      - name: Apply reproducible PGO to the normalizer CLI
+        if: matrix.asset == 'linux-x86_64' || matrix.asset == 'macos-aarch64'
         shell: bash
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           FORGE_PGO_FEATURES: ${{ matrix.features }}
-          FORGE_PGO_RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace
+          FORGE_PGO_RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace ${{ matrix.rustflags }}
         run: |
           set -euo pipefail
           tools/build-pgo-forge.sh "${{ matrix.target }}"
           cp \
             "target/forge-pgo-${{ matrix.target }}/optimized/${{ matrix.target }}/release/forge" \
             "target/${{ matrix.target }}/release/forge"
+
+      - name: Upload Apple Silicon PGO profile evidence
+        if: matrix.asset == 'macos-aarch64'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: apple-pgo-profile-macos-aarch64
+          path: |
+            target/forge-pgo-${{ matrix.target }}/canonical-profile.txt
+            target/forge-pgo-${{ matrix.target }}/training.json
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Build the self-contained Python platform wheel
         env:
@@ -552,6 +563,55 @@ jobs:
             "actual/forge_normalizer-${{ needs.validate.outputs.version }}-py3-none-manylinux_2_34_x86_64.whl" \
             "reproduced/forge_normalizer-${{ needs.validate.outputs.version }}-py3-none-manylinux_2_34_x86_64.whl"
 
+  reproducible-macos-aarch64:
+    name: Reproduce macOS ARM64 PGO CLI
+    needs: [validate, build]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install Rust 1.97.0 and matching LLVM PGO tools
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+        with:
+          targets: aarch64-apple-darwin
+          components: llvm-tools-preview
+
+      - name: Download published Apple Silicon candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-macos-aarch64
+          path: actual
+
+      - name: Download published Apple Silicon PGO profile
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: apple-pgo-profile-macos-aarch64
+          path: actual-profile
+
+      - name: Independently rebuild and compare the PGO CLI
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+          FORGE_PGO_FEATURES: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service
+          FORGE_PGO_RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace -Ctarget-feature=+neon,+aes,+sha2
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools/build-pgo-forge.sh aarch64-apple-darwin
+          mkdir -p actual/extracted
+          tar -xzf \
+            "actual/forge-v${{ needs.validate.outputs.version }}-macos-aarch64.tar.gz" \
+            -C actual/extracted
+          actual_forge="actual/extracted/forge-v${{ needs.validate.outputs.version }}-macos-aarch64/forge"
+          reproduced_forge="target/forge-pgo-aarch64-apple-darwin/optimized/aarch64-apple-darwin/release/forge"
+          reproduced_profile="target/forge-pgo-aarch64-apple-darwin/canonical-profile.txt"
+          cmp "$actual_forge" "$reproduced_forge"
+          cmp actual-profile/canonical-profile.txt "$reproduced_profile"
+          shasum -a 256 \
+            "$actual_forge" \
+            "$reproduced_forge" \
+            actual-profile/canonical-profile.txt \
+            "$reproduced_profile"
+
   wasm:
     name: Build browser WASM package
     needs: validate
@@ -590,7 +650,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [validate, build, build-linux-v3, reproducible-linux, wasm]
+    needs: [validate, build, build-linux-v3, reproducible-linux, reproducible-macos-aarch64, wasm]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     permissions:

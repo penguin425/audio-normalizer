@@ -35,10 +35,11 @@ hot
 2
 
 """
-        rendered, count, removed_value_profiles = profile.canonicalize(
-            source, 10_000
+        rendered, count, removed_empty_profiles, removed_value_profiles = (
+            profile.canonicalize(source, 10_000)
         )
         self.assertEqual(count, 1)
+        self.assertEqual(removed_empty_profiles, 0)
         self.assertEqual(removed_value_profiles, 0)
         self.assertIn("cold\n# Func Hash:\n1\n# Num Counters:\n3\n# Counter Values:\n0\n0\n0\n", rendered)
         self.assertIn("hot\n# Func Hash:\n2\n# Num Counters:\n3\n# Counter Values:\n4\n10000\n2\n", rendered)
@@ -71,16 +72,48 @@ next
 10000
 
 """
-        rendered, count, removed_value_profiles = profile.canonicalize(
-            source, 10_000
+        rendered, count, removed_empty_profiles, removed_value_profiles = (
+            profile.canonicalize(source, 10_000)
         )
         self.assertEqual(count, 1)
+        self.assertEqual(removed_empty_profiles, 0)
         self.assertEqual(removed_value_profiles, 1)
         self.assertIn("# Counter Values:\n0\n", rendered)
         self.assertNotIn("# Num Value Kinds:", rendered)
         self.assertNotIn("# NumValueSites:", rendered)
         self.assertNotIn("8:3", rendered)
         self.assertIn("next\n# Func Hash:\n2\n", rendered)
+
+    def test_original_all_zero_function_profiles_are_removed(self):
+        source = """# IR level Instrumentation Flag
+:ir
+unused
+# Func Hash:
+1
+# Num Counters:
+3
+# Counter Values:
+0
+0
+0
+
+hot
+# Func Hash:
+2
+# Num Counters:
+1
+# Counter Values:
+10000
+
+"""
+        rendered, count, removed_empty_profiles, removed_value_profiles = (
+            profile.canonicalize(source, 10_000)
+        )
+        self.assertEqual(count, 0)
+        self.assertEqual(removed_empty_profiles, 1)
+        self.assertEqual(removed_value_profiles, 0)
+        self.assertNotIn("unused\n# Func Hash:", rendered)
+        self.assertIn("hot\n# Func Hash:\n2\n", rendered)
 
     def test_rejects_non_ir_and_truncated_profiles(self):
         with self.assertRaises(ValueError):
