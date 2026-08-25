@@ -2,7 +2,6 @@
 
 use super::truepeak::TruePeakMeter;
 use serde::Serialize;
-use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LimiterEnvelopePoint {
@@ -39,14 +38,17 @@ impl Default for LimiterConfig {
 
 pub struct TruePeakLimiter {
     meters: Vec<TruePeakMeter>,
-    delay: Vec<VecDeque<f32>>,
+    delay: Vec<Vec<f32>>,
+    delay_start: usize,
+    delay_len: usize,
+    delay_capacity: usize,
     lookahead_frames: usize,
     release_coeff: f32,
     ceiling: f32,
     envelope: f32,
     hold_frames: usize,
     last_samples: Vec<f32>,
-    max_reduction_db: f64,
+    minimum_envelope: f32,
     emitted_frames: usize,
     limited_frames: usize,
     reduction_sum_db: f64,
@@ -84,15 +86,18 @@ impl TruePeakLimiter {
                 .map(|_| TruePeakMeter::for_sample_rate(sample_rate))
                 .collect(),
             delay: (0..channels)
-                .map(|_| VecDeque::with_capacity(lookahead_frames + 1))
+                .map(|_| vec![0.0; lookahead_frames + 1])
                 .collect(),
+            delay_start: 0,
+            delay_len: 0,
+            delay_capacity: lookahead_frames + 1,
             lookahead_frames,
             release_coeff: (-1.0 / release_samples).exp() as f32,
             ceiling: 10.0_f64.powf(ceiling_db / 20.0) as f32,
             envelope: 1.0,
             hold_frames: 0,
             last_samples: vec![0.0; channels as usize],
-            max_reduction_db: 0.0,
+            minimum_envelope: 1.0,
             emitted_frames: 0,
             limited_frames: 0,
             reduction_sum_db: 0.0,
@@ -101,7 +106,7 @@ impl TruePeakLimiter {
             interval_start_frame: 0,
             interval_frames: 0,
             interval_reduction_sum_db: 0.0,
-            interval_max_reduction_db: 0.0,
+            interval_max_reduction_db: -0.0,
             statistics_envelope: Vec::new(),
         })
     }
@@ -142,21 +147,27 @@ impl TruePeakLimiter {
         if output.len() != self.delay.len() {
             return Err("limiter output channel count changed".into());
         }
-        let emit = frames.saturating_sub(self.lookahead_frames.saturating_sub(self.delay[0].len()));
+        let emit = frames.saturating_sub(self.lookahead_frames.saturating_sub(self.delay_len));
         for channel in output.iter_mut() {
             channel.clear();
             channel.reserve(emit);
         }
         for (frame, _) in planar[0].iter().enumerate() {
+            let mut delay_write = self.delay_start + self.delay_len;
+            if delay_write >= self.delay_capacity {
+                delay_write -= self.delay_capacity;
+            }
             let detected = push_and_detect_frame(
                 &mut self.meters,
                 &mut self.delay,
                 &mut self.last_samples,
                 planar,
                 frame,
+                delay_write,
             );
+            self.delay_len += 1;
             self.update_envelope(detected);
-            if self.delay[0].len() > self.lookahead_frames {
+            if self.delay_len > self.lookahead_frames {
                 self.emit_one(output);
             }
         }
@@ -190,12 +201,12 @@ impl TruePeakLimiter {
         if output.len() != self.delay.len() {
             return Err("limiter output channel count changed".into());
         }
-        let remaining = self.delay[0].len();
+        let remaining = self.delay_len;
         for channel in output.iter_mut() {
             channel.clear();
             channel.reserve(remaining);
         }
-        while !self.delay[0].is_empty() {
+        while self.delay_len != 0 {
             let detected = detect_repeated_frame(&mut self.meters, &self.last_samples);
             self.update_envelope(detected);
             self.emit_one(output);
@@ -206,7 +217,7 @@ impl TruePeakLimiter {
         let statistics = LimiterStatistics {
             processed_frames: self.emitted_frames,
             limited_frames: self.limited_frames,
-            maximum_reduction_db: self.max_reduction_db,
+            maximum_reduction_db: reduction_db(self.minimum_envelope),
             mean_reduction_db: if self.emitted_frames == 0 {
                 0.0
             } else {
@@ -219,10 +230,16 @@ impl TruePeakLimiter {
     }
 
     pub fn max_reduction_db(&self) -> f64 {
-        self.max_reduction_db
+        reduction_db(self.minimum_envelope)
     }
 
     fn update_envelope(&mut self, detected: f32) {
+        // The common defensive-limiter case never reaches the ceiling. With a
+        // fully released envelope, the complete update below is an identity;
+        // avoid its release arithmetic and dB bookkeeping on every frame.
+        if self.envelope == 1.0 && self.hold_frames == 0 && detected <= self.ceiling {
+            return;
+        }
         let required = if detected > self.ceiling {
             (self.ceiling / detected) * 0.9999
         } else {
@@ -236,20 +253,12 @@ impl TruePeakLimiter {
         } else {
             self.envelope = 1.0 - (1.0 - self.envelope) * self.release_coeff;
         }
-        if self.envelope > 0.0 {
-            self.max_reduction_db = self
-                .max_reduction_db
-                .max(-20.0 * (self.envelope as f64).log10());
-        }
+        self.minimum_envelope = self.minimum_envelope.min(self.envelope);
     }
 
     fn emit_one(&mut self, output: &mut [Vec<f32>]) {
         if self.statistics_enabled {
-            let reduction_db = if self.envelope > 0.0 {
-                -20.0 * (self.envelope as f64).log10()
-            } else {
-                f64::INFINITY
-            };
+            let reduction_db = reduction_db(self.envelope);
             if reduction_db > 1e-6 {
                 self.limited_frames += 1;
             }
@@ -259,11 +268,14 @@ impl TruePeakLimiter {
             self.interval_reduction_sum_db += reduction_db;
             self.interval_max_reduction_db = self.interval_max_reduction_db.max(reduction_db);
         }
-        for (channel, queue) in self.delay.iter_mut().enumerate() {
-            if let Some(sample) = queue.pop_front() {
-                output[channel].push(sample * self.envelope);
-            }
+        for (channel, delay) in self.delay.iter().enumerate() {
+            output[channel].push(delay[self.delay_start] * self.envelope);
         }
+        self.delay_start += 1;
+        if self.delay_start == self.delay_capacity {
+            self.delay_start = 0;
+        }
+        self.delay_len -= 1;
         if self.statistics_enabled && self.interval_frames == self.statistics_interval_frames {
             self.finish_statistics_interval();
         }
@@ -283,7 +295,20 @@ impl TruePeakLimiter {
         self.interval_start_frame = end_frame;
         self.interval_frames = 0;
         self.interval_reduction_sum_db = 0.0;
-        self.interval_max_reduction_db = 0.0;
+        self.interval_max_reduction_db = -0.0;
+    }
+}
+
+#[inline]
+fn reduction_db(envelope: f32) -> f64 {
+    if envelope == 1.0 {
+        // Preserve the established `-20 * log10(1.0)` sign bit in serialized
+        // difference evidence while avoiding the transcendental call.
+        -0.0
+    } else if envelope > 0.0 {
+        -20.0 * (envelope as f64).log10()
+    } else {
+        f64::INFINITY
     }
 }
 
@@ -293,18 +318,19 @@ impl TruePeakLimiter {
 #[inline]
 fn push_and_detect_frame(
     meters: &mut [TruePeakMeter],
-    delay: &mut [VecDeque<f32>],
+    delay: &mut [Vec<f32>],
     last_samples: &mut [f32],
     planar: &[Vec<f32>],
     frame: usize,
+    delay_write: usize,
 ) -> f32 {
     if meters.len() == 2 {
         let left_sample = planar[0][frame];
         let right_sample = planar[1][frame];
         last_samples[0] = left_sample;
         last_samples[1] = right_sample;
-        delay[0].push_back(left_sample);
-        delay[1].push_back(right_sample);
+        delay[0][delay_write] = left_sample;
+        delay[1][delay_write] = right_sample;
         let (left, right) = meters.split_at_mut(1);
         let (left_peak, right_peak) = TruePeakMeter::process_stereo_sample(
             &mut left[0],
@@ -324,11 +350,11 @@ fn push_and_detect_frame(
     {
         let left_sample = sample_pair[0][frame];
         last_pair[0] = left_sample;
-        delay_pair[0].push_back(left_sample);
+        delay_pair[0][delay_write] = left_sample;
         if meter_pair.len() == 2 {
             let right_sample = sample_pair[1][frame];
             last_pair[1] = right_sample;
-            delay_pair[1].push_back(right_sample);
+            delay_pair[1][delay_write] = right_sample;
             let (left, right) = meter_pair.split_at_mut(1);
             let (left_peak, right_peak) = TruePeakMeter::process_stereo_sample(
                 &mut left[0],
@@ -425,6 +451,62 @@ mod tests {
         assert_eq!(statistics.envelope.len(), 5);
         assert_eq!(statistics.envelope.last().unwrap().end_frame, 4_800);
         assert_eq!(output[0].len(), input[0].len());
+    }
+
+    #[test]
+    fn idle_limiter_is_bit_exact_and_preserves_signed_zero_statistics() {
+        let frames = 4_097;
+        let input = [
+            (0..frames)
+                .map(|frame| {
+                    if frame == 0 {
+                        -0.0
+                    } else {
+                        0.01 * (frame as f32 * 0.017).sin()
+                    }
+                })
+                .collect::<Vec<_>>(),
+            (0..frames)
+                .map(|frame| 0.008 * (frame as f32 * 0.023).cos())
+                .collect::<Vec<_>>(),
+        ];
+        let mut limiter = TruePeakLimiter::new(48_000, 2, -1.0, LimiterConfig::default()).unwrap();
+        limiter.set_statistics_interval_frames(257);
+        let mut output = [Vec::new(), Vec::new()];
+
+        for range in [0..1, 1..239, 239..481, 481..frames] {
+            let chunk = input
+                .iter()
+                .map(|channel| channel[range.clone()].to_vec())
+                .collect::<Vec<_>>();
+            let emitted = limiter.process(&chunk).unwrap();
+            for (destination, source) in output.iter_mut().zip(emitted) {
+                destination.extend(source);
+            }
+        }
+        let (tail, statistics) = limiter.finish_with_statistics();
+        for (destination, source) in output.iter_mut().zip(tail) {
+            destination.extend(source);
+        }
+
+        for (actual, expected) in output.iter().zip(&input) {
+            assert_eq!(actual.len(), expected.len());
+            assert!(actual
+                .iter()
+                .zip(expected)
+                .all(|(left, right)| left.to_bits() == right.to_bits()));
+        }
+        assert_eq!(statistics.processed_frames, frames);
+        assert_eq!(statistics.limited_frames, 0);
+        assert_eq!(
+            statistics.maximum_reduction_db.to_bits(),
+            (-0.0_f64).to_bits()
+        );
+        assert_eq!(statistics.mean_reduction_db.to_bits(), 0.0_f64.to_bits());
+        assert!(statistics.envelope.iter().all(|point| {
+            point.mean_reduction_db.to_bits() == 0.0_f64.to_bits()
+                && point.maximum_reduction_db.to_bits() == (-0.0_f64).to_bits()
+        }));
     }
 
     #[test]

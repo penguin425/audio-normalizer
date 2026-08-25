@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import struct
 import sys
 import tempfile
 import unittest
@@ -44,6 +45,20 @@ class BenchmarkTests(unittest.TestCase):
             size = benchmark.write_pcm16_wave(path, 1, 8_000, 2)
             self.assertEqual(size, 44 + 8_000 * 2 * 2)
             self.assertEqual(path.read_bytes()[:12], b"RIFF$}\x00\x00WAVE")
+
+    def test_active_limiter_wave_has_a_deterministic_full_scale_transient(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "active.wav"
+            benchmark.write_pcm16_wave(
+                path,
+                2,
+                48_000,
+                2,
+                full_scale_transient=True,
+            )
+            transient_offset = 44 + 48_000 * 2 * 2
+            samples = struct.unpack("<hh", path.read_bytes()[transient_offset:transient_offset + 4])
+            self.assertEqual(samples, (32_767, 32_767))
 
     def test_dsd_fixtures_have_bounded_deterministic_wrappers(self):
         with tempfile.TemporaryDirectory() as directory:
