@@ -138,6 +138,11 @@ the `-o` extension override this.
   order remain deterministic; `--jobs 1` and nested file-level work retain the
   synchronous path. Limiter and uncached conversion paths use the established
   copy fallback when their output storage cannot be transferred safely.
+* **Borrowed compressed-audio analysis** feeds native planar `f32` decoder
+  planes directly into loudness, true-peak, range, resampling, and optional PCM
+  spool analysis. Symphonia codecs such as MP3 avoid a packet-sized PCM copy;
+  integer decoder output and mutable render passes retain their established
+  conversion buffers. Public library APIs and measured output remain unchanged.
 * **Bounded parallel FLAC encoding** coalesces short decoder packets, encodes
   independent fixed-size frames and their bitstreams on up to eight tasks in
   the global worker pool, overlaps the serial source-order MD5 update with that
