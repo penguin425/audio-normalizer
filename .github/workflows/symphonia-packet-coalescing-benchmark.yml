@@ -168,6 +168,7 @@ jobs:
         shell: bash
         env:
           BENCHMARK_ROOT: ${{ runner.temp }}/packet-coalescing-benchmark
+          BENCHMARK_OUTPUT_PARENT: ${{ runner.os == 'Linux' && '/dev/shm' || runner.temp }}
           BASELINE_FORGE: ${{ runner.temp }}/target-baseline/release/forge
           CANDIDATE_FORGE: ${{ runner.temp }}/target-candidate/release/forge
         run: |
@@ -190,6 +191,14 @@ jobs:
 
           root = Path(os.environ["BENCHMARK_ROOT"])
           root.mkdir()
+          output_parent = Path(os.environ["BENCHMARK_OUTPUT_PARENT"])
+          output_root = output_parent / f"forge-packet-output-{os.getpid()}"
+          if shutil.disk_usage(output_parent).free < 256 * 1024 * 1024:
+              raise RuntimeError(
+                  f"benchmark output filesystem has less than 256 MiB free: "
+                  f"{output_parent}"
+              )
+          output_root.mkdir()
           logs = root / "logs"
           logs.mkdir()
           source = root / "source.wav"
@@ -221,6 +230,10 @@ jobs:
                   "platform": sys.platform,
                   "cpu_model": cpu_model(),
                   "cpu_count": os.cpu_count(),
+                  "output_storage": (
+                      "memory-backed" if sys.platform.startswith("linux")
+                      else "runner-temp"
+                  ),
               },
               "modes": {},
           }
@@ -233,7 +246,7 @@ jobs:
               for case in ("analyze", "normalize"):
                   samples = {"baseline": [], "candidate": []}
                   rounds = []
-                  output_path = root / f"{mode}-{case}-output.wav"
+                  output_path = output_root / f"{mode}-{case}-output.wav"
 
                   def command(name):
                       if case == "analyze":
@@ -326,6 +339,8 @@ jobs:
                   }
                   mode_cases[case] = {"summary": summary, "rounds": rounds}
               result["modes"][mode] = mode_cases
+
+          output_root.rmdir()
 
           Path("symphonia-packet-coalescing-interleaved.json").write_text(
               json.dumps(result, indent=2) + "\n",
