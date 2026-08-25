@@ -106,7 +106,7 @@ impl TruePeakLimiter {
             interval_start_frame: 0,
             interval_frames: 0,
             interval_reduction_sum_db: 0.0,
-            interval_max_reduction_db: 0.0,
+            interval_max_reduction_db: -0.0,
             statistics_envelope: Vec::new(),
         })
     }
@@ -295,7 +295,7 @@ impl TruePeakLimiter {
         self.interval_start_frame = end_frame;
         self.interval_frames = 0;
         self.interval_reduction_sum_db = 0.0;
-        self.interval_max_reduction_db = 0.0;
+        self.interval_max_reduction_db = -0.0;
     }
 }
 
