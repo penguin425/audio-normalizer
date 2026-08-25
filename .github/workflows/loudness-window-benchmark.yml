@@ -1,4 +1,4 @@
-name: Loudness window candidate benchmark
+name: Loudness frame fullness candidate benchmark
 
 on:
   pull_request:
@@ -11,12 +11,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: loudness-window-benchmark-${{ github.event.pull_request.number }}
+  group: loudness-frame-fullness-benchmark-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   benchmark:
-    name: benchmark (${{ matrix.os }})
+    name: frame fullness (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -39,7 +39,7 @@ jobs:
       - name: Install Rust 1.97.0
         uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
 
-      - name: Test exact running-window arithmetic
+      - name: Test exact running-window arithmetic and fullness invariant
         shell: bash
         env:
           CARGO_INCREMENTAL: "0"
@@ -50,6 +50,10 @@ jobs:
           cargo test --locked --manifest-path candidate/Cargo.toml \
             --no-default-features --lib \
             fixed_running_window_matches_vecdeque_sum_bit_exactly \
+            -- --nocapture
+          cargo test --locked --manifest-path candidate/Cargo.toml \
+            --no-default-features --lib \
+            frame_count_matches_running_window_fullness \
             -- --nocapture
           cargo test --locked --manifest-path candidate/Cargo.toml \
             --no-default-features --lib \
@@ -113,8 +117,10 @@ jobs:
         run: |
           set -euo pipefail
           common=(
-            --duration-seconds 300
-            --iterations 5
+            # Keep each measured command long enough that hosted-runner
+            # scheduling jitter cannot dominate this small hot-loop change.
+            --duration-seconds 600
+            --iterations 7
             --case wav-stereo-analyze
             --case wav-stereo-batch-normalize
           )
@@ -143,7 +149,7 @@ jobs:
           set -euo pipefail
           common=(
             --duration-seconds 600
-            --iterations 5
+            --iterations 7
             --case wav-stereo-analyze
           )
           python3 candidate/tools/benchmark.py \
@@ -185,7 +191,7 @@ jobs:
               }
               rows = []
               for case_id in indexed["base-first"]:
-                  row = {"id": case_id, "samples_per_binary": 10}
+                  row = {"id": case_id, "samples_per_binary": 14}
                   for metric in ("wall", "cpu", "rss"):
                       def values(name):
                           samples = indexed[name][case_id]["samples"]
@@ -216,10 +222,12 @@ jobs:
                           "candidate_pooled": candidate_value,
                           "change_percent": (candidate_value / base_value - 1.0) * 100.0,
                       }
+                  assert row["wall"]["change_percent"] <= 3.0, row
+                  assert row["cpu"]["change_percent"] <= 3.0, row
                   rows.append(row)
               summary["modes"]["default" if mode == "default" else "jobs_1"] = rows
 
-          Path("loudness-window-summary.json").write_text(
+          Path("loudness-frame-fullness-summary.json").write_text(
               json.dumps(summary, indent=2) + "\n"
           )
           print(json.dumps(summary, indent=2))
@@ -228,10 +236,10 @@ jobs:
       - name: Upload benchmark evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
-          name: loudness-window-benchmark-${{ runner.os }}-${{ runner.arch }}
+          name: loudness-frame-fullness-${{ runner.os }}-${{ runner.arch }}
           path: |
             default-*.json
             one-*.json
-            loudness-window-summary.json
+            loudness-frame-fullness-summary.json
           if-no-files-found: error
           retention-days: 30
