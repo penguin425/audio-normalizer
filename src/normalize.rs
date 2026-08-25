@@ -3297,7 +3297,7 @@ fn process_normalized_stream(
         })?;
     } else {
         let mut converter: Option<SampleRateConverter> = None;
-        decoder::decode_stream(input, |info, planar| {
+        decoder::decode_stream_coalesced(input, |info, planar| {
             if info.sample_rate == analysis.sample_rate {
                 return process_normalized_chunk(
                     planar,

@@ -22,10 +22,9 @@ const FLAC_SAMPLE_VALUES_PER_DECODER: u64 = 192_000;
 const FLAC_FILE_BYTES_PER_DECODER: u64 = 192 * 1024;
 const MAX_PARALLEL_FLAC_PACKET_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PARALLEL_FLAC_PCM_BYTES: usize = 32 * 1024 * 1024;
-// MP3, AAC, and Vorbis normally decode much smaller packets. Group whole
-// packets to amortize callbacks, while staying below the analyzer's 16,384
-// frame True Peak task threshold: forcing every grouped packet through a
-// Rayon join reduces wall time but raises CPU time materially.
+// MP3, AAC, and Vorbis normally decode much smaller packets. The normalization
+// render pass groups whole packets to amortize callbacks and writer work while
+// staying below the analyzer's 16,384-frame True Peak task threshold.
 const TARGET_SYMPHONIA_STREAM_CHUNK_FRAMES: usize = 4_096;
 
 #[derive(Debug, Clone)]
@@ -560,10 +559,20 @@ pub fn decode_stream<F>(path: &Path, consume: F) -> Result<StreamInfo, String>
 where
     F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
 {
-    decode_stream_with_flac_workers(path, None, consume)
+    decode_stream_with_flac_workers::<false, _>(path, None, consume)
 }
 
-fn decode_stream_with_flac_workers<F>(
+/// Decode with small planar-f32 packets coalesced for the normalization render
+/// pass. Analysis deliberately keeps codec packet boundaries: larger chunks
+/// can reduce True Peak pruning efficiency on some architectures.
+pub(crate) fn decode_stream_coalesced<F>(path: &Path, consume: F) -> Result<StreamInfo, String>
+where
+    F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
+{
+    decode_stream_with_flac_workers::<true, _>(path, None, consume)
+}
+
+fn decode_stream_with_flac_workers<const COALESCE_F32: bool, F>(
     path: &Path,
     forced_flac_workers: Option<usize>,
     mut consume: F,
@@ -721,23 +730,34 @@ where
         if frames == 0 {
             continue;
         }
-        let info = info
-            .as_ref()
-            .expect("decoded output establishes stream info");
-        match decoded {
-            GenericAudioBufferRef::F32(buffer) => {
-                append_symphonia_f32_stream_chunk(info, buffer, &mut planar, &mut consume)?;
+        if COALESCE_F32 {
+            let info = info
+                .as_ref()
+                .expect("decoded output establishes stream info");
+            match decoded {
+                GenericAudioBufferRef::F32(buffer) => {
+                    append_symphonia_f32_stream_chunk(info, buffer, &mut planar, &mut consume)?;
+                }
+                decoded => {
+                    flush_symphonia_stream_chunk(info, &mut planar, &mut consume)?;
+                    decoded.copy_to_vecs_planar::<f32>(&mut planar);
+                    consume_and_clear_stream_chunk(info, &mut planar, &mut consume)?;
+                }
             }
-            decoded => {
-                flush_symphonia_stream_chunk(info, &mut planar, &mut consume)?;
-                decoded.copy_to_vecs_planar::<f32>(&mut planar);
-                consume_and_clear_stream_chunk(info, &mut planar, &mut consume)?;
-            }
+        } else {
+            decoded.copy_to_vecs_planar::<f32>(&mut planar);
+            consume(
+                info.as_ref()
+                    .expect("decoded output establishes stream info"),
+                &mut planar,
+            )?;
         }
     }
 
-    if let Some(info) = info.as_ref() {
-        flush_symphonia_stream_chunk(info, &mut planar, &mut consume)?;
+    if COALESCE_F32 {
+        if let Some(info) = info.as_ref() {
+            flush_symphonia_stream_chunk(info, &mut planar, &mut consume)?;
+        }
     }
     info.ok_or_else(|| format!("{}: no audio decoded", path.display()))
 }
@@ -1331,16 +1351,17 @@ mod tests {
 
     fn decode_flac_with_workers(path: &Path, workers: usize) -> (StreamInfo, Vec<Vec<f32>>) {
         let mut samples = Vec::new();
-        let info = decode_stream_with_flac_workers(path, Some(workers), |info, planar| {
-            if samples.is_empty() {
-                samples = vec![Vec::new(); info.channels as usize];
-            }
-            for (destination, source) in samples.iter_mut().zip(planar) {
-                destination.extend_from_slice(source);
-            }
-            Ok(())
-        })
-        .unwrap();
+        let info =
+            decode_stream_with_flac_workers::<false, _>(path, Some(workers), |info, planar| {
+                if samples.is_empty() {
+                    samples = vec![Vec::new(); info.channels as usize];
+                }
+                for (destination, source) in samples.iter_mut().zip(planar) {
+                    destination.extend_from_slice(source);
+                }
+                Ok(())
+            })
+            .unwrap();
         (info, samples)
     }
 

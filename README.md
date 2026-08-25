@@ -213,10 +213,10 @@ the `-o` extension override this.
   tail is bit-identical to the portable decoder. The allocating library path
   retains its lower-overhead parallel per-channel implementation.
 * **Coalesced compressed-audio packets** append small planar-f32 Symphonia
-  packets into reusable 4,096-frame chunks before analysis or rendering. This
-  amortizes callback and downstream chunk overhead without splitting large
-  packets, changing sample order, or forcing short work through the True Peak
-  task pool.
+  packets into reusable 4,096-frame chunks during the normalization render
+  pass. This amortizes callback and writer overhead without splitting large
+  packets or changing sample order. Analysis retains codec packet boundaries
+  so True Peak pruning stays fine-grained on every architecture.
 * **Bounded-memory streaming** decodes analysis and normalization in chunks.
   Normalization uses two sequential passes so gain is known before encoding,
   without retaining the complete audio file in RAM. Single-source render paths
