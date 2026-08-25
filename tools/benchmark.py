@@ -106,7 +106,12 @@ def pcm_bytes(duration_seconds: int, sample_rate: int, channels: int) -> int:
 
 
 def write_pcm16_wave(
-    path: Path, duration_seconds: int, sample_rate: int, channels: int
+    path: Path,
+    duration_seconds: int,
+    sample_rate: int,
+    channels: int,
+    *,
+    full_scale_transient: bool = False,
 ) -> int:
     data_bytes = pcm_bytes(duration_seconds, sample_rate, channels)
     riff_size = 36 + data_bytes
@@ -135,6 +140,11 @@ def write_pcm16_wave(
             count = min(frames_left, CHUNK_FRAMES)
             output.write(block if count == CHUNK_FRAMES else block[: count * frame_bytes])
             frames_left -= count
+    if full_scale_transient:
+        transient_frame = duration_seconds * sample_rate // 2
+        with path.open("r+b") as output:
+            output.seek(44 + transient_frame * frame_bytes)
+            output.write(struct.pack("<" + "h" * channels, *([32_767] * channels)))
     return path.stat().st_size
 
 
@@ -563,7 +573,13 @@ def run_case(
         else:
             wave_path = case_dir / "source.wav"
             require_space(case_dir, estimated * (2 if operation == "normalize" else 1))
-            write_pcm16_wave(wave_path, duration, sample_rate, channels)
+            write_pcm16_wave(
+                wave_path,
+                duration,
+                sample_rate,
+                channels,
+                full_scale_transient=case_id == "wav-stereo-limiter-active",
+            )
             input_path = wave_path
             if input_format == "flac":
                 if ffmpeg is None:

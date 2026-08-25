@@ -81,22 +81,55 @@ jobs:
           sys.path.insert(0, "candidate/tools")
           from benchmark import write_pcm16_wave
 
-          write_pcm16_wave(Path(os.environ["EXACT_DIR"]) / "stereo.wav", 30, 48_000, 2)
+          directory = Path(os.environ["EXACT_DIR"])
+          write_pcm16_wave(directory / "idle.wav", 30, 48_000, 2)
+          write_pcm16_wave(
+              directory / "active.wav",
+              30,
+              48_000,
+              2,
+              full_scale_transient=True,
+          )
           PY
 
           baseline="${RUNNER_TEMP}/target-baseline/release/forge"
           candidate="${RUNNER_TEMP}/target-candidate/release/forge"
-          "${baseline}" "${exact_dir}/stereo.wav" --jobs 1 --limiter --verify \
+          "${baseline}" "${exact_dir}/idle.wav" --jobs 1 --limiter --verify \
+            --difference-report "${exact_dir}/base-idle-difference.json" \
             --overwrite -o "${exact_dir}/base-idle.wav"
-          "${candidate}" "${exact_dir}/stereo.wav" --jobs 1 --limiter --verify \
+          "${candidate}" "${exact_dir}/idle.wav" --jobs 1 --limiter --verify \
+            --difference-report "${exact_dir}/candidate-idle-difference.json" \
             --overwrite -o "${exact_dir}/candidate-idle.wav"
           cmp "${exact_dir}/base-idle.wav" "${exact_dir}/candidate-idle.wav"
 
-          "${baseline}" "${exact_dir}/stereo.wav" --jobs 1 --target=-6 --ceiling=-3 \
-            --limiter --verify --overwrite -o "${exact_dir}/base-active.wav"
-          "${candidate}" "${exact_dir}/stereo.wav" --jobs 1 --target=-6 --ceiling=-3 \
-            --limiter --verify --overwrite -o "${exact_dir}/candidate-active.wav"
+          "${baseline}" "${exact_dir}/active.wav" --jobs 1 --target=-6 --ceiling=-3 \
+            --limiter --verify \
+            --difference-report "${exact_dir}/base-active-difference.json" \
+            --overwrite -o "${exact_dir}/base-active.wav"
+          "${candidate}" "${exact_dir}/active.wav" --jobs 1 --target=-6 --ceiling=-3 \
+            --limiter --verify \
+            --difference-report "${exact_dir}/candidate-active-difference.json" \
+            --overwrite -o "${exact_dir}/candidate-active.wav"
           cmp "${exact_dir}/base-active.wav" "${exact_dir}/candidate-active.wav"
+
+          EXACT_DIR="${exact_dir}" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          directory = Path(os.environ["EXACT_DIR"])
+          for binary in ("base", "candidate"):
+              idle = json.loads(
+                  (directory / f"{binary}-idle-difference.json").read_text()
+              )["assets"][0]["protection"]
+              active = json.loads(
+                  (directory / f"{binary}-active-difference.json").read_text()
+              )["assets"][0]["protection"]
+              assert idle["limited_frames"] == 0, idle
+              assert idle["maximum_limiter_reduction_db"] == 0.0, idle
+              assert active["limited_frames"] > 0, active
+              assert active["maximum_limiter_reduction_db"] > 1.0, active
+          PY
 
       - name: Run limiter benchmarks in both orders
         shell: bash
