@@ -244,7 +244,9 @@ impl RunningWindow {
 
 pub struct StreamingAnalyzer {
     sample_rate: u32,
-    roles: Vec<ChannelRole>,
+    // Channel roles are immutable for an analysis. Resolve their Annex 3
+    // gains once so the per-frame hot loops only load a scalar coefficient.
+    weights: Vec<f64>,
     filters: Vec<KWeight>,
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     kweight_pair: Option<KWeightPair>,
@@ -322,9 +324,10 @@ impl StreamingAnalyzer {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let kweight_pair = (interval_frames.is_none() && channels == 2)
             .then(|| KWeightPair::for_sample_rate(sample_rate));
+        let weights = roles.iter().copied().map(channel_weight).collect();
         Self {
             sample_rate,
-            roles,
+            weights,
             filters: (0..channels)
                 .map(|_| KWeight::for_sample_rate(sample_rate))
                 .collect(),
@@ -363,7 +366,7 @@ impl StreamingAnalyzer {
     }
 
     pub fn process(&mut self, planar: &[Vec<f32>]) -> Result<(), String> {
-        if planar.len() != self.roles.len() {
+        if planar.len() != self.weights.len() {
             return Err("stream channel count changed".into());
         }
         let chunk_frames = planar.first().map_or(0, Vec::len);
@@ -427,8 +430,8 @@ impl StreamingAnalyzer {
         // The arithmetic and window-update order intentionally matches the
         // generic path below; no temporary PCM or energy buffer is introduced.
         if self.timeline_interval_frames.is_none() && planar.len() == 2 {
-            let weight0 = channel_weight(self.roles[0]);
-            let weight1 = channel_weight(self.roles[1]);
+            let weight0 = self.weights[0];
+            let weight1 = self.weights[1];
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             let kweight_pair = self
                 .kweight_pair
@@ -556,7 +559,7 @@ impl StreamingAnalyzer {
                     &mut self.filters,
                     #[cfg(target_arch = "x86_64")]
                     &mut self.kweight_quads,
-                    &self.roles,
+                    &self.weights,
                     planar,
                     frame,
                     &mut self.raw_sum_squares,
@@ -616,7 +619,7 @@ impl StreamingAnalyzer {
                 self.interval_true_peak = self.interval_true_peak.max(reconstructed_peak);
                 self.interval_sample_peak = self.interval_sample_peak.max(sample.abs());
                 let filtered = filter.process(sample) as f64;
-                weighted += channel_weight(self.roles[index]) * filtered * filtered;
+                weighted += self.weights[index] * filtered * filtered;
                 let raw = sample as f64;
                 self.raw_sum_squares += raw * raw;
                 self.sample_peak = self.sample_peak.max(sample.abs());
@@ -755,8 +758,8 @@ impl StreamingAnalyzer {
         hop: usize,
     ) -> Result<(), String> {
         if planar.len() == 2 {
-            let weight0 = channel_weight(self.roles[0]);
-            let weight1 = channel_weight(self.roles[1]);
+            let weight0 = self.weights[0];
+            let weight1 = self.weights[1];
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             let kweight_pair = self
                 .kweight_pair
@@ -845,7 +848,7 @@ impl StreamingAnalyzer {
                 &mut self.filters,
                 #[cfg(target_arch = "x86_64")]
                 &mut self.kweight_quads,
-                &self.roles,
+                &self.weights,
                 planar,
                 frame,
                 &mut self.raw_sum_squares,
@@ -913,7 +916,7 @@ impl StreamingAnalyzer {
             let short_term_window = (self.sample_rate as usize * 3).max(1);
             self.record_timeline_point(momentary_window, short_term_window);
         }
-        let channels = self.roles.len();
+        let channels = self.weights.len();
         let total_samples = self.frames * channels;
         let rms = if total_samples == 0 {
             0.0
@@ -1025,13 +1028,13 @@ fn process_true_peak_channel_group(meters: &mut [TruePeakMeter], channels: &[Vec
 fn process_kweighted_frame_multichannel(
     filters: &mut [KWeight],
     #[cfg(target_arch = "x86_64")] kweight_quads: &mut Option<Vec<KWeightQuad>>,
-    roles: &[ChannelRole],
+    weights: &[f64],
     planar: &[Vec<f32>],
     frame: usize,
     raw_sum_squares: &mut f64,
     sample_peak: &mut f32,
 ) -> f64 {
-    debug_assert_eq!(filters.len(), roles.len());
+    debug_assert_eq!(filters.len(), weights.len());
     debug_assert_eq!(filters.len(), planar.len());
     let mut weighted = 0.0;
     #[cfg(target_arch = "x86_64")]
@@ -1047,7 +1050,7 @@ fn process_kweighted_frame_multichannel(
             let filtered = quad.process(input);
             for lane in 0..4 {
                 let lane_filtered = filtered[lane] as f64;
-                weighted += channel_weight(roles[channel + lane]) * lane_filtered * lane_filtered;
+                weighted += weights[channel + lane] * lane_filtered * lane_filtered;
                 let raw = input[lane] as f64;
                 *raw_sum_squares += raw * raw;
                 *sample_peak = sample_peak.max(input[lane].abs());
@@ -1057,7 +1060,7 @@ fn process_kweighted_frame_multichannel(
         for index in channel..filters.len() {
             let sample = planar[index][frame];
             let filtered = filters[index].process(sample) as f64;
-            weighted += channel_weight(roles[index]) * filtered * filtered;
+            weighted += weights[index] * filtered * filtered;
             let raw = sample as f64;
             *raw_sum_squares += raw * raw;
             *sample_peak = sample_peak.max(sample.abs());
@@ -1067,7 +1070,7 @@ fn process_kweighted_frame_multichannel(
     for ((index, channel), filter) in planar.iter().enumerate().zip(filters.iter_mut()) {
         let sample = channel[frame];
         let filtered = filter.process(sample) as f64;
-        weighted += channel_weight(roles[index]) * filtered * filtered;
+        weighted += weights[index] * filtered * filtered;
         let raw = sample as f64;
         *raw_sum_squares += raw * raw;
         *sample_peak = sample_peak.max(sample.abs());
