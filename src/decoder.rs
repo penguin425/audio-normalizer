@@ -22,6 +22,11 @@ const FLAC_SAMPLE_VALUES_PER_DECODER: u64 = 192_000;
 const FLAC_FILE_BYTES_PER_DECODER: u64 = 192 * 1024;
 const MAX_PARALLEL_FLAC_PACKET_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PARALLEL_FLAC_PCM_BYTES: usize = 32 * 1024 * 1024;
+// MP3, AAC, and Vorbis normally decode much smaller packets. Group whole
+// packets to amortize callbacks, while staying below the analyzer's 16,384
+// frame True Peak task threshold: forcing every grouped packet through a
+// Rayon join reduces wall time but raises CPU time materially.
+const TARGET_SYMPHONIA_STREAM_CHUNK_FRAMES: usize = 4_096;
 
 #[derive(Debug, Clone)]
 pub struct StreamInfo {
@@ -566,6 +571,7 @@ fn decode_stream_with_flac_workers<F>(
 where
     F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
 {
+    use symphonia::core::audio::GenericAudioBufferRef;
     use symphonia::core::errors::Error;
     use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::FormatOptions;
@@ -715,11 +721,98 @@ where
         if frames == 0 {
             continue;
         }
-        decoded.copy_to_vecs_planar::<f32>(&mut planar);
-        consume(info.as_ref().unwrap(), &mut planar)?;
+        let info = info
+            .as_ref()
+            .expect("decoded output establishes stream info");
+        match decoded {
+            GenericAudioBufferRef::F32(buffer) => {
+                append_symphonia_f32_stream_chunk(info, buffer, &mut planar, &mut consume)?;
+            }
+            decoded => {
+                flush_symphonia_stream_chunk(info, &mut planar, &mut consume)?;
+                decoded.copy_to_vecs_planar::<f32>(&mut planar);
+                consume_and_clear_stream_chunk(info, &mut planar, &mut consume)?;
+            }
+        }
     }
 
+    if let Some(info) = info.as_ref() {
+        flush_symphonia_stream_chunk(info, &mut planar, &mut consume)?;
+    }
     info.ok_or_else(|| format!("{}: no audio decoded", path.display()))
+}
+
+fn append_symphonia_f32_stream_chunk<F>(
+    info: &StreamInfo,
+    decoded: &symphonia::core::audio::AudioBuffer<f32>,
+    planar: &mut Vec<Vec<f32>>,
+    consume: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
+{
+    use symphonia::core::audio::Audio;
+
+    let channels = decoded.num_planes();
+    if planar.is_empty() {
+        planar.resize_with(channels, || {
+            Vec::with_capacity(TARGET_SYMPHONIA_STREAM_CHUNK_FRAMES)
+        });
+    }
+    if planar.len() != channels {
+        return Err("stream channel count changed".into());
+    }
+    let buffered_frames = planar.first().map_or(0, Vec::len);
+    if planar
+        .iter()
+        .any(|channel| channel.len() != buffered_frames)
+    {
+        return Err("stream channel length mismatch".into());
+    }
+    if buffered_frames > 0 && decoded.frames() >= TARGET_SYMPHONIA_STREAM_CHUNK_FRAMES {
+        // Keep an already-large decoder packet intact instead of copying the
+        // pending tail into it and growing the reusable allocation needlessly.
+        consume_and_clear_stream_chunk(info, planar.as_mut_slice(), consume)?;
+    }
+    for (destination, source) in planar.iter_mut().zip(decoded.iter_planes()) {
+        destination.extend_from_slice(source);
+    }
+    if planar
+        .first()
+        .is_some_and(|channel| channel.len() >= TARGET_SYMPHONIA_STREAM_CHUNK_FRAMES)
+    {
+        consume_and_clear_stream_chunk(info, planar.as_mut_slice(), consume)?;
+    }
+    Ok(())
+}
+
+fn flush_symphonia_stream_chunk<F>(
+    info: &StreamInfo,
+    planar: &mut [Vec<f32>],
+    consume: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
+{
+    if planar.first().is_some_and(|channel| !channel.is_empty()) {
+        consume_and_clear_stream_chunk(info, planar, consume)?;
+    }
+    Ok(())
+}
+
+fn consume_and_clear_stream_chunk<F>(
+    info: &StreamInfo,
+    planar: &mut [Vec<f32>],
+    consume: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
+{
+    consume(info, planar)?;
+    for channel in planar {
+        channel.clear();
+    }
+    Ok(())
 }
 
 enum FlacPacketStatus {
@@ -1136,6 +1229,69 @@ mod tests {
                 assert!(target - chunk_bytes < frame_bytes);
             }
         }
+    }
+
+    #[test]
+    fn symphonia_f32_packets_coalesce_without_splitting_large_chunks() {
+        use symphonia::core::audio::{AudioMut, AudioSpec};
+
+        fn packet(start: usize, frames: usize) -> symphonia::core::audio::AudioBuffer<f32> {
+            let spec = AudioSpec::new(48_000, CHANNEL_LAYOUT_STEREO.clone());
+            let mut buffer = symphonia::core::audio::AudioBuffer::new(spec, frames);
+            buffer.resize_with_silence(frames);
+            let (left, right) = buffer.plane_pair_mut(0, 1).unwrap();
+            for frame in 0..frames {
+                let sample = (start + frame) as f32 / 65_536.0;
+                left[frame] = sample;
+                right[frame] = -sample;
+            }
+            buffer
+        }
+
+        let info = StreamInfo {
+            sample_rate: 48_000,
+            channels: 2,
+            channel_roles: default_channel_roles(2),
+            source_kind: PcmKind::F32,
+        };
+        let mut planar = Vec::new();
+        let mut observed = vec![Vec::new(), Vec::new()];
+        let mut chunk_frames = Vec::new();
+        let mut consume = |_: &StreamInfo, chunk: &mut [Vec<f32>]| {
+            chunk_frames.push(chunk[0].len());
+            for (destination, source) in observed.iter_mut().zip(chunk) {
+                destination.extend_from_slice(source);
+            }
+            Ok(())
+        };
+
+        let packet_frames = [1_500, 1_500, 1_500, 1_000, 20_000, 123];
+        let mut start = 0;
+        for frames in packet_frames {
+            append_symphonia_f32_stream_chunk(
+                &info,
+                &packet(start, frames),
+                &mut planar,
+                &mut consume,
+            )
+            .unwrap();
+            start += frames;
+        }
+        flush_symphonia_stream_chunk(&info, &mut planar, &mut consume).unwrap();
+
+        assert_eq!(chunk_frames, [4_500, 1_000, 20_000, 123]);
+        let expected_left = (0..start)
+            .map(|frame| frame as f32 / 65_536.0)
+            .collect::<Vec<_>>();
+        let expected_right = expected_left
+            .iter()
+            .map(|sample| -*sample)
+            .collect::<Vec<_>>();
+        assert_eq!(observed, [expected_left, expected_right]);
+        assert!(planar.iter().all(Vec::is_empty));
+        assert!(planar
+            .iter()
+            .all(|channel| channel.capacity() >= TARGET_SYMPHONIA_STREAM_CHUNK_FRAMES));
     }
 
     #[test]
