@@ -15,6 +15,13 @@ use std::path::Path;
 
 const MONO_WAV_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const MULTICHANNEL_WAV_STREAM_CHUNK_BYTES: usize = 1024 * 1024;
+const MAX_PARALLEL_FLAC_DECODERS: usize = 8;
+const MIN_PARALLEL_FLAC_DECODERS: usize = 4;
+const FLAC_PACKETS_PER_DECODER: usize = 32;
+const FLAC_SAMPLE_VALUES_PER_DECODER: u64 = 192_000;
+const FLAC_FILE_BYTES_PER_DECODER: u64 = 192 * 1024;
+const MAX_PARALLEL_FLAC_PACKET_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PARALLEL_FLAC_PCM_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct StreamInfo {
@@ -273,6 +280,7 @@ fn decode_symphonia(
 
 struct SymphoniaAudioTrack {
     id: u32,
+    num_frames: Option<u64>,
     codec_params: symphonia::core::codecs::audio::AudioCodecParameters,
 }
 
@@ -302,6 +310,7 @@ fn select_symphonia_audio_track(
         .clone();
     Ok(SymphoniaAudioTrack {
         id: track.id,
+        num_frames: track.num_frames,
         codec_params,
     })
 }
@@ -542,7 +551,18 @@ fn role_from_symphonia_position(
 
 /// Decode an audio file in bounded chunks without retaining the complete
 /// sample stream.
-pub fn decode_stream<F>(path: &Path, mut consume: F) -> Result<StreamInfo, String>
+pub fn decode_stream<F>(path: &Path, consume: F) -> Result<StreamInfo, String>
+where
+    F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
+{
+    decode_stream_with_flac_workers(path, None, consume)
+}
+
+fn decode_stream_with_flac_workers<F>(
+    path: &Path,
+    forced_flac_workers: Option<usize>,
+    mut consume: F,
+) -> Result<StreamInfo, String>
 where
     F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
 {
@@ -593,6 +613,40 @@ where
     let mut track = select_symphonia_audio_track(path, format.as_ref())?;
     require_symphonia_sample_rate(path, &track.codec_params)?;
     let decoder_options = symphonia_decoder_options();
+    let file_bytes = if extension == "flac" && track.num_frames.is_none() {
+        std::fs::metadata(path)
+            .map_err(|error| format!("{}: {error}", path.display()))?
+            .len()
+    } else {
+        0
+    };
+    let flac_worker_cap = parallel_flac_worker_cap(&track, file_bytes);
+    let parallel_flac = extension == "flac"
+        && flac_worker_cap >= MIN_PARALLEL_FLAC_DECODERS
+        && track.codec_params.codec == symphonia::core::codecs::audio::well_known::CODEC_ID_FLAC;
+    let flac_workers = if parallel_flac {
+        forced_flac_workers
+            .unwrap_or_else(|| {
+                if rayon::current_thread_index().is_none() {
+                    rayon::current_num_threads()
+                } else {
+                    1
+                }
+            })
+            .clamp(1, flac_worker_cap)
+    } else {
+        1
+    };
+    if parallel_flac && flac_workers > 1 {
+        return decode_native_flac_stream_parallel(
+            path,
+            format.as_mut(),
+            track,
+            decoder_options,
+            flac_workers,
+            consume,
+        );
+    }
     let mut decoder = get_codecs()
         .make_audio_decoder(&track.codec_params, &decoder_options)
         .map_err(|error| format!("{}: unsupported codec: {error}", path.display()))?;
@@ -663,6 +717,278 @@ where
         }
         decoded.copy_to_vecs_planar::<f32>(&mut planar);
         consume(info.as_ref().unwrap(), &mut planar)?;
+    }
+
+    info.ok_or_else(|| format!("{}: no audio decoded", path.display()))
+}
+
+enum FlacPacketStatus {
+    Decoded {
+        spec: symphonia::core::audio::AudioSpec,
+        frames: usize,
+    },
+    Skipped,
+    Error(String),
+}
+
+enum FlacDemuxBoundary {
+    BatchFull,
+    End,
+    Reset,
+    Error(String),
+}
+
+fn parallel_flac_worker_cap(track: &SymphoniaAudioTrack, file_bytes: u64) -> usize {
+    let estimated_workers = track.num_frames.map_or_else(
+        || file_bytes / FLAC_FILE_BYTES_PER_DECODER,
+        |frames| {
+            let channels = track
+                .codec_params
+                .channels
+                .as_ref()
+                .map_or(1, |channels| channels.count() as u64);
+            frames.saturating_mul(channels) / FLAC_SAMPLE_VALUES_PER_DECODER
+        },
+    );
+    usize::try_from(estimated_workers)
+        .unwrap_or(MAX_PARALLEL_FLAC_DECODERS)
+        .clamp(1, MAX_PARALLEL_FLAC_DECODERS)
+}
+
+fn create_parallel_flac_decoders(
+    params: &symphonia::core::codecs::audio::AudioCodecParameters,
+    options: symphonia::core::codecs::audio::AudioDecoderOptions,
+    workers: usize,
+) -> Result<Vec<Box<dyn symphonia::core::codecs::audio::AudioDecoder>>, String> {
+    use symphonia::default::get_codecs;
+
+    (0..workers)
+        .map(|_| {
+            get_codecs()
+                .make_audio_decoder(params, &options)
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
+fn parallel_flac_batch_limit(workers: usize, max_frames_per_packet: u64, channels: usize) -> usize {
+    let pcm_bytes_per_packet = usize::try_from(max_frames_per_packet)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(channels.max(1))
+        .saturating_mul(std::mem::size_of::<f32>())
+        .max(1);
+    let pcm_limit = (MAX_PARALLEL_FLAC_PCM_BYTES / pcm_bytes_per_packet).max(1);
+    workers
+        .max(1)
+        .saturating_mul(FLAC_PACKETS_PER_DECODER)
+        .min(pcm_limit)
+        .max(1)
+}
+
+fn decode_parallel_flac_batch(
+    decoders: &mut [Box<dyn symphonia::core::codecs::audio::AudioDecoder>],
+    packets: &[symphonia::core::packet::Packet],
+    buffers: &mut [Vec<Vec<f32>>],
+) -> Vec<FlacPacketStatus> {
+    use rayon::prelude::*;
+    use symphonia::core::errors::Error;
+
+    debug_assert!(!decoders.is_empty());
+    debug_assert!(buffers.len() >= packets.len());
+    if packets.is_empty() {
+        return Vec::new();
+    }
+    let chunk_size = packets.len().div_ceil(decoders.len());
+    decoders
+        .par_iter_mut()
+        .zip(packets.par_chunks(chunk_size))
+        .zip(buffers[..packets.len()].par_chunks_mut(chunk_size))
+        .map(|((decoder, packet_chunk), buffer_chunk)| {
+            decoder.reset();
+            packet_chunk
+                .iter()
+                .zip(buffer_chunk)
+                .map(|(packet, planar)| match decoder.decode(packet) {
+                    Ok(decoded) => {
+                        let spec = decoded.spec().clone();
+                        let frames = decoded.frames();
+                        if frames == 0 {
+                            planar.clear();
+                        } else {
+                            decoded.copy_to_vecs_planar::<f32>(planar);
+                        }
+                        FlacPacketStatus::Decoded { spec, frames }
+                    }
+                    Err(Error::DecodeError(_)) => {
+                        planar.clear();
+                        FlacPacketStatus::Skipped
+                    }
+                    Err(error) => {
+                        planar.clear();
+                        FlacPacketStatus::Error(error.to_string())
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn decode_native_flac_stream_parallel<F>(
+    path: &Path,
+    format: &mut dyn symphonia::core::formats::FormatReader,
+    mut track: SymphoniaAudioTrack,
+    decoder_options: symphonia::core::codecs::audio::AudioDecoderOptions,
+    worker_count: usize,
+    mut consume: F,
+) -> Result<StreamInfo, String>
+where
+    F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
+{
+    use symphonia::core::codecs::audio::well_known::CODEC_ID_FLAC;
+    use symphonia::core::errors::Error;
+
+    let mut decoders =
+        create_parallel_flac_decoders(&track.codec_params, decoder_options, worker_count)
+            .map_err(|error| format!("{}: unsupported codec: {error}", path.display()))?;
+    let mut batch_limit = parallel_flac_batch_limit(
+        decoders.len(),
+        decoders[0]
+            .codec_params()
+            .max_frames_per_packet
+            .unwrap_or(65_535),
+        decoders[0]
+            .codec_params()
+            .channels
+            .as_ref()
+            .map_or(1, |channels| channels.count()),
+    );
+    let mut packets = Vec::with_capacity(batch_limit);
+    let mut pending_packet = None;
+    let mut buffers = vec![Vec::new(); batch_limit];
+    let mut output_format: Option<SymphoniaOutputFormat> = None;
+    let mut info: Option<StreamInfo> = None;
+
+    loop {
+        packets.clear();
+        let mut packet_bytes = 0_usize;
+        let boundary = loop {
+            let packet = if let Some(packet) = pending_packet.take() {
+                packet
+            } else {
+                match format.next_packet() {
+                    Ok(Some(packet)) => packet,
+                    Ok(None) => break FlacDemuxBoundary::End,
+                    Err(Error::ResetRequired) => break FlacDemuxBoundary::Reset,
+                    Err(error) => break FlacDemuxBoundary::Error(error.to_string()),
+                }
+            };
+            if packet.track_id != track.id {
+                continue;
+            }
+            let next_packet_bytes = packet_bytes.saturating_add(packet.data.len());
+            if !packets.is_empty() && next_packet_bytes > MAX_PARALLEL_FLAC_PACKET_BYTES {
+                pending_packet = Some(packet);
+                break FlacDemuxBoundary::BatchFull;
+            }
+            packet_bytes = next_packet_bytes;
+            packets.push(packet);
+            if packets.len() == batch_limit {
+                break FlacDemuxBoundary::BatchFull;
+            }
+        };
+
+        if !packets.is_empty() {
+            let statuses = decode_parallel_flac_batch(&mut decoders, &packets, &mut buffers);
+            for (status, planar) in statuses.into_iter().zip(&mut buffers) {
+                match status {
+                    FlacPacketStatus::Skipped => continue,
+                    FlacPacketStatus::Error(error) => {
+                        return Err(format!("{}: decode: {error}", path.display()));
+                    }
+                    FlacPacketStatus::Decoded { spec, frames } => {
+                        let decoded_channels = spec.channels().count();
+                        if decoded_channels == 0 {
+                            continue;
+                        }
+                        if let Some(output) = output_format.as_ref() {
+                            validate_symphonia_decoded_compatibility(
+                                path,
+                                output,
+                                &spec,
+                                PcmKind::F32,
+                            )?;
+                        } else {
+                            let output = establish_symphonia_output_format(
+                                path,
+                                &track.codec_params,
+                                &spec,
+                                PcmKind::F32,
+                            )?;
+                            info = Some(StreamInfo {
+                                sample_rate: output.sample_rate,
+                                channels: output.channels,
+                                channel_roles: output.channel_roles.clone(),
+                                source_kind: output.source_kind,
+                            });
+                            output_format = Some(output);
+                        }
+                        if frames != 0 {
+                            consume(info.as_ref().unwrap(), planar)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        match boundary {
+            FlacDemuxBoundary::BatchFull => {}
+            FlacDemuxBoundary::End => break,
+            FlacDemuxBoundary::Error(error) => {
+                return Err(format!("{}: read packet: {error}", path.display()));
+            }
+            FlacDemuxBoundary::Reset => {
+                let next_track = select_symphonia_audio_track(path, format)?;
+                require_symphonia_sample_rate(path, &next_track.codec_params)?;
+                if next_track.codec_params.codec != CODEC_ID_FLAC {
+                    return Err(format!(
+                        "{}: codec changed during native FLAC decode",
+                        path.display()
+                    ));
+                }
+                if let Some(output) = output_format.as_ref() {
+                    validate_symphonia_track_compatibility(
+                        path,
+                        output,
+                        &next_track.codec_params,
+                        PcmKind::F32,
+                    )?;
+                }
+                track = next_track;
+                decoders = create_parallel_flac_decoders(
+                    &track.codec_params,
+                    decoder_options,
+                    worker_count,
+                )
+                .map_err(|error| format!("{}: reinit decoder: {error}", path.display()))?;
+                batch_limit = parallel_flac_batch_limit(
+                    decoders.len(),
+                    decoders[0]
+                        .codec_params()
+                        .max_frames_per_packet
+                        .unwrap_or(65_535),
+                    decoders[0]
+                        .codec_params()
+                        .channels
+                        .as_ref()
+                        .map_or(1, |channels| channels.count()),
+                );
+                packets = Vec::with_capacity(batch_limit);
+                buffers.resize_with(batch_limit, Vec::new);
+            }
+        }
     }
 
     info.ok_or_else(|| format!("{}: no audio decoded", path.display()))
@@ -810,6 +1136,81 @@ mod tests {
                 assert!(target - chunk_bytes < frame_bytes);
             }
         }
+    }
+
+    #[test]
+    fn parallel_flac_batch_geometry_is_memory_bounded() {
+        assert_eq!(parallel_flac_batch_limit(8, 4_096, 2), 256);
+        assert_eq!(parallel_flac_batch_limit(8, 65_535, 8), 16);
+        assert_eq!(parallel_flac_batch_limit(8, u64::MAX, 8), 1);
+
+        let short = SymphoniaAudioTrack {
+            id: 0,
+            num_frames: Some(48_000),
+            codec_params: codec_params(48_000, CHANNEL_LAYOUT_STEREO.clone()),
+        };
+        let crossover = SymphoniaAudioTrack {
+            id: 0,
+            num_frames: Some(192_000),
+            codec_params: codec_params(48_000, CHANNEL_LAYOUT_STEREO.clone()),
+        };
+        let unknown = SymphoniaAudioTrack {
+            id: 0,
+            num_frames: None,
+            codec_params: codec_params(48_000, CHANNEL_LAYOUT_STEREO.clone()),
+        };
+        assert_eq!(parallel_flac_worker_cap(&short, u64::MAX), 1);
+        assert_eq!(parallel_flac_worker_cap(&crossover, 0), 2);
+        let efficient = SymphoniaAudioTrack {
+            id: 0,
+            num_frames: Some(384_000),
+            codec_params: codec_params(48_000, CHANNEL_LAYOUT_STEREO.clone()),
+        };
+        assert_eq!(parallel_flac_worker_cap(&efficient, 0), 4);
+        assert!(parallel_flac_worker_cap(&efficient, 0) >= MIN_PARALLEL_FLAC_DECODERS);
+        assert_eq!(parallel_flac_worker_cap(&unknown, 383 * 1024), 1);
+        assert_eq!(parallel_flac_worker_cap(&unknown, 384 * 1024), 2);
+        assert_eq!(parallel_flac_worker_cap(&unknown, u64::MAX), 8);
+    }
+
+    fn decode_flac_with_workers(path: &Path, workers: usize) -> (StreamInfo, Vec<Vec<f32>>) {
+        let mut samples = Vec::new();
+        let info = decode_stream_with_flac_workers(path, Some(workers), |info, planar| {
+            if samples.is_empty() {
+                samples = vec![Vec::new(); info.channels as usize];
+            }
+            for (destination, source) in samples.iter_mut().zip(planar) {
+                destination.extend_from_slice(source);
+            }
+            Ok(())
+        })
+        .unwrap();
+        (info, samples)
+    }
+
+    #[test]
+    fn native_flac_parallel_decode_matches_serial_packets_bit_exactly() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("parallel.flac");
+        let frames = 96 * 4_096 + 137;
+        let mut planar = vec![Vec::with_capacity(frames), Vec::with_capacity(frames)];
+        for frame in 0..frames {
+            planar[0].push(((frame * 97 % 32_000) as f32 - 16_000.0) / 32_768.0);
+            planar[1].push(((frame * 131 % 30_000) as f32 - 15_000.0) / 32_768.0);
+        }
+        let mut writer =
+            crate::flacenc::FlacStreamWriter::create(&path, 48_000, 2, 16, false).unwrap();
+        writer.write_chunk(&planar).unwrap();
+        writer.finish().unwrap();
+
+        let (serial_info, serial) = decode_flac_with_workers(&path, 1);
+        let (parallel_info, parallel) = decode_flac_with_workers(&path, 4);
+        assert_eq!(parallel_info.sample_rate, serial_info.sample_rate);
+        assert_eq!(parallel_info.channels, serial_info.channels);
+        assert_eq!(parallel_info.channel_roles, serial_info.channel_roles);
+        assert_eq!(parallel_info.source_kind, serial_info.source_kind);
+        assert_eq!(parallel, serial);
+        assert_eq!(parallel[0].len(), frames);
     }
 
     fn codec_params(
