@@ -84,7 +84,7 @@ jobs:
         shell: bash
         env:
           CARGO_INCREMENTAL: "0"
-          RUSTFLAGS: -Ctarget-cpu=native
+          RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-Ctarget-feature=+neon,+aes,+sha2' || '-Ctarget-cpu=native' }}
         run: |
           set -euo pipefail
           CARGO_TARGET_DIR="${RUNNER_TEMP}/target-baseline" \
