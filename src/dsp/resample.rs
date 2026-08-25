@@ -154,7 +154,26 @@ impl SampleRateConverter {
         })
     }
 
-    pub fn process<C>(
+    pub fn process(
+        &mut self,
+        planar: &[Vec<f32>],
+        consume: impl FnMut(&mut [Vec<f32>]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.process_planar(planar, consume)
+    }
+
+    pub(crate) fn process_borrowed<C>(
+        &mut self,
+        planar: &[C],
+        consume: impl FnMut(&mut [Vec<f32>]) -> Result<(), String>,
+    ) -> Result<(), String>
+    where
+        C: AsRef<[f32]>,
+    {
+        self.process_planar(planar, consume)
+    }
+
+    fn process_planar<C>(
         &mut self,
         planar: &[C],
         mut consume: impl FnMut(&mut [Vec<f32>]) -> Result<(), String>,
@@ -461,7 +480,7 @@ mod tests {
                 .map(|channel| &channel[range.clone()])
                 .collect::<Vec<_>>();
             converter
-                .process(&chunk, |resampled| {
+                .process_borrowed(&chunk, |resampled| {
                     largest_chunk = largest_chunk.max(resampled[0].len());
                     for (destination, source) in output.iter_mut().zip(resampled) {
                         destination.extend_from_slice(source);

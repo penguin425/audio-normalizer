@@ -967,7 +967,7 @@ fn prepare_file_for_plan(
             }
         }
         if let Some(converter) = converter.as_mut() {
-            converter.process(chunk, |output| {
+            converter.process_borrowed(chunk, |output| {
                 analyze_and_capture(output, analyzer.as_mut().unwrap(), &mut spool)
             })
         } else {
