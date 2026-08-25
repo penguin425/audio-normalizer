@@ -1,0 +1,447 @@
+name: Symphonia packet coalescing benchmark
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/symphonia-packet-coalescing-benchmark.yml"
+      - "src/decoder.rs"
+      - "src/dsp/lufs.rs"
+      - "src/normalize.rs"
+      - "src/pcm_spool.rs"
+      - "tools/benchmark.py"
+      - "tools/test_benchmark.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: symphonia-packet-coalescing-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: benchmark (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+
+      - name: Check out exact pull-request base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: baseline
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+
+      - name: Install ffmpeg
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_OS}" == "Linux" ]]; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends ffmpeg
+          elif ! command -v ffmpeg >/dev/null; then
+            brew install ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+
+      - name: Test decoder and benchmark contracts
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_TARGET_DIR: ${{ runner.temp }}/target-candidate-tests
+        run: |
+          set -euo pipefail
+          python3 candidate/tools/test_benchmark.py
+          cargo test --locked --manifest-path candidate/Cargo.toml \
+            --no-default-features --lib \
+            symphonia_render_packets_coalesce_without_splitting_large_chunks \
+            -- --nocapture
+
+      - name: Build exact baseline and candidate
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "0"
+          RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-Ctarget-feature=+neon,+aes,+sha2' || '-Ctarget-cpu=native' }}
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/target-baseline" \
+            cargo build --locked --release --manifest-path baseline/Cargo.toml \
+              --no-default-features --bin forge --bin forge-container-qc
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/target-candidate" \
+            cargo build --locked --release --manifest-path candidate/Cargo.toml \
+              --no-default-features --bin forge --bin forge-container-qc
+
+      - name: Verify exact MP3, AAC, and Vorbis results
+        shell: bash
+        run: |
+          set -euo pipefail
+          exact_dir="${RUNNER_TEMP}/exact-output"
+          mkdir "${exact_dir}"
+          EXACT_DIR="${exact_dir}" python3 - <<'PY'
+          import os
+          import shutil
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "candidate/tools")
+          from benchmark import encode_fixture, write_pcm16_wave
+
+          root = Path(os.environ["EXACT_DIR"])
+          source = root / "source.wav"
+          write_pcm16_wave(source, 60, 48_000, 2)
+          ffmpeg = Path(shutil.which("ffmpeg"))
+          fixtures = (
+              (
+                  "mp3",
+                  [
+                      "-map_metadata", "-1",
+                      "-c:a", "libmp3lame",
+                      "-b:a", "192k",
+                      "-write_xing", "0",
+                  ],
+              ),
+              (
+                  "m4a",
+                  ["-map_metadata", "-1", "-c:a", "aac", "-b:a", "192k"],
+              ),
+              (
+                  "ogg",
+                  [
+                      "-map_metadata", "-1",
+                      "-c:a", "vorbis",
+                      "-strict", "-2",
+                      "-q:a", "5",
+                  ],
+              ),
+          )
+          for extension, arguments in fixtures:
+              encode_fixture(
+                  ffmpeg,
+                  source,
+                  root / f"input.{extension}",
+                  arguments,
+                  1_800,
+              )
+          source.unlink()
+          PY
+
+          baseline="${RUNNER_TEMP}/target-baseline/release/forge"
+          candidate="${RUNNER_TEMP}/target-candidate/release/forge"
+          for extension in mp3 m4a ogg; do
+            input="${exact_dir}/input.${extension}"
+            "${baseline}" "${input}" --analyze --json \
+              > "${exact_dir}/base-${extension}.json"
+            "${candidate}" "${input}" --analyze --json \
+              > "${exact_dir}/candidate-${extension}.json"
+            "${candidate}" "${input}" --jobs 1 --analyze --json \
+              > "${exact_dir}/candidate-${extension}-one.json"
+            cmp "${exact_dir}/base-${extension}.json" \
+              "${exact_dir}/candidate-${extension}.json"
+            cmp "${exact_dir}/candidate-${extension}.json" \
+              "${exact_dir}/candidate-${extension}-one.json"
+
+            "${baseline}" "${input}" --overwrite \
+              -o "${exact_dir}/base-${extension}.wav"
+            "${candidate}" "${input}" --overwrite \
+              -o "${exact_dir}/candidate-${extension}.wav"
+            "${candidate}" "${input}" --jobs 1 --overwrite \
+              -o "${exact_dir}/candidate-${extension}-one.wav"
+            cmp "${exact_dir}/base-${extension}.wav" \
+              "${exact_dir}/candidate-${extension}.wav"
+            cmp "${exact_dir}/candidate-${extension}.wav" \
+              "${exact_dir}/candidate-${extension}-one.wav"
+          done
+
+      - name: Run thermally balanced interleaved MP3 benchmarks
+        shell: bash
+        env:
+          BENCHMARK_ROOT: ${{ runner.temp }}/packet-coalescing-benchmark
+          BENCHMARK_OUTPUT_PARENT: ${{ runner.os == 'Linux' && '/dev/shm' || runner.temp }}
+          BASELINE_FORGE: ${{ runner.temp }}/target-baseline/release/forge
+          CANDIDATE_FORGE: ${{ runner.temp }}/target-candidate/release/forge
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import shutil
+          import statistics
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "candidate/tools")
+          from benchmark import (
+              cpu_model,
+              encode_fixture,
+              run_measured,
+              write_pcm16_wave,
+          )
+
+          root = Path(os.environ["BENCHMARK_ROOT"])
+          root.mkdir()
+          output_parent = Path(os.environ["BENCHMARK_OUTPUT_PARENT"])
+          output_root = output_parent / f"forge-packet-output-{os.getpid()}"
+          if shutil.disk_usage(output_parent).free < 256 * 1024 * 1024:
+              raise RuntimeError(
+                  f"benchmark output filesystem has less than 256 MiB free: "
+                  f"{output_parent}"
+              )
+          output_root.mkdir()
+          logs = root / "logs"
+          logs.mkdir()
+          source = root / "source.wav"
+          input_path = root / "input.mp3"
+          write_pcm16_wave(source, 600, 48_000, 2)
+          encode_fixture(
+              Path(shutil.which("ffmpeg")),
+              source,
+              input_path,
+              [
+                  "-map_metadata", "-1",
+                  "-c:a", "libmp3lame",
+                  "-b:a", "320k",
+              ],
+              1_800,
+          )
+          source.unlink()
+
+          binaries = {
+              "baseline": Path(os.environ["BASELINE_FORGE"]),
+              "candidate": Path(os.environ["CANDIDATE_FORGE"]),
+          }
+          result = {
+              "method": (
+                  "7-round ABBA/BAAB on one pre-encoded 600-second MP3 "
+                  "fixture; 14 samples per binary"
+              ),
+              "system": {
+                  "platform": sys.platform,
+                  "cpu_model": cpu_model(),
+                  "cpu_count": os.cpu_count(),
+                  "output_storage": (
+                      "memory-backed" if sys.platform.startswith("linux")
+                      else "runner-temp"
+                  ),
+              },
+              "modes": {},
+          }
+
+          for mode, extra_args in (
+              ("default", []),
+              ("jobs_1", ["--jobs", "1"]),
+          ):
+              mode_cases = {}
+              for case in ("analyze", "normalize"):
+                  samples = {"baseline": [], "candidate": []}
+                  rounds = []
+                  output_path = output_root / f"{mode}-{case}-output.wav"
+
+                  def command(name):
+                      if case == "analyze":
+                          return [
+                              str(binaries[name]),
+                              str(input_path),
+                              *extra_args,
+                              "--analyze",
+                              "--json",
+                          ]
+                      output_path.unlink(missing_ok=True)
+                      return [
+                          str(binaries[name]),
+                          str(input_path),
+                          *extra_args,
+                          "--overwrite",
+                          "-o",
+                          str(output_path),
+                      ]
+
+                  def measure(name, label):
+                      sample = run_measured(
+                          command(name),
+                          1_800,
+                          logs / f"{mode}-{case}-{label}-{name}.out",
+                          logs / f"{mode}-{case}-{label}-{name}.err",
+                      )
+                      output_path.unlink(missing_ok=True)
+                      assert sample["exit_code"] == 0, sample
+                      return sample
+
+                  # Warm both binaries symmetrically; warm-ups are not measured.
+                  for name in ("baseline", "candidate"):
+                      measure(name, "warm")
+
+                  for round_index in range(7):
+                      order = (
+                          ("baseline", "candidate", "candidate", "baseline")
+                          if round_index % 2 == 0
+                          else ("candidate", "baseline", "baseline", "candidate")
+                      )
+                      round_samples = {"baseline": [], "candidate": []}
+                      for position, name in enumerate(order):
+                          sample = measure(name, f"{round_index:02d}-{position}")
+                          samples[name].append(sample)
+                          round_samples[name].append(sample)
+                      rounds.append({"order": order, "samples": round_samples})
+
+                  summary = {"samples_per_binary": len(samples["baseline"])}
+                  for label, getter in (
+                      ("wall", lambda sample: sample["wall_seconds"]),
+                      (
+                          "cpu",
+                          lambda sample: sample["user_cpu_seconds"]
+                          + sample["system_cpu_seconds"],
+                      ),
+                  ):
+                      baseline = [getter(sample) for sample in samples["baseline"]]
+                      candidate = [getter(sample) for sample in samples["candidate"]]
+                      round_changes = []
+                      for round_result in rounds:
+                          base_round = statistics.median(
+                              getter(sample)
+                              for sample in round_result["samples"]["baseline"]
+                          )
+                          candidate_round = statistics.median(
+                              getter(sample)
+                              for sample in round_result["samples"]["candidate"]
+                          )
+                          round_changes.append(
+                              (candidate_round / base_round - 1.0) * 100.0
+                          )
+                      baseline_median = statistics.median(baseline)
+                      candidate_median = statistics.median(candidate)
+                      summary[label] = {
+                          "baseline_median": baseline_median,
+                          "candidate_median": candidate_median,
+                          "pooled_change_percent": (
+                              candidate_median / baseline_median - 1.0
+                          )
+                          * 100.0,
+                          "median_paired_round_change_percent": statistics.median(
+                              round_changes
+                          ),
+                          "paired_round_changes_percent": round_changes,
+                      }
+                  summary["peak_rss_bytes"] = {
+                      name: max(sample["peak_rss_bytes"] for sample in values)
+                      for name, values in samples.items()
+                  }
+                  mode_cases[case] = {"summary": summary, "rounds": rounds}
+              result["modes"][mode] = mode_cases
+
+          output_root.rmdir()
+
+          Path("symphonia-packet-coalescing-interleaved.json").write_text(
+              json.dumps(result, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          with Path("symphonia-packet-coalescing-summary.md").open(
+              "w", encoding="utf-8"
+          ) as output:
+              output.write("## Symphonia packet coalescing benchmark\n\n")
+              output.write(
+                  "Seven ABBA/BAAB rounds; 14 samples per binary and mode.\n"
+              )
+              for mode, cases in result["modes"].items():
+                  output.write(f"\n### {mode}\n\n")
+                  output.write(
+                      "| Case | Pooled wall | Paired wall | Pooled CPU "
+                      "| Paired CPU | RSS delta |\n"
+                  )
+                  output.write("|---|---:|---:|---:|---:|---:|\n")
+                  for case, case_result in cases.items():
+                      summary = case_result["summary"]
+                      rss = summary["peak_rss_bytes"]
+                      output.write(
+                          f"| {case} "
+                          f"| {summary['wall']['pooled_change_percent']:+.3f}% "
+                          f"| {summary['wall']['median_paired_round_change_percent']:+.3f}% "
+                          f"| {summary['cpu']['pooled_change_percent']:+.3f}% "
+                          f"| {summary['cpu']['median_paired_round_change_percent']:+.3f}% "
+                          f"| {rss['candidate'] - rss['baseline']:+d} B |\n"
+                      )
+          print(json.dumps({
+              mode: {
+                  case: case_result["summary"]
+                  for case, case_result in cases.items()
+              }
+              for mode, cases in result["modes"].items()
+          }, indent=2))
+          PY
+          cat symphonia-packet-coalescing-summary.md >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: symphonia-packet-coalescing-${{ matrix.os }}-${{ runner.arch }}
+          path: |
+            symphonia-packet-coalescing-interleaved.json
+            symphonia-packet-coalescing-summary.md
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce performance and memory gates
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import statistics
+          from pathlib import Path
+
+          evidence = json.loads(
+              Path("symphonia-packet-coalescing-interleaved.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          normalization_pooled = []
+          normalization_paired = []
+          for mode in ("default", "jobs_1"):
+              for case, case_result in evidence["modes"][mode].items():
+                  summary = case_result["summary"]
+                  assert summary["samples_per_binary"] == 14, (mode, case, summary)
+                  for metric in ("wall", "cpu"):
+                      values = summary[metric]
+                      pooled = values["pooled_change_percent"]
+                      paired = values["median_paired_round_change_percent"]
+                      assert pooled <= 3.0, (mode, case, metric, "pooled", pooled)
+                      assert paired <= 3.0, (mode, case, metric, "paired", paired)
+                      if case == "normalize":
+                          normalization_pooled.append(pooled)
+                          normalization_paired.append(paired)
+                  rss = summary["peak_rss_bytes"]
+                  rss_delta = rss["candidate"] - rss["baseline"]
+                  assert rss_delta <= 4 * 1024 * 1024, (
+                      mode,
+                      case,
+                      "RSS delta",
+                      rss_delta,
+                  )
+          assert len(normalization_pooled) == 4, normalization_pooled
+          assert len(normalization_paired) == 4, normalization_paired
+          pooled_aggregate = statistics.fmean(normalization_pooled)
+          paired_aggregate = statistics.fmean(normalization_paired)
+          assert pooled_aggregate <= -0.25, (
+              "pooled normalization speedup was not material",
+              pooled_aggregate,
+              normalization_pooled,
+          )
+          assert paired_aggregate <= -0.25, (
+              "paired normalization speedup was not material",
+              paired_aggregate,
+              normalization_paired,
+          )
+          print(f"pooled normalization change: {pooled_aggregate:+.3f}%")
+          print(f"paired normalization change: {paired_aggregate:+.3f}%")
+          PY
