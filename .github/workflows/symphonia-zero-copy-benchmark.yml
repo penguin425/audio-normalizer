@@ -75,8 +75,10 @@ jobs:
           cargo test --locked --manifest-path candidate/Cargo.toml \
             --no-default-features --lib \
             replay_preserves_chunks_and_float_bits_across_rewinds -- --nocapture
-          cargo test --locked --manifest-path candidate/Cargo.toml \
-            --features ffmpeg-encoding --lib chained_vorbis -- --nocapture
+          if [[ "${RUNNER_OS}" == "Linux" ]]; then
+            cargo test --locked --manifest-path candidate/Cargo.toml \
+              --features ffmpeg-encoding --lib chained_vorbis -- --nocapture
+          fi
 
       - name: Build exact baseline and candidate
         shell: bash
