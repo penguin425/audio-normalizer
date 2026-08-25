@@ -64,6 +64,12 @@ impl PcmSpool {
         self.frames
     }
 
+    pub(crate) fn finish_writing(&mut self) -> Result<(), String> {
+        self.file
+            .flush()
+            .map_err(|error| format!("flush PCM spool: {error}"))
+    }
+
     pub(crate) fn replay(
         &mut self,
         mut consume: impl FnMut(&mut [Vec<f32>]) -> Result<(), String>,

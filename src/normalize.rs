@@ -981,10 +981,13 @@ fn prepare_file_for_plan(
     let analyzer = analyzer.ok_or_else(|| format!("{}: no audio decoded", path.display()))?;
     let roles = resolved_roles.expect("analyzer creation resolves channel roles");
     let measured = analyzer.finish();
-    if spool
-        .as_ref()
-        .is_some_and(|captured| captured.frames() != measured.frames)
-    {
+    let discard_spool = spool.as_mut().is_some_and(|captured| {
+        captured.frames() != measured.frames || captured.finish_writing().is_err()
+    });
+    if discard_spool {
+        // A spool is only a performance optimization. Preserve the established
+        // re-decode fallback when a buffered tail cannot reach temporary
+        // storage instead of failing an otherwise valid normalization.
         spool = None;
     }
     Ok(PreparedAnalysis {
