@@ -1,3 +1,3 @@
 """Forge Python package version."""
 
-__version__ = "0.164.0"
+__version__ = "0.165.0"
