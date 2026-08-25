@@ -363,11 +363,28 @@ impl StreamingAnalyzer {
     }
 
     pub fn process(&mut self, planar: &[Vec<f32>]) -> Result<(), String> {
+        self.process_planar(planar)
+    }
+
+    pub(crate) fn process_borrowed<C>(&mut self, planar: &[C]) -> Result<(), String>
+    where
+        C: AsRef<[f32]> + Sync,
+    {
+        self.process_planar(planar)
+    }
+
+    fn process_planar<C>(&mut self, planar: &[C]) -> Result<(), String>
+    where
+        C: AsRef<[f32]> + Sync,
+    {
         if planar.len() != self.roles.len() {
             return Err("stream channel count changed".into());
         }
-        let chunk_frames = planar.first().map_or(0, Vec::len);
-        if planar.iter().any(|channel| channel.len() != chunk_frames) {
+        let chunk_frames = planar.first().map_or(0, |channel| channel.as_ref().len());
+        if planar
+            .iter()
+            .any(|channel| channel.as_ref().len() != chunk_frames)
+        {
             return Err("stream channel length mismatch".into());
         }
         let momentary_window = ((self.sample_rate as usize * 4) / 10).max(1);
@@ -443,15 +460,17 @@ impl StreamingAnalyzer {
             let (meter0, meter1) = self.true_peak_meters.split_at_mut(1);
             let meter0 = &mut meter0[0];
             let meter1 = &mut meter1[0];
-            let skip_meter0 = meter0.try_skip_peak_only_block(&planar[0]);
-            let skip_meter1 = meter1.try_skip_peak_only_block(&planar[1]);
+            let channel0 = planar[0].as_ref();
+            let channel1 = planar[1].as_ref();
+            let skip_meter0 = meter0.try_skip_peak_only_block(channel0);
+            let skip_meter1 = meter1.try_skip_peak_only_block(channel1);
             #[allow(
                 clippy::needless_range_loop,
                 reason = "the measured hot path uses one frame index across two fixed channels"
             )]
             for frame in 0..chunk_frames {
-                let sample0 = planar[0][frame];
-                let sample1 = planar[1][frame];
+                let sample0 = channel0[frame];
+                let sample1 = channel1[frame];
                 match (skip_meter0, skip_meter1) {
                     (false, false) => {
                         TruePeakMeter::process_stereo_peak_only_sample(
@@ -611,7 +630,7 @@ impl StreamingAnalyzer {
             let mut weighted = 0.0;
             for ((index, channel), filter) in planar.iter().enumerate().zip(self.filters.iter_mut())
             {
-                let sample = channel[frame];
+                let sample = channel.as_ref()[frame];
                 let reconstructed_peak = self.true_peak_meters[index].process_sample(sample);
                 self.interval_true_peak = self.interval_true_peak.max(reconstructed_peak);
                 self.interval_sample_peak = self.interval_sample_peak.max(sample.abs());
@@ -683,7 +702,10 @@ impl StreamingAnalyzer {
         feature = "cuda-truepeak",
         any(target_os = "linux", target_os = "windows")
     ))]
-    fn begin_cuda_true_peak(&mut self, planar: &[Vec<f32>], frames: usize) -> bool {
+    fn begin_cuda_true_peak<C>(&mut self, planar: &[C], frames: usize) -> bool
+    where
+        C: AsRef<[f32]> + Sync,
+    {
         let state = std::mem::replace(&mut self.cuda_true_peak, CudaTruePeakState::Disabled);
         match state {
             CudaTruePeakState::Disabled => false,
@@ -731,7 +753,10 @@ impl StreamingAnalyzer {
         feature = "cuda-truepeak",
         any(target_os = "linux", target_os = "windows")
     ))]
-    fn finish_cuda_true_peak(&mut self, planar: &[Vec<f32>]) {
+    fn finish_cuda_true_peak<C>(&mut self, planar: &[C])
+    where
+        C: AsRef<[f32]> + Sync,
+    {
         let state = std::mem::replace(&mut self.cuda_true_peak, CudaTruePeakState::Disabled);
         let CudaTruePeakState::Active(mut worker) = state else {
             return;
@@ -746,14 +771,17 @@ impl StreamingAnalyzer {
         }
     }
 
-    fn process_without_true_peak(
+    fn process_without_true_peak<C>(
         &mut self,
-        planar: &[Vec<f32>],
+        planar: &[C],
         chunk_frames: usize,
         momentary_window: usize,
         short_term_window: usize,
         hop: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), String>
+    where
+        C: AsRef<[f32]> + Sync,
+    {
         if planar.len() == 2 {
             let weight0 = channel_weight(self.roles[0]);
             let weight1 = channel_weight(self.roles[1]);
@@ -768,13 +796,15 @@ impl StreamingAnalyzer {
             let filter0 = &mut filter0[0];
             #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             let filter1 = &mut filter1[0];
+            let channel0 = planar[0].as_ref();
+            let channel1 = planar[1].as_ref();
             #[allow(
                 clippy::needless_range_loop,
                 reason = "the measured hot path uses one frame index across two fixed channels"
             )]
             for frame in 0..chunk_frames {
-                let sample0 = planar[0][frame];
-                let sample1 = planar[1][frame];
+                let sample0 = channel0[frame];
+                let sample1 = channel1[frame];
                 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                 let filtered = kweight_pair.process([sample0, sample1]);
                 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -988,13 +1018,18 @@ impl StreamingAnalyzer {
 }
 
 #[inline]
-fn process_true_peak_channel_group(meters: &mut [TruePeakMeter], channels: &[Vec<f32>]) {
+fn process_true_peak_channel_group<C>(meters: &mut [TruePeakMeter], channels: &[C])
+where
+    C: AsRef<[f32]>,
+{
     debug_assert_eq!(meters.len(), channels.len());
     if meters.len() == 2 {
         let (left_meter, right_meter) = meters.split_at_mut(1);
-        let skip_left = left_meter[0].try_skip_peak_only_block(&channels[0]);
-        let skip_right = right_meter[0].try_skip_peak_only_block(&channels[1]);
-        for (&left_sample, &right_sample) in channels[0].iter().zip(&channels[1]) {
+        let left_channel = channels[0].as_ref();
+        let right_channel = channels[1].as_ref();
+        let skip_left = left_meter[0].try_skip_peak_only_block(left_channel);
+        let skip_right = right_meter[0].try_skip_peak_only_block(right_channel);
+        for (&left_sample, &right_sample) in left_channel.iter().zip(right_channel) {
             match (skip_left, skip_right) {
                 (false, false) => {
                     TruePeakMeter::process_stereo_peak_only_sample(
@@ -1014,7 +1049,7 @@ fn process_true_peak_channel_group(meters: &mut [TruePeakMeter], channels: &[Vec
             }
         }
     } else if let (Some(meter), Some(channel)) = (meters.first_mut(), channels.first()) {
-        meter.process(channel);
+        meter.process(channel.as_ref());
     }
 }
 
@@ -1022,15 +1057,18 @@ fn process_true_peak_channel_group(meters: &mut [TruePeakMeter], channels: &[Vec
 /// pass. Filter states are independent, while weighted and raw reductions
 /// retain the established left-to-right channel order exactly.
 #[inline(always)]
-fn process_kweighted_frame_multichannel(
+fn process_kweighted_frame_multichannel<C>(
     filters: &mut [KWeight],
     #[cfg(target_arch = "x86_64")] kweight_quads: &mut Option<Vec<KWeightQuad>>,
     roles: &[ChannelRole],
-    planar: &[Vec<f32>],
+    planar: &[C],
     frame: usize,
     raw_sum_squares: &mut f64,
     sample_peak: &mut f32,
-) -> f64 {
+) -> f64
+where
+    C: AsRef<[f32]>,
+{
     debug_assert_eq!(filters.len(), roles.len());
     debug_assert_eq!(filters.len(), planar.len());
     let mut weighted = 0.0;
@@ -1039,10 +1077,10 @@ fn process_kweighted_frame_multichannel(
         let mut channel = 0;
         for quad in quads {
             let input = [
-                planar[channel][frame],
-                planar[channel + 1][frame],
-                planar[channel + 2][frame],
-                planar[channel + 3][frame],
+                planar[channel].as_ref()[frame],
+                planar[channel + 1].as_ref()[frame],
+                planar[channel + 2].as_ref()[frame],
+                planar[channel + 3].as_ref()[frame],
             ];
             let filtered = quad.process(input);
             for lane in 0..4 {
@@ -1055,7 +1093,7 @@ fn process_kweighted_frame_multichannel(
             channel += 4;
         }
         for index in channel..filters.len() {
-            let sample = planar[index][frame];
+            let sample = planar[index].as_ref()[frame];
             let filtered = filters[index].process(sample) as f64;
             weighted += channel_weight(roles[index]) * filtered * filtered;
             let raw = sample as f64;
@@ -1065,7 +1103,7 @@ fn process_kweighted_frame_multichannel(
         return weighted;
     }
     for ((index, channel), filter) in planar.iter().enumerate().zip(filters.iter_mut()) {
-        let sample = channel[frame];
+        let sample = channel.as_ref()[frame];
         let filtered = filter.process(sample) as f64;
         weighted += channel_weight(roles[index]) * filtered * filtered;
         let raw = sample as f64;
@@ -1079,8 +1117,11 @@ fn process_kweighted_frame_multichannel(
     feature = "cuda-truepeak",
     any(target_os = "linux", target_os = "windows")
 ))]
-fn process_true_peak_cpu(meters: &mut [TruePeakMeter], planar: &[Vec<f32>]) {
-    let frames = planar.first().map_or(0, Vec::len);
+fn process_true_peak_cpu<C>(meters: &mut [TruePeakMeter], planar: &[C])
+where
+    C: AsRef<[f32]> + Sync,
+{
+    let frames = planar.first().map_or(0, |channel| channel.as_ref().len());
     if meters.len() >= 4
         && frames >= MIN_PARALLEL_TRUE_PEAK_FRAMES
         && rayon::current_num_threads() > 1
@@ -1518,6 +1559,66 @@ mod tests {
         assert!((streamed.rms_db - whole_rms).abs() < 1e-9);
         assert_eq!(streamed.sample_peak, whole_peak);
         assert_eq!(streamed.true_peak, whole_true_peak);
+    }
+
+    #[test]
+    fn borrowed_planar_input_matches_owned_input_bit_exactly() {
+        let left = (0..96_137)
+            .map(|index| ((index as f64 * 0.071).sin() * 0.3) as f32)
+            .collect::<Vec<_>>();
+        let right = (0..96_137)
+            .map(|index| ((index as f64 * 0.113).cos() * 0.2) as f32)
+            .collect::<Vec<_>>();
+        let roles = vec![ChannelRole::Main, ChannelRole::Surround];
+
+        let mut owned = StreamingAnalyzer::new(48_000, roles.clone());
+        owned.process(&[left.clone(), right.clone()]).unwrap();
+        let owned = owned.finish();
+
+        let mut borrowed = StreamingAnalyzer::new(48_000, roles);
+        borrowed
+            .process_borrowed(&[left.as_slice(), right.as_slice()])
+            .unwrap();
+        let borrowed = borrowed.finish();
+
+        assert_eq!(borrowed.frames, owned.frames);
+        assert_eq!(borrowed.sample_peak.to_bits(), owned.sample_peak.to_bits());
+        assert_eq!(borrowed.true_peak.to_bits(), owned.true_peak.to_bits());
+        assert_eq!(borrowed.rms_db.to_bits(), owned.rms_db.to_bits());
+        assert_eq!(
+            borrowed.weighted_mean_square.to_bits(),
+            owned.weighted_mean_square.to_bits()
+        );
+        assert_eq!(
+            borrowed.ebu.integrated_lufs.to_bits(),
+            owned.ebu.integrated_lufs.to_bits()
+        );
+        assert_eq!(
+            borrowed.ebu.max_momentary_lufs.to_bits(),
+            owned.ebu.max_momentary_lufs.to_bits()
+        );
+        assert_eq!(
+            borrowed.ebu.max_short_term_lufs.to_bits(),
+            owned.ebu.max_short_term_lufs.to_bits()
+        );
+        assert_eq!(
+            borrowed.ebu.loudness_range_lu.to_bits(),
+            owned.ebu.loudness_range_lu.to_bits()
+        );
+        assert_eq!(
+            borrowed
+                .ebu
+                .gating_blocks
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            owned
+                .ebu
+                .gating_blocks
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

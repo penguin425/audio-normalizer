@@ -180,7 +180,10 @@ impl CudaTruePeakWorker {
 
     /// Queue transfers, interpolation, reduction, and the tiny result copy.
     /// The caller performs CPU K-weighting before calling [`Self::finish_chunk`].
-    pub(crate) fn begin_chunk(&mut self, planar: &[Vec<f32>]) -> Result<(), String> {
+    pub(crate) fn begin_chunk<C>(&mut self, planar: &[C]) -> Result<(), String>
+    where
+        C: AsRef<[f32]>,
+    {
         let frames = validate_planar(planar, self.channels)?;
         if frames == 0 {
             return Ok(());
@@ -204,7 +207,7 @@ impl CudaTruePeakWorker {
                     .samples
                     .slice_mut(start + HISTORY..start + HISTORY + frames);
                 self.stream
-                    .memcpy_htod(channel, &mut destination)
+                    .memcpy_htod(channel.as_ref(), &mut destination)
                     .map_err(|error| format!("upload CUDA true-peak samples: {error}"))?;
             }
         }
@@ -235,7 +238,10 @@ impl CudaTruePeakWorker {
         Ok(())
     }
 
-    pub(crate) fn finish_chunk(&mut self, planar: &[Vec<f32>]) -> Result<(), String> {
+    pub(crate) fn finish_chunk<C>(&mut self, planar: &[C]) -> Result<(), String>
+    where
+        C: AsRef<[f32]>,
+    {
         self.stream
             .synchronize()
             .map_err(|error| format!("synchronize CUDA true-peak worker: {error}"))?;
@@ -247,7 +253,7 @@ impl CudaTruePeakWorker {
             *peak = peak.max(f32::from_bits(bits));
         }
         for (recent, channel) in self.recent.iter_mut().zip(planar) {
-            update_recent(recent, channel);
+            update_recent(recent, channel.as_ref());
         }
         Ok(())
     }
@@ -288,9 +294,13 @@ impl CudaTruePeakWorker {
         Ok(())
     }
 
-    fn prepare_prefix(&mut self, planar: &[Vec<f32>]) {
+    fn prepare_prefix<C>(&mut self, planar: &[C])
+    where
+        C: AsRef<[f32]>,
+    {
         for ((destination, recent), channel) in self.prefix.iter_mut().zip(&self.recent).zip(planar)
         {
+            let channel = channel.as_ref();
             if recent.is_empty() {
                 destination.fill(channel[0]);
             } else {
@@ -308,12 +318,18 @@ fn allocation_len(channels: usize, frames: usize) -> Result<usize, String> {
         .ok_or_else(|| "CUDA true-peak allocation size overflow".into())
 }
 
-fn validate_planar(planar: &[Vec<f32>], channels: usize) -> Result<usize, String> {
+fn validate_planar<C>(planar: &[C], channels: usize) -> Result<usize, String>
+where
+    C: AsRef<[f32]>,
+{
     if planar.len() != channels {
         return Err("CUDA true-peak channel count changed".into());
     }
-    let frames = planar.first().map_or(0, Vec::len);
-    if planar.iter().any(|channel| channel.len() != frames) {
+    let frames = planar.first().map_or(0, |channel| channel.as_ref().len());
+    if planar
+        .iter()
+        .any(|channel| channel.as_ref().len() != frames)
+    {
         return Err("CUDA true-peak channel length mismatch".into());
     }
     Ok(frames)

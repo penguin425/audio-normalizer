@@ -154,13 +154,16 @@ impl SampleRateConverter {
         })
     }
 
-    pub fn process(
+    pub fn process<C>(
         &mut self,
-        planar: &[Vec<f32>],
+        planar: &[C],
         mut consume: impl FnMut(&mut [Vec<f32>]) -> Result<(), String>,
-    ) -> Result<(), String> {
+    ) -> Result<(), String>
+    where
+        C: AsRef<[f32]>,
+    {
         self.validate(planar)?;
-        let frames = planar.first().map_or(0, Vec::len);
+        let frames = planar.first().map_or(0, |channel| channel.as_ref().len());
         self.input_frames_seen = self
             .input_frames_seen
             .checked_add(frames)
@@ -171,6 +174,7 @@ impl SampleRateConverter {
             let pending_frames = self.input_pending[0].len();
             let take = (input_frames - pending_frames).min(frames - start);
             for (pending, channel) in self.input_pending.iter_mut().zip(planar) {
+                let channel = channel.as_ref();
                 pending.extend_from_slice(&channel[start..start + take]);
             }
             start += take;
@@ -289,7 +293,10 @@ impl SampleRateConverter {
         consume(&mut self.output_buffer)
     }
 
-    fn validate(&self, planar: &[Vec<f32>]) -> Result<(), String> {
+    fn validate<C>(&self, planar: &[C]) -> Result<(), String>
+    where
+        C: AsRef<[f32]>,
+    {
         if planar.len() != self.channels {
             return Err(format!(
                 "sample-rate converter expected {} channels, got {}",
@@ -297,8 +304,11 @@ impl SampleRateConverter {
                 planar.len()
             ));
         }
-        let frames = planar.first().map_or(0, Vec::len);
-        if planar.iter().any(|channel| channel.len() != frames) {
+        let frames = planar.first().map_or(0, |channel| channel.as_ref().len());
+        if planar
+            .iter()
+            .any(|channel| channel.as_ref().len() != frames)
+        {
             return Err("sample-rate converter received uneven channel lengths".into());
         }
         Ok(())
@@ -448,7 +458,7 @@ mod tests {
         for range in [0..137, 137..1_111, 1_111..2_047, 2_047..frames] {
             let chunk = planar
                 .iter()
-                .map(|channel| channel[range.clone()].to_vec())
+                .map(|channel| &channel[range.clone()])
                 .collect::<Vec<_>>();
             converter
                 .process(&chunk, |resampled| {

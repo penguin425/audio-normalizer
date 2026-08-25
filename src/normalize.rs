@@ -944,7 +944,7 @@ fn prepare_file_for_plan(
     let mut converter: Option<SampleRateConverter> = None;
     let mut spool: Option<PcmSpool> = None;
     let mut resolved_roles = None;
-    let info = decoder::decode_stream(path, |info, chunk| {
+    let info = decoder::decode_stream_borrowed(path, |info, chunk| {
         if analyzer.is_none() {
             let roles = resolve_stream_roles(path, info, channel_roles)?;
             let output_rate = plan.output_sample_rate.unwrap_or(info.sample_rate);
@@ -1007,12 +1007,15 @@ fn prepare_file_for_plan(
     })
 }
 
-fn analyze_and_capture(
-    planar: &mut [Vec<f32>],
+fn analyze_and_capture<C>(
+    planar: &[C],
     analyzer: &mut lufs::StreamingAnalyzer,
     spool: &mut Option<PcmSpool>,
-) -> Result<(), String> {
-    analyzer.process(planar)?;
+) -> Result<(), String>
+where
+    C: AsRef<[f32]> + Sync,
+{
+    analyzer.process_borrowed(planar)?;
     let capture_failed = spool
         .as_mut()
         .is_some_and(|captured| captured.write_chunk(planar).is_err());
@@ -1088,7 +1091,7 @@ pub fn analyze_file_range_with_roles<P: AsRef<Path>>(
     let mut analyzer: Option<lufs::StreamingAnalyzer> = None;
     let mut captured_info = None;
     let mut source_frames = 0usize;
-    let decoded = decoder::decode_stream(path.as_ref(), |info, chunk| {
+    let decoded = decoder::decode_stream_borrowed(path.as_ref(), |info, chunk| {
         captured_info.get_or_insert_with(|| info.clone());
         if channel_roles.is_none()
             && info.channels > 6
@@ -1120,7 +1123,8 @@ pub fn analyze_file_range_with_roles<P: AsRef<Path>>(
             range_start.saturating_add((duration * info.sample_rate as f64).round() as usize)
         });
         let chunk_start = source_frames;
-        let chunk_end = source_frames + chunk.first().map_or(0, Vec::len);
+        let chunk_frames = chunk.first().map_or(0, |channel| channel.len());
+        let chunk_end = source_frames + chunk_frames;
         source_frames = chunk_end;
         if range_end.is_some_and(|end| chunk_start >= end) {
             return Err(RANGE_COMPLETE.into());
@@ -1130,10 +1134,6 @@ pub fn analyze_file_range_with_roles<P: AsRef<Path>>(
             .map_or(chunk_end, |end| end.min(chunk_end))
             .saturating_sub(chunk_start);
         if selected_start < selected_end {
-            let selected = chunk
-                .iter()
-                .map(|channel| channel[selected_start..selected_end].to_vec())
-                .collect::<Vec<_>>();
             let interval_frames = timeline_interval_ms.map(|milliseconds| {
                 ((info.sample_rate as f64 * milliseconds / 1_000.0).round() as usize).max(1)
             });
@@ -1144,7 +1144,15 @@ pub fn analyze_file_range_with_roles<P: AsRef<Path>>(
                     interval_frames,
                 )
             });
-            meter.process(&selected)?;
+            if selected_start == 0 && selected_end == chunk_frames {
+                meter.process_borrowed(chunk)?;
+            } else {
+                let selected = chunk
+                    .iter()
+                    .map(|channel| &channel[selected_start..selected_end])
+                    .collect::<Vec<_>>();
+                meter.process_borrowed(&selected)?;
+            }
         }
         if range_end.is_some_and(|end| chunk_end >= end) {
             Err(RANGE_COMPLETE.into())

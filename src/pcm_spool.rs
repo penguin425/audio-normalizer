@@ -22,7 +22,10 @@ impl PcmSpool {
         })
     }
 
-    pub(crate) fn write_chunk(&mut self, planar: &[Vec<f32>]) -> Result<(), String> {
+    pub(crate) fn write_chunk<C>(&mut self, planar: &[C]) -> Result<(), String>
+    where
+        C: AsRef<[f32]>,
+    {
         if planar.len() != self.channels {
             return Err(format!(
                 "PCM spool expected {} channels, got {}",
@@ -30,8 +33,11 @@ impl PcmSpool {
                 planar.len()
             ));
         }
-        let frames = planar.first().map_or(0, Vec::len);
-        if planar.iter().any(|channel| channel.len() != frames) {
+        let frames = planar.first().map_or(0, |channel| channel.as_ref().len());
+        if planar
+            .iter()
+            .any(|channel| channel.as_ref().len() != frames)
+        {
             return Err("PCM spool received unequal channel lengths".into());
         }
         if frames == 0 {
@@ -44,7 +50,7 @@ impl PcmSpool {
             .map_err(|error| format!("write PCM spool record: {error}"))?;
         for channel in planar {
             self.file
-                .write_all(samples_as_bytes(channel))
+                .write_all(samples_as_bytes(channel.as_ref()))
                 .map_err(|error| format!("write PCM spool samples: {error}"))?;
         }
         self.frames = self
@@ -171,7 +177,8 @@ mod tests {
         ];
         let mut spool = PcmSpool::new(2).unwrap();
         for chunk in &chunks {
-            spool.write_chunk(chunk).unwrap();
+            let borrowed = chunk.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            spool.write_chunk(&borrowed).unwrap();
         }
         assert_eq!(spool.frames(), 5);
 

@@ -558,14 +558,142 @@ where
     decode_stream_with_flac_workers(path, None, consume)
 }
 
+/// Decode into immutable channel slices for analysis-only consumers.
+///
+/// Symphonia codecs that already produce planar `f32` expose their decoder
+/// buffer directly. Integer decoders and Forge's mutable native streaming
+/// paths retain their established conversion buffers and are borrowed only
+/// for the duration of the callback.
+pub(crate) fn decode_stream_borrowed<F>(path: &Path, consume: F) -> Result<StreamInfo, String>
+where
+    F: FnMut(&StreamInfo, &[&[f32]]) -> Result<(), String>,
+{
+    let mut consumer = BorrowedStreamConsumer { consume };
+    decode_stream_with_consumer(path, None, &mut consumer)
+}
+
+const STACK_PLANAR_REFS: usize = 8;
+
+fn with_planar_refs<'a, R, G, F>(channels: usize, mut get: G, consume: F) -> R
+where
+    G: FnMut(usize) -> &'a [f32],
+    F: FnOnce(&[&'a [f32]]) -> R,
+{
+    if channels <= STACK_PLANAR_REFS {
+        let mut planes = [&[][..]; STACK_PLANAR_REFS];
+        for (channel, plane) in planes[..channels].iter_mut().enumerate() {
+            *plane = get(channel);
+        }
+        consume(&planes[..channels])
+    } else {
+        let planes = (0..channels).map(get).collect::<Vec<_>>();
+        consume(&planes)
+    }
+}
+
+trait StreamChunkConsumer {
+    fn consume_mutable(&mut self, info: &StreamInfo, planar: &mut [Vec<f32>])
+        -> Result<(), String>;
+
+    fn consume_symphonia_f32(
+        &mut self,
+        info: &StreamInfo,
+        buffer: &symphonia::core::audio::AudioBuffer<f32>,
+    ) -> Result<(), String>;
+}
+
+struct BorrowedStreamConsumer<F> {
+    consume: F,
+}
+
+impl<F> StreamChunkConsumer for BorrowedStreamConsumer<F>
+where
+    F: FnMut(&StreamInfo, &[&[f32]]) -> Result<(), String>,
+{
+    fn consume_mutable(
+        &mut self,
+        info: &StreamInfo,
+        planar: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        with_planar_refs(
+            planar.len(),
+            |channel| planar[channel].as_slice(),
+            |planes| (self.consume)(info, planes),
+        )
+    }
+
+    fn consume_symphonia_f32(
+        &mut self,
+        info: &StreamInfo,
+        buffer: &symphonia::core::audio::AudioBuffer<f32>,
+    ) -> Result<(), String> {
+        use symphonia::core::audio::Audio;
+
+        with_planar_refs(
+            buffer.num_planes(),
+            |channel| {
+                buffer
+                    .plane(channel)
+                    .expect("decoded channel count matches its audio planes")
+            },
+            |planes| (self.consume)(info, planes),
+        )
+    }
+}
+
+struct MutableStreamConsumer<F> {
+    consume: F,
+    converted: Vec<Vec<f32>>,
+}
+
+impl<F> StreamChunkConsumer for MutableStreamConsumer<F>
+where
+    F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
+{
+    fn consume_mutable(
+        &mut self,
+        info: &StreamInfo,
+        planar: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        (self.consume)(info, planar)
+    }
+
+    fn consume_symphonia_f32(
+        &mut self,
+        info: &StreamInfo,
+        buffer: &symphonia::core::audio::AudioBuffer<f32>,
+    ) -> Result<(), String> {
+        use symphonia::core::audio::Audio;
+
+        buffer.copy_to_vecs_planar::<f32>(&mut self.converted);
+        (self.consume)(info, &mut self.converted)
+    }
+}
+
 fn decode_stream_with_flac_workers<F>(
     path: &Path,
     forced_flac_workers: Option<usize>,
-    mut consume: F,
+    consume: F,
 ) -> Result<StreamInfo, String>
 where
     F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
 {
+    let mut consumer = MutableStreamConsumer {
+        consume,
+        converted: Vec::new(),
+    };
+    decode_stream_with_consumer(path, forced_flac_workers, &mut consumer)
+}
+
+fn decode_stream_with_consumer<C>(
+    path: &Path,
+    forced_flac_workers: Option<usize>,
+    consumer: &mut C,
+) -> Result<StreamInfo, String>
+where
+    C: StreamChunkConsumer,
+{
+    use symphonia::core::audio::GenericAudioBufferRef;
     use symphonia::core::errors::Error;
     use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::FormatOptions;
@@ -579,15 +707,19 @@ where
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
     if matches!(extension.as_str(), "wav" | "wave" | "bwf" | "bw64" | "rf64") {
-        return decode_wav_stream(path, consume);
+        return decode_wav_stream(path, |info, planar| consumer.consume_mutable(info, planar));
     }
     if matches!(extension.as_str(), "dsf" | "dff") {
-        return crate::dsd::decode_stream(path, consume);
+        return crate::dsd::decode_stream(path, |info, planar| {
+            consumer.consume_mutable(info, planar)
+        });
     }
     if extension == "opus" {
         #[cfg(feature = "opus-encoding")]
         {
-            return crate::opus::decode_stream(path, consume);
+            return crate::opus::decode_stream(path, |info, planar| {
+                consumer.consume_mutable(info, planar)
+            });
         }
         #[cfg(not(feature = "opus-encoding"))]
         {
@@ -644,7 +776,7 @@ where
             track,
             decoder_options,
             flac_workers,
-            consume,
+            |info, planar| consumer.consume_mutable(info, planar),
         );
     }
     let mut decoder = get_codecs()
@@ -715,8 +847,18 @@ where
         if frames == 0 {
             continue;
         }
-        decoded.copy_to_vecs_planar::<f32>(&mut planar);
-        consume(info.as_ref().unwrap(), &mut planar)?;
+        let info = info
+            .as_ref()
+            .expect("decoded output establishes stream info");
+        match decoded {
+            GenericAudioBufferRef::F32(buffer) => {
+                consumer.consume_symphonia_f32(info, buffer)?;
+            }
+            decoded => {
+                decoded.copy_to_vecs_planar::<f32>(&mut planar);
+                consumer.consume_mutable(info, &mut planar)?;
+            }
+        }
     }
 
     info.ok_or_else(|| format!("{}: no audio decoded", path.display()))
@@ -1337,6 +1479,18 @@ mod tests {
         assert_eq!(info.sample_rate, decoded.sample_rate);
         assert_eq!(info.channels, decoded.channels);
         assert_eq!(streamed, decoded.data);
+
+        let mut borrowed = vec![Vec::new(); decoded.channels as usize];
+        let borrowed_info = decode_stream_borrowed(&chained, |_, planar| {
+            for (destination, source) in borrowed.iter_mut().zip(planar) {
+                destination.extend_from_slice(source);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(borrowed_info.sample_rate, decoded.sample_rate);
+        assert_eq!(borrowed_info.channels, decoded.channels);
+        assert_eq!(borrowed, decoded.data);
     }
 
     #[cfg(feature = "ffmpeg-encoding")]
@@ -1360,6 +1514,8 @@ mod tests {
         let error = decode(&chained).unwrap_err();
         assert!(error.contains("sample rate changed from 48000 to 44100"));
         let error = decode_stream(&chained, |_, _| Ok(())).unwrap_err();
+        assert!(error.contains("sample rate changed from 48000 to 44100"));
+        let error = decode_stream_borrowed(&chained, |_, _| Ok(())).unwrap_err();
         assert!(error.contains("sample rate changed from 48000 to 44100"));
     }
 }
