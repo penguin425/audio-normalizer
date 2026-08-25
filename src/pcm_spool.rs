@@ -1,11 +1,16 @@
 //! Ephemeral planar-f32 storage for exact two-stage normalization.
 
 use std::fs::File;
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::mem::size_of_val;
 
+// Decoder and resampler chunks are commonly only a few KiB. Keep their exact
+// record boundaries while amortizing temporary-file syscalls over a bounded
+// buffer that remains small relative to one second of multichannel PCM.
+const IO_BUFFER_BYTES: usize = 1024 * 1024;
+
 pub(crate) struct PcmSpool {
-    file: File,
+    file: BufWriter<File>,
     channels: usize,
     frames: usize,
 }
@@ -15,8 +20,9 @@ impl PcmSpool {
         if channels == 0 {
             return Err("PCM spool requires at least one channel".into());
         }
+        let file = tempfile::tempfile().map_err(|error| format!("create PCM spool: {error}"))?;
         Ok(Self {
-            file: tempfile::tempfile().map_err(|error| format!("create PCM spool: {error}"))?,
+            file: BufWriter::with_capacity(IO_BUFFER_BYTES, file),
             channels,
             frames: 0,
         })
@@ -58,6 +64,12 @@ impl PcmSpool {
         self.frames
     }
 
+    pub(crate) fn finish_writing(&mut self) -> Result<(), String> {
+        self.file
+            .flush()
+            .map_err(|error| format!("flush PCM spool: {error}"))
+    }
+
     pub(crate) fn replay(
         &mut self,
         mut consume: impl FnMut(&mut [Vec<f32>]) -> Result<(), String>,
@@ -65,15 +77,16 @@ impl PcmSpool {
         self.file
             .seek(SeekFrom::Start(0))
             .map_err(|error| format!("rewind PCM spool: {error}"))?;
+        let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, self.file.get_mut());
         let mut planar = (0..self.channels).map(|_| Vec::new()).collect::<Vec<_>>();
         let mut replayed_frames = 0usize;
-        while let Some(frames) = read_record_frames(&mut self.file)? {
+        while let Some(frames) = read_record_frames(&mut reader)? {
             if frames == 0 {
                 return Err("PCM spool contains an empty record".into());
             }
             for channel in &mut planar {
                 channel.resize(frames, 0.0);
-                self.file
+                reader
                     .read_exact(samples_as_bytes_mut(channel))
                     .map_err(|error| format!("read PCM spool samples: {error}"))?;
             }
@@ -121,15 +134,15 @@ impl PcmSpool {
     }
 }
 
-fn read_record_frames(file: &mut File) -> Result<Option<usize>, String> {
+fn read_record_frames(reader: &mut impl Read) -> Result<Option<usize>, String> {
     let mut bytes = [0u8; 8];
-    let first = file
+    let first = reader
         .read(&mut bytes)
         .map_err(|error| format!("read PCM spool record: {error}"))?;
     if first == 0 {
         return Ok(None);
     }
-    file.read_exact(&mut bytes[first..]).map_err(|error| {
+    reader.read_exact(&mut bytes[first..]).map_err(|error| {
         if error.kind() == ErrorKind::UnexpectedEof {
             "PCM spool ended inside a record header".to_string()
         } else {
@@ -249,6 +262,38 @@ mod tests {
 
         let error = spool.replay_owned(|_| Ok(vec![Vec::new()])).unwrap_err();
         assert!(error.contains("returned 1 channels, expected 2"));
+    }
+
+    #[test]
+    fn replay_preserves_records_larger_than_the_io_buffer() {
+        let frames = IO_BUFFER_BYTES / size_of::<f32>() + 137;
+        let left = (0..frames)
+            .map(|frame| f32::from_bits(frame as u32 ^ 0x3f00_0000))
+            .collect::<Vec<_>>();
+        let right = (0..frames)
+            .map(|frame| f32::from_bits(frame as u32 ^ 0xbf00_0000))
+            .collect::<Vec<_>>();
+        let expected = [left, right];
+        let mut spool = PcmSpool::new(2).unwrap();
+        spool.write_chunk(&expected).unwrap();
+
+        spool
+            .replay(|actual| {
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert_eq!(
+                        actual
+                            .iter()
+                            .map(|sample| sample.to_bits())
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .map(|sample| sample.to_bits())
+                            .collect::<Vec<_>>()
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

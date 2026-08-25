@@ -218,7 +218,8 @@ the `-o` extension override this.
   reuse temporary output-domain PCM for resampled audio and decode-heavy
   lossless/DSD inputs, avoiding a second decode or resample; fast same-rate
   inputs and multi-track albums retain the lower-I/O/bounded-resource re-decode
-  path.
+  path. One MiB sequential read/write buffers amortize the small decoder and
+  resampler record I/O while preserving exact record boundaries.
   Standard-input audio is spooled to a temporary file so the same correct
   two-pass algorithm remains available in shell pipelines.
 * Release profile uses `lto = "fat"`, `codegen-units = 1`, and
