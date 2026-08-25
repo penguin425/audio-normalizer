@@ -192,6 +192,10 @@ the `-o` extension override this.
   deadlines replace a division/remainder check on every sample, while the
   established f64 addition/subtraction order, BS.1770 block boundaries, gating
   population, analysis JSON, and normalized output remain exact.
+* **Pre-resolved loudness channel plans** convert immutable BS.1770 channel
+  roles into scalar gains once when analysis starts. Multichannel hot loops load
+  those gains directly instead of re-evaluating role variants for every frame;
+  channel summation order and normalized output remain bit-identical.
 * **Specialized stereo streaming analysis** selects the paired K-weighting
   state once, keeps both true-peak meters in the hot loop, and avoids dynamic
   channel iteration. The generic channel-layout path remains unchanged, and
