@@ -256,6 +256,9 @@ pub struct StreamingAnalyzer {
         any(target_os = "linux", target_os = "windows")
     ))]
     cuda_true_peak: CudaTruePeakState,
+    // Both rings receive exactly one energy value for every increment of
+    // `frames`. Consequently `frames >= window_limit` is the cheapest exact
+    // full-window test in the per-frame hot loops.
     momentary: RunningWindow,
     short_term: RunningWindow,
     momentary_sum: f64,
@@ -499,10 +502,10 @@ impl StreamingAnalyzer {
                     short_term_window,
                 );
                 self.frames += 1;
-                if self.momentary.len() == momentary_window {
+                if self.frames >= momentary_window {
                     self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum);
                 }
-                if self.short_term.len() == short_term_window {
+                if self.frames >= short_term_window {
                     self.max_short_term_sum = self.max_short_term_sum.max(self.short_term_sum);
                 }
                 if self.frames == self.next_momentary_block_frame {
@@ -576,10 +579,10 @@ impl StreamingAnalyzer {
                     short_term_window,
                 );
                 self.frames += 1;
-                if self.momentary.len() == momentary_window {
+                if self.frames >= momentary_window {
                     self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum);
                 }
-                if self.short_term.len() == short_term_window {
+                if self.frames >= short_term_window {
                     self.max_short_term_sum = self.max_short_term_sum.max(self.short_term_sum);
                 }
                 if self.frames == self.next_momentary_block_frame {
@@ -635,10 +638,10 @@ impl StreamingAnalyzer {
                 short_term_window,
             );
             self.frames += 1;
-            if self.momentary.len() == momentary_window {
+            if self.frames >= momentary_window {
                 self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum);
             }
-            if self.short_term.len() == short_term_window {
+            if self.frames >= short_term_window {
                 self.max_short_term_sum = self.max_short_term_sum.max(self.short_term_sum);
             }
             if self.frames == self.next_momentary_block_frame {
@@ -808,10 +811,10 @@ impl StreamingAnalyzer {
                     short_term_window,
                 );
                 self.frames += 1;
-                if self.momentary.len() == momentary_window {
+                if self.frames >= momentary_window {
                     self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum);
                 }
-                if self.short_term.len() == short_term_window {
+                if self.frames >= short_term_window {
                     self.max_short_term_sum = self.max_short_term_sum.max(self.short_term_sum);
                 }
                 if self.frames == self.next_momentary_block_frame {
@@ -878,10 +881,10 @@ impl StreamingAnalyzer {
             short_term_window,
         );
         self.frames += 1;
-        if self.momentary.len() == momentary_window {
+        if self.frames >= momentary_window {
             self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum);
         }
-        if self.short_term.len() == short_term_window {
+        if self.frames >= short_term_window {
             self.max_short_term_sum = self.max_short_term_sum.max(self.short_term_sum);
         }
         if self.frames == self.next_momentary_block_frame {
@@ -1402,6 +1405,31 @@ mod tests {
                 }
                 assert_eq!(candidate.len(), reference.len());
                 assert_eq!(candidate_sum.to_bits(), reference_sum.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn frame_count_matches_running_window_fullness() {
+        for (momentary_limit, short_term_limit) in [(1, 1), (2, 7), (7, 31), (31, 127)] {
+            let mut momentary = RunningWindow::new(momentary_limit);
+            let mut short_term = RunningWindow::new(short_term_limit);
+            let mut momentary_sum = 0.0;
+            let mut short_term_sum = 0.0;
+            let mut frames = 0_usize;
+            for index in 0..4_097 {
+                let value = (index % 1_009) as f64 / 1_009.0;
+                momentary.push(&mut momentary_sum, value);
+                short_term.push(&mut short_term_sum, value);
+                frames += 1;
+                assert_eq!(
+                    momentary.len() == momentary_limit,
+                    frames >= momentary_limit
+                );
+                assert_eq!(
+                    short_term.len() == short_term_limit,
+                    frames >= short_term_limit
+                );
             }
         }
     }

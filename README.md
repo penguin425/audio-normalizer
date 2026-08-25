@@ -189,9 +189,11 @@ the `-o` extension override this.
   each while retaining only three seconds of filtered energy.
 * **Fixed streaming loudness windows** keep the 400 ms momentary and three-second
   short-term histories in preallocated circular arrays. Monotonic block-frame
-  deadlines replace a division/remainder check on every sample, while the
-  established f64 addition/subtraction order, BS.1770 block boundaries, gating
-  population, analysis JSON, and normalized output remain exact.
+  deadlines replace a division/remainder check on every sample, and the total
+  frame count proves when each window is full without re-reading either ring
+  length. The established f64 addition/subtraction order, BS.1770 block
+  boundaries, gating population, analysis JSON, and normalized output remain
+  exact.
 * **Specialized stereo streaming analysis** selects the paired K-weighting
   state once, keeps both true-peak meters in the hot loop, and avoids dynamic
   channel iteration. The generic channel-layout path remains unchanged, and
