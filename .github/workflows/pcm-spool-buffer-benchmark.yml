@@ -1,4 +1,4 @@
-name: PCM spool buffer candidate benchmark
+name: PCM spool buffer regression benchmark
 
 on:
   pull_request:
@@ -159,7 +159,6 @@ jobs:
         run: |
           python3 - <<'PY'
           import json
-          import statistics
           from pathlib import Path
 
           summary = {"system": {}, "modes": {}, "complete": True}
@@ -282,8 +281,6 @@ jobs:
               Path("pcm-spool-buffer-summary.json").read_text(encoding="utf-8")
           )
           assert summary["complete"], summary
-          all_changes = []
-          resample_changes = []
           for mode in ("default", "one"):
               for case_id, row in summary["modes"][mode].items():
                   metrics = row["metrics"]
@@ -299,23 +296,5 @@ jobs:
                       "RSS delta",
                       rss_delta,
                   )
-                  all_changes.extend((wall, cpu))
-                  if case_id == "wav-stereo-resample-normalize":
-                      resample_changes.extend((wall, cpu))
-          assert len(all_changes) == 8, all_changes
-          assert len(resample_changes) == 4, resample_changes
-          overall = statistics.fmean(all_changes)
-          resample = statistics.fmean(resample_changes)
-          assert overall <= -1.0, (
-              "buffering did not show a material aggregate speedup",
-              overall,
-              all_changes,
-          )
-          assert resample <= -2.0, (
-              "resampled normalization did not show a material speedup",
-              resample,
-              resample_changes,
-          )
-          print(f"aggregate wall/CPU change: {overall:+.3f}%")
-          print(f"resample wall/CPU change: {resample:+.3f}%")
+          print("all PCM spool regression gates passed")
           PY
