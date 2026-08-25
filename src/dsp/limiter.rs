@@ -462,12 +462,12 @@ mod tests {
                     if frame == 0 {
                         -0.0
                     } else {
-                        (0.01 * (frame as f32 * 0.017).sin()) as f32
+                        0.01 * (frame as f32 * 0.017).sin()
                     }
                 })
                 .collect::<Vec<_>>(),
             (0..frames)
-                .map(|frame| (0.008 * (frame as f32 * 0.023).cos()) as f32)
+                .map(|frame| 0.008 * (frame as f32 * 0.023).cos())
                 .collect::<Vec<_>>(),
         ];
         let mut limiter = TruePeakLimiter::new(48_000, 2, -1.0, LimiterConfig::default()).unwrap();
