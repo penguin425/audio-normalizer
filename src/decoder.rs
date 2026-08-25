@@ -559,7 +559,7 @@ pub fn decode_stream<F>(path: &Path, consume: F) -> Result<StreamInfo, String>
 where
     F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
 {
-    decode_stream_with_flac_workers::<false, _>(path, None, consume)
+    decode_stream_with_flac_workers(path, None, consume)
 }
 
 /// Decode with small planar-f32 packets coalesced for the normalization render
@@ -569,10 +569,28 @@ pub(crate) fn decode_stream_coalesced<F>(path: &Path, consume: F) -> Result<Stre
 where
     F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
 {
-    decode_stream_with_flac_workers::<true, _>(path, None, consume)
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if !matches!(
+        extension.as_str(),
+        "mp3" | "aac" | "m4a" | "mp4" | "ogg" | "oga"
+    ) {
+        return decode_stream(path, consume);
+    }
+
+    let mut consume = consume;
+    let mut pending = Vec::new();
+    let info = decode_stream(path, |info, planar| {
+        append_symphonia_stream_chunk(info, planar, &mut pending, &mut consume)
+    })?;
+    flush_symphonia_stream_chunk(&info, &mut pending, &mut consume)?;
+    Ok(info)
 }
 
-fn decode_stream_with_flac_workers<const COALESCE_F32: bool, F>(
+fn decode_stream_with_flac_workers<F>(
     path: &Path,
     forced_flac_workers: Option<usize>,
     mut consume: F,
@@ -580,7 +598,6 @@ fn decode_stream_with_flac_workers<const COALESCE_F32: bool, F>(
 where
     F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
 {
-    use symphonia::core::audio::GenericAudioBufferRef;
     use symphonia::core::errors::Error;
     use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::FormatOptions;
@@ -730,50 +747,30 @@ where
         if frames == 0 {
             continue;
         }
-        if COALESCE_F32 {
-            let info = info
-                .as_ref()
-                .expect("decoded output establishes stream info");
-            match decoded {
-                GenericAudioBufferRef::F32(buffer) => {
-                    append_symphonia_f32_stream_chunk(info, buffer, &mut planar, &mut consume)?;
-                }
-                decoded => {
-                    flush_symphonia_stream_chunk(info, &mut planar, &mut consume)?;
-                    decoded.copy_to_vecs_planar::<f32>(&mut planar);
-                    consume_and_clear_stream_chunk(info, &mut planar, &mut consume)?;
-                }
-            }
-        } else {
-            decoded.copy_to_vecs_planar::<f32>(&mut planar);
-            consume(
-                info.as_ref()
-                    .expect("decoded output establishes stream info"),
-                &mut planar,
-            )?;
-        }
+        decoded.copy_to_vecs_planar::<f32>(&mut planar);
+        consume(info.as_ref().unwrap(), &mut planar)?;
     }
 
-    if COALESCE_F32 {
-        if let Some(info) = info.as_ref() {
-            flush_symphonia_stream_chunk(info, &mut planar, &mut consume)?;
-        }
-    }
     info.ok_or_else(|| format!("{}: no audio decoded", path.display()))
 }
 
-fn append_symphonia_f32_stream_chunk<F>(
+fn append_symphonia_stream_chunk<F>(
     info: &StreamInfo,
-    decoded: &symphonia::core::audio::AudioBuffer<f32>,
+    decoded: &mut [Vec<f32>],
     planar: &mut Vec<Vec<f32>>,
     consume: &mut F,
 ) -> Result<(), String>
 where
     F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
 {
-    use symphonia::core::audio::Audio;
-
-    let channels = decoded.num_planes();
+    let channels = decoded.len();
+    let decoded_frames = decoded.first().map_or(0, Vec::len);
+    if decoded
+        .iter()
+        .any(|channel| channel.len() != decoded_frames)
+    {
+        return Err("stream channel length mismatch".into());
+    }
     if planar.is_empty() {
         planar.resize_with(channels, || {
             Vec::with_capacity(TARGET_SYMPHONIA_STREAM_CHUNK_FRAMES)
@@ -789,12 +786,13 @@ where
     {
         return Err("stream channel length mismatch".into());
     }
-    if buffered_frames > 0 && decoded.frames() >= TARGET_SYMPHONIA_STREAM_CHUNK_FRAMES {
+    if decoded_frames >= TARGET_SYMPHONIA_STREAM_CHUNK_FRAMES {
         // Keep an already-large decoder packet intact instead of copying the
         // pending tail into it and growing the reusable allocation needlessly.
-        consume_and_clear_stream_chunk(info, planar.as_mut_slice(), consume)?;
+        flush_symphonia_stream_chunk(info, planar.as_mut_slice(), consume)?;
+        return consume(info, decoded);
     }
-    for (destination, source) in planar.iter_mut().zip(decoded.iter_planes()) {
+    for (destination, source) in planar.iter_mut().zip(decoded.iter()) {
         destination.extend_from_slice(source);
     }
     if planar
@@ -1252,18 +1250,14 @@ mod tests {
     }
 
     #[test]
-    fn symphonia_f32_packets_coalesce_without_splitting_large_chunks() {
-        use symphonia::core::audio::{AudioMut, AudioSpec};
-
-        fn packet(start: usize, frames: usize) -> symphonia::core::audio::AudioBuffer<f32> {
-            let spec = AudioSpec::new(48_000, CHANNEL_LAYOUT_STEREO.clone());
-            let mut buffer = symphonia::core::audio::AudioBuffer::new(spec, frames);
-            buffer.resize_with_silence(frames);
-            let (left, right) = buffer.plane_pair_mut(0, 1).unwrap();
+    fn symphonia_render_packets_coalesce_without_splitting_large_chunks() {
+        fn packet(start: usize, frames: usize) -> Vec<Vec<f32>> {
+            let mut buffer = vec![vec![0.0; frames], vec![0.0; frames]];
+            let (left, right) = buffer.split_at_mut(1);
             for frame in 0..frames {
                 let sample = (start + frame) as f32 / 65_536.0;
-                left[frame] = sample;
-                right[frame] = -sample;
+                left[0][frame] = sample;
+                right[0][frame] = -sample;
             }
             buffer
         }
@@ -1288,13 +1282,8 @@ mod tests {
         let packet_frames = [1_500, 1_500, 1_500, 1_000, 20_000, 123];
         let mut start = 0;
         for frames in packet_frames {
-            append_symphonia_f32_stream_chunk(
-                &info,
-                &packet(start, frames),
-                &mut planar,
-                &mut consume,
-            )
-            .unwrap();
+            let mut packet = packet(start, frames);
+            append_symphonia_stream_chunk(&info, &mut packet, &mut planar, &mut consume).unwrap();
             start += frames;
         }
         flush_symphonia_stream_chunk(&info, &mut planar, &mut consume).unwrap();
@@ -1351,17 +1340,16 @@ mod tests {
 
     fn decode_flac_with_workers(path: &Path, workers: usize) -> (StreamInfo, Vec<Vec<f32>>) {
         let mut samples = Vec::new();
-        let info =
-            decode_stream_with_flac_workers::<false, _>(path, Some(workers), |info, planar| {
-                if samples.is_empty() {
-                    samples = vec![Vec::new(); info.channels as usize];
-                }
-                for (destination, source) in samples.iter_mut().zip(planar) {
-                    destination.extend_from_slice(source);
-                }
-                Ok(())
-            })
-            .unwrap();
+        let info = decode_stream_with_flac_workers(path, Some(workers), |info, planar| {
+            if samples.is_empty() {
+                samples = vec![Vec::new(); info.channels as usize];
+            }
+            for (destination, source) in samples.iter_mut().zip(planar) {
+                destination.extend_from_slice(source);
+            }
+            Ok(())
+        })
+        .unwrap();
         (info, samples)
     }
 
