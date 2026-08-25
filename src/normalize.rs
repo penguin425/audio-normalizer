@@ -3251,6 +3251,7 @@ fn process_normalized_stream(
         path: input,
         spool: source_spool,
     } = source;
+    let limiter_proven_idle = limiter_is_proven_idle(analysis, gain, ceiling, plan);
     let mut limiter = plan
         .limiter
         .map(|config| {
@@ -3262,12 +3263,13 @@ fn process_normalized_stream(
             )
         })
         .transpose()?;
-    if capture_statistics {
-        const MAX_ENVELOPE_POINTS: usize = 10_000;
-        let minimum_interval = (analysis.sample_rate as usize / 10).max(1);
-        let bounded_interval = analysis.frames.div_ceil(MAX_ENVELOPE_POINTS).max(1);
+    if limiter_proven_idle {
+        limiter = None;
+    }
+    let statistics_interval = capture_statistics.then(|| limiter_statistics_interval(analysis));
+    if let Some(statistics_interval) = statistics_interval {
         if let Some(limiter) = limiter.as_mut() {
-            limiter.set_statistics_interval_frames(minimum_interval.max(bounded_interval));
+            limiter.set_statistics_interval_frames(statistics_interval);
         }
     }
     let mut limiter_output = if limiter.is_some() {
@@ -3356,10 +3358,41 @@ fn process_normalized_stream(
             write(&limiter_output)?;
         }
         limiter_statistics
+    } else if limiter_proven_idle {
+        statistics_interval
+            .map(|interval| LimiterStatistics::proven_idle(analysis.frames, interval))
     } else {
         None
     };
     Ok(statistics.map(|statistics| statistics.finish(limiter_statistics)))
+}
+
+fn limiter_statistics_interval(analysis: &Analysis) -> usize {
+    const MAX_ENVELOPE_POINTS: usize = 10_000;
+    let minimum_interval = (analysis.sample_rate as usize / 10).max(1);
+    let bounded_interval = analysis.frames.div_ceil(MAX_ENVELOPE_POINTS).max(1);
+    minimum_interval.max(bounded_interval)
+}
+
+/// Prove from a discrete-sample bound that the linked True Peak limiter cannot
+/// leave unity gain. The sample peak and gain are multiplied as `f32`, exactly
+/// matching the render pass; correctly rounded multiplication is monotonic for
+/// the finite non-negative magnitudes accepted here. The True Peak helper then
+/// expands that rounded maximum by the FIR phase L1 bound.
+fn limiter_is_proven_idle(analysis: &Analysis, gain: f32, ceiling: f32, plan: &Plan) -> bool {
+    if plan.limiter.is_none()
+        || !analysis.sample_peak.is_finite()
+        || analysis.sample_peak < 0.0
+        || !gain.is_finite()
+        || gain < 0.0
+        || !ceiling.is_finite()
+        || ceiling < 0.0
+    {
+        return false;
+    }
+    let post_gain_sample_peak = analysis.sample_peak * gain;
+    crate::dsp::truepeak::upper_bound_from_sample_peak(analysis.sample_rate, post_gain_sample_peak)
+        <= f64::from(ceiling)
 }
 
 fn process_normalized_chunk(
@@ -3623,6 +3656,139 @@ mod tests {
             output_sample_rate: None,
             resample_quality: ResampleQuality::Balanced,
         }
+    }
+
+    #[test]
+    fn limiter_idle_proof_is_conservative_at_the_ceiling() {
+        let mut render_plan = plan();
+        render_plan.limiter = Some(LimiterConfig::default());
+        let mut measured = analysis(-20.0, -6.020_599_913_279_624);
+        measured.sample_rate = 192_000;
+        measured.sample_peak = 0.5;
+
+        assert!(limiter_is_proven_idle(&measured, 1.0, 0.5, &render_plan));
+        assert!(!limiter_is_proven_idle(
+            &measured,
+            0.5_f32.next_up() / 0.5,
+            0.5,
+            &render_plan
+        ));
+
+        measured.sample_rate = 48_000;
+        assert!(!limiter_is_proven_idle(&measured, 1.0, 0.5, &render_plan));
+        assert!(limiter_is_proven_idle(&measured, 0.25, 0.5, &render_plan));
+
+        render_plan.limiter = None;
+        assert!(!limiter_is_proven_idle(&measured, 0.25, 0.5, &render_plan));
+    }
+
+    #[test]
+    fn proven_idle_stream_matches_the_full_limiter_and_its_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("source.wav");
+        let bypass_output = directory.path().join("bypass.wav");
+        let full_output = directory.path().join("full.wav");
+        let frames = 48_000 * 4 + 137;
+        let data = (0..2)
+            .map(|channel| {
+                let frequency = 701.0 + channel as f32 * 421.0;
+                (0..frames)
+                    .map(|frame| {
+                        0.03 * (std::f32::consts::TAU * frequency * frame as f32 / 48_000.0).sin()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        WavWriter::write(
+            &input,
+            &AudioBuffer {
+                sample_rate: 48_000,
+                channels: 2,
+                frames,
+                data,
+                channel_roles: default_channel_roles(2),
+                source_kind: PcmKind::F32,
+            },
+            PcmKind::F32,
+            false,
+        )
+        .unwrap();
+        let source = analyze_file(&input).unwrap();
+        let mut forced_full = source.clone();
+        forced_full.sample_peak = 1.0;
+        let mut render_plan = plan();
+        render_plan.limiter = Some(LimiterConfig::default());
+        render_plan.output_kind = Some(PcmKind::F32);
+        let ceiling = 10.0_f64.powf(render_plan.ceiling_db / 20.0) as f32;
+        assert!(limiter_is_proven_idle(&source, 1.0, ceiling, &render_plan));
+        assert!(!limiter_is_proven_idle(
+            &forced_full,
+            1.0,
+            ceiling,
+            &render_plan
+        ));
+        let options = StreamRenderOptions {
+            opus_album_lufs: None,
+            capture_statistics: true,
+            capture_lossless_verification: false,
+            verification_channel_roles: None,
+        };
+        let bypass = normalize_stream(
+            StreamSource {
+                path: &input,
+                spool: None,
+            },
+            &bypass_output,
+            &source,
+            1.0,
+            &render_plan,
+            OutputFormat::Wav,
+            options,
+        )
+        .unwrap()
+        .statistics
+        .unwrap();
+        let full = normalize_stream(
+            StreamSource {
+                path: &input,
+                spool: None,
+            },
+            &full_output,
+            &forced_full,
+            1.0,
+            &render_plan,
+            OutputFormat::Wav,
+            options,
+        )
+        .unwrap()
+        .statistics
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(&bypass_output).unwrap(),
+            std::fs::read(&full_output).unwrap()
+        );
+        assert_analysis_identical(&bypass.intended, &full.intended, "idle limiter bypass");
+        assert_eq!(
+            bypass.input_full_scale_exceeding_samples,
+            full.input_full_scale_exceeding_samples
+        );
+        assert_eq!(
+            bypass.post_gain_full_scale_exceeding_samples,
+            full.post_gain_full_scale_exceeding_samples
+        );
+        assert_eq!(
+            bypass.post_gain_ceiling_exceeding_samples,
+            full.post_gain_ceiling_exceeding_samples
+        );
+        assert_eq!(
+            bypass.protected_full_scale_exceeding_samples,
+            full.protected_full_scale_exceeding_samples
+        );
+        assert_eq!(
+            serde_json::to_value(bypass.limiter.unwrap()).unwrap(),
+            serde_json::to_value(full.limiter.unwrap()).unwrap()
+        );
     }
 
     #[test]
