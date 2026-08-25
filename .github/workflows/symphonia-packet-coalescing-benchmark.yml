@@ -118,7 +118,12 @@ jobs:
               ),
               (
                   "ogg",
-                  ["-map_metadata", "-1", "-c:a", "libvorbis", "-q:a", "5"],
+                  [
+                      "-map_metadata", "-1",
+                      "-c:a", "vorbis",
+                      "-strict", "-2",
+                      "-q:a", "5",
+                  ],
               ),
           )
           for extension, arguments in fixtures:
