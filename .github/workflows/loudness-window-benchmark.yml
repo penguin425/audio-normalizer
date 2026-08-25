@@ -49,7 +49,7 @@ jobs:
           set -euo pipefail
           cargo test --locked --manifest-path candidate/Cargo.toml \
             --no-default-features --lib \
-            fixed_running_window_matches_vecdeque_sum_bit_exactly \
+            shared_loudness_windows_match_two_vecdeque_sums_bit_exactly \
             -- --nocapture
           cargo test --locked --manifest-path candidate/Cargo.toml \
             --no-default-features --lib \
@@ -216,6 +216,7 @@ jobs:
                           "candidate_pooled": candidate_value,
                           "change_percent": (candidate_value / base_value - 1.0) * 100.0,
                       }
+                  assert row["wall"]["change_percent"] <= 3.0, row
                   rows.append(row)
               summary["modes"]["default" if mode == "default" else "jobs_1"] = rows
 
