@@ -228,32 +228,42 @@ impl LoudnessWindows {
     #[inline(always)]
     fn push(&mut self, momentary_sum: &mut f64, short_term_sum: &mut f64, value: f64) {
         let length = self.values.len();
-        let expired_momentary =
-            (length >= self.momentary_limit).then(|| self.values[self.momentary_cursor]);
-        let expired_short_term =
-            (length == self.short_term_limit).then(|| self.values[self.short_term_cursor]);
-
-        // Retain the previous two-window arithmetic order exactly: add the new
-        // value first, then subtract the expired value from each independent
-        // running sum.
-        *momentary_sum += value;
-        if let Some(expired) = expired_momentary {
-            *momentary_sum -= expired;
+        if length == self.short_term_limit {
+            // Once the three-second window is full, every subsequent frame
+            // takes this branch. Load both expired values before replacing the
+            // oldest slot because both cursors coincide when the limits are
+            // equal. The add/subtract order remains bit-identical to the two
+            // original independent windows.
+            let expired_momentary = self.values[self.momentary_cursor];
+            let expired_short_term = self.values[self.short_term_cursor];
+            *momentary_sum += value;
+            *momentary_sum -= expired_momentary;
+            *short_term_sum += value;
+            *short_term_sum -= expired_short_term;
+            self.values[self.short_term_cursor] = value;
             self.momentary_cursor += 1;
             if self.momentary_cursor == self.short_term_limit {
                 self.momentary_cursor = 0;
             }
-        }
-        *short_term_sum += value;
-        if let Some(expired) = expired_short_term {
-            *short_term_sum -= expired;
-            self.values[self.short_term_cursor] = value;
             self.short_term_cursor += 1;
             if self.short_term_cursor == self.short_term_limit {
                 self.short_term_cursor = 0;
             }
-        } else {
-            self.values.push(value);
+            return;
+        }
+
+        // Initial fill is bounded to the first three seconds. Retain the
+        // previous two-window arithmetic order exactly: add the new value,
+        // then subtract the expired momentary value when that window is full.
+        *momentary_sum += value;
+        if length >= self.momentary_limit {
+            *momentary_sum -= self.values[self.momentary_cursor];
+            self.momentary_cursor += 1;
+        }
+        *short_term_sum += value;
+        self.values.push(value);
+        if self.momentary_cursor == self.short_term_limit {
+            self.momentary_cursor = 0;
         }
     }
 
