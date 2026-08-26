@@ -13,8 +13,44 @@ benchmark = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(benchmark)
 
+PAIRED_MODULE_PATH = Path(__file__).with_name("paired_benchmark.py")
+PAIRED_SPEC = importlib.util.spec_from_file_location(
+    "forge_paired_benchmark", PAIRED_MODULE_PATH
+)
+paired_benchmark = importlib.util.module_from_spec(PAIRED_SPEC)
+assert PAIRED_SPEC.loader is not None
+PAIRED_SPEC.loader.exec_module(paired_benchmark)
+
 
 class BenchmarkTests(unittest.TestCase):
+    def test_paired_schedule_balances_each_small_block_and_starting_order(self):
+        schedule = paired_benchmark.alternating_schedule(4)
+        self.assertEqual(len(schedule), 16)
+        self.assertEqual(schedule.count(paired_benchmark.BASELINE), 8)
+        self.assertEqual(schedule.count(paired_benchmark.CANDIDATE), 8)
+        self.assertEqual(
+            schedule[:4],
+            [
+                paired_benchmark.BASELINE,
+                paired_benchmark.CANDIDATE,
+                paired_benchmark.CANDIDATE,
+                paired_benchmark.BASELINE,
+            ],
+        )
+        self.assertEqual(
+            schedule[4:8],
+            [
+                paired_benchmark.CANDIDATE,
+                paired_benchmark.BASELINE,
+                paired_benchmark.BASELINE,
+                paired_benchmark.CANDIDATE,
+            ],
+        )
+        self.assertEqual(
+            paired_benchmark.alternating_schedule(1, inverted=True),
+            schedule[4:8],
+        )
+
     def test_repeated_measurements_use_medians_and_maximum_rss(self):
         summary = benchmark.aggregate_measurements([
             {
