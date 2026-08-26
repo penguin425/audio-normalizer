@@ -203,6 +203,36 @@ impl WavStreamWriter {
         Ok(())
     }
 
+    pub(crate) fn supports_borrowed_planar(&self) -> bool {
+        !self.dither
+            && (self.kind == PcmKind::F32 || (self.kind == PcmKind::S16 && self.rngs.len() <= 2))
+    }
+
+    pub(crate) fn write_normalized_borrowed_chunk(
+        &mut self,
+        planar: &[&[f32]],
+        gain: f32,
+        ceiling: f32,
+    ) -> Result<(), WavWriteError> {
+        if !self.supports_borrowed_planar() {
+            return Err(WavWriteError::Io(io::Error::other(
+                "borrowed planar encoding is unavailable for this WAVE format",
+            )));
+        }
+        let frames = self.validate_borrowed_chunk(planar)?;
+        convert::encode_normalized_borrowed_interleaved_with_rngs_into(
+            planar,
+            self.kind,
+            gain,
+            ceiling,
+            &mut self.rngs,
+            &mut self.encoded,
+        );
+        self.file.write_all(&self.encoded)?;
+        self.remaining_frames -= frames;
+        Ok(())
+    }
+
     /// Exact interleaved PCM bytes produced by the most recent successful
     /// [`Self::write_chunk`] call.
     pub(crate) fn last_encoded_chunk(&self) -> &[u8] {
@@ -211,6 +241,26 @@ impl WavStreamWriter {
 
     fn validate_chunk(&self, planar: &[Vec<f32>]) -> Result<usize, WavWriteError> {
         let frames = planar.first().map_or(0, Vec::len);
+        if frames > self.remaining_frames {
+            return Err(WavWriteError::Io(io::Error::other(
+                "more frames decoded than expected",
+            )));
+        }
+        Ok(frames)
+    }
+
+    fn validate_borrowed_chunk(&self, planar: &[&[f32]]) -> Result<usize, WavWriteError> {
+        if planar.len() != self.rngs.len() {
+            return Err(WavWriteError::Io(io::Error::other(
+                "channel count does not match WAVE output",
+            )));
+        }
+        let frames = planar.first().map_or(0, |channel| channel.len());
+        if planar.iter().any(|channel| channel.len() != frames) {
+            return Err(WavWriteError::Io(io::Error::other(
+                "channel lengths do not match",
+            )));
+        }
         if frames > self.remaining_frames {
             return Err(WavWriteError::Io(io::Error::other(
                 "more frames decoded than expected",
@@ -481,5 +531,45 @@ mod tests {
         writer.write_chunk(&chunk).unwrap();
         assert_eq!(writer.encoded.capacity(), first_capacity);
         writer.finish().unwrap();
+    }
+
+    #[test]
+    fn borrowed_stream_chunk_matches_owned_wave_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let owned_output = directory.path().join("owned.wav");
+        let borrowed_output = directory.path().join("borrowed.wav");
+        let chunk = vec![
+            vec![f32::NAN, -1.25, -0.0, 0.0, 0.25, 1.0, 1.25, 0.3, -0.7],
+            vec![1.25, 1.0, 0.5, 0.0, -0.0, -0.5, -1.0, -1.25, 0.1],
+        ];
+
+        let gain = 0.75;
+        let ceiling = 0.9;
+        let mut normalized = chunk.clone();
+        for channel in &mut normalized {
+            crate::dsp::simd::apply_gain_and_hard_clip(channel, gain, ceiling);
+        }
+        let mut owned =
+            WavStreamWriter::create(&owned_output, 48_000, 2, 9, PcmKind::S16, false).unwrap();
+        owned.write_chunk(&normalized).unwrap();
+        owned.finish().unwrap();
+
+        let borrowed_storage = chunk;
+        let borrowed = borrowed_storage
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
+        let mut borrowed_writer =
+            WavStreamWriter::create(&borrowed_output, 48_000, 2, 9, PcmKind::S16, false).unwrap();
+        assert!(borrowed_writer.supports_borrowed_planar());
+        borrowed_writer
+            .write_normalized_borrowed_chunk(&borrowed, gain, ceiling)
+            .unwrap();
+        borrowed_writer.finish().unwrap();
+
+        assert_eq!(
+            std::fs::read(borrowed_output).unwrap(),
+            std::fs::read(owned_output).unwrap()
+        );
     }
 }

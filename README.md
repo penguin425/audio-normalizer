@@ -224,12 +224,15 @@ the `-o` extension override this.
   lossless/DSD inputs, avoiding a second decode or resample; fast same-rate
   inputs and multi-track albums retain the lower-I/O/bounded-resource re-decode
   path. When an exact WAV, FLAC, or DSD duration proves that one top-level spool
-  fits, Forge retains at most 128 MiB of its exact PCM in userspace. One
-  process-wide lease prevents concurrent memory multiplication; unknown or
-  longer inputs and nested file jobs use the established temporary file from
-  their first sample. A defensive exact spill handles inconsistent metadata,
-  while one MiB sequential buffers amortize disk I/O and preserve record
-  boundaries.
+  fits, Forge reserves its reliable payload plus one MiB of record headroom
+  once, then retains at most 128 MiB of exact PCM in userspace. Undithered S16
+  and F32 WAVE deliveries consume those retained channel planes directly and
+  fuse gain, clipping, and encoding in one pass, avoiding both the replay copy
+  and a PCM writeback. One process-wide lease prevents concurrent memory
+  multiplication; unknown or longer inputs and nested file jobs use the
+  established temporary file from their first sample. A defensive exact spill
+  handles inconsistent metadata, while one MiB sequential buffers amortize
+  disk I/O and preserve record boundaries.
   Standard-input audio is spooled to a temporary file so the same correct
   two-pass algorithm remains available in shell pipelines.
 * Release profile uses `lto = "fat"`, `codegen-units = 1`, and

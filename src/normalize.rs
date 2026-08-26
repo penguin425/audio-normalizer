@@ -2826,6 +2826,36 @@ impl NormalizedStreamWriter {
         }
     }
 
+    fn supports_borrowed_planar(&self) -> bool {
+        matches!(
+            self,
+            Self::Wav {
+                writer,
+                lossless: None,
+                ..
+            } if writer.supports_borrowed_planar()
+        )
+    }
+
+    fn write_normalized_borrowed_chunk(
+        &mut self,
+        planar: &[&[f32]],
+        gain: f32,
+        ceiling: f32,
+    ) -> Result<(), String> {
+        match self {
+            Self::Wav {
+                output,
+                writer,
+                lossless: None,
+                ..
+            } if writer.supports_borrowed_planar() => writer
+                .write_normalized_borrowed_chunk(planar, gain, ceiling)
+                .map_err(|error| format!("write {}: {error}", output.display())),
+            _ => Err("stream writer does not support borrowed planar PCM".into()),
+        }
+    }
+
     fn finish(self) -> Result<Option<Analysis>, String> {
         match self {
             Self::Wav {
@@ -3181,6 +3211,26 @@ fn normalize_stream(
     }
     let mut writer =
         NormalizedStreamWriter::create(source.path, output, analysis, gain, plan, format, options)?;
+    if plan.limiter.is_none()
+        && !options.capture_statistics
+        && writer.supports_borrowed_planar()
+        && source
+            .spool
+            .as_deref()
+            .is_some_and(PcmSpool::can_replay_borrowed)
+    {
+        source
+            .spool
+            .as_deref()
+            .expect("borrowed spool eligibility checked above")
+            .replay_borrowed(|planar| {
+                writer.write_normalized_borrowed_chunk(planar, gain, ceiling)
+            })?;
+        return Ok(StreamRenderResult {
+            statistics: None,
+            lossless_output: writer.finish()?,
+        });
+    }
     let statistics = process_normalized_stream(
         source,
         analysis,

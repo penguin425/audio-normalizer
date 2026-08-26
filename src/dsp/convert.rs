@@ -509,8 +509,58 @@ pub(crate) fn encode_interleaved_with_rngs_into(
     encode_interleaved_scalar_from(planar, kind, dither, rngs, out, 0);
 }
 
-fn encode_interleaved_scalar_from(
-    planar: &[Vec<f32>],
+/// Apply the established gain/clip operation and encode borrowed channel
+/// planes in one pass. This is intentionally limited to the undithered formats
+/// used by the one-shot in-memory normalization path.
+pub(crate) fn encode_normalized_borrowed_interleaved_with_rngs_into(
+    planar: &[&[f32]],
+    kind: PcmKind,
+    gain: f32,
+    ceiling: f32,
+    rngs: &mut [u64],
+    out: &mut Vec<u8>,
+) {
+    let channels = planar.len();
+    assert!(channels >= 1);
+    assert_eq!(rngs.len(), channels);
+    assert!(matches!(kind, PcmKind::S16 | PcmKind::F32));
+    assert!(kind != PcmKind::S16 || channels <= 2);
+    let frames = planar[0].len();
+    for channel in planar {
+        assert_eq!(channel.len(), frames, "channel length mismatch");
+    }
+    let bpp = kind.bytes_per_sample();
+    out.clear();
+    out.resize(frames * channels * bpp, 0);
+
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        match kind {
+            PcmKind::S16 => {
+                unsafe { encode_normalized_s16_no_dither_avx2(planar, gain, ceiling, out) };
+                return;
+            }
+            PcmKind::F32 => {
+                unsafe { encode_normalized_f32_avx2(planar, gain, ceiling, out) };
+                return;
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    match kind {
+        PcmKind::S16 => unsafe { encode_normalized_s16_no_dither_neon(planar, gain, ceiling, out) },
+        PcmKind::F32 => unsafe { encode_normalized_f32_neon(planar, gain, ceiling, out) },
+        _ => unreachable!(),
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    encode_normalized_interleaved_scalar_from(planar, kind, gain, ceiling, rngs, out, 0);
+}
+
+fn encode_interleaved_scalar_from<P: AsRef<[f32]>>(
+    planar: &[P],
     kind: PcmKind,
     dither: bool,
     rngs: &mut [u64],
@@ -519,11 +569,11 @@ fn encode_interleaved_scalar_from(
 ) {
     let channels = planar.len();
     let bpp = kind.bytes_per_sample();
-    let frames = planar[0].len();
+    let frames = planar[0].as_ref().len();
     let mut idx = start_frame * channels * bpp;
     for f in start_frame..frames {
         for (ch, rng) in planar.iter().zip(rngs.iter_mut()) {
-            let s = ch[f];
+            let s = ch.as_ref()[f];
             let b = encode_sample(s, kind, dither, rng);
             out[idx..idx + bpp].copy_from_slice(&b[..bpp]);
             idx += bpp;
@@ -531,15 +581,38 @@ fn encode_interleaved_scalar_from(
     }
 }
 
+fn encode_normalized_interleaved_scalar_from<P: AsRef<[f32]>>(
+    planar: &[P],
+    kind: PcmKind,
+    gain: f32,
+    ceiling: f32,
+    rngs: &mut [u64],
+    out: &mut [u8],
+    start_frame: usize,
+) {
+    let channels = planar.len();
+    let bpp = kind.bytes_per_sample();
+    let frames = planar[0].as_ref().len();
+    let mut idx = start_frame * channels * bpp;
+    for frame in start_frame..frames {
+        for (channel, rng) in planar.iter().zip(rngs.iter_mut()) {
+            let normalized = (channel.as_ref()[frame] * gain).clamp(-ceiling, ceiling);
+            let encoded = encode_sample(normalized, kind, false, rng);
+            out[idx..idx + bpp].copy_from_slice(&encoded[..bpp]);
+            idx += bpp;
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn encode_s16_no_dither_avx2(planar: &[Vec<f32>], out: &mut [u8]) {
-    let frames = planar[0].len();
+unsafe fn encode_s16_no_dither_avx2<P: AsRef<[f32]>>(planar: &[P], out: &mut [u8]) {
+    let frames = planar[0].as_ref().len();
     let channels = planar.len();
     let mut frame = 0;
     if channels == 1 {
         while frame + 8 <= frames {
-            let samples = _mm256_loadu_ps(planar[0].as_ptr().add(frame));
+            let samples = _mm256_loadu_ps(planar[0].as_ref().as_ptr().add(frame));
             let quantized = quantize_s16x8(samples);
             let packed = _mm_packs_epi32(
                 _mm256_castsi256_si128(quantized),
@@ -550,8 +623,8 @@ unsafe fn encode_s16_no_dither_avx2(planar: &[Vec<f32>], out: &mut [u8]) {
         }
     } else {
         while frame + 8 <= frames {
-            let left = quantize_s16x8(_mm256_loadu_ps(planar[0].as_ptr().add(frame)));
-            let right = quantize_s16x8(_mm256_loadu_ps(planar[1].as_ptr().add(frame)));
+            let left = quantize_s16x8(_mm256_loadu_ps(planar[0].as_ref().as_ptr().add(frame)));
+            let right = quantize_s16x8(_mm256_loadu_ps(planar[1].as_ref().as_ptr().add(frame)));
             let left = _mm_packs_epi32(
                 _mm256_castsi256_si128(left),
                 _mm256_extracti128_si256(left, 1),
@@ -577,6 +650,165 @@ unsafe fn encode_s16_no_dither_avx2(planar: &[Vec<f32>], out: &mut [u8]) {
         out,
         frame,
     );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn encode_normalized_s16_no_dither_avx2<P: AsRef<[f32]>>(
+    planar: &[P],
+    gain: f32,
+    ceiling: f32,
+    out: &mut [u8],
+) {
+    let frames = planar[0].as_ref().len();
+    let channels = planar.len();
+    let gain_vector = _mm256_set1_ps(gain);
+    let lower = _mm256_set1_ps(-ceiling);
+    let upper = _mm256_set1_ps(ceiling);
+    let mut frame = 0;
+    if channels == 1 {
+        while frame + 8 <= frames {
+            let samples = _mm256_loadu_ps(planar[0].as_ref().as_ptr().add(frame));
+            let quantized = quantize_normalized_s16x8(samples, gain_vector, lower, upper);
+            let packed = _mm_packs_epi32(
+                _mm256_castsi256_si128(quantized),
+                _mm256_extracti128_si256(quantized, 1),
+            );
+            _mm_storeu_si128(out.as_mut_ptr().add(frame * 2).cast(), packed);
+            frame += 8;
+        }
+    } else {
+        while frame + 8 <= frames {
+            let left = quantize_normalized_s16x8(
+                _mm256_loadu_ps(planar[0].as_ref().as_ptr().add(frame)),
+                gain_vector,
+                lower,
+                upper,
+            );
+            let right = quantize_normalized_s16x8(
+                _mm256_loadu_ps(planar[1].as_ref().as_ptr().add(frame)),
+                gain_vector,
+                lower,
+                upper,
+            );
+            let left = _mm_packs_epi32(
+                _mm256_castsi256_si128(left),
+                _mm256_extracti128_si256(left, 1),
+            );
+            let right = _mm_packs_epi32(
+                _mm256_castsi256_si128(right),
+                _mm256_extracti128_si256(right, 1),
+            );
+            let low = _mm_unpacklo_epi16(left, right);
+            let high = _mm_unpackhi_epi16(left, right);
+            let destination = out.as_mut_ptr().add(frame * 4);
+            _mm_storeu_si128(destination.cast(), low);
+            _mm_storeu_si128(destination.add(16).cast(), high);
+            frame += 8;
+        }
+    }
+    let mut rngs = [0_u64; 2];
+    encode_normalized_interleaved_scalar_from(
+        planar,
+        PcmKind::S16,
+        gain,
+        ceiling,
+        &mut rngs[..channels],
+        out,
+        frame,
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_normalized_s16x8(
+    samples: __m256,
+    gain: __m256,
+    lower: __m256,
+    upper: __m256,
+) -> __m256i {
+    let gained = _mm256_mul_ps(samples, gain);
+    // Match `apply_gain_and_hard_clip_avx2`: keeping the gained value in the
+    // second operand preserves its NaN for the quantizer's NaN-to-zero rule.
+    let protected = _mm256_min_ps(upper, _mm256_max_ps(lower, gained));
+    quantize_s16x8(protected)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn encode_normalized_f32_avx2<P: AsRef<[f32]>>(
+    planar: &[P],
+    gain: f32,
+    ceiling: f32,
+    out: &mut [u8],
+) {
+    let frames = planar[0].as_ref().len();
+    let channels = planar.len();
+    let gain_vector = _mm256_set1_ps(gain);
+    let lower = _mm256_set1_ps(-ceiling);
+    let upper = _mm256_set1_ps(ceiling);
+    let mut frame = 0;
+    if channels == 1 {
+        while frame + 8 <= frames {
+            let samples = _mm256_loadu_ps(planar[0].as_ref().as_ptr().add(frame));
+            let normalized = normalize_f32_outputx8(samples, gain_vector, lower, upper);
+            _mm256_storeu_ps(out.as_mut_ptr().add(frame * 4).cast(), normalized);
+            frame += 8;
+        }
+    } else {
+        while frame + 8 <= frames {
+            let left = normalize_f32_outputx8(
+                _mm256_loadu_ps(planar[0].as_ref().as_ptr().add(frame)),
+                gain_vector,
+                lower,
+                upper,
+            );
+            let right = normalize_f32_outputx8(
+                _mm256_loadu_ps(planar[1].as_ref().as_ptr().add(frame)),
+                gain_vector,
+                lower,
+                upper,
+            );
+            let low = _mm256_unpacklo_ps(left, right);
+            let high = _mm256_unpackhi_ps(left, right);
+            let first = _mm256_permute2f128_ps::<0x20>(low, high);
+            let second = _mm256_permute2f128_ps::<0x31>(low, high);
+            let destination = out.as_mut_ptr().add(frame * 8).cast::<f32>();
+            _mm256_storeu_ps(destination, first);
+            _mm256_storeu_ps(destination.add(8), second);
+            frame += 8;
+        }
+    }
+    let mut rngs = [0_u64; 2];
+    encode_normalized_interleaved_scalar_from(
+        planar,
+        PcmKind::F32,
+        gain,
+        ceiling,
+        &mut rngs[..channels],
+        out,
+        frame,
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn normalize_f32_outputx8(
+    samples: __m256,
+    gain: __m256,
+    lower: __m256,
+    upper: __m256,
+) -> __m256 {
+    let gained = _mm256_mul_ps(samples, gain);
+    let protected = _mm256_min_ps(upper, _mm256_max_ps(lower, gained));
+    let ordered = _mm256_cmp_ps::<{ _CMP_ORD_Q }>(protected, protected);
+    let finite_or_infinite = _mm256_and_ps(protected, ordered);
+    _mm256_min_ps(
+        _mm256_set1_ps(1.0),
+        _mm256_max_ps(_mm256_set1_ps(-1.0), finite_or_infinite),
+    )
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -627,24 +859,24 @@ unsafe fn encode_multichannel_no_dither_avx2(planar: &[Vec<f32>], kind: PcmKind,
 
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[target_feature(enable = "neon")]
-unsafe fn encode_s16_no_dither_neon(planar: &[Vec<f32>], out: &mut [u8]) {
-    let frames = planar[0].len();
+unsafe fn encode_s16_no_dither_neon<P: AsRef<[f32]>>(planar: &[P], out: &mut [u8]) {
+    let frames = planar[0].as_ref().len();
     let channels = planar.len();
     let mut frame = 0;
     if channels == 1 {
         while frame + 8 <= frames {
-            let low = quantize_s16x4(vld1q_f32(planar[0].as_ptr().add(frame)));
-            let high = quantize_s16x4(vld1q_f32(planar[0].as_ptr().add(frame + 4)));
+            let low = quantize_s16x4(vld1q_f32(planar[0].as_ref().as_ptr().add(frame)));
+            let high = quantize_s16x4(vld1q_f32(planar[0].as_ref().as_ptr().add(frame + 4)));
             let packed = vcombine_s16(vqmovn_s32(low), vqmovn_s32(high));
             vst1q_s16(out.as_mut_ptr().add(frame * 2).cast(), packed);
             frame += 8;
         }
     } else {
         while frame + 8 <= frames {
-            let left_low = quantize_s16x4(vld1q_f32(planar[0].as_ptr().add(frame)));
-            let left_high = quantize_s16x4(vld1q_f32(planar[0].as_ptr().add(frame + 4)));
-            let right_low = quantize_s16x4(vld1q_f32(planar[1].as_ptr().add(frame)));
-            let right_high = quantize_s16x4(vld1q_f32(planar[1].as_ptr().add(frame + 4)));
+            let left_low = quantize_s16x4(vld1q_f32(planar[0].as_ref().as_ptr().add(frame)));
+            let left_high = quantize_s16x4(vld1q_f32(planar[0].as_ref().as_ptr().add(frame + 4)));
+            let right_low = quantize_s16x4(vld1q_f32(planar[1].as_ref().as_ptr().add(frame)));
+            let right_high = quantize_s16x4(vld1q_f32(planar[1].as_ref().as_ptr().add(frame + 4)));
             let left = vcombine_s16(vqmovn_s32(left_low), vqmovn_s32(left_high));
             let right = vcombine_s16(vqmovn_s32(right_low), vqmovn_s32(right_high));
             let destination = out.as_mut_ptr().add(frame * 4).cast();
@@ -662,6 +894,170 @@ unsafe fn encode_s16_no_dither_neon(planar: &[Vec<f32>], out: &mut [u8]) {
         out,
         frame,
     );
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+unsafe fn encode_normalized_s16_no_dither_neon<P: AsRef<[f32]>>(
+    planar: &[P],
+    gain: f32,
+    ceiling: f32,
+    out: &mut [u8],
+) {
+    let frames = planar[0].as_ref().len();
+    let channels = planar.len();
+    let gain_vector = vdupq_n_f32(gain);
+    let lower = vdupq_n_f32(-ceiling);
+    let upper = vdupq_n_f32(ceiling);
+    let mut frame = 0;
+    if channels == 1 {
+        while frame + 8 <= frames {
+            let low = quantize_normalized_s16x4(
+                vld1q_f32(planar[0].as_ref().as_ptr().add(frame)),
+                gain_vector,
+                lower,
+                upper,
+            );
+            let high = quantize_normalized_s16x4(
+                vld1q_f32(planar[0].as_ref().as_ptr().add(frame + 4)),
+                gain_vector,
+                lower,
+                upper,
+            );
+            let packed = vcombine_s16(vqmovn_s32(low), vqmovn_s32(high));
+            vst1q_s16(out.as_mut_ptr().add(frame * 2).cast(), packed);
+            frame += 8;
+        }
+    } else {
+        while frame + 8 <= frames {
+            let left_low = quantize_normalized_s16x4(
+                vld1q_f32(planar[0].as_ref().as_ptr().add(frame)),
+                gain_vector,
+                lower,
+                upper,
+            );
+            let left_high = quantize_normalized_s16x4(
+                vld1q_f32(planar[0].as_ref().as_ptr().add(frame + 4)),
+                gain_vector,
+                lower,
+                upper,
+            );
+            let right_low = quantize_normalized_s16x4(
+                vld1q_f32(planar[1].as_ref().as_ptr().add(frame)),
+                gain_vector,
+                lower,
+                upper,
+            );
+            let right_high = quantize_normalized_s16x4(
+                vld1q_f32(planar[1].as_ref().as_ptr().add(frame + 4)),
+                gain_vector,
+                lower,
+                upper,
+            );
+            let left = vcombine_s16(vqmovn_s32(left_low), vqmovn_s32(left_high));
+            let right = vcombine_s16(vqmovn_s32(right_low), vqmovn_s32(right_high));
+            let destination = out.as_mut_ptr().add(frame * 4).cast();
+            vst1q_s16(destination, vzip1q_s16(left, right));
+            vst1q_s16(destination.add(8), vzip2q_s16(left, right));
+            frame += 8;
+        }
+    }
+    let mut rngs = [0_u64; 2];
+    encode_normalized_interleaved_scalar_from(
+        planar,
+        PcmKind::S16,
+        gain,
+        ceiling,
+        &mut rngs[..channels],
+        out,
+        frame,
+    );
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn quantize_normalized_s16x4(
+    samples: float32x4_t,
+    gain: float32x4_t,
+    lower: float32x4_t,
+    upper: float32x4_t,
+) -> int32x4_t {
+    let gained = vmulq_f32(samples, gain);
+    let protected = vminq_f32(upper, vmaxq_f32(lower, gained));
+    quantize_s16x4(protected)
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+unsafe fn encode_normalized_f32_neon<P: AsRef<[f32]>>(
+    planar: &[P],
+    gain: f32,
+    ceiling: f32,
+    out: &mut [u8],
+) {
+    let frames = planar[0].as_ref().len();
+    let channels = planar.len();
+    let gain_vector = vdupq_n_f32(gain);
+    let lower = vdupq_n_f32(-ceiling);
+    let upper = vdupq_n_f32(ceiling);
+    let mut frame = 0;
+    if channels == 1 {
+        while frame + 4 <= frames {
+            let samples = vld1q_f32(planar[0].as_ref().as_ptr().add(frame));
+            let normalized = normalize_f32_outputx4(samples, gain_vector, lower, upper);
+            vst1q_f32(out.as_mut_ptr().add(frame * 4).cast(), normalized);
+            frame += 4;
+        }
+    } else {
+        while frame + 4 <= frames {
+            let left = normalize_f32_outputx4(
+                vld1q_f32(planar[0].as_ref().as_ptr().add(frame)),
+                gain_vector,
+                lower,
+                upper,
+            );
+            let right = normalize_f32_outputx4(
+                vld1q_f32(planar[1].as_ref().as_ptr().add(frame)),
+                gain_vector,
+                lower,
+                upper,
+            );
+            let destination = out.as_mut_ptr().add(frame * 8).cast::<f32>();
+            vst1q_f32(destination, vzip1q_f32(left, right));
+            vst1q_f32(destination.add(4), vzip2q_f32(left, right));
+            frame += 4;
+        }
+    }
+    let mut rngs = [0_u64; 2];
+    encode_normalized_interleaved_scalar_from(
+        planar,
+        PcmKind::F32,
+        gain,
+        ceiling,
+        &mut rngs[..channels],
+        out,
+        frame,
+    );
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn normalize_f32_outputx4(
+    samples: float32x4_t,
+    gain: float32x4_t,
+    lower: float32x4_t,
+    upper: float32x4_t,
+) -> float32x4_t {
+    let gained = vmulq_f32(samples, gain);
+    let protected = vminq_f32(upper, vmaxq_f32(lower, gained));
+    let ordered = vceqq_f32(protected, protected);
+    let finite_or_infinite = vbslq_f32(ordered, protected, vdupq_n_f32(0.0));
+    vminq_f32(
+        vdupq_n_f32(1.0),
+        vmaxq_f32(vdupq_n_f32(-1.0), finite_or_infinite),
+    )
 }
 
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
@@ -1010,6 +1406,71 @@ mod tests {
             let plain = encode_interleaved(&samples, kind, false);
             let dithered = encode_interleaved(&samples, kind, true);
             assert_ne!(dithered, plain, "dither was inert for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn fused_borrowed_normalization_matches_owned_encoder_exactly() {
+        let channel = vec![
+            f32::NAN,
+            f32::INFINITY,
+            -f32::INFINITY,
+            -1.25,
+            -1.0,
+            -0.0,
+            0.0,
+            0.5 / 32_768.0,
+            -0.5 / 32_768.0,
+            1.0,
+            1.25,
+            f32::from_bits(1),
+            0.125,
+            -0.375,
+            0.875,
+            -0.9375,
+            0.3,
+        ];
+        for kind in [PcmKind::S16, PcmKind::F32] {
+            for channels in 1..=2 {
+                for (gain, ceiling) in [(0.75, 0.9), (1.37, 0.99), (1.0, 1.0)] {
+                    let original = channel_variants(&channel, channels);
+                    let mut normalized = original.clone();
+                    for channel in &mut normalized {
+                        crate::dsp::simd::apply_gain_and_hard_clip(channel, gain, ceiling);
+                    }
+                    let mut expected_rngs = dither_rngs(channels);
+                    let mut expected = Vec::new();
+                    encode_interleaved_with_rngs_into(
+                        &normalized,
+                        kind,
+                        false,
+                        &mut expected_rngs,
+                        &mut expected,
+                    );
+
+                    let borrowed_storage = original;
+                    let borrowed = borrowed_storage
+                        .iter()
+                        .map(Vec::as_slice)
+                        .collect::<Vec<_>>();
+                    let mut actual_rngs = dither_rngs(channels);
+                    let mut actual = Vec::new();
+                    encode_normalized_borrowed_interleaved_with_rngs_into(
+                        &borrowed,
+                        kind,
+                        gain,
+                        ceiling,
+                        &mut actual_rngs,
+                        &mut actual,
+                    );
+
+                    assert_eq!(
+                        actual, expected,
+                        "kind={kind:?}, channels={channels}, gain={gain}, ceiling={ceiling}"
+                    );
+                    assert_eq!(actual_rngs, expected_rngs);
+                }
+            }
         }
     }
 
