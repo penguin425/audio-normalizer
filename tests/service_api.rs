@@ -1,5 +1,5 @@
 use serde_json::Value;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command};
 use std::thread;
@@ -38,16 +38,29 @@ fn spawn_metrics_service() -> (Child, String) {
     (child, address)
 }
 
-fn request(address: &str, request: &[u8]) -> Vec<u8> {
-    let mut stream = TcpStream::connect(address).expect("connect service");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    stream.write_all(request).unwrap();
-    stream.shutdown(std::net::Shutdown::Write).unwrap();
+fn request_once(address: &str, request: &[u8]) -> io::Result<Vec<u8>> {
+    let mut stream = TcpStream::connect(address)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(request)?;
+    stream.shutdown(std::net::Shutdown::Write)?;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).unwrap();
-    response
+    stream.read_to_end(&mut response)?;
+    Ok(response)
+}
+
+fn request(address: &str, request: &[u8]) -> Vec<u8> {
+    let mut last_failure = String::new();
+    for attempt in 0..100 {
+        match request_once(address, request) {
+            Ok(response) if !response.starts_with(b"HTTP/1.1 503") => return response,
+            Ok(_) => last_failure = "service was temporarily busy".to_owned(),
+            Err(error) => last_failure = error.to_string(),
+        }
+        if attempt < 99 {
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    panic!("forge-service request did not complete: {last_failure}");
 }
 
 fn wait_for_service(address: &str) {
