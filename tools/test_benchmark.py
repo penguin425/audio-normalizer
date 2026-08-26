@@ -12,6 +12,7 @@ SPEC = importlib.util.spec_from_file_location("forge_benchmark", MODULE_PATH)
 benchmark = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(benchmark)
+sys.modules["benchmark"] = benchmark
 
 PAIRED_MODULE_PATH = Path(__file__).with_name("paired_benchmark.py")
 PAIRED_SPEC = importlib.util.spec_from_file_location(
