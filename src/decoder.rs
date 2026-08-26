@@ -1133,13 +1133,27 @@ pub fn decode_stream_owned<F>(path: &Path, mut consume: F) -> Result<StreamInfo,
 where
     F: FnMut(&StreamInfo, Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, String>,
 {
+    decode_stream_owned_with_declared_frames(path, |info, _, planar| consume(info, planar))
+}
+
+/// Ownership-transferring decode with the same exact-duration planning hint as
+/// [`decode_stream_with_declared_frames`]. Keeping this crate-private avoids
+/// exposing container metadata as part of the public streaming API while the
+/// analysis pipeline can still preallocate its bounded PCM spool.
+pub(crate) fn decode_stream_owned_with_declared_frames<F>(
+    path: &Path,
+    mut consume: F,
+) -> Result<StreamInfo, String>
+where
+    F: FnMut(&StreamInfo, Option<u64>, Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, String>,
+{
     let mut handoff = Vec::new();
-    decode_stream(path, |info, planar| {
+    decode_stream_with_declared_frames(path, |info, declared_frames, planar| {
         handoff.reserve(planar.len());
         for channel in planar.iter_mut() {
             handoff.push(std::mem::take(channel));
         }
-        let mut recycled = consume(info, std::mem::take(&mut handoff))?;
+        let mut recycled = consume(info, declared_frames, std::mem::take(&mut handoff))?;
         if recycled.len() != planar.len() {
             return Err(format!(
                 "stream consumer returned {} channels, expected {}",

@@ -184,6 +184,39 @@ impl SampleRateConverter {
         Ok(())
     }
 
+    /// Resample while transferring ownership of each produced planar chunk.
+    /// The consumer returns a channel buffer set for the next FFT output, so a
+    /// bounded downstream pipeline can overlap analysis without copying PCM.
+    pub(crate) fn process_owned(
+        &mut self,
+        planar: &[Vec<f32>],
+        mut consume: impl FnMut(Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, String>,
+    ) -> Result<(), String> {
+        self.validate(planar)?;
+        let frames = planar.first().map_or(0, Vec::len);
+        self.input_frames_seen = self
+            .input_frames_seen
+            .checked_add(frames)
+            .ok_or_else(|| "sample-rate converter input duration overflow".to_string())?;
+        let mut start = 0;
+        while start < frames {
+            let input_frames = self.resampler.input_frames_next();
+            let pending_frames = self.input_pending[0].len();
+            let take = (input_frames - pending_frames).min(frames - start);
+            for (pending, channel) in self.input_pending.iter_mut().zip(planar) {
+                pending.extend_from_slice(&channel[start..start + take]);
+            }
+            start += take;
+            if self.input_pending[0].len() == input_frames {
+                self.resample_and_emit_owned(None, "resample audio", &mut consume)?;
+                for channel in &mut self.input_pending {
+                    channel.clear();
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn finish(
         &mut self,
         mut consume: impl FnMut(&mut [Vec<f32>]) -> Result<(), String>,
@@ -226,11 +259,72 @@ impl SampleRateConverter {
         Ok(())
     }
 
+    pub(crate) fn finish_owned(
+        &mut self,
+        mut consume: impl FnMut(Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, String>,
+    ) -> Result<(), String> {
+        let calculated_output_frames = ((self.input_frames_seen as u128 * self.output_rate as u128
+            + self.input_rate as u128 / 2)
+            / self.input_rate as u128) as usize;
+        if let Some(expected) = self.expected_output_frames {
+            if expected != calculated_output_frames {
+                return Err(format!(
+                    "sample-rate converter expected {expected} output frames from its caller, but received enough input for {calculated_output_frames}"
+                ));
+            }
+        } else {
+            self.expected_output_frames = Some(calculated_output_frames);
+        }
+        let pending_frames = self.input_pending[0].len();
+        if pending_frames > 0 {
+            self.resample_and_emit_owned(
+                Some(pending_frames),
+                "finish sample-rate conversion",
+                &mut consume,
+            )?;
+            for channel in &mut self.input_pending {
+                channel.clear();
+            }
+        }
+        for _ in 0..self.max_flush_passes {
+            if self.emitted_frames == calculated_output_frames {
+                break;
+            }
+            self.resample_and_emit_owned(Some(0), "flush sample-rate conversion", &mut consume)?;
+        }
+        if self.emitted_frames != calculated_output_frames {
+            return Err(format!(
+                "sample-rate converter produced {} frames, expected {}",
+                self.emitted_frames, calculated_output_frames
+            ));
+        }
+        Ok(())
+    }
+
     fn resample_and_emit(
         &mut self,
         partial_len: Option<usize>,
         operation: &str,
         consume: &mut impl FnMut(&mut [Vec<f32>]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.resample_into_output(partial_len, operation)?;
+        self.emit(consume)
+    }
+
+    fn resample_and_emit_owned(
+        &mut self,
+        partial_len: Option<usize>,
+        operation: &str,
+        consume: &mut impl FnMut(Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, String>,
+    ) -> Result<(), String> {
+        self.resample_into_output(partial_len, operation)?;
+        self.emit_owned(consume)
+    }
+
+    fn resample_into_output(
+        &mut self,
+        partial_len: Option<usize>,
+        operation: &str,
     ) -> Result<(), String> {
         let input_frames = partial_len.unwrap_or_else(|| self.resampler.input_frames_next());
         let output_frames = self.resampler.output_frames_next();
@@ -256,13 +350,40 @@ impl SampleRateConverter {
         for channel in &mut self.output_buffer {
             channel.truncate(produced);
         }
-        self.emit(consume)
+        Ok(())
     }
 
     fn emit(
         &mut self,
         consume: &mut impl FnMut(&mut [Vec<f32>]) -> Result<(), String>,
     ) -> Result<(), String> {
+        if !self.prepare_output_for_emit() {
+            return Ok(());
+        }
+        consume(&mut self.output_buffer)
+    }
+
+    fn emit_owned(
+        &mut self,
+        consume: &mut impl FnMut(Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, String>,
+    ) -> Result<(), String> {
+        if !self.prepare_output_for_emit() {
+            return Ok(());
+        }
+        let output = std::mem::take(&mut self.output_buffer);
+        let recycled = consume(output)?;
+        if recycled.len() != self.channels {
+            return Err(format!(
+                "sample-rate converter consumer returned {} channels, expected {}",
+                recycled.len(),
+                self.channels
+            ));
+        }
+        self.output_buffer = recycled;
+        Ok(())
+    }
+
+    fn prepare_output_for_emit(&mut self) -> bool {
         let frames = self.output_buffer.first().map_or(0, Vec::len);
         let start = self.delay_frames_remaining.min(frames);
         self.delay_frames_remaining -= start;
@@ -274,7 +395,7 @@ impl SampleRateConverter {
             for channel in &mut self.output_buffer {
                 channel.clear();
             }
-            return Ok(());
+            return false;
         }
         if start > 0 {
             for channel in &mut self.output_buffer {
@@ -286,7 +407,7 @@ impl SampleRateConverter {
             channel.truncate(emitted);
         }
         self.emitted_frames += end - start;
-        consume(&mut self.output_buffer)
+        true
     }
 
     fn validate(&self, planar: &[Vec<f32>]) -> Result<(), String> {
@@ -581,6 +702,95 @@ mod tests {
         assert!(
             streaming.input_pending[0].len() < streaming.resampler.input_frames_next(),
             "processed input was retained instead of clearing the fixed block"
+        );
+    }
+
+    #[test]
+    fn owned_streaming_is_bit_exact_and_recycles_output_storage() {
+        let input_rate = 44_100;
+        let output_rate = 48_000;
+        let frames = CHUNK_FRAMES * 3 + 509;
+        let planar = [
+            (0..frames)
+                .map(|frame| 0.21 * (TAU * 997.0 * frame as f32 / input_rate as f32).sin())
+                .collect::<Vec<_>>(),
+            (0..frames)
+                .map(|frame| 0.13 * (TAU * 613.0 * frame as f32 / input_rate as f32).cos())
+                .collect::<Vec<_>>(),
+        ];
+        let ranges = [0..137, 137..1_019, 1_019..2_083, 2_083..frames];
+        let mut borrowed = SampleRateConverter::new_streaming(
+            input_rate,
+            output_rate,
+            2,
+            ResampleQuality::Balanced,
+        )
+        .unwrap();
+        let mut owned = SampleRateConverter::new_streaming(
+            input_rate,
+            output_rate,
+            2,
+            ResampleQuality::Balanced,
+        )
+        .unwrap();
+        let mut borrowed_output = [Vec::new(), Vec::new()];
+        let mut owned_output = [Vec::new(), Vec::new()];
+        let mut owned_pointers = Vec::new();
+
+        for range in ranges {
+            let chunk = planar
+                .iter()
+                .map(|channel| channel[range.clone()].to_vec())
+                .collect::<Vec<_>>();
+            borrowed
+                .process(&chunk, |output| {
+                    for (destination, source) in borrowed_output.iter_mut().zip(output) {
+                        destination.extend_from_slice(source);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            owned
+                .process_owned(&chunk, |mut output| {
+                    owned_pointers.push(output[0].as_ptr());
+                    for (destination, source) in owned_output.iter_mut().zip(&output) {
+                        destination.extend_from_slice(source);
+                    }
+                    for channel in &mut output {
+                        channel.clear();
+                    }
+                    Ok(output)
+                })
+                .unwrap();
+        }
+        borrowed
+            .finish(|output| {
+                for (destination, source) in borrowed_output.iter_mut().zip(output) {
+                    destination.extend_from_slice(source);
+                }
+                Ok(())
+            })
+            .unwrap();
+        owned
+            .finish_owned(|mut output| {
+                owned_pointers.push(output[0].as_ptr());
+                for (destination, source) in owned_output.iter_mut().zip(&output) {
+                    destination.extend_from_slice(source);
+                }
+                for channel in &mut output {
+                    channel.clear();
+                }
+                Ok(output)
+            })
+            .unwrap();
+
+        assert_eq!(owned_output, borrowed_output);
+        assert!(owned_pointers.len() > 2);
+        assert!(
+            owned_pointers
+                .iter()
+                .all(|pointer| *pointer == owned_pointers[0]),
+            "owned handoff did not recycle the FFT output allocation"
         );
     }
 

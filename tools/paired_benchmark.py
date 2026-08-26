@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Paired end-to-end benchmark for the bounded PCM spool paths.
+"""Paired end-to-end benchmark for PCM spool and analysis-pipeline paths.
 
 The generic benchmark harness measures one Forge binary per fixture. This
 specialized harness keeps one deterministic fixture hot and alternates the

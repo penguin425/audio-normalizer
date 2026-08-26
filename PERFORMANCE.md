@@ -1662,6 +1662,45 @@ that overlap. Peak RSS changed by -0.87% and -11.11% in the Linux and Apple
 Silicon one-worker cases respectively; the default eight-file workload changed
 by -16.63% and -20.13%.
 
+### v0.170.0: bounded resample-analysis overlap
+
+Top-level normalization with an explicit output sample rate now overlaps the
+decode/resample producer with the ordered loudness-analysis and PCM-capture
+consumer. Two planar slots move by ownership through one bounded Rayon scope;
+`--jobs 1` and work already nested inside batch/album parallelism retain the
+sequential path. Operations without an explicit output-rate request are
+deliberately excluded because their small measured wall-time change did not
+justify additional aggregate CPU.
+
+Rubato's established 1,024-input-frame FFT blocks, window, delay compensation,
+and output samples are unchanged. Passing every small FFT output through an
+mpsc rendezvous was 19.53% slower after correcting storage selection. The
+retained implementation instead copies those outputs into a reusable roughly
+12k-frame handoff, reducing synchronization frequency while keeping the common
+chunk below the analyzer's 16,384-frame nested True Peak threshold. A still
+earlier prototype created the spool after entering the Rayon scope, which
+incorrectly selected temporary-file storage for an otherwise eligible short
+top-level file; it regressed resampled normalization by 35.62% and was removed.
+
+The retained local comparison uses the exact v0.169.0 commit and candidate,
+Rust 1.98.0, native-host fat LTO without PGO, and deterministic stereo PCM16
+WAVE input. The 300-second rows pool 16 measurements per binary in balanced
+B-C-C-B/C-B-B-C order; the over-budget 600-second row pools 12. Fixture
+generation is excluded, total CPU is user plus system time, and RSS is the
+maximum sampled resident set.
+
+| Workload | v0.169.0 wall | v0.170.0 wall | Wall change | CPU change | Peak RSS change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 300 s WAVE 48→44.1 kHz normalize | 0.844 s | 0.710 s | -15.90% | +4.38% | +0.25 MiB |
+| 600 s WAVE 48→44.1 kHz normalize | 1.883 s | 1.607 s | -14.65% | +4.15% | 0 MiB |
+| 300 s WAVE 48→44.1 kHz one-worker control | 0.833 s | 0.834 s | +0.13% | +0.51% | +0.25 MiB |
+
+Focused tests compare every analysis scalar and gating-block bit, concatenated
+resampler PCM, and normalized WAVE bytes between sequential, pipelined,
+baseline, and one-worker execution. The owned FFT output callback also proves
+that its allocation is recycled. These checks preserve BS.1770 operation order
+and duration; the optimization changes scheduling rather than the signal.
+
 ## Final integration gate
 
 Before each release, run the full feature matrix, official conformance jobs

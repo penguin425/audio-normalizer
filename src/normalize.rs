@@ -934,7 +934,44 @@ struct PreparedAnalysis {
     spool: Option<PcmSpool>,
 }
 
+const ANALYSIS_PIPELINE_DEPTH: usize = 2;
+// Rubato intentionally keeps 1,024-input-frame FFT blocks for its established
+// response. Coalesce only the downstream handoff so synchronization is
+// amortized without changing resampling arithmetic or crossing the common
+// 16,384-frame nested True Peak threshold.
+const TARGET_RESAMPLED_ANALYSIS_CHUNK_FRAMES: usize = 12 * 1024;
+
+enum AnalysisPipelineMessage {
+    Start {
+        analyzer: Box<lufs::StreamingAnalyzer>,
+        spool: Option<PcmSpool>,
+    },
+    Chunk(Vec<Vec<f32>>),
+    Finish,
+    Abort,
+}
+
+enum AnalysisPipelineOutcome {
+    Finished {
+        analyzer: Option<Box<lufs::StreamingAnalyzer>>,
+        spool: Option<PcmSpool>,
+    },
+    Aborted,
+}
+
 fn prepare_file_for_plan(
+    path: &Path,
+    channel_roles: Option<&[ChannelRole]>,
+    plan: &Plan,
+    capture_spool: bool,
+) -> Result<PreparedAnalysis, String> {
+    if analysis_pipeline_enabled(plan) {
+        return prepare_file_for_plan_pipelined(path, channel_roles, plan, capture_spool);
+    }
+    prepare_file_for_plan_sequential(path, channel_roles, plan, capture_spool)
+}
+
+fn prepare_file_for_plan_sequential(
     path: &Path,
     channel_roles: Option<&[ChannelRole]>,
     plan: &Plan,
@@ -983,6 +1020,329 @@ fn prepare_file_for_plan(
     }
     let analyzer = analyzer.ok_or_else(|| format!("{}: no audio decoded", path.display()))?;
     let roles = resolved_roles.expect("analyzer creation resolves channel roles");
+    finish_prepared_analysis(info, roles, plan, analyzer, spool)
+}
+
+fn analysis_pipeline_enabled(plan: &Plan) -> bool {
+    // Nested batch/album jobs already use the shared worker budget across
+    // files. An explicit output-rate request supplies enough independent
+    // producer work to amortize the bounded handoff; default-rate decoding
+    // retains its lower-CPU path.
+    plan.output_sample_rate.is_some()
+        && rayon::current_num_threads() > 1
+        && rayon::current_thread_index().is_none()
+}
+
+fn run_analysis_pipeline(
+    input: Receiver<AnalysisPipelineMessage>,
+    recycled: SyncSender<Vec<Vec<f32>>>,
+    failed: &AtomicBool,
+) -> Result<AnalysisPipelineOutcome, String> {
+    let mut analyzer = None;
+    let mut spool = None;
+    let mut first_error = None;
+    while let Ok(message) = input.recv() {
+        match message {
+            AnalysisPipelineMessage::Start {
+                analyzer: next_analyzer,
+                spool: next_spool,
+            } => {
+                if analyzer.is_some() {
+                    failed.store(true, Ordering::Release);
+                    first_error.get_or_insert_with(|| {
+                        "analysis pipeline received duplicate initialization".to_string()
+                    });
+                } else {
+                    analyzer = Some(next_analyzer);
+                    spool = next_spool;
+                }
+            }
+            AnalysisPipelineMessage::Chunk(mut chunk) => {
+                if first_error.is_none() {
+                    let result = analyzer.as_mut().map_or_else(
+                        || Err("analysis pipeline received PCM before initialization".into()),
+                        |analyzer| analyze_and_capture(&mut chunk, analyzer, &mut spool),
+                    );
+                    if let Err(error) = result {
+                        failed.store(true, Ordering::Release);
+                        first_error = Some(error);
+                    }
+                }
+                // The producer owns exactly ANALYSIS_PIPELINE_DEPTH slots, so
+                // this bounded return channel cannot exceed its capacity.
+                let _ = recycled.send(chunk);
+            }
+            AnalysisPipelineMessage::Finish => {
+                if let Some(error) = first_error {
+                    return Err(error);
+                }
+                return Ok(AnalysisPipelineOutcome::Finished { analyzer, spool });
+            }
+            AnalysisPipelineMessage::Abort => {
+                return first_error.map_or(Ok(AnalysisPipelineOutcome::Aborted), Err);
+            }
+        }
+    }
+    first_error.map_or(Ok(AnalysisPipelineOutcome::Aborted), Err)
+}
+
+fn send_analysis_pipeline_chunk(
+    chunk: Vec<Vec<f32>>,
+    input: &SyncSender<AnalysisPipelineMessage>,
+    recycled: &Receiver<Vec<Vec<f32>>>,
+    available: &mut Vec<Vec<Vec<f32>>>,
+    failed: &AtomicBool,
+) -> Result<Vec<Vec<f32>>, String> {
+    if failed.load(Ordering::Acquire) {
+        return Err("analysis pipeline stopped after an analysis error".into());
+    }
+    loop {
+        match recycled.try_recv() {
+            Ok(chunk) => available.push(chunk),
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                return Err("analysis pipeline stopped unexpectedly".into());
+            }
+        }
+    }
+    input
+        .send(AnalysisPipelineMessage::Chunk(chunk))
+        .map_err(|_| "analysis pipeline stopped unexpectedly")?;
+    if failed.load(Ordering::Acquire) {
+        return Err("analysis pipeline stopped after an analysis error".into());
+    }
+    let recycled = if let Some(chunk) = available.pop() {
+        chunk
+    } else {
+        recycled
+            .recv()
+            .map_err(|_| "analysis pipeline stopped unexpectedly")?
+    };
+    if failed.load(Ordering::Acquire) {
+        return Err("analysis pipeline stopped after an analysis error".into());
+    }
+    Ok(recycled)
+}
+
+fn append_resampled_analysis_pipeline_chunk(
+    mut output: Vec<Vec<f32>>,
+    pending: &mut Vec<Vec<f32>>,
+    input: &SyncSender<AnalysisPipelineMessage>,
+    recycled: &Receiver<Vec<Vec<f32>>>,
+    available: &mut Vec<Vec<Vec<f32>>>,
+    failed: &AtomicBool,
+) -> Result<Vec<Vec<f32>>, String> {
+    if failed.load(Ordering::Acquire) {
+        return Err("analysis pipeline stopped after an analysis error".into());
+    }
+    if pending.len() != output.len() {
+        return Err("resampled analysis pipeline channel count changed".into());
+    }
+    let frames = output.first().map_or(0, Vec::len);
+    if output.iter().any(|channel| channel.len() != frames) {
+        return Err("resampled analysis pipeline received unequal channel lengths".into());
+    }
+    for (destination, source) in pending.iter_mut().zip(&output) {
+        destination.extend_from_slice(source);
+    }
+    if pending
+        .first()
+        .is_some_and(|channel| channel.len() >= TARGET_RESAMPLED_ANALYSIS_CHUNK_FRAMES)
+    {
+        let chunk = std::mem::take(pending);
+        let mut next = send_analysis_pipeline_chunk(chunk, input, recycled, available, failed)?;
+        for channel in &mut next {
+            channel.clear();
+        }
+        *pending = next;
+    }
+    for channel in &mut output {
+        channel.clear();
+    }
+    Ok(output)
+}
+
+fn flush_resampled_analysis_pipeline_chunk(
+    pending: &mut Vec<Vec<f32>>,
+    input: &SyncSender<AnalysisPipelineMessage>,
+    recycled: &Receiver<Vec<Vec<f32>>>,
+    available: &mut Vec<Vec<Vec<f32>>>,
+    failed: &AtomicBool,
+) -> Result<(), String> {
+    if pending.first().is_none_or(Vec::is_empty) {
+        return Ok(());
+    }
+    let chunk = std::mem::take(pending);
+    let mut next = send_analysis_pipeline_chunk(chunk, input, recycled, available, failed)?;
+    for channel in &mut next {
+        channel.clear();
+    }
+    *pending = next;
+    Ok(())
+}
+
+fn prepare_file_for_plan_pipelined(
+    path: &Path,
+    channel_roles: Option<&[ChannelRole]>,
+    plan: &Plan,
+    capture_spool: bool,
+) -> Result<PreparedAnalysis, String> {
+    let (input_sender, input_receiver) = sync_channel(ANALYSIS_PIPELINE_DEPTH);
+    let (recycle_sender, recycle_receiver) = sync_channel(ANALYSIS_PIPELINE_DEPTH);
+    let (result_sender, result_receiver) = sync_channel(1);
+    let failed = Arc::new(AtomicBool::new(false));
+    let producer_failed = Arc::clone(&failed);
+    let analyzer_failed = Arc::clone(&failed);
+    let mut converter: Option<SampleRateConverter> = None;
+    let mut resolved_roles = None;
+    let mut available = Vec::new();
+    let mut resampled_pending = Vec::new();
+    let mut started = false;
+
+    let (decoding, resolved_roles) = rayon::scope(move |scope| {
+        scope.spawn(move |_| {
+            let result =
+                run_analysis_pipeline(input_receiver, recycle_sender, analyzer_failed.as_ref());
+            let _ = result_sender.send(result);
+        });
+
+        let decoded = decoder::decode_stream_owned_with_declared_frames(
+            path,
+            |info, declared_frames, planar| {
+                if !started {
+                    let roles = resolve_stream_roles(path, info, channel_roles)?;
+                    let output_rate = plan.output_sample_rate.unwrap_or(info.sample_rate);
+                    let next_converter = if output_rate != info.sample_rate {
+                        Some(SampleRateConverter::new_streaming(
+                            info.sample_rate,
+                            output_rate,
+                            info.channels as usize,
+                            plan.resample_quality,
+                        )?)
+                    } else {
+                        None
+                    };
+                    let spool = if capture_spool
+                        && should_capture_pcm(path, next_converter.is_some())
+                    {
+                        let expected_bytes =
+                            expected_pcm_spool_bytes(path, info, output_rate, declared_frames);
+                        PcmSpool::new_for_top_level_pipeline(info.channels as usize, expected_bytes)
+                            .ok()
+                    } else {
+                        None
+                    };
+                    input_sender
+                        .send(AnalysisPipelineMessage::Start {
+                            analyzer: Box::new(lufs::StreamingAnalyzer::new(
+                                output_rate,
+                                roles.clone(),
+                            )),
+                            spool,
+                        })
+                        .map_err(|_| "analysis pipeline stopped during setup")?;
+                    available = (1..ANALYSIS_PIPELINE_DEPTH)
+                        .map(|_| {
+                            (0..usize::from(info.channels))
+                                .map(|_| Vec::new())
+                                .collect::<Vec<_>>()
+                        })
+                        .collect();
+                    converter = next_converter;
+                    if converter.is_some() {
+                        resampled_pending = (0..usize::from(info.channels))
+                            .map(|_| Vec::with_capacity(TARGET_RESAMPLED_ANALYSIS_CHUNK_FRAMES))
+                            .collect();
+                    }
+                    resolved_roles = Some(roles);
+                    started = true;
+                }
+
+                if let Some(converter) = converter.as_mut() {
+                    converter.process_owned(&planar, |chunk| {
+                        append_resampled_analysis_pipeline_chunk(
+                            chunk,
+                            &mut resampled_pending,
+                            &input_sender,
+                            &recycle_receiver,
+                            &mut available,
+                            producer_failed.as_ref(),
+                        )
+                    })?;
+                    Ok(planar)
+                } else {
+                    send_analysis_pipeline_chunk(
+                        planar,
+                        &input_sender,
+                        &recycle_receiver,
+                        &mut available,
+                        producer_failed.as_ref(),
+                    )
+                }
+            },
+        );
+        let processed = decoded.and_then(|info| {
+            if let Some(converter) = converter.as_mut() {
+                converter.finish_owned(|chunk| {
+                    append_resampled_analysis_pipeline_chunk(
+                        chunk,
+                        &mut resampled_pending,
+                        &input_sender,
+                        &recycle_receiver,
+                        &mut available,
+                        producer_failed.as_ref(),
+                    )
+                })?;
+                flush_resampled_analysis_pipeline_chunk(
+                    &mut resampled_pending,
+                    &input_sender,
+                    &recycle_receiver,
+                    &mut available,
+                    producer_failed.as_ref(),
+                )?;
+            }
+            Ok(info)
+        });
+        let terminal = if processed.is_ok() {
+            AnalysisPipelineMessage::Finish
+        } else {
+            AnalysisPipelineMessage::Abort
+        };
+        let processed = if input_sender.send(terminal).is_err() && processed.is_ok() {
+            Err("analysis pipeline stopped unexpectedly".into())
+        } else {
+            processed
+        };
+        (processed, resolved_roles)
+    });
+    let analyzed = result_receiver
+        .recv()
+        .map_err(|_| "analysis pipeline stopped without a result")?;
+
+    match analyzed {
+        // Analysis of an earlier chunk precedes a later decode/resample failure.
+        Err(error) => Err(error),
+        Ok(AnalysisPipelineOutcome::Finished { analyzer, spool }) => {
+            let info = decoding?;
+            let analyzer =
+                analyzer.ok_or_else(|| format!("{}: no audio decoded", path.display()))?;
+            let roles = resolved_roles.expect("analyzer creation resolves channel roles");
+            finish_prepared_analysis(info, roles, plan, *analyzer, spool)
+        }
+        Ok(AnalysisPipelineOutcome::Aborted) => match decoding {
+            Err(error) => Err(error),
+            Ok(_) => Err("analysis pipeline aborted unexpectedly".into()),
+        },
+    }
+}
+
+fn finish_prepared_analysis(
+    info: decoder::StreamInfo,
+    roles: Vec<ChannelRole>,
+    plan: &Plan,
+    analyzer: lufs::StreamingAnalyzer,
+    mut spool: Option<PcmSpool>,
+) -> Result<PreparedAnalysis, String> {
     let measured = analyzer.finish();
     let discard_spool = spool.as_mut().is_some_and(|captured| {
         captured.frames() != measured.frames || captured.finish_writing().is_err()
@@ -4151,6 +4511,95 @@ mod tests {
             same_rate.spool.is_none(),
             "same-rate WAVE should skip spooling"
         );
+    }
+
+    #[test]
+    fn analysis_pipeline_matches_sequential_measurements_and_pcm() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("pipeline-input.wav");
+        let sample_rate = 44_100;
+        let frames = sample_rate as usize * 2 + 509;
+        let left = (0..frames)
+            .map(|frame| {
+                0.19 * (std::f32::consts::TAU * 997.0 * frame as f32 / sample_rate as f32).sin()
+            })
+            .collect::<Vec<_>>();
+        let right = (0..frames)
+            .map(|frame| {
+                0.11 * (std::f32::consts::TAU * 613.0 * frame as f32 / sample_rate as f32).cos()
+            })
+            .collect::<Vec<_>>();
+        WavWriter::write(
+            &input,
+            &AudioBuffer {
+                sample_rate,
+                channels: 2,
+                frames,
+                data: vec![left, right],
+                channel_roles: default_channel_roles(2),
+                source_kind: PcmKind::F32,
+            },
+            PcmKind::F32,
+            false,
+        )
+        .unwrap();
+        let mut resample_plan = plan();
+        resample_plan.output_sample_rate = Some(48_000);
+
+        let sequential =
+            prepare_file_for_plan_sequential(&input, None, &resample_plan, true).unwrap();
+        let pipelined =
+            prepare_file_for_plan_pipelined(&input, None, &resample_plan, true).unwrap();
+        let left = &sequential.analysis;
+        let right = &pipelined.analysis;
+        assert_eq!(left.sample_rate, right.sample_rate);
+        assert_eq!(left.channels, right.channels);
+        assert_eq!(left.channel_roles, right.channel_roles);
+        assert_eq!(left.frames, right.frames);
+        assert_eq!(left.kind, right.kind);
+        assert_eq!(left.lufs.to_bits(), right.lufs.to_bits());
+        assert_eq!(
+            left.max_momentary_lufs.to_bits(),
+            right.max_momentary_lufs.to_bits()
+        );
+        assert_eq!(
+            left.max_short_term_lufs.to_bits(),
+            right.max_short_term_lufs.to_bits()
+        );
+        assert_eq!(
+            left.loudness_range_lu.to_bits(),
+            right.loudness_range_lu.to_bits()
+        );
+        assert_eq!(left.rms_db.to_bits(), right.rms_db.to_bits());
+        assert_eq!(left.sample_peak.to_bits(), right.sample_peak.to_bits());
+        assert_eq!(left.true_peak.to_bits(), right.true_peak.to_bits());
+        assert_eq!(
+            left.loudness_blocks
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            right
+                .loudness_blocks
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+
+        let collect_spool = |mut spool: PcmSpool| {
+            let mut output = vec![Vec::new(), Vec::new()];
+            spool
+                .replay(|chunk| {
+                    for (destination, source) in output.iter_mut().zip(chunk) {
+                        destination.extend_from_slice(source);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            output
+        };
+        let sequential_pcm = collect_spool(sequential.spool.unwrap());
+        let pipelined_pcm = collect_spool(pipelined.spool.unwrap());
+        assert_eq!(sequential_pcm, pipelined_pcm);
     }
 
     #[test]
