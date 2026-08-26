@@ -125,7 +125,7 @@ jobs:
           cmp "${exact_dir}/base-resampled.wav" "${exact_dir}/candidate-resampled.wav"
           cmp "${exact_dir}/candidate-resampled.wav" "${exact_dir}/candidate-resampled-one.wav"
 
-      - name: Run benchmarks in both orders
+      - name: Run interleaved short benchmarks
         shell: bash
         run: |
           set -euo pipefail
@@ -137,7 +137,7 @@ jobs:
               --forge "${forge}"
               --ffmpeg "$(command -v ffmpeg)"
               --duration-seconds 300
-              --iterations 7
+              --iterations 2
               --case flac-stereo-normalize
               --case wav-stereo-resample-normalize
               --work-dir "${RUNNER_TEMP}/${label}"
@@ -153,13 +153,27 @@ jobs:
           baseline="${RUNNER_TEMP}/target-baseline/release/forge"
           candidate="${RUNNER_TEMP}/target-candidate/release/forge"
           for mode in default one; do
-            run_benchmark "${mode}" "${mode}-base-first" "${baseline}"
-            run_benchmark "${mode}" "${mode}-candidate-second" "${candidate}"
-            run_benchmark "${mode}" "${mode}-candidate-first" "${candidate}"
-            run_benchmark "${mode}" "${mode}-base-second" "${baseline}"
+            # Fine-grained B-C-C-B / C-B-B-C blocks balance runner drift while
+            # preserving the strict per-case and aggregate regression gates.
+            for round in 1 2 3 4; do
+              if (( round % 2 == 1 )); then
+                order=(base-a candidate-a candidate-b base-b)
+              else
+                order=(candidate-a base-a base-b candidate-b)
+              fi
+              for slot in "${order[@]}"; do
+                if [[ "${slot}" == base-* ]]; then
+                  forge="${baseline}"
+                else
+                  forge="${candidate}"
+                fi
+                run_benchmark \
+                  "${mode}" "short-${mode}-${round}-${slot}" "${forge}"
+              done
+            done
           done
 
-      - name: Run over-budget controls in both orders
+      - name: Run interleaved over-budget controls
         shell: bash
         run: |
           set -euo pipefail
@@ -171,11 +185,11 @@ jobs:
               --forge "${forge}"
               --ffmpeg "$(command -v ffmpeg)"
               --duration-seconds 600
-              --iterations 3
+              --iterations 1
               --case flac-stereo-normalize
               --case wav-stereo-resample-normalize
-              --work-dir "${RUNNER_TEMP}/long-${label}"
-              --output "long-${label}.json"
+              --work-dir "${RUNNER_TEMP}/${label}"
+              --output "${label}.json"
             )
             if [[ "${mode}" == "one" ]]; then
               RAYON_NUM_THREADS=1 python3 candidate/tools/benchmark.py "${common[@]}"
@@ -187,10 +201,24 @@ jobs:
           baseline="${RUNNER_TEMP}/target-baseline/release/forge"
           candidate="${RUNNER_TEMP}/target-candidate/release/forge"
           for mode in default one; do
-            run_benchmark "${mode}" "${mode}-base-first" "${baseline}"
-            run_benchmark "${mode}" "${mode}-candidate-second" "${candidate}"
-            run_benchmark "${mode}" "${mode}-candidate-first" "${candidate}"
-            run_benchmark "${mode}" "${mode}-base-second" "${baseline}"
+            # Keep the file-backed controls interleaved for the same reason as
+            # the in-budget measurements above.
+            for round in 1 2 3 4; do
+              if (( round % 2 == 1 )); then
+                order=(base-a candidate-a candidate-b base-b)
+              else
+                order=(candidate-a base-a base-b candidate-b)
+              fi
+              for slot in "${order[@]}"; do
+                if [[ "${slot}" == base-* ]]; then
+                  forge="${baseline}"
+                else
+                  forge="${candidate}"
+                fi
+                run_benchmark \
+                  "${mode}" "long-${mode}-${round}-${slot}" "${forge}"
+              done
+            done
           done
 
       - name: Summarize pooled medians
@@ -203,46 +231,60 @@ jobs:
           from pathlib import Path
 
           summary = {"system": {}, "modes": {}, "complete": True}
-          expected = (
-              "base-first",
-              "base-second",
-              "candidate-first",
-              "candidate-second",
-          )
+          expected_reports = 16
           for mode in ("default", "one"):
-              paths = {name: Path(f"{mode}-{name}.json") for name in expected}
-              missing = [str(path) for path in paths.values() if not path.is_file()]
-              if missing:
+              paths = sorted(Path(".").glob(f"short-{mode}-*.json"))
+              if len(paths) != expected_reports:
                   summary["complete"] = False
-                  summary["modes"][mode] = {"missing": missing}
+                  summary["modes"][mode] = {
+                      "missing": [
+                          f"expected {expected_reports} interleaved reports, "
+                          f"found {len(paths)}"
+                      ]
+                  }
                   continue
-              documents = {
-                  name: json.loads(path.read_text(encoding="utf-8"))
-                  for name, path in paths.items()
-              }
-              if not all(document["passed"] for document in documents.values()):
+              documents = [
+                  (path, json.loads(path.read_text(encoding="utf-8")))
+                  for path in paths
+              ]
+              if not all(document["passed"] for _, document in documents):
                   summary["complete"] = False
               if not summary["system"]:
-                  summary["system"] = documents["base-first"]["system"]
-              indexed = {
-                  name: {result["id"]: result for result in document["results"]}
-                  for name, document in documents.items()
-              }
-              rows = {}
-              for case_id in indexed["base-first"]:
-                  samples = {
-                      name: results[case_id]["samples"]
-                      for name, results in indexed.items()
+                  summary["system"] = documents[0][1]["system"]
+              indexed = [
+                  (path, {result["id"]: result for result in document["results"]})
+                  for path, document in documents
+              ]
+              case_ids = list(indexed[0][1])
+              if any(set(results) != set(case_ids) for _, results in indexed):
+                  summary["complete"] = False
+                  summary["modes"][mode] = {
+                      "missing": ["interleaved reports contain different cases"]
                   }
+                  continue
+              baseline_documents = [
+                  results for path, results in indexed if "-base-" in path.name
+              ]
+              candidate_documents = [
+                  results for path, results in indexed if "-candidate-" in path.name
+              ]
+              if len(baseline_documents) != 8 or len(candidate_documents) != 8:
+                  summary["complete"] = False
+                  summary["modes"][mode] = {
+                      "missing": ["interleaved binary labels are incomplete"]
+                  }
+                  continue
+              rows = {}
+              for case_id in case_ids:
                   baseline = [
                       sample
-                      for name in ("base-first", "base-second")
-                      for sample in samples[name]
+                      for results in baseline_documents
+                      for sample in results[case_id]["samples"]
                   ]
                   candidate = [
                       sample
-                      for name in ("candidate-first", "candidate-second")
-                      for sample in samples[name]
+                      for results in candidate_documents
+                      for sample in results[case_id]["samples"]
                   ]
                   row = {"samples_per_binary": len(baseline), "metrics": {}}
                   for metric in ("wall_seconds", "peak_rss_bytes"):
@@ -303,8 +345,7 @@ jobs:
         with:
           name: pcm-spool-buffer-${{ matrix.os }}-${{ runner.arch }}
           path: |
-            default-*.json
-            one-*.json
+            short-*.json
             long-*.json
             pcm-spool-buffer-summary.json
             pcm-spool-buffer-summary.md
@@ -327,6 +368,12 @@ jobs:
           cpu_changes = []
           for mode in ("default", "one"):
               for case_id, row in summary["modes"][mode].items():
+                  assert row["samples_per_binary"] == 16, (
+                      mode,
+                      case_id,
+                      "samples per binary",
+                      row["samples_per_binary"],
+                  )
                   metrics = row["metrics"]
                   wall = metrics["wall_seconds"]["change_percent"]
                   cpu = metrics["total_cpu_seconds"]["change_percent"]
@@ -362,34 +409,40 @@ jobs:
 
           changes = []
           for mode in ("default", "one"):
-              names = (
-                  "base-first",
-                  "base-second",
-                  "candidate-first",
-                  "candidate-second",
-              )
-              documents = {
-                  name: json.loads(
-                      Path(f"long-{mode}-{name}.json").read_text(encoding="utf-8")
-                  )
-                  for name in names
-              }
-              assert all(document["passed"] for document in documents.values())
-              indexed = {
-                  name: {result["id"]: result for result in document["results"]}
-                  for name, document in documents.items()
-              }
-              for case_id in indexed["base-first"]:
+              paths = sorted(Path(".").glob(f"long-{mode}-*.json"))
+              assert len(paths) == 16, (mode, "report count", len(paths))
+              documents = [
+                  (path, json.loads(path.read_text(encoding="utf-8")))
+                  for path in paths
+              ]
+              assert all(document["passed"] for _, document in documents)
+              indexed = [
+                  (path, {result["id"]: result for result in document["results"]})
+                  for path, document in documents
+              ]
+              case_ids = list(indexed[0][1])
+              assert all(set(results) == set(case_ids) for _, results in indexed)
+              baseline_documents = [
+                  results for path, results in indexed if "-base-" in path.name
+              ]
+              candidate_documents = [
+                  results for path, results in indexed if "-candidate-" in path.name
+              ]
+              assert len(baseline_documents) == 8
+              assert len(candidate_documents) == 8
+              for case_id in case_ids:
                   baseline = [
                       sample
-                      for name in ("base-first", "base-second")
-                      for sample in indexed[name][case_id]["samples"]
+                      for results in baseline_documents
+                      for sample in results[case_id]["samples"]
                   ]
                   candidate = [
                       sample
-                      for name in ("candidate-first", "candidate-second")
-                      for sample in indexed[name][case_id]["samples"]
+                      for results in candidate_documents
+                      for sample in results[case_id]["samples"]
                   ]
+                  assert len(baseline) == 8, (mode, case_id, "baseline samples")
+                  assert len(candidate) == 8, (mode, case_id, "candidate samples")
                   for metric, getter in (
                       ("wall", lambda sample: sample["wall_seconds"]),
                       (
