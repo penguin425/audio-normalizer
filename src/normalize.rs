@@ -944,36 +944,39 @@ fn prepare_file_for_plan(
     let mut converter: Option<SampleRateConverter> = None;
     let mut spool: Option<PcmSpool> = None;
     let mut resolved_roles = None;
-    let info = decoder::decode_stream(path, |info, chunk| {
-        if analyzer.is_none() {
-            let roles = resolve_stream_roles(path, info, channel_roles)?;
-            let output_rate = plan.output_sample_rate.unwrap_or(info.sample_rate);
-            analyzer = Some(lufs::StreamingAnalyzer::new(output_rate, roles.clone()));
-            resolved_roles = Some(roles);
-            if output_rate != info.sample_rate {
-                converter = Some(SampleRateConverter::new_streaming(
-                    info.sample_rate,
-                    output_rate,
-                    info.channels as usize,
-                    plan.resample_quality,
-                )?);
+    let info =
+        decoder::decode_stream_with_declared_frames(path, |info, declared_frames, chunk| {
+            if analyzer.is_none() {
+                let roles = resolve_stream_roles(path, info, channel_roles)?;
+                let output_rate = plan.output_sample_rate.unwrap_or(info.sample_rate);
+                analyzer = Some(lufs::StreamingAnalyzer::new(output_rate, roles.clone()));
+                resolved_roles = Some(roles);
+                if output_rate != info.sample_rate {
+                    converter = Some(SampleRateConverter::new_streaming(
+                        info.sample_rate,
+                        output_rate,
+                        info.channels as usize,
+                        plan.resample_quality,
+                    )?);
+                }
+                if capture_spool && should_capture_pcm(path, converter.is_some()) {
+                    // The spool is a performance optimization. If its bounded RAM
+                    // or temporary-file storage cannot be created, retain the
+                    // established two-decode path rather than failing an otherwise
+                    // valid normalization.
+                    let expected_bytes =
+                        expected_pcm_spool_bytes(path, info, output_rate, declared_frames);
+                    spool = PcmSpool::new(info.channels as usize, expected_bytes).ok();
+                }
             }
-            if capture_spool && should_capture_pcm(path, converter.is_some()) {
-                // The spool is a performance optimization. If the host cannot
-                // create its temporary file, retain the established two-decode
-                // path rather than turning a successful normalization into an
-                // out-of-space/temp-directory failure.
-                spool = PcmSpool::new(info.channels as usize).ok();
+            if let Some(converter) = converter.as_mut() {
+                converter.process(chunk, |output| {
+                    analyze_and_capture(output, analyzer.as_mut().unwrap(), &mut spool)
+                })
+            } else {
+                analyze_and_capture(chunk, analyzer.as_mut().unwrap(), &mut spool)
             }
-        }
-        if let Some(converter) = converter.as_mut() {
-            converter.process(chunk, |output| {
-                analyze_and_capture(output, analyzer.as_mut().unwrap(), &mut spool)
-            })
-        } else {
-            analyze_and_capture(chunk, analyzer.as_mut().unwrap(), &mut spool)
-        }
-    })?;
+        })?;
     if let Some(converter) = converter.as_mut() {
         converter
             .finish(|output| analyze_and_capture(output, analyzer.as_mut().unwrap(), &mut spool))?;
@@ -1066,6 +1069,36 @@ fn should_capture_pcm(path: &Path, resampling: bool) -> bool {
                     "flac" | "dsf" | "dff"
                 )
             })
+}
+
+fn expected_pcm_spool_bytes(
+    path: &Path,
+    info: &decoder::StreamInfo,
+    output_rate: u32,
+    declared_frames: Option<u64>,
+) -> Option<usize> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if !matches!(
+        extension.as_str(),
+        "wav" | "wave" | "bwf" | "bw64" | "rf64" | "flac" | "dsf" | "dff"
+    ) {
+        return None;
+    }
+    let source_frames = u128::from(declared_frames?);
+    let output_frames = if output_rate == info.sample_rate {
+        source_frames
+    } else {
+        (source_frames * u128::from(output_rate) + u128::from(info.sample_rate) / 2)
+            / u128::from(info.sample_rate)
+    };
+    usize::try_from(output_frames)
+        .ok()?
+        .checked_mul(info.channels as usize)?
+        .checked_mul(std::mem::size_of::<f32>())
 }
 
 /// Analyze an optional source-time range and optionally capture a loudness
@@ -2793,6 +2826,36 @@ impl NormalizedStreamWriter {
         }
     }
 
+    fn supports_borrowed_planar(&self) -> bool {
+        matches!(
+            self,
+            Self::Wav {
+                writer,
+                lossless: None,
+                ..
+            } if writer.supports_borrowed_planar()
+        )
+    }
+
+    fn write_normalized_borrowed_chunk(
+        &mut self,
+        planar: &[&[f32]],
+        gain: f32,
+        ceiling: f32,
+    ) -> Result<(), String> {
+        match self {
+            Self::Wav {
+                output,
+                writer,
+                lossless: None,
+                ..
+            } if writer.supports_borrowed_planar() => writer
+                .write_normalized_borrowed_chunk(planar, gain, ceiling)
+                .map_err(|error| format!("write {}: {error}", output.display())),
+            _ => Err("stream writer does not support borrowed planar PCM".into()),
+        }
+    }
+
     fn finish(self) -> Result<Option<Analysis>, String> {
         match self {
             Self::Wav {
@@ -3148,6 +3211,26 @@ fn normalize_stream(
     }
     let mut writer =
         NormalizedStreamWriter::create(source.path, output, analysis, gain, plan, format, options)?;
+    if plan.limiter.is_none()
+        && !options.capture_statistics
+        && writer.supports_borrowed_planar()
+        && source
+            .spool
+            .as_deref()
+            .is_some_and(PcmSpool::can_replay_borrowed)
+    {
+        source
+            .spool
+            .as_deref()
+            .expect("borrowed spool eligibility checked above")
+            .replay_borrowed(|planar| {
+                writer.write_normalized_borrowed_chunk(planar, gain, ceiling)
+            })?;
+        return Ok(StreamRenderResult {
+            statistics: None,
+            lossless_output: writer.finish()?,
+        });
+    }
     let statistics = process_normalized_stream(
         source,
         analysis,
@@ -3984,6 +4067,29 @@ mod tests {
         assert_eq!(result.attempts, 1);
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn pcm_spool_estimate_uses_reliable_output_domain_lengths() {
+        let info = decoder::StreamInfo {
+            sample_rate: 44_100,
+            channels: 2,
+            channel_roles: default_channel_roles(2),
+            source_kind: PcmKind::F32,
+        };
+        assert_eq!(
+            expected_pcm_spool_bytes(Path::new("track.flac"), &info, 48_000, Some(44_100 * 300),),
+            Some(48_000 * 300 * 2 * std::mem::size_of::<f32>())
+        );
+        assert_eq!(
+            expected_pcm_spool_bytes(Path::new("track.mp3"), &info, 48_000, Some(44_100 * 300),),
+            None,
+            "lossy container duration metadata is not an exact allocation bound"
+        );
+        assert_eq!(
+            expected_pcm_spool_bytes(Path::new("track.flac"), &info, 48_000, None),
+            None
+        );
     }
 
     #[test]

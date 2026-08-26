@@ -705,9 +705,20 @@ fn dff_channel_roles(ids: &[[u8; 4]]) -> Vec<ChannelRole> {
         .collect()
 }
 
-pub fn decode_stream<F>(path: &Path, mut consume: F) -> Result<crate::decoder::StreamInfo, String>
+pub fn decode_stream<F>(path: &Path, consume: F) -> Result<crate::decoder::StreamInfo, String>
 where
     F: FnMut(&crate::decoder::StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
+{
+    let mut consume = consume;
+    decode_stream_with_declared_frames(path, |info, _, planar| consume(info, planar))
+}
+
+pub(crate) fn decode_stream_with_declared_frames<F>(
+    path: &Path,
+    mut consume: F,
+) -> Result<crate::decoder::StreamInfo, String>
+where
+    F: FnMut(&crate::decoder::StreamInfo, Option<u64>, &mut [Vec<f32>]) -> Result<(), String>,
 {
     let info = probe(path)?;
     let stream_info = crate::decoder::StreamInfo {
@@ -732,6 +743,11 @@ where
     let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
     file.seek(SeekFrom::Start(info.data_offset))
         .map_err(|error| format!("seek {} DSD data: {error}", path.display()))?;
+    let declared_frames = Some(info.output_frames);
+    let mut consume_without_metadata =
+        |stream_info: &crate::decoder::StreamInfo, planar: &mut [Vec<f32>]| {
+            consume(stream_info, declared_frames, planar)
+        };
 
     match info.layout {
         DsdLayout::Dsf { .. } => decode_dsf_data(
@@ -741,7 +757,7 @@ where
             &mut pending,
             &mut source_samples,
             &stream_info,
-            &mut consume,
+            &mut consume_without_metadata,
         )?,
         DsdLayout::Dsdiff => decode_dsdiff_data(
             &mut file,
@@ -750,10 +766,15 @@ where
             &mut pending,
             &mut source_samples,
             &stream_info,
-            &mut consume,
+            &mut consume_without_metadata,
         )?,
     }
-    flush_pending(&mut pending, &stream_info, &mut consume, true)?;
+    flush_pending(
+        &mut pending,
+        &stream_info,
+        &mut consume_without_metadata,
+        true,
+    )?;
     if source_samples
         .iter()
         .any(|count| *count != info.source_samples_per_channel)
