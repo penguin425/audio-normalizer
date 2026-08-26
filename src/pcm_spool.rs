@@ -1,28 +1,85 @@
 //! Ephemeral planar-f32 storage for exact two-stage normalization.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::mem::size_of_val;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Decoder and resampler chunks are commonly only a few KiB. Keep their exact
 // record boundaries while amortizing temporary-file syscalls over a bounded
 // buffer that remains small relative to one second of multichannel PCM.
 const IO_BUFFER_BYTES: usize = 1024 * 1024;
+// Retain the common five-minute stereo delivery in userspace while bounding
+// additional process memory. Only one top-level spool may hold this budget;
+// nested file-level jobs keep the established temporary-file path.
+const MAX_IN_MEMORY_PCM_BYTES: usize = 128 * 1024 * 1024;
+static IN_MEMORY_PCM_SPOOL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct MemorySpoolLease {
+    tracked: bool,
+}
+
+impl MemorySpoolLease {
+    fn try_acquire() -> Option<Self> {
+        IN_MEMORY_PCM_SPOOL_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self { tracked: true })
+    }
+
+    #[cfg(test)]
+    fn untracked() -> Self {
+        Self { tracked: false }
+    }
+}
+
+impl Drop for MemorySpoolLease {
+    fn drop(&mut self) {
+        if self.tracked {
+            IN_MEMORY_PCM_SPOOL_ACTIVE.store(false, Ordering::Release);
+        }
+    }
+}
+
+enum PcmSpoolStorage {
+    Memory {
+        bytes: Vec<u8>,
+        limit: usize,
+        lease: MemorySpoolLease,
+    },
+    File(BufWriter<File>),
+    Transitioning,
+}
 
 pub(crate) struct PcmSpool {
-    file: BufWriter<File>,
+    storage: PcmSpoolStorage,
     channels: usize,
     frames: usize,
 }
 
 impl PcmSpool {
-    pub(crate) fn new(channels: usize) -> Result<Self, String> {
+    pub(crate) fn new(channels: usize, expected_pcm_bytes: Option<usize>) -> Result<Self, String> {
         if channels == 0 {
             return Err("PCM spool requires at least one channel".into());
         }
-        let file = tempfile::tempfile().map_err(|error| format!("create PCM spool: {error}"))?;
+        let fits_memory_budget = expected_pcm_bytes
+            .and_then(|bytes| bytes.checked_add(IO_BUFFER_BYTES))
+            .is_some_and(|bytes| bytes <= MAX_IN_MEMORY_PCM_BYTES);
+        let memory = if fits_memory_budget && rayon::current_thread_index().is_none() {
+            MemorySpoolLease::try_acquire().map(|lease| PcmSpoolStorage::Memory {
+                bytes: Vec::new(),
+                limit: MAX_IN_MEMORY_PCM_BYTES,
+                lease,
+            })
+        } else {
+            None
+        };
+        let storage = match memory {
+            Some(storage) => storage,
+            None => file_storage()?,
+        };
         Ok(Self {
-            file: BufWriter::with_capacity(IO_BUFFER_BYTES, file),
+            storage,
             channels,
             frames: 0,
         })
@@ -45,13 +102,33 @@ impl PcmSpool {
         }
         let frames_u64 = u64::try_from(frames)
             .map_err(|_| "PCM spool chunk length does not fit its record header".to_string())?;
-        self.file
-            .write_all(&frames_u64.to_le_bytes())
-            .map_err(|error| format!("write PCM spool record: {error}"))?;
-        for channel in planar {
-            self.file
-                .write_all(samples_as_bytes(channel))
-                .map_err(|error| format!("write PCM spool samples: {error}"))?;
+        let payload_bytes = planar.iter().try_fold(0usize, |total, channel| {
+            total
+                .checked_add(size_of_val(channel.as_slice()))
+                .ok_or_else(|| "PCM spool record size overflow".to_string())
+        })?;
+        let record_bytes = size_of_val(&frames_u64)
+            .checked_add(payload_bytes)
+            .ok_or_else(|| "PCM spool record size overflow".to_string())?;
+        self.prepare_record_storage(record_bytes)?;
+        match &mut self.storage {
+            PcmSpoolStorage::Memory { bytes, .. } => {
+                bytes.extend_from_slice(&frames_u64.to_le_bytes());
+                for channel in planar {
+                    bytes.extend_from_slice(samples_as_bytes(channel));
+                }
+            }
+            PcmSpoolStorage::File(file) => {
+                file.write_all(&frames_u64.to_le_bytes())
+                    .map_err(|error| format!("write PCM spool record: {error}"))?;
+                for channel in planar {
+                    file.write_all(samples_as_bytes(channel))
+                        .map_err(|error| format!("write PCM spool samples: {error}"))?;
+                }
+            }
+            PcmSpoolStorage::Transitioning => {
+                return Err("PCM spool storage transition was interrupted".into());
+            }
         }
         self.frames = self
             .frames
@@ -65,43 +142,115 @@ impl PcmSpool {
     }
 
     pub(crate) fn finish_writing(&mut self) -> Result<(), String> {
-        self.file
-            .flush()
-            .map_err(|error| format!("flush PCM spool: {error}"))
+        match &mut self.storage {
+            PcmSpoolStorage::Memory { .. } => Ok(()),
+            PcmSpoolStorage::File(file) => file
+                .flush()
+                .map_err(|error| format!("flush PCM spool: {error}")),
+            PcmSpoolStorage::Transitioning => {
+                Err("PCM spool storage transition was interrupted".into())
+            }
+        }
+    }
+
+    fn prepare_record_storage(&mut self, record_bytes: usize) -> Result<(), String> {
+        let spill = match &mut self.storage {
+            PcmSpoolStorage::Memory { bytes, limit, .. } => {
+                let retained = bytes
+                    .len()
+                    .checked_add(record_bytes)
+                    .ok_or_else(|| "PCM spool size overflow".to_string())?;
+                retained > *limit || bytes.try_reserve(record_bytes).is_err()
+            }
+            PcmSpoolStorage::File(_) => false,
+            PcmSpoolStorage::Transitioning => {
+                return Err("PCM spool storage transition was interrupted".into());
+            }
+        };
+        if spill {
+            self.spill_to_file()?;
+        }
+        Ok(())
+    }
+
+    fn spill_to_file(&mut self) -> Result<(), String> {
+        let storage = std::mem::replace(&mut self.storage, PcmSpoolStorage::Transitioning);
+        let (bytes, limit, lease) = match storage {
+            PcmSpoolStorage::Memory {
+                bytes,
+                limit,
+                lease,
+            } => (bytes, limit, lease),
+            storage => {
+                self.storage = storage;
+                return Ok(());
+            }
+        };
+        let file = match tempfile::tempfile() {
+            Ok(file) => file,
+            Err(error) => {
+                self.storage = PcmSpoolStorage::Memory {
+                    bytes,
+                    limit,
+                    lease,
+                };
+                return Err(format!("create PCM spool: {error}"));
+            }
+        };
+        let mut file = BufWriter::with_capacity(IO_BUFFER_BYTES, file);
+        if let Err(error) = file.write_all(&bytes) {
+            self.storage = PcmSpoolStorage::Memory {
+                bytes,
+                limit,
+                lease,
+            };
+            return Err(format!("spill PCM spool: {error}"));
+        }
+        self.storage = PcmSpoolStorage::File(file);
+        drop(lease);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn in_memory_for_test(channels: usize, limit: usize) -> Self {
+        assert_ne!(channels, 0);
+        Self {
+            storage: PcmSpoolStorage::Memory {
+                bytes: Vec::new(),
+                limit,
+                lease: MemorySpoolLease::untracked(),
+            },
+            channels,
+            frames: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_in_memory(&self) -> bool {
+        matches!(self.storage, PcmSpoolStorage::Memory { .. })
     }
 
     pub(crate) fn replay(
         &mut self,
         mut consume: impl FnMut(&mut [Vec<f32>]) -> Result<(), String>,
     ) -> Result<(), String> {
-        self.file
-            .seek(SeekFrom::Start(0))
-            .map_err(|error| format!("rewind PCM spool: {error}"))?;
-        let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, self.file.get_mut());
-        let mut planar = (0..self.channels).map(|_| Vec::new()).collect::<Vec<_>>();
-        let mut replayed_frames = 0usize;
-        while let Some(frames) = read_record_frames(&mut reader)? {
-            if frames == 0 {
-                return Err("PCM spool contains an empty record".into());
+        let channels = self.channels;
+        let frames = self.frames;
+        match &mut self.storage {
+            PcmSpoolStorage::Memory { bytes, .. } => {
+                let mut reader = Cursor::new(bytes.as_slice());
+                replay_records(&mut reader, channels, frames, &mut consume)
             }
-            for channel in &mut planar {
-                channel.resize(frames, 0.0);
-                reader
-                    .read_exact(samples_as_bytes_mut(channel))
-                    .map_err(|error| format!("read PCM spool samples: {error}"))?;
+            PcmSpoolStorage::File(file) => {
+                file.seek(SeekFrom::Start(0))
+                    .map_err(|error| format!("rewind PCM spool: {error}"))?;
+                let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, file.get_mut());
+                replay_records(&mut reader, channels, frames, &mut consume)
             }
-            replayed_frames = replayed_frames
-                .checked_add(frames)
-                .ok_or_else(|| "PCM spool replay duration overflow".to_string())?;
-            consume(&mut planar)?;
+            PcmSpoolStorage::Transitioning => {
+                Err("PCM spool storage transition was interrupted".into())
+            }
         }
-        if replayed_frames != self.frames {
-            return Err(format!(
-                "PCM spool replayed {replayed_frames} frames, expected {}",
-                self.frames
-            ));
-        }
-        Ok(())
     }
 
     /// Replay by handing each channel allocation to the consumer and accepting
@@ -132,6 +281,45 @@ impl PcmSpool {
             Ok(())
         })
     }
+}
+
+fn file_storage() -> Result<PcmSpoolStorage, String> {
+    let file = tempfile::tempfile().map_err(|error| format!("create PCM spool: {error}"))?;
+    Ok(PcmSpoolStorage::File(BufWriter::with_capacity(
+        IO_BUFFER_BYTES,
+        file,
+    )))
+}
+
+fn replay_records(
+    reader: &mut impl Read,
+    channels: usize,
+    expected_frames: usize,
+    consume: &mut impl FnMut(&mut [Vec<f32>]) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut planar = (0..channels).map(|_| Vec::new()).collect::<Vec<_>>();
+    let mut replayed_frames = 0usize;
+    while let Some(frames) = read_record_frames(reader)? {
+        if frames == 0 {
+            return Err("PCM spool contains an empty record".into());
+        }
+        for channel in &mut planar {
+            channel.resize(frames, 0.0);
+            reader
+                .read_exact(samples_as_bytes_mut(channel))
+                .map_err(|error| format!("read PCM spool samples: {error}"))?;
+        }
+        replayed_frames = replayed_frames
+            .checked_add(frames)
+            .ok_or_else(|| "PCM spool replay duration overflow".to_string())?;
+        consume(&mut planar)?;
+    }
+    if replayed_frames != expected_frames {
+        return Err(format!(
+            "PCM spool replayed {replayed_frames} frames, expected {expected_frames}"
+        ));
+    }
+    Ok(())
 }
 
 fn read_record_frames(reader: &mut impl Read) -> Result<Option<usize>, String> {
@@ -182,7 +370,7 @@ mod tests {
             ],
             vec![vec![0.5, -0.5], vec![0.125, -0.125]],
         ];
-        let mut spool = PcmSpool::new(2).unwrap();
+        let mut spool = PcmSpool::new(2, Some(40)).unwrap();
         for chunk in &chunks {
             spool.write_chunk(chunk).unwrap();
         }
@@ -223,7 +411,7 @@ mod tests {
             vec![vec![0.25, -0.5, 0.75], vec![-0.25, 0.5, -0.75]],
             vec![vec![1.0, -1.0], vec![0.125, -0.125]],
         ];
-        let mut spool = PcmSpool::new(2).unwrap();
+        let mut spool = PcmSpool::new(2, Some(40)).unwrap();
         for chunk in &chunks {
             spool.write_chunk(chunk).unwrap();
         }
@@ -274,7 +462,7 @@ mod tests {
             .map(|frame| f32::from_bits(frame as u32 ^ 0xbf00_0000))
             .collect::<Vec<_>>();
         let expected = [left, right];
-        let mut spool = PcmSpool::new(2).unwrap();
+        let mut spool = PcmSpool::new(2, Some(frames * 2 * size_of::<f32>())).unwrap();
         spool.write_chunk(&expected).unwrap();
 
         spool
@@ -297,8 +485,45 @@ mod tests {
     }
 
     #[test]
+    fn bounded_memory_spool_spills_to_the_exact_file_format() {
+        let first = vec![vec![0.25, -0.5, 0.75], vec![-0.25, 0.5, -0.75]];
+        let second = vec![vec![1.0], vec![-1.0]];
+        let mut spool = PcmSpool::in_memory_for_test(2, 40);
+        spool.write_chunk(&first).unwrap();
+        assert!(spool.is_in_memory());
+        spool.write_chunk(&second).unwrap();
+        assert!(!spool.is_in_memory());
+        spool.finish_writing().unwrap();
+
+        for _ in 0..2 {
+            let mut replayed = Vec::new();
+            spool
+                .replay(|planar| {
+                    replayed.push(
+                        planar
+                            .iter()
+                            .map(|channel| channel.iter().map(|sample| sample.to_bits()).collect())
+                            .collect::<Vec<Vec<u32>>>(),
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            let expected = [&first, &second]
+                .into_iter()
+                .map(|planar| {
+                    planar
+                        .iter()
+                        .map(|channel| channel.iter().map(|sample| sample.to_bits()).collect())
+                        .collect::<Vec<Vec<u32>>>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(replayed, expected);
+        }
+    }
+
+    #[test]
     fn rejects_changed_channel_geometry() {
-        let mut spool = PcmSpool::new(2).unwrap();
+        let mut spool = PcmSpool::new(2, None).unwrap();
         assert!(spool.write_chunk(&[vec![0.0]]).is_err());
         assert!(spool.write_chunk(&[vec![0.0, 1.0], vec![0.0]]).is_err());
     }

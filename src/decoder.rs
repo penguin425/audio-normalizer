@@ -33,6 +33,9 @@ pub struct StreamInfo {
     pub channels: u16,
     pub channel_roles: Vec<ChannelRole>,
     pub source_kind: PcmKind,
+    /// Container-declared frame count, which callers must trust only for
+    /// formats whose duration metadata is exact.
+    pub declared_frames: Option<u64>,
 }
 
 /// Decode any supported audio file into a planar-f32 [`AudioBuffer`].
@@ -740,6 +743,7 @@ where
                 channels: output.channels,
                 channel_roles: output.channel_roles.clone(),
                 source_kind: output.source_kind,
+                declared_frames: track.num_frames,
             });
             output_format = Some(output);
         }
@@ -1043,6 +1047,7 @@ where
                                 channels: output.channels,
                                 channel_roles: output.channel_roles.clone(),
                                 source_kind: output.source_kind,
+                                declared_frames: track.num_frames,
                             });
                             output_format = Some(output);
                         }
@@ -1145,6 +1150,9 @@ where
         channels: wav.channels,
         channel_roles: wav.channel_roles,
         source_kind: wav.kind,
+        declared_frames: Some(
+            wav.data_size / (u64::from(wav.channels) * wav.kind.bytes_per_sample() as u64),
+        ),
     };
     let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     file.seek(SeekFrom::Start(wav.data_offset))
@@ -1267,6 +1275,7 @@ mod tests {
             channels: 2,
             channel_roles: default_channel_roles(2),
             source_kind: PcmKind::F32,
+            declared_frames: None,
         };
         let mut planar = Vec::new();
         let mut observed = vec![Vec::new(), Vec::new()];

@@ -715,6 +715,7 @@ where
         channels: info.channels,
         channel_roles: info.channel_roles.clone(),
         source_kind: PcmKind::F32,
+        declared_frames: Some(info.output_frames),
     };
     if info.output_frames == 0 {
         return Err(format!(

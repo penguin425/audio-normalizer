@@ -1,10 +1,13 @@
-name: PCM spool buffer regression benchmark
+name: PCM spool storage benchmark
 
 on:
   pull_request:
     paths:
       - ".github/workflows/pcm-spool-buffer-benchmark.yml"
+      - "src/decoder.rs"
+      - "src/dsd.rs"
       - "src/normalize.rs"
+      - "src/opus.rs"
       - "src/pcm_spool.rs"
       - "tools/benchmark.py"
       - "tools/test_benchmark.py"
@@ -64,6 +67,9 @@ jobs:
           python3 candidate/tools/test_benchmark.py
           cargo test --locked --manifest-path candidate/Cargo.toml \
             --no-default-features --lib pcm_spool::tests -- --nocapture
+          cargo test --locked --manifest-path candidate/Cargo.toml \
+            --no-default-features --lib \
+            pcm_spool_estimate_uses_reliable_output_domain_lengths -- --nocapture
 
       - name: Build exact baseline and candidate
         shell: bash
@@ -130,12 +136,46 @@ jobs:
             local common=(
               --forge "${forge}"
               --ffmpeg "$(command -v ffmpeg)"
-              --duration-seconds 600
+              --duration-seconds 300
               --iterations 7
               --case flac-stereo-normalize
               --case wav-stereo-resample-normalize
               --work-dir "${RUNNER_TEMP}/${label}"
               --output "${label}.json"
+            )
+            if [[ "${mode}" == "one" ]]; then
+              RAYON_NUM_THREADS=1 python3 candidate/tools/benchmark.py "${common[@]}"
+            else
+              python3 candidate/tools/benchmark.py "${common[@]}"
+            fi
+          }
+
+          baseline="${RUNNER_TEMP}/target-baseline/release/forge"
+          candidate="${RUNNER_TEMP}/target-candidate/release/forge"
+          for mode in default one; do
+            run_benchmark "${mode}" "${mode}-base-first" "${baseline}"
+            run_benchmark "${mode}" "${mode}-candidate-second" "${candidate}"
+            run_benchmark "${mode}" "${mode}-candidate-first" "${candidate}"
+            run_benchmark "${mode}" "${mode}-base-second" "${baseline}"
+          done
+
+      - name: Run over-budget controls in both orders
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_benchmark() {
+            local mode="$1"
+            local label="$2"
+            local forge="$3"
+            local common=(
+              --forge "${forge}"
+              --ffmpeg "$(command -v ffmpeg)"
+              --duration-seconds 600
+              --iterations 3
+              --case flac-stereo-normalize
+              --case wav-stereo-resample-normalize
+              --work-dir "${RUNNER_TEMP}/long-${label}"
+              --output "long-${label}.json"
             )
             if [[ "${mode}" == "one" ]]; then
               RAYON_NUM_THREADS=1 python3 candidate/tools/benchmark.py "${common[@]}"
@@ -265,6 +305,7 @@ jobs:
           path: |
             default-*.json
             one-*.json
+            long-*.json
             pcm-spool-buffer-summary.json
             pcm-spool-buffer-summary.md
           if-no-files-found: warn
@@ -291,9 +332,9 @@ jobs:
                   cpu = metrics["total_cpu_seconds"]["change_percent"]
                   rss = metrics["peak_rss_bytes"]
                   rss_delta = rss["candidate"] - rss["baseline"]
-                  assert wall <= 5.0, (mode, case_id, "wall", wall)
+                  assert wall <= 3.0, (mode, case_id, "wall", wall)
                   assert cpu <= 3.0, (mode, case_id, "cpu", cpu)
-                  assert rss_delta <= 4 * 1024 * 1024, (
+                  assert rss_delta <= 132 * 1024 * 1024, (
                       mode,
                       case_id,
                       "RSS delta",
@@ -305,8 +346,74 @@ jobs:
           assert len(cpu_changes) == 4, cpu_changes
           average_wall = statistics.fmean(wall_changes)
           average_cpu = statistics.fmean(cpu_changes)
-          assert average_wall <= 3.0, ("average wall regression", average_wall)
-          assert average_cpu <= 3.0, ("average CPU regression", average_cpu)
+          assert average_wall <= -2.0, ("average wall improvement", average_wall)
+          assert average_cpu <= -2.0, ("average CPU improvement", average_cpu)
           print(f"average wall change: {average_wall:+.3f}%")
           print(f"average CPU change: {average_cpu:+.3f}%")
+          PY
+
+      - name: Enforce over-budget regression gates
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import statistics
+          from pathlib import Path
+
+          changes = []
+          for mode in ("default", "one"):
+              names = (
+                  "base-first",
+                  "base-second",
+                  "candidate-first",
+                  "candidate-second",
+              )
+              documents = {
+                  name: json.loads(
+                      Path(f"long-{mode}-{name}.json").read_text(encoding="utf-8")
+                  )
+                  for name in names
+              }
+              assert all(document["passed"] for document in documents.values())
+              indexed = {
+                  name: {result["id"]: result for result in document["results"]}
+                  for name, document in documents.items()
+              }
+              for case_id in indexed["base-first"]:
+                  baseline = [
+                      sample
+                      for name in ("base-first", "base-second")
+                      for sample in indexed[name][case_id]["samples"]
+                  ]
+                  candidate = [
+                      sample
+                      for name in ("candidate-first", "candidate-second")
+                      for sample in indexed[name][case_id]["samples"]
+                  ]
+                  for metric, getter in (
+                      ("wall", lambda sample: sample["wall_seconds"]),
+                      (
+                          "cpu",
+                          lambda sample: sample["user_cpu_seconds"]
+                          + sample["system_cpu_seconds"],
+                      ),
+                  ):
+                      base_value = statistics.median(map(getter, baseline))
+                      candidate_value = statistics.median(map(getter, candidate))
+                      change = (candidate_value / base_value - 1.0) * 100.0
+                      assert change <= 5.0, (mode, case_id, metric, change)
+                      changes.append(change)
+                  rss_delta = max(
+                      sample["peak_rss_bytes"] for sample in candidate
+                  ) - max(sample["peak_rss_bytes"] for sample in baseline)
+                  assert rss_delta <= 4 * 1024 * 1024, (
+                      mode,
+                      case_id,
+                      "RSS delta",
+                      rss_delta,
+                  )
+          assert len(changes) == 8, changes
+          average = statistics.fmean(changes)
+          assert average <= 3.0, ("over-budget average regression", average)
+          print(f"over-budget wall/CPU average change: {average:+.3f}%")
           PY

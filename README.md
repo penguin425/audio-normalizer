@@ -223,8 +223,13 @@ the `-o` extension override this.
   reuse temporary output-domain PCM for resampled audio and decode-heavy
   lossless/DSD inputs, avoiding a second decode or resample; fast same-rate
   inputs and multi-track albums retain the lower-I/O/bounded-resource re-decode
-  path. One MiB sequential read/write buffers amortize the small decoder and
-  resampler record I/O while preserving exact record boundaries.
+  path. When an exact WAV, FLAC, or DSD duration proves that one top-level spool
+  fits, Forge retains at most 128 MiB of its exact PCM in userspace. One
+  process-wide lease prevents concurrent memory multiplication; unknown or
+  longer inputs and nested file jobs use the established temporary file from
+  their first sample. A defensive exact spill handles inconsistent metadata,
+  while one MiB sequential buffers amortize disk I/O and preserve record
+  boundaries.
   Standard-input audio is spooled to a temporary file so the same correct
   two-pass algorithm remains available in shell pipelines.
 * Release profile uses `lto = "fat"`, `codegen-units = 1`, and

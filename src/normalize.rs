@@ -959,11 +959,12 @@ fn prepare_file_for_plan(
                 )?);
             }
             if capture_spool && should_capture_pcm(path, converter.is_some()) {
-                // The spool is a performance optimization. If the host cannot
-                // create its temporary file, retain the established two-decode
-                // path rather than turning a successful normalization into an
-                // out-of-space/temp-directory failure.
-                spool = PcmSpool::new(info.channels as usize).ok();
+                // The spool is a performance optimization. If its bounded RAM
+                // or temporary-file storage cannot be created, retain the
+                // established two-decode path rather than failing an otherwise
+                // valid normalization.
+                let expected_bytes = expected_pcm_spool_bytes(path, info, output_rate);
+                spool = PcmSpool::new(info.channels as usize, expected_bytes).ok();
             }
         }
         if let Some(converter) = converter.as_mut() {
@@ -1066,6 +1067,35 @@ fn should_capture_pcm(path: &Path, resampling: bool) -> bool {
                     "flac" | "dsf" | "dff"
                 )
             })
+}
+
+fn expected_pcm_spool_bytes(
+    path: &Path,
+    info: &decoder::StreamInfo,
+    output_rate: u32,
+) -> Option<usize> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if !matches!(
+        extension.as_str(),
+        "wav" | "wave" | "bwf" | "bw64" | "rf64" | "flac" | "dsf" | "dff"
+    ) {
+        return None;
+    }
+    let source_frames = u128::from(info.declared_frames?);
+    let output_frames = if output_rate == info.sample_rate {
+        source_frames
+    } else {
+        (source_frames * u128::from(output_rate) + u128::from(info.sample_rate) / 2)
+            / u128::from(info.sample_rate)
+    };
+    usize::try_from(output_frames)
+        .ok()?
+        .checked_mul(info.channels as usize)?
+        .checked_mul(std::mem::size_of::<f32>())
 }
 
 /// Analyze an optional source-time range and optionally capture a loudness
@@ -3984,6 +4014,34 @@ mod tests {
         assert_eq!(result.attempts, 1);
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn pcm_spool_estimate_uses_reliable_output_domain_lengths() {
+        let info = decoder::StreamInfo {
+            sample_rate: 44_100,
+            channels: 2,
+            channel_roles: default_channel_roles(2),
+            source_kind: PcmKind::F32,
+            declared_frames: Some(44_100 * 300),
+        };
+        assert_eq!(
+            expected_pcm_spool_bytes(Path::new("track.flac"), &info, 48_000),
+            Some(48_000 * 300 * 2 * std::mem::size_of::<f32>())
+        );
+        assert_eq!(
+            expected_pcm_spool_bytes(Path::new("track.mp3"), &info, 48_000),
+            None,
+            "lossy container duration metadata is not an exact allocation bound"
+        );
+        let unknown = decoder::StreamInfo {
+            declared_frames: None,
+            ..info
+        };
+        assert_eq!(
+            expected_pcm_spool_bytes(Path::new("track.flac"), &unknown, 48_000),
+            None
+        );
     }
 
     #[test]
