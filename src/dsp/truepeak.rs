@@ -365,14 +365,26 @@ impl TruePeakMeter {
             #[cfg(target_arch = "x86_64")]
             let interpolated = if self.use_avx2_fma {
                 // SAFETY: the constructor performed runtime AVX2/FMA detection.
-                unsafe { interpolate_avx2_fma(history, table) }
+                unsafe {
+                    if self.factor == 2 {
+                        interpolate_2x_avx2_fma(history, table)
+                    } else {
+                        interpolate_avx2_fma(history, table)
+                    }
+                }
             } else {
                 interpolate_scalar(history, table, self.factor)
             };
             #[cfg(target_arch = "aarch64")]
             let interpolated = {
                 // SAFETY: Advanced SIMD is part of the AArch64 architecture.
-                unsafe { interpolate_neon(history, table) }
+                unsafe {
+                    if self.factor == 2 {
+                        interpolate_2x_neon(history, table)
+                    } else {
+                        interpolate_neon(history, table)
+                    }
+                }
             };
             #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             let interpolated = interpolate_scalar(history, table, self.factor);
@@ -403,14 +415,26 @@ impl TruePeakMeter {
             #[cfg(target_arch = "x86_64")]
             let interpolated = if self.use_avx2_fma {
                 // SAFETY: the constructor performed runtime AVX2/FMA detection.
-                unsafe { interpolate_avx2_fma(history, table) }
+                unsafe {
+                    if self.factor == 2 {
+                        interpolate_2x_avx2_fma(history, table)
+                    } else {
+                        interpolate_avx2_fma(history, table)
+                    }
+                }
             } else {
                 interpolate_scalar(history, table, self.factor)
             };
             #[cfg(target_arch = "aarch64")]
             let interpolated = {
                 // SAFETY: Advanced SIMD is part of the AArch64 architecture.
-                unsafe { interpolate_neon(history, table) }
+                unsafe {
+                    if self.factor == 2 {
+                        interpolate_2x_neon(history, table)
+                    } else {
+                        interpolate_neon(history, table)
+                    }
+                }
             };
             #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             let interpolated = interpolate_scalar(history, table, self.factor);
@@ -457,14 +481,26 @@ impl TruePeakMeter {
             let (left_interpolated, right_interpolated) = if left.use_avx2_fma {
                 // SAFETY: both meters run on this process and the constructor
                 // performed runtime AVX2/FMA detection.
-                unsafe { interpolate_stereo_avx2_fma(left_history, right_history, table) }
+                unsafe {
+                    if left.factor == 2 {
+                        interpolate_stereo_2x_avx2_fma(left_history, right_history, table)
+                    } else {
+                        interpolate_stereo_avx2_fma(left_history, right_history, table)
+                    }
+                }
             } else {
                 interpolate_stereo_scalar(left_history, right_history, table, left.factor)
             };
             #[cfg(target_arch = "aarch64")]
             let (left_interpolated, right_interpolated) = {
                 // SAFETY: Advanced SIMD is part of the AArch64 architecture.
-                unsafe { interpolate_stereo_neon(left_history, right_history, table) }
+                unsafe {
+                    if left.factor == 2 {
+                        interpolate_stereo_2x_neon(left_history, right_history, table)
+                    } else {
+                        interpolate_stereo_neon(left_history, right_history, table)
+                    }
+                }
             };
             #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             let (left_interpolated, right_interpolated) =
@@ -528,14 +564,26 @@ impl TruePeakMeter {
             #[cfg(target_arch = "x86_64")]
             let (left_interpolated, right_interpolated) = if left.use_avx2_fma {
                 // SAFETY: both constructors performed runtime AVX2/FMA detection.
-                unsafe { interpolate_stereo_avx2_fma(left_history, right_history, table) }
+                unsafe {
+                    if left.factor == 2 {
+                        interpolate_stereo_2x_avx2_fma(left_history, right_history, table)
+                    } else {
+                        interpolate_stereo_avx2_fma(left_history, right_history, table)
+                    }
+                }
             } else {
                 interpolate_stereo_scalar(left_history, right_history, table, left.factor)
             };
             #[cfg(target_arch = "aarch64")]
             let (left_interpolated, right_interpolated) = {
                 // SAFETY: Advanced SIMD is part of the AArch64 architecture.
-                unsafe { interpolate_stereo_neon(left_history, right_history, table) }
+                unsafe {
+                    if left.factor == 2 {
+                        interpolate_stereo_2x_neon(left_history, right_history, table)
+                    } else {
+                        interpolate_stereo_neon(left_history, right_history, table)
+                    }
+                }
             };
             #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             let (left_interpolated, right_interpolated) =
@@ -550,14 +598,26 @@ impl TruePeakMeter {
             #[cfg(target_arch = "x86_64")]
             let interpolated = if left.use_avx2_fma {
                 // SAFETY: the constructor performed runtime AVX2/FMA detection.
-                unsafe { interpolate_avx2_fma(left_history, table) }
+                unsafe {
+                    if left.factor == 2 {
+                        interpolate_2x_avx2_fma(left_history, table)
+                    } else {
+                        interpolate_avx2_fma(left_history, table)
+                    }
+                }
             } else {
                 interpolate_scalar(left_history, table, left.factor)
             };
             #[cfg(target_arch = "aarch64")]
             let interpolated = {
                 // SAFETY: Advanced SIMD is part of the AArch64 architecture.
-                unsafe { interpolate_neon(left_history, table) }
+                unsafe {
+                    if left.factor == 2 {
+                        interpolate_2x_neon(left_history, table)
+                    } else {
+                        interpolate_neon(left_history, table)
+                    }
+                }
             };
             #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             let interpolated = interpolate_scalar(left_history, table, left.factor);
@@ -568,14 +628,26 @@ impl TruePeakMeter {
             #[cfg(target_arch = "x86_64")]
             let interpolated = if right.use_avx2_fma {
                 // SAFETY: the constructor performed runtime AVX2/FMA detection.
-                unsafe { interpolate_avx2_fma(right_history, table) }
+                unsafe {
+                    if right.factor == 2 {
+                        interpolate_2x_avx2_fma(right_history, table)
+                    } else {
+                        interpolate_avx2_fma(right_history, table)
+                    }
+                }
             } else {
                 interpolate_scalar(right_history, table, right.factor)
             };
             #[cfg(target_arch = "aarch64")]
             let interpolated = {
                 // SAFETY: Advanced SIMD is part of the AArch64 architecture.
-                unsafe { interpolate_neon(right_history, table) }
+                unsafe {
+                    if right.factor == 2 {
+                        interpolate_2x_neon(right_history, table)
+                    } else {
+                        interpolate_neon(right_history, table)
+                    }
+                }
             };
             #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             let interpolated = interpolate_scalar(right_history, table, right.factor);
@@ -646,6 +718,23 @@ fn interpolate_stereo_scalar(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+unsafe fn interpolate_2x_avx2_fma(
+    history: &[f64; TAPS_PER_PHASE],
+    table: &PhaseTable,
+) -> [f64; MAX_PHASES] {
+    let mut accumulator = _mm_setzero_pd();
+    for tap in 0..TAPS_PER_PHASE {
+        let sample = _mm_set1_pd(*history.get_unchecked(tap));
+        let coefficients = _mm_loadu_pd(table.get_unchecked(tap).as_ptr());
+        accumulator = _mm_fmadd_pd(sample, coefficients, accumulator);
+    }
+    let mut output = [0.0; MAX_PHASES];
+    _mm_storeu_pd(output.as_mut_ptr(), accumulator);
+    output
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn interpolate_avx2_fma(
     history: &[f64; TAPS_PER_PHASE],
     table: &PhaseTable,
@@ -659,6 +748,29 @@ unsafe fn interpolate_avx2_fma(
     let mut output = [0.0; MAX_PHASES];
     _mm256_storeu_pd(output.as_mut_ptr(), accumulator);
     output
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn interpolate_stereo_2x_avx2_fma(
+    left_history: &[f64; TAPS_PER_PHASE],
+    right_history: &[f64; TAPS_PER_PHASE],
+    table: &PhaseTable,
+) -> ([f64; MAX_PHASES], [f64; MAX_PHASES]) {
+    let mut left_accumulator = _mm_setzero_pd();
+    let mut right_accumulator = _mm_setzero_pd();
+    for tap in 0..TAPS_PER_PHASE {
+        let coefficients = _mm_loadu_pd(table.get_unchecked(tap).as_ptr());
+        let left_sample = _mm_set1_pd(*left_history.get_unchecked(tap));
+        let right_sample = _mm_set1_pd(*right_history.get_unchecked(tap));
+        left_accumulator = _mm_fmadd_pd(left_sample, coefficients, left_accumulator);
+        right_accumulator = _mm_fmadd_pd(right_sample, coefficients, right_accumulator);
+    }
+    let mut left_output = [0.0; MAX_PHASES];
+    let mut right_output = [0.0; MAX_PHASES];
+    _mm_storeu_pd(left_output.as_mut_ptr(), left_accumulator);
+    _mm_storeu_pd(right_output.as_mut_ptr(), right_accumulator);
+    (left_output, right_output)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -686,6 +798,23 @@ unsafe fn interpolate_stereo_avx2_fma(
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+unsafe fn interpolate_2x_neon(
+    history: &[f64; TAPS_PER_PHASE],
+    table: &PhaseTable,
+) -> [f64; MAX_PHASES] {
+    let mut accumulator = vdupq_n_f64(0.0);
+    for tap in 0..TAPS_PER_PHASE {
+        let sample = vdupq_n_f64(*history.get_unchecked(tap));
+        let coefficients = vld1q_f64(table.get_unchecked(tap).as_ptr());
+        accumulator = vfmaq_f64(accumulator, sample, coefficients);
+    }
+    let mut output = [0.0; MAX_PHASES];
+    vst1q_f64(output.as_mut_ptr(), accumulator);
+    output
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 unsafe fn interpolate_neon(
     history: &[f64; TAPS_PER_PHASE],
     table: &PhaseTable,
@@ -702,6 +831,29 @@ unsafe fn interpolate_neon(
     vst1q_f64(output.as_mut_ptr(), low);
     vst1q_f64(output.as_mut_ptr().add(2), high);
     output
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn interpolate_stereo_2x_neon(
+    left_history: &[f64; TAPS_PER_PHASE],
+    right_history: &[f64; TAPS_PER_PHASE],
+    table: &PhaseTable,
+) -> ([f64; MAX_PHASES], [f64; MAX_PHASES]) {
+    let mut left_accumulator = vdupq_n_f64(0.0);
+    let mut right_accumulator = vdupq_n_f64(0.0);
+    for tap in 0..TAPS_PER_PHASE {
+        let coefficients = vld1q_f64(table.get_unchecked(tap).as_ptr());
+        let left_sample = vdupq_n_f64(*left_history.get_unchecked(tap));
+        let right_sample = vdupq_n_f64(*right_history.get_unchecked(tap));
+        left_accumulator = vfmaq_f64(left_accumulator, left_sample, coefficients);
+        right_accumulator = vfmaq_f64(right_accumulator, right_sample, coefficients);
+    }
+    let mut left_output = [0.0; MAX_PHASES];
+    let mut right_output = [0.0; MAX_PHASES];
+    vst1q_f64(left_output.as_mut_ptr(), left_accumulator);
+    vst1q_f64(right_output.as_mut_ptr(), right_accumulator);
+    (left_output, right_output)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -761,6 +913,93 @@ fn reference_peak(samples: &[f32], factor: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_first_two_lanes_match(expected: [f64; MAX_PHASES], actual: [f64; MAX_PHASES]) {
+        for phase in 0..2 {
+            assert_eq!(
+                actual[phase].to_bits(),
+                expected[phase].to_bits(),
+                "phase {phase}: {} != {}",
+                actual[phase],
+                expected[phase]
+            );
+        }
+        assert_eq!(actual[2].to_bits(), 0.0_f64.to_bits());
+        assert_eq!(actual[3].to_bits(), 0.0_f64.to_bits());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn two_phase_avx2_matches_four_lane_fma_bit_for_bit() {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) {
+            return;
+        }
+        let table = phase_table(2);
+        let finite_left = std::array::from_fn(|index| {
+            ((index as f64 * 0.173).sin() * 0.83) + ((index as f64 * 0.071).cos() * 0.11)
+        });
+        let finite_right = std::array::from_fn(|index| {
+            ((index as f64 * 0.257).cos() * 0.67) - ((index as f64 * 0.113).sin() * 0.19)
+        });
+        let mut exceptional_left = finite_left;
+        exceptional_left[3] = f64::NAN;
+        exceptional_left[11] = f64::INFINITY;
+        let mut exceptional_right = finite_right;
+        exceptional_right[5] = f64::NEG_INFINITY;
+        exceptional_right[13] = -0.0;
+
+        for (left, right) in [
+            (finite_left, finite_right),
+            (exceptional_left, exceptional_right),
+        ] {
+            // SAFETY: this test performed runtime AVX2/FMA detection.
+            unsafe {
+                assert_first_two_lanes_match(
+                    interpolate_avx2_fma(&left, table),
+                    interpolate_2x_avx2_fma(&left, table),
+                );
+                let expected = interpolate_stereo_avx2_fma(&left, &right, table);
+                let actual = interpolate_stereo_2x_avx2_fma(&left, &right, table);
+                assert_first_two_lanes_match(expected.0, actual.0);
+                assert_first_two_lanes_match(expected.1, actual.1);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn two_phase_neon_matches_four_lane_fma_bit_for_bit() {
+        let table = phase_table(2);
+        let finite_left = std::array::from_fn(|index| {
+            ((index as f64 * 0.173).sin() * 0.83) + ((index as f64 * 0.071).cos() * 0.11)
+        });
+        let finite_right = std::array::from_fn(|index| {
+            ((index as f64 * 0.257).cos() * 0.67) - ((index as f64 * 0.113).sin() * 0.19)
+        });
+        let mut exceptional_left = finite_left;
+        exceptional_left[3] = f64::NAN;
+        exceptional_left[11] = f64::INFINITY;
+        let mut exceptional_right = finite_right;
+        exceptional_right[5] = f64::NEG_INFINITY;
+        exceptional_right[13] = -0.0;
+
+        for (left, right) in [
+            (finite_left, finite_right),
+            (exceptional_left, exceptional_right),
+        ] {
+            // SAFETY: Advanced SIMD is part of the AArch64 architecture.
+            unsafe {
+                assert_first_two_lanes_match(
+                    interpolate_neon(&left, table),
+                    interpolate_2x_neon(&left, table),
+                );
+                let expected = interpolate_stereo_neon(&left, &right, table);
+                let actual = interpolate_stereo_2x_neon(&left, &right, table);
+                assert_first_two_lanes_match(expected.0, actual.0);
+                assert_first_two_lanes_match(expected.1, actual.1);
+            }
+        }
+    }
 
     #[test]
     fn polyphase_dc_gain_is_one() {
