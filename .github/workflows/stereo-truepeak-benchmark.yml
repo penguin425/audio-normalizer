@@ -1,4 +1,4 @@
-name: Stereo True Peak overlap candidate benchmark
+name: Stereo True Peak SIMD candidate benchmark
 
 on:
   pull_request:
@@ -40,16 +40,18 @@ jobs:
       - name: Install Rust 1.97.0
         uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
 
-      - name: Prove the parallel and fused analyzers are bit-exact
+      - name: Prove the SIMD and fused analyzers are bit-exact
         shell: bash
         env:
           CARGO_INCREMENTAL: "0"
           CARGO_TARGET_DIR: ${{ runner.temp }}/target-candidate-tests
           RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-Ctarget-feature=+neon,+aes,+sha2' || '' }}
-        run: >-
-          cargo test --locked --manifest-path candidate/Cargo.toml
-          --no-default-features --lib
-          stereo_parallel_true_peak_matches_fused_path_bit_exactly -- --nocapture
+        run: |
+          cargo test --locked --manifest-path candidate/Cargo.toml \
+            --no-default-features --lib two_phase_ -- --nocapture
+          cargo test --locked --manifest-path candidate/Cargo.toml \
+            --no-default-features --lib \
+            stereo_parallel_true_peak_matches_fused_path_bit_exactly -- --nocapture
 
       - name: Build exact baseline and candidate
         shell: bash
@@ -79,7 +81,7 @@ jobs:
           sys.path.insert(0, "candidate/tools")
           from benchmark import write_pcm16_wave
 
-          write_pcm16_wave(Path(os.environ["EXACT_DIR"]) / "stereo.wav", 30, 48_000, 2)
+          write_pcm16_wave(Path(os.environ["EXACT_DIR"]) / "stereo.wav", 30, 96_000, 2)
           PY
 
           baseline="${RUNNER_TEMP}/target-baseline/release/forge"
@@ -102,6 +104,7 @@ jobs:
           set -euo pipefail
           common=(
             --duration-seconds 300
+            --sample-rate 96000
             --iterations 5
             --case wav-stereo-analyze
             --case wav-stereo-normalize
@@ -132,6 +135,7 @@ jobs:
           set -euo pipefail
           common=(
             --duration-seconds 300
+            --sample-rate 96000
             --iterations 5
             --case wav-stereo-analyze
             --case wav-stereo-normalize
