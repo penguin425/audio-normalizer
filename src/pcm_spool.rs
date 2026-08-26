@@ -61,13 +61,35 @@ pub(crate) struct PcmSpool {
 
 impl PcmSpool {
     pub(crate) fn new(channels: usize, expected_pcm_bytes: Option<usize>) -> Result<Self, String> {
+        Self::new_inner(
+            channels,
+            expected_pcm_bytes,
+            rayon::current_thread_index().is_none(),
+        )
+    }
+
+    /// Create storage for a pipeline whose top-level eligibility was checked
+    /// before entering a Rayon scope. The scope body itself reports a worker
+    /// index even though the caller still owns the single-file operation.
+    pub(crate) fn new_for_top_level_pipeline(
+        channels: usize,
+        expected_pcm_bytes: Option<usize>,
+    ) -> Result<Self, String> {
+        Self::new_inner(channels, expected_pcm_bytes, true)
+    }
+
+    fn new_inner(
+        channels: usize,
+        expected_pcm_bytes: Option<usize>,
+        allow_memory: bool,
+    ) -> Result<Self, String> {
         if channels == 0 {
             return Err("PCM spool requires at least one channel".into());
         }
         let memory_capacity = expected_pcm_bytes
             .and_then(|bytes| bytes.checked_add(IO_BUFFER_BYTES))
             .filter(|bytes| *bytes <= MAX_IN_MEMORY_PCM_BYTES);
-        let memory = if rayon::current_thread_index().is_none() {
+        let memory = if allow_memory {
             memory_capacity.and_then(|capacity| {
                 MemorySpoolLease::try_acquire()
                     .and_then(|lease| preallocated_memory_storage(capacity, lease))

@@ -235,6 +235,14 @@ the `-o` extension override this.
   disk I/O and preserve record boundaries.
   Standard-input audio is spooled to a temporary file so the same correct
   two-pass algorithm remains available in shell pipelines.
+* **Overlapped output-domain analysis** uses a two-slot ownership handoff for
+  top-level sample-rate conversion when more than one worker is available.
+  Decode and the established 1,024-frame FFT resampler advance while a worker
+  performs ordered BS.1770/True Peak analysis and optional PCM capture. The
+  resampler response is unchanged: only downstream handoffs are coalesced into
+  reusable roughly 12k-frame chunks to amortize synchronization. Operations
+  without `--sample-rate`, `--jobs 1`, and nested batch/album work retain the
+  lower-CPU sequential path.
 * Release profile uses `lto = "fat"`, `codegen-units = 1`, and
   `panic = "abort"`. The published Linux and Apple Silicon `forge` CLIs add
   deterministic, branch-counter-only PGO while retaining portable ISA
