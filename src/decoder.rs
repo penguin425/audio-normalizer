@@ -33,9 +33,6 @@ pub struct StreamInfo {
     pub channels: u16,
     pub channel_roles: Vec<ChannelRole>,
     pub source_kind: PcmKind,
-    /// Container-declared frame count, which callers must trust only for
-    /// formats whose duration metadata is exact.
-    pub declared_frames: Option<u64>,
 }
 
 /// Decode any supported audio file into a planar-f32 [`AudioBuffer`].
@@ -562,6 +559,22 @@ pub fn decode_stream<F>(path: &Path, consume: F) -> Result<StreamInfo, String>
 where
     F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
 {
+    let mut consume = consume;
+    decode_stream_with_declared_frames(path, |info, _, planar| consume(info, planar))
+}
+
+/// Decode while exposing container-declared duration only to internal callers.
+///
+/// The extra value is deliberately kept out of the public [`StreamInfo`] API:
+/// it is a storage-planning hint, and only format-specific callers that can
+/// prove the declaration exact may trust it as an allocation bound.
+pub(crate) fn decode_stream_with_declared_frames<F>(
+    path: &Path,
+    consume: F,
+) -> Result<StreamInfo, String>
+where
+    F: FnMut(&StreamInfo, Option<u64>, &mut [Vec<f32>]) -> Result<(), String>,
+{
     decode_stream_with_flac_workers(path, None, consume)
 }
 
@@ -599,7 +612,7 @@ fn decode_stream_with_flac_workers<F>(
     mut consume: F,
 ) -> Result<StreamInfo, String>
 where
-    F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
+    F: FnMut(&StreamInfo, Option<u64>, &mut [Vec<f32>]) -> Result<(), String>,
 {
     use symphonia::core::errors::Error;
     use symphonia::core::formats::probe::Hint;
@@ -617,12 +630,12 @@ where
         return decode_wav_stream(path, consume);
     }
     if matches!(extension.as_str(), "dsf" | "dff") {
-        return crate::dsd::decode_stream(path, consume);
+        return crate::dsd::decode_stream_with_declared_frames(path, consume);
     }
     if extension == "opus" {
         #[cfg(feature = "opus-encoding")]
         {
-            return crate::opus::decode_stream(path, consume);
+            return crate::opus::decode_stream(path, |info, planar| consume(info, None, planar));
         }
         #[cfg(not(feature = "opus-encoding"))]
         {
@@ -687,6 +700,7 @@ where
         .map_err(|error| format!("{}: unsupported codec: {error}", path.display()))?;
     let mut output_format: Option<SymphoniaOutputFormat> = None;
     let mut info: Option<StreamInfo> = None;
+    let mut declared_frames = None;
     let mut planar = Vec::new();
 
     loop {
@@ -743,8 +757,8 @@ where
                 channels: output.channels,
                 channel_roles: output.channel_roles.clone(),
                 source_kind: output.source_kind,
-                declared_frames: track.num_frames,
             });
+            declared_frames = track.num_frames;
             output_format = Some(output);
         }
         let frames = decoded.frames();
@@ -752,7 +766,7 @@ where
             continue;
         }
         decoded.copy_to_vecs_planar::<f32>(&mut planar);
-        consume(info.as_ref().unwrap(), &mut planar)?;
+        consume(info.as_ref().unwrap(), declared_frames, &mut planar)?;
     }
 
     info.ok_or_else(|| format!("{}: no audio decoded", path.display()))
@@ -960,7 +974,7 @@ fn decode_native_flac_stream_parallel<F>(
     mut consume: F,
 ) -> Result<StreamInfo, String>
 where
-    F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
+    F: FnMut(&StreamInfo, Option<u64>, &mut [Vec<f32>]) -> Result<(), String>,
 {
     use symphonia::core::codecs::audio::well_known::CODEC_ID_FLAC;
     use symphonia::core::errors::Error;
@@ -985,6 +999,7 @@ where
     let mut buffers = vec![Vec::new(); batch_limit];
     let mut output_format: Option<SymphoniaOutputFormat> = None;
     let mut info: Option<StreamInfo> = None;
+    let mut declared_frames = None;
 
     loop {
         packets.clear();
@@ -1047,12 +1062,12 @@ where
                                 channels: output.channels,
                                 channel_roles: output.channel_roles.clone(),
                                 source_kind: output.source_kind,
-                                declared_frames: track.num_frames,
                             });
+                            declared_frames = track.num_frames;
                             output_format = Some(output);
                         }
                         if frames != 0 {
-                            consume(info.as_ref().unwrap(), planar)?;
+                            consume(info.as_ref().unwrap(), declared_frames, planar)?;
                         }
                     }
                 }
@@ -1142,17 +1157,16 @@ where
 
 fn decode_wav_stream<F>(path: &Path, mut consume: F) -> Result<StreamInfo, String>
 where
-    F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
+    F: FnMut(&StreamInfo, Option<u64>, &mut [Vec<f32>]) -> Result<(), String>,
 {
     let wav = WavReader::probe(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let declared_frames =
+        wav.data_size / (u64::from(wav.channels) * wav.kind.bytes_per_sample() as u64);
     let info = StreamInfo {
         sample_rate: wav.sample_rate,
         channels: wav.channels,
         channel_roles: wav.channel_roles,
         source_kind: wav.kind,
-        declared_frames: Some(
-            wav.data_size / (u64::from(wav.channels) * wav.kind.bytes_per_sample() as u64),
-        ),
     };
     let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     file.seek(SeekFrom::Start(wav.data_offset))
@@ -1180,7 +1194,7 @@ where
             info.channels as usize,
             &mut planar,
         );
-        consume(&info, &mut planar)?;
+        consume(&info, Some(declared_frames), &mut planar)?;
         remaining -= aligned;
     }
     Ok(info)
@@ -1275,7 +1289,6 @@ mod tests {
             channels: 2,
             channel_roles: default_channel_roles(2),
             source_kind: PcmKind::F32,
-            declared_frames: None,
         };
         let mut planar = Vec::new();
         let mut observed = vec![Vec::new(), Vec::new()];
@@ -1349,7 +1362,7 @@ mod tests {
 
     fn decode_flac_with_workers(path: &Path, workers: usize) -> (StreamInfo, Vec<Vec<f32>>) {
         let mut samples = Vec::new();
-        let info = decode_stream_with_flac_workers(path, Some(workers), |info, planar| {
+        let info = decode_stream_with_flac_workers(path, Some(workers), |info, _, planar| {
             if samples.is_empty() {
                 samples = vec![Vec::new(); info.channels as usize];
             }

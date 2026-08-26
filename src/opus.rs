@@ -385,7 +385,6 @@ where
             channels: parsed.channels,
             channel_roles: internal_channel_roles(parsed.channels),
             source_kind: PcmKind::F32,
-            declared_frames: None,
         };
         if let Some(primary) = &primary_info {
             if primary.channels != info.channels || primary.channel_roles != info.channel_roles {

@@ -944,37 +944,39 @@ fn prepare_file_for_plan(
     let mut converter: Option<SampleRateConverter> = None;
     let mut spool: Option<PcmSpool> = None;
     let mut resolved_roles = None;
-    let info = decoder::decode_stream(path, |info, chunk| {
-        if analyzer.is_none() {
-            let roles = resolve_stream_roles(path, info, channel_roles)?;
-            let output_rate = plan.output_sample_rate.unwrap_or(info.sample_rate);
-            analyzer = Some(lufs::StreamingAnalyzer::new(output_rate, roles.clone()));
-            resolved_roles = Some(roles);
-            if output_rate != info.sample_rate {
-                converter = Some(SampleRateConverter::new_streaming(
-                    info.sample_rate,
-                    output_rate,
-                    info.channels as usize,
-                    plan.resample_quality,
-                )?);
+    let info =
+        decoder::decode_stream_with_declared_frames(path, |info, declared_frames, chunk| {
+            if analyzer.is_none() {
+                let roles = resolve_stream_roles(path, info, channel_roles)?;
+                let output_rate = plan.output_sample_rate.unwrap_or(info.sample_rate);
+                analyzer = Some(lufs::StreamingAnalyzer::new(output_rate, roles.clone()));
+                resolved_roles = Some(roles);
+                if output_rate != info.sample_rate {
+                    converter = Some(SampleRateConverter::new_streaming(
+                        info.sample_rate,
+                        output_rate,
+                        info.channels as usize,
+                        plan.resample_quality,
+                    )?);
+                }
+                if capture_spool && should_capture_pcm(path, converter.is_some()) {
+                    // The spool is a performance optimization. If its bounded RAM
+                    // or temporary-file storage cannot be created, retain the
+                    // established two-decode path rather than failing an otherwise
+                    // valid normalization.
+                    let expected_bytes =
+                        expected_pcm_spool_bytes(path, info, output_rate, declared_frames);
+                    spool = PcmSpool::new(info.channels as usize, expected_bytes).ok();
+                }
             }
-            if capture_spool && should_capture_pcm(path, converter.is_some()) {
-                // The spool is a performance optimization. If its bounded RAM
-                // or temporary-file storage cannot be created, retain the
-                // established two-decode path rather than failing an otherwise
-                // valid normalization.
-                let expected_bytes = expected_pcm_spool_bytes(path, info, output_rate);
-                spool = PcmSpool::new(info.channels as usize, expected_bytes).ok();
+            if let Some(converter) = converter.as_mut() {
+                converter.process(chunk, |output| {
+                    analyze_and_capture(output, analyzer.as_mut().unwrap(), &mut spool)
+                })
+            } else {
+                analyze_and_capture(chunk, analyzer.as_mut().unwrap(), &mut spool)
             }
-        }
-        if let Some(converter) = converter.as_mut() {
-            converter.process(chunk, |output| {
-                analyze_and_capture(output, analyzer.as_mut().unwrap(), &mut spool)
-            })
-        } else {
-            analyze_and_capture(chunk, analyzer.as_mut().unwrap(), &mut spool)
-        }
-    })?;
+        })?;
     if let Some(converter) = converter.as_mut() {
         converter
             .finish(|output| analyze_and_capture(output, analyzer.as_mut().unwrap(), &mut spool))?;
@@ -1073,6 +1075,7 @@ fn expected_pcm_spool_bytes(
     path: &Path,
     info: &decoder::StreamInfo,
     output_rate: u32,
+    declared_frames: Option<u64>,
 ) -> Option<usize> {
     let extension = path
         .extension()
@@ -1085,7 +1088,7 @@ fn expected_pcm_spool_bytes(
     ) {
         return None;
     }
-    let source_frames = u128::from(info.declared_frames?);
+    let source_frames = u128::from(declared_frames?);
     let output_frames = if output_rate == info.sample_rate {
         source_frames
     } else {
@@ -4023,23 +4026,18 @@ mod tests {
             channels: 2,
             channel_roles: default_channel_roles(2),
             source_kind: PcmKind::F32,
-            declared_frames: Some(44_100 * 300),
         };
         assert_eq!(
-            expected_pcm_spool_bytes(Path::new("track.flac"), &info, 48_000),
+            expected_pcm_spool_bytes(Path::new("track.flac"), &info, 48_000, Some(44_100 * 300),),
             Some(48_000 * 300 * 2 * std::mem::size_of::<f32>())
         );
         assert_eq!(
-            expected_pcm_spool_bytes(Path::new("track.mp3"), &info, 48_000),
+            expected_pcm_spool_bytes(Path::new("track.mp3"), &info, 48_000, Some(44_100 * 300),),
             None,
             "lossy container duration metadata is not an exact allocation bound"
         );
-        let unknown = decoder::StreamInfo {
-            declared_frames: None,
-            ..info
-        };
         assert_eq!(
-            expected_pcm_spool_bytes(Path::new("track.flac"), &unknown, 48_000),
+            expected_pcm_spool_bytes(Path::new("track.flac"), &info, 48_000, None),
             None
         );
     }
