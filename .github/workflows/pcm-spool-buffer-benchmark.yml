@@ -185,7 +185,7 @@ jobs:
               --forge "${forge}"
               --ffmpeg "$(command -v ffmpeg)"
               --duration-seconds 600
-              --iterations 1
+              --iterations 2
               --case flac-stereo-normalize
               --case wav-stereo-resample-normalize
               --work-dir "${RUNNER_TEMP}/${label}"
@@ -441,8 +441,8 @@ jobs:
                       for results in candidate_documents
                       for sample in results[case_id]["samples"]
                   ]
-                  assert len(baseline) == 8, (mode, case_id, "baseline samples")
-                  assert len(candidate) == 8, (mode, case_id, "candidate samples")
+                  assert len(baseline) == 16, (mode, case_id, "baseline samples")
+                  assert len(candidate) == 16, (mode, case_id, "candidate samples")
                   for metric, getter in (
                       ("wall", lambda sample: sample["wall_seconds"]),
                       (
