@@ -103,6 +103,18 @@ impl PcmSpool {
         }
         let frames_u64 = u64::try_from(frames)
             .map_err(|_| "PCM spool chunk length does not fit its record header".to_string())?;
+        // Long and unknown-duration inputs use the established file-backed
+        // spool. Keep that hot path as small as the pre-memory-spool
+        // implementation: capacity accounting is only useful while a record
+        // can still be retained in memory.
+        if let PcmSpoolStorage::File(file) = &mut self.storage {
+            write_file_record(file, frames_u64, planar)?;
+            self.frames = self
+                .frames
+                .checked_add(frames)
+                .ok_or_else(|| "PCM spool duration overflow".to_string())?;
+            return Ok(());
+        }
         let payload_bytes = planar.iter().try_fold(0usize, |total, channel| {
             total
                 .checked_add(size_of_val(channel.as_slice()))
@@ -127,12 +139,7 @@ impl PcmSpool {
                 }
             }
             PcmSpoolStorage::File(file) => {
-                file.write_all(&frames_u64.to_le_bytes())
-                    .map_err(|error| format!("write PCM spool record: {error}"))?;
-                for channel in planar {
-                    file.write_all(samples_as_bytes(channel))
-                        .map_err(|error| format!("write PCM spool samples: {error}"))?;
-                }
+                write_file_record(file, frames_u64, planar)?;
             }
             PcmSpoolStorage::Transitioning => {
                 return Err("PCM spool storage transition was interrupted".into());
@@ -501,6 +508,21 @@ fn replay_records(
         return Err(format!(
             "PCM spool replayed {replayed_frames} frames, expected {expected_frames}"
         ));
+    }
+    Ok(())
+}
+
+#[inline]
+fn write_file_record(
+    file: &mut BufWriter<File>,
+    frames: u64,
+    planar: &[Vec<f32>],
+) -> Result<(), String> {
+    file.write_all(&frames.to_le_bytes())
+        .map_err(|error| format!("write PCM spool record: {error}"))?;
+    for channel in planar {
+        file.write_all(samples_as_bytes(channel))
+            .map_err(|error| format!("write PCM spool samples: {error}"))?;
     }
     Ok(())
 }
