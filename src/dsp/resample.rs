@@ -1,11 +1,17 @@
 //! Bounded-memory, delay-compensated sample-rate conversion.
 
 use crate::wav::AudioBuffer;
+use rubato::audioadapter::Adapter;
 use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
 use rubato::{Fft, FixedSync, Indexing, Resampler, WindowFunction};
 use serde::{Deserialize, Serialize};
 
 const CHUNK_FRAMES: usize = 1024;
+// Keep Rubato's established 1,024-frame FFT arithmetic while amortizing the
+// adapter, bounds-check, and downstream callback overhead over roughly the
+// same sub-16,384-frame chunks used by the analysis pipeline.
+const TARGET_DIRECT_OUTPUT_BATCH_FRAMES: usize = 12 * 1024;
+const MAX_DIRECT_INPUT_BATCH_BLOCKS: usize = 256;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -36,6 +42,23 @@ impl ResampleQuality {
     }
 }
 
+fn direct_input_batch_blocks(input_rate: u32, output_rate: u32) -> usize {
+    let blocks = (TARGET_DIRECT_OUTPUT_BATCH_FRAMES as u128)
+        .saturating_mul(input_rate as u128)
+        .div_ceil((CHUNK_FRAMES as u128).saturating_mul(output_rate as u128));
+    blocks.clamp(1, MAX_DIRECT_INPUT_BATCH_BLOCKS as u128) as usize
+}
+
+fn maximum_batched_output_frames(resampler: &Fft<f32>, blocks: usize) -> Option<usize> {
+    let maximum_available_input = resampler
+        .fft_size_in()
+        .checked_sub(1)?
+        .checked_add(resampler.input_frames_max().checked_mul(blocks)?)?;
+    maximum_available_input
+        .checked_div(resampler.fft_size_in())?
+        .checked_mul(resampler.fft_size_out())
+}
+
 pub struct SampleRateConverter {
     resampler: Fft<f32>,
     input_rate: u32,
@@ -48,6 +71,11 @@ pub struct SampleRateConverter {
     emitted_frames: usize,
     delay_frames_remaining: usize,
     max_flush_passes: usize,
+    direct_input_batch_blocks: usize,
+    #[cfg(test)]
+    direct_input_blocks: usize,
+    #[cfg(test)]
+    buffered_input_blocks: usize,
 }
 
 impl SampleRateConverter {
@@ -134,7 +162,10 @@ impl SampleRateConverter {
         let fft_block_input_frames = (fft_block_output_upper as f64 / ratio).ceil() as usize;
         let max_flush_passes = fft_block_input_frames.div_ceil(CHUNK_FRAMES) + 3;
         let input_capacity = resampler.input_frames_max();
-        let output_capacity = resampler.output_frames_max();
+        let direct_input_batch_blocks = direct_input_batch_blocks(input_rate, output_rate);
+        let batched_output_capacity =
+            maximum_batched_output_frames(&resampler, direct_input_batch_blocks)
+                .ok_or_else(|| "sample-rate converter output capacity overflow".to_string())?;
         Ok(Self {
             resampler,
             input_rate,
@@ -144,13 +175,18 @@ impl SampleRateConverter {
                 .map(|_| Vec::with_capacity(input_capacity))
                 .collect(),
             output_buffer: (0..channels)
-                .map(|_| Vec::with_capacity(output_capacity))
+                .map(|_| Vec::with_capacity(batched_output_capacity))
                 .collect(),
             input_frames_seen: 0,
             expected_output_frames,
             emitted_frames: 0,
             delay_frames_remaining,
             max_flush_passes,
+            direct_input_batch_blocks,
+            #[cfg(test)]
+            direct_input_blocks: 0,
+            #[cfg(test)]
+            buffered_input_blocks: 0,
         })
     }
 
@@ -166,20 +202,43 @@ impl SampleRateConverter {
             .checked_add(frames)
             .ok_or_else(|| "sample-rate converter input duration overflow".to_string())?;
         let mut start = 0;
-        while start < frames {
+        if !self.input_pending[0].is_empty() {
             let input_frames = self.resampler.input_frames_next();
             let pending_frames = self.input_pending[0].len();
-            let take = (input_frames - pending_frames).min(frames - start);
+            let take = (input_frames - pending_frames).min(frames);
             for (pending, channel) in self.input_pending.iter_mut().zip(planar) {
-                pending.extend_from_slice(&channel[start..start + take]);
+                pending.extend_from_slice(&channel[..take]);
             }
-            start += take;
+            start = take;
             if self.input_pending[0].len() == input_frames {
-                self.resample_and_emit(None, "resample audio", &mut consume)?;
+                self.resample_and_emit(None, "resample buffered audio", &mut consume)?;
                 for channel in &mut self.input_pending {
                     channel.clear();
                 }
             }
+        }
+        // Keep only a cross-callback remainder in `input_pending`. Complete
+        // fixed blocks borrow the decoder's planar storage through Rubato's
+        // input offset, avoiding one full PCM copy per block.
+        while start < frames {
+            let input_frames = self.resampler.input_frames_next();
+            let complete_blocks = (frames - start) / input_frames;
+            if complete_blocks > 0 {
+                let blocks = complete_blocks.min(self.direct_input_batch_blocks);
+                self.resample_direct_batch_and_emit(
+                    planar,
+                    start,
+                    blocks,
+                    "resample direct audio",
+                    &mut consume,
+                )?;
+                start += input_frames * blocks;
+                continue;
+            }
+            for (pending, channel) in self.input_pending.iter_mut().zip(planar) {
+                pending.extend_from_slice(&channel[start..]);
+            }
+            break;
         }
         Ok(())
     }
@@ -199,20 +258,42 @@ impl SampleRateConverter {
             .checked_add(frames)
             .ok_or_else(|| "sample-rate converter input duration overflow".to_string())?;
         let mut start = 0;
-        while start < frames {
+        if !self.input_pending[0].is_empty() {
             let input_frames = self.resampler.input_frames_next();
             let pending_frames = self.input_pending[0].len();
-            let take = (input_frames - pending_frames).min(frames - start);
+            let take = (input_frames - pending_frames).min(frames);
             for (pending, channel) in self.input_pending.iter_mut().zip(planar) {
-                pending.extend_from_slice(&channel[start..start + take]);
+                pending.extend_from_slice(&channel[..take]);
             }
-            start += take;
+            start = take;
             if self.input_pending[0].len() == input_frames {
-                self.resample_and_emit_owned(None, "resample audio", &mut consume)?;
+                self.resample_and_emit_owned(None, "resample buffered audio", &mut consume)?;
                 for channel in &mut self.input_pending {
                     channel.clear();
                 }
             }
+        }
+        // The owned-output pipeline can still borrow its input. Ownership is
+        // transferred only for the recycled FFT output slots downstream.
+        while start < frames {
+            let input_frames = self.resampler.input_frames_next();
+            let complete_blocks = (frames - start) / input_frames;
+            if complete_blocks > 0 {
+                let blocks = complete_blocks.min(self.direct_input_batch_blocks);
+                self.resample_direct_batch_and_emit_owned(
+                    planar,
+                    start,
+                    blocks,
+                    "resample direct audio",
+                    &mut consume,
+                )?;
+                start += input_frames * blocks;
+                continue;
+            }
+            for (pending, channel) in self.input_pending.iter_mut().zip(planar) {
+                pending.extend_from_slice(&channel[start..]);
+            }
+            break;
         }
         Ok(())
     }
@@ -307,7 +388,19 @@ impl SampleRateConverter {
         operation: &str,
         consume: &mut impl FnMut(&mut [Vec<f32>]) -> Result<(), String>,
     ) -> Result<(), String> {
-        self.resample_into_output(partial_len, operation)?;
+        self.resample_pending_into_output(partial_len, operation)?;
+        self.emit(consume)
+    }
+
+    fn resample_direct_batch_and_emit(
+        &mut self,
+        planar: &[Vec<f32>],
+        input_offset: usize,
+        blocks: usize,
+        operation: &str,
+        consume: &mut impl FnMut(&mut [Vec<f32>]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.resample_direct_batch_into_output(planar, input_offset, blocks, operation)?;
         self.emit(consume)
     }
 
@@ -317,37 +410,116 @@ impl SampleRateConverter {
         operation: &str,
         consume: &mut impl FnMut(Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, String>,
     ) -> Result<(), String> {
-        self.resample_into_output(partial_len, operation)?;
+        self.resample_pending_into_output(partial_len, operation)?;
         self.emit_owned(consume)
     }
 
-    fn resample_into_output(
+    fn resample_direct_batch_and_emit_owned(
+        &mut self,
+        planar: &[Vec<f32>],
+        input_offset: usize,
+        blocks: usize,
+        operation: &str,
+        consume: &mut impl FnMut(Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, String>,
+    ) -> Result<(), String> {
+        self.resample_direct_batch_into_output(planar, input_offset, blocks, operation)?;
+        self.emit_owned(consume)
+    }
+
+    fn resample_pending_into_output(
         &mut self,
         partial_len: Option<usize>,
         operation: &str,
     ) -> Result<(), String> {
         let input_frames = partial_len.unwrap_or_else(|| self.resampler.input_frames_next());
-        let output_frames = self.resampler.output_frames_next();
         let input =
             SequentialSliceOfVecs::new(self.input_pending.as_slice(), self.channels, input_frames)
                 .map_err(|error| format!("prepare resampler input: {error}"))?;
-        for channel in &mut self.output_buffer {
-            channel.resize(output_frames, 0.0);
-        }
         let indexing = partial_len.map(|frames| Indexing::new().partial_len(frames));
-        let produced = {
-            let mut output_adapter = SequentialSliceOfVecs::new_mut(
+        Self::resample_adapter_into_output(
+            &mut self.resampler,
+            &mut self.output_buffer,
+            self.channels,
+            &input,
+            indexing.as_ref(),
+            operation,
+        )?;
+        #[cfg(test)]
+        {
+            self.buffered_input_blocks += 1;
+        }
+        Ok(())
+    }
+
+    fn resample_direct_batch_into_output(
+        &mut self,
+        planar: &[Vec<f32>],
+        mut input_offset: usize,
+        blocks: usize,
+        operation: &str,
+    ) -> Result<(), String> {
+        debug_assert!(blocks > 0);
+        let frames = planar.first().map_or(0, Vec::len);
+        let input = SequentialSliceOfVecs::new(planar, self.channels, frames)
+            .map_err(|error| format!("prepare direct resampler input: {error}"))?;
+        let output_capacity = maximum_batched_output_frames(&self.resampler, blocks)
+            .ok_or_else(|| "sample-rate converter output batch overflow".to_string())?;
+        for channel in &mut self.output_buffer {
+            channel.resize(output_capacity, 0.0);
+        }
+        let produced_total = {
+            let mut output = SequentialSliceOfVecs::new_mut(
                 self.output_buffer.as_mut_slice(),
                 self.channels,
-                output_frames,
+                output_capacity,
             )
-            .map_err(|error| format!("prepare resampler output: {error}"))?;
-            self.resampler
-                .process_into_buffer(&input, &mut output_adapter, indexing.as_ref())
+            .map_err(|error| format!("prepare batched resampler output: {error}"))?;
+            let mut produced_total = 0usize;
+            for _ in 0..blocks {
+                let indexing = Indexing::new()
+                    .input_offset(input_offset)
+                    .output_offset(produced_total);
+                let (consumed, produced) = self
+                    .resampler
+                    .process_into_buffer(&input, &mut output, Some(&indexing))
+                    .map_err(|error| format!("{operation}: {error}"))?;
+                input_offset += consumed;
+                produced_total += produced;
+            }
+            produced_total
+        };
+        for channel in &mut self.output_buffer {
+            channel.truncate(produced_total);
+        }
+        #[cfg(test)]
+        {
+            self.direct_input_blocks += blocks;
+        }
+        Ok(())
+    }
+
+    fn resample_adapter_into_output(
+        resampler: &mut Fft<f32>,
+        output_buffer: &mut [Vec<f32>],
+        channels: usize,
+        input: &dyn Adapter<f32>,
+        indexing: Option<&Indexing>,
+        operation: &str,
+    ) -> Result<(), String> {
+        let output_frames = resampler.output_frames_next();
+        for channel in output_buffer.iter_mut() {
+            channel.resize(output_frames, 0.0);
+        }
+        let produced = {
+            let mut output_adapter =
+                SequentialSliceOfVecs::new_mut(output_buffer, channels, output_frames)
+                    .map_err(|error| format!("prepare resampler output: {error}"))?;
+            resampler
+                .process_into_buffer(input, &mut output_adapter, indexing)
                 .map_err(|error| format!("{operation}: {error}"))?
                 .1
         };
-        for channel in &mut self.output_buffer {
+        for channel in output_buffer {
             channel.truncate(produced);
         }
         Ok(())
@@ -563,7 +735,8 @@ mod tests {
             ResampleQuality::Balanced,
         )
         .unwrap();
-        let output_bound = converter.resampler.output_frames_max();
+        let output_bound =
+            converter.resampler.output_frames_max() * converter.direct_input_batch_blocks;
         let mut output = [Vec::new(), Vec::new()];
         let mut largest_chunk = 0;
         for range in [0..137, 137..1_111, 1_111..2_047, 2_047..frames] {
@@ -792,6 +965,119 @@ mod tests {
                 .all(|pointer| *pointer == owned_pointers[0]),
             "owned handoff did not recycle the FFT output allocation"
         );
+    }
+
+    #[test]
+    fn complete_blocks_bypass_input_copy_and_match_buffered_streaming() {
+        let input_rate = 48_000;
+        let output_rate = 44_100;
+        let frames = CHUNK_FRAMES * 3 + 317;
+        let planar = [
+            (0..frames)
+                .map(|frame| 0.21 * (TAU * 997.0 * frame as f32 / input_rate as f32).sin())
+                .collect::<Vec<_>>(),
+            (0..frames)
+                .map(|frame| 0.13 * (TAU * 613.0 * frame as f32 / input_rate as f32).cos())
+                .collect::<Vec<_>>(),
+        ];
+
+        let mut direct = SampleRateConverter::new_streaming(
+            input_rate,
+            output_rate,
+            2,
+            ResampleQuality::Balanced,
+        )
+        .unwrap();
+        let mut direct_output = [Vec::new(), Vec::new()];
+        direct
+            .process(&planar, |output| {
+                for (destination, source) in direct_output.iter_mut().zip(output) {
+                    destination.extend_from_slice(source);
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(direct.direct_input_blocks, 3);
+        assert_eq!(direct.buffered_input_blocks, 0);
+        assert_eq!(direct.input_pending[0].len(), 317);
+        direct
+            .finish(|output| {
+                for (destination, source) in direct_output.iter_mut().zip(output) {
+                    destination.extend_from_slice(source);
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let mut owned = SampleRateConverter::new_streaming(
+            input_rate,
+            output_rate,
+            2,
+            ResampleQuality::Balanced,
+        )
+        .unwrap();
+        let mut owned_output = [Vec::new(), Vec::new()];
+        owned
+            .process_owned(&planar, |mut output| {
+                for (destination, source) in owned_output.iter_mut().zip(&output) {
+                    destination.extend_from_slice(source);
+                }
+                for channel in &mut output {
+                    channel.clear();
+                }
+                Ok(output)
+            })
+            .unwrap();
+        assert_eq!(owned.direct_input_blocks, 3);
+        assert_eq!(owned.input_pending[0].len(), 317);
+        owned
+            .finish_owned(|mut output| {
+                for (destination, source) in owned_output.iter_mut().zip(&output) {
+                    destination.extend_from_slice(source);
+                }
+                for channel in &mut output {
+                    channel.clear();
+                }
+                Ok(output)
+            })
+            .unwrap();
+        assert_eq!(owned_output, direct_output);
+
+        let mut buffered = SampleRateConverter::new_streaming(
+            input_rate,
+            output_rate,
+            2,
+            ResampleQuality::Balanced,
+        )
+        .unwrap();
+        let mut buffered_output = [Vec::new(), Vec::new()];
+        for start in (0..frames).step_by(257) {
+            let end = (start + 257).min(frames);
+            let chunk = planar
+                .iter()
+                .map(|channel| channel[start..end].to_vec())
+                .collect::<Vec<_>>();
+            buffered
+                .process(&chunk, |output| {
+                    for (destination, source) in buffered_output.iter_mut().zip(output) {
+                        destination.extend_from_slice(source);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(buffered.direct_input_blocks, 0);
+        assert_eq!(buffered.buffered_input_blocks, 3);
+        buffered
+            .finish(|output| {
+                for (destination, source) in buffered_output.iter_mut().zip(output) {
+                    destination.extend_from_slice(source);
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(direct_output, buffered_output);
     }
 
     #[test]

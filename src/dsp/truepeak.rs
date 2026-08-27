@@ -256,6 +256,34 @@ impl TruePeakMeter {
             return false;
         }
         let (block_maximum, has_nan) = crate::dsp::simd::abs_max_and_has_nan(samples);
+        self.try_skip_peak_only_block_reduced(samples, block_maximum, has_nan)
+    }
+
+    /// Return the discrete sample peak from the same SIMD reduction used to
+    /// decide whether exact FIR interpolation can be skipped. Loudness analysis
+    /// can then avoid repeating a scalar sample-peak reduction in its frame loop.
+    #[inline]
+    pub(crate) fn try_skip_peak_only_block_with_sample_peak(
+        &mut self,
+        samples: &[f32],
+    ) -> (bool, f32) {
+        let (block_maximum, has_nan) = crate::dsp::simd::abs_max_and_has_nan(samples);
+        (
+            self.try_skip_peak_only_block_reduced(samples, block_maximum, has_nan),
+            block_maximum,
+        )
+    }
+
+    #[inline]
+    fn try_skip_peak_only_block_reduced(
+        &mut self,
+        samples: &[f32],
+        block_maximum: f32,
+        has_nan: bool,
+    ) -> bool {
+        if samples.is_empty() || self.factor <= 1 || !self.pruning_active {
+            return false;
+        }
         if has_nan {
             return false;
         }

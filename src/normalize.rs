@@ -940,6 +940,9 @@ const ANALYSIS_PIPELINE_DEPTH: usize = 2;
 // amortized without changing resampling arithmetic or crossing the common
 // 16,384-frame nested True Peak threshold.
 const TARGET_RESAMPLED_ANALYSIS_CHUNK_FRAMES: usize = 12 * 1024;
+// A converter batch of this size already amortizes the analysis-channel handoff.
+// Transfer it directly instead of copying it through the coalescing buffer.
+const MIN_DIRECT_RESAMPLED_ANALYSIS_CHUNK_FRAMES: usize = 8 * 1024;
 
 enum AnalysisPipelineMessage {
     Start {
@@ -1061,11 +1064,19 @@ fn run_analysis_pipeline(
                 if first_error.is_none() {
                     let result = analyzer.as_mut().map_or_else(
                         || Err("analysis pipeline received PCM before initialization".into()),
-                        |analyzer| analyze_and_capture(&mut chunk, analyzer, &mut spool),
+                        |analyzer| analyzer.process(&chunk),
                     );
                     if let Err(error) = result {
                         failed.store(true, Ordering::Release);
                         first_error = Some(error);
+                    } else if let Some(captured) = spool.as_mut() {
+                        match captured.write_owned_chunk(chunk) {
+                            Ok(recycled) => chunk = recycled,
+                            Err(returned) => {
+                                chunk = returned;
+                                spool = None;
+                            }
+                        }
                     }
                 }
                 // The producer owns exactly ANALYSIS_PIPELINE_DEPTH slots, so
@@ -1141,6 +1152,15 @@ fn append_resampled_analysis_pipeline_chunk(
     let frames = output.first().map_or(0, Vec::len);
     if output.iter().any(|channel| channel.len() != frames) {
         return Err("resampled analysis pipeline received unequal channel lengths".into());
+    }
+    if frames >= MIN_DIRECT_RESAMPLED_ANALYSIS_CHUNK_FRAMES
+        && pending.first().is_some_and(Vec::is_empty)
+    {
+        let mut next = send_analysis_pipeline_chunk(output, input, recycled, available, failed)?;
+        for channel in &mut next {
+            channel.clear();
+        }
+        return Ok(next);
     }
     for (destination, source) in pending.iter_mut().zip(&output) {
         destination.extend_from_slice(source);

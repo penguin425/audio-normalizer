@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - ".github/workflows/pcm-spool-buffer-benchmark.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
       - "src/decoder.rs"
       - "src/dsd.rs"
       - "src/dsp/resample.rs"
