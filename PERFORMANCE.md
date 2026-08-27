@@ -1746,15 +1746,20 @@ budget; the 600-second control proves the over-budget file path.
 | one worker, 600 s WAVE 48→44.1 kHz normalize | 1.868 s | 1.800 s | -3.672% | -2.941% | 0 MiB |
 
 The four 300-second wall changes average -4.148%, with aggregate CPU averaging
--0.723%. All eight over-budget wall/CPU changes average -0.841%. Hosted Linux
-and Apple Silicon calibration independently measured default resample wall
-improvements of -3.809% and -3.685%. The retained cross-platform gate therefore
-requires at least 3% for that path, at most 3% CPU regression for the unchanged
-default FLAC control, at most 3% wall and CPU regression for both one-worker
-controls, and at least 1% pooled wall improvement. Broad 8% per-case tripwires
-and the existing RSS limits still reject isolated regressions while allowing
-hosted multicore wall jitter to be judged against aggregate CPU and the pooled
-result.
+-0.723%. All eight over-budget wall/CPU changes average -0.841%. Two hosted
+Linux runs measured one-worker resample wall/CPU improvements of
+-8.454%/-8.492% and -10.838%/-11.009%; two Apple Silicon runs measured
+-7.757%/-7.760% and -8.564%/-10.735%. The corresponding default-worker wall
+changes ranged from -10.475% to -0.663% because independent pipeline work can
+overlap the resampler differently on hosted runners.
+
+The retained cross-platform gate therefore requires at least 3% wall and CPU
+improvement from the one-worker resample control, at most 3% CPU regression for
+the unchanged FLAC path in either mode, and no pooled wall regression. Broad
+10% wall and 8% CPU per-case tripwires plus the existing RSS limits still
+reject isolated regressions. This separates the resampler's reproducible cost
+reduction from multicore scheduling noise without weakening output-equivalence
+or over-budget controls.
 
 Main, candidate, and candidate one-worker 48→44.1 kHz normalized WAVE files are
 byte-identical with SHA-256
