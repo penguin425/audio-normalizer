@@ -27,12 +27,13 @@ if str(TOOLS_DIRECTORY) not in sys.path:
 from benchmark import write_pcm16_wave
 
 
-GENERATOR = "forge-pgo-training/1"
+GENERATOR = "forge-pgo-training/2"
 DEFAULT_DURATION_SECONDS = 12
 MAX_DURATION_SECONDS = 300
 DEFAULT_TRACKS = 4
 MAX_TRACKS = 8
 SAMPLE_RATE = 48_000
+HIGH_SAMPLE_RATE = 96_000
 
 
 class TrainingCase(NamedTuple):
@@ -64,6 +65,7 @@ def prepare_profile_directory(path: Path) -> Path:
 
 def create_fixtures(workspace: Path, duration: int, tracks: int) -> dict[str, object]:
     stereo = workspace / "stereo.wav"
+    stereo_high_rate = workspace / "stereo-96k.wav"
     surround = workspace / "surround-7.1.wav"
     track_directory = workspace / "tracks"
     track_directory.mkdir()
@@ -72,19 +74,30 @@ def create_fixtures(workspace: Path, duration: int, tracks: int) -> dict[str, ob
         for index in range(1, tracks + 1)
     ]
     write_pcm16_wave(stereo, duration, SAMPLE_RATE, 2)
+    write_pcm16_wave(stereo_high_rate, duration, HIGH_SAMPLE_RATE, 2)
     write_pcm16_wave(surround, max(1, duration // 2), SAMPLE_RATE, 8)
     for path in track_paths:
         write_pcm16_wave(path, duration, SAMPLE_RATE, 2)
-    return {"stereo": stereo, "surround": surround, "tracks": track_paths}
+    return {
+        "stereo": stereo,
+        "stereo_high_rate": stereo_high_rate,
+        "surround": surround,
+        "tracks": track_paths,
+    }
 
 
 def training_plan(
-    forge: Path, workspace: Path, fixtures: dict[str, object]
+    forge: Path,
+    workspace: Path,
+    fixtures: dict[str, object],
+    include_opus: bool = False,
 ) -> list[TrainingCase]:
     stereo = fixtures["stereo"]
+    stereo_high_rate = fixtures["stereo_high_rate"]
     surround = fixtures["surround"]
     tracks = fixtures["tracks"]
     assert isinstance(stereo, Path)
+    assert isinstance(stereo_high_rate, Path)
     assert isinstance(surround, Path)
     assert isinstance(tracks, list)
     jobs = ["--jobs", "1"]
@@ -104,18 +117,21 @@ def training_plan(
         directory.mkdir()
 
     normalized = outputs / "normalized.wav"
+    normalized_high_rate = outputs / "normalized-96k.wav"
     verified = outputs / "verified.wav"
     resampled = outputs / "resampled.wav"
     dithered = outputs / "dithered.wav"
     limited = outputs / "limited.wav"
     flac = outputs / "training.flac"
     flac_normalized = outputs / "flac-normalized.wav"
+    opus = outputs / "training.opus"
+    opus_normalized = outputs / "opus-normalized.wav"
     surround_output = outputs / "surround.wav"
     cache = workspace / "analysis-cache"
 
     forge_arg = str(forge)
     track_args = [str(path) for path in tracks]
-    return [
+    cases = [
         TrainingCase(
             "wav-analyze",
             [forge_arg, str(stereo), "--analyze", "--json", *jobs],
@@ -123,6 +139,21 @@ def training_plan(
         TrainingCase(
             "wav-normalize",
             [forge_arg, str(stereo), "--overwrite", "-o", str(normalized), *jobs],
+        ),
+        TrainingCase(
+            "wav-96k-analyze",
+            [forge_arg, str(stereo_high_rate), "--analyze", "--json", *jobs],
+        ),
+        TrainingCase(
+            "wav-96k-normalize",
+            [
+                forge_arg,
+                str(stereo_high_rate),
+                "--overwrite",
+                "-o",
+                str(normalized_high_rate),
+                *jobs,
+            ],
         ),
         TrainingCase(
             "wav-verify",
@@ -267,6 +298,42 @@ def training_plan(
             ],
         ),
     ]
+    if include_opus:
+        cases.extend(
+            [
+                TrainingCase(
+                    "wav-to-opus",
+                    [
+                        forge_arg,
+                        str(stereo),
+                        "--format",
+                        "opus",
+                        "--overwrite",
+                        "-o",
+                        str(opus),
+                        *jobs,
+                    ],
+                ),
+                TrainingCase(
+                    "opus-analyze",
+                    [forge_arg, str(opus), "--analyze", "--json", *jobs],
+                ),
+                TrainingCase(
+                    "opus-normalize",
+                    [
+                        forge_arg,
+                        str(opus),
+                        "--format",
+                        "wav",
+                        "--overwrite",
+                        "-o",
+                        str(opus_normalized),
+                        *jobs,
+                    ],
+                ),
+            ]
+        )
+    return cases
 
 
 def run_training(
@@ -275,6 +342,7 @@ def run_training(
     work_parent: Path,
     duration: int,
     tracks: int,
+    include_opus: bool,
 ) -> dict[str, object]:
     workspace = Path(tempfile.mkdtemp(prefix="forge-pgo-training-", dir=work_parent))
     labels: list[str] = []
@@ -285,7 +353,7 @@ def run_training(
     environment["RAYON_NUM_THREADS"] = "1"
     try:
         fixtures = create_fixtures(workspace, duration, tracks)
-        plan = training_plan(forge, workspace, fixtures)
+        plan = training_plan(forge, workspace, fixtures, include_opus=include_opus)
         for case in plan:
             print(f"forge-pgo-training: {case.label}", file=sys.stderr)
             completed = subprocess.run(
@@ -313,8 +381,10 @@ def run_training(
         "generator": GENERATOR,
         "duration_seconds": duration,
         "sample_rate_hz": SAMPLE_RATE,
+        "additional_sample_rates_hz": [HIGH_SAMPLE_RATE],
         "tracks": tracks,
         "worker_threads": 1,
+        "include_opus": include_opus,
         "cases": labels,
         "profile_files": len(profiles),
         "profile_bytes": sum(path.stat().st_size for path in profiles),
@@ -330,6 +400,11 @@ def parse_args() -> argparse.Namespace:
         "--duration-seconds", type=positive_int, default=DEFAULT_DURATION_SECONDS
     )
     parser.add_argument("--tracks", type=positive_int, default=DEFAULT_TRACKS)
+    parser.add_argument(
+        "--include-opus",
+        action="store_true",
+        help="exercise Forge's built-in Opus encoder and decoder",
+    )
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -354,6 +429,7 @@ def main() -> int:
         work_parent,
         args.duration_seconds,
         args.tracks,
+        args.include_opus,
     )
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.output is None:

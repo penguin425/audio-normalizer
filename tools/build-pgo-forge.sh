@@ -60,11 +60,17 @@ if [[ "$target" == *windows* ]]; then
   executable_name="forge.exe"
 fi
 instrumented_forge="${instrumented_target}/${target}/release/${executable_name}"
-python3 "$root_dir/tools/train-pgo.py" \
-  --forge "$instrumented_forge" \
-  --profile-dir "$profile_dir" \
-  --duration-seconds "$duration" \
+training_args=(
+  --forge "$instrumented_forge"
+  --profile-dir "$profile_dir"
+  --duration-seconds "$duration"
   --output "$training_report"
+)
+normalized_features=",${features// /,},"
+if [[ "$normalized_features" == *",opus-encoding,"* ]]; then
+  training_args+=(--include-opus)
+fi
+python3 "$root_dir/tools/train-pgo.py" "${training_args[@]}"
 
 shopt -s nullglob
 raw_profiles=("$profile_dir"/*.profraw)
