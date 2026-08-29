@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // record boundaries while amortizing temporary-file syscalls over a bounded
 // buffer that remains small relative to one second of multichannel PCM.
 const IO_BUFFER_BYTES: usize = 1024 * 1024;
+const ESTIMATED_OWNED_CHUNK_BYTES: usize = 64 * 1024;
 // Retain the common five-minute stereo delivery in userspace while bounding
 // additional process memory. Only one top-level spool may hold this budget;
 // nested file-level jobs keep the established temporary-file path.
@@ -49,6 +50,12 @@ enum PcmSpoolStorage {
         limit: usize,
         lease: MemorySpoolLease,
     },
+    ChunkedMemory {
+        chunks: Vec<Vec<Vec<f32>>>,
+        retained_bytes: usize,
+        limit: usize,
+        lease: MemorySpoolLease,
+    },
     File(BufWriter<File>),
     Transitioning,
 }
@@ -65,6 +72,7 @@ impl PcmSpool {
             channels,
             expected_pcm_bytes,
             rayon::current_thread_index().is_none(),
+            false,
         )
     }
 
@@ -75,13 +83,14 @@ impl PcmSpool {
         channels: usize,
         expected_pcm_bytes: Option<usize>,
     ) -> Result<Self, String> {
-        Self::new_inner(channels, expected_pcm_bytes, true)
+        Self::new_inner(channels, expected_pcm_bytes, true, true)
     }
 
     fn new_inner(
         channels: usize,
         expected_pcm_bytes: Option<usize>,
         allow_memory: bool,
+        prefer_chunked_memory: bool,
     ) -> Result<Self, String> {
         if channels == 0 {
             return Err("PCM spool requires at least one channel".into());
@@ -91,8 +100,13 @@ impl PcmSpool {
             .filter(|bytes| *bytes <= MAX_IN_MEMORY_PCM_BYTES);
         let memory = if allow_memory {
             memory_capacity.and_then(|capacity| {
-                MemorySpoolLease::try_acquire()
-                    .and_then(|lease| preallocated_memory_storage(capacity, lease))
+                MemorySpoolLease::try_acquire().and_then(|lease| {
+                    if prefer_chunked_memory {
+                        chunked_memory_storage(capacity, lease)
+                    } else {
+                        preallocated_memory_storage(capacity, lease)
+                    }
+                })
             })
         } else {
             None
@@ -122,6 +136,12 @@ impl PcmSpool {
         }
         if frames == 0 {
             return Ok(());
+        }
+        if matches!(self.storage, PcmSpoolStorage::ChunkedMemory { .. }) {
+            return self
+                .write_owned_chunk(planar.to_vec())
+                .map(|_| ())
+                .map_err(|_| "retain owned PCM spool chunk".to_string());
         }
         let frames_u64 = u64::try_from(frames)
             .map_err(|_| "PCM spool chunk length does not fit its record header".to_string())?;
@@ -163,6 +183,9 @@ impl PcmSpool {
             PcmSpoolStorage::File(file) => {
                 write_file_record(file, frames_u64, planar)?;
             }
+            PcmSpoolStorage::ChunkedMemory { .. } => {
+                unreachable!("chunked writes return before flat storage handling")
+            }
             PcmSpoolStorage::Transitioning => {
                 return Err("PCM spool storage transition was interrupted".into());
             }
@@ -174,13 +197,112 @@ impl PcmSpool {
         Ok(())
     }
 
+    /// Retain a top-level analysis chunk without copying its PCM payload. The
+    /// returned empty channel set replaces the retained allocation in the
+    /// bounded producer pipeline. Other storage modes preserve the established
+    /// write-and-recycle behavior.
+    pub(crate) fn write_owned_chunk(
+        &mut self,
+        mut planar: Vec<Vec<f32>>,
+    ) -> Result<Vec<Vec<f32>>, Vec<Vec<f32>>> {
+        if planar.len() != self.channels {
+            return Err(planar);
+        }
+        let frames = planar.first().map_or(0, Vec::len);
+        if frames == 0 || planar.iter().any(|channel| channel.len() != frames) {
+            return Err(planar);
+        }
+        let Some(next_total_frames) = self.frames.checked_add(frames) else {
+            return Err(planar);
+        };
+
+        if !matches!(self.storage, PcmSpoolStorage::ChunkedMemory { .. }) {
+            return match self.write_chunk(&planar) {
+                Ok(()) => {
+                    for channel in &mut planar {
+                        channel.clear();
+                    }
+                    Ok(planar)
+                }
+                Err(_) => Err(planar),
+            };
+        }
+
+        let retained_capacity_bytes =
+            planar
+                .iter()
+                .try_fold(std::mem::size_of::<u64>(), |total, channel| {
+                    channel
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<f32>())
+                        .and_then(|bytes| total.checked_add(bytes))
+                });
+        let Some(retained_capacity_bytes) = retained_capacity_bytes else {
+            return Err(planar);
+        };
+        let retain_in_memory = match &mut self.storage {
+            PcmSpoolStorage::ChunkedMemory {
+                chunks,
+                retained_bytes,
+                limit,
+                ..
+            } => {
+                retained_bytes
+                    .checked_add(retained_capacity_bytes)
+                    .is_some_and(|next| next <= *limit)
+                    && chunks.try_reserve(1).is_ok()
+            }
+            _ => unreachable!("chunked storage checked above"),
+        };
+        if !retain_in_memory {
+            if self.spill_to_file().is_err() {
+                return Err(planar);
+            }
+            let frames_u64 = match u64::try_from(frames) {
+                Ok(value) => value,
+                Err(_) => return Err(planar),
+            };
+            let result = match &mut self.storage {
+                PcmSpoolStorage::File(file) => write_file_record(file, frames_u64, &planar),
+                _ => unreachable!("chunked spill must create file storage"),
+            };
+            if result.is_err() {
+                return Err(planar);
+            }
+            self.frames = next_total_frames;
+            for channel in &mut planar {
+                channel.clear();
+            }
+            return Ok(planar);
+        }
+
+        let mut recycled = Vec::new();
+        if recycled.try_reserve_exact(self.channels).is_err() {
+            return Err(planar);
+        }
+        recycled.resize_with(self.channels, Vec::new);
+        match &mut self.storage {
+            PcmSpoolStorage::ChunkedMemory {
+                chunks,
+                retained_bytes,
+                ..
+            } => {
+                chunks.push(planar);
+                *retained_bytes += retained_capacity_bytes;
+            }
+            _ => unreachable!("chunked storage checked above"),
+        }
+        self.frames = next_total_frames;
+        Ok(recycled)
+    }
+
     pub(crate) fn frames(&self) -> usize {
         self.frames
     }
 
     pub(crate) fn finish_writing(&mut self) -> Result<(), String> {
         match &mut self.storage {
-            PcmSpoolStorage::Memory { .. } => Ok(()),
+            PcmSpoolStorage::Memory { .. } | PcmSpoolStorage::ChunkedMemory { .. } => Ok(()),
             PcmSpoolStorage::File(file) => file
                 .flush()
                 .map_err(|error| format!("flush PCM spool: {error}")),
@@ -215,6 +337,9 @@ impl PcmSpool {
                 spill
             }
             PcmSpoolStorage::File(_) => false,
+            PcmSpoolStorage::ChunkedMemory { .. } => {
+                unreachable!("borrowed chunk writes are routed through owned storage")
+            }
             PcmSpoolStorage::Transitioning => {
                 return Err("PCM spool storage transition was interrupted".into());
             }
@@ -227,47 +352,82 @@ impl PcmSpool {
 
     fn spill_to_file(&mut self) -> Result<(), String> {
         let storage = std::mem::replace(&mut self.storage, PcmSpoolStorage::Transitioning);
-        let (samples, record_frames, retained_bytes, limit, lease) = match storage {
+        match storage {
             PcmSpoolStorage::Memory {
                 samples,
                 record_frames,
                 retained_bytes,
                 limit,
                 lease,
-            } => (samples, record_frames, retained_bytes, limit, lease),
-            storage => {
-                self.storage = storage;
-                return Ok(());
-            }
-        };
-        let file = match tempfile::tempfile() {
-            Ok(file) => file,
-            Err(error) => {
-                self.storage = PcmSpoolStorage::Memory {
-                    samples,
-                    record_frames,
-                    retained_bytes,
-                    limit,
-                    lease,
+            } => {
+                let file = match tempfile::tempfile() {
+                    Ok(file) => file,
+                    Err(error) => {
+                        self.storage = PcmSpoolStorage::Memory {
+                            samples,
+                            record_frames,
+                            retained_bytes,
+                            limit,
+                            lease,
+                        };
+                        return Err(format!("create PCM spool: {error}"));
+                    }
                 };
-                return Err(format!("create PCM spool: {error}"));
+                let mut file = BufWriter::with_capacity(IO_BUFFER_BYTES, file);
+                if let Err(error) =
+                    write_memory_records(&mut file, &samples, &record_frames, self.channels)
+                {
+                    self.storage = PcmSpoolStorage::Memory {
+                        samples,
+                        record_frames,
+                        retained_bytes,
+                        limit,
+                        lease,
+                    };
+                    return Err(error);
+                }
+                self.storage = PcmSpoolStorage::File(file);
+                drop(lease);
+                Ok(())
             }
-        };
-        let mut file = BufWriter::with_capacity(IO_BUFFER_BYTES, file);
-        if let Err(error) = write_memory_records(&mut file, &samples, &record_frames, self.channels)
-        {
-            self.storage = PcmSpoolStorage::Memory {
-                samples,
-                record_frames,
+            PcmSpoolStorage::ChunkedMemory {
+                chunks,
                 retained_bytes,
                 limit,
                 lease,
-            };
-            return Err(error);
+            } => {
+                let file = match tempfile::tempfile() {
+                    Ok(file) => file,
+                    Err(error) => {
+                        self.storage = PcmSpoolStorage::ChunkedMemory {
+                            chunks,
+                            retained_bytes,
+                            limit,
+                            lease,
+                        };
+                        return Err(format!("create PCM spool: {error}"));
+                    }
+                };
+                let mut file = BufWriter::with_capacity(IO_BUFFER_BYTES, file);
+                if let Err(error) = write_chunked_memory_records(&mut file, &chunks, self.channels)
+                {
+                    self.storage = PcmSpoolStorage::ChunkedMemory {
+                        chunks,
+                        retained_bytes,
+                        limit,
+                        lease,
+                    };
+                    return Err(error);
+                }
+                self.storage = PcmSpoolStorage::File(file);
+                drop(lease);
+                Ok(())
+            }
+            storage => {
+                self.storage = storage;
+                Ok(())
+            }
         }
-        self.storage = PcmSpoolStorage::File(file);
-        drop(lease);
-        Ok(())
     }
 
     #[cfg(test)]
@@ -277,6 +437,21 @@ impl PcmSpool {
             storage: PcmSpoolStorage::Memory {
                 samples: Vec::new(),
                 record_frames: Vec::new(),
+                retained_bytes: 0,
+                limit,
+                lease: MemorySpoolLease::untracked(),
+            },
+            channels,
+            frames: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn chunked_in_memory_for_test(channels: usize, limit: usize) -> Self {
+        assert_ne!(channels, 0);
+        Self {
+            storage: PcmSpoolStorage::ChunkedMemory {
+                chunks: Vec::new(),
                 retained_bytes: 0,
                 limit,
                 lease: MemorySpoolLease::untracked(),
@@ -303,6 +478,13 @@ impl PcmSpool {
                 record_frames,
                 ..
             } => replay_memory_records(samples, record_frames, channels, frames, &mut consume),
+            PcmSpoolStorage::ChunkedMemory { chunks, .. } => {
+                validate_chunked_memory_geometry(chunks, channels, frames)?;
+                for chunk in chunks {
+                    consume(chunk)?;
+                }
+                Ok(())
+            }
             PcmSpoolStorage::File(file) => {
                 file.seek(SeekFrom::Start(0))
                     .map_err(|error| format!("rewind PCM spool: {error}"))?;
@@ -316,7 +498,10 @@ impl PcmSpool {
     }
 
     pub(crate) fn can_replay_borrowed(&self) -> bool {
-        matches!(&self.storage, PcmSpoolStorage::Memory { .. })
+        matches!(
+            &self.storage,
+            PcmSpoolStorage::Memory { .. } | PcmSpoolStorage::ChunkedMemory { .. }
+        )
     }
 
     /// Hand immutable views of the retained channel planes directly to a
@@ -327,28 +512,39 @@ impl PcmSpool {
     ) -> Result<(), String> {
         let channels = self.channels;
         let expected_frames = self.frames;
-        let PcmSpoolStorage::Memory {
-            samples,
-            record_frames,
-            ..
-        } = &self.storage
-        else {
-            return Err("PCM spool is not retained in memory".into());
-        };
-        validate_memory_geometry(samples, record_frames, channels, expected_frames)?;
-
-        let mut remaining = samples.as_slice();
-        for &frames in record_frames.iter() {
-            let record_values = frames
-                .checked_mul(channels)
-                .ok_or_else(|| "PCM spool record size overflow".to_string())?;
-            let (record, tail) = remaining.split_at(record_values);
-            let planar = record.chunks_exact(frames).collect::<Vec<_>>();
-            debug_assert_eq!(planar.len(), channels);
-            consume(&planar)?;
-            remaining = tail;
+        match &self.storage {
+            PcmSpoolStorage::Memory {
+                samples,
+                record_frames,
+                ..
+            } => {
+                validate_memory_geometry(samples, record_frames, channels, expected_frames)?;
+                let mut planar = Vec::with_capacity(channels);
+                let mut remaining = samples.as_slice();
+                for &frames in record_frames.iter() {
+                    let record_values = frames
+                        .checked_mul(channels)
+                        .ok_or_else(|| "PCM spool record size overflow".to_string())?;
+                    let (record, tail) = remaining.split_at(record_values);
+                    planar.clear();
+                    planar.extend(record.chunks_exact(frames));
+                    debug_assert_eq!(planar.len(), channels);
+                    consume(&planar)?;
+                    remaining = tail;
+                }
+                debug_assert!(remaining.is_empty());
+            }
+            PcmSpoolStorage::ChunkedMemory { chunks, .. } => {
+                validate_chunked_memory_geometry(chunks, channels, expected_frames)?;
+                let mut planar = Vec::with_capacity(channels);
+                for chunk in chunks {
+                    planar.clear();
+                    planar.extend(chunk.iter().map(Vec::as_slice));
+                    consume(&planar)?;
+                }
+            }
+            _ => return Err("PCM spool is not retained in memory".into()),
         }
-        debug_assert!(remaining.is_empty());
         Ok(())
     }
 
@@ -359,6 +555,13 @@ impl PcmSpool {
         &mut self,
         mut consume: impl FnMut(Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, String>,
     ) -> Result<(), String> {
+        if let PcmSpoolStorage::ChunkedMemory { chunks, .. } = &mut self.storage {
+            validate_chunked_memory_geometry(chunks, self.channels, self.frames)?;
+            for chunk in std::mem::take(chunks) {
+                let _ = consume(chunk)?;
+            }
+            return Ok(());
+        }
         let mut handoff = Vec::new();
         let channels = self.channels;
         self.replay(|planar| {
@@ -393,6 +596,22 @@ fn preallocated_memory_storage(
     Some(PcmSpoolStorage::Memory {
         samples,
         record_frames: Vec::new(),
+        retained_bytes: 0,
+        limit: MAX_IN_MEMORY_PCM_BYTES,
+        lease,
+    })
+}
+
+fn chunked_memory_storage(
+    capacity_bytes: usize,
+    lease: MemorySpoolLease,
+) -> Option<PcmSpoolStorage> {
+    let mut chunks = Vec::new();
+    chunks
+        .try_reserve_exact(capacity_bytes.div_ceil(ESTIMATED_OWNED_CHUNK_BYTES))
+        .ok()?;
+    Some(PcmSpoolStorage::ChunkedMemory {
+        chunks,
         retained_bytes: 0,
         limit: MAX_IN_MEMORY_PCM_BYTES,
         lease,
@@ -443,6 +662,26 @@ fn write_memory_records(
     Ok(())
 }
 
+fn write_chunked_memory_records(
+    writer: &mut impl Write,
+    chunks: &[Vec<Vec<f32>>],
+    channels: usize,
+) -> Result<(), String> {
+    for chunk in chunks {
+        if chunk.len() != channels {
+            return Err("PCM spool memory geometry is inconsistent".into());
+        }
+        let frames = chunk.first().map_or(0, Vec::len);
+        if frames == 0 || chunk.iter().any(|channel| channel.len() != frames) {
+            return Err("PCM spool memory geometry is inconsistent".into());
+        }
+        let frames_u64 = u64::try_from(frames)
+            .map_err(|_| "PCM spool chunk length does not fit its record header".to_string())?;
+        write_file_record(writer, frames_u64, chunk)?;
+    }
+    Ok(())
+}
+
 fn validate_memory_geometry(
     samples: &[f32],
     record_frames: &[usize],
@@ -468,6 +707,32 @@ fn validate_memory_geometry(
     }
     if sample_values != samples.len() {
         return Err("PCM spool memory geometry is inconsistent".into());
+    }
+    if replayed_frames != expected_frames {
+        return Err(format!(
+            "PCM spool replayed {replayed_frames} frames, expected {expected_frames}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_chunked_memory_geometry(
+    chunks: &[Vec<Vec<f32>>],
+    channels: usize,
+    expected_frames: usize,
+) -> Result<(), String> {
+    let mut replayed_frames = 0usize;
+    for chunk in chunks {
+        if chunk.len() != channels {
+            return Err("PCM spool memory geometry is inconsistent".into());
+        }
+        let frames = chunk.first().map_or(0, Vec::len);
+        if frames == 0 || chunk.iter().any(|channel| channel.len() != frames) {
+            return Err("PCM spool memory geometry is inconsistent".into());
+        }
+        replayed_frames = replayed_frames
+            .checked_add(frames)
+            .ok_or_else(|| "PCM spool replay duration overflow".to_string())?;
     }
     if replayed_frames != expected_frames {
         return Err(format!(
@@ -536,7 +801,7 @@ fn replay_records(
 
 #[inline]
 fn write_file_record(
-    file: &mut BufWriter<File>,
+    file: &mut impl Write,
     frames: u64,
     planar: &[Vec<f32>],
 ) -> Result<(), String> {
@@ -604,6 +869,96 @@ mod tests {
                 assert!(record_frames.is_empty());
             }
             _ => panic!("preallocation should produce memory storage"),
+        }
+    }
+
+    #[test]
+    fn chunked_memory_spool_retains_and_replays_owned_allocations() {
+        let mut left = Vec::with_capacity(16);
+        left.extend([0.25_f32, -0.5, 0.75]);
+        let mut right = Vec::with_capacity(16);
+        right.extend([-0.125_f32, 0.375, -0.625]);
+        let left_pointer = left.as_ptr();
+        let right_pointer = right.as_ptr();
+        let mut spool = PcmSpool::chunked_in_memory_for_test(2, 4096);
+
+        let recycled = spool.write_owned_chunk(vec![left, right]).unwrap();
+        assert_eq!(recycled.len(), 2);
+        assert!(recycled.iter().all(Vec::is_empty));
+        assert!(recycled.iter().all(|channel| channel.capacity() == 0));
+        assert_eq!(spool.frames(), 3);
+
+        let mut borrowed_calls = 0;
+        spool
+            .replay_borrowed(|planar| {
+                borrowed_calls += 1;
+                assert_eq!(planar[0].as_ptr(), left_pointer);
+                assert_eq!(planar[1].as_ptr(), right_pointer);
+                assert_eq!(planar[0], [0.25, -0.5, 0.75]);
+                assert_eq!(planar[1], [-0.125, 0.375, -0.625]);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(borrowed_calls, 1);
+
+        let mut owned_calls = 0;
+        let mut recycled = Some(recycled);
+        spool
+            .replay_owned(|chunk| {
+                owned_calls += 1;
+                assert_eq!(chunk[0].as_ptr(), left_pointer);
+                assert_eq!(chunk[1].as_ptr(), right_pointer);
+                Ok(recycled.take().unwrap())
+            })
+            .unwrap();
+        assert_eq!(owned_calls, 1);
+    }
+
+    #[test]
+    fn chunked_memory_spool_spills_owned_records_to_the_exact_file_format() {
+        let first = vec![vec![0.25_f32, -0.5, 0.75], vec![-0.25, 0.5, -0.75]];
+        let second = vec![vec![1.0_f32], vec![-1.0]];
+        let first_capacity_bytes = size_of::<u64>()
+            + first
+                .iter()
+                .map(|channel| channel.capacity() * size_of::<f32>())
+                .sum::<usize>();
+        let expected = [first.clone(), second.clone()]
+            .into_iter()
+            .map(|planar| {
+                planar
+                    .iter()
+                    .map(|channel| channel.iter().map(|sample| sample.to_bits()).collect())
+                    .collect::<Vec<Vec<u32>>>()
+            })
+            .collect::<Vec<_>>();
+        let mut spool = PcmSpool::chunked_in_memory_for_test(2, first_capacity_bytes);
+
+        let first_recycled = spool.write_owned_chunk(first).unwrap();
+        assert!(matches!(
+            spool.storage,
+            PcmSpoolStorage::ChunkedMemory { .. }
+        ));
+        assert!(first_recycled.iter().all(|channel| channel.capacity() == 0));
+        let second_recycled = spool.write_owned_chunk(second).unwrap();
+        assert!(matches!(spool.storage, PcmSpoolStorage::File(_)));
+        assert!(second_recycled.iter().all(Vec::is_empty));
+        spool.finish_writing().unwrap();
+
+        for _ in 0..2 {
+            let mut replayed = Vec::new();
+            spool
+                .replay(|planar| {
+                    replayed.push(
+                        planar
+                            .iter()
+                            .map(|channel| channel.iter().map(|sample| sample.to_bits()).collect())
+                            .collect::<Vec<Vec<u32>>>(),
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(replayed, expected);
         }
     }
 

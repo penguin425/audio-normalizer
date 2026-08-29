@@ -187,11 +187,12 @@ the `-o` extension override this.
   input order.
 * **Rolling block energies** make the 75%-overlapping LUFS gating blocks O(1)
   each while retaining only three seconds of filtered energy.
-* **Fixed streaming loudness windows** keep the 400 ms momentary and three-second
-  short-term histories in preallocated circular arrays. Monotonic block-frame
-  deadlines replace a division/remainder check on every sample, while the
-  established f64 addition/subtraction order, BS.1770 block boundaries, gating
-  population, analysis JSON, and normalized output remain exact.
+* **Fixed streaming loudness windows** share one preallocated three-second
+  circular history between the 400 ms momentary and short-term sums. Monotonic
+  block-frame deadlines replace a division/remainder check on every sample,
+  while the established f64 addition/subtraction order, BS.1770 block
+  boundaries, gating population, analysis JSON, and normalized output remain
+  exact.
 * **Specialized stereo streaming analysis** selects the paired K-weighting
   state once, keeps both true-peak meters in the hot loop, and avoids dynamic
   channel iteration. The generic channel-layout path remains unchanged, and
@@ -224,25 +225,29 @@ the `-o` extension override this.
   lossless/DSD inputs, avoiding a second decode or resample; fast same-rate
   inputs and multi-track albums retain the lower-I/O/bounded-resource re-decode
   path. When an exact WAV, FLAC, or DSD duration proves that one top-level spool
-  fits, Forge reserves its reliable payload plus one MiB of record headroom
-  once, then retains at most 128 MiB of exact PCM in userspace. Undithered S16
-  and F32 WAVE deliveries consume those retained channel planes directly and
-  fuse gain, clipping, and encoding in one pass, avoiding both the replay copy
-  and a PCM writeback. One process-wide lease prevents concurrent memory
-  multiplication; unknown or longer inputs and nested file jobs use the
-  established temporary file from their first sample. A defensive exact spill
-  handles inconsistent metadata, while one MiB sequential buffers amortize
-  disk I/O and preserve record boundaries.
+  fits, Forge budgets its reliable payload plus one MiB of record headroom and
+  retains at most 128 MiB of exact PCM in userspace. Sequential capture reserves
+  one flat buffer; overlapped resample capture instead retains each produced
+  channel allocation and returns empty channel slots to the producer, removing
+  the capture copy. Undithered S16 and F32 WAVE deliveries consume retained
+  channel planes directly and fuse gain, clipping, and encoding in one pass,
+  avoiding both the replay copy and a PCM writeback. One process-wide lease
+  prevents concurrent memory multiplication; unknown or longer inputs and
+  nested file jobs use the established temporary file from their first sample.
+  A defensive exact spill handles inconsistent metadata, while one MiB
+  sequential buffers amortize disk I/O and preserve record boundaries.
   Standard-input audio is spooled to a temporary file so the same correct
   two-pass algorithm remains available in shell pipelines.
 * **Overlapped output-domain analysis** uses a two-slot ownership handoff for
   top-level sample-rate conversion when more than one worker is available.
-  Decode and the established 1,024-frame FFT resampler advance while a worker
-  performs ordered BS.1770/True Peak analysis and optional PCM capture. The
-  resampler response is unchanged: only downstream handoffs are coalesced into
-  reusable roughly 12k-frame chunks to amortize synchronization. Operations
-  without `--sample-rate`, `--jobs 1`, and nested batch/album work retain the
-  lower-CPU sequential path.
+  Rubato 5 borrows complete decoder planes through indexed input offsets, keeps
+  only the final cross-callback tail in a staging buffer, and batches the
+  established 1,024-frame FFT operations into roughly 12k-frame output
+  handoffs. Decode/resampling advances while a worker performs ordered
+  BS.1770/True Peak analysis and optional zero-copy PCM capture. The resampler
+  response and output samples are unchanged. Operations without
+  `--sample-rate`, `--jobs 1`, and nested batch/album work retain the lower-CPU
+  sequential path.
 * Release profile uses `lto = "fat"`, `codegen-units = 1`, and
   `panic = "abort"`. The published Linux and Apple Silicon `forge` CLIs add
   deterministic, branch-counter-only PGO while retaining portable ISA

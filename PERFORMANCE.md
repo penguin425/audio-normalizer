@@ -1701,6 +1701,82 @@ baseline, and one-worker execution. The owned FFT output callback also proves
 that its allocation is recycled. These checks preserve BS.1770 operation order
 and duration; the optimization changes scheduling rather than the signal.
 
+### v0.171.0: indexed Rubato 5 input and zero-copy PCM capture
+
+Sample-rate conversion now uses Rubato 5's audio-adapter API to borrow complete
+decoder blocks with `Indexing::input_offset`; only a final partial block that
+crosses callback boundaries is copied. Twelve established 1,024-input-frame
+FFT operations share one output adapter and downstream callback, with the exact
+capacity derived from Rubato's input and output FFT sizes. The window, fixed
+input arithmetic, delay compensation, output duration, and samples are
+unchanged.
+
+The ordered analysis consumer now retains ownership of eligible output-domain
+PCM chunks directly instead of copying them into a second flat spool. It
+returns zero-capacity channel slots so the resampler allocates only its exact
+next batch size; actual retained capacities, not sample lengths, enforce the
+128 MiB process-wide budget. If that budget is exceeded, every retained record
+is written in order to the established buffered temporary-file format before
+capture continues. Inputs known to exceed the budget use that file path from
+their first sample.
+
+Two smaller analysis passes were removed at the same time. Momentary and
+short-term loudness sums now share one three-second circular energy history
+while preserving the former add-then-subtract f64 order bit for bit. The
+stereo True Peak pruning reduction also supplies the discrete sample peak, so
+the frame loop does not repeat a scalar absolute-maximum pass. K-weight SIMD
+entry points are explicitly inlined into that specialized hot path.
+
+The local comparison uses the exact main commit `4e2af43` and candidate, Rust
+1.98.0, native-host fat LTO without PGO, and deterministic stereo PCM16 input.
+Each row pools 16 measurements per binary in balanced B-C-C-B/C-B-B-C order.
+Fixture generation is excluded, total CPU is user plus system time, and RSS is
+the maximum sampled resident set. The 300-second input remains below the memory
+budget; the 600-second control proves the over-budget file path.
+
+| Mode and workload | main wall | v0.171.0 wall | Wall change | CPU change | Peak RSS change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| default, 300 s FLAC normalize | 1.266 s | 1.253 s | -1.060% | +0.009% | -0.14 MiB |
+| default, 300 s WAVE 48→44.1 kHz normalize | 0.707 s | 0.628 s | -11.107% | +0.978% | +2.50 MiB |
+| one worker, 300 s FLAC normalize | 1.494 s | 1.480 s | -0.983% | -0.473% | 0 MiB |
+| one worker, 300 s WAVE 48→44.1 kHz normalize | 0.850 s | 0.821 s | -3.443% | -3.404% | -0.25 MiB |
+| default, 600 s FLAC normalize | 2.820 s | 2.830 s | +0.353% | +0.813% | -0.02 MiB |
+| default, 600 s WAVE 48→44.1 kHz normalize | 1.582 s | 1.540 s | -2.633% | -0.622% | 0 MiB |
+| one worker, 600 s FLAC normalize | 3.333 s | 3.376 s | +1.289% | +0.683% | 0 MiB |
+| one worker, 600 s WAVE 48→44.1 kHz normalize | 1.868 s | 1.800 s | -3.672% | -2.941% | 0 MiB |
+
+The four 300-second wall changes average -4.148%, with aggregate CPU averaging
+-0.723%. All eight over-budget wall/CPU changes average -0.841%. Two hosted
+Linux runs measured one-worker resample wall/CPU improvements of
+-8.454%/-8.492% and -10.838%/-11.009%; two Apple Silicon runs measured
+-7.757%/-7.760% and -8.564%/-10.735%. The corresponding default-worker wall
+changes ranged from -10.475% to -0.663% because independent pipeline work can
+overlap the resampler differently on hosted runners.
+
+The retained cross-platform gate therefore requires at least 3% wall and CPU
+improvement from the one-worker resample control, at most 3% CPU regression for
+the unchanged FLAC path in either mode, and no pooled wall regression. Broad
+10% wall and 8% CPU per-case tripwires plus the existing RSS limits still
+reject isolated regressions. This separates the resampler's reproducible cost
+reduction from multicore scheduling noise without weakening output-equivalence
+or over-budget controls.
+
+The independent v0.167.0 Symphonia packet-coalescing sentinel also preserved
+exact MP3, AAC, and Vorbis results. Two Apple Silicon repetitions measured
+normalization aggregates of +0.380%/-0.103% (pooled) and +0.029%/-1.535%
+(paired), with every individual wall/CPU result below the existing 3%
+regression ceiling and lower peak RSS. Because both the main baseline and this
+candidate already contain the v0.167.0 optimization, that workflow now enforces
+a 1% aggregate regression ceiling rather than incorrectly requiring every
+later hot-path change to reproduce the original feature's speedup.
+
+Main, candidate, and candidate one-worker 48→44.1 kHz normalized WAVE files are
+byte-identical with SHA-256
+`727e8154c527af11de2a642c6a67c69240841b56a20e736b3b577911123954f4`.
+Focused tests cover direct versus buffered resampler input, owned allocation
+identity, capacity-safe recycling, exact memory-to-file spill and replay, and
+bit-exact shared loudness-window sums.
+
 ## Final integration gate
 
 Before each release, run the full feature matrix, official conformance jobs

@@ -139,6 +139,7 @@ impl KWeightPair {
         }
     }
 
+    #[inline]
     #[target_feature(enable = "sse2")]
     unsafe fn process_sse2(&mut self, input: [f32; 2]) -> [f32; 2] {
         let input = _mm_cvtps_pd(_mm_set_ps(0.0, 0.0, input[1], input[0]));
@@ -203,6 +204,7 @@ impl KWeightPair {
         }
     }
 
+    #[inline]
     #[target_feature(enable = "neon")]
     unsafe fn process_neon(&mut self, input: [f32; 2]) -> [f32; 2] {
         let input = vcvt_f64_f32(vld1_f32(input.as_ptr()));
@@ -289,6 +291,7 @@ impl KWeightQuad {
         }
     }
 
+    #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn process_avx2(&mut self, input: [f32; 4]) -> [f32; 4] {
         let input = _mm256_cvtps_pd(_mm_loadu_ps(input.as_ptr()));

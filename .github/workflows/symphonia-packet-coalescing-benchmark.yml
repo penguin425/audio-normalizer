@@ -432,13 +432,17 @@ jobs:
           assert len(normalization_paired) == 4, normalization_paired
           pooled_aggregate = statistics.fmean(normalization_pooled)
           paired_aggregate = statistics.fmean(normalization_paired)
-          assert pooled_aggregate <= -0.25, (
-              "pooled normalization speedup was not material",
+          # The packet-coalescing speedup landed in v0.167.0, so both sides of
+          # later pull-request comparisons already contain it. Keep this as a
+          # tight end-to-end regression sentinel instead of requiring every
+          # unrelated hot-path change to reproduce the original speedup.
+          assert pooled_aggregate <= 1.0, (
+              "pooled normalization aggregate regressed",
               pooled_aggregate,
               normalization_pooled,
           )
-          assert paired_aggregate <= -0.25, (
-              "paired normalization speedup was not material",
+          assert paired_aggregate <= 1.0, (
+              "paired normalization aggregate regressed",
               paired_aggregate,
               normalization_paired,
           )
