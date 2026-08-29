@@ -1761,6 +1761,15 @@ reject isolated regressions. This separates the resampler's reproducible cost
 reduction from multicore scheduling noise without weakening output-equivalence
 or over-budget controls.
 
+The independent v0.167.0 Symphonia packet-coalescing sentinel also preserved
+exact MP3, AAC, and Vorbis results. Two Apple Silicon repetitions measured
+normalization aggregates of +0.380%/-0.103% (pooled) and +0.029%/-1.535%
+(paired), with every individual wall/CPU result below the existing 3%
+regression ceiling and lower peak RSS. Because both the main baseline and this
+candidate already contain the v0.167.0 optimization, that workflow now enforces
+a 1% aggregate regression ceiling rather than incorrectly requiring every
+later hot-path change to reproduce the original feature's speedup.
+
 Main, candidate, and candidate one-worker 48→44.1 kHz normalized WAVE files are
 byte-identical with SHA-256
 `727e8154c527af11de2a642c6a67c69240841b56a20e736b3b577911123954f4`.
