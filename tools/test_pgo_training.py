@@ -27,9 +27,13 @@ class PgoTrainingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fixtures = training.create_fixtures(root, 1, 2)
-            plan = training.training_plan(Path("/tmp/forge"), root, fixtures)
+            plan = training.training_plan(
+                Path("/tmp/forge"), root, fixtures, include_opus=True
+            )
             labels = [case.label for case in plan]
             self.assertEqual(len(labels), len(set(labels)))
+            self.assertIn("wav-96k-analyze", labels)
+            self.assertIn("wav-96k-normalize", labels)
             self.assertIn("wav-verify", labels)
             self.assertIn("wav-resample", labels)
             self.assertIn("wav-dither", labels)
@@ -41,9 +45,22 @@ class PgoTrainingTests(unittest.TestCase):
             self.assertIn("album-normalize", labels)
             self.assertIn("cache-miss-normalize", labels)
             self.assertIn("cache-hit-normalize", labels)
+            self.assertIn("wav-to-opus", labels)
+            self.assertIn("opus-analyze", labels)
+            self.assertIn("opus-normalize", labels)
             for case in plan:
                 jobs_index = case.command.index("--jobs")
                 self.assertEqual(case.command[jobs_index + 1], "1")
+
+    def test_opus_training_is_opt_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixtures = training.create_fixtures(root, 1, 2)
+            labels = [
+                case.label
+                for case in training.training_plan(Path("/tmp/forge"), root, fixtures)
+            ]
+            self.assertFalse(any("opus" in label for label in labels))
 
     def test_fixtures_are_bounded_and_deterministic(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
@@ -53,7 +70,14 @@ class PgoTrainingTests(unittest.TestCase):
                 first_fixtures["stereo"].read_bytes(),
                 second_fixtures["stereo"].read_bytes(),
             )
+            self.assertEqual(
+                first_fixtures["stereo_high_rate"].read_bytes(),
+                second_fixtures["stereo_high_rate"].read_bytes(),
+            )
             self.assertEqual(first_fixtures["stereo"].stat().st_size, 192_044)
+            self.assertEqual(
+                first_fixtures["stereo_high_rate"].stat().st_size, 384_044
+            )
             self.assertEqual(first_fixtures["surround"].stat().st_size, 768_044)
             self.assertEqual(len(first_fixtures["tracks"]), 2)
 

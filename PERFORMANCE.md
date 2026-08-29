@@ -1777,6 +1777,89 @@ Focused tests cover direct versus buffered resampler input, owned allocation
 identity, capacity-safe recycling, exact memory-to-file spill and replay, and
 bit-exact shared loudness-window sums.
 
+### v0.172.0: broader deterministic PGO training
+
+The bounded instrumentation-PGO corpus now includes 96 kHz stereo analysis
+and normalization in every PGO build. Release feature sets containing
+`opus-encoding` additionally train the built-in Opus encoder, decoder, and
+normalization path. Builds without that feature retain the 16-case non-Opus
+plan; official Linux and Apple Silicon release CLIs use the complete 19-case
+plan. Training remains serial and deterministic, and the versioned report now
+records both the additional sample rate and whether Opus was included.
+
+The incremental comparison uses the published v0.171.0 and pull-request
+v0.172.0 Linux x86-64-v3 archives, both produced by the same Rust 1.97.0
+release workflow with counter-only PGO. The only executable hot-path input that
+changed is the training profile. On an AMD Ryzen 9 3950X, deterministic
+300-second inputs were measured seven times per report in B-C-C-B run order,
+yielding 14 samples per binary and workload. Fixture generation is
+excluded, total CPU is user plus system time, and RSS is the maximum sampled
+resident set.
+
+| Workload | v0.171.0 wall | v0.172.0 wall | Wall change | CPU change | Peak RSS change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 48 kHz WAVE analysis | 0.515 s | 0.484 s | -6.04% | -4.29% | +0.25 MiB |
+| 48 kHz WAVE normalization | 0.553 s | 0.538 s | -2.81% | -4.23% | +0.25 MiB |
+| Opus analysis | 1.171 s | 1.152 s | -1.62% | -1.36% | +0.25 MiB |
+| 96 kHz WAVE analysis | 1.066 s | 0.892 s | -16.33% | -13.63% | 0 MiB |
+| 96 kHz WAVE normalization | 1.193 s | 1.053 s | -11.67% | -9.01% | 0 MiB |
+
+The three 48 kHz/Opus workloads improve aggregate wall time by 2.93% and CPU
+by 2.92%. The newly represented 96 kHz pair improves aggregate wall time by
+13.87% and CPU by 11.24%. Both independent seven-sample medians agree on the
+direction and magnitude of the 96 kHz result: analysis measured
+1.069/1.063 seconds for the old profile and 0.889/0.892 seconds for the new
+profile, while normalization measured 1.184/1.197 and 1.053/1.051 seconds.
+
+The generic Linux PGO tier was measured separately with one shared fixture per
+workload and 16 samples per binary in alternating B-C-C-B/C-B-B-C blocks. This
+tighter pairing removes the thermal drift seen when complete benchmark reports
+were run sequentially.
+
+| Generic PGO workload | Wall change | CPU change | Peak RSS change |
+| --- | ---: | ---: | ---: |
+| 48 kHz WAVE analysis | -0.88% | -0.52% | 0 MiB |
+| 48 kHz WAVE normalization | -0.53% | -0.01% | 0 MiB |
+| Opus analysis | -0.23% | -0.25% | 0 MiB |
+| 96 kHz WAVE analysis | +0.33% | +0.55% | 0 MiB |
+| 96 kHz WAVE normalization | +0.24% | -1.32% | 0 MiB |
+
+Across all five generic-tier workloads, aggregate wall time changed by
++0.008%, aggregate CPU by -0.337%, and peak RSS did not change. The generic
+tier is therefore neutral within measurement resolution while the optional
+x86-64-v3 tier realizes the material gain.
+
+The hosted Apple Silicon control rebuilt the complete 19-case profile and
+retained PGO improvements for every existing end-to-end workload: aggregate
+wall time fell 16.09% and CPU 10.84% versus the portable binary, while
+individual wall changes ranged from -8.69% to -26.18%. Analysis JSON and
+normal/verified WAVE output remained byte-identical. The canonical profile is
+378,005 bytes with SHA-256
+`51151a888267dabbda5f1205bf6d7eb901be9e2ebd60414c14c368d996826a21`;
+the versioned training report records all 19 cases, 96 kHz, and Opus inclusion.
+The full evidence is retained by
+[Actions run 33269852819](https://github.com/penguin425/audio-normalizer/actions/runs/33269852819).
+
+The independent PCM spool/resample workflow also compared non-PGO base and
+candidate binaries whose relevant runtime source is identical in this release.
+Its Ubuntu run measured all four default/one-worker wall changes between
+-0.53% and -1.08%, with aggregate wall/CPU changes of -0.76%/-0.53% and exact
+output. The former gate nevertheless failed because it required every later PR
+to reproduce at least 3% of v0.171.0's original one-worker resampler speedup.
+After that feature release, the workflow now acts as a regression sentinel: it
+allows at most 3% on the isolated one-worker path and 1% across the four-case
+wall/CPU aggregate, while retaining the broader per-case, RSS, over-budget,
+output-equivalence, and unchanged-FLAC controls.
+
+Thirty-second 48 kHz WAVE, 96 kHz WAVE, and Opus controls produced
+byte-identical analysis JSON and normalized WAVE output between the two PGO
+binaries. Their normalized-output SHA-256 values are respectively
+`ce17fe5ee98e7b7f4ded77f16adb5342773018246cacb951f6989aac603dc826`,
+`034f1e5aac910b308e04f7a65beec092d00b982a218221e704b0a3d4e8382915`,
+and `0c9cff888bdd3fb3e1341ac7b70650a6bd0c882f0261d55dcdb113470c17d5d9`.
+Portable non-PGO executables and all signal-processing arithmetic are
+unchanged.
+
 ## Final integration gate
 
 Before each release, run the full feature matrix, official conformance jobs
