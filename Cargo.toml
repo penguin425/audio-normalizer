@@ -194,7 +194,7 @@ httpdate = "1"
 ureq = { version = "3.3", default-features = false, features = ["rustls"] }
 url = "2.5"
 rubato = { version = "5.0.0", default-features = false, features = ["fft_resampler"] }
-jsonschema = { version = "0.49.1", default-features = false }
+jsonschema = { version = "0.52.0", default-features = false }
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 ndarray = { version = "0.17", default-features = false, optional = true }
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["ndarray", "load-dynamic"], optional = true }
