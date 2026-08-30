@@ -238,7 +238,7 @@ Forge already provides:
   batch, album, and 7.1 WAVE normalization, FLAC/MP3 analysis and normalization,
   and bounded pathological WAVE QC, with repeated samples, median timing,
   maximum RSS evidence, and compatible-host baseline regression gates.
-- Channel-contiguous AVX2 gain/ceiling fusion, byte-exact AVX2 PCM16
+- Channel-contiguous AVX2 gain/ceiling fusion, byte-exact AVX2 PCM16 and PCM24
   mono/stereo quantization and interleaving, reusable WAVE chunk storage, and
   scalar/SIMD equivalence coverage for exceptional values and quantizer
   boundaries.
