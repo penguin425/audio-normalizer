@@ -246,6 +246,15 @@ fn main() -> ExitCode {
                     "Attach one validated forge-anomaly-provider audit per analyzed input in input order",
                 ),
         )
+        .arg(
+            Arg::new("ebu_qc_xml")
+                .long("ebu-qc-xml")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .requires("ebu_qc")
+                .conflicts_with("watch")
+                .help("Write a schema-valid EBU QC 2026-04 generic XML envelope for one input"),
+        )
         .get_matches();
     let true_peak_backend = matches
         .get_one::<String>("true_peak_backend")
@@ -297,6 +306,7 @@ fn main() -> ExitCode {
         .get_many::<PathBuf>("anomaly_audit")
         .map(|values| values.cloned().collect::<Vec<_>>())
         .unwrap_or_default();
+    let ebu_qc_xml = matches.get_one::<PathBuf>("ebu_qc_xml").cloned();
     let result = run(
         cli,
         batch_options,
@@ -304,6 +314,7 @@ fn main() -> ExitCode {
         watch_options,
         catalogue_options,
         anomaly_audits,
+        ebu_qc_xml,
     );
     if backend == forge_normalizer::dsp::lufs::TruePeakBackend::Cuda {
         if let Some(reason) = forge_normalizer::dsp::lufs::cuda_runtime_fallback_reason() {
@@ -353,6 +364,7 @@ fn run(
     watch_options: WatchOptions,
     catalogue_options: CatalogueOptions,
     anomaly_audits: Vec<PathBuf>,
+    ebu_qc_xml: Option<PathBuf>,
 ) -> Result<(), String> {
     if watch_options.enabled {
         return run_watch(cli, cache_options, watch_options, anomaly_audits);
@@ -365,6 +377,7 @@ fn run(
         &cache_options,
         &catalogue_options,
         &anomaly_audits,
+        ebu_qc_xml.as_deref(),
     )?;
     pipeline.emit_stdout()
 }
@@ -482,6 +495,7 @@ fn process_watch_candidate(
         cache_options,
         &CatalogueOptions::default(),
         &[],
+        None,
     );
     match result {
         Ok(()) => watch.mark_completed(&candidate.id),
@@ -527,6 +541,7 @@ fn run_paths(
     cache_options: &CacheOptions,
     catalogue_options: &CatalogueOptions,
     anomaly_audit_paths: &[PathBuf],
+    ebu_qc_xml: Option<&Path>,
 ) -> Result<(), String> {
     if let Some(j) = cli.jobs {
         ThreadPoolBuilder::new()
@@ -834,14 +849,10 @@ fn run_paths(
         if cli.adm_profile_report.is_some() && cli.inputs.len() != 1 {
             return Err("--adm-profile-report requires exactly one input".into());
         }
-        if cli.ebu_qc_xml.is_some() && cli.inputs.len() != 1 {
+        if ebu_qc_xml.is_some() && cli.inputs.len() != 1 {
             return Err("--ebu-qc-xml requires exactly one input".into());
         }
-        if cli
-            .ebu_qc_xml
-            .as_ref()
-            .is_some_and(|path| path.as_os_str() == "-")
-        {
+        if ebu_qc_xml.is_some_and(|path| path.as_os_str() == "-") {
             return Err("--ebu-qc-xml requires a file path, not stdout".into());
         }
         let codec_metadata = cli
@@ -1028,7 +1039,7 @@ fn run_paths(
                 .as_ref()
                 .map(|options| qc::analyze_file(input, &an, options))
                 .transpose()?;
-            if cli.ebu_qc_xml.is_some() {
+            if ebu_qc_xml.is_some() {
                 let results = ebu_qc
                     .as_ref()
                     .expect("--ebu-qc-xml requires EBU QC analysis");
@@ -1421,7 +1432,7 @@ fn run_paths(
             serde_json::to_writer_pretty(file, audit)
                 .map_err(|error| format!("write ADM profile report: {error}"))?;
         }
-        if let Some(path) = &cli.ebu_qc_xml {
+        if let Some(path) = ebu_qc_xml {
             if let Some(parent) = path
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
