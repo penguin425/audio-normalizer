@@ -480,8 +480,12 @@ pub(crate) fn encode_interleaved_with_rngs_into(
             }
             return;
         }
-        if kind == PcmKind::S24 && channels >= 3 {
-            unsafe { encode_multichannel_no_dither_avx2(planar, kind, out) };
+        if kind == PcmKind::S24 {
+            if channels <= 2 {
+                unsafe { encode_s24_no_dither_avx2(planar, out) };
+            } else {
+                unsafe { encode_multichannel_no_dither_avx2(planar, kind, out) };
+            }
             return;
         }
     }
@@ -649,6 +653,63 @@ unsafe fn encode_s16_no_dither_avx2<P: AsRef<[f32]>>(planar: &[P], out: &mut [u8
         &mut rngs[..channels],
         out,
         frame,
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn encode_s24_no_dither_avx2(planar: &[Vec<f32>], out: &mut [u8]) {
+    let frames = planar[0].len();
+    let channels = planar.len();
+    debug_assert!(matches!(channels, 1 | 2));
+    let mut frame = 0;
+    if channels == 1 {
+        while frame + 8 <= frames {
+            let quantized = quantize_s24x8(_mm256_loadu_ps(planar[0].as_ptr().add(frame)));
+            let destination = out.as_mut_ptr().add(frame * 3);
+            store_packed_s24x4(_mm256_castsi256_si128(quantized), destination);
+            store_packed_s24x4(_mm256_extracti128_si256(quantized, 1), destination.add(12));
+            frame += 8;
+        }
+    } else {
+        while frame + 8 <= frames {
+            let left = quantize_s24x8(_mm256_loadu_ps(planar[0].as_ptr().add(frame)));
+            let right = quantize_s24x8(_mm256_loadu_ps(planar[1].as_ptr().add(frame)));
+            let low_pairs = _mm256_unpacklo_epi32(left, right);
+            let high_pairs = _mm256_unpackhi_epi32(left, right);
+            let first = _mm256_permute2x128_si256::<0x20>(low_pairs, high_pairs);
+            let second = _mm256_permute2x128_si256::<0x31>(low_pairs, high_pairs);
+            let destination = out.as_mut_ptr().add(frame * 6);
+            store_packed_s24x4(_mm256_castsi256_si128(first), destination);
+            store_packed_s24x4(_mm256_extracti128_si256(first, 1), destination.add(12));
+            store_packed_s24x4(_mm256_castsi256_si128(second), destination.add(24));
+            store_packed_s24x4(_mm256_extracti128_si256(second, 1), destination.add(36));
+            frame += 8;
+        }
+    }
+    let mut rngs = [0_u64; 2];
+    encode_interleaved_scalar_from(
+        planar,
+        PcmKind::S24,
+        false,
+        &mut rngs[..channels],
+        out,
+        frame,
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn store_packed_s24x4(samples: __m128i, destination: *mut u8) {
+    let packed = _mm_shuffle_epi8(
+        samples,
+        _mm_setr_epi8(0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1),
+    );
+    _mm_storel_epi64(destination.cast(), packed);
+    std::ptr::write_unaligned(
+        destination.add(8).cast::<u32>(),
+        _mm_extract_epi32::<2>(packed) as u32,
     );
 }
 
