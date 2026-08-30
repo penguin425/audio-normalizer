@@ -106,6 +106,11 @@ the `-o` extension override this.
   PCM16/PCM24 WAVE coverage with NEON on little-endian AArch64, and reuses the
   WAVE writer's chunk storage. Dither, exceptional samples, limiter processing,
   and verification retain their established semantics.
+* **Packed stereo PCM24 output** quantizes eight mono/stereo frames at a time
+  with runtime-dispatched AVX2, interleaves stereo lanes in registers, and
+  stores the exact three-byte little-endian representation. Dithered output,
+  scalar tails, non-AVX2 hosts, and existing multichannel kernels retain their
+  established paths and bytes.
 * **Allocation-stable look-ahead limiting** reuses caller-owned planar output
   channels for every decoded chunk and for the final delayed tail. Adjacent
   True Peak meters advance through the paired SIMD kernel, with a direct stereo

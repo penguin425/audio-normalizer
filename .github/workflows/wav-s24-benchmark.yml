@@ -1,0 +1,238 @@
+name: WAV S24 stereo SIMD benchmark
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/wav-s24-benchmark.yml"
+      - "schema/performance-benchmark-v1.schema.json"
+      - "src/dsp/convert.rs"
+      - "tools/benchmark.py"
+      - "tools/test_benchmark.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wav-s24-benchmark-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: benchmark (ubuntu-24.04 x86-64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+
+      - name: Check out exact pull-request base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: baseline
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+
+      - name: Require the measured AVX2 path
+        shell: bash
+        run: grep -qw avx2 /proc/cpuinfo
+
+      - name: Prove byte-exact S24 quantization and benchmark contracts
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_TARGET_DIR: ${{ runner.temp }}/target-candidate-tests
+        run: |
+          set -euo pipefail
+          python3 candidate/tools/test_benchmark.py
+          cargo test --locked --manifest-path candidate/Cargo.toml \
+            --no-default-features --lib \
+            s24_simd_encoder_matches_scalar_quantization_for_multichannel_layouts \
+            -- --nocapture
+
+      - name: Build exact baseline and candidate
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/target-baseline" \
+            cargo build --locked --release --manifest-path baseline/Cargo.toml \
+              --no-default-features --bin forge --bin forge-container-qc
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/target-candidate" \
+            cargo build --locked --release --manifest-path candidate/Cargo.toml \
+              --no-default-features --bin forge --bin forge-container-qc
+
+      - name: Verify exact mono, stereo, high-rate, and dithered output
+        shell: bash
+        run: |
+          set -euo pipefail
+          exact_dir="${RUNNER_TEMP}/exact-output"
+          mkdir "${exact_dir}"
+          EXACT_DIR="${exact_dir}" python3 - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "candidate/tools")
+          from benchmark import write_pcm16_wave
+
+          exact_dir = Path(os.environ["EXACT_DIR"])
+          write_pcm16_wave(exact_dir / "mono-48k.wav", 30, 48_000, 1)
+          write_pcm16_wave(exact_dir / "stereo-48k.wav", 30, 48_000, 2)
+          write_pcm16_wave(exact_dir / "stereo-96k.wav", 30, 96_000, 2)
+          PY
+
+          baseline="${RUNNER_TEMP}/target-baseline/release/forge"
+          candidate="${RUNNER_TEMP}/target-candidate/release/forge"
+          for fixture in mono-48k stereo-48k stereo-96k; do
+            "${baseline}" "${exact_dir}/${fixture}.wav" --bits 24 --overwrite \
+              -o "${exact_dir}/base-${fixture}.wav"
+            "${candidate}" "${exact_dir}/${fixture}.wav" --bits 24 --overwrite \
+              -o "${exact_dir}/candidate-${fixture}.wav"
+            cmp "${exact_dir}/base-${fixture}.wav" \
+              "${exact_dir}/candidate-${fixture}.wav"
+
+            "${baseline}" "${exact_dir}/${fixture}.wav" --bits 24 --dither \
+              --overwrite -o "${exact_dir}/base-dither-${fixture}.wav"
+            "${candidate}" "${exact_dir}/${fixture}.wav" --bits 24 --dither \
+              --overwrite -o "${exact_dir}/candidate-dither-${fixture}.wav"
+            cmp "${exact_dir}/base-dither-${fixture}.wav" \
+              "${exact_dir}/candidate-dither-${fixture}.wav"
+          done
+
+      - name: Run benchmarks in both orders
+        shell: bash
+        env:
+          RAYON_NUM_THREADS: "4"
+        run: |
+          set -euo pipefail
+          common=(--duration-seconds 300 --iterations 5 --case wav-stereo-s24-normalize)
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-baseline/release/forge" \
+            --container-qc "${RUNNER_TEMP}/target-baseline/release/forge-container-qc" \
+            --work-dir "${RUNNER_TEMP}/base-first" \
+            --output base-first.json "${common[@]}"
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-candidate/release/forge" \
+            --container-qc "${RUNNER_TEMP}/target-candidate/release/forge-container-qc" \
+            --work-dir "${RUNNER_TEMP}/candidate-second" \
+            --output candidate-second.json "${common[@]}"
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-candidate/release/forge" \
+            --container-qc "${RUNNER_TEMP}/target-candidate/release/forge-container-qc" \
+            --work-dir "${RUNNER_TEMP}/candidate-first" \
+            --output candidate-first.json "${common[@]}"
+          python3 candidate/tools/benchmark.py \
+            --forge "${RUNNER_TEMP}/target-baseline/release/forge" \
+            --container-qc "${RUNNER_TEMP}/target-baseline/release/forge-container-qc" \
+            --work-dir "${RUNNER_TEMP}/base-second" \
+            --output base-second.json "${common[@]}"
+
+      - name: Summarize pooled and per-order medians
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import statistics
+          from pathlib import Path
+
+          names = ("base-first", "candidate-second", "candidate-first", "base-second")
+          documents = {
+              name: json.loads(Path(f"{name}.json").read_text(encoding="utf-8"))
+              for name in names
+          }
+          assert all(document["passed"] for document in documents.values())
+          samples = {
+              name: document["results"][0]["samples"]
+              for name, document in documents.items()
+          }
+          summary = {
+              "system": documents["base-first"]["system"],
+              "case": "wav-stereo-s24-normalize",
+              "samples_per_binary": 10,
+              "metrics": {},
+          }
+          for metric in ("wall", "cpu", "rss"):
+              def values(name):
+                  rows = samples[name]
+                  if metric == "wall":
+                      return [row["wall_seconds"] for row in rows]
+                  if metric == "cpu":
+                      return [
+                          row["user_cpu_seconds"] + row["system_cpu_seconds"]
+                          for row in rows
+                      ]
+                  return [row["peak_rss_bytes"] for row in rows]
+
+              measured = {name: values(name) for name in names}
+              baseline = measured["base-first"] + measured["base-second"]
+              candidate = measured["candidate-first"] + measured["candidate-second"]
+              reducer = max if metric == "rss" else statistics.median
+              base_value = reducer(baseline)
+              candidate_value = reducer(candidate)
+              summary["metrics"][metric] = {
+                  "base_first": reducer(measured["base-first"]),
+                  "candidate_second": reducer(measured["candidate-second"]),
+                  "candidate_first": reducer(measured["candidate-first"]),
+                  "base_second": reducer(measured["base-second"]),
+                  "baseline_pooled": base_value,
+                  "candidate_pooled": candidate_value,
+                  "change_percent": (candidate_value / base_value - 1.0) * 100.0,
+              }
+
+          Path("wav-s24-summary.json").write_text(
+              json.dumps(summary, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(summary, indent=2))
+          with Path("wav-s24-summary.md").open("w", encoding="utf-8") as output:
+              output.write("## WAV S24 stereo SIMD benchmark\n\n")
+              output.write("| Samples | Wall | CPU | RSS |\n")
+              output.write("|---:|---:|---:|---:|\n")
+              metrics = summary["metrics"]
+              output.write(
+                  f"| {summary['samples_per_binary']} "
+                  f"| {metrics['wall']['change_percent']:+.3f}% "
+                  f"| {metrics['cpu']['change_percent']:+.3f}% "
+                  f"| {metrics['rss']['change_percent']:+.3f}% |\n"
+              )
+          PY
+          cat wav-s24-summary.md >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload benchmark evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: wav-s24-benchmark-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            base-*.json
+            candidate-*.json
+            wav-s24-summary.json
+            wav-s24-summary.md
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce performance and memory gates
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          summary = json.loads(Path("wav-s24-summary.json").read_text(encoding="utf-8"))
+          assert summary["samples_per_binary"] == 10, summary
+          metrics = summary["metrics"]
+          assert metrics["wall"]["change_percent"] <= -5.0, metrics["wall"]
+          assert metrics["cpu"]["change_percent"] <= -5.0, metrics["cpu"]
+          assert metrics["wall"]["candidate_second"] \
+              / metrics["wall"]["base_first"] - 1.0 <= -0.02, metrics["wall"]
+          assert metrics["wall"]["candidate_first"] \
+              / metrics["wall"]["base_second"] - 1.0 <= -0.02, metrics["wall"]
+          rss_delta = metrics["rss"]["candidate_pooled"] \
+              - metrics["rss"]["baseline_pooled"]
+          assert rss_delta <= 4 * 1024 * 1024, ("rss delta", rss_delta)
+          PY

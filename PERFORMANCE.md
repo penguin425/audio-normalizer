@@ -1860,6 +1860,33 @@ and `0c9cff888bdd3fb3e1341ac7b70650a6bd0c882f0261d55dcdb113470c17d5d9`.
 Portable non-PGO executables and all signal-processing arithmetic are
 unchanged.
 
+### v0.173.0: packed AVX2 mono/stereo 24-bit WAVE output
+
+Undithered mono and stereo 24-bit WAVE output now quantizes eight planar f32
+frames at a time with runtime-dispatched AVX2. Stereo lanes are interleaved in
+registers and each four-sample group is packed directly into its exact 12-byte
+little-endian representation. The scalar tail, dithered output, non-AVX2
+hosts, and the existing multichannel AVX2 path are unchanged.
+
+The local comparison uses the exact main commit `fb98b62` and candidate core
+commit `59e4f84`, Rust 1.97.0, and separate generic x86-64 release builds
+without PGO. A deterministic 300-second, 48 kHz stereo PCM16 source was
+normalized to PCM24 seven times per report in B-C-C-B order, yielding 14
+samples per binary. Fixture generation is excluded, total CPU is user plus
+system time, and RSS is the maximum sampled resident set.
+
+| Workload | v0.172.0 wall | v0.173.0 wall | Wall change | CPU change | Peak RSS change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Stereo PCM24 WAVE normalization | 0.717 s | 0.544 s | -24.07% | -18.45% | -0.25 MiB |
+
+The candidate improved in both execution orders. Byte comparisons cover 48
+and 96 kHz stereo, 48 kHz mono, and the unchanged dithered path. The SIMD unit
+test additionally compares every byte and RNG state against scalar
+quantization for one through 16 channels, including NaN, infinities,
+subnormals, half-LSB boundaries, and scalar tails. Pull requests must retain at
+least 5% pooled wall and CPU improvement on the AVX2 benchmark host, improve
+wall time in both execution orders, and stay within a 4 MiB RSS allowance.
+
 ## Final integration gate
 
 Before each release, run the full feature matrix, official conformance jobs
