@@ -1260,6 +1260,120 @@ pub fn gated_lufs(block_ms: &[f64]) -> f64 {
     -0.691 + 10.0 * used.log10()
 }
 
+/// Minimum and maximum BS.1770 integrated loudness over every contiguous
+/// fixed-size population of complete 400 ms / 100 ms-hop gating blocks.
+///
+/// The sliding population is maintained in two Fenwick trees, allowing the
+/// absolute- and relative-gated sums for every window to be queried in
+/// `O(log n)` instead of re-gating every block in every overlapping window.
+pub fn rolling_gated_loudness_extrema(
+    block_ms: &[f64],
+    blocks_per_window: usize,
+) -> Option<(f64, f64)> {
+    if blocks_per_window == 0 || block_ms.len() < blocks_per_window {
+        return None;
+    }
+    let normalized = block_ms
+        .iter()
+        .map(|value| {
+            if value.is_finite() && *value > 0.0 {
+                *value
+            } else {
+                0.0
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut coordinates = normalized.clone();
+    coordinates.sort_by(f64::total_cmp);
+    coordinates.dedup_by(|left, right| left.to_bits() == right.to_bits());
+    let mut counts = Fenwick::new(coordinates.len());
+    let mut sums = Fenwick::new(coordinates.len());
+    let coordinate = |value: f64| {
+        coordinates
+            .binary_search_by(|candidate| candidate.total_cmp(&value))
+            .expect("normalized gating block has a coordinate")
+    };
+    for value in normalized.iter().take(blocks_per_window).copied() {
+        let index = coordinate(value);
+        counts.add(index, 1.0);
+        sums.add(index, value);
+    }
+
+    let mut minimum = f64::INFINITY;
+    let mut maximum = f64::NEG_INFINITY;
+    for start in 0..=normalized.len() - blocks_per_window {
+        let loudness = gated_lufs_from_fenwick(&coordinates, &counts, &sums);
+        minimum = minimum.min(loudness);
+        maximum = maximum.max(loudness);
+        if start + blocks_per_window < normalized.len() {
+            let removed = normalized[start];
+            let added = normalized[start + blocks_per_window];
+            let removed_index = coordinate(removed);
+            counts.add(removed_index, -1.0);
+            sums.add(removed_index, -removed);
+            let added_index = coordinate(added);
+            counts.add(added_index, 1.0);
+            sums.add(added_index, added);
+        }
+    }
+    Some((minimum, maximum))
+}
+
+fn gated_lufs_from_fenwick(coordinates: &[f64], counts: &Fenwick, sums: &Fenwick) -> f64 {
+    let absolute_gate = 10.0_f64.powf((-70.0 + 0.691) / 10.0);
+    let absolute_index = coordinates.partition_point(|value| *value < absolute_gate);
+    let absolute_count = counts.suffix(absolute_index);
+    if absolute_count < 0.5 {
+        return f64::NEG_INFINITY;
+    }
+    let absolute_sum = sums.suffix(absolute_index);
+    let absolute_mean = absolute_sum / absolute_count;
+    let relative_gate = absolute_mean / 10.0;
+    let gate = absolute_gate.max(relative_gate);
+    let final_index = coordinates.partition_point(|value| *value < gate);
+    let final_count = counts.suffix(final_index);
+    let used = if final_count < 0.5 {
+        absolute_mean
+    } else {
+        sums.suffix(final_index) / final_count
+    };
+    -0.691 + 10.0 * used.log10()
+}
+
+struct Fenwick {
+    tree: Vec<f64>,
+}
+
+impl Fenwick {
+    fn new(length: usize) -> Self {
+        Self {
+            tree: vec![0.0; length + 1],
+        }
+    }
+
+    fn add(&mut self, index: usize, value: f64) {
+        let mut cursor = index + 1;
+        while cursor < self.tree.len() {
+            self.tree[cursor] += value;
+            cursor += cursor & cursor.wrapping_neg();
+        }
+    }
+
+    fn prefix(&self, end: usize) -> f64 {
+        let mut sum = 0.0;
+        let mut cursor = end;
+        while cursor > 0 {
+            sum += self.tree[cursor];
+            cursor &= cursor - 1;
+        }
+        sum
+    }
+
+    fn suffix(&self, start: usize) -> f64 {
+        self.prefix(self.tree.len() - 1) - self.prefix(start)
+    }
+}
+
 /// Convert an ungated K/channel-weighted mean square to LKFS/LUFS.
 pub fn ungated_lufs(mean_square: f64) -> f64 {
     if mean_square > 0.0 {
@@ -1353,6 +1467,37 @@ mod tests {
             channel_roles: vec![ChannelRole::Main],
             source_kind: PcmKind::F32,
         }
+    }
+
+    #[test]
+    fn rolling_gated_extrema_match_naive_overlapping_windows() {
+        let blocks = [
+            0.0, 0.000_001, 0.004, 0.005, 0.006, 0.000_02, 0.008, 0.01, 0.003, 0.02, 0.000_003,
+            0.007, 0.009, 0.011, 0.012,
+        ];
+        let window = 7;
+        let expected = blocks.windows(window).map(gated_lufs).fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(minimum, maximum), value| (minimum.min(value), maximum.max(value)),
+        );
+        let actual = rolling_gated_loudness_extrema(&blocks, window).unwrap();
+        assert!(
+            (actual.0 - expected.0).abs() < 1e-12,
+            "{actual:?} {expected:?}"
+        );
+        assert!(
+            (actual.1 - expected.1).abs() < 1e-12,
+            "{actual:?} {expected:?}"
+        );
+    }
+
+    #[test]
+    fn rolling_gated_extrema_require_a_complete_window() {
+        assert_eq!(rolling_gated_loudness_extrema(&[0.1], 0), None);
+        assert_eq!(rolling_gated_loudness_extrema(&[0.1], 2), None);
+        let silence = rolling_gated_loudness_extrema(&[0.0; 4], 4).unwrap();
+        assert!(silence.0.is_infinite() && silence.0.is_sign_negative());
+        assert!(silence.1.is_infinite() && silence.1.is_sign_negative());
     }
 
     #[test]

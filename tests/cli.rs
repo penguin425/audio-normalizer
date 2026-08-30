@@ -1505,7 +1505,26 @@ fn ebu_production_profile_writes_a_rule_audit() {
         &[
             WaveChunk {
                 id: *b"axml",
-                body: br#"<audioFormatExtended version="ITU-R_BS.2076-3"><profileList><profile profileName="EBU Production Profile" profileVersion="1.0" profileLevel="1">EBU Tech 3393</profile></profileList></audioFormatExtended>"#.to_vec(),
+                body: br#"<audioFormatExtended version="ITU-R_BS.2076-3">
+  <profileList>
+    <profile profileName="EBU Production Profile" profileVersion="1.0" profileLevel="1">EBU Tech 3393</profile>
+  </profileList>
+  <tagList><tagGroup><tag class="urn:profile:production:Layer">1</tag><audioProgrammeIDRef>APR_1001</audioProgrammeIDRef></tagGroup></tagList>
+  <audioProgramme audioProgrammeID="APR_1001" audioProgrammeName="Programme">
+    <audioContentIDRef>ACO_1001</audioContentIDRef>
+  </audioProgramme>
+  <audioContent audioContentID="ACO_1001" audioContentName="Content">
+    <audioObjectIDRef>AO_1001</audioObjectIDRef><dialogue>1</dialogue>
+  </audioContent>
+  <audioObject audioObjectID="AO_1001" audioObjectName="Object" importance="10" interact="0">
+    <audioPackFormatIDRef>AP_00010001</audioPackFormatIDRef>
+    <audioTrackUIDRef>ATU_00000001</audioTrackUIDRef>
+  </audioObject>
+  <audioTrackUID UID="ATU_00000001">
+    <audioChannelFormatIDRef>AC_00010001</audioChannelFormatIDRef>
+    <audioPackFormatIDRef>AP_00010001</audioPackFormatIDRef>
+  </audioTrackUID>
+</audioFormatExtended>"#.to_vec(),
             },
             WaveChunk {
                 id: *b"chna",
@@ -1544,7 +1563,7 @@ fn ebu_production_profile_writes_a_rule_audit() {
     assert_eq!(report[0]["adm_production_profile_mode"], "write");
     assert_eq!(report[0]["adm_production_profile_passed"], true);
     let audit: serde_json::Value = serde_json::from_slice(&std::fs::read(audit).unwrap()).unwrap();
-    assert_eq!(audit["validator"], "forge-tech3393-bs2076-3-2");
+    assert_eq!(audit["validator"], "forge-tech3393-2025-bs2076-3-3");
     assert_eq!(audit["adm_standard"], "ITU-R BS.2076-3");
     assert!(audit["rules"].as_array().unwrap().len() >= 16);
 }
@@ -1908,6 +1927,38 @@ fn ebu_qc_writes_versioned_baseband_evidence() {
         .as_str()
         .unwrap()
         .ends_with("ebu-qc-results-v2"));
+}
+
+#[test]
+fn ebu_qc_writes_schema_valid_2026_04_xml_envelope() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("programme.wav");
+    let report = directory.path().join("reports/ebu-qc.xml");
+    std::fs::write(&input, wav_fixture_bytes()).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args([
+            input.to_str().unwrap(),
+            "--analyze",
+            "--ebu-qc",
+            "--silence-threshold=-200",
+            "--tone-threshold=1",
+            "--ebu-qc-xml",
+            report.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let xml = std::fs::read_to_string(report).unwrap();
+    assert!(xml.contains("<Report xmlns=\"tag:qc.ebu.ch,2026-04\">"));
+    assert!(xml.contains("<EditRate>48000/1</EditRate>"));
+    assert!(xml.contains("<EBUQCID>0010B</EBUQCID>"));
+    assert!(xml.contains("<EBUQCID>0084B</EBUQCID>"));
+    assert!(!xml.contains("FORGE-DC-OFFSET"));
 }
 
 #[test]

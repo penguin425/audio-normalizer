@@ -263,7 +263,7 @@ pub fn analyze(audio: &AudioBuffer, analysis: &Analysis, options: &QcOptions) ->
         })
         .unwrap_or_default();
     vec![
-        result("0078B", "1.0", "Audio Silence", silence),
+        result("0078B", "3.0", "Audio Silence", silence),
         result("0005B", "2.0", "Audio Digital Clipping", clipping),
         result("0014B", "2.0", "Audio Test Tones", tones),
         result("0009F", "2.0", "Audio Duration", duration_events),
@@ -271,7 +271,7 @@ pub fn analyze(audio: &AudioBuffer, analysis: &Analysis, options: &QcOptions) ->
             rule_id: "0010B".into(),
             ebu_qc_id: "0010B".into(),
             version: "2.0".into(),
-            name: "Audio Programme Loudness".into(),
+            name: "Loudness".into(),
             layer: "baseband".into(),
             passed: true,
             calculated: true,
@@ -291,7 +291,7 @@ pub fn analyze(audio: &AudioBuffer, analysis: &Analysis, options: &QcOptions) ->
             rule_id: "0084B".into(),
             ebu_qc_id: "0084B".into(),
             version: "1.0".into(),
-            name: "Audio Peaks TP".into(),
+            name: "Audio Peaks (TP)".into(),
             layer: "baseband".into(),
             passed: true,
             calculated: true,
@@ -331,7 +331,7 @@ pub fn analyze(audio: &AudioBuffer, analysis: &Analysis, options: &QcOptions) ->
         ),
         result("0088B", "1.0", "Audio Hum & Buzz", hum),
         result("0086B", "1.0", "Audio Noise", noise),
-        result("0170B", "1.0", "Audio Cross Talk", crosstalk),
+        result("0170B", "1.0", "Cross Talk", crosstalk),
         result("0230B", "1.0", "Audio Channel Panning", panning),
         result("0095B", "1.0", "LFE/Centre Channel Assignment", lfe_centre),
         conditional_result("0124B", "2.0", "Mono Audio", options.expect_mono, mono),
