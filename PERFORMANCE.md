@@ -1887,6 +1887,35 @@ subnormals, half-LSB boundaries, and scalar tails. Pull requests must retain at
 least 5% pooled wall and CPU improvement on the AVX2 benchmark host, improve
 wall time in both execution orders, and stay within a 4 MiB RSS allowance.
 
+### v0.173.1: explicit PGO inputs for cross-runner reproduction
+
+The Linux release reproducer now rebuilds the generic and x86-64-v3 CLIs from
+the exact canonical branch-counter profiles produced by their primary build
+jobs. Those profiles and their versioned training reports are checksummed,
+attested, and retained as release assets. Compilation, packaging, the Python
+wheel build, and byte comparisons still run independently in a clean job; only
+the measured optimization input is shared. `tools/build-pgo-forge.sh` also
+rejects a non-empty optimized target so Cargo cannot reuse an executable built
+from an older profile.
+
+This closes a hardware-dependent gap exposed by the first v0.173.0 tag run.
+The primary and reproducer used the same Ubuntu 24.04 runner image and produced
+profiles with the same 1,237 functions and 27,850 blocks, but hot counters
+differed: the maximum function count was 196,722,768 versus 196,732,496 and the
+total count was 1,259,604,027 versus 1,259,596,407. Runtime-dispatched AVX2/FMA
+training therefore selected slightly different optimization inputs on two
+host CPUs, making otherwise deterministic archives differ.
+
+Two repetitions of the canonical training corpus on one host produced the
+same profile SHA-256,
+`443e914a595bc151e248588fabe1dcb1aa3fb9ae34153ba5ee21aec7da6564f4`.
+Using that profile from a separate PGO root then produced the same optimized
+`forge` binary byte for byte in both builds, with SHA-256
+`17d1fb1f67ca160502e4a036155258b1694e1698777d27c01c81f931612a96d3`.
+The profile is thus deterministic for fixed execution inputs and hardware;
+recording it makes the remaining hardware-dependent measurement an auditable
+release input instead of asking an unrelated runner to recreate it.
+
 ## Final integration gate
 
 Before each release, run the full feature matrix, official conformance jobs

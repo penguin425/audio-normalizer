@@ -266,6 +266,28 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Stage Linux PGO build inputs
+        if: matrix.asset == 'linux-x86_64'
+        shell: bash
+        run: |
+          cp \
+            "target/forge-pgo-${{ matrix.target }}/canonical-profile.txt" \
+            "forge-v${{ needs.validate.outputs.version }}-linux-x86_64.pgo-profile.txt"
+          cp \
+            "target/forge-pgo-${{ matrix.target }}/training.json" \
+            "forge-v${{ needs.validate.outputs.version }}-linux-x86_64.pgo-training.json"
+
+      - name: Upload Linux PGO build inputs
+        if: matrix.asset == 'linux-x86_64'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: forge-pgo-profile-linux-x86_64
+          path: |
+            forge-v${{ needs.validate.outputs.version }}-linux-x86_64.pgo-profile.txt
+            forge-v${{ needs.validate.outputs.version }}-linux-x86_64.pgo-training.json
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Build the self-contained Python platform wheel
         env:
           SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
@@ -464,6 +486,26 @@ jobs:
         shell: bash
         run: tools/build-pgo-forge.sh x86_64-unknown-linux-gnu
 
+      - name: Stage x86-64-v3 PGO build inputs
+        shell: bash
+        run: |
+          cp \
+            target/forge-pgo-x86_64-v3/canonical-profile.txt \
+            "forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.pgo-profile.txt"
+          cp \
+            target/forge-pgo-x86_64-v3/training.json \
+            "forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.pgo-training.json"
+
+      - name: Upload x86-64-v3 PGO build inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: forge-pgo-profile-linux-x86_64-v3
+          path: |
+            forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.pgo-profile.txt
+            forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.pgo-training.json
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Package the supplemental x86-64-v3 CLI
         shell: bash
         run: >-
@@ -516,7 +558,19 @@ jobs:
           name: forge-linux-x86_64-v3
           path: actual
 
-      - name: Independently rebuild and compare
+      - name: Download generic Linux PGO profile
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-pgo-profile-linux-x86_64
+          path: actual-profile
+
+      - name: Download x86-64-v3 PGO profile
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-pgo-profile-linux-x86_64-v3
+          path: actual-v3-profile
+
+      - name: Rebuild from recorded PGO inputs and compare
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           FORGE_PGO_FEATURES: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service,cuda-truepeak
@@ -529,12 +583,14 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --locked --release --target x86_64-unknown-linux-gnu --features opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service,cuda-truepeak
-          tools/build-pgo-forge.sh x86_64-unknown-linux-gnu
+          FORGE_PGO_PROFILE_INPUT="$GITHUB_WORKSPACE/actual-profile/forge-v${{ needs.validate.outputs.version }}-linux-x86_64.pgo-profile.txt" \
+            tools/build-pgo-forge.sh x86_64-unknown-linux-gnu
           cp \
             target/forge-pgo-x86_64-unknown-linux-gnu/optimized/x86_64-unknown-linux-gnu/release/forge \
             target/x86_64-unknown-linux-gnu/release/forge
           FORGE_PGO_ROOT="$FORGE_PGO_V3_ROOT" \
             FORGE_PGO_RUSTFLAGS="$FORGE_PGO_V3_RUSTFLAGS" \
+            FORGE_PGO_PROFILE_INPUT="$GITHUB_WORKSPACE/actual-v3-profile/forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.pgo-profile.txt" \
             tools/build-pgo-forge.sh x86_64-unknown-linux-gnu
           mkdir reproduced
           tools/package-linux-release.sh "${{ needs.validate.outputs.version }}" x86_64-unknown-linux-gnu "${{ needs.validate.outputs.source-date-epoch }}" reproduced

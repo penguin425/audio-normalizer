@@ -255,10 +255,12 @@ the `-o` extension override this.
   sequential path.
 * Release profile uses `lto = "fat"`, `codegen-units = 1`, and
   `panic = "abort"`. The published Linux and Apple Silicon `forge` CLIs add
-  deterministic, branch-counter-only PGO while retaining portable ISA
-  baselines and runtime-dispatched kernels. Linux also provides a supplemental
-  PGO `x86-64-v3` CLI for compatible CPUs. Local Cargo builds use
-  `target-cpu=native` and are not portable.
+  branch-counter-only PGO while retaining portable ISA baselines and
+  runtime-dispatched kernels. Linux rebuilds consume the recorded canonical
+  profile as an explicit build input so runner CPU differences cannot change
+  the released executable. Linux also provides a supplemental PGO
+  `x86-64-v3` CLI for compatible CPUs. Local Cargo builds use `target-cpu=native`
+  and are not portable.
 
 See [PERFORMANCE.md](PERFORMANCE.md) for the primary research basis, measured
 release results, rejected experiments, and implementation order.
@@ -425,10 +427,12 @@ ARM64 feature baseline. Other tools, shared libraries, wheels, and
 package-manager installations remain portable non-PGO builds.
 Each release includes generated release notes, `SHA256SUMS`, SPDX and
 CycloneDX SBOMs, an offline SLSA provenance bundle, and generated Homebrew,
-Scoop, and WinGet manifests. GitHub artifact attestations provide verifiable
-build provenance for every checksummed release asset. Publication is blocked
-unless an independent Linux rebuild is byte-for-byte identical and every
-checksum and attestation verifies.
+Scoop, and WinGet manifests. Linux releases also retain the canonical PGO
+profiles and versioned training reports used to build the generic and
+x86-64-v3 CLIs. GitHub artifact attestations provide verifiable build
+provenance for every checksummed release asset. Publication is blocked unless
+an independent Linux rebuild from those explicit profiles is byte-for-byte
+identical and every checksum and attestation verifies.
 
 Install a release directly with
 [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall):
