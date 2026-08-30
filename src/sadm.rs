@@ -288,11 +288,11 @@ fn parse_frame(xml: &[u8]) -> Result<ParsedFrame, String> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(element)) => {
-                observe_element(&reader, &element, depth, &mut parsed)?;
+                observe_element(&element, depth, &mut parsed)?;
                 depth += 1;
             }
             Ok(Event::Empty(element)) => {
-                observe_element(&reader, &element, depth, &mut parsed)?;
+                observe_element(&element, depth, &mut parsed)?;
             }
             Ok(Event::End(_)) => depth = depth.saturating_sub(1),
             Ok(Event::Eof) => break,
@@ -304,7 +304,6 @@ fn parse_frame(xml: &[u8]) -> Result<ParsedFrame, String> {
 }
 
 fn observe_element(
-    reader: &Reader<&[u8]>,
     element: &quick_xml::events::BytesStart<'_>,
     depth: usize,
     parsed: &mut ParsedFrame,
@@ -320,7 +319,7 @@ fn observe_element(
             let attribute = attribute.map_err(|error| format!("XML attribute: {error}"))?;
             let key = local_name(attribute.key.as_ref());
             let value = attribute
-                .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+                .normalized_value(XmlVersion::Implicit1_0)
                 .map_err(|error| format!("XML attribute value: {error}"))?
                 .into_owned();
             parsed.attributes.insert(key, value);
@@ -335,7 +334,7 @@ fn observe_element(
             if local_name(attribute.key.as_ref()) == "status" {
                 parsed.changed_statuses.push(
                     attribute
-                        .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+                        .normalized_value(XmlVersion::Implicit1_0)
                         .map_err(|error| format!("XML status: {error}"))?
                         .into_owned(),
                 );
@@ -365,8 +364,8 @@ fn rule(
     }
 }
 
-fn local_name(name: &[u8]) -> String {
-    String::from_utf8_lossy(name.rsplit(|byte| *byte == b':').next().unwrap_or(name)).into_owned()
+fn local_name(name: &str) -> String {
+    name.rsplit(':').next().unwrap_or(name).to_owned()
 }
 
 fn valid_frame_id(value: &str) -> bool {

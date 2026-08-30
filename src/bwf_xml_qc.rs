@@ -510,19 +510,18 @@ fn parse_xml(bytes: &[u8]) -> Result<XmlDocumentInfo, String> {
                 if let Some(encoding) = declaration.encoding() {
                     let encoding =
                         encoding.map_err(|error| format!("XML encoding declaration: {error}"))?;
-                    if !encoding.as_ref().eq_ignore_ascii_case(b"utf-8")
-                        && !encoding.as_ref().eq_ignore_ascii_case(b"utf8")
+                    if !encoding.as_ref().eq_ignore_ascii_case("utf-8")
+                        && !encoding.as_ref().eq_ignore_ascii_case("utf8")
                     {
                         return Err(format!(
                             "encoding declaration is {}, expected UTF-8",
-                            String::from_utf8_lossy(encoding.as_ref())
+                            encoding.as_ref()
                         ));
                     }
                 }
             }
             Ok(Event::Start(element)) => {
                 observe_xml_start(
-                    &reader,
                     &element,
                     &mut stack,
                     &mut frame_depths,
@@ -533,7 +532,6 @@ fn parse_xml(bytes: &[u8]) -> Result<XmlDocumentInfo, String> {
             }
             Ok(Event::Empty(element)) => {
                 observe_xml_start(
-                    &reader,
                     &element,
                     &mut stack,
                     &mut frame_depths,
@@ -551,9 +549,7 @@ fn parse_xml(bytes: &[u8]) -> Result<XmlDocumentInfo, String> {
             }
             Ok(Event::Text(text)) => {
                 if let Some(value) = text_stack.last_mut() {
-                    let decoded = text
-                        .xml10_content()
-                        .map_err(|error| format!("XML text: {error}"))?;
+                    let decoded = text.xml10_content();
                     value.push_str(
                         &quick_xml::escape::unescape(&decoded)
                             .map_err(|error| format!("XML entity: {error}"))?,
@@ -562,17 +558,11 @@ fn parse_xml(bytes: &[u8]) -> Result<XmlDocumentInfo, String> {
             }
             Ok(Event::CData(text)) => {
                 if let Some(value) = text_stack.last_mut() {
-                    value.push_str(
-                        &text
-                            .xml10_content()
-                            .map_err(|error| format!("XML CDATA: {error}"))?,
-                    );
+                    value.push_str(&text.xml10_content());
                 }
             }
             Ok(Event::GeneralRef(reference)) => {
-                let reference = reference
-                    .decode()
-                    .map_err(|error| format!("XML entity name: {error}"))?;
+                let reference = reference.xml10_content();
                 let escaped = format!("&{reference};");
                 let resolved = quick_xml::escape::unescape(&escaped)
                     .map_err(|error| format!("XML entity: {error}"))?;
@@ -644,7 +634,6 @@ fn parse_xml(bytes: &[u8]) -> Result<XmlDocumentInfo, String> {
 }
 
 fn observe_xml_start(
-    reader: &Reader<&[u8]>,
     element: &quick_xml::events::BytesStart<'_>,
     stack: &mut Vec<String>,
     frame_depths: &mut Vec<usize>,
@@ -662,9 +651,9 @@ fn observe_xml_start(
     let raw_name = raw_name.as_ref();
     let name = local_name(raw_name);
     let root_namespace_key = stack.is_empty().then(|| {
-        raw_name.iter().position(|byte| *byte == b':').map_or_else(
-            || b"xmlns".to_vec(),
-            |separator| [b"xmlns:".as_slice(), &raw_name[..separator]].concat(),
+        raw_name.split_once(':').map_or_else(
+            || "xmlns".to_owned(),
+            |(prefix, _)| format!("xmlns:{prefix}"),
         )
     });
     if stack.is_empty() {
@@ -691,7 +680,7 @@ fn observe_xml_start(
         let attribute = attribute.map_err(|error| format!("XML attribute: {error}"))?;
         let key = local_name(attribute.key.as_ref());
         let value = attribute
-            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+            .normalized_value(XmlVersion::Implicit1_0)
             .map_err(|error| format!("XML attribute value: {error}"))?
             .into_owned();
         if root_namespace_key
@@ -870,8 +859,8 @@ fn reference_set(
     }
 }
 
-fn local_name(name: &[u8]) -> String {
-    String::from_utf8_lossy(name.rsplit(|byte| *byte == b':').next().unwrap_or(name)).into_owned()
+fn local_name(name: &str) -> String {
+    name.rsplit(':').next().unwrap_or(name).to_owned()
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {

@@ -1011,9 +1011,7 @@ fn read_ixml(body: &[u8]) -> Result<ParsedIxml, String> {
             }
             Ok(Event::Text(text)) => {
                 if let Some(value) = text_stack.last_mut() {
-                    let decoded = text
-                        .xml10_content()
-                        .map_err(|error| format!("decode XML text: {error}"))?;
+                    let decoded = text.xml10_content();
                     value.push_str(
                         &unescape(&decoded)
                             .map_err(|error| format!("decode XML entity: {error}"))?,
@@ -1022,11 +1020,7 @@ fn read_ixml(body: &[u8]) -> Result<ParsedIxml, String> {
             }
             Ok(Event::CData(text)) => {
                 if let Some(value) = text_stack.last_mut() {
-                    value.push_str(
-                        &text
-                            .xml10_content()
-                            .map_err(|error| format!("decode XML CDATA: {error}"))?,
-                    );
+                    value.push_str(&text.xml10_content());
                 }
             }
             Ok(Event::End(element)) => {
@@ -1132,8 +1126,8 @@ fn nonempty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-fn xml_local_name(name: &[u8]) -> String {
-    String::from_utf8_lossy(name.rsplit(|byte| *byte == b':').next().unwrap_or(name)).into_owned()
+fn xml_local_name(name: &str) -> String {
+    name.rsplit(':').next().unwrap_or(name).to_owned()
 }
 
 fn validate_ixml_tracks(ixml: &IxmlInfo, channels: u16, checks: &mut Vec<AuditCheck>) {

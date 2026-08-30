@@ -513,7 +513,6 @@ fn parse_adm(xml: &[u8]) -> Result<ParsedAdm, String> {
                 let name = local_name(element.name().as_ref());
                 stack.push(name.clone());
                 observe_element(
-                    &reader,
                     &element,
                     &stack,
                     &mut parsed,
@@ -526,7 +525,6 @@ fn parse_adm(xml: &[u8]) -> Result<ParsedAdm, String> {
                 let name = local_name(element.name().as_ref());
                 stack.push(name);
                 observe_element(
-                    &reader,
                     &element,
                     &stack,
                     &mut parsed,
@@ -543,7 +541,7 @@ fn parse_adm(xml: &[u8]) -> Result<ParsedAdm, String> {
                 stack.pop();
             }
             Ok(Event::Text(text)) => {
-                let value = String::from_utf8_lossy(text.as_ref()).trim().to_owned();
+                let value = text.as_ref().trim().to_owned();
                 if let Some((_, index)) = active_profiles.last() {
                     parsed.profiles[*index].text.push_str(&value);
                 }
@@ -577,7 +575,6 @@ fn parse_adm(xml: &[u8]) -> Result<ParsedAdm, String> {
 }
 
 fn observe_element(
-    reader: &Reader<&[u8]>,
     element: &quick_xml::events::BytesStart<'_>,
     stack: &[String],
     parsed: &mut ParsedAdm,
@@ -592,7 +589,7 @@ fn observe_element(
         let attribute = attribute.map_err(|error| format!("XML attribute at {path}: {error}"))?;
         let key = local_name(attribute.key.as_ref());
         let value = attribute
-            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+            .normalized_value(XmlVersion::Implicit1_0)
             .map_err(|error| format!("XML attribute value at {path}: {error}"))?
             .into_owned();
         if key.ends_with("ID") || key == "UID" {
@@ -676,9 +673,8 @@ fn close_depth(
     }
 }
 
-fn local_name(name: &[u8]) -> String {
-    let name = String::from_utf8_lossy(name);
-    name.rsplit(':').next().unwrap_or(&name).to_owned()
+fn local_name(name: &str) -> String {
+    name.rsplit(':').next().unwrap_or(name).to_owned()
 }
 
 fn xml_path(stack: &[String]) -> String {

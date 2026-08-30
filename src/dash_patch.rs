@@ -181,7 +181,7 @@ fn parse_xml(bytes: &[u8], label: &str) -> Result<XmlElement, String> {
                 let inherited = stack
                     .last()
                     .map_or_else(base_namespaces, |parent| parent.namespaces.clone());
-                stack.push(new_element(&reader, &element, &inherited)?);
+                stack.push(new_element(&element, &inherited)?);
             }
             Ok(Event::Empty(element)) => {
                 element_count += 1;
@@ -195,15 +195,13 @@ fn parse_xml(bytes: &[u8], label: &str) -> Result<XmlElement, String> {
                     .last()
                     .map_or_else(base_namespaces, |parent| parent.namespaces.clone());
                 attach(
-                    XmlNode::Element(new_element(&reader, &element, &inherited)?),
+                    XmlNode::Element(new_element(&element, &inherited)?),
                     &mut stack,
                     &mut root,
                 )?;
             }
             Ok(Event::Text(text)) => {
-                let decoded = text
-                    .xml10_content()
-                    .map_err(|error| format!("decode {label} text: {error}"))?;
+                let decoded = text.xml10_content();
                 let value = unescape(&decoded)
                     .map_err(|error| format!("unescape {label} text: {error}"))?;
                 if let Some(parent) = stack.last_mut() {
@@ -214,42 +212,31 @@ fn parse_xml(bytes: &[u8], label: &str) -> Result<XmlElement, String> {
             }
             Ok(Event::CData(text)) => {
                 if let Some(parent) = stack.last_mut() {
-                    parent.children.push(XmlNode::Text(
-                        String::from_utf8_lossy(text.as_ref()).into_owned(),
-                    ));
+                    parent
+                        .children
+                        .push(XmlNode::Text(text.as_ref().to_owned()));
                 } else {
                     return Err(format!("{label} contains CDATA outside its root element"));
                 }
             }
             Ok(Event::Comment(comment)) => {
                 if let Some(parent) = stack.last_mut() {
-                    let value = comment
-                        .decode()
-                        .map_err(|error| format!("decode {label} comment: {error}"))?;
-                    parent.children.push(XmlNode::Comment(value.into_owned()));
+                    parent
+                        .children
+                        .push(XmlNode::Comment(comment.as_ref().to_owned()));
                 }
             }
             Ok(Event::PI(instruction)) => {
                 if let Some(parent) = stack.last_mut() {
-                    let target = reader
-                        .decoder()
-                        .decode(instruction.target())
-                        .map_err(|error| format!("decode {label} PI target: {error}"))?
-                        .into_owned();
-                    let content = reader
-                        .decoder()
-                        .decode(instruction.content())
-                        .map_err(|error| format!("decode {label} PI content: {error}"))?
-                        .into_owned();
+                    let target = instruction.target().to_owned();
+                    let content = instruction.content().to_owned();
                     parent
                         .children
                         .push(XmlNode::ProcessingInstruction { target, content });
                 }
             }
             Ok(Event::GeneralRef(reference)) => {
-                let name = reference
-                    .xml10_content()
-                    .map_err(|error| format!("decode {label} entity reference: {error}"))?;
+                let name = reference.xml10_content();
                 let encoded = format!("&{name};");
                 let value = unescape(&encoded)
                     .map_err(|error| format!("resolve {label} entity reference: {error}"))?;
@@ -294,17 +281,16 @@ fn parse_xml(bytes: &[u8], label: &str) -> Result<XmlElement, String> {
 }
 
 fn new_element(
-    reader: &Reader<&[u8]>,
     start: &BytesStart<'_>,
     inherited_namespaces: &[(String, String)],
 ) -> Result<XmlElement, String> {
-    let name = String::from_utf8_lossy(start.name().as_ref()).into_owned();
+    let name = start.name().as_ref().to_owned();
     let mut attributes = Vec::new();
     for attribute in start.attributes().with_checks(false) {
         let attribute = attribute.map_err(|error| format!("read XML attribute: {error}"))?;
-        let key = String::from_utf8_lossy(attribute.key.as_ref()).into_owned();
+        let key = attribute.key.as_ref().to_owned();
         let value = attribute
-            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+            .normalized_value(XmlVersion::Implicit1_0)
             .map_err(|error| format!("decode XML attribute {key}: {error}"))?
             .into_owned();
         if attributes.iter().any(|(existing, _)| existing == &key) {
