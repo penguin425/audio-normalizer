@@ -829,7 +829,6 @@ fn parse_mpd(xml: &[u8]) -> Result<Mpd, String> {
                 let name = local_name(element.name().as_ref());
                 stack.push(name);
                 observe_element(
-                    &reader,
                     &element,
                     &stack,
                     &mut mpd,
@@ -842,7 +841,6 @@ fn parse_mpd(xml: &[u8]) -> Result<Mpd, String> {
                 let name = local_name(element.name().as_ref());
                 stack.push(name);
                 observe_element(
-                    &reader,
                     &element,
                     &stack,
                     &mut mpd,
@@ -869,7 +867,7 @@ fn parse_mpd(xml: &[u8]) -> Result<Mpd, String> {
                 stack.pop();
             }
             Ok(Event::Text(text)) => {
-                let value = String::from_utf8_lossy(text.as_ref()).trim().to_owned();
+                let value = text.as_ref().trim().to_owned();
                 match stack.last().map(String::as_str) {
                     Some("BaseURL") if !value.is_empty() => {
                         set_base_url_value(
@@ -915,7 +913,6 @@ fn parse_mpd(xml: &[u8]) -> Result<Mpd, String> {
 
 #[allow(clippy::too_many_arguments)]
 fn observe_element(
-    reader: &Reader<&[u8]>,
     element: &BytesStart<'_>,
     stack: &[String],
     mpd: &mut Mpd,
@@ -930,7 +927,7 @@ fn observe_element(
         ));
     }
     let name = stack.last().map(String::as_str).unwrap_or_default();
-    let attributes = attributes(reader, element)?;
+    let attributes = attributes(element)?;
     match name {
         "MPD" if stack.len() == 1 => {
             mpd.root_count += 1;
@@ -938,7 +935,7 @@ fn observe_element(
             mpd.namespace = attributes
                 .get("xmlns")
                 .cloned()
-                .or_else(|| namespace_attribute(reader, element).ok().flatten());
+                .or_else(|| namespace_attribute(element).ok().flatten());
             mpd.profiles = attributes
                 .get("profiles")
                 .map(|value| {
@@ -5251,16 +5248,13 @@ fn has_datetime_zone(value: &str) -> bool {
         || (value.len() >= 6 && matches!(value.as_bytes().get(value.len() - 6), Some(b'+' | b'-')))
 }
 
-fn attributes(
-    reader: &Reader<&[u8]>,
-    element: &BytesStart<'_>,
-) -> Result<HashMap<String, String>, String> {
+fn attributes(element: &BytesStart<'_>) -> Result<HashMap<String, String>, String> {
     let mut result = HashMap::new();
     for attribute in element.attributes() {
         let attribute = attribute.map_err(|error| format!("XML attribute: {error}"))?;
         let key = local_name(attribute.key.as_ref());
         let value = attribute
-            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+            .normalized_value(XmlVersion::Implicit1_0)
             .map_err(|error| format!("XML attribute value: {error}"))?
             .into_owned();
         if result.insert(key.clone(), value).is_some() {
@@ -5270,15 +5264,12 @@ fn attributes(
     Ok(result)
 }
 
-fn namespace_attribute(
-    reader: &Reader<&[u8]>,
-    element: &BytesStart<'_>,
-) -> Result<Option<String>, String> {
+fn namespace_attribute(element: &BytesStart<'_>) -> Result<Option<String>, String> {
     for attribute in element.attributes() {
         let attribute = attribute.map_err(|error| format!("XML attribute: {error}"))?;
-        if attribute.key.as_ref() == b"xmlns" {
+        if attribute.key.as_ref() == "xmlns" {
             return attribute
-                .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+                .normalized_value(XmlVersion::Implicit1_0)
                 .map(|value| Some(value.into_owned()))
                 .map_err(|error| format!("XML namespace: {error}"));
         }
@@ -5595,8 +5586,8 @@ fn current_template_mut(
     }
 }
 
-fn local_name(name: &[u8]) -> String {
-    String::from_utf8_lossy(name.rsplit(|byte| *byte == b':').next().unwrap_or(name)).into_owned()
+fn local_name(name: &str) -> String {
+    name.rsplit(':').next().unwrap_or(name).to_owned()
 }
 
 fn finding(

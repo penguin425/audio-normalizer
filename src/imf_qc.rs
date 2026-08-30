@@ -547,26 +547,23 @@ fn parse_xml(bytes: &[u8]) -> Result<XmlNode, String> {
                 if stack.len() >= MAX_DEPTH {
                     return Err(format!("XML exceeds the {MAX_DEPTH} level depth limit"));
                 }
-                stack.push(new_node(&reader, &element)?);
+                stack.push(new_node(&element)?);
             }
             Ok(Event::Empty(element)) => {
                 element_count += 1;
                 if element_count > MAX_ELEMENTS {
                     return Err(format!("XML exceeds the {MAX_ELEMENTS} element limit"));
                 }
-                attach_node(new_node(&reader, &element)?, &mut stack, &mut root)?;
+                attach_node(new_node(&element)?, &mut stack, &mut root)?;
             }
             Ok(Event::Text(text)) => {
                 if let Some(node) = stack.last_mut() {
-                    let decoded = text
-                        .decode()
-                        .map_err(|error| format!("decode XML text: {error}"))?;
-                    node.text.push_str(decoded.trim());
+                    node.text.push_str(text.as_ref().trim());
                 }
             }
             Ok(Event::CData(text)) => {
                 if let Some(node) = stack.last_mut() {
-                    node.text.push_str(&String::from_utf8_lossy(text.as_ref()));
+                    node.text.push_str(text.as_ref());
                 }
             }
             Ok(Event::End(_)) => {
@@ -592,13 +589,13 @@ fn parse_xml(bytes: &[u8]) -> Result<XmlNode, String> {
     root.ok_or_else(|| "XML contains no document element".into())
 }
 
-fn new_node(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Result<XmlNode, String> {
+fn new_node(element: &BytesStart<'_>) -> Result<XmlNode, String> {
     let mut attributes = HashMap::new();
     for attribute in element.attributes() {
         let attribute = attribute.map_err(|error| format!("XML attribute: {error}"))?;
-        let key = String::from_utf8_lossy(attribute.key.as_ref()).into_owned();
+        let key = attribute.key.as_ref().to_owned();
         let value = attribute
-            .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+            .normalized_value(XmlVersion::Implicit1_0)
             .map_err(|error| format!("decode XML attribute: {error}"))?
             .into_owned();
         attributes.insert(key, value);
@@ -1534,14 +1531,12 @@ fn lcm_u128(left: u128, right: u128) -> Option<u128> {
     left.checked_div(gcd_u128(left, right))?.checked_mul(right)
 }
 
-fn local_name(name: &[u8]) -> String {
-    let value = String::from_utf8_lossy(name);
-    value.rsplit(':').next().unwrap_or(&value).to_owned()
+fn local_name(name: &str) -> String {
+    name.rsplit(':').next().unwrap_or(name).to_owned()
 }
 
-fn prefix(name: &[u8]) -> Option<String> {
-    let value = String::from_utf8_lossy(name);
-    value.split_once(':').map(|(prefix, _)| prefix.to_owned())
+fn prefix(name: &str) -> Option<String> {
+    name.split_once(':').map(|(prefix, _)| prefix.to_owned())
 }
 
 impl XmlNode {
