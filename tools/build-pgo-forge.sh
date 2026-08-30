@@ -13,15 +13,30 @@ profile_dir="${pgo_root}/profiles"
 instrumented_target="${pgo_root}/instrumented"
 optimized_target="${pgo_root}/optimized"
 training_report="${pgo_root}/training.json"
+profile_input="${FORGE_PGO_PROFILE_INPUT:-}"
 features="${FORGE_PGO_FEATURES:-}"
 base_rustflags="${FORGE_PGO_RUSTFLAGS:-}"
 duration="${FORGE_PGO_DURATION_SECONDS:-12}"
 
-mkdir -p "$profile_dir"
-if find "$profile_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
-  echo "PGO profile directory must be empty: $profile_dir" >&2
+mkdir -p "$pgo_root"
+if [[ -d "$optimized_target" ]] &&
+  find "$optimized_target" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+  echo "PGO optimized target must be empty: $optimized_target" >&2
   echo "use a new FORGE_PGO_ROOT or clean its Cargo target explicitly" >&2
   exit 1
+fi
+if [[ -n "$profile_input" ]]; then
+  if [[ ! -f "$profile_input" ]]; then
+    echo "canonical PGO profile input was not found: $profile_input" >&2
+    exit 1
+  fi
+else
+  mkdir -p "$profile_dir"
+  if find "$profile_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+    echo "PGO profile directory must be empty: $profile_dir" >&2
+    echo "use a new FORGE_PGO_ROOT or clean its Cargo target explicitly" >&2
+    exit 1
+  fi
 fi
 
 host="$(rustc -vV | sed -n 's/^host: //p')"
@@ -46,50 +61,57 @@ if [[ -n "$features" ]]; then
   cargo_args+=(--features "$features")
 fi
 
-# LLVM value-profile updates depend on runtime insertion order and are not
-# reproducible across otherwise identical training runs. Branch counters carry
-# the hot-path information Forge needs, so disable value profiling in both
-# phases and let the canonicalizer remove any value records defensively.
-generate_flags="${base_rustflags:+${base_rustflags} }-Cllvm-args=-disable-vp -Cprofile-generate=${profile_dir}"
-CARGO_TARGET_DIR="$instrumented_target" \
-RUSTFLAGS="$generate_flags" \
-  cargo "${cargo_args[@]}"
-
 executable_name="forge"
 if [[ "$target" == *windows* ]]; then
   executable_name="forge.exe"
 fi
-instrumented_forge="${instrumented_target}/${target}/release/${executable_name}"
-training_args=(
-  --forge "$instrumented_forge"
-  --profile-dir "$profile_dir"
-  --duration-seconds "$duration"
-  --output "$training_report"
-)
-normalized_features=",${features// /,},"
-if [[ "$normalized_features" == *",opus-encoding,"* ]]; then
-  training_args+=(--include-opus)
-fi
-python3 "$root_dir/tools/train-pgo.py" "${training_args[@]}"
 
-shopt -s nullglob
-raw_profiles=("$profile_dir"/*.profraw)
-shopt -u nullglob
-if (( ${#raw_profiles[@]} == 0 )); then
-  echo "PGO training produced no raw profiles" >&2
-  exit 1
+if [[ -n "$profile_input" ]]; then
+  canonical_profile="$profile_input"
+  echo "forge-pgo: reusing canonical profile $canonical_profile" >&2
+else
+  # LLVM value-profile updates depend on runtime insertion order and are not
+  # reproducible across otherwise identical training runs. Branch counters
+  # carry the hot-path information Forge needs, so disable value profiling in
+  # both phases and let the canonicalizer remove any value records defensively.
+  generate_flags="${base_rustflags:+${base_rustflags} }-Cllvm-args=-disable-vp -Cprofile-generate=${profile_dir}"
+  CARGO_TARGET_DIR="$instrumented_target" \
+  RUSTFLAGS="$generate_flags" \
+    cargo "${cargo_args[@]}"
+
+  instrumented_forge="${instrumented_target}/${target}/release/${executable_name}"
+  training_args=(
+    --forge "$instrumented_forge"
+    --profile-dir "$profile_dir"
+    --duration-seconds "$duration"
+    --output "$training_report"
+  )
+  normalized_features=",${features// /,},"
+  if [[ "$normalized_features" == *",opus-encoding,"* ]]; then
+    training_args+=(--include-opus)
+  fi
+  python3 "$root_dir/tools/train-pgo.py" "${training_args[@]}"
+
+  shopt -s nullglob
+  raw_profiles=("$profile_dir"/*.profraw)
+  shopt -u nullglob
+  if (( ${#raw_profiles[@]} == 0 )); then
+    echo "PGO training produced no raw profiles" >&2
+    exit 1
+  fi
+  raw_profile="${pgo_root}/raw.profdata"
+  "$llvm_profdata" merge \
+    --failure-mode=all \
+    --output="$raw_profile" \
+    "${raw_profiles[@]}"
+  text_profile="${pgo_root}/raw-profile.txt"
+  canonical_profile="${pgo_root}/canonical-profile.txt"
+  "$llvm_profdata" merge --text --output="$text_profile" "$raw_profile"
+  python3 "$root_dir/tools/canonicalize-pgo-profile.py" \
+    --input "$text_profile" \
+    --output "$canonical_profile"
 fi
-raw_profile="${pgo_root}/raw.profdata"
-"$llvm_profdata" merge \
-  --failure-mode=all \
-  --output="$raw_profile" \
-  "${raw_profiles[@]}"
-text_profile="${pgo_root}/raw-profile.txt"
-canonical_profile="${pgo_root}/canonical-profile.txt"
-"$llvm_profdata" merge --text --output="$text_profile" "$raw_profile"
-python3 "$root_dir/tools/canonicalize-pgo-profile.py" \
-  --input "$text_profile" \
-  --output "$canonical_profile"
+
 merged_profile="${pgo_root}/merged.profdata"
 "$llvm_profdata" merge --output="$merged_profile" "$canonical_profile"
 "$llvm_profdata" show --detailed-summary "$merged_profile"

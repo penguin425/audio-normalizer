@@ -245,10 +245,10 @@ Forge already provides:
 - Deterministic LLVM instrumentation PGO for the generic Linux and Apple
   Silicon `forge` CLIs, with bounded serial training, order-independent branch
   counters, removal of nondeterministic value profiles and empty function
-  records, canonical-profile and executable reproduction gates, and an
-  optional x86-64-v3 PGO CLI for compatible CPUs. Package managers, libraries,
-  plug-ins, wheels, and the remaining tools stay on their portable CPU
-  baselines.
+  records, recorded canonical profiles as explicit Linux rebuild inputs,
+  executable reproduction gates, and an optional x86-64-v3 PGO CLI for
+  compatible CPUs. Package managers, libraries, plug-ins, wheels, and the
+  remaining tools stay on their portable CPU baselines.
 - A stereo-specialized streaming analyzer that keeps both K-weighting filters
   and true-peak meters borrowed across the frame loop, removes dynamic channel
   iteration for the dominant delivery layout, preserves the generic timeline
