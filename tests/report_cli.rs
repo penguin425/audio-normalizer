@@ -198,7 +198,7 @@ fn explain_covers_every_manifest_qc_category_without_duplicates() {
     }]);
     let adm_rules = json!([
         {
-            "rule_id": "TECH3393-TABLE50-PROFILE-IDENTIFIER",
+            "rule_id": "TECH3393-2025-PROFILE-IDENTIFIER",
             "path": "/audioFormatExtended/profileList/profile",
             "requirement": "one profile shall contain EBU Tech 3393",
             "observed": "not present",
@@ -350,7 +350,7 @@ fn explain_covers_every_manifest_qc_category_without_duplicates() {
         "0010B",
         "FORGE-WAVE-RIFF-SIZE",
         "FORGE-AAC-ADTS-BOUNDS",
-        "TECH3393-TABLE50-PROFILE-IDENTIFIER",
+        "TECH3393-2025-PROFILE-IDENTIFIER",
         "BS2076-3-AXML-REQUIRED",
         "FORGE-ADM-PRESENTATION-REFERENCE",
         "FORGE-ADM-REFERENCE-RENDER-VALIDATION",

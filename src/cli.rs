@@ -293,6 +293,10 @@ pub struct Cli {
     #[arg(long = "ebu-qc", requires = "analyze_only")]
     pub ebu_qc: bool,
 
+    /// Write a schema-valid EBU QC 2026-04 generic XML envelope for one input.
+    #[arg(long = "ebu-qc-xml", value_name = "PATH", requires = "ebu_qc")]
+    pub ebu_qc_xml: Option<PathBuf>,
+
     /// Level at or below which EBU 0078B silence is detected.
     #[arg(
         long = "silence-threshold",

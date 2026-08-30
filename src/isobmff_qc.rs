@@ -57,6 +57,7 @@ struct Track {
     loudness: Vec<LoudnessEntry>,
     drc_boxes: Vec<String>,
     aac_config: Option<crate::aac_qc::AscInfo>,
+    usac_config: Option<crate::aac_qc::UsacConfigInfo>,
     edit_media_time: Option<i64>,
     edit_segment_duration: Option<u64>,
     sample_group_types: Vec<String>,
@@ -598,6 +599,54 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
                     Some(json!({"track_id": track.id, "stts": stts_samples, "stsz": sample_count})),
                 ));
             }
+            if let Some(usac) = track.usac_config.as_ref() {
+                let fragmented = state.has_mvex || has_moof;
+                bitstream.push(check(
+                    "FORGE-ISOBMFF-XHE-AAC-FMP4",
+                    fragmented,
+                    "xHE-AAC Audio Object Type 42 is carried in fragmented MP4",
+                    Some(json!({
+                        "track_id": track.id,
+                        "audio_object_type": usac.audio_object_type,
+                        "fragmented": fragmented
+                    })),
+                ));
+                let metadata_present = usac.uni_drc_config_present && usac.loudness_info_present;
+                bitstream.push(check(
+                    "FORGE-ISOBMFF-XHE-AAC-INSTREAM-METADATA",
+                    metadata_present,
+                    "xHE-AAC carries bounded in-stream MPEG-D UniDRC and loudnessInfo configuration extensions",
+                    Some(json!({
+                        "track_id": track.id,
+                        "uni_drc_config_present": usac.uni_drc_config_present,
+                        "loudness_info_present": usac.loudness_info_present,
+                        "payload_profile_validation": "not evaluated"
+                    })),
+                ));
+                if let (Some(access_units), Some(stts_duration)) =
+                    (track.stts_samples, track.stts_duration)
+                {
+                    let coded_samples = access_units.saturating_mul(u64::from(usac.frame_samples));
+                    let end_trim = coded_samples.checked_sub(stts_duration);
+                    let timing_valid = track.timescale == Some(usac.output_sample_rate_hz)
+                        && end_trim.is_some_and(|trim| trim < u64::from(usac.frame_samples));
+                    xcheck.push(check(
+                        "FORGE-ISOBMFF-XHE-AAC-SAMPLE-TIMING",
+                        timing_valid,
+                        "xHE-AAC access-unit count, USAC frame length, media timescale, and stts duration agree",
+                        Some(json!({
+                            "track_id": track.id,
+                            "access_units": access_units,
+                            "frame_samples": usac.frame_samples,
+                            "coded_samples": coded_samples,
+                            "stts_duration": stts_duration,
+                            "transport_end_trim_samples": end_trim,
+                            "media_timescale": track.timescale,
+                            "output_sample_rate_hz": usac.output_sample_rate_hz
+                        })),
+                    ));
+                }
+            }
             if let (Some(chunk_samples), Some(sample_count)) =
                 (track.chunk_samples, track.sample_count)
             {
@@ -643,9 +692,9 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
                 track.stts_duration,
             ) {
                 let coded_samples = access_units.saturating_mul(u64::from(asc.frame_samples));
+                let end_trim = coded_samples.checked_sub(stts_duration);
                 let timing_valid = track.timescale == Some(asc.output_sample_rate_hz)
-                    && stts_duration <= coded_samples
-                    && coded_samples - stts_duration < u64::from(asc.frame_samples);
+                    && end_trim.is_some_and(|trim| trim < u64::from(asc.frame_samples));
                 xcheck.push(check(
                     "FORGE-ISOBMFF-AAC-SAMPLE-TIMING",
                     timing_valid,
@@ -656,7 +705,7 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
                         "frame_samples": asc.frame_samples,
                         "coded_samples": coded_samples,
                         "stts_duration": stts_duration,
-                        "transport_end_trim_samples": coded_samples - stts_duration,
+                        "transport_end_trim_samples": end_trim,
                         "media_timescale": track.timescale,
                         "output_sample_rate_hz": asc.output_sample_rate_hz
                     })),
@@ -3271,20 +3320,17 @@ fn parse_stsd(
                 Ok(children) => {
                     let protection = (sample_entry_type == "enca")
                         .then(|| parse_cenc_protection(&children, checks));
-                    let is_iamf = sample_entry_type == "iamf"
-                        || protection
-                            .as_ref()
-                            .and_then(|item| item.original_format.as_deref())
-                            == Some("iamf");
-                    let is_alac = sample_entry_type == "alac"
-                        || protection
-                            .as_ref()
-                            .and_then(|item| item.original_format.as_deref())
-                            == Some("alac");
+                    let protected_format = protection
+                        .as_ref()
+                        .and_then(|item| item.original_format.as_deref());
+                    let is_iamf = sample_entry_type == "iamf" || protected_format == Some("iamf");
+                    let is_alac = sample_entry_type == "alac" || protected_format == Some("alac");
                     if is_iamf {
                         logical_codec = "iamf".to_string();
                     } else if is_alac {
                         logical_codec = "alac".to_string();
+                    } else if protected_format == Some("mp4a") {
+                        logical_codec = "mp4a".to_string();
                     }
                     track.iamf_entries.push(if is_iamf {
                         Some(parse_iamf_sample_entry(
@@ -3328,18 +3374,27 @@ fn parse_stsd(
                     }
                     track.drc_boxes.extend(drc);
                     if logical_codec == "mp4a" {
-                        let asc = children
+                        let decoder_config = children
                             .iter()
                             .find(|(kind, _)| kind == "esds")
-                            .and_then(|(_, payload)| decoder_specific_info(payload).ok())
-                            .and_then(|bytes| crate::aac_qc::parse_asc_bytes(bytes).ok());
+                            .and_then(|(_, payload)| decoder_specific_info(payload).ok());
+                        let usac = decoder_config
+                            .and_then(|bytes| crate::aac_qc::parse_usac_config_bytes(bytes).ok());
+                        let asc = decoder_config.and_then(|bytes| {
+                            (usac.is_none())
+                                .then(|| crate::aac_qc::parse_asc_bytes(bytes).ok())
+                                .flatten()
+                        });
                         checks.push(check(
                             "FORGE-ISOBMFF-AAC-ASC",
-                            asc.is_some(),
-                            "mp4a sample entry contains a bounded AudioSpecificConfig",
-                            asc.as_ref().map(|value| json!(value)),
+                            asc.is_some() || usac.is_some(),
+                            "mp4a sample entry contains a bounded AAC or MPEG-D USAC AudioSpecificConfig",
+                            asc.as_ref()
+                                .map(|value| json!(value))
+                                .or_else(|| usac.as_ref().map(|value| json!(value))),
                         ));
                         track.aac_config = asc;
+                        track.usac_config = usac;
                     }
                 }
                 Err(()) => {
@@ -5106,6 +5161,7 @@ fn track_json(track: &Track) -> Value {
         "loudness": track.loudness.iter().map(loudness_json).collect::<Vec<_>>(),
         "mpeg_d_drc_boxes": track.drc_boxes,
         "aac_audio_specific_config": track.aac_config,
+        "xhe_aac_usac_config": track.usac_config,
         "edit_media_time": track.edit_media_time,
         "edit_segment_duration": track.edit_segment_duration,
         "sample_group_types": track.sample_group_types,
@@ -5431,8 +5487,14 @@ mod tests {
         [senc, saiz, saio].concat()
     }
 
-    fn aac_esds() -> Vec<u8> {
-        let decoder_config = [vec![0x40, 0x15], vec![0; 11], vec![0x05, 0x02, 0x11, 0x90]].concat();
+    fn aac_esds_with_config(audio_specific_config: &[u8]) -> Vec<u8> {
+        let decoder_config = [
+            vec![0x40, 0x15],
+            vec![0; 11],
+            vec![0x05, u8::try_from(audio_specific_config.len()).unwrap()],
+            audio_specific_config.to_vec(),
+        ]
+        .concat();
         let es_descriptor = [
             vec![0x00, 0x01, 0x00],
             vec![0x04, u8::try_from(decoder_config.len()).unwrap()],
@@ -5896,6 +5958,27 @@ mod tests {
         stbl_children: Vec<u8>,
         movie_children: Vec<u8>,
     ) -> Vec<u8> {
+        minimal_audio_mp4_advanced_with_asc(
+            chunk_offset,
+            track_user_data,
+            sample_entry_children,
+            track_children,
+            stbl_children,
+            movie_children,
+            &[0x11, 0x90],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn minimal_audio_mp4_advanced_with_asc(
+        chunk_offset: u32,
+        track_user_data: Vec<u8>,
+        sample_entry_children: Vec<u8>,
+        track_children: Vec<u8>,
+        stbl_children: Vec<u8>,
+        movie_children: Vec<u8>,
+        audio_specific_config: &[u8],
+    ) -> Vec<u8> {
         let ftyp = boxed(
             b"ftyp",
             [b"M4A ".as_slice(), &[0, 0, 0, 0], b"isom"].concat(),
@@ -5929,7 +6012,7 @@ mod tests {
         sample_entry[16..18].copy_from_slice(&2_u16.to_be_bytes());
         sample_entry[18..20].copy_from_slice(&16_u16.to_be_bytes());
         sample_entry[24..28].copy_from_slice(&(48_000_u32 << 16).to_be_bytes());
-        sample_entry.extend(aac_esds());
+        sample_entry.extend(aac_esds_with_config(audio_specific_config));
         sample_entry.extend(sample_entry_children);
         let stsd = boxed(
             b"stsd",
@@ -5987,6 +6070,48 @@ mod tests {
         let moov = boxed(b"moov", [movie_children, trak].concat());
         let mdat = boxed(b"mdat", vec![1, 2, 3, 4]);
         [ftyp, moov, mdat].concat()
+    }
+
+    fn xhe_aac_asc(with_required_metadata: bool) -> Vec<u8> {
+        let mut output = Vec::<u8>::new();
+        let mut position = 0_usize;
+        let mut write = |value: u64, width: usize| {
+            for shift in (0..width).rev() {
+                if position.is_multiple_of(8) {
+                    output.push(0);
+                }
+                let index = position / 8;
+                output[index] |= (((value >> shift) & 1) as u8) << (7 - position % 8);
+                position += 1;
+            }
+        };
+        write(31, 5); // escaped AOT
+        write(10, 6); // USAC AOT 42
+        write(3, 4); // outer 48 kHz
+        write(2, 4); // outer stereo
+        write(3, 5); // USAC 48 kHz
+        write(1, 3); // 1024 samples without SBR
+        write(2, 5); // USAC stereo
+        write(u64::from(with_required_metadata), 4); // one or two elements minus one
+        write(1, 2); // CPE
+        write(0, 1); // tw_mdct
+        write(1, 1); // noise filling
+        if with_required_metadata {
+            write(3, 2); // extension element
+            write(4, 4); // UniDRC
+            write(1, 4); // one byte
+            write(0, 1); // no default payload length
+            write(0, 1); // payload fragmentation flag
+            write(0, 8); // bounded configuration payload
+            write(1, 1); // config extensions present
+            write(0, 2); // one extension minus one
+            write(2, 4); // loudnessInfoSet
+            write(1, 4); // one byte
+            write(0, 8);
+        } else {
+            write(0, 1); // no config extensions
+        }
+        output
     }
 
     fn media_fragment(sequence: u32, decode_time: u64) -> Vec<u8> {
@@ -6980,6 +7105,120 @@ mod tests {
             2
         );
         assert_eq!(track["mpeg_d_drc_boxes"], json!(["udc2", "udi2"]));
+    }
+
+    #[test]
+    fn validates_xhe_aac_usac_fmp4_and_required_instream_metadata() {
+        let trex = boxed(
+            b"trex",
+            full_box(
+                0,
+                [
+                    1_u32.to_be_bytes(),
+                    1_u32.to_be_bytes(),
+                    1_024_u32.to_be_bytes(),
+                    4_u32.to_be_bytes(),
+                    0_u32.to_be_bytes(),
+                ]
+                .concat(),
+            ),
+        );
+        let movie = boxed(b"mvex", trex);
+        let asc = xhe_aac_asc(true);
+        let preliminary = minimal_audio_mp4_advanced_with_asc(
+            0,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            movie.clone(),
+            &asc,
+        );
+        let mdat_start = preliminary
+            .windows(4)
+            .position(|window| window == b"mdat")
+            .unwrap() as u32
+            + 4;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("xhe-aac.mp4");
+        File::create(&path)
+            .unwrap()
+            .write_all(&minimal_audio_mp4_advanced_with_asc(
+                mdat_start,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                movie,
+                &asc,
+            ))
+            .unwrap();
+
+        let result = crate::container_qc::audit(&path).unwrap();
+        assert!(result.passed, "{result:#?}");
+        let checks = result
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.checks)
+            .collect::<Vec<_>>();
+        assert!(checks
+            .iter()
+            .any(|check| check.rule_id == "FORGE-ISOBMFF-XHE-AAC-FMP4" && check.passed));
+        assert!(checks.iter().any(|check| {
+            check.rule_id == "FORGE-ISOBMFF-XHE-AAC-INSTREAM-METADATA" && check.passed
+        }));
+        assert!(checks.iter().any(|check| {
+            check.rule_id == "FORGE-ISOBMFF-XHE-AAC-SAMPLE-TIMING" && check.passed
+        }));
+        let config = &result.properties["tracks"][0]["xhe_aac_usac_config"];
+        assert_eq!(config["audio_object_type"], 42);
+        assert_eq!(config["output_sample_rate_hz"], 48_000);
+        assert_eq!(config["output_channels"], 2);
+        assert_eq!(config["uni_drc_config_present"], true);
+        assert_eq!(config["loudness_info_present"], true);
+    }
+
+    #[test]
+    fn rejects_xhe_aac_without_required_instream_metadata() {
+        let trex = boxed(
+            b"trex",
+            full_box(
+                0,
+                [
+                    1_u32.to_be_bytes(),
+                    1_u32.to_be_bytes(),
+                    1_024_u32.to_be_bytes(),
+                    4_u32.to_be_bytes(),
+                    0_u32.to_be_bytes(),
+                ]
+                .concat(),
+            ),
+        );
+        let asc = xhe_aac_asc(false);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("xhe-aac-missing-metadata.mp4");
+        File::create(&path)
+            .unwrap()
+            .write_all(&minimal_audio_mp4_advanced_with_asc(
+                0,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                boxed(b"mvex", trex),
+                &asc,
+            ))
+            .unwrap();
+
+        let result = crate::container_qc::audit(&path).unwrap();
+        assert!(!result.passed);
+        assert!(result
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.checks)
+            .any(|check| {
+                check.rule_id == "FORGE-ISOBMFF-XHE-AAC-INSTREAM-METADATA" && !check.passed
+            }));
     }
 
     #[test]

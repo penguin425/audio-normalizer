@@ -12,6 +12,7 @@ use forge_normalizer::cli;
 use forge_normalizer::codec_qc;
 use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::dsp::resample::ResampleQuality;
+use forge_normalizer::ebu_qc_report;
 use forge_normalizer::normalization_diff::{
     self, NormalizationDifferenceAsset, NormalizationDifferenceReport,
 };
@@ -833,6 +834,16 @@ fn run_paths(
         if cli.adm_profile_report.is_some() && cli.inputs.len() != 1 {
             return Err("--adm-profile-report requires exactly one input".into());
         }
+        if cli.ebu_qc_xml.is_some() && cli.inputs.len() != 1 {
+            return Err("--ebu-qc-xml requires exactly one input".into());
+        }
+        if cli
+            .ebu_qc_xml
+            .as_ref()
+            .is_some_and(|path| path.as_os_str() == "-")
+        {
+            return Err("--ebu-qc-xml requires a file path, not stdout".into());
+        }
         let codec_metadata = cli
             .codec_metadata
             .as_deref()
@@ -888,6 +899,7 @@ fn run_paths(
         let mut timeline_reports = Vec::new();
         let mut dialogue_detection_output = None;
         let mut adm_profile_audit_output = None;
+        let mut ebu_qc_xml_output = None;
         let mut qc_failed = false;
         for input in &cli.inputs {
             let timed = analyze_range_cached(
@@ -1016,6 +1028,15 @@ fn run_paths(
                 .as_ref()
                 .map(|options| qc::analyze_file(input, &an, options))
                 .transpose()?;
+            if cli.ebu_qc_xml.is_some() {
+                let results = ebu_qc
+                    .as_ref()
+                    .expect("--ebu-qc-xml requires EBU QC analysis");
+                ebu_qc_xml_output = Some((
+                    ebu_qc_report::EbuQcReportMetadata::from_file(input, &an)?,
+                    results.clone(),
+                ));
+            }
             if adm_qc.as_ref().is_some_and(|result| !result.passed) {
                 qc_failed = true;
             }
@@ -1399,6 +1420,21 @@ fn run_paths(
                 .map_err(|error| format!("create {}: {error}", path.display()))?;
             serde_json::to_writer_pretty(file, audit)
                 .map_err(|error| format!("write ADM profile report: {error}"))?;
+        }
+        if let Some(path) = &cli.ebu_qc_xml {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| format!("create {}: {error}", parent.display()))?;
+            }
+            let (metadata, results) = ebu_qc_xml_output
+                .as_ref()
+                .expect("EBU QC XML analysis always produces report data");
+            let file = File::create(path)
+                .map_err(|error| format!("create {}: {error}", path.display()))?;
+            ebu_qc_report::write_xml(file, metadata, results)?;
         }
         write_catalogue_report(
             catalogue.as_ref(),

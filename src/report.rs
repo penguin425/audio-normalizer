@@ -174,6 +174,11 @@ impl ComplianceProfile {
                 ..Self::symmetric("ebu-r128-cinematic", -23.0, 0.2, -1.0)
                     .sourced("EBU R 128 s4", "2023")
             },
+            "itu-h872-game" => {
+                Self::true_peak_only(name, -1.0).sourced("ITU-T H.872 clause 9.3.1", "10/2024")
+            }
+            "itu-h872-handheld" => Self::true_peak_only(name, -1.0)
+                .sourced("ITU-T H.872 clause 9.3.1 Note 4", "10/2024"),
             "atsc-a85-short" => {
                 Self::symmetric("atsc-a85-short", -24.0, 2.0, -2.0).sourced("ATSC A/85", "2026-07")
             }
@@ -249,6 +254,28 @@ impl ComplianceProfile {
             loudness_tolerance_lu: None,
             lower_tolerance_lu: None,
             upper_tolerance_lu: Some(tolerance),
+            max_true_peak_dbtp: Some(true_peak),
+            max_short_term_lufs: None,
+            max_momentary_lufs: None,
+            min_loudness_range_lu: None,
+            max_loudness_range_lu: None,
+            min_peak_to_loudness_ratio_lu: None,
+            max_peak_to_loudness_ratio_lu: None,
+            peak_to_loudness_ratio_max_exclusive: false,
+            max_loudness_to_dialogue_ratio_lu: None,
+        }
+    }
+
+    fn true_peak_only(name: &str, true_peak: f64) -> Self {
+        Self {
+            name: name.into(),
+            standard: None,
+            standard_version: None,
+            loudness_basis: LoudnessBasis::Programme,
+            target_lufs: None,
+            loudness_tolerance_lu: None,
+            lower_tolerance_lu: None,
+            upper_tolerance_lu: None,
             max_true_peak_dbtp: Some(true_peak),
             max_short_term_lufs: None,
             max_momentary_lufs: None,
@@ -391,6 +418,9 @@ impl ComplianceProfile {
         dialogue_lufs: Option<f64>,
     ) -> Result<ComplianceResult, String> {
         let mut rules = Vec::new();
+        if let Some(target) = h872_target(self) {
+            add_h872_rules(&mut rules, analysis, target)?;
+        }
         if let Some(target) = self.target_lufs {
             let (metric, measured) = match self.loudness_basis {
                 LoudnessBasis::Programme => ("integrated_lufs", analysis.lufs),
@@ -476,6 +506,79 @@ impl ComplianceProfile {
             rules,
         })
     }
+}
+
+fn h872_target(profile: &ComplianceProfile) -> Option<f64> {
+    match (
+        profile.name.as_str(),
+        profile.standard.as_deref(),
+        profile.standard_version.as_deref(),
+    ) {
+        ("itu-h872-game", Some("ITU-T H.872 clause 9.3.1"), Some("10/2024")) => Some(-23.0),
+        ("itu-h872-handheld", Some("ITU-T H.872 clause 9.3.1 Note 4"), Some("10/2024")) => {
+            Some(-18.0)
+        }
+        _ => None,
+    }
+}
+
+fn add_h872_rules(
+    rules: &mut Vec<ComplianceRuleResult>,
+    analysis: &Analysis,
+    target_lufs: f64,
+) -> Result<(), String> {
+    const WINDOW_SECONDS: usize = 30 * 60;
+    rules.push(ComplianceRuleResult::range(
+        "capture_duration_seconds",
+        analysis.duration_secs(),
+        WINDOW_SECONDS as f64,
+        f64::INFINITY,
+    ));
+    if analysis.duration_secs() < WINDOW_SECONDS as f64 {
+        return Ok(());
+    }
+
+    let sample_rate = analysis.sample_rate as usize;
+    let momentary_frames = (0.4 * sample_rate as f64).round() as usize;
+    let hop_frames = (0.1 * sample_rate as f64).round() as usize;
+    let window_frames = WINDOW_SECONDS
+        .checked_mul(sample_rate)
+        .ok_or_else(|| "ITU-T H.872 window size overflow".to_string())?;
+    if momentary_frames == 0 || hop_frames == 0 || window_frames < momentary_frames {
+        return Err("ITU-T H.872 requires a valid BS.1770 gating block geometry".into());
+    }
+    let blocks_per_window = (window_frames - momentary_frames) / hop_frames + 1;
+    let expected_blocks = if analysis.frames < momentary_frames {
+        0
+    } else {
+        (analysis.frames - momentary_frames) / hop_frames + 1
+    };
+    if analysis.loudness_blocks.len() != expected_blocks {
+        return Err(format!(
+            "ITU-T H.872 requires all {expected_blocks} retained BS.1770 blocks; analysis retained {}",
+            analysis.loudness_blocks.len()
+        ));
+    }
+    let (minimum, maximum) = crate::dsp::lufs::rolling_gated_loudness_extrema(
+        &analysis.loudness_blocks,
+        blocks_per_window,
+    )
+    .ok_or_else(|| "ITU-T H.872 requires at least one complete 30-minute window".to_string())?;
+    let lower = target_lufs - 2.0;
+    let upper = target_lufs + 2.0;
+    rules.push(ComplianceRuleResult::range(
+        "minimum_rolling_30m_integrated_lufs",
+        minimum,
+        lower,
+        upper,
+    ));
+    rules.push(ComplianceRuleResult::range(
+        "maximum_rolling_30m_integrated_lufs",
+        maximum,
+        lower,
+        upper,
+    ));
+    Ok(())
 }
 
 fn add_max_rule(
@@ -1510,6 +1613,78 @@ mod tests {
                 .passed
         );
         assert!(!result.passed);
+    }
+
+    fn h872_analysis(lufs: f64, seconds: usize) -> crate::normalize::Analysis {
+        let sample_rate = 48_000;
+        let frames = sample_rate as usize * seconds;
+        let momentary = (0.4 * sample_rate as f64).round() as usize;
+        let hop = (0.1 * sample_rate as f64).round() as usize;
+        let blocks = if frames < momentary {
+            0
+        } else {
+            (frames - momentary) / hop + 1
+        };
+        crate::normalize::Analysis {
+            sample_rate,
+            channels: 2,
+            channel_roles: crate::wav::default_channel_roles(2),
+            frames,
+            kind: crate::wav::PcmKind::S24,
+            lufs,
+            max_momentary_lufs: lufs,
+            max_short_term_lufs: lufs,
+            loudness_range_lu: 0.0,
+            rms_db: lufs,
+            sample_peak: 0.5,
+            true_peak: 10.0_f32.powf(-1.1 / 20.0),
+            loudness_blocks: vec![10.0_f64.powf((lufs + 0.691) / 10.0); blocks],
+        }
+    }
+
+    #[test]
+    fn itu_h872_profiles_scan_complete_thirty_minute_windows() {
+        let standard = ComplianceProfile::builtin("itu-h872-game").unwrap();
+        let result = standard.evaluate(&h872_analysis(-23.0, 30 * 60)).unwrap();
+        assert!(result.passed, "{:#?}", result.rules);
+        assert_eq!(result.standard.as_deref(), Some("ITU-T H.872 clause 9.3.1"));
+        assert!(result
+            .rules
+            .iter()
+            .any(|rule| rule.metric == "minimum_rolling_30m_integrated_lufs"));
+
+        let loud = standard.evaluate(&h872_analysis(-20.0, 30 * 60)).unwrap();
+        assert!(!loud.passed);
+        assert!(
+            !loud
+                .rules
+                .iter()
+                .find(|rule| rule.metric == "maximum_rolling_30m_integrated_lufs")
+                .unwrap()
+                .passed
+        );
+
+        let handheld = ComplianceProfile::builtin("itu-h872-handheld").unwrap();
+        assert!(
+            handheld
+                .evaluate(&h872_analysis(-18.0, 30 * 60))
+                .unwrap()
+                .passed
+        );
+    }
+
+    #[test]
+    fn itu_h872_rejects_a_capture_without_a_complete_window() {
+        let profile = ComplianceProfile::builtin("itu-h872-game").unwrap();
+        let result = profile.evaluate(&h872_analysis(-23.0, 29 * 60)).unwrap();
+        assert!(!result.passed);
+        let duration = result
+            .rules
+            .iter()
+            .find(|rule| rule.metric == "capture_duration_seconds")
+            .unwrap();
+        assert!(!duration.passed);
+        assert_eq!(result.rules.len(), 2, "duration and true-peak rules only");
     }
 
     #[test]

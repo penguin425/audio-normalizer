@@ -20,10 +20,11 @@ use std::process::{Command, Output};
 pub const RENDERER_STANDARD: &str = "ITU-R BS.2127-1";
 pub const PROFILE_STANDARD: &str = "ITU-R BS.2168-0";
 pub const PRODUCTION_PROFILE_STANDARD: &str = "EBU Tech 3393";
+pub const PRODUCTION_PROFILE_EDITION: &str = "September 2025";
 pub const PRODUCTION_PROFILE_NAME: &str = "EBU Production Profile";
 pub const PRODUCTION_PROFILE_VERSION: &str = "1.0";
 pub const PRODUCTION_PROFILE_LEVEL: &str = "1";
-pub const PRODUCTION_VALIDATOR: &str = "forge-tech3393-bs2076-3-2";
+pub const PRODUCTION_VALIDATOR: &str = "forge-tech3393-2025-bs2076-3-3";
 pub const ADM_STANDARD: &str = "ITU-R BS.2076-3";
 pub const ADM_VERSION: &str = "ITU-R_BS.2076-3";
 
@@ -80,6 +81,17 @@ struct ParsedAdm {
     references: Vec<(String, String)>,
     time_values: Vec<(String, String)>,
     deprecated_mxf_lookups: Vec<String>,
+    elements: Vec<ParsedElement>,
+}
+
+#[derive(Debug, Default)]
+struct ParsedElement {
+    name: String,
+    path: String,
+    parent: Option<usize>,
+    attributes: HashMap<String, String>,
+    children: HashMap<String, usize>,
+    text: String,
 }
 
 #[derive(Debug)]
@@ -244,21 +256,12 @@ pub fn validate_production_profile(
         .first()
         .and_then(|(_, version)| version.as_deref());
     rules.push(AdmProfileRule {
-        rule_id: "BS2076-3-VERSION",
+        rule_id: "TECH3393-2025-AFE-VERSION",
         path: "/audioFormatExtended/@version".into(),
-        requirement: match mode {
-            ProductionProfileMode::Read => {
-                "version shall identify a published BS.2076 revision when present".into()
-            }
-            ProductionProfileMode::Write => {
-                format!("version shall be present and equal {ADM_VERSION}")
-            }
-        },
+        requirement: "Tech 3393:2025 Table 59: version shall be ITU-R_BS.2076-2 or ITU-R_BS.2076-3"
+            .into(),
         observed: version.unwrap_or("not present").into(),
-        passed: match mode {
-            ProductionProfileMode::Read => version.is_none_or(is_supported_adm_version),
-            ProductionProfileMode::Write => version == Some(ADM_VERSION),
-        },
+        passed: version.is_some_and(is_production_profile_adm_version),
     });
     rules.push(AdmProfileRule {
         rule_id: "BS2076-3-TAG-LIST-CARDINALITY",
@@ -308,12 +311,14 @@ pub fn validate_production_profile(
         passed: invalid_times.is_empty(),
     });
 
+    rules.extend(validate_tech3393_structure(&parsed, mode));
+
     let profile_list_pass = match mode {
         ProductionProfileMode::Read => parsed.profile_lists <= 1,
         ProductionProfileMode::Write => parsed.profile_lists == 1,
     };
     rules.push(AdmProfileRule {
-        rule_id: "TECH3393-2.2.10-PROFILE-LIST",
+        rule_id: "TECH3393-2025-PROFILE-LIST-CARDINALITY",
         path: "/audioFormatExtended/profileList".into(),
         requirement: match mode {
             ProductionProfileMode::Read => "zero or one profileList element".into(),
@@ -328,11 +333,15 @@ pub fn validate_production_profile(
         ProductionProfileMode::Write => (1..=8).contains(&parsed.profiles.len()),
     };
     rules.push(AdmProfileRule {
-        rule_id: "TECH3393-TABLE50-PROFILE-COUNT",
+        rule_id: "TECH3393-2025-PROFILE-COUNT",
         path: "/audioFormatExtended/profileList/profile".into(),
         requirement: match mode {
-            ProductionProfileMode::Read => "zero to eight profile elements".into(),
-            ProductionProfileMode::Write => "one to eight profile elements".into(),
+            ProductionProfileMode::Read => {
+                "Tech 3393:2025 Table 52: zero to eight profile elements".into()
+            }
+            ProductionProfileMode::Write => {
+                "Tech 3393:2025 Table 52: one to eight profile elements".into()
+            }
         },
         observed: format!("{} profile element(s)", parsed.profiles.len()),
         passed: count_pass,
@@ -343,7 +352,7 @@ pub fn validate_production_profile(
         .iter()
         .find(|profile| profile.text.trim() == PRODUCTION_PROFILE_STANDARD);
     rules.push(AdmProfileRule {
-        rule_id: "TECH3393-TABLE50-PROFILE-IDENTIFIER",
+        rule_id: "TECH3393-2025-PROFILE-IDENTIFIER",
         path: "/audioFormatExtended/profileList/profile".into(),
         requirement: format!("one profile shall contain {PRODUCTION_PROFILE_STANDARD}"),
         observed: production
@@ -358,17 +367,17 @@ pub fn validate_production_profile(
     if let Some(profile) = production {
         for (rule_id, attribute, expected) in [
             (
-                "TECH3393-TABLE51-PROFILE-NAME",
+                "TECH3393-2025-PROFILE-NAME",
                 "profileName",
                 PRODUCTION_PROFILE_NAME,
             ),
             (
-                "TECH3393-TABLE51-PROFILE-VERSION",
+                "TECH3393-2025-PROFILE-VERSION",
                 "profileVersion",
                 PRODUCTION_PROFILE_VERSION,
             ),
             (
-                "TECH3393-TABLE51-PROFILE-LEVEL",
+                "TECH3393-2025-PROFILE-LEVEL",
                 "profileLevel",
                 PRODUCTION_PROFILE_LEVEL,
             ),
@@ -455,9 +464,9 @@ pub fn validate_production_profile(
     if mode == ProductionProfileMode::Read {
         for (path, count) in &parsed.track_format_stream_refs {
             rules.push(AdmProfileRule {
-                rule_id: "TECH3393-TABLE49-STREAM-REFERENCE",
+                rule_id: "TECH3393-2025-TRACK-STREAM-REFERENCE",
                 path: path.clone(),
-                requirement: "audioTrackFormat shall contain exactly one audioStreamFormatIDRef"
+                requirement: "Tech 3393:2025 Table 51: audioTrackFormat shall contain exactly one audioStreamFormatIDRef"
                     .into(),
                 observed: format!("{count} audioStreamFormatIDRef element(s)"),
                 passed: *count == 1,
@@ -499,6 +508,714 @@ fn profile_result(
     }
 }
 
+#[derive(Clone, Copy)]
+struct ChildConstraint {
+    name: &'static str,
+    read_min: usize,
+    read_max: usize,
+    write_min: usize,
+    write_max: usize,
+}
+
+fn validate_tech3393_structure(
+    parsed: &ParsedAdm,
+    mode: ProductionProfileMode,
+) -> Vec<AdmProfileRule> {
+    let mut rules = Vec::new();
+    let roots = parsed
+        .elements
+        .iter()
+        .filter(|element| element.name == "audioFormatExtended")
+        .collect::<Vec<_>>();
+    let root_count = |name: &str| {
+        roots
+            .iter()
+            .map(|root| root.children.get(name).copied().unwrap_or(0))
+            .sum::<usize>()
+    };
+    for (rule_id, element, minimum, read_maximum, write_maximum, table) in [
+        (
+            "TECH3393-2025-PROGRAMME-COUNT",
+            "audioProgramme",
+            1,
+            32,
+            32,
+            "Tables 1 and 60",
+        ),
+        (
+            "TECH3393-2025-CONTENT-COUNT",
+            "audioContent",
+            1,
+            128,
+            128,
+            "Tables 1 and 60",
+        ),
+        (
+            "TECH3393-2025-OBJECT-COUNT",
+            "audioObject",
+            1,
+            128,
+            128,
+            "Tables 1 and 60",
+        ),
+        (
+            "TECH3393-2025-TRACK-UID-COUNT",
+            "audioTrackUID",
+            1,
+            128,
+            128,
+            "Tables 1 and 60",
+        ),
+        (
+            "TECH3393-2025-PACK-FORMAT-COUNT",
+            "audioPackFormat",
+            0,
+            256,
+            256,
+            "Tables 2 and 60",
+        ),
+        (
+            "TECH3393-2025-CHANNEL-FORMAT-COUNT",
+            "audioChannelFormat",
+            0,
+            1024,
+            1024,
+            "Tables 2 and 60",
+        ),
+        (
+            "TECH3393-2025-STREAM-FORMAT-COUNT",
+            "audioStreamFormat",
+            0,
+            1024,
+            0,
+            "Tables 2 and 60",
+        ),
+        (
+            "TECH3393-2025-TRACK-FORMAT-COUNT",
+            "audioTrackFormat",
+            0,
+            1024,
+            0,
+            "Tables 2 and 60",
+        ),
+        (
+            "TECH3393-2025-TAG-LIST-COUNT",
+            "tagList",
+            if mode == ProductionProfileMode::Write {
+                1
+            } else {
+                0
+            },
+            1,
+            1,
+            "Table 60",
+        ),
+    ] {
+        let count = root_count(element);
+        let maximum = if mode == ProductionProfileMode::Write {
+            write_maximum
+        } else {
+            read_maximum
+        };
+        rules.push(AdmProfileRule {
+            rule_id,
+            path: format!("/audioFormatExtended/{element}"),
+            requirement: format!(
+                "Tech 3393:2025 {table}: {minimum} to {maximum} {element} element(s)"
+            ),
+            observed: format!("{count} element(s)"),
+            passed: (minimum..=maximum).contains(&count),
+        });
+    }
+
+    validate_required_attributes(
+        parsed,
+        mode,
+        &mut rules,
+        "audioProgramme",
+        "TECH3393-2025-PROGRAMME-ATTRIBUTES",
+        "Table 4",
+        &["audioProgrammeID", "audioProgrammeName"],
+        &["audioProgrammeID", "audioProgrammeName"],
+    );
+    validate_required_attributes(
+        parsed,
+        mode,
+        &mut rules,
+        "audioContent",
+        "TECH3393-2025-CONTENT-ATTRIBUTES",
+        "Table 15",
+        &["audioContentID", "audioContentName"],
+        &["audioContentID", "audioContentName"],
+    );
+    validate_required_attributes(
+        parsed,
+        mode,
+        &mut rules,
+        "audioObject",
+        "TECH3393-2025-OBJECT-ATTRIBUTES",
+        "Table 22",
+        &["audioObjectID", "audioObjectName"],
+        &["audioObjectID", "audioObjectName", "importance", "interact"],
+    );
+    validate_required_attributes(
+        parsed,
+        mode,
+        &mut rules,
+        "audioTrackUID",
+        "TECH3393-2025-TRACK-UID-ATTRIBUTES",
+        "Table 28",
+        &["UID"],
+        &["UID"],
+    );
+    validate_format_attributes(
+        parsed,
+        mode,
+        &mut rules,
+        "audioPackFormat",
+        "audioPackFormatID",
+        "audioPackFormatName",
+        "TECH3393-2025-PACK-FORMAT-ATTRIBUTES",
+        "Table 30",
+    );
+    validate_format_attributes(
+        parsed,
+        mode,
+        &mut rules,
+        "audioChannelFormat",
+        "audioChannelFormatID",
+        "audioChannelFormatName",
+        "TECH3393-2025-CHANNEL-FORMAT-ATTRIBUTES",
+        "Table 34",
+    );
+    if mode == ProductionProfileMode::Read {
+        validate_format_attributes(
+            parsed,
+            mode,
+            &mut rules,
+            "audioStreamFormat",
+            "audioStreamFormatID",
+            "audioStreamFormatName",
+            "TECH3393-2025-STREAM-FORMAT-ATTRIBUTES",
+            "Table 48",
+        );
+        validate_format_attributes(
+            parsed,
+            mode,
+            &mut rules,
+            "audioTrackFormat",
+            "audioTrackFormatID",
+            "audioTrackFormatName",
+            "TECH3393-2025-TRACK-FORMAT-ATTRIBUTES",
+            "Table 50",
+        );
+    }
+
+    validate_child_constraints(
+        parsed,
+        mode,
+        &mut rules,
+        "audioProgramme",
+        "TECH3393-2025-PROGRAMME-CHILDREN",
+        "Table 5",
+        &[
+            child("audioProgrammeLabel", 0, 16, 0, 16),
+            child("audioContentIDRef", 1, 128, 1, 128),
+            child("loudnessMetadata", 0, 1, 0, 1),
+            child("audioProgrammeReferenceScreen", 0, 1, 0, 1),
+            child("authoringInformation", 0, 1, 0, 1),
+            child("alternativeValueSet", 0, 32, 0, 32),
+        ],
+    );
+    validate_child_constraints(
+        parsed,
+        mode,
+        &mut rules,
+        "audioContent",
+        "TECH3393-2025-CONTENT-CHILDREN",
+        "Table 16",
+        &[
+            child("audioContentLabel", 0, 16, 0, 16),
+            child("audioObjectIDRef", 1, 128, 1, 128),
+            child("loudnessMetadata", 0, 1, 0, 1),
+            child("dialogue", 0, 1, 1, 1),
+            child("alternativeValueSet", 0, 4, 0, 4),
+        ],
+    );
+    validate_child_constraints(
+        parsed,
+        mode,
+        &mut rules,
+        "audioObject",
+        "TECH3393-2025-OBJECT-CHILDREN",
+        "Table 23",
+        &[
+            child("audioPackFormatIDRef", 0, 1, 0, 1),
+            child("audioObjectIDRef", 0, 128, 0, 128),
+            child("audioObjectLabel", 0, 16, 0, 16),
+            child("audioComplementaryObjectGroupLabel", 0, 16, 0, 16),
+            child("audioComplementaryObjectIDRef", 0, 128, 0, 128),
+            child("audioTrackUIDRef", 0, 128, 0, 128),
+            child("audioObjectInteraction", 0, 1, 0, 1),
+            child("gain", 0, 1, 0, 1),
+            child("headLocked", 0, 1, 0, 1),
+            child("positionOffset", 0, 1, 0, 1),
+            child("mute", 0, 1, 0, 1),
+            child("alternativeValueSet", 0, 16, 0, 16),
+        ],
+    );
+    validate_track_uid_children(parsed, mode, &mut rules);
+    validate_child_constraints(
+        parsed,
+        mode,
+        &mut rules,
+        "audioPackFormat",
+        "TECH3393-2025-PACK-FORMAT-CHILDREN",
+        "Tables 31 to 33",
+        &[
+            child("audioChannelFormatIDRef", 0, 1024, 0, 1024),
+            child("audioPackFormatIDRef", 0, 32, 0, 32),
+            child("absoluteDistance", 0, 1, 0, 1),
+            child("encodePackFormatIDRef", 0, 1, 0, 1),
+            child("decodePackFormatIDRef", 0, 1, 0, 1),
+            child("inputPackFormatIDRef", 0, 1, 0, 1),
+            child("outputPackFormatIDRef", 0, 1, 0, 1),
+        ],
+    );
+    validate_child_constraints(
+        parsed,
+        mode,
+        &mut rules,
+        "audioChannelFormat",
+        "TECH3393-2025-CHANNEL-FORMAT-CHILDREN",
+        "Table 35",
+        &[
+            child("audioBlockFormat", 1, usize::MAX, 1, usize::MAX),
+            child("frequency", 0, 2, 0, 2),
+        ],
+    );
+    validate_child_constraints(
+        parsed,
+        mode,
+        &mut rules,
+        "audioStreamFormat",
+        "TECH3393-2025-STREAM-FORMAT-CHILDREN",
+        "Table 49",
+        &[
+            child("audioChannelFormatIDRef", 1, 1, 1, 1),
+            child("audioPackFormatIDRef", 0, 0, 0, 0),
+            child("audioTrackFormatIDRef", 0, usize::MAX, 0, 0),
+        ],
+    );
+
+    validate_name_and_label_lengths(parsed, &mut rules);
+    validate_object_structure(parsed, &mut rules);
+    validate_object_graph(parsed, &mut rules);
+    validate_tag_groups(parsed, mode, &mut rules);
+    rules
+}
+
+const fn child(
+    name: &'static str,
+    read_min: usize,
+    read_max: usize,
+    write_min: usize,
+    write_max: usize,
+) -> ChildConstraint {
+    ChildConstraint {
+        name,
+        read_min,
+        read_max,
+        write_min,
+        write_max,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_required_attributes(
+    parsed: &ParsedAdm,
+    mode: ProductionProfileMode,
+    rules: &mut Vec<AdmProfileRule>,
+    element_name: &str,
+    rule_id: &'static str,
+    table: &'static str,
+    read_required: &[&str],
+    write_required: &[&str],
+) {
+    let required = if mode == ProductionProfileMode::Write {
+        write_required
+    } else {
+        read_required
+    };
+    for element in parsed
+        .elements
+        .iter()
+        .filter(|element| element.name == element_name)
+    {
+        let missing = required
+            .iter()
+            .filter(|attribute| !element.attributes.contains_key(**attribute))
+            .copied()
+            .collect::<Vec<_>>();
+        rules.push(AdmProfileRule {
+            rule_id,
+            path: element.path.clone(),
+            requirement: format!(
+                "Tech 3393:2025 {table}: required attributes: {}",
+                required.join(", ")
+            ),
+            observed: if missing.is_empty() {
+                "all required attributes present".into()
+            } else {
+                format!("missing: {}", missing.join(", "))
+            },
+            passed: missing.is_empty(),
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_format_attributes(
+    parsed: &ParsedAdm,
+    mode: ProductionProfileMode,
+    rules: &mut Vec<AdmProfileRule>,
+    element_name: &str,
+    id_attribute: &str,
+    name_attribute: &str,
+    rule_id: &'static str,
+    table: &'static str,
+) {
+    for element in parsed
+        .elements
+        .iter()
+        .filter(|element| element.name == element_name)
+    {
+        let id_present = element.attributes.contains_key(id_attribute);
+        let name_present = element.attributes.contains_key(name_attribute);
+        let label = element.attributes.get("typeLabel");
+        let definition = element.attributes.get("typeDefinition");
+        let type_present = if mode == ProductionProfileMode::Write {
+            label.is_some()
+        } else {
+            label.is_some() || definition.is_some()
+        };
+        let known_label = label.is_none_or(|value| {
+            matches!(value.as_str(), "0001" | "0002" | "0003" | "0004" | "0005")
+        });
+        let known_definition = definition.is_none_or(|value| {
+            matches!(
+                value.as_str(),
+                "DirectSpeakers" | "Matrix" | "Objects" | "HOA" | "Binaural" | "PCM"
+            )
+        });
+        rules.push(AdmProfileRule {
+            rule_id,
+            path: element.path.clone(),
+            requirement: format!(
+                "Tech 3393:2025 {table}: ID and name are required; a published type shall be identified"
+            ),
+            observed: format!(
+                "ID={}, name={}, typeLabel={}, typeDefinition={}",
+                present(id_present),
+                present(name_present),
+                label.map_or("not present", String::as_str),
+                definition.map_or("not present", String::as_str),
+            ),
+            passed: id_present
+                && name_present
+                && type_present
+                && known_label
+                && known_definition,
+        });
+    }
+}
+
+fn validate_child_constraints(
+    parsed: &ParsedAdm,
+    mode: ProductionProfileMode,
+    rules: &mut Vec<AdmProfileRule>,
+    element_name: &str,
+    rule_id: &'static str,
+    tables: &'static str,
+    constraints: &[ChildConstraint],
+) {
+    for element in parsed
+        .elements
+        .iter()
+        .filter(|element| element.name == element_name)
+    {
+        let violations = constraints
+            .iter()
+            .filter_map(|constraint| {
+                let count = element.children.get(constraint.name).copied().unwrap_or(0);
+                let (minimum, maximum) = if mode == ProductionProfileMode::Write {
+                    (constraint.write_min, constraint.write_max)
+                } else {
+                    (constraint.read_min, constraint.read_max)
+                };
+                (!(minimum..=maximum).contains(&count)).then(|| {
+                    if maximum == usize::MAX {
+                        format!("{}={count}, expected at least {minimum}", constraint.name)
+                    } else {
+                        format!(
+                            "{}={count}, expected {minimum}..={maximum}",
+                            constraint.name
+                        )
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        rules.push(AdmProfileRule {
+            rule_id,
+            path: element.path.clone(),
+            requirement: format!("Tech 3393:2025 {tables}: child-element cardinalities"),
+            observed: if violations.is_empty() {
+                "all constrained child cardinalities valid".into()
+            } else {
+                violations.join("; ")
+            },
+            passed: violations.is_empty(),
+        });
+    }
+}
+
+fn validate_track_uid_children(
+    parsed: &ParsedAdm,
+    mode: ProductionProfileMode,
+    rules: &mut Vec<AdmProfileRule>,
+) {
+    for element in parsed
+        .elements
+        .iter()
+        .filter(|element| element.name == "audioTrackUID")
+    {
+        let track = child_count(element, "audioTrackFormatIDRef");
+        let channel = child_count(element, "audioChannelFormatIDRef");
+        let pack = child_count(element, "audioPackFormatIDRef");
+        let passed = if mode == ProductionProfileMode::Write {
+            track == 0 && channel == 1 && pack == 1
+        } else {
+            track + channel == 1 && pack == 1
+        };
+        rules.push(AdmProfileRule {
+            rule_id: "TECH3393-2025-TRACK-UID-CHILDREN",
+            path: element.path.clone(),
+            requirement: match mode {
+                ProductionProfileMode::Read => "Tech 3393:2025 Table 29: exactly one track/channel-format reference and one pack-format reference".into(),
+                ProductionProfileMode::Write => "Tech 3393:2025 Table 29: exactly one channel-format reference, no track-format reference, and one pack-format reference".into(),
+            },
+            observed: format!("track={track}, channel={channel}, pack={pack}"),
+            passed,
+        });
+    }
+}
+
+fn validate_name_and_label_lengths(parsed: &ParsedAdm, rules: &mut Vec<AdmProfileRule>) {
+    let mut invalid_names = Vec::new();
+    for element in &parsed.elements {
+        for (attribute, value) in &element.attributes {
+            if attribute.ends_with("Name") && value.chars().count() > 128 {
+                invalid_names.push(format!(
+                    "{}/@{}={} chars",
+                    element.path,
+                    attribute,
+                    value.chars().count()
+                ));
+            }
+        }
+    }
+    rules.push(AdmProfileRule {
+        rule_id: "TECH3393-2025-NAME-LENGTH",
+        path: "/audioFormatExtended".into(),
+        requirement: "Tech 3393:2025 Table 3: ADM names shall not exceed 128 characters".into(),
+        observed: if invalid_names.is_empty() {
+            "all observed names are at most 128 characters".into()
+        } else {
+            invalid_names.join("; ")
+        },
+        passed: invalid_names.is_empty(),
+    });
+
+    let invalid_labels = parsed
+        .elements
+        .iter()
+        .filter(|element| {
+            matches!(
+                element.name.as_str(),
+                "audioProgrammeLabel"
+                    | "audioContentLabel"
+                    | "audioObjectLabel"
+                    | "audioComplementaryObjectGroupLabel"
+            ) && element.text.chars().count() > 256
+        })
+        .map(|element| format!("{}={} chars", element.path, element.text.chars().count()))
+        .collect::<Vec<_>>();
+    rules.push(AdmProfileRule {
+        rule_id: "TECH3393-2025-LABEL-LENGTH",
+        path: "/audioFormatExtended".into(),
+        requirement: "Tech 3393:2025 Tables 5, 16, and 23: ADM labels shall not exceed 256 characters".into(),
+        observed: if invalid_labels.is_empty() {
+            "all observed labels are at most 256 characters".into()
+        } else {
+            invalid_labels.join("; ")
+        },
+        passed: invalid_labels.is_empty(),
+    });
+}
+
+fn validate_object_structure(parsed: &ParsedAdm, rules: &mut Vec<AdmProfileRule>) {
+    for element in parsed
+        .elements
+        .iter()
+        .filter(|element| element.name == "audioObject")
+    {
+        let packs = child_count(element, "audioPackFormatIDRef");
+        let objects = child_count(element, "audioObjectIDRef");
+        let tracks = child_count(element, "audioTrackUIDRef");
+        let passed = (packs == 1 && objects == 0 && tracks > 0)
+            || (packs == 0 && objects > 0 && tracks == 0);
+        rules.push(AdmProfileRule {
+            rule_id: "TECH3393-2025-OBJECT-REFERENCE-MODE",
+            path: element.path.clone(),
+            requirement: "Tech 3393:2025 section 2.2.3: an audioObject shall reference one pack plus tracks, or child objects, but not both".into(),
+            observed: format!("pack={packs}, object={objects}, trackUID={tracks}"),
+            passed,
+        });
+    }
+}
+
+fn validate_object_graph(parsed: &ParsedAdm, rules: &mut Vec<AdmProfileRule>) {
+    let objects = parsed
+        .elements
+        .iter()
+        .enumerate()
+        .filter(|(_, element)| element.name == "audioObject")
+        .filter_map(|(index, element)| {
+            element
+                .attributes
+                .get("audioObjectID")
+                .map(|id| (id.as_str(), index))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut maximum_depth = 0;
+    let mut cyclic = Vec::new();
+    for id in objects.keys().copied() {
+        let mut visiting = HashSet::new();
+        match object_depth(parsed, &objects, id, &mut visiting) {
+            Ok(depth) => maximum_depth = maximum_depth.max(depth),
+            Err(cycle) => cyclic.push(cycle),
+        }
+    }
+    cyclic.sort();
+    cyclic.dedup();
+    rules.push(AdmProfileRule {
+        rule_id: "TECH3393-2025-OBJECT-NESTING",
+        path: "/audioFormatExtended/audioObject".into(),
+        requirement: "Tech 3393:2025 Tables 1 and 23: object references shall be acyclic and nesting shall not exceed six layers".into(),
+        observed: if cyclic.is_empty() {
+            format!("maximum nesting depth {maximum_depth}")
+        } else {
+            format!("cycle(s): {}", cyclic.join(", "))
+        },
+        passed: cyclic.is_empty() && maximum_depth <= 6,
+    });
+}
+
+fn object_depth<'a>(
+    parsed: &'a ParsedAdm,
+    objects: &HashMap<&'a str, usize>,
+    id: &'a str,
+    visiting: &mut HashSet<&'a str>,
+) -> Result<usize, String> {
+    if !visiting.insert(id) {
+        return Err(id.to_owned());
+    }
+    let Some(index) = objects.get(id).copied() else {
+        visiting.remove(id);
+        return Ok(1);
+    };
+    let children = parsed
+        .elements
+        .iter()
+        .filter(|element| element.parent == Some(index) && element.name == "audioObjectIDRef")
+        .map(|element| element.text.as_str())
+        .filter(|reference| objects.contains_key(reference))
+        .collect::<Vec<_>>();
+    let mut depth = 1;
+    for child in children {
+        depth = depth.max(1 + object_depth(parsed, objects, child, visiting)?);
+    }
+    visiting.remove(id);
+    Ok(depth)
+}
+
+fn validate_tag_groups(
+    parsed: &ParsedAdm,
+    mode: ProductionProfileMode,
+    rules: &mut Vec<AdmProfileRule>,
+) {
+    let groups = parsed
+        .elements
+        .iter()
+        .enumerate()
+        .filter(|(_, element)| element.name == "tagGroup")
+        .collect::<Vec<_>>();
+    let mut layer_groups = 0;
+    let mut other_groups = 0;
+    for (index, group) in &groups {
+        let tags = parsed
+            .elements
+            .iter()
+            .filter(|element| element.parent == Some(*index) && element.name == "tag")
+            .collect::<Vec<_>>();
+        let layer = tags.iter().any(|tag| {
+            tag.attributes.get("class").map(String::as_str) == Some("urn:profile:production:Layer")
+        });
+        if layer {
+            layer_groups += 1;
+        } else {
+            other_groups += 1;
+        }
+        let references = child_count(group, "audioProgrammeIDRef")
+            + child_count(group, "audioContentIDRef")
+            + child_count(group, "audioObjectIDRef");
+        let passed = tags.len() == 1
+            && references > 0
+            && child_count(group, "audioProgrammeIDRef") <= 1
+            && child_count(group, "audioContentIDRef") <= 128
+            && child_count(group, "audioObjectIDRef") <= 128;
+        rules.push(AdmProfileRule {
+            rule_id: "TECH3393-2025-TAG-GROUP-CHILDREN",
+            path: group.path.clone(),
+            requirement: "Tech 3393:2025 Tables 55 and 56: one tag and at least one bounded ADM reference per tagGroup".into(),
+            observed: format!("tags={}, ADM references={references}", tags.len()),
+            passed,
+        });
+    }
+    let minimum_layers = usize::from(mode == ProductionProfileMode::Write);
+    rules.push(AdmProfileRule {
+        rule_id: "TECH3393-2025-TAG-GROUP-COUNT",
+        path: "/audioFormatExtended/tagList".into(),
+        requirement: format!(
+            "Tech 3393:2025 Table 54: {minimum_layers}..=8 Layer tagGroup(s) and 0..=8 other tagGroup(s)"
+        ),
+        observed: format!("Layer={layer_groups}, other={other_groups}"),
+        passed: (minimum_layers..=8).contains(&layer_groups) && other_groups <= 8,
+    });
+}
+
+fn child_count(element: &ParsedElement, name: &str) -> usize {
+    element.children.get(name).copied().unwrap_or(0)
+}
+
+fn present(value: bool) -> &'static str {
+    if value {
+        "present"
+    } else {
+        "not present"
+    }
+}
+
 fn parse_adm(xml: &[u8]) -> Result<ParsedAdm, String> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(true);
@@ -507,19 +1224,22 @@ fn parse_adm(xml: &[u8]) -> Result<ParsedAdm, String> {
     let mut active_profiles = Vec::<(usize, usize)>::new();
     let mut active_tracks = Vec::<(usize, usize)>::new();
     let mut active_tag_groups = Vec::<(usize, usize)>::new();
+    let mut element_stack = Vec::<usize>::new();
     loop {
         match reader.read_event() {
             Ok(Event::Start(element)) => {
                 let name = local_name(element.name().as_ref());
                 stack.push(name.clone());
-                observe_element(
+                let index = observe_element(
                     &element,
                     &stack,
+                    element_stack.last().copied(),
                     &mut parsed,
                     &mut active_profiles,
                     &mut active_tracks,
                     &mut active_tag_groups,
                 )?;
+                element_stack.push(index);
             }
             Ok(Event::Empty(element)) => {
                 let name = local_name(element.name().as_ref());
@@ -527,6 +1247,7 @@ fn parse_adm(xml: &[u8]) -> Result<ParsedAdm, String> {
                 observe_element(
                     &element,
                     &stack,
+                    element_stack.last().copied(),
                     &mut parsed,
                     &mut active_profiles,
                     &mut active_tracks,
@@ -542,6 +1263,9 @@ fn parse_adm(xml: &[u8]) -> Result<ParsedAdm, String> {
             }
             Ok(Event::Text(text)) => {
                 let value = text.as_ref().trim().to_owned();
+                if let Some(index) = element_stack.last() {
+                    parsed.elements[*index].text.push_str(&value);
+                }
                 if let Some((_, index)) = active_profiles.last() {
                     parsed.profiles[*index].text.push_str(&value);
                 }
@@ -557,6 +1281,7 @@ fn parse_adm(xml: &[u8]) -> Result<ParsedAdm, String> {
                     &mut active_tag_groups,
                 );
                 stack.pop();
+                element_stack.pop();
             }
             Ok(Event::Eof) => break,
             Err(error) => {
@@ -568,7 +1293,7 @@ fn parse_adm(xml: &[u8]) -> Result<ParsedAdm, String> {
             _ => {}
         }
     }
-    if !stack.is_empty() {
+    if !stack.is_empty() || !element_stack.is_empty() {
         return Err("XML ended with unclosed elements".into());
     }
     Ok(parsed)
@@ -577,12 +1302,14 @@ fn parse_adm(xml: &[u8]) -> Result<ParsedAdm, String> {
 fn observe_element(
     element: &quick_xml::events::BytesStart<'_>,
     stack: &[String],
+    parent: Option<usize>,
     parsed: &mut ParsedAdm,
     active_profiles: &mut Vec<(usize, usize)>,
     active_tracks: &mut Vec<(usize, usize)>,
     active_tag_groups: &mut Vec<(usize, usize)>,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let name = stack.last().map(String::as_str).unwrap_or_default();
+    let observed_name = canonical_element_name(name);
     let path = xml_path(stack);
     let mut attributes = HashMap::new();
     for attribute in element.attributes() {
@@ -615,6 +1342,21 @@ fn observe_element(
         }
         attributes.insert(key, value);
     }
+    let index = parsed.elements.len();
+    if let Some(parent) = parent {
+        *parsed.elements[parent]
+            .children
+            .entry(observed_name.to_owned())
+            .or_default() += 1;
+    }
+    parsed.elements.push(ParsedElement {
+        name: observed_name.to_owned(),
+        path: path.clone(),
+        parent,
+        attributes: attributes.clone(),
+        children: HashMap::new(),
+        text: String::new(),
+    });
     if name == "audioFormatExtended" {
         parsed
             .roots
@@ -653,7 +1395,7 @@ fn observe_element(
     } else if name == "audioMXFLookUp" {
         parsed.deprecated_mxf_lookups.push(path);
     }
-    Ok(())
+    Ok(index)
 }
 
 fn close_depth(
@@ -677,6 +1419,14 @@ fn local_name(name: &str) -> String {
     name.rsplit(':').next().unwrap_or(name).to_owned()
 }
 
+fn canonical_element_name(name: &str) -> &str {
+    if name.starts_with("audioBlockFormat") {
+        "audioBlockFormat"
+    } else {
+        name
+    }
+}
+
 fn xml_path(stack: &[String]) -> String {
     format!("/{}", stack.join("/"))
 }
@@ -692,18 +1442,15 @@ fn duplicate_ids(ids: &[ParsedId]) -> Vec<String> {
     duplicates
 }
 
-fn is_supported_adm_version(value: &str) -> bool {
-    matches!(
-        value,
-        "ITU-R_BS.2076-1" | "ITU-R_BS.2076-2" | "ITU-R_BS.2076-3"
-    )
+fn is_production_profile_adm_version(value: &str) -> bool {
+    matches!(value, "ITU-R_BS.2076-2" | "ITU-R_BS.2076-3")
 }
 
 fn valid_adm_id(element: &str, value: &str) -> bool {
     let specification: Option<(&str, &[usize])> = match element {
         "audioPackFormat" => Some(("AP", &[8])),
         "audioChannelFormat" => Some(("AC", &[8])),
-        "audioBlockFormat" => Some(("AB", &[8, 8])),
+        element if element.starts_with("audioBlockFormat") => Some(("AB", &[8, 8])),
         "audioStreamFormat" => Some(("AS", &[8])),
         "audioTrackFormat" => Some(("AT", &[8, 2])),
         "audioProgramme" => Some(("APR", &[4])),
@@ -1086,21 +1833,32 @@ mod tests {
         .unwrap();
     }
 
+    const VALID_TECH3393_AXML: &[u8] = br#"<audioFormatExtended version="ITU-R_BS.2076-3">
+  <profileList>
+    <profile profileName="EBU Production Profile" profileVersion="1.0" profileLevel="1">EBU Tech 3393</profile>
+  </profileList>
+  <tagList><tagGroup><tag class="urn:profile:production:Layer">1</tag><audioProgrammeIDRef>APR_1001</audioProgrammeIDRef></tagGroup></tagList>
+  <audioProgramme audioProgrammeID="APR_1001" audioProgrammeName="Programme">
+    <audioContentIDRef>ACO_1001</audioContentIDRef>
+  </audioProgramme>
+  <audioContent audioContentID="ACO_1001" audioContentName="Content">
+    <audioObjectIDRef>AO_1001</audioObjectIDRef><dialogue>1</dialogue>
+  </audioContent>
+  <audioObject audioObjectID="AO_1001" audioObjectName="Object" importance="10" interact="0">
+    <audioPackFormatIDRef>AP_00010001</audioPackFormatIDRef>
+    <audioTrackUIDRef>ATU_00000001</audioTrackUIDRef>
+  </audioObject>
+  <audioTrackUID UID="ATU_00000001">
+    <audioChannelFormatIDRef>AC_00010001</audioChannelFormatIDRef>
+    <audioPackFormatIDRef>AP_00010001</audioPackFormatIDRef>
+  </audioTrackUID>
+</audioFormatExtended>"#;
+
     #[test]
     fn production_profile_write_mode_requires_tech3393_declaration() {
         let work = tempfile::tempdir().unwrap();
         let input = work.path().join("production.bw64");
-        write_adm_fixture(
-            &input,
-            br#"<audioFormatExtended version="ITU-R_BS.2076-3">
-  <profileList>
-    <profile profileName="EBU Production Profile" profileVersion="1.0" profileLevel="1">EBU Tech 3393</profile>
-  </profileList>
-  <audioTrackFormat audioTrackFormatID="AT_00010001_01">
-    <audioStreamFormatIDRef>AS_00010001</audioStreamFormatIDRef>
-  </audioTrackFormat>
-</audioFormatExtended>"#,
-        );
+        write_adm_fixture(&input, VALID_TECH3393_AXML);
         let result = validate_production_profile(&input, ProductionProfileMode::Write).unwrap();
         assert!(result.passed, "{:#?}", result.rules);
         assert_eq!(result.standard, "EBU Tech 3393");
@@ -1112,16 +1870,7 @@ mod tests {
     fn chna_accepts_zero_filled_unused_record_capacity() {
         let work = tempfile::tempdir().unwrap();
         let input = work.path().join("reserved-chna-capacity.bw64");
-        write_adm_fixture_with_unused_records(
-            &input,
-            br#"<audioFormatExtended version="ITU-R_BS.2076-3">
-  <profileList>
-    <profile profileName="EBU Production Profile" profileVersion="1.0" profileLevel="1">EBU Tech 3393</profile>
-  </profileList>
-  <audioTrackUID UID="ATU_00000001"/>
-</audioFormatExtended>"#,
-            2,
-        );
+        write_adm_fixture_with_unused_records(&input, VALID_TECH3393_AXML, 2);
 
         let result = validate_production_profile(&input, ProductionProfileMode::Write).unwrap();
         assert!(result.passed, "{:#?}", result.rules);
@@ -1147,7 +1896,7 @@ mod tests {
         let result = validate_production_profile(&input, ProductionProfileMode::Write).unwrap();
         assert!(!result.passed);
         assert!(result.rules.iter().any(|rule| {
-            rule.rule_id == "TECH3393-TABLE51-PROFILE-NAME"
+            rule.rule_id == "TECH3393-2025-PROFILE-NAME"
                 && rule.path.ends_with("/@profileName")
                 && !rule.passed
         }));
@@ -1169,14 +1918,13 @@ mod tests {
         );
         let result = validate_production_profile(&input, ProductionProfileMode::Read).unwrap();
         assert!(!result.passed);
+        assert!(result.rules.iter().any(|rule| {
+            rule.rule_id == "TECH3393-2025-TRACK-STREAM-REFERENCE" && !rule.passed
+        }));
         assert!(result
             .rules
             .iter()
-            .any(|rule| { rule.rule_id == "TECH3393-TABLE49-STREAM-REFERENCE" && !rule.passed }));
-        assert!(result
-            .rules
-            .iter()
-            .any(|rule| { rule.rule_id == "TECH3393-TABLE50-PROFILE-IDENTIFIER" && rule.passed }));
+            .any(|rule| { rule.rule_id == "TECH3393-2025-PROFILE-IDENTIFIER" && rule.passed }));
     }
 
     #[test]
@@ -1189,19 +1937,23 @@ mod tests {
   <profileList>
     <profile profileName="EBU Production Profile" profileVersion="1.0" profileLevel="1">EBU Tech 3393</profile>
   </profileList>
-  <tagList><tagGroup><tag class="genre">Speech</tag><audioObjectIDRef>AO_1001</audioObjectIDRef></tagGroup></tagList>
-  <audioObject audioObjectID="AO_1001" start="00:00:00.12000S48000">
+  <tagList><tagGroup><tag class="urn:profile:production:Layer">1</tag><audioProgrammeIDRef>APR_1001</audioProgrammeIDRef></tagGroup></tagList>
+  <audioProgramme audioProgrammeID="APR_1001" audioProgrammeName="Programme"><audioContentIDRef>ACO_1001</audioContentIDRef></audioProgramme>
+  <audioContent audioContentID="ACO_1001" audioContentName="Content"><audioObjectIDRef>AO_1001</audioObjectIDRef><dialogue>1</dialogue></audioContent>
+  <audioObject audioObjectID="AO_1001" audioObjectName="Object" importance="10" interact="0" start="00:00:00.12000S48000" duration="00:00:01.00000">
+    <audioPackFormatIDRef>AP_00010001</audioPackFormatIDRef>
     <audioTrackUIDRef>ATU_00000001</audioTrackUIDRef>
   </audioObject>
   <audioTrackUID UID="ATU_00000001">
     <audioChannelFormatIDRef>AC_00010001</audioChannelFormatIDRef>
+    <audioPackFormatIDRef>AP_00010001</audioPackFormatIDRef>
   </audioTrackUID>
 </audioFormatExtended>"#,
         );
         let result = validate_production_profile(&input, ProductionProfileMode::Write).unwrap();
         assert!(result.passed, "{:#?}", result.rules);
         for rule_id in [
-            "BS2076-3-VERSION",
+            "TECH3393-2025-AFE-VERSION",
             "BS2076-3-ID-SYNTAX",
             "BS2076-3-TIME-FORMAT",
             "BS2076-3-TAG-GROUP-REFERENCE",
@@ -1235,7 +1987,7 @@ mod tests {
         let result = validate_production_profile(&input, ProductionProfileMode::Write).unwrap();
         assert!(!result.passed);
         for rule_id in [
-            "BS2076-3-VERSION",
+            "TECH3393-2025-AFE-VERSION",
             "BS2076-3-ID-SYNTAX",
             "BS2076-3-TIME-FORMAT",
             "BS2076-3-TAG-GROUP-REFERENCE",

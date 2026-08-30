@@ -30,6 +30,10 @@ Forge already provides:
   SeekHead/Cues, CRC-32, codec-private data, and Opus gapless timing.
 - Dependency-free ADTS and LOAS/LATM AAC QC, including ASC SBR/PS signalling,
   decoded timing, and ISO-BMFF edit-list/sample-group gapless reconciliation.
+  ISO-BMFF xHE-AAC additionally parses bounded MPEG-D USAC Audio Object Type 42
+  configuration, checks fMP4/sample timing, and requires UniDRC plus
+  `loudnessInfoSet` extension presence while explicitly leaving payload-profile
+  interpretation for future work.
 - Dependency-free AC-3/E-AC-3 elementary-stream QC for bounded syncframes,
   complete BSI, `dialnorm`, interpreted DRC gain words, channel mode, strict
   Atmos/JOC Extension Type A signalling, six-block access-unit and
@@ -133,6 +137,14 @@ Forge already provides:
   phase reversal, test tones, clicks, minimum average level, silence, true
   peak, hum/buzz, band-limited noise, cross-talk, panning, LFE/centre
   assignment, and mono delivery.
+- Schema-valid April 2026 EBU QC generic XML envelopes for calculated published
+  Items, with deterministic identifiers and sample edit units; complete
+  Scenario 1 Catalogue-specific input/output vocabularies remain future work.
+- September 2025 EBU Tech 3393 reading/writing structural audits covering the
+  profile declaration, bounded core ADM graph/cardinalities, identifiers,
+  references, labels, object nesting, tag groups, and `chna` reconciliation.
+- ITU-T H.872 game and handheld compliance profiles using exact gated loudness
+  extrema over every complete rolling 30-minute window and a −1 dBTP ceiling.
 - Forge-specific decoded-audio rules for DC offset, inter-channel sample
   delay, stuck samples, and discontinuities, with bounded/coalesced evidence.
 - SPDX/CycloneDX release SBOMs, verified SLSA provenance, byte-reproducible
@@ -472,4 +484,4 @@ Core loudness work continues to track
 [EBU R 128 and its supplements](https://tech.ebu.ch/loudness/), and
 [AES TD1008](https://aes.org/wp-content/uploads/2024/01/20210924_TD1008_v3.13.pdf).
 Provenance work tracks the
-[C2PA 2.2 specifications](https://spec.c2pa.org/specifications/specifications/2.2/index.html).
+[C2PA 2.4 specifications](https://spec.c2pa.org/specifications/specifications/2.4/index.html).

@@ -26,6 +26,24 @@ pub(crate) struct AscInfo {
     pub frame_samples: u16,
 }
 
+/// The delivery-relevant, bounded portion of an MPEG-D USAC configuration.
+///
+/// xHE-AAC is signalled as MPEG-4 Audio Object Type 42. Its decoder
+/// configuration is not a GASpecificConfig, so it must not be accepted by the
+/// legacy AAC parser merely because the outer AudioSpecificConfig is bounded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct UsacConfigInfo {
+    pub audio_object_type: u8,
+    pub output_sample_rate_hz: u32,
+    pub core_sbr_frame_length_index: u8,
+    pub channel_configuration_index: u8,
+    pub output_channels: u16,
+    pub frame_samples: u16,
+    pub element_count: u16,
+    pub uni_drc_config_present: bool,
+    pub loudness_info_present: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LatmStream {
     asc: AscInfo,
@@ -577,6 +595,277 @@ pub(crate) fn parse_asc_bytes(bytes: &[u8]) -> Result<AscInfo, String> {
     parse_audio_specific_config(&mut BitReader::new(bytes))
 }
 
+pub(crate) fn parse_usac_config_bytes(bytes: &[u8]) -> Result<UsacConfigInfo, String> {
+    let mut bits = BitReader::new(bytes);
+    let audio_object_type = read_audio_object_type(&mut bits)?;
+    if audio_object_type != 42 {
+        return Err(format!(
+            "AudioSpecificConfig object type {audio_object_type} is not MPEG-D USAC"
+        ));
+    }
+    let outer_sample_rate = read_sample_rate(&mut bits)?;
+    let outer_channel_configuration = bits.read(4)? as u8;
+
+    let frequency_index = bits.read(5)? as usize;
+    let output_sample_rate_hz = if frequency_index == 31 {
+        let frequency = bits.read(24)? as u32;
+        if frequency == 0 {
+            return Err("zero explicit USAC sampling frequency".into());
+        }
+        frequency
+    } else {
+        USAC_SAMPLE_RATES
+            .get(frequency_index)
+            .copied()
+            .flatten()
+            .ok_or_else(|| "reserved USAC sampling-frequency index".to_string())?
+    };
+    if output_sample_rate_hz != outer_sample_rate {
+        return Err("outer and USAC sampling frequencies disagree".into());
+    }
+
+    let core_sbr_frame_length_index = bits.read(3)? as u8;
+    let frame_samples = match core_sbr_frame_length_index {
+        0 => 768,
+        1 => 1_024,
+        2 | 3 => 2_048,
+        4 => 4_096,
+        _ => return Err("reserved USAC core/SBR frame-length index".into()),
+    };
+    let channel_configuration_index = bits.read(5)? as u8;
+    if channel_configuration_index > 15
+        || outer_channel_configuration != channel_configuration_index
+    {
+        return Err("outer and USAC channel configurations disagree".into());
+    }
+    let output_channels = match channel_configuration_index {
+        0 => {
+            let channels = read_escape_value(&mut bits, 5, 8, 16)?;
+            if !(1..=255).contains(&channels) {
+                return Err("USAC explicit channel count is outside 1..=255".into());
+            }
+            for _ in 0..channels {
+                bits.read(5)?;
+            }
+            channels as u16
+        }
+        1 => 1,
+        2 | 8 => 2,
+        _ => return Err("unsupported USAC channel-configuration index".into()),
+    };
+
+    let element_count = read_escape_value(&mut bits, 4, 8, 16)?
+        .checked_add(1)
+        .ok_or_else(|| "USAC element count overflow".to_string())?;
+    if element_count > 16 {
+        return Err("USAC configuration exceeds 16 elements".into());
+    }
+    let sbr = core_sbr_frame_length_index >= 2;
+    let mut described_channels = 0_u16;
+    let mut uni_drc_config_present = false;
+    for _ in 0..element_count {
+        match bits.read(2)? {
+            0 => {
+                described_channels = described_channels.saturating_add(1);
+                validate_xhe_tw_mdct(&mut bits)?;
+                if sbr {
+                    skip_usac_sbr_config(&mut bits)?;
+                }
+            }
+            1 => {
+                described_channels = described_channels.saturating_add(2);
+                validate_xhe_tw_mdct(&mut bits)?;
+                if sbr {
+                    skip_usac_sbr_config(&mut bits)?;
+                    let stereo_config_index = bits.read(2)? as u8;
+                    if stereo_config_index > 0 {
+                        skip_usac_mps212_config(&mut bits, stereo_config_index)?;
+                    }
+                }
+            }
+            2 => described_channels = described_channels.saturating_add(1),
+            3 => {
+                let extension_type = read_escape_value(&mut bits, 4, 8, 16)?;
+                let extension_bytes = read_escape_value(&mut bits, 4, 8, 16)?;
+                if extension_bytes >= 768 {
+                    return Err("USAC extension-element config exceeds 767 bytes".into());
+                }
+                if bits.bit()? {
+                    read_escape_value(&mut bits, 8, 16, 0)?;
+                }
+                bits.bit()?;
+                bits.skip(
+                    usize::try_from(extension_bytes)
+                        .map_err(|_| "USAC extension length overflow")?
+                        .checked_mul(8)
+                        .ok_or("USAC extension bit length overflow")?,
+                )?;
+                uni_drc_config_present |= extension_type == 4 && extension_bytes > 0;
+            }
+            _ => unreachable!(),
+        }
+        if described_channels > 2 {
+            return Err("xHE-AAC configuration exceeds the mono/stereo profile".into());
+        }
+    }
+    if described_channels != output_channels {
+        return Err(format!(
+            "USAC elements describe {described_channels} channels but the configuration declares {output_channels}"
+        ));
+    }
+
+    let mut loudness_info_present = false;
+    if bits.bit()? {
+        let extension_count = read_escape_value(&mut bits, 2, 4, 8)?
+            .checked_add(1)
+            .ok_or_else(|| "USAC config-extension count overflow".to_string())?;
+        if extension_count > 16 {
+            return Err("USAC configuration exceeds 16 config extensions".into());
+        }
+        for _ in 0..extension_count {
+            let extension_type = read_escape_value(&mut bits, 4, 8, 16)?;
+            let extension_bytes = read_escape_value(&mut bits, 4, 8, 16)?;
+            if extension_bytes > 768 {
+                return Err("USAC config extension exceeds 768 bytes".into());
+            }
+            let byte_count = usize::try_from(extension_bytes)
+                .map_err(|_| "USAC config-extension length overflow")?;
+            if extension_type == 0 {
+                for _ in 0..byte_count {
+                    if bits.read(8)? != 0xa5 {
+                        return Err("USAC fill extension contains a non-0xa5 byte".into());
+                    }
+                }
+            } else {
+                bits.skip(
+                    byte_count
+                        .checked_mul(8)
+                        .ok_or("USAC config-extension bit length overflow")?,
+                )?;
+            }
+            loudness_info_present |= extension_type == 2 && extension_bytes > 0;
+        }
+    }
+    if !bits.remaining_bits_are_zero() {
+        return Err("USAC AudioSpecificConfig has non-padding trailing bits".into());
+    }
+
+    Ok(UsacConfigInfo {
+        audio_object_type,
+        output_sample_rate_hz,
+        core_sbr_frame_length_index,
+        channel_configuration_index,
+        output_channels,
+        frame_samples,
+        element_count: element_count as u16,
+        uni_drc_config_present,
+        loudness_info_present,
+    })
+}
+
+const USAC_SAMPLE_RATES: [Option<u32>; 31] = [
+    Some(96_000),
+    Some(88_200),
+    Some(64_000),
+    Some(48_000),
+    Some(44_100),
+    Some(32_000),
+    Some(24_000),
+    Some(22_050),
+    Some(16_000),
+    Some(12_000),
+    Some(11_025),
+    Some(8_000),
+    Some(7_350),
+    None,
+    None,
+    Some(57_600),
+    Some(51_200),
+    Some(40_000),
+    Some(38_400),
+    Some(34_150),
+    Some(28_800),
+    Some(25_600),
+    Some(20_000),
+    Some(19_200),
+    Some(17_075),
+    Some(14_400),
+    Some(12_800),
+    Some(9_600),
+    None,
+    None,
+    None,
+];
+
+fn validate_xhe_tw_mdct(bits: &mut BitReader<'_>) -> Result<(), String> {
+    if bits.bit()? {
+        return Err("xHE-AAC requires tw_mdct to be zero".into());
+    }
+    bits.bit()?;
+    Ok(())
+}
+
+fn skip_usac_sbr_config(bits: &mut BitReader<'_>) -> Result<(), String> {
+    bits.skip(3 + 4 + 4)?;
+    let extra_one = bits.bit()?;
+    let extra_two = bits.bit()?;
+    if extra_one {
+        bits.skip(2 + 1 + 2)?;
+    }
+    if extra_two {
+        bits.skip(2 + 2 + 1 + 1)?;
+    }
+    Ok(())
+}
+
+fn skip_usac_mps212_config(
+    bits: &mut BitReader<'_>,
+    stereo_config_index: u8,
+) -> Result<(), String> {
+    bits.skip(3 + 3)?;
+    let temporal_shape = bits.read(2)? as u8;
+    if bits.read(2)? > 2 {
+        return Err("reserved USAC MPS decorrelation configuration".into());
+    }
+    bits.skip(1 + 1)?;
+    if bits.bit()? && bits.read(5)? > 28 {
+        return Err("USAC MPS phase bands exceed 28".into());
+    }
+    if stereo_config_index > 1 {
+        if bits.read(5)? > 28 {
+            return Err("USAC MPS residual bands exceed 28".into());
+        }
+        bits.bit()?;
+    }
+    if temporal_shape == 2 {
+        bits.bit()?;
+    }
+    Ok(())
+}
+
+fn read_escape_value(
+    bits: &mut BitReader<'_>,
+    first_bits: usize,
+    second_bits: usize,
+    third_bits: usize,
+) -> Result<u64, String> {
+    let first_max = (1_u64 << first_bits) - 1;
+    let second_max = (1_u64 << second_bits) - 1;
+    let mut value = bits.read(first_bits)?;
+    if value == first_max {
+        let second = bits.read(second_bits)?;
+        value = value
+            .checked_add(second)
+            .ok_or_else(|| "USAC escaped value overflow".to_string())?;
+        if second == second_max && third_bits > 0 {
+            value = value
+                .checked_add(bits.read(third_bits)?)
+                .ok_or_else(|| "USAC escaped value overflow".to_string())?;
+        }
+    }
+    Ok(value)
+}
+
 fn parse_audio_specific_config(bits: &mut BitReader<'_>) -> Result<AscInfo, String> {
     let initial_audio_object_type = read_audio_object_type(bits)?;
     let core_sample_rate = read_sample_rate(bits)?;
@@ -850,6 +1139,21 @@ mod tests {
         fn bytes(self) -> Vec<u8> {
             self.bytes
         }
+
+        fn write_escape(&mut self, mut value: u64, first: usize, second: usize, third: usize) {
+            for width in [first, second, third] {
+                if width == 0 {
+                    break;
+                }
+                let maximum = (1_u64 << width) - 1;
+                let part = value.min(maximum);
+                self.write(part, width);
+                if part < maximum {
+                    break;
+                }
+                value -= part;
+            }
+        }
     }
 
     fn adts_frame(
@@ -1011,5 +1315,54 @@ mod tests {
         assert!(implicit.ps_present);
         assert_eq!(implicit.output_sample_rate_hz, 44_100);
         assert_eq!(implicit.output_channels, Some(2));
+    }
+
+    #[test]
+    fn parses_bounded_xhe_aac_usac_and_metadata_extensions() {
+        let mut bits = BitWriter::default();
+        bits.write(31, 5); // escaped Audio Object Type
+        bits.write(10, 6); // 32 + 10 = USAC (42)
+        bits.write(3, 4); // outer 48 kHz
+        bits.write(2, 4); // outer stereo
+        bits.write(3, 5); // USAC 48 kHz
+        bits.write(1, 3); // 1024 samples, no SBR
+        bits.write(2, 5); // USAC stereo
+        bits.write_escape(1, 4, 8, 16); // two elements minus one
+        bits.write(1, 2); // channel-pair element
+        bits.write(0, 1); // xHE tw_mdct
+        bits.write(1, 1); // noise filling
+        bits.write(3, 2); // extension element
+        bits.write_escape(4, 4, 8, 16); // MPEG-D UniDRC
+        bits.write_escape(1, 4, 8, 16); // one config byte
+        bits.write(0, 1); // no default payload length
+        bits.write(0, 1); // payload fragmentation flag
+        bits.write(0, 8); // bounded UniDRC configuration payload
+        bits.write(1, 1); // usacConfigExtensionPresent
+        bits.write_escape(0, 2, 4, 8); // one extension minus one
+        bits.write_escape(2, 4, 8, 16); // loudnessInfoSet
+        bits.write_escape(1, 4, 8, 16); // one payload byte
+        bits.write(0, 8);
+
+        let config = parse_usac_config_bytes(&bits.bytes()).unwrap();
+        assert_eq!(config.audio_object_type, 42);
+        assert_eq!(config.output_sample_rate_hz, 48_000);
+        assert_eq!(config.output_channels, 2);
+        assert_eq!(config.frame_samples, 1_024);
+        assert_eq!(config.element_count, 2);
+        assert!(config.uni_drc_config_present);
+        assert!(config.loudness_info_present);
+    }
+
+    #[test]
+    fn xhe_aac_rejects_outer_usac_configuration_mismatch() {
+        let mut bits = BitWriter::default();
+        bits.write(31, 5);
+        bits.write(10, 6);
+        bits.write(3, 4); // outer 48 kHz
+        bits.write(2, 4);
+        bits.write(4, 5); // USAC 44.1 kHz
+        bits.write(1, 3);
+        bits.write(2, 5);
+        assert!(parse_usac_config_bytes(&bits.bytes()).is_err());
     }
 }

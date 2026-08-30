@@ -54,6 +54,7 @@ pub mod downmix_qc;
 pub mod dsd;
 pub mod dsp;
 pub mod dts_adapter;
+pub mod ebu_qc_report;
 mod flac_qc;
 pub mod flacenc;
 pub mod hls_qc;

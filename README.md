@@ -344,9 +344,9 @@ limits, path safety, optional codec requirements, schemas, and exit status.
 * **EBU Mode analysis** reports Integrated, maximum Momentary (400 ms), maximum
   Short-term (3 s), and Loudness Range (LRA) measurements.
 * **Delivery compliance reports** include EBU R 128, ATSC A/85 short- and
-  long-form, and AES77 presets plus custom JSON/TOML profiles. Every evaluated
-  rule and the aggregate PASS/FAIL result are available in machine-readable
-  reports.
+  long-form, ARIB TR-B32, AES77, and ITU-T H.872 game-audio presets plus custom
+  JSON/TOML profiles. Every evaluated rule and the aggregate PASS/FAIL result
+  are available in machine-readable reports.
 * **True peak** is measured by 4× polyphase FIR oversampling (Kaiser-windowed
   lowpass, unity DC gain), so inter-sample peaks that exceed sample peaks are
   caught — and the gain is reduced so the output never clips after DAC
@@ -924,9 +924,14 @@ Track user data is also inspected for ISO/IEC 14496-12 `ludt`, `tlou`, and
 entry counts, track/album uniqueness, peak provenance, and every MPEG-D DRC
 measurement tuple are validated and exposed in JSON. MPEG-D DRC `udc1`/`udi1`
 and `udc2`/`udi2` sample-entry boxes are structurally checked and required to
-occur as coefficient/instruction pairs when present. This supplies the
-container evidence needed by later Apple HLS and xHE-AAC delivery profiles
-without treating optional metadata as mandatory for every MP4 file.
+occur as coefficient/instruction pairs when present. MPEG-D USAC/xHE-AAC
+Audio Object Type 42 receives a separate bounded decoder-configuration audit:
+Forge requires fragmented MP4 carriage, checks the output sample rate, channel
+configuration, frame geometry, access-unit timing, and requires non-empty
+UniDRC and `loudnessInfoSet` configuration extensions. The extension payloads
+are retained only as presence evidence; their Basic Loudness profile fields,
+effects, and peak values are not yet decoded or certified. Ordinary AAC and
+MP4 files are not made to require this xHE-specific metadata.
 Top-level CMAF `emsg` boxes using `https://aomedia.org/emsg/ID3` are also
 validated as version 1 event messages with a positive timescale and one
 complete ID3v2.4 tag. ID3 frame bounds and `RVA2` channel adjustments are
@@ -964,7 +969,7 @@ trust-list network access occurs only when the user explicitly supplies a URL.
 The report follows `schema/provenance-qc-v1.schema.json`; exit status is 0 for a
 policy pass, 1 for missing/invalid/untrusted credentials, and 2 for tool,
 configuration, or I/O errors. See the
-[C2PA 2.2 specification](https://spec.c2pa.org/specifications/specifications/2.2/specs/C2PA_Specification.html)
+[C2PA 2.4 specification](https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html)
 and [official c2patool documentation](https://github.com/contentauth/c2pa-rs/blob/main/cli/docs/usage.md).
 
 ### HLS and CMAF package QC
@@ -1472,6 +1477,12 @@ forge --analyze programme.wav --ebu-qc --expected-duration 1800 \
   --expected-channels 2 \
   --manifest delivery.json
 
+# Export calculated published Items in the EBU QC 2026-04 XML envelope
+forge --analyze programme.wav --ebu-qc --ebu-qc-xml reports/ebu-qc.xml
+
+# Check every complete rolling 30-minute game-audio window
+forge --analyze game-capture.wav --compliance itu-h872-game --json
+
 # Measure explicit dialogue/anchor regions for ATSC A/85 long-form delivery
 forge --analyze programme.wav --compliance atsc-a85-long \
   --dialogue-ranges dialogue.toml --json
@@ -1697,6 +1708,7 @@ backup behavior.
 | `--codec-reference` | none | Unencoded reference for loudness/peak/duration round-trip comparison |
 | `--codec-qc-tolerance` | `0.5` | Allowed codec/dialnorm deviation in LU/dB |
 | `--ebu-qc` | off | Run published EBU baseband QC Items |
+| `--ebu-qc-xml` | none | Write a schema-valid EBU QC 2026-04 generic XML envelope for one input |
 | `--silence-threshold` | `-60` | EBU 0078B silence threshold in dBFS |
 | `--silence-duration` | `1` | Minimum silence duration in seconds |
 | `--clipping-samples` | `3` | Consecutive full-scale samples for EBU 0005B |
@@ -1772,6 +1784,15 @@ Every rule retains at most 10,000 coalesced events and reports
 delivery profile can trade sensitivity against false positives. EBU Item
 versions and `source_url` fields follow the current
 [EBU QC API v2](https://qc.ebu.io/help/api) catalogue.
+
+For one input, `--ebu-qc-xml PATH` exports calculated published Items in the
+April 2026 EBU QC XML namespace, with a SHA-256 content identifier,
+deterministic instance identifiers, UTC source timestamp, and sample edit
+rate. The output validates against the generic EBU QC data-model XSD. It
+deliberately does not claim complete Scenario 1 Catalogue-vocabulary
+conformance: Forge's lossless JSON report remains the source for Item-specific
+thresholds, measurements, and event details that are not represented by the
+generic XML fields.
 
 > Negative values need `=`: `--target=-16` (clap parses `-16` as a flag otherwise).
 
@@ -1861,6 +1882,8 @@ device; always prefer a distributor's current delivery specification.
 | `atsc-a85-long` | −24 ±2 LKFS/LUFS, explicit dialogue regions | true peak ≤ −2 dBTP |
 | `arib-tr-b32` | −24 ±1 LKFS/LUFS | ARIB TR-B32 1.6 completed-programme delivery; true peak ≤ −1 dBTP |
 | `arib-tr-b32-creative` | ≤ −23 LKFS/LUFS | explicitly signalled creative lower-target exception; true peak ≤ −1 dBTP |
+| `itu-h872-game` | every complete rolling 30-minute window: −23 ±2 LUFS | ITU-T H.872 game audio; true peak ≤ −1 dBTP; capture must contain a complete window |
+| `itu-h872-handheld` | every complete rolling 30-minute window: −18 ±2 LUFS | ITU-T H.872 handheld alternative; true peak ≤ −1 dBTP; capture must contain a complete window |
 | `aes77-assorted` | ≤ −16 LUFS (target −18, upper tolerance +2) | true peak ≤ −1 dBTP |
 | `aes77-music-track` | −16.0 ±0.2 LUFS | true peak ≤ −1 dBTP |
 | `aes77-interstitial` | −18.0 ±0.2 LUFS | true peak ≤ −1 dBTP |
@@ -1880,6 +1903,14 @@ without the BS.1770-2+ relative-level gate. Region energies are duration
 weighted. Reports identify the measurement standard and method explicitly.
 Forge does not silently guess dialogue: use explicit regions or opt into the
 auditable detector with `--auto-dialogue`.
+
+The ITU-T H.872 profiles evaluate every overlapping population of complete
+BS.1770 gating blocks spanning 30 minutes. Forge maintains the gated block
+population in `O(n log n)` time, reports both the minimum and maximum rolling
+integrated loudness, and fails short captures instead of substituting a
+different measurement interval. The handheld preset implements the standard's
+digital loudness alternative; it does not infer acoustic headphone SPL from
+uncalibrated PCM.
 
 For cinematic EBU R 128 s4 QC, use
 `--compliance ebu-r128-cinematic --dialogue-ranges dialogue.json`. This selects
@@ -2256,8 +2287,8 @@ referenced by `axml`, and measures its explicit one-based channel selection.
 Reports label this as `direct-channel-map (no ADM object renderer)` so a channel
 selection is never misrepresented as a full object-based render.
 
-EBU Tech 3393 Production Profile auditing is available without an external
-renderer:
+The September 2025 EBU Tech 3393 Production Profile audit is available without
+an external renderer:
 
 ```sh
 forge --analyze programme.bw64 --adm-profile ebu-production \
@@ -2265,16 +2296,21 @@ forge --analyze programme.bw64 --adm-profile ebu-production \
 ```
 
 The validator distinguishes the profile's reading and writing requirements. It
-checks well-formed `axml`, profileList/profile cardinality, the `EBU Tech 3393`
-identifier, required profile name/version/level attributes, unique ADM IDs, and
-the Table 49 audioTrackFormat stream reference rule. The same audit validates
-the current ITU-R BS.2076-3 model version, element-specific ID syntax, local
-content/track references, decimal and fractional-sample time syntax, tagList
-constraints, removal of the deprecated `audioMXFLookUp`, and `chna` structure,
-track coverage, UID uniqueness, and `axml` cross-references. Every result
-records its rule ID, ADM path, requirement, observation, validator version, and
+checks well-formed `axml`, the 2025 profile declaration/cardinalities,
+BS.2076-2/-3 model versions, bounded programme/content/object/pack/channel/
+stream/track/UID structure, required attributes, element-specific ID and type
+syntax, names and labels, local references, object nesting/cycles, pack-versus-
+child object alternatives, decimal and fractional-sample time syntax, the
+Table 51 track/stream relationship, tag-group limits, removal of deprecated
+`audioMXFLookUp`, and `chna` coverage and cross-references. Every result records
+its rule ID, ADM path, requirement, observation, validator version, and
 pass/fail state. External common-definition references are reported but are not
 incorrectly rejected merely because they are not embedded in `axml`.
+
+This is a broad machine-checkable structural audit, not a claim that every
+conditional coordinate, timing sequence, language, and concurrent-object rule
+in all normative Tech 3393 tables has been certified. A full render remains
+necessary for presentation-dependent behaviour.
 
 Full object/scene presentation QC uses the EBU ADM Toolbox reference
 implementation:
