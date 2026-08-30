@@ -53,7 +53,7 @@ LIMITER_CASES = (
     "wav-stereo-limiter-idle",
     "wav-stereo-limiter-active",
 )
-OPTIONAL_CASES = (*DSD_CASES, *OPUS_CASES, *LIMITER_CASES)
+OPTIONAL_CASES = (*DSD_CASES, *OPUS_CASES, *LIMITER_CASES, "wav-stereo-s24-normalize")
 ALL_CASES = (*DEFAULT_CASES, *OPTIONAL_CASES)
 MAX_DURATION_SECONDS = 3_600
 MAX_PATHOLOGICAL_CHUNKS = 100_001
@@ -372,6 +372,10 @@ def sanitized_command(case_id: str) -> list[str]:
         "wav-stereo-normalize": [
             "forge", "<input.wav>", "--overwrite", "-o", "<output.wav>"
         ],
+        "wav-stereo-s24-normalize": [
+            "forge", "<input.wav>", "--bits", "24", "--overwrite", "-o",
+            "<output.wav>",
+        ],
         "wav-stereo-verify": [
             "forge", "<input.wav>", "--verify", "--overwrite", "-o", "<output.wav>"
         ],
@@ -450,6 +454,7 @@ def case_spec(case_id: str) -> tuple[str, str, int, str]:
     specs = {
         "wav-stereo-analyze": ("lossless", "wav", 2, "analyze"),
         "wav-stereo-normalize": ("lossless", "wav", 2, "normalize"),
+        "wav-stereo-s24-normalize": ("lossless", "wav", 2, "normalize"),
         "wav-stereo-verify": ("lossless", "wav", 2, "normalize"),
         "wav-stereo-limiter-idle": ("lossless", "wav", 2, "normalize"),
         "wav-stereo-limiter-active": ("lossless", "wav", 2, "normalize"),
@@ -637,6 +642,8 @@ def run_case(
                 if case_id == "wav-stereo-resample-normalize":
                     output_sample_rate = 48_000 if sample_rate != 48_000 else 44_100
                     command += ["--sample-rate", str(output_sample_rate)]
+                if case_id == "wav-stereo-s24-normalize":
+                    command += ["--bits", "24"]
                 if channels == 8:
                     command += ["--channel-layout", "7.1"]
                 command += ["--overwrite", "-o", str(output_path)]
