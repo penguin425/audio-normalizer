@@ -9,7 +9,7 @@ clipping, and true-peak ceiling risk for every requested profile.
 This is an engineering QC profile, not a normative Dolby, MPEG-H, IAMF, or
 ITU renderer. Object metadata, renderer-specific downmix metadata, speaker
 calibration, HRTF/binaural rendering, and codec decoding remain outside this
-command. Use [`forge-presentation-qc`](README.md#immersive-presentation-qc)
+command. Use [`forge-presentation-qc`](DOCUMENTATION.md#command-line-tools)
 to audit an externally rendered presentation, and provide its renderer and
 model/version evidence separately.
 
