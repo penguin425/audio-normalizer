@@ -13,6 +13,7 @@ use forge_normalizer::codec_qc;
 use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::dsp::resample::ResampleQuality;
 use forge_normalizer::ebu_qc_report;
+use forge_normalizer::ebu_qc_scenario1;
 use forge_normalizer::normalization_diff::{
     self, NormalizationDifferenceAsset, NormalizationDifferenceReport,
 };
@@ -253,7 +254,7 @@ fn main() -> ExitCode {
                 .value_parser(clap::value_parser!(PathBuf))
                 .requires("ebu_qc")
                 .conflicts_with("watch")
-                .help("Write a schema-valid EBU QC 2026-04 generic XML envelope for one input"),
+                .help("Write an EBU QC 2026-04 Scenario 1 XML report for one input"),
         )
         .get_matches();
     let true_peak_backend = matches
@@ -913,13 +914,20 @@ fn run_paths(
         let mut ebu_qc_xml_output = None;
         let mut qc_failed = false;
         for input in &cli.inputs {
+            let analysis_timeline_interval_ms = if cli.timeline.is_some() {
+                Some(cli.timeline_interval_ms)
+            } else if ebu_qc_xml.is_some() {
+                Some(40.0)
+            } else {
+                None
+            };
             let timed = analyze_range_cached(
                 analysis_cache.as_ref(),
                 input,
                 channel_roles_override.as_deref(),
                 start_seconds,
                 cli.duration_seconds,
-                cli.timeline.as_ref().map(|_| cli.timeline_interval_ms),
+                analysis_timeline_interval_ms,
             )?;
             let an = timed.analysis;
             let detection = cli
@@ -1045,7 +1053,14 @@ fn run_paths(
                     .expect("--ebu-qc-xml requires EBU QC analysis");
                 ebu_qc_xml_output = Some((
                     ebu_qc_report::EbuQcReportMetadata::from_file(input, &an)?,
+                    an.clone(),
+                    ebu_qc_options
+                        .as_ref()
+                        .expect("--ebu-qc-xml requires EBU QC options")
+                        .clone(),
                     results.clone(),
+                    timed.timeline.clone(),
+                    analysis_timeline_interval_ms.expect("--ebu-qc-xml always captures a timeline"),
                 ));
             }
             if adm_qc.as_ref().is_some_and(|result| !result.passed) {
@@ -1440,12 +1455,21 @@ fn run_paths(
                 std::fs::create_dir_all(parent)
                     .map_err(|error| format!("create {}: {error}", parent.display()))?;
             }
-            let (metadata, results) = ebu_qc_xml_output
-                .as_ref()
-                .expect("EBU QC XML analysis always produces report data");
+            let (metadata, analysis, options, results, timeline, timeline_interval_ms) =
+                ebu_qc_xml_output
+                    .as_ref()
+                    .expect("EBU QC XML analysis always produces report data");
             let file = File::create(path)
                 .map_err(|error| format!("create {}: {error}", path.display()))?;
-            ebu_qc_report::write_xml(file, metadata, results)?;
+            ebu_qc_scenario1::write_xml(
+                file,
+                metadata,
+                analysis,
+                options,
+                results,
+                timeline,
+                *timeline_interval_ms,
+            )?;
         }
         write_catalogue_report(
             catalogue.as_ref(),
