@@ -421,9 +421,10 @@ re-render from the original input without compounding lossy generations.
 
 - `forge-metadata-repair` now derives ISO-BMFF `ludt/tlou` programme loudness,
   sample peak, and true peak from bounded decoded PCM. It preserves `mdat`
-  payloads by hash, retains album loudness, adjusts affected `stco/co64`
-  offsets, and fails closed for presentation codecs and unsupported offset
-  mechanisms.
+  payloads by hash, adjusts affected `stco/co64` offsets, and fails closed for
+  presentation codecs and unsupported offset mechanisms. Schema v2 derives
+  `alou` from the combined population of complete 400 ms blocks across a
+  bounded, de-duplicated album reference list.
 - Extend metadata-only normalization only when another container has a
   standardized, widely honoured mechanism; avoid private gain fields.
 

@@ -33,7 +33,7 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<bool, String> {
-    let report = forge_normalizer::metadata_repair::evaluate_extended_file(&cli.request)?;
+    let report = forge_normalizer::metadata_repair::evaluate_versioned_file(&cli.request)?;
     let mut bytes = if cli.compact {
         serde_json::to_vec(&report)
     } else {
@@ -51,13 +51,13 @@ fn run(cli: Cli) -> Result<bool, String> {
     }
     eprintln!(
         "forge-metadata-repair: {} ({}, {} action(s))",
-        if report.report.passed {
+        if report.report().passed {
             "PASS"
         } else {
             "REVIEW REQUIRED"
         },
-        report.report.source_format,
-        report.report.actions.len()
+        report.report().source_format,
+        report.report().actions.len()
     );
-    Ok(report.report.passed)
+    Ok(report.report().passed)
 }
