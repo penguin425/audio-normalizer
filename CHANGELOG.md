@@ -21,7 +21,8 @@ tags and keeps public compatibility commitments in
 
 ### Changed
 
-- Cancel superseded pull-request CI, supply-chain, and fuzz workflows.
+- Cancel superseded pull-request CI, supply-chain, and fuzz workflows, and
+  start optional cross-platform jobs only after the required Rust gate passes.
 - Publish releases through a tag-restricted GitHub environment and include the
   maintenance policies in release archives.
 - Select the highest published semantic version as GitHub's Latest release,
