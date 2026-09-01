@@ -24,6 +24,7 @@ forge-container-qc --help
 
 - [EBU QC Scenario 1 XML reports](EBU-QC-SCENARIO1.md)
 - [ATSC A/85 streaming-service QC](ATSC-A85-SERVICE-QC.md)
+- [ADM programme and complementary-presentation QC](ADM-PRESENTATION-QC.md)
 - [Binaural renderer QC](BINAURAL-QC.md)
 - [Immersive downmix QC](IMMERSIVE-DOWNMIX.md)
 - [External anomaly-provider protocol](ANOMALY-ADAPTER.md)
@@ -60,7 +61,7 @@ The release contains the main `forge` normalizer plus focused binaries:
 | Streaming and comparison | `forge-live`, `forge-compare`, `forge-audio-compare` |
 | Containers and packages | `forge-container-qc`, `forge-streaming-qc`, `forge-imf-qc`, `forge-aes31-qc`, `forge-provenance-qc` |
 | Network delivery | `forge-rtp-qc`, `forge-st2022-7-qc`, `forge-nmos-qc`, `forge-remote-qc` |
-| Immersive and codecs | `forge-presentation-qc`, `forge-downmix-qc`, `forge-binaural-qc`, `forge-sadm-qc`, `forge-ac4-qc`, `forge-dts-qc`, `forge-mpegh-qc` |
+| Immersive and codecs | `forge-adm-presentation-qc`, `forge-presentation-qc`, `forge-downmix-qc`, `forge-binaural-qc`, `forge-sadm-qc`, `forge-ac4-qc`, `forge-dts-qc`, `forge-mpegh-qc` |
 | Automation | `forge-multi-delivery`, `forge-segment-normalize`, `forge-remediate`, `forge-metadata-repair`, `forge-report`, `forge-service` |
 | Providers | `forge-dialogue-provider`, `forge-anomaly-provider`, `forge-onnx-provider` |
 

@@ -1,6 +1,6 @@
 [package]
 name = "forge-normalizer"
-version = "0.177.0"
+version = "0.178.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer (WAV/MP3/FLAC/Opus/AAC/Vorbis)"
@@ -74,6 +74,10 @@ path = "src/bin/forge-streaming-qc.rs"
 [[bin]]
 name = "forge-presentation-qc"
 path = "src/bin/forge-presentation-qc.rs"
+
+[[bin]]
+name = "forge-adm-presentation-qc"
+path = "src/bin/forge-adm-presentation-qc.rs"
 
 [[bin]]
 name = "forge-downmix-qc"
