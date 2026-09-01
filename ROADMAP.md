@@ -412,8 +412,12 @@ re-render from the original input without compounding lossy generations.
 
 ### Immersive, personalized, and accessible audio
 
-- Validate every ADM programme/content/object presentation, not only the
-  default render.
+- `forge-adm-presentation-qc` now enumerates every ADM `audioProgramme` and the
+  Cartesian product of its complementary-object groups, renders each selection
+  with the EBU `ear-render` BS.2127 implementation, and independently measures
+  loudness, true peak, duration, and channel geometry. Expansion, process
+  output, timeout, decoded samples, and retained files are bounded; hashes bind
+  the input, renderer, and every render to the versioned evidence report.
 - `forge-downmix-qc` now measures deterministic WAVE-order stereo/5.1/7.1.4
   profiles with explicit matrices, loudness/true-peak deltas, and clip-risk
   gates. User-selected speaker layouts remain future renderer-adapter work.
