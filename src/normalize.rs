@@ -2910,14 +2910,25 @@ fn writes_album_loudness_tags(format: OutputFormat) -> bool {
     )
 }
 
-fn album_loudness_metadata(analyses: &[Analysis]) -> (f64, f32) {
-    (
-        album_lufs(analyses),
-        analyses
+#[derive(Clone, Copy)]
+struct AlbumLoudnessMetadata {
+    lufs: f64,
+    sample_peak: f32,
+    true_peak: f32,
+}
+
+fn album_loudness_metadata(analyses: &[Analysis]) -> AlbumLoudnessMetadata {
+    AlbumLoudnessMetadata {
+        lufs: album_lufs(analyses),
+        sample_peak: analyses
+            .iter()
+            .map(|analysis| analysis.sample_peak)
+            .fold(0.0_f32, f32::max),
+        true_peak: analyses
             .iter()
             .map(|analysis| analysis.true_peak)
             .fold(0.0_f32, f32::max),
-    )
+    }
 }
 
 fn finalize_metadata(
@@ -2926,7 +2937,7 @@ fn finalize_metadata(
     format: OutputFormat,
     measured_output: Option<&Analysis>,
     _track_lufs: f64,
-    album: Option<(f64, f32)>,
+    album: Option<AlbumLoudnessMetadata>,
     plan: &Plan,
 ) -> Result<(), String> {
     metadata::copy_metadata(input, output)?;
@@ -2938,11 +2949,7 @@ fn finalize_metadata(
         #[cfg(feature = "opus-encoding")]
         {
             let track_lufs = measured_output.map_or(_track_lufs, |measured| measured.lufs);
-            crate::opus::rewrite_r128_tags(
-                output,
-                track_lufs,
-                album.map(|(album_lufs, _)| album_lufs),
-            )?;
+            crate::opus::rewrite_r128_tags(output, track_lufs, album.map(|album| album.lufs))?;
         }
     }
     if matches!(
@@ -2950,7 +2957,19 @@ fn finalize_metadata(
         OutputFormat::M4a | OutputFormat::Alac | OutputFormat::Vorbis
     ) {
         let measured = known_or_analyze_output(output, measured_output)?;
-        metadata::write_replaygain(output, measured.lufs, measured.true_peak, album)?;
+        metadata::write_replaygain(
+            output,
+            measured.lufs,
+            measured.true_peak,
+            album.map(|album| (album.lufs, album.true_peak)),
+        )?;
+        if matches!(format, OutputFormat::M4a | OutputFormat::Alac) {
+            metadata::write_isobmff_loudness_metadata(
+                output,
+                &measured,
+                album.map(|album| (album.lufs, album.sample_peak, album.true_peak)),
+            )?;
+        }
     }
     Ok(())
 }

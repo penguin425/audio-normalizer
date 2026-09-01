@@ -42,6 +42,10 @@ impl AtomicOutput {
         self.temporary.path()
     }
 
+    pub(crate) fn file_mut(&mut self) -> &mut File {
+        self.temporary.as_file_mut()
+    }
+
     pub(crate) fn write_all(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.temporary
             .write_all(bytes)

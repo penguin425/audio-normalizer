@@ -61,8 +61,8 @@ Run `forge --help` for the complete option list.
 - Configurable true-peak ceiling, optional look-ahead limiter, resampling, and
   integer PCM dither.
 - Recursive and resumable batch processing with JSON, CSV, and NDJSON reports.
-- Output re-verification, ReplayGain and BWF metadata, and delivery compliance
-  profiles.
+- Output re-verification, ReplayGain, native M4A/ALAC `tlou`/`alou`, BWF
+  metadata, and delivery compliance profiles.
 - Bounded parsers and companion QC tools for broadcast, streaming, immersive,
   and packaged media.
 
