@@ -83,6 +83,7 @@ on:
       - "schema/remediation-report-v1.schema.json"
       - "REMEDIATION.md"
       - "src/metadata_repair.rs"
+      - "src/isobmff_loudness_repair.rs"
       - "src/bin/forge-metadata-repair.rs"
       - "schema/metadata-repair-request-v1.schema.json"
       - "schema/metadata-repair-report-v1.schema.json"

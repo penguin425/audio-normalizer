@@ -8,7 +8,7 @@ use std::process::ExitCode;
 #[command(
     name = "forge-metadata-repair",
     version,
-    about = "Validate and conservatively repair BWF/ADM metadata into a separate output file"
+    about = "Validate and conservatively repair BWF, ADM, or ISO-BMFF loudness metadata into a separate output file"
 )]
 struct Cli {
     /// JSON or TOML metadata repair request.
@@ -33,7 +33,7 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<bool, String> {
-    let report = forge_normalizer::metadata_repair::evaluate_file(&cli.request)?;
+    let report = forge_normalizer::metadata_repair::evaluate_extended_file(&cli.request)?;
     let mut bytes = if cli.compact {
         serde_json::to_vec(&report)
     } else {
@@ -51,13 +51,13 @@ fn run(cli: Cli) -> Result<bool, String> {
     }
     eprintln!(
         "forge-metadata-repair: {} ({}, {} action(s))",
-        if report.passed {
+        if report.report.passed {
             "PASS"
         } else {
             "REVIEW REQUIRED"
         },
-        report.source_format,
-        report.actions.len()
+        report.report.source_format,
+        report.report.actions.len()
     );
-    Ok(report.passed)
+    Ok(report.report.passed)
 }
