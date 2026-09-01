@@ -1,6 +1,6 @@
 [package]
 name = "forge-normalizer"
-version = "0.180.0"
+version = "0.181.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer (WAV/MP3/FLAC/Opus/AAC/Vorbis)"
@@ -54,6 +54,10 @@ path = "src/main.rs"
 [[bin]]
 name = "forge-live"
 path = "src/bin/forge-live.rs"
+
+[[bin]]
+name = "forge-doctor"
+path = "src/bin/forge-doctor.rs"
 
 [[bin]]
 name = "forge-compare"

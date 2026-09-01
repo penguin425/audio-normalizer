@@ -69,6 +69,7 @@ cat >"${dist_dir}/forge-scoop.json" <<EOF
   "bin": [
     "forge.exe",
     "forge-live.exe",
+    "forge-doctor.exe",
     "forge-compare.exe",
     "forge-audio-compare.exe",
     "forge-container-qc.exe",

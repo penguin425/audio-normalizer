@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/audio-normalizer/schema/doctor-report-v1.schema.json",
+  "title": "Forge capability doctor report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generator",
+    "target",
+    "parallelism",
+    "features",
+    "runtime",
+    "cpu",
+    "formats",
+    "requirements",
+    "ok"
+  ],
+  "properties": {
+    "schema_version": { "const": "forge-doctor-v1" },
+    "generator": { "type": "string", "pattern": "^forge-normalizer/[0-9]+\\.[0-9]+\\.[0-9]+" },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "arch", "family"],
+      "properties": {
+        "os": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "arch": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "family": { "type": "string", "minLength": 1, "maxLength": 32 }
+      }
+    },
+    "parallelism": { "type": "integer", "minimum": 1 },
+    "features": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/buildCapability" }
+    },
+    "runtime": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/runtimeCapability" }
+    },
+    "cpu": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/cpuCapability" }
+    },
+    "formats": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/formatCapability" }
+    },
+    "requirements": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/requirement" }
+    },
+    "ok": { "type": "boolean" }
+  },
+  "$defs": {
+    "buildCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "compiled"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "compiled": { "type": "boolean" }
+      }
+    },
+    "runtimeCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "available", "detail"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "available": { "type": "boolean" },
+        "detail": { "type": "string", "minLength": 1, "maxLength": 512 }
+      }
+    },
+    "cpuCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "available"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "available": { "type": "boolean" }
+      }
+    },
+    "formatCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "read", "write", "write_dependency"],
+      "properties": {
+        "format": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "read": { "type": "boolean" },
+        "write": { "type": "boolean" },
+        "write_dependency": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 128 },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "available"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "available": { "type": "boolean" }
+      }
+    }
+  }
+}
