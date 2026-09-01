@@ -22,6 +22,7 @@ forge-container-qc --help
 
 ## Quality control and codec adapters
 
+- [ATSC A/85 streaming-service QC](ATSC-A85-SERVICE-QC.md)
 - [Binaural renderer QC](BINAURAL-QC.md)
 - [Immersive downmix QC](IMMERSIVE-DOWNMIX.md)
 - [External anomaly-provider protocol](ANOMALY-ADAPTER.md)
