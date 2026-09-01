@@ -46,6 +46,16 @@ fn tmp_path(name: &str) -> PathBuf {
     p
 }
 
+#[cfg(feature = "opus-encoding")]
+fn expected_r128_gain(lufs: f64) -> i16 {
+    if !lufs.is_finite() {
+        return 0;
+    }
+    ((-23.0 - lufs) * 256.0)
+        .round()
+        .clamp(i16::MIN as f64, i16::MAX as f64) as i16
+}
+
 #[test]
 fn ambiguous_multichannel_wav_requires_an_explicit_layout() {
     let buffer = synth_sine(48_000, 0.5, 0.1, 997.0, 8);
@@ -767,13 +777,93 @@ fn opus_album_writes_shared_r128_album_gain() {
         &[OutputFormat::Opus, OutputFormat::Opus],
     )
     .unwrap();
-    for output in [&output_a, &output_b] {
+    let measured = [&output_a, &output_b].map(|output| normalize::analyze_file(output).unwrap());
+    let album_lufs = normalize::album_lufs(&measured);
+    for (output, analysis) in [&output_a, &output_b].into_iter().zip(&measured) {
         let (track, album) = forge_normalizer::opus::read_r128_tags(output).unwrap();
-        assert!(track.is_some());
-        assert_eq!(album, Some(-5 * 256));
+        assert_eq!(track, Some(expected_r128_gain(analysis.lufs)));
+        assert_eq!(album, Some(expected_r128_gain(album_lufs)));
     }
     for path in [input_a, input_b, output_a, output_b] {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(feature = "ffmpeg-encoding")]
+#[test]
+fn corrected_vorbis_album_replaygain_uses_final_decoded_population() {
+    let directory = tempfile::tempdir().unwrap();
+    let input_a = directory.path().join("album-a.wav");
+    let input_b = directory.path().join("album-b.wav");
+    let output_a = directory.path().join("album-a.ogg");
+    let output_b = directory.path().join("album-b.ogg");
+    WavWriter::write(
+        &input_a,
+        &synth_sine(48_000, 1.2, 0.025, 440.0, 2),
+        PcmKind::S24,
+        false,
+    )
+    .unwrap();
+    WavWriter::write(
+        &input_b,
+        &synth_sine(48_000, 3.1, 0.11, 733.0, 2),
+        PcmKind::S24,
+        false,
+    )
+    .unwrap();
+    let plan = Plan {
+        mode: Mode::Lufs,
+        target_lufs: -18.0,
+        target_peak_db: -1.0,
+        target_rms_db: -18.0,
+        ceiling_db: -1.0,
+        max_gain_db: None,
+        dither: false,
+        output_kind: None,
+        mp3_bitrate: 160,
+        mp3_quality: 2,
+        limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
+    };
+
+    normalize::normalize_album_corrected(
+        &[input_a, input_b],
+        &[output_a.clone(), output_b.clone()],
+        &plan,
+        &[OutputFormat::Vorbis, OutputFormat::Vorbis],
+        0.1,
+        2,
+    )
+    .unwrap();
+
+    let measured = [&output_a, &output_b].map(|output| normalize::analyze_file(output).unwrap());
+    let album_lufs = normalize::album_lufs(&measured);
+    let album_peak = measured
+        .iter()
+        .map(|analysis| analysis.true_peak)
+        .fold(0.0_f32, f32::max);
+    for (output, analysis) in [&output_a, &output_b].into_iter().zip(&measured) {
+        let tagged = lofty::read_from_path(output).unwrap();
+        let tag = tagged.primary_tag().unwrap();
+        assert_eq!(
+            tag.get_string(ItemKey::ReplayGainTrackGain),
+            Some(format!("{:+.2} dB", -18.0 - analysis.lufs).as_str())
+        );
+        assert_eq!(
+            tag.get_string(ItemKey::ReplayGainTrackPeak),
+            Some(format!("{:.8}", analysis.true_peak).as_str())
+        );
+        assert_eq!(
+            tag.get_string(ItemKey::ReplayGainAlbumGain),
+            Some(format!("{:+.2} dB", -18.0 - album_lufs).as_str())
+        );
+        assert_eq!(
+            tag.get_string(ItemKey::ReplayGainAlbumPeak),
+            Some(format!("{album_peak:.8}").as_str())
+        );
     }
 }
 
