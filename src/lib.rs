@@ -71,6 +71,7 @@ mod monkeys_audio_qc;
 mod mp3_qc;
 #[cfg(feature = "mp3-encoding")]
 pub mod mp3enc;
+mod mpeg_d_drc;
 pub mod mpegh_adapter;
 mod mpegts_qc;
 pub mod multi_delivery;

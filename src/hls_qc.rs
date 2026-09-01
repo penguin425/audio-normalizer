@@ -4,12 +4,14 @@ use crate::container_qc;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 pub const HLS_QC_SCHEMA: &str = "https://penguin425.github.io/audio-normalizer/schema/hls-qc-v1";
 const MAX_PLAYLIST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REFERENCED_PLAYLISTS: usize = 4_096;
+const MAX_IPF_SAMPLE_BYTES: u64 = 16 * 1024 * 1024;
 const MPEG_PTS_MODULUS: u64 = 1_u64 << 33;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -77,6 +79,13 @@ struct Playlist {
     rendition_reports: Vec<RenditionReport>,
     program_date_time_count: usize,
     has_i_frames_only: bool,
+    has_independent_segments: bool,
+}
+
+#[derive(Clone, Debug)]
+struct XheTrackInit {
+    track_id: u64,
+    audio_preroll: Option<crate::aac_qc::UsacAudioPrerollConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +157,7 @@ pub fn audit(path: &Path, profile: HlsProfile) -> Result<HlsAudit, String> {
     let mut findings = Vec::new();
     let root = parse_playlist(path, profile, &mut findings)?;
     let root_path = root.path.clone();
+    let root_independent_segments = root.has_independent_segments;
     let media_renditions = root.media_renditions.clone();
     let mut media = Vec::new();
     if root.kind == "multivariant" {
@@ -227,7 +237,7 @@ pub fn audit(path: &Path, profile: HlsProfile) -> Result<HlsAudit, String> {
     }
 
     for playlist in &media {
-        audit_media_files(playlist, profile, &mut findings);
+        audit_media_files(playlist, profile, root_independent_segments, &mut findings);
     }
     cross_check_renditions(&media, profile, &mut findings);
     cross_check_cmaf_audio_renditions(&root_path, &media_renditions, &media, &mut findings);
@@ -272,7 +282,8 @@ pub fn audit(path: &Path, profile: HlsProfile) -> Result<HlsAudit, String> {
                 "skipped_segments": item.skipped_segments,
                 "preload_hints": item.preload_hints.len(),
                 "rendition_reports": item.rendition_reports.len(),
-                "can_block_reload": item.server_control.as_ref().is_some_and(|control| control.can_block_reload)
+                "can_block_reload": item.server_control.as_ref().is_some_and(|control| control.can_block_reload),
+                "independent_segments": item.has_independent_segments || root_independent_segments
             })).collect::<Vec<_>>()
         }),
     })
@@ -636,6 +647,9 @@ fn parse_playlist(
             }
         } else if *line == "#EXT-X-I-FRAMES-ONLY" {
             playlist.has_i_frames_only = true;
+        } else if *line == "#EXT-X-INDEPENDENT-SEGMENTS" {
+            singleton_tag(&mut singleton, "EXT-X-INDEPENDENT-SEGMENTS", findings);
+            playlist.has_independent_segments = true;
         } else if line.starts_with("#EXT-X-KEY:") {
             findings.push(finding(
                 "FORGE-HLS-PART-TAG-ORDER",
@@ -1053,7 +1067,13 @@ fn current_parent_has_parts(playlist: &Playlist) -> bool {
         .is_some_and(|part| part.parent == playlist.segment_uris.len())
 }
 
-fn audit_media_files(playlist: &Playlist, profile: HlsProfile, findings: &mut Vec<HlsFinding>) {
+fn audit_media_files(
+    playlist: &Playlist,
+    profile: HlsProfile,
+    inherited_independent_segments: bool,
+    findings: &mut Vec<HlsFinding>,
+) {
+    let mut xhe_tracks = Vec::new();
     if let Some(uri) = &playlist.map_uri {
         if let Some(path) = local_reference(&playlist.path, uri) {
             let exists = path.is_file();
@@ -1065,7 +1085,7 @@ fn audit_media_files(playlist: &Playlist, profile: HlsProfile, findings: &mut Ve
                 None,
             ));
             if exists && playlist.is_fmp4 {
-                audit_isobmff(&path, true, profile, findings);
+                xhe_tracks = audit_isobmff(&path, true, profile, findings);
             }
         }
     }
@@ -1074,6 +1094,7 @@ fn audit_media_files(playlist: &Playlist, profile: HlsProfile, findings: &mut Ve
     let mut previous_ts_streams: Option<Vec<TsAudioStream>> = None;
     let mut last_timed_id3_pts: HashMap<u64, u64> = HashMap::new();
     let mut last_emsg_time = None;
+    let mut xhe_ipf_results = Vec::new();
     for (segment_index, uri) in playlist.segment_uris.iter().enumerate() {
         let discontinuity = playlist
             .segment_discontinuities
@@ -1179,6 +1200,37 @@ fn audit_media_files(playlist: &Playlist, profile: HlsProfile, findings: &mut Ve
                     &mut last_emsg_time,
                     findings,
                 );
+                for track in &xhe_tracks {
+                    let first_sample = audit.properties["fragment_first_samples"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|sample| {
+                            sample["fragment_index"].as_u64() == Some(0)
+                                && sample["track_id"].as_u64() == Some(track.track_id)
+                        });
+                    let result = inspect_xhe_segment_ipf(&path, track, first_sample);
+                    let passed = result.as_ref().is_ok_and(|inspection| inspection.valid_ipf);
+                    xhe_ipf_results.push(passed);
+                    findings.push(finding(
+                        "FORGE-APPLE-HLS-XHE-AAC-IPF",
+                        Severity::Warning,
+                        passed,
+                        "Apple recommends that each xHE-AAC segment begin with an Immediate Playout Frame",
+                        Some(match result {
+                            Ok(inspection) => json!({
+                                "segment": segment_index,
+                                "track_id": track.track_id,
+                                "inspection": inspection
+                            }),
+                            Err(error) => json!({
+                                "segment": segment_index,
+                                "track_id": track.track_id,
+                                "error": error
+                            }),
+                        }),
+                    ));
+                }
             }
             Err(error) => findings.push(finding(
                 "FORGE-HLS-SEGMENT-READ",
@@ -1189,6 +1241,77 @@ fn audit_media_files(playlist: &Playlist, profile: HlsProfile, findings: &mut Ve
             )),
         }
     }
+    if !xhe_tracks.is_empty() {
+        let all_segments_are_ipf = !xhe_ipf_results.is_empty()
+            && xhe_ipf_results.len() == playlist.segment_uris.len() * xhe_tracks.len()
+            && xhe_ipf_results.iter().all(|passed| *passed);
+        let independent_segments =
+            inherited_independent_segments || playlist.has_independent_segments;
+        findings.push(finding(
+            "FORGE-HLS-XHE-AAC-INDEPENDENT-SEGMENTS-TRUTH",
+            Severity::Error,
+            !independent_segments || all_segments_are_ipf,
+            "EXT-X-INDEPENDENT-SEGMENTS is used only when every local xHE-AAC segment begins with an IPF",
+            Some(json!({
+                "declared": independent_segments,
+                "segments_checked": xhe_ipf_results.len(),
+                "all_segments_are_ipf": all_segments_are_ipf
+            })),
+        ));
+        findings.push(finding(
+            "FORGE-APPLE-HLS-XHE-AAC-INDEPENDENT-SEGMENTS",
+            Severity::Warning,
+            !all_segments_are_ipf || independent_segments,
+            "Apple recommends EXT-X-INDEPENDENT-SEGMENTS when every xHE-AAC segment starts with an IPF",
+            Some(json!({
+                "declared": independent_segments,
+                "all_segments_are_ipf": all_segments_are_ipf
+            })),
+        ));
+    }
+}
+
+fn inspect_xhe_segment_ipf(
+    path: &Path,
+    track: &XheTrackInit,
+    first_sample: Option<&Value>,
+) -> Result<crate::aac_qc::UsacIpfInspection, String> {
+    let preroll = track
+        .audio_preroll
+        .as_ref()
+        .ok_or("xHE-AAC configuration has no AudioPreRoll extension element")?;
+    let sample =
+        first_sample.ok_or("segment has no resolved first sample for the xHE-AAC track")?;
+    if sample["is_sync_sample"].as_bool() != Some(true) {
+        return Err("segment first xHE-AAC sample is marked non-sync".into());
+    }
+    let offset = sample["offset"]
+        .as_u64()
+        .ok_or("segment first-sample offset is missing")?;
+    let size = sample["size"]
+        .as_u64()
+        .ok_or("segment first-sample size is missing")?;
+    if size == 0 || size > MAX_IPF_SAMPLE_BYTES {
+        return Err(format!(
+            "segment first-sample size {size} is outside 1..={MAX_IPF_SAMPLE_BYTES}"
+        ));
+    }
+    let end = offset
+        .checked_add(size)
+        .ok_or("segment first-sample range overflow")?;
+    let file_size = fs::metadata(path)
+        .map_err(|error| format!("stat {}: {error}", path.display()))?
+        .len();
+    if end > file_size {
+        return Err("segment first-sample range exceeds the file".into());
+    }
+    let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| format!("seek {}: {error}", path.display()))?;
+    let mut bytes = vec![0_u8; usize::try_from(size).unwrap()];
+    file.read_exact(&mut bytes)
+        .map_err(|error| format!("read {} xHE-AAC sample: {error}", path.display()))?;
+    crate::aac_qc::inspect_usac_ipf(&bytes, preroll)
 }
 
 fn audit_transport_segment(
@@ -1492,9 +1615,10 @@ fn audit_isobmff(
     initialization: bool,
     profile: HlsProfile,
     findings: &mut Vec<HlsFinding>,
-) {
+) -> Vec<XheTrackInit> {
     match container_qc::audit(path) {
         Ok(audit) => {
+            let xhe_tracks = xhe_tracks_from_init_properties(&audit.properties);
             findings.push(finding(
                 "FORGE-HLS-INITIALIZATION-CONTAINER",
                 Severity::Error,
@@ -1541,15 +1665,49 @@ fn audit_isobmff(
                     None,
                 ));
             }
+            xhe_tracks
         }
-        Err(error) => findings.push(finding(
-            "FORGE-HLS-INITIALIZATION-READ",
-            Severity::Error,
-            false,
-            error,
-            Some(json!(path)),
-        )),
+        Err(error) => {
+            findings.push(finding(
+                "FORGE-HLS-INITIALIZATION-READ",
+                Severity::Error,
+                false,
+                error,
+                Some(json!(path)),
+            ));
+            Vec::new()
+        }
     }
+}
+
+fn xhe_tracks_from_init_properties(properties: &Value) -> Vec<XheTrackInit> {
+    properties["tracks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|track| {
+            let config = track.get("xhe_aac_usac_config")?.as_object()?;
+            (config.get("audio_object_type")?.as_u64() == Some(42)).then_some(())?;
+            let track_id = track.get("track_id")?.as_u64()?;
+            let audio_preroll = config
+                .get("audio_preroll")
+                .and_then(Value::as_object)
+                .and_then(|preroll| {
+                    Some(crate::aac_qc::UsacAudioPrerollConfig {
+                        element_index: u16::try_from(preroll.get("element_index")?.as_u64()?)
+                            .ok()?,
+                        default_payload_length_bytes: preroll
+                            .get("default_payload_length_bytes")?
+                            .as_u64(),
+                        payload_fragmentation: preroll.get("payload_fragmentation")?.as_bool()?,
+                    })
+                });
+            Some(XheTrackInit {
+                track_id,
+                audio_preroll,
+            })
+        })
+        .collect()
 }
 
 fn cross_check_renditions(media: &[Playlist], profile: HlsProfile, findings: &mut Vec<HlsFinding>) {
@@ -2160,6 +2318,33 @@ fn finding(
 mod tests {
     use super::*;
 
+    fn ipf_sample() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut position = 0_usize;
+        let mut write = |value: u64, width: usize| {
+            for shift in (0..width).rev() {
+                if position.is_multiple_of(8) {
+                    bytes.push(0);
+                }
+                let index = position / 8;
+                bytes[index] |= (((value >> shift) & 1) as u8) << (7 - position % 8);
+                position += 1;
+            }
+        };
+        write(1, 1); // usacIndependencyFlag
+        write(1, 1); // AudioPreRoll present
+        write(0, 1); // explicit payload length
+        write(5, 8);
+        write(1, 4); // one-byte replacement config
+        write(0, 8);
+        write(0, 1); // no crossfade
+        write(0, 1); // reserved
+        write(1, 2); // one pre-roll AU
+        write(1, 16);
+        write(0x80, 8);
+        bytes
+    }
+
     fn boxed(kind: &[u8; 4], body: Vec<u8>) -> Vec<u8> {
         [
             u32::try_from(body.len() + 8)
@@ -2522,7 +2707,7 @@ mod tests {
             ..Playlist::default()
         };
         let mut findings = Vec::new();
-        audit_media_files(&playlist, HlsProfile::Rfc8216, &mut findings);
+        audit_media_files(&playlist, HlsProfile::Rfc8216, false, &mut findings);
         assert!(
             findings
                 .iter()
@@ -2533,10 +2718,51 @@ mod tests {
 
         fs::write(directory.path().join("two.m4s"), media_segment(10, 512)).unwrap();
         let mut findings = Vec::new();
-        audit_media_files(&playlist, HlsProfile::Rfc8216, &mut findings);
+        audit_media_files(&playlist, HlsProfile::Rfc8216, false, &mut findings);
         assert!(findings
             .iter()
             .any(|item| item.rule_id == "FORGE-HLS-FRAGMENT-SEQUENCE" && !item.passed));
+    }
+
+    #[test]
+    fn verifies_xhe_immediate_playout_frame_from_resolved_sample_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("segment.m4s");
+        let mut file = vec![0xaa, 0xbb];
+        let sample = ipf_sample();
+        file.extend_from_slice(&sample);
+        fs::write(&path, file).unwrap();
+        let track = XheTrackInit {
+            track_id: 7,
+            audio_preroll: Some(crate::aac_qc::UsacAudioPrerollConfig {
+                element_index: 0,
+                default_payload_length_bytes: None,
+                payload_fragmentation: false,
+            }),
+        };
+        let location = json!({
+            "fragment_index": 0,
+            "track_id": 7,
+            "offset": 2,
+            "size": sample.len(),
+            "is_sync_sample": true
+        });
+        let inspection = inspect_xhe_segment_ipf(&path, &track, Some(&location)).unwrap();
+        assert!(inspection.valid_ipf);
+    }
+
+    #[test]
+    fn records_independent_segments_playlist_tag() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audio.m3u8");
+        fs::write(
+            &path,
+            "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nhttps://example.invalid/audio.m4s\n",
+        )
+        .unwrap();
+        let mut findings = Vec::new();
+        let playlist = parse_playlist(&path, HlsProfile::AppleHls, &mut findings).unwrap();
+        assert!(playlist.has_independent_segments);
     }
 
     #[test]
