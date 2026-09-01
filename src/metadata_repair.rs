@@ -382,9 +382,12 @@ fn evaluate_internal(
                     output,
                     prepared.target.track_id,
                     &prepared.encoded,
-                    spec.max_input_bytes,
-                    spec.max_metadata_chunk_bytes,
-                    spec.max_chunks,
+                    None,
+                    isobmff_loudness_repair::RewriteLimits {
+                        max_input_bytes: spec.max_input_bytes,
+                        max_moov_bytes: spec.max_metadata_chunk_bytes,
+                        max_boxes: spec.max_chunks,
+                    },
                 )?;
                 let bytes = result.bytes_written;
                 isobmff_rewrite = Some(result);
@@ -456,8 +459,12 @@ fn evaluate_internal(
             spec.max_chunks,
         )?;
         let mdat_preserved = prepared.source_mdat_sha256 == output_mdat_sha256;
-        let metadata_round_trip_passed =
-            verify_isobmff_loudness_round_trip(&after, prepared.target.track_id, &prepared.encoded);
+        let metadata_round_trip_passed = isobmff_loudness_repair::verify_round_trip(
+            &after,
+            prepared.target.track_id,
+            &prepared.encoded,
+            None,
+        );
         let passed = mdat_preserved && metadata_round_trip_passed;
         if !mdat_preserved {
             warnings.push(
@@ -740,56 +747,6 @@ fn read_adm_profile(path: &Path, format: &str) -> Result<Option<ProductionProfil
         return Ok(None);
     }
     adm::validate_production_profile(path, ProductionProfileMode::Read).map(Some)
-}
-
-fn verify_isobmff_loudness_round_trip(
-    audit: &ContainerAudit,
-    track_id: u32,
-    expected: &EncodedLoudness,
-) -> bool {
-    let Some(tracks) = audit.properties["tracks"].as_array() else {
-        return false;
-    };
-    let matching = tracks
-        .iter()
-        .filter(|track| track["track_id"].as_u64() == Some(u64::from(track_id)))
-        .collect::<Vec<_>>();
-    if matching.len() != 1 || matching[0]["loudness_box_count"].as_u64() != Some(1) {
-        return false;
-    }
-    let Some(entries) = matching[0]["loudness"].as_array() else {
-        return false;
-    };
-    let track_entries = entries
-        .iter()
-        .filter(|entry| entry["scope"].as_str() == Some("track"))
-        .collect::<Vec<_>>();
-    if track_entries.len() != 1 {
-        return false;
-    }
-    let entry = track_entries[0];
-    if entry["version"].as_u64() != Some(0)
-        || !entry["eq_set_id"].is_null()
-        || entry["downmix_id"].as_u64() != Some(0)
-        || entry["drc_set_id"].as_u64() != Some(0)
-        || entry["sample_peak_code"].as_i64() != Some(i64::from(expected.sample_peak_code))
-        || entry["true_peak_code"].as_i64() != Some(i64::from(expected.true_peak_code))
-        || entry["true_peak_measurement_system"].as_u64() != Some(2)
-        || entry["true_peak_reliability"].as_u64() != Some(3)
-    {
-        return false;
-    }
-    let Some(measurements) = entry["measurements"].as_array() else {
-        return false;
-    };
-    measurements.len() == 1
-        && measurements[0]["method_definition"].as_u64() == Some(1)
-        && measurements[0]["method_value"].as_u64() == Some(u64::from(expected.program_code))
-        && measurements[0]["measurement_system"].as_u64() == Some(2)
-        && measurements[0]["reliability"].as_u64() == Some(3)
-        && measurements[0]["value_lkfs"]
-            .as_f64()
-            .is_some_and(|value| (value - expected.program_loudness_lkfs).abs() < 1e-12)
 }
 
 fn write_output(

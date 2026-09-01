@@ -11,12 +11,15 @@ use lofty::mpeg::MpegFile;
 use lofty::probe::Probe;
 use lofty::tag::{ItemKey, Tag, TagExt};
 use std::borrow::Cow;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::normalize::Analysis;
 use crate::wav::WaveChunk;
+
+const ISO_BMFF_MAX_MOOV_BYTES: u64 = 16 * 1024 * 1024;
+const ISO_BMFF_MAX_BOXES: u32 = 100_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoudnessMetadataScheme {
@@ -65,6 +68,136 @@ pub fn write_loudness_metadata(
         }
     }
     Ok(scheme)
+}
+
+/// Return whether the path is an ISO Base Media File Format container.
+pub fn is_isobmff_file(path: &Path) -> Result<bool, String> {
+    Ok(probe_file_type(path)? == FileType::Mp4)
+}
+
+/// Atomically create or replace native ISO-BMFF `ludt/tlou` metadata and,
+/// when supplied, `alou` album metadata without re-encoding media payloads.
+///
+/// The album tuple contains integrated loudness, linear sample peak, and
+/// linear true peak. Undefined silence measurements are left unrepresented;
+/// ISO-BMFF's numeric fields have no exact representation for negative
+/// infinity.
+pub fn write_isobmff_loudness_metadata(
+    path: &Path,
+    track: &Analysis,
+    album: Option<(f64, f32, f32)>,
+) -> Result<bool, String> {
+    if !track.lufs.is_finite() || track.sample_peak <= 0.0 || track.true_peak <= 0.0 {
+        return Ok(false);
+    }
+    let source_metadata = fs::metadata(path)
+        .map_err(|error| format!("stat ISO-BMFF metadata source {}: {error}", path.display()))?;
+    let source_bytes = source_metadata.len();
+    let before = crate::container_qc::audit(path)?;
+    let target = crate::isobmff_loudness_repair::select_target(&before)?;
+    let track_measurement = decoded_loudness(track)?;
+    crate::isobmff_loudness_repair::validate_reference_geometry(&target, &track_measurement)?;
+    let encoded_track = crate::isobmff_loudness_repair::encode_measurement(&track_measurement)?;
+    let encoded_album = album
+        .filter(|(lufs, sample_peak, true_peak)| {
+            lufs.is_finite() && *sample_peak > 0.0 && *true_peak > 0.0
+        })
+        .map(|(lufs, sample_peak, true_peak)| {
+            crate::isobmff_loudness_repair::encode_measurement(
+                &crate::isobmff_loudness_repair::DecodedLoudness {
+                    sample_rate_hz: track.sample_rate,
+                    channels: track.channels,
+                    frames: u64::try_from(track.frames)
+                        .map_err(|_| "ISO-BMFF album frame count exceeds u64".to_string())?,
+                    decoded_samples: 0,
+                    integrated_lufs: lufs,
+                    sample_peak_dbfs: linear_db(sample_peak),
+                    true_peak_dbtp: linear_db(true_peak),
+                },
+            )
+        })
+        .transpose()?;
+    let source_mdat =
+        crate::isobmff_loudness_repair::mdat_sha256(path, source_bytes, ISO_BMFF_MAX_BOXES)?;
+    let mut staged = crate::atomic::AtomicOutput::new(path)?;
+    crate::isobmff_loudness_repair::rewrite(
+        path,
+        staged.file_mut(),
+        target.track_id,
+        &encoded_track,
+        encoded_album.as_ref(),
+        crate::isobmff_loudness_repair::RewriteLimits {
+            max_input_bytes: source_bytes,
+            max_moov_bytes: ISO_BMFF_MAX_MOOV_BYTES,
+            max_boxes: ISO_BMFF_MAX_BOXES,
+        },
+    )?;
+    staged
+        .file_mut()
+        .sync_all()
+        .map_err(|error| format!("sync ISO-BMFF loudness metadata: {error}"))?;
+    let after = crate::container_qc::audit(staged.path())?;
+    if !after.passed
+        || !crate::isobmff_loudness_repair::verify_round_trip(
+            &after,
+            target.track_id,
+            &encoded_track,
+            encoded_album.as_ref(),
+        )
+    {
+        return Err(format!(
+            "{}: ISO-BMFF loudness metadata failed post-write container verification",
+            path.display()
+        ));
+    }
+    let output_mdat = crate::isobmff_loudness_repair::mdat_sha256(
+        staged.path(),
+        source_bytes
+            .checked_add(ISO_BMFF_MAX_MOOV_BYTES)
+            .ok_or("ISO-BMFF output size limit overflow")?,
+        ISO_BMFF_MAX_BOXES,
+    )?;
+    if source_mdat != output_mdat {
+        return Err(format!(
+            "{}: ISO-BMFF media payload changed while writing loudness metadata",
+            path.display()
+        ));
+    }
+    fs::set_permissions(staged.path(), source_metadata.permissions()).map_err(|error| {
+        format!(
+            "preserve permissions on ISO-BMFF loudness metadata output {}: {error}",
+            path.display()
+        )
+    })?;
+    staged.commit()?;
+    Ok(true)
+}
+
+fn decoded_loudness(
+    analysis: &Analysis,
+) -> Result<crate::isobmff_loudness_repair::DecodedLoudness, String> {
+    let frames = u64::try_from(analysis.frames)
+        .map_err(|_| "ISO-BMFF track frame count exceeds u64".to_string())?;
+    let decoded_samples = frames
+        .checked_mul(u64::from(analysis.channels))
+        .ok_or("ISO-BMFF decoded sample count overflow")?;
+    Ok(crate::isobmff_loudness_repair::DecodedLoudness {
+        sample_rate_hz: analysis.sample_rate,
+        channels: analysis.channels,
+        frames,
+        decoded_samples,
+        integrated_lufs: analysis.lufs,
+        sample_peak_dbfs: linear_db(analysis.sample_peak),
+        true_peak_dbtp: linear_db(analysis.true_peak),
+    })
+}
+
+fn linear_db(value: f32) -> f64 {
+    if value > 0.0 {
+        20.0 * f64::from(value).log10()
+    } else {
+        f64::NEG_INFINITY
+    }
 }
 
 /// Copy the source's primary metadata tag to the destination container.

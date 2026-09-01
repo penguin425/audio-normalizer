@@ -867,6 +867,107 @@ fn corrected_vorbis_album_replaygain_uses_final_decoded_population() {
     }
 }
 
+#[cfg(feature = "ffmpeg-encoding")]
+#[test]
+fn corrected_m4a_album_writes_exact_native_track_and_album_loudness() {
+    let directory = tempfile::tempdir().unwrap();
+    let input_a = directory.path().join("album-a.wav");
+    let input_b = directory.path().join("album-b.wav");
+    let output_a = directory.path().join("album-a.m4a");
+    let output_b = directory.path().join("album-b.m4a");
+    WavWriter::write(
+        &input_a,
+        &synth_sine(48_000, 1.2, 0.025, 440.0, 2),
+        PcmKind::S24,
+        false,
+    )
+    .unwrap();
+    WavWriter::write(
+        &input_b,
+        &synth_sine(48_000, 3.1, 0.11, 733.0, 2),
+        PcmKind::S24,
+        false,
+    )
+    .unwrap();
+    let plan = Plan {
+        mode: Mode::Lufs,
+        target_lufs: -18.0,
+        target_peak_db: -1.0,
+        target_rms_db: -18.0,
+        ceiling_db: -1.0,
+        max_gain_db: None,
+        dither: false,
+        output_kind: None,
+        mp3_bitrate: 160,
+        mp3_quality: 2,
+        limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
+        output_sample_rate: None,
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
+    };
+
+    normalize::normalize_album_corrected(
+        &[input_a, input_b],
+        &[output_a.clone(), output_b.clone()],
+        &plan,
+        &[OutputFormat::M4a, OutputFormat::M4a],
+        0.1,
+        2,
+    )
+    .unwrap();
+
+    let measured = [&output_a, &output_b].map(|output| normalize::analyze_file(output).unwrap());
+    let album_lufs = normalize::album_lufs(&measured);
+    let album_sample_peak = measured
+        .iter()
+        .map(|analysis| analysis.sample_peak)
+        .fold(0.0_f32, f32::max);
+    let album_true_peak = measured
+        .iter()
+        .map(|analysis| analysis.true_peak)
+        .fold(0.0_f32, f32::max);
+    let loudness_code = |lufs: f64| ((lufs + 57.75) * 4.0).round() as u64;
+    let peak_code = |peak: f32| {
+        let db = 20.0 * f64::from(peak).log10();
+        ((20.0 - db) * 32.0).round() as i64
+    };
+
+    for (output, analysis) in [&output_a, &output_b].into_iter().zip(&measured) {
+        let audit = forge_normalizer::container_qc::audit(output).unwrap();
+        assert!(audit.passed, "{audit:#?}");
+        let entries = audit.properties["tracks"][0]["loudness"]
+            .as_array()
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        let track = entries
+            .iter()
+            .find(|entry| entry["scope"] == "track")
+            .unwrap();
+        let album = entries
+            .iter()
+            .find(|entry| entry["scope"] == "album")
+            .unwrap();
+        assert_eq!(
+            track["measurements"][0]["method_value"],
+            loudness_code(analysis.lufs)
+        );
+        assert_eq!(track["sample_peak_code"], peak_code(analysis.sample_peak));
+        assert_eq!(track["true_peak_code"], peak_code(analysis.true_peak));
+        assert_eq!(
+            album["measurements"][0]["method_value"],
+            loudness_code(album_lufs)
+        );
+        assert_eq!(album["sample_peak_code"], peak_code(album_sample_peak));
+        assert_eq!(album["true_peak_code"], peak_code(album_true_peak));
+
+        let tagged = lofty::read_from_path(output).unwrap();
+        let tag = tagged.primary_tag().unwrap();
+        assert!(tag.get_string(ItemKey::ReplayGainTrackGain).is_some());
+        assert!(tag.get_string(ItemKey::ReplayGainAlbumGain).is_some());
+    }
+}
+
 #[cfg(feature = "opus-encoding")]
 #[test]
 fn opus_mapping_family_one_roundtrips_5_1_through_7_1() {

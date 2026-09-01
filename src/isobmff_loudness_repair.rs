@@ -58,6 +58,13 @@ pub(crate) struct RewriteResult {
     pub adjusted_chunk_offsets: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RewriteLimits {
+    pub max_input_bytes: u64,
+    pub max_moov_bytes: u64,
+    pub max_boxes: u32,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FileBox {
     kind: [u8; 4],
@@ -274,6 +281,62 @@ pub(crate) fn encode_measurement(measured: &DecodedLoudness) -> Result<EncodedLo
     })
 }
 
+pub(crate) fn verify_round_trip(
+    audit: &ContainerAudit,
+    track_id: u32,
+    expected_track: &EncodedLoudness,
+    expected_album: Option<&EncodedLoudness>,
+) -> bool {
+    let Some(tracks) = audit.properties["tracks"].as_array() else {
+        return false;
+    };
+    let matching = tracks
+        .iter()
+        .filter(|track| track["track_id"].as_u64() == Some(u64::from(track_id)))
+        .collect::<Vec<_>>();
+    if matching.len() != 1 || matching[0]["loudness_box_count"].as_u64() != Some(1) {
+        return false;
+    }
+    let Some(entries) = matching[0]["loudness"].as_array() else {
+        return false;
+    };
+    verify_scope(entries, "track", expected_track)
+        && expected_album.is_none_or(|expected| verify_scope(entries, "album", expected))
+}
+
+fn verify_scope(entries: &[serde_json::Value], scope: &str, expected: &EncodedLoudness) -> bool {
+    let matching = entries
+        .iter()
+        .filter(|entry| entry["scope"].as_str() == Some(scope))
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return false;
+    }
+    let entry = matching[0];
+    if entry["version"].as_u64() != Some(0)
+        || !entry["eq_set_id"].is_null()
+        || entry["downmix_id"].as_u64() != Some(0)
+        || entry["drc_set_id"].as_u64() != Some(0)
+        || entry["sample_peak_code"].as_i64() != Some(i64::from(expected.sample_peak_code))
+        || entry["true_peak_code"].as_i64() != Some(i64::from(expected.true_peak_code))
+        || entry["true_peak_measurement_system"].as_u64() != Some(2)
+        || entry["true_peak_reliability"].as_u64() != Some(3)
+    {
+        return false;
+    }
+    let Some(measurements) = entry["measurements"].as_array() else {
+        return false;
+    };
+    measurements.len() == 1
+        && measurements[0]["method_definition"].as_u64() == Some(1)
+        && measurements[0]["method_value"].as_u64() == Some(u64::from(expected.program_code))
+        && measurements[0]["measurement_system"].as_u64() == Some(2)
+        && measurements[0]["reliability"].as_u64() == Some(3)
+        && measurements[0]["value_lkfs"]
+            .as_f64()
+            .is_some_and(|value| (value - expected.program_loudness_lkfs).abs() < 1e-12)
+}
+
 fn encode_peak(name: &str, value: f64) -> Result<u16, String> {
     let code = ((20.0 - value) * 32.0).round();
     if !(1.0..=f64::from(MAX_SIGNED_PEAK_CODE)).contains(&code) {
@@ -300,11 +363,15 @@ pub(crate) fn rewrite(
     source: &Path,
     output: &mut dyn Write,
     target_track_id: u32,
-    loudness: &EncodedLoudness,
-    max_input_bytes: u64,
-    max_moov_bytes: u64,
-    max_boxes: u32,
+    track_loudness: &EncodedLoudness,
+    album_loudness: Option<&EncodedLoudness>,
+    limits: RewriteLimits,
 ) -> Result<RewriteResult, String> {
+    let RewriteLimits {
+        max_input_bytes,
+        max_moov_bytes,
+        max_boxes,
+    } = limits;
     let (mut input, file_size, top) = scan_file(source, max_input_bytes, max_boxes)?;
     let moov = unique_box(&top, *b"moov", "movie")?;
     if moov.size() > max_moov_bytes {
@@ -325,7 +392,8 @@ pub(crate) fn rewrite(
     let (mut rewritten_moov, replaced_existing) = replace_loudness_in_moov(
         &original_moov,
         target_track_id,
-        loudness,
+        track_loudness,
+        album_loudness,
         &mut box_count,
         max_boxes,
     )?;
@@ -507,7 +575,8 @@ fn unique_box(boxes: &[FileBox], kind: [u8; 4], label: &str) -> Result<FileBox, 
 fn replace_loudness_in_moov(
     moov: &[u8],
     target_track_id: u32,
-    loudness: &EncodedLoudness,
+    track_loudness: &EncodedLoudness,
+    album_loudness: Option<&EncodedLoudness>,
     box_count: &mut u32,
     max_boxes: u32,
 ) -> Result<(Vec<u8>, bool), String> {
@@ -532,8 +601,14 @@ fn replace_loudness_in_moov(
     let target_index = target_index.ok_or_else(|| {
         format!("ISO-BMFF movie does not contain audio track ID {target_track_id}")
     })?;
-    let (replacement, replaced_existing) =
-        replace_loudness_in_track(moov, children[target_index], loudness, box_count, max_boxes)?;
+    let (replacement, replaced_existing) = replace_loudness_in_track(
+        moov,
+        children[target_index],
+        track_loudness,
+        album_loudness,
+        box_count,
+        max_boxes,
+    )?;
     let mut body = Vec::new();
     for (index, child) in children.iter().enumerate() {
         if index == target_index {
@@ -588,7 +663,8 @@ fn track_identity(
 fn replace_loudness_in_track(
     bytes: &[u8],
     track: SliceBox,
-    loudness: &EncodedLoudness,
+    track_loudness: &EncodedLoudness,
+    album_loudness: Option<&EncodedLoudness>,
     box_count: &mut u32,
     max_boxes: u32,
 ) -> Result<(Vec<u8>, bool), String> {
@@ -601,13 +677,22 @@ fn replace_loudness_in_track(
     if udta_indices.len() > 1 {
         return Err("ISO-BMFF audio track contains multiple udta boxes".into());
     }
-    let new_tlou = make_tlou(loudness)?;
+    let new_tlou = make_loudness_base(*b"tlou", track_loudness)?;
+    let new_alou = album_loudness
+        .map(|loudness| make_loudness_base(*b"alou", loudness))
+        .transpose()?;
     let mut replaced_existing = false;
     let mut body = Vec::new();
     for (index, child) in children.iter().enumerate() {
         if udta_indices.first() == Some(&index) {
-            let (replacement, replaced) =
-                replace_ludt_in_udta(bytes, *child, &new_tlou, box_count, max_boxes)?;
+            let (replacement, replaced) = replace_ludt_in_udta(
+                bytes,
+                *child,
+                &new_tlou,
+                new_alou.as_deref(),
+                box_count,
+                max_boxes,
+            )?;
             body.extend_from_slice(&replacement);
             replaced_existing = replaced;
         } else {
@@ -615,7 +700,11 @@ fn replace_loudness_in_track(
         }
     }
     if udta_indices.is_empty() {
-        body.extend_from_slice(&make_box(*b"udta", &make_box(*b"ludt", &new_tlou)?)?);
+        let mut loudness = new_tlou;
+        if let Some(new_alou) = new_alou {
+            loudness.extend_from_slice(&new_alou);
+        }
+        body.extend_from_slice(&make_box(*b"udta", &make_box(*b"ludt", &loudness)?)?);
     }
     Ok((make_box(*b"trak", &body)?, replaced_existing))
 }
@@ -624,6 +713,7 @@ fn replace_ludt_in_udta(
     bytes: &[u8],
     udta: SliceBox,
     new_tlou: &[u8],
+    new_alou: Option<&[u8]>,
     box_count: &mut u32,
     max_boxes: u32,
 ) -> Result<(Vec<u8>, bool), String> {
@@ -638,23 +728,28 @@ fn replace_ludt_in_udta(
     let mut body = Vec::new();
     for child in children {
         if child.kind == *b"ludt" {
-            body.extend_from_slice(&replace_tlou_in_ludt(
-                bytes, child, new_tlou, box_count, max_boxes,
+            body.extend_from_slice(&replace_loudness_in_ludt(
+                bytes, child, new_tlou, new_alou, box_count, max_boxes,
             )?);
         } else {
             body.extend_from_slice(child.raw(bytes));
         }
     }
     if ludt_count == 0 {
-        body.extend_from_slice(&make_box(*b"ludt", new_tlou)?);
+        let mut loudness = new_tlou.to_vec();
+        if let Some(new_alou) = new_alou {
+            loudness.extend_from_slice(new_alou);
+        }
+        body.extend_from_slice(&make_box(*b"ludt", &loudness)?);
     }
     Ok((make_box(*b"udta", &body)?, ludt_count == 1))
 }
 
-fn replace_tlou_in_ludt(
+fn replace_loudness_in_ludt(
     bytes: &[u8],
     ludt: SliceBox,
     new_tlou: &[u8],
+    new_alou: Option<&[u8]>,
     box_count: &mut u32,
     max_boxes: u32,
 ) -> Result<Vec<u8>, String> {
@@ -666,24 +761,45 @@ fn replace_tlou_in_ludt(
     if tlou_count > 1 {
         return Err("ISO-BMFF loudness box contains multiple tlou boxes".into());
     }
+    let alou_count = children
+        .iter()
+        .filter(|child| child.kind == *b"alou")
+        .count();
+    if alou_count > 1 {
+        return Err("ISO-BMFF loudness box contains multiple alou boxes".into());
+    }
     let mut body = Vec::new();
     for child in children {
         if child.kind == *b"tlou" {
             body.extend_from_slice(new_tlou);
+            if let Some(new_alou) = new_alou {
+                // The reference serializer writes every track entry before
+                // every album entry. Reinsert alou here even when the source
+                // had the two known children in the opposite order.
+                body.extend_from_slice(new_alou);
+            }
+        } else if child.kind == *b"alou" && new_alou.is_some() {
+            // Replaced beside tlou above.
         } else {
-            // Album loudness and any unknown child remain byte-for-byte.  The
-            // post-write container audit still rejects structurally invalid
-            // unknown children rather than silently discarding them.
+            // When no album measurement was supplied, existing album
+            // loudness remains byte-for-byte. Unknown children are preserved
+            // too; post-write QC rejects structurally invalid children.
             body.extend_from_slice(child.raw(bytes));
         }
     }
     if tlou_count == 0 {
         body.extend_from_slice(new_tlou);
+        if let Some(new_alou) = new_alou {
+            body.extend_from_slice(new_alou);
+        }
     }
     make_box(*b"ludt", &body)
 }
 
-fn make_tlou(loudness: &EncodedLoudness) -> Result<Vec<u8>, String> {
+fn make_loudness_base(kind: [u8; 4], loudness: &EncodedLoudness) -> Result<Vec<u8>, String> {
+    if !matches!(&kind, b"tlou" | b"alou") {
+        return Err("ISO-BMFF loudness base must be tlou or alou".into());
+    }
     let ids = 0_u16;
     let peaks = (u32::from(loudness.sample_peak_code) << 12) | u32::from(loudness.true_peak_code);
     let mut body = vec![0, 0, 0, 0]; // FullBox version 0, flags 0.
@@ -700,7 +816,7 @@ fn make_tlou(loudness: &EncodedLoudness) -> Result<Vec<u8>, String> {
         loudness.program_code,
         (MEASUREMENT_SYSTEM_BS_1770 << 4) | RELIABILITY_ACCURATE,
     ]);
-    make_box(*b"tlou", &body)
+    make_box(kind, &body)
 }
 
 fn make_box(kind: [u8; 4], body: &[u8]) -> Result<Vec<u8>, String> {
@@ -1024,6 +1140,14 @@ mod tests {
         .unwrap()
     }
 
+    fn limits() -> RewriteLimits {
+        RewriteLimits {
+            max_input_bytes: 1024 * 1024,
+            max_moov_bytes: 1024 * 1024,
+            max_boxes: 100,
+        }
+    }
+
     #[test]
     fn quantizes_normative_loudness_and_peak_steps() {
         let encoded = measurement();
@@ -1044,16 +1168,7 @@ mod tests {
         std::fs::write(&path, [ftyp, moov.clone(), mdat].concat()).unwrap();
 
         let mut output = Vec::new();
-        let result = rewrite(
-            &path,
-            &mut output,
-            1,
-            &measurement(),
-            1024 * 1024,
-            1024 * 1024,
-            100,
-        )
-        .unwrap();
+        let result = rewrite(&path, &mut output, 1, &measurement(), None, limits()).unwrap();
         assert!(result.changed);
         assert!(!result.replaced_existing);
         assert_eq!(result.adjusted_chunk_offsets, 1);
@@ -1076,16 +1191,7 @@ mod tests {
         let moov = make_box(*b"moov", &track(1, 0)).unwrap();
         let moof = make_box(*b"moof", &[]).unwrap();
         std::fs::write(&path, [moov, moof].concat()).unwrap();
-        let error = rewrite(
-            &path,
-            &mut Vec::new(),
-            1,
-            &measurement(),
-            1024 * 1024,
-            1024 * 1024,
-            100,
-        )
-        .unwrap_err();
+        let error = rewrite(&path, &mut Vec::new(), 1, &measurement(), None, limits()).unwrap_err();
         assert!(error.contains("moof"));
     }
 
@@ -1094,7 +1200,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("album.m4a");
         let album = make_box(*b"alou", &[0, 0, 0, 0, 9, 8, 7]).unwrap();
-        let old_tlou = make_tlou(
+        let old_tlou = make_loudness_base(
+            *b"tlou",
             &encode_measurement(&DecodedLoudness {
                 sample_rate_hz: 48_000,
                 channels: 2,
@@ -1116,20 +1223,64 @@ mod tests {
         std::fs::write(&path, moov).unwrap();
 
         let mut output = Vec::new();
-        let result = rewrite(
-            &path,
-            &mut output,
-            1,
-            &measurement(),
-            1024 * 1024,
-            1024 * 1024,
-            100,
-        )
-        .unwrap();
+        let result = rewrite(&path, &mut output, 1, &measurement(), None, limits()).unwrap();
         assert!(result.replaced_existing);
         assert!(output
             .windows(album.len())
             .any(|window| window == album.as_slice()));
+    }
+
+    #[test]
+    fn writes_track_then_album_loudness_and_replaces_old_album_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("album-replace.m4a");
+        let old_album = make_box(*b"alou", &[0, 0, 0, 0, 9, 8, 7]).unwrap();
+        let old_track = make_loudness_base(*b"tlou", &measurement()).unwrap();
+        let udta = make_box(
+            *b"udta",
+            &make_box(*b"ludt", &[old_album.clone(), old_track].concat()).unwrap(),
+        )
+        .unwrap();
+        let moov = make_box(*b"moov", &track_with_extra(1, 0, udta)).unwrap();
+        std::fs::write(&path, moov).unwrap();
+        let album = encode_measurement(&DecodedLoudness {
+            sample_rate_hz: 48_000,
+            channels: 2,
+            frames: 96_000,
+            decoded_samples: 192_000,
+            integrated_lufs: -19.11,
+            sample_peak_dbfs: -3.02,
+            true_peak_dbtp: -2.01,
+        })
+        .unwrap();
+
+        let mut output = Vec::new();
+        rewrite(
+            &path,
+            &mut output,
+            1,
+            &measurement(),
+            Some(&album),
+            limits(),
+        )
+        .unwrap();
+
+        let tlou = output
+            .windows(4)
+            .position(|value| value == b"tlou")
+            .unwrap();
+        let alou = output
+            .windows(4)
+            .position(|value| value == b"alou")
+            .unwrap();
+        assert!(tlou < alou);
+        assert_eq!(
+            output.windows(4).filter(|value| *value == b"alou").count(),
+            1
+        );
+        assert!(!output
+            .windows(old_album.len())
+            .any(|window| window == old_album.as_slice()));
     }
 
     #[test]
@@ -1141,16 +1292,7 @@ mod tests {
         moov[stco + 4] = 1;
         std::fs::write(&path, moov).unwrap();
 
-        let error = rewrite(
-            &path,
-            &mut Vec::new(),
-            1,
-            &measurement(),
-            1024 * 1024,
-            1024 * 1024,
-            100,
-        )
-        .unwrap_err();
+        let error = rewrite(&path, &mut Vec::new(), 1, &measurement(), None, limits()).unwrap_err();
         assert!(error.contains("stco chunk-offset FullBox is malformed"));
     }
 }

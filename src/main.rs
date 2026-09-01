@@ -2836,11 +2836,31 @@ fn write_loudness_tags(
     } else {
         None
     };
+    let isobmff_album = cli.album.then(|| {
+        (
+            normalize::album_lufs(&analyses),
+            analyses
+                .iter()
+                .map(|analysis| analysis.sample_peak)
+                .fold(0.0_f32, f32::max),
+            analyses
+                .iter()
+                .map(|analysis| analysis.true_peak)
+                .fold(0.0_f32, f32::max),
+        )
+    });
     for (input, analysis) in cli.inputs.iter().zip(&analyses) {
         print_analysis(input, analysis, None);
         let scheme = forge_normalizer::metadata::loudness_metadata_scheme(input)?;
+        let is_isobmff = forge_normalizer::metadata::is_isobmff_file(input)?;
         if cli.dry_run {
             eprintln!("  would write {} metadata", scheme.label());
+            if is_isobmff {
+                eprintln!(
+                    "  would also write ISO-BMFF ludt/tlou{} metadata",
+                    if cli.album { "/alou" } else { "" }
+                );
+            }
         } else {
             let written = forge_normalizer::metadata::write_loudness_metadata(
                 input,
@@ -2868,6 +2888,22 @@ fn write_loudness_tags(
                      sample peak {:.8}",
                     round_trip.engineering_gain_db(),
                     round_trip.engineering_sample_peak()
+                );
+            }
+        }
+        if is_isobmff && !cli.dry_run {
+            if forge_normalizer::metadata::write_isobmff_loudness_metadata(
+                input,
+                analysis,
+                isobmff_album,
+            )? {
+                eprintln!(
+                    "  wrote and verified ISO-BMFF ludt/tlou{} metadata",
+                    if cli.album { "/alou" } else { "" }
+                );
+            } else {
+                eprintln!(
+                    "  skipped ISO-BMFF loudness boxes because silence has no finite encoded value"
                 );
             }
         }

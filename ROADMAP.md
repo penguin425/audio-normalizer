@@ -18,6 +18,10 @@ Forge already provides:
 - Album-mode ReplayGain Gain/Peak and RFC 7845 R128 gain use the combined
   population of final decoded outputs, so lossy codec drift and unequal track
   durations are reflected consistently in every tagged track.
+- M4A/ALAC normalization and metadata-only tagging create native ISO-BMFF
+  `ludt/tlou`; album mode also writes `alou` from the combined final decoded
+  gating blocks and album-wide sample/true peaks. Media payload hashes and the
+  exact quantized metadata are verified before atomic replacement.
 - `forge-doctor` reports the exact compile-time features, bounded runtime
   probes, CPU SIMD support, and effective read/write format matrix; repeatable
   `--require` checks make missing deployment capabilities fail with exit 1.
