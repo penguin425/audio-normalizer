@@ -1,4 +1,5 @@
 use clap::{Parser, ValueEnum};
+use forge_normalizer::atsc_a85_service;
 use forge_normalizer::dash_observe::{self, DashObservationOptions};
 use forge_normalizer::dash_qc::{self, DashProfile};
 use forge_normalizer::hls_qc::{self, HlsProfile};
@@ -16,13 +17,14 @@ enum Profile {
     Iso23009,
     DashIfIop,
     DashLive,
+    AtscA85Service,
 }
 
 #[derive(Parser)]
 #[command(
     name = "forge-streaming-qc",
     version,
-    about = "Audit HLS or DASH manifests and local CMAF/fMP4 package assets"
+    about = "Audit HLS/DASH packages or an ATSC A/85 streaming-service asset plan"
 )]
 struct Cli {
     input: PathBuf,
@@ -110,6 +112,17 @@ fn run(cli: Cli) -> Result<bool, String> {
         }
     });
     let (mut bytes, passed, warning_count) = match profile {
+        Profile::AtscA85Service => {
+            if cli.previous_mpd.is_some() || cli.mpd_patch.is_some() || cli.observe_remote {
+                return Err(
+                    "--previous-mpd, --mpd-patch, and --observe-remote are only valid for DASH profiles".into(),
+                );
+            }
+            let audit = atsc_a85_service::audit(&cli.input)?;
+            let passed = audit.passed;
+            let warning_count = audit.warning_count;
+            (encode(&audit, cli.compact)?, passed, warning_count)
+        }
         Profile::Rfc8216 | Profile::AppleHls | Profile::LlHls => {
             if cli.previous_mpd.is_some() || cli.mpd_patch.is_some() || cli.observe_remote {
                 return Err(
@@ -120,7 +133,10 @@ fn run(cli: Cli) -> Result<bool, String> {
                 Profile::Rfc8216 => HlsProfile::Rfc8216,
                 Profile::AppleHls => HlsProfile::AppleHls,
                 Profile::LlHls => HlsProfile::LlHls,
-                Profile::Iso23009 | Profile::DashIfIop | Profile::DashLive => unreachable!(),
+                Profile::Iso23009
+                | Profile::DashIfIop
+                | Profile::DashLive
+                | Profile::AtscA85Service => unreachable!(),
             };
             let audit = hls_qc::audit(&cli.input, profile)?;
             let passed = audit.passed;
@@ -132,7 +148,9 @@ fn run(cli: Cli) -> Result<bool, String> {
                 Profile::Iso23009 => DashProfile::Iso23009,
                 Profile::DashIfIop => DashProfile::DashIfIop,
                 Profile::DashLive => DashProfile::DashLive,
-                Profile::Rfc8216 | Profile::AppleHls | Profile::LlHls => unreachable!(),
+                Profile::Rfc8216 | Profile::AppleHls | Profile::LlHls | Profile::AtscA85Service => {
+                    unreachable!()
+                }
             };
             let mut audit = if let Some(patch) = &cli.mpd_patch {
                 dash_qc::audit_with_patch(&cli.input, patch, profile)?

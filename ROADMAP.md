@@ -112,6 +112,10 @@ Forge already provides:
   DASH Adaptation Set Switching descriptors, including normalized
   timescale/presentation-offset boundaries and discontinuity state.
 - HLS, DASH, and CMAF package checks; ISO loudness and MPEG-D DRC metadata.
+- ATSC A/85:2026 Annex L multi-asset streaming-service QC with explicit
+  long-form dialogue anchors, short-form full-programme measurement,
+  metadata/non-metadata target reconciliation, insertion and accompanying
+  programme checks, mixed-mode evidence, and the Annex M -2 dBTP ceiling.
 - DASH CICP ProgramLoudness/AnchorLoudness descriptor syntax, inheritance,
   and local ISO-BMFF measurement reconciliation; optional paired MPEG-D DRC
   container evidence; and HLS timed-ID3 validation for MPEG-TS PES and CMAF

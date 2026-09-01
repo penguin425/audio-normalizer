@@ -32,6 +32,7 @@ pub mod analysis;
 pub mod analysis_cache;
 pub mod anomaly_provider;
 mod atomic;
+pub mod atsc_a85_service;
 pub mod audio_compare;
 pub mod batch;
 pub mod binaural_qc;

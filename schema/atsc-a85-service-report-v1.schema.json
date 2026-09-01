@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/atsc-a85-service-report-v1",
+  "title": "Forge ATSC A/85:2026 streaming-service QC report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "generator", "standard", "method", "request", "service_id",
+    "target_lkfs", "target_authority", "assets", "service_checks", "warnings",
+    "warning_count", "passed"
+  ],
+  "properties": {
+    "schema": { "const": "https://penguin425.github.io/audio-normalizer/schema/atsc-a85-service-report-v1" },
+    "generator": { "type": "string", "pattern": "^forge-normalizer/" },
+    "standard": { "$ref": "#/$defs/standard" },
+    "method": { "$ref": "#/$defs/method" },
+    "request": { "$ref": "#/$defs/file" },
+    "service_id": { "type": "string" },
+    "target_lkfs": { "type": "number" },
+    "target_authority": { "enum": ["recommended_range", "prior_arrangement"] },
+    "assets": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/asset" }
+    },
+    "service_checks": { "type": "array", "items": { "$ref": "#/$defs/check" } },
+    "warnings": { "type": "array", "items": { "$ref": "#/$defs/warning" } },
+    "warning_count": { "type": "integer", "minimum": 0 },
+    "passed": { "type": "boolean" }
+  },
+  "$defs": {
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": { "type": "string" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sample_rate_hz", "channels", "frames", "duration_seconds", "integrated_lufs",
+        "loudness_range_lu", "rms_dbfs", "sample_peak_dbfs", "true_peak_dbtp"
+      ],
+      "properties": {
+        "sample_rate_hz": { "type": "integer", "minimum": 1 },
+        "channels": { "type": "integer", "minimum": 1 },
+        "frames": { "type": "integer", "minimum": 0 },
+        "duration_seconds": { "type": "number", "minimum": 0 },
+        "integrated_lufs": { "type": ["number", "null"] },
+        "loudness_range_lu": { "type": ["number", "null"] },
+        "rms_dbfs": { "type": ["number", "null"] },
+        "sample_peak_dbfs": { "type": ["number", "null"] },
+        "true_peak_dbtp": { "type": ["number", "null"] }
+      }
+    },
+    "dialogue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["integrated_lkfs", "duration_seconds", "range_count", "standard", "method"],
+      "properties": {
+        "integrated_lkfs": { "type": ["number", "null"] },
+        "duration_seconds": { "type": "number", "minimum": 0 },
+        "range_count": { "type": "integer", "minimum": 1 },
+        "standard": { "type": "string" },
+        "method": { "type": "string" }
+      }
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rule_id", "clause", "passed", "message", "observed"],
+      "properties": {
+        "rule_id": { "type": "string", "pattern": "^ATSC-A85-" },
+        "clause": { "type": "string" },
+        "passed": { "type": "boolean" },
+        "message": { "type": "string" },
+        "observed": {}
+      }
+    },
+    "warning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rule_id", "clause", "message", "asset_ids"],
+      "properties": {
+        "rule_id": { "type": "string", "pattern": "^ATSC-A85-" },
+        "clause": { "type": "string" },
+        "message": { "type": "string" },
+        "asset_ids": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "file", "programme_kind", "delivery_codec", "metadata_mode",
+        "declaration_source", "declared_loudness_lkfs", "programme", "dialogue",
+        "loudness_basis", "measured_loudness_lkfs", "metadata_deviation_lu",
+        "normalized_playback_loudness_lkfs", "service_target_deviation_lu",
+        "true_peak_headroom_db", "accompanies", "inserted", "checks", "passed"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "file": { "$ref": "#/$defs/file" },
+        "programme_kind": { "enum": ["long_form", "short_form"] },
+        "delivery_codec": {
+          "enum": ["ac3", "ac4", "dts-uhd", "e-ac3", "mpeg-h", "xhe-aac", "aac", "mpeg-layer2", "mp3"]
+        },
+        "metadata_mode": { "enum": ["metadata", "non_metadata"] },
+        "declaration_source": { "type": "string" },
+        "declared_loudness_lkfs": { "type": ["number", "null"] },
+        "programme": { "$ref": "#/$defs/measurement" },
+        "dialogue": { "anyOf": [{ "$ref": "#/$defs/dialogue" }, { "type": "null" }] },
+        "loudness_basis": { "type": "string" },
+        "measured_loudness_lkfs": { "type": ["number", "null"] },
+        "metadata_deviation_lu": { "type": ["number", "null"] },
+        "normalized_playback_loudness_lkfs": { "type": ["number", "null"] },
+        "service_target_deviation_lu": { "type": ["number", "null"] },
+        "true_peak_headroom_db": { "type": ["number", "null"] },
+        "accompanies": { "type": ["string", "null"] },
+        "inserted": { "type": "boolean" },
+        "checks": { "type": "array", "items": { "$ref": "#/$defs/check" } },
+        "passed": { "type": "boolean" }
+      }
+    },
+    "standard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "approved", "source_url", "annex"],
+      "properties": {
+        "name": { "const": "ATSC A/85:2026-07" },
+        "approved": { "const": "2026-07-08" },
+        "source_url": { "type": "string", "format": "uri" },
+        "annex": { "type": "string" }
+      }
+    },
+    "method": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "classification", "codec_metadata_evidence", "long_form_measurement",
+        "short_form_measurement", "metadata_playback_estimate", "maximum_assets",
+        "maximum_dialogue_ranges_per_asset"
+      ],
+      "properties": {
+        "id": { "const": "forge-atsc-a85-service-qc-v1" },
+        "classification": { "type": "string" },
+        "codec_metadata_evidence": { "type": "string" },
+        "long_form_measurement": { "type": "string" },
+        "short_form_measurement": { "type": "string" },
+        "metadata_playback_estimate": { "type": "string" },
+        "maximum_assets": { "const": 64 },
+        "maximum_dialogue_ranges_per_asset": { "const": 4096 }
+      }
+    }
+  }
+}
