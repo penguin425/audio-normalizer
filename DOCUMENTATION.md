@@ -58,6 +58,7 @@ The release contains the main `forge` normalizer plus focused binaries:
 
 | Area | Commands |
 | --- | --- |
+| Diagnostics | `forge-doctor` |
 | Streaming and comparison | `forge-live`, `forge-compare`, `forge-audio-compare` |
 | Containers and packages | `forge-container-qc`, `forge-streaming-qc`, `forge-imf-qc`, `forge-aes31-qc`, `forge-provenance-qc` |
 | Network delivery | `forge-rtp-qc`, `forge-st2022-7-qc`, `forge-nmos-qc`, `forge-remote-qc` |

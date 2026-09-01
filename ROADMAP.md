@@ -15,6 +15,9 @@ Forge already provides:
   bounded work-stealing parallelism across album tracks and independent batch
   files, limiter, sample-rate conversion, integer PCM dither, ReplayGain, and
   BWF loudness metadata.
+- `forge-doctor` reports the exact compile-time features, bounded runtime
+  probes, CPU SIMD support, and effective read/write format matrix; repeatable
+  `--require` checks make missing deployment capabilities fail with exit 1.
 - Corrected BWF and ReplayGain finalization reuses the already-verified output
   analysis under container-default channel roles, while explicit custom roles
   retain the independent container re-analysis needed for compatibility.
