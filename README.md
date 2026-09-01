@@ -100,8 +100,10 @@ Release archives include focused commands such as `forge-live`,
 `forge-container-qc`, `forge-streaming-qc`, `forge-compare`,
 `forge-audio-compare`, and `forge-service`. `forge-adm-presentation-qc` audits
 every ADM programme and complementary-object render through the EBU reference
-renderer. Other commands cover IMF, AES31, RTP/AES67/ST 2110, NMOS, codec
-adapters, remediation, and multi-delivery workflows.
+renderer. `forge-metadata-repair` can add measured ISO-BMFF `ludt/tlou`
+loudness metadata without re-encoding media. Other commands cover IMF, AES31,
+RTP/AES67/ST 2110, NMOS, codec adapters, remediation, and multi-delivery
+workflows.
 
 See the [documentation map](DOCUMENTATION.md#command-line-tools) or run any
 command with `--help`.

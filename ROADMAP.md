@@ -406,9 +406,13 @@ re-render from the original input without compounding lossy generations.
 
 ### Loudness workflow depth
 
-- Extend metadata-only normalization when additional containers acquire a
-  standardized, widely honoured gain mechanism; avoid inventing private gain
-  fields where none exists.
+- `forge-metadata-repair` now derives ISO-BMFF `ludt/tlou` programme loudness,
+  sample peak, and true peak from bounded decoded PCM. It preserves `mdat`
+  payloads by hash, retains album loudness, adjusts affected `stco/co64`
+  offsets, and fails closed for presentation codecs and unsupported offset
+  mechanisms.
+- Extend metadata-only normalization only when another container has a
+  standardized, widely honoured mechanism; avoid private gain fields.
 
 ### Immersive, personalized, and accessible audio
 
@@ -427,11 +431,10 @@ re-render from the original input without compounding lossy generations.
 - `forge-remediate` produces a bounded dry-run plan for true-peak and LRA
   remediation, binding source/settings hashes and requiring a fresh render and
   remeasurement for every dynamic action. It never rewrites audio.
-- `forge-metadata-repair` provides bounded copy-to-new-file BWF/ADM repair with
-  pre/post container and ADM validators, source/output hashes, unknown-chunk/XML
-  preservation, and explicit validate-and-copy-only behaviour for MXF. Source
-  replacement is intentionally not exposed; `atomic_replace` applies only to
-  the requested destination.
+- `forge-metadata-repair` provides bounded copy-to-new-file BWF/ADM and
+  ISO-BMFF loudness repair with pre/post validators, source/output hashes, and
+  byte-preservation evidence. MXF remains validate-and-copy only. Source
+  replacement is not exposed; `atomic_replace` applies only to the destination.
 - Separate dialogue, effects, music, audio-description, and clean-audio stem
   loudness checks.
 - Personalization-range safety: verify that user gain/interactivity limits

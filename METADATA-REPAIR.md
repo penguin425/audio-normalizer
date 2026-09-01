@@ -2,9 +2,10 @@
 
 `forge-metadata-repair` validates a delivery file, copies it to a separate
 destination, and optionally performs conservative byte-preserving repairs.
-Audio essence is never decoded or re-encoded.  Unknown WAVE chunks, padding,
-ADM XML outside the explicitly selected attribute, and all MXF bytes are
-preserved.
+Audio essence is never re-encoded.  ISO-BMFF loudness repair decodes a bounded
+reference only for measurement; the original media payload remains unchanged.
+Unknown WAVE chunks, padding, ADM XML outside the explicitly selected
+attribute, ISO-BMFF media payloads, and all MXF bytes are preserved.
 
 ```bash
 forge-metadata-repair metadata-repair.json --output metadata-repair-report.json
@@ -19,8 +20,20 @@ exact copy.  `mode: "repair"` (the default) supports:
   `ensure_bwf_v2` or `bwf_loudness` is requested.
 * Updating an existing ADM `axml` `audioFormatExtended/@version` to the
   published `ITU-R_BS.2076-3` value, followed by the ADM profile validator.
-* MXF and other containers are validate-and-copy only.  A mutation request for
-  them fails closed rather than risking KLV partition/index corruption.
+* `isobmff_loudness: {}` measures the single audio track's decoded PCM and
+  creates or replaces ISO/IEC 14496-12 `ludt/tlou` Program Loudness, sample
+  peak, and true-peak metadata.  Values use MPEG-D's 0.25 LU and 1/32 dB
+  quantization with BS.1770/accurate provenance.  For an fMP4 initialization
+  segment, set `decoded_reference` to a bounded PCM or complete encoded render.
+* MXF and unsupported containers are validate-and-copy only.  A mutation
+  request fails closed rather than risking partition or offset corruption.
+
+The ISO-BMFF writer supports exactly one audio track.  It buffers only `moov`,
+preserves existing album loudness, hashes every `mdat` payload before and after,
+and adjusts unfragmented `stco/co64` entries when `moov` grows.  It refuses
+APAC, xHE-AAC and presentation codecs, media files containing `moof`, unknown
+`saio/iloc/tfra` offset mechanisms, and 32-bit offset overflow.  Those cases
+need a presentation-aware muxer rather than an implicit metadata patch.
 
 `container_qc::audit` and the ADM production-profile validator run before and
 after every copy.  Reports include source/output SHA-256 values, action IDs,
