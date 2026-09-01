@@ -1,11 +1,16 @@
 [package]
 name = "forge-normalizer"
-version = "0.183.0"
+version = "0.184.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer (WAV/MP3/FLAC/Opus/AAC/Vorbis)"
 license = "MIT"
 repository = "https://github.com/penguin425/audio-normalizer"
+homepage = "https://penguin425.github.io/audio-normalizer/"
+documentation = "https://docs.rs/forge-normalizer"
+readme = "README.md"
+keywords = ["audio", "loudness", "lufs", "ebu-r128", "normalization"]
+categories = ["multimedia::audio", "command-line-utilities"]
 
 [package.metadata.binstall]
 disabled-strategies = ["quick-install"]

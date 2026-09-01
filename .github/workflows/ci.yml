@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   rust:
     runs-on: ubuntu-latest
@@ -22,6 +26,9 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all --check
+
+      - name: Validate crates.io package metadata and contents
+        run: tools/check-release-readiness.sh
 
       - name: Run Clippy
         run: cargo clippy --all-targets --no-default-features -- -D warnings
@@ -87,6 +94,7 @@ jobs:
 
   wasm:
     name: Browser WASM analysis
+    needs: rust
     runs-on: ubuntu-24.04
 
     steps:
@@ -118,6 +126,7 @@ jobs:
 
   rust-api:
     name: Rust API compatibility
+    needs: rust
     runs-on: ubuntu-24.04
 
     steps:
@@ -161,6 +170,7 @@ jobs:
 
   c-api:
     name: C/Python ABI (${{ matrix.os }})
+    needs: rust
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -247,6 +257,7 @@ jobs:
 
   host-adapters:
     name: FFmpeg/GStreamer host adapters
+    needs: rust
     runs-on: ubuntu-24.04
 
     steps:
@@ -269,6 +280,7 @@ jobs:
 
   vst3-adapter:
     name: VST3 adapter
+    needs: rust
     runs-on: ubuntu-24.04
 
     steps:
@@ -287,6 +299,7 @@ jobs:
 
   au-adapter:
     name: Audio Unit adapter
+    needs: rust
     runs-on: macos-latest
 
     steps:
@@ -302,6 +315,7 @@ jobs:
 
   plugin-parity:
     name: Plugin parity (${{ matrix.os }})
+    needs: rust
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -369,6 +383,7 @@ jobs:
 
   aaf-interoperability:
     name: AAF effect and MetaDictionary interoperability
+    needs: rust
     runs-on: ubuntu-latest
 
     steps:
@@ -388,6 +403,7 @@ jobs:
 
   iamf-interoperability:
     name: AOMedia OAR/IAMF interoperability matrix
+    needs: rust
     runs-on: ubuntu-latest
 
     steps:

@@ -116,7 +116,8 @@ cp schema/audio-anomaly-provider-v1.schema.json \
    schema/service-analysis-v1.schema.json \
    schema/service-error-v1.schema.json \
    schema/service-health-v1.schema.json "$staging/schema/"
-cp README.md PERFORMANCE.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md \
+cp README.md CHANGELOG.md COMPATIBILITY.md CONTRIBUTING.md SECURITY.md DOCUMENTATION.md \
+   PERFORMANCE.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md \
    BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md \
    MPEGH-ADAPTER.md DTS-ADAPTER.md ADM-PRESENTATION-QC.md ANOMALY-ADAPTER.md \
    SERVICE-METRICS.md C-API.md HOST-ADAPTERS.md NEXT-GENERATION-PLAN.md \
