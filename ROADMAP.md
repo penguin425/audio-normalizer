@@ -15,6 +15,9 @@ Forge already provides:
   bounded work-stealing parallelism across album tracks and independent batch
   files, limiter, sample-rate conversion, integer PCM dither, ReplayGain, and
   BWF loudness metadata.
+- Album-mode ReplayGain Gain/Peak and RFC 7845 R128 gain use the combined
+  population of final decoded outputs, so lossy codec drift and unequal track
+  durations are reflected consistently in every tagged track.
 - `forge-doctor` reports the exact compile-time features, bounded runtime
   probes, CPU SIMD support, and effective read/write format matrix; repeatable
   `--require` checks make missing deployment capabilities fail with exit 1.

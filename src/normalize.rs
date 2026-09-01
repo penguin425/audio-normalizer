@@ -2555,22 +2555,27 @@ fn normalize_album_with_roles_impl(
     };
     let gain = album_gain(&analyses, plan);
     let album_output_lufs = album_lufs(&analyses) + gain_db(gain);
+    let write_album_tags = formats.iter().copied().any(writes_album_loudness_tags);
     let staged: Vec<AtomicOutput> = outputs
         .iter()
         .map(|output| AtomicOutput::new(output))
         .collect::<Result<_, _>>()?;
+    let staged_paths = staged
+        .iter()
+        .map(|output| output.path().to_owned())
+        .collect::<Vec<_>>();
     let rendered = inputs
         .par_iter()
-        .zip(staged.par_iter())
+        .zip(staged_paths.par_iter())
         .enumerate()
         .map(|(i, (input, output))| {
             let fmt = formats.get(i).copied().unwrap_or(OutputFormat::Wav);
-            let rendered = normalize_stream(
+            normalize_stream(
                 StreamSource {
                     path: input,
                     spool: None,
                 },
-                output.path(),
+                output,
                 &analyses[i],
                 gain,
                 plan,
@@ -2578,25 +2583,55 @@ fn normalize_album_with_roles_impl(
                 StreamRenderOptions {
                     opus_album_lufs: Some(album_output_lufs),
                     capture_statistics,
-                    capture_lossless_verification: false,
+                    capture_lossless_verification: write_album_tags,
                     verification_channel_roles: None,
                 },
-            )?;
-            finalize_metadata(
-                input,
-                output.path(),
-                fmt,
-                None,
-                analyses[i].lufs + gain_db(gain),
-                Some(album_output_lufs),
-                plan,
-            )?;
-            Ok((analyses[i].clone(), gain, rendered.statistics))
+            )
         })
         .collect::<Vec<Result<_, String>>>();
     // Indexed collection preserves caller order. Resolve errors serially so
     // simultaneous failures still report the first input deterministically.
-    let results = rendered.into_iter().collect::<Result<Vec<_>, _>>()?;
+    let rendered = rendered.into_iter().collect::<Result<Vec<_>, _>>()?;
+    let (statistics, lossless_outputs): (Vec<_>, Vec<_>) = rendered
+        .into_iter()
+        .map(|result| (result.statistics, result.lossless_output))
+        .unzip();
+    let metadata_outputs = write_album_tags
+        .then(|| {
+            staged_paths
+                .par_iter()
+                .zip(lossless_outputs.into_par_iter())
+                .map(|(path, lossless)| lossless.map(Ok).unwrap_or_else(|| analyze_file(path)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    let album_metadata = metadata_outputs.as_deref().map(album_loudness_metadata);
+    let finalized = inputs
+        .par_iter()
+        .zip(staged_paths.par_iter())
+        .enumerate()
+        .map(|(index, (input, output))| {
+            let format = formats.get(index).copied().unwrap_or(OutputFormat::Wav);
+            let measured = metadata_outputs.as_ref().map(|analyses| &analyses[index]);
+            finalize_metadata(
+                input,
+                output,
+                format,
+                measured,
+                measured.map_or(analyses[index].lufs + gain_db(gain), |value| value.lufs),
+                album_metadata,
+                plan,
+            )
+        })
+        .collect::<Vec<_>>();
+    finalized.into_iter().collect::<Result<Vec<_>, _>>()?;
+    let results = analyses
+        .into_iter()
+        .zip(statistics)
+        .map(|(analysis, statistics)| (analysis, gain, statistics))
+        .collect();
     for output in staged {
         output.commit()?;
     }
@@ -2791,15 +2826,34 @@ fn normalize_album_corrected_with_optional_analyses(
             && worst_true_peak <= plan.ceiling_db + tolerance
             && verifications.iter().all(Verification::passed);
         if album_passed {
+            let write_album_tags = formats.iter().copied().any(writes_album_loudness_tags);
+            let metadata_outputs = if write_album_tags {
+                if channel_roles.is_none() {
+                    Some(decoded.clone())
+                } else {
+                    let measured = staged_paths
+                        .par_iter()
+                        .map(analyze_file)
+                        .collect::<Vec<_>>();
+                    Some(measured.into_iter().collect::<Result<Vec<_>, _>>()?)
+                }
+            } else {
+                None
+            };
+            let album_metadata = metadata_outputs.as_deref().map(album_loudness_metadata);
             for (index, (input, output)) in inputs.iter().zip(&staged_paths).enumerate() {
                 let format = formats.get(index).copied().unwrap_or(OutputFormat::Wav);
+                let measured = metadata_outputs
+                    .as_ref()
+                    .map(|analyses| &analyses[index])
+                    .or_else(|| channel_roles.is_none().then_some(&decoded[index]));
                 finalize_metadata(
                     input,
                     output,
                     format,
-                    channel_roles.is_none().then_some(&decoded[index]),
-                    decoded[index].lufs,
-                    Some(actual_album_lufs),
+                    measured,
+                    measured.map_or(decoded[index].lufs, |value| value.lufs),
+                    album_metadata,
                     plan,
                 )?;
             }
@@ -2849,13 +2903,30 @@ fn gain_db(gain: f32) -> f64 {
     20.0 * (gain as f64).log10()
 }
 
+fn writes_album_loudness_tags(format: OutputFormat) -> bool {
+    matches!(
+        format,
+        OutputFormat::Opus | OutputFormat::M4a | OutputFormat::Alac | OutputFormat::Vorbis
+    )
+}
+
+fn album_loudness_metadata(analyses: &[Analysis]) -> (f64, f32) {
+    (
+        album_lufs(analyses),
+        analyses
+            .iter()
+            .map(|analysis| analysis.true_peak)
+            .fold(0.0_f32, f32::max),
+    )
+}
+
 fn finalize_metadata(
     input: &Path,
     output: &Path,
     format: OutputFormat,
     measured_output: Option<&Analysis>,
     _track_lufs: f64,
-    _album_lufs: Option<f64>,
+    album: Option<(f64, f32)>,
     plan: &Plan,
 ) -> Result<(), String> {
     metadata::copy_metadata(input, output)?;
@@ -2866,7 +2937,12 @@ fn finalize_metadata(
     if format == OutputFormat::Opus {
         #[cfg(feature = "opus-encoding")]
         {
-            crate::opus::rewrite_r128_tags(output, _track_lufs, _album_lufs)?;
+            let track_lufs = measured_output.map_or(_track_lufs, |measured| measured.lufs);
+            crate::opus::rewrite_r128_tags(
+                output,
+                track_lufs,
+                album.map(|(album_lufs, _)| album_lufs),
+            )?;
         }
     }
     if matches!(
@@ -2874,7 +2950,7 @@ fn finalize_metadata(
         OutputFormat::M4a | OutputFormat::Alac | OutputFormat::Vorbis
     ) {
         let measured = known_or_analyze_output(output, measured_output)?;
-        metadata::write_replaygain(output, measured.lufs, measured.true_peak, None)?;
+        metadata::write_replaygain(output, measured.lufs, measured.true_peak, album)?;
     }
     Ok(())
 }
