@@ -9,6 +9,11 @@ on:
       - ".cargo/config.toml"
       - ".github/workflows/release.yml"
       - "README.md"
+      - "CHANGELOG.md"
+      - "COMPATIBILITY.md"
+      - "CONTRIBUTING.md"
+      - "SECURITY.md"
+      - "DOCUMENTATION.md"
       - "PERFORMANCE.md"
       - "LICENSE"
       - "include/forge_normalizer.h"
@@ -131,6 +136,7 @@ on:
       - "tools/package-linux-release.sh"
       - "tools/package-linux-v3-release.sh"
       - "tools/generate-package-metadata.sh"
+      - "tools/check-release-readiness.sh"
       # Cargo-only dependency updates are covered by the full-feature CI jobs.
       # Release dry-runs still run whenever packaging, public interfaces,
       # release documentation, or release tooling changes.
@@ -181,8 +187,21 @@ jobs:
             echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}"
             exit 1
           fi
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            if [[ "$(git cat-file -t "${GITHUB_REF_NAME}")" != "tag" ]]; then
+              echo "::error::Release ${GITHUB_REF_NAME} must be an annotated tag"
+              exit 1
+            fi
+            if [[ "$(git rev-parse "${GITHUB_REF_NAME}^{commit}")" != "$(git rev-parse HEAD)" ]]; then
+              echo "::error::Release ${GITHUB_REF_NAME} does not resolve to the checked-out commit"
+              exit 1
+            fi
+          fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "source-date-epoch=$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Validate crates.io package metadata and contents
+        run: tools/check-release-readiness.sh "${{ steps.version.outputs.version }}"
 
   build:
     name: Build ${{ matrix.asset }}
@@ -424,7 +443,7 @@ jobs:
              schema/service-analysis-v1.schema.json \
              schema/service-error-v1.schema.json \
              schema/service-health-v1.schema.json "$staging/schema/"
-          cp README.md PERFORMANCE.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md MPEGH-ADAPTER.md DTS-ADAPTER.md ADM-PRESENTATION-QC.md ANOMALY-ADAPTER.md SERVICE-METRICS.md C-API.md HOST-ADAPTERS.md VST3-ADAPTER.md AU-ADAPTER.md IMMERSIVE-DOWNMIX.md BINAURAL-QC.md REMEDIATION.md METADATA-REPAIR.md NEXT-GENERATION-PLAN.md ROADMAP.md LICENSE "$staging/"
+          cp README.md CHANGELOG.md COMPATIBILITY.md CONTRIBUTING.md SECURITY.md DOCUMENTATION.md PERFORMANCE.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md MPEGH-ADAPTER.md DTS-ADAPTER.md ADM-PRESENTATION-QC.md ANOMALY-ADAPTER.md SERVICE-METRICS.md C-API.md HOST-ADAPTERS.md VST3-ADAPTER.md AU-ADAPTER.md IMMERSIVE-DOWNMIX.md BINAURAL-QC.md REMEDIATION.md METADATA-REPAIR.md NEXT-GENERATION-PLAN.md ROADMAP.md LICENSE "$staging/"
           tar -czf "${staging}.tar.gz" "$staging"
 
       - name: Package Windows binary
@@ -466,7 +485,7 @@ jobs:
           Copy-Item "schema/remediation-request-v1.schema.json","schema/remediation-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/metadata-repair-request-v1.schema.json","schema/metadata-repair-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/audio-anomaly-provider-v1.schema.json","schema/anomaly-provider-audit-v1.schema.json","schema/model-qc-v1.schema.json","schema/onnx-anomaly-model-v1.schema.json","schema/onnx-feature-frames-v1.schema.json","schema/remote-range-v1.schema.json","schema/remote-qc-v1.schema.json","schema/service-analysis-v1.schema.json","schema/service-error-v1.schema.json","schema/service-health-v1.schema.json" "$staging/schema/"
-          Copy-Item "README.md","PERFORMANCE.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","MULTI-DELIVERY.md","SEGMENT-NORMALIZATION.md","AC4-ADAPTER.md","MPEGH-ADAPTER.md","DTS-ADAPTER.md","ADM-PRESENTATION-QC.md","ANOMALY-ADAPTER.md","SERVICE-METRICS.md","C-API.md","HOST-ADAPTERS.md","VST3-ADAPTER.md","AU-ADAPTER.md","IMMERSIVE-DOWNMIX.md","BINAURAL-QC.md","REMEDIATION.md","METADATA-REPAIR.md","NEXT-GENERATION-PLAN.md","ROADMAP.md","LICENSE" $staging
+          Copy-Item "README.md","CHANGELOG.md","COMPATIBILITY.md","CONTRIBUTING.md","SECURITY.md","DOCUMENTATION.md","PERFORMANCE.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","MULTI-DELIVERY.md","SEGMENT-NORMALIZATION.md","AC4-ADAPTER.md","MPEGH-ADAPTER.md","DTS-ADAPTER.md","ADM-PRESENTATION-QC.md","ANOMALY-ADAPTER.md","SERVICE-METRICS.md","C-API.md","HOST-ADAPTERS.md","VST3-ADAPTER.md","AU-ADAPTER.md","IMMERSIVE-DOWNMIX.md","BINAURAL-QC.md","REMEDIATION.md","METADATA-REPAIR.md","NEXT-GENERATION-PLAN.md","ROADMAP.md","LICENSE" $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
 
       - name: Upload packaged binary
@@ -727,6 +746,7 @@ jobs:
     needs: [validate, build, build-linux-v3, reproducible-linux, reproducible-macos-aarch64, wasm]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
+    environment: release
     permissions:
       attestations: write
       contents: write
@@ -810,4 +830,16 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --generate-notes \
+            --latest=false \
             --title "Forge $TAG"
+
+          highest_tag="$(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' |
+              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+              sort -V |
+              tail -n 1
+          )"
+          if [[ "$TAG" == "$highest_tag" ]]; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --latest
+          fi

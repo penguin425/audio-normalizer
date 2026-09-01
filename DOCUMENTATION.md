@@ -42,6 +42,7 @@ its schema version and the bounded checks it performs.
 - [FFmpeg and GStreamer adapters](HOST-ADAPTERS.md)
 - [VST3 adapter](VST3-ADAPTER.md)
 - [Audio Unit adapter](AU-ADAPTER.md)
+- [Compatibility and deprecation policy](COMPATIBILITY.md)
 - [Rust API stability policy](API-STABILITY.md)
 
 ## Operations and engineering
@@ -51,6 +52,9 @@ its schema version and the bounded checks it performs.
 - [Benchmark harness](BENCHMARKS.md)
 - [Implementation roadmap](ROADMAP.md)
 - [Next-generation plan](NEXT-GENERATION-PLAN.md)
+- [Changelog](CHANGELOG.md)
+- [Security policy](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
 
 ## Command-line tools
 

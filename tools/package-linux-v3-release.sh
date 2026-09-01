@@ -24,7 +24,7 @@ fi
 
 mkdir -p "$staging"
 cp "$forge_binary" "$staging/forge"
-cp README.md PERFORMANCE.md LICENSE "$staging/"
+cp README.md CHANGELOG.md COMPATIBILITY.md SECURITY.md PERFORMANCE.md LICENSE "$staging/"
 
 find "$staging" -exec touch -h -d "@${source_date_epoch}" {} +
 tar \

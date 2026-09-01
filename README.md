@@ -8,18 +8,14 @@ it.
 
 [Latest release](https://github.com/penguin425/audio-normalizer/releases/latest)
 · [Documentation](DOCUMENTATION.md)
+· [Changelog](CHANGELOG.md)
 · [Roadmap](ROADMAP.md)
 
 ## Quick start
 
-Install a prebuilt release with
-[`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall):
-
-```sh
-cargo binstall forge-normalizer
-```
-
-Or build the default WAV/FLAC-capable version from source with Rust 1.89 or
+Download a platform archive from the
+[latest GitHub Release](https://github.com/penguin425/audio-normalizer/releases/latest),
+or build the default WAV/FLAC-capable version from source with Rust 1.89 or
 newer:
 
 ```sh
@@ -131,9 +127,12 @@ Use the checksums and attestation bundle shipped with each
 
 - [Documentation map and command index](DOCUMENTATION.md)
 - [JSON schemas](schema/)
+- [Compatibility and deprecation policy](COMPATIBILITY.md)
 - [Rust API stability policy](API-STABILITY.md)
 - [Performance methodology](PERFORMANCE.md)
 - [Implementation roadmap](ROADMAP.md)
+- [Security policy](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
 
 ## Scope and limitations
 
