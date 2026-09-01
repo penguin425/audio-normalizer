@@ -1569,12 +1569,16 @@ fn ebu_production_profile_writes_a_rule_audit() {
 }
 
 fn wav_fixture_bytes() -> Vec<u8> {
+    wav_fixture_with_frames(48_000)
+}
+
+fn wav_fixture_with_frames(frames: usize) -> Vec<u8> {
     let file = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
     let buffer = AudioBuffer {
         sample_rate: 48_000,
         channels: 1,
-        frames: 48_000,
-        data: vec![(0..48_000)
+        frames,
+        data: vec![(0..frames)
             .map(|frame| 0.1 * (std::f32::consts::TAU * 440.0 * frame as f32 / 48_000.0).sin())
             .collect()],
         channel_roles: default_channel_roles(1),
@@ -1930,11 +1934,11 @@ fn ebu_qc_writes_versioned_baseband_evidence() {
 }
 
 #[test]
-fn ebu_qc_writes_schema_valid_2026_04_xml_envelope() {
+fn ebu_qc_writes_scenario1_2026_04_catalogue_xml() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("programme.wav");
     let report = directory.path().join("reports/ebu-qc.xml");
-    std::fs::write(&input, wav_fixture_bytes()).unwrap();
+    std::fs::write(&input, wav_fixture_with_frames(48_000 * 4)).unwrap();
 
     let result = Command::new(env!("CARGO_BIN_EXE_forge"))
         .args([
@@ -1958,6 +1962,9 @@ fn ebu_qc_writes_schema_valid_2026_04_xml_envelope() {
     assert!(xml.contains("<EditRate>48000/1</EditRate>"));
     assert!(xml.contains("<EBUQCID>0010B</EBUQCID>"));
     assert!(xml.contains("<EBUQCID>0084B</EBUQCID>"));
+    assert!(xml.contains("<Name>SilenceThresholdLevel</Name>"));
+    assert!(xml.contains("<Name>LoudnessMomentaryOverTime</Name>"));
+    assert!(!xml.contains("<Name>Event</Name>"));
     assert!(!xml.contains("FORGE-DC-OFFSET"));
 }
 

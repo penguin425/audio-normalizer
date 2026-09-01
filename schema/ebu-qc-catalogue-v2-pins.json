@@ -1,0 +1,112 @@
+{
+  "schema": "https://penguin425.github.io/audio-normalizer/schema/ebu-qc-catalogue-v2-pins-v1",
+  "catalogue_api": "https://qc.ebu.io/api/v2",
+  "catalogue_api_version": "v2",
+  "catalogue_api_namespace": "tag:qc.ebu.ch,2026-01",
+  "report_data_model_namespace": "tag:qc.ebu.ch,2026-04",
+  "verified_at": "2026-09-02",
+  "definitions": [
+    {
+      "id": "0078B",
+      "version": "3.0",
+      "name": "Audio Silence",
+      "sha256": "4b3226020b33fb85e31d4bd2b777cbe958ce06c579d91dbd28d21958e0659ecb"
+    },
+    {
+      "id": "0005B",
+      "version": "2.0",
+      "name": "Audio Digital Clipping",
+      "sha256": "6e339ee5532b9110af0a1266e9a4104bac4bde79f0944a46e187041c2f106dd8"
+    },
+    {
+      "id": "0014B",
+      "version": "2.0",
+      "name": "Audio Test Tones",
+      "sha256": "a479246e9ed1e45b392c52cec821e845573ea53b58a07285efb6b52b5ab0b875"
+    },
+    {
+      "id": "0009F",
+      "version": "2.0",
+      "name": "Audio Duration",
+      "sha256": "e4ab05954b3dddf8e80490cb98f71118fa6a0fba8f295b636acdd5dea3282fb0"
+    },
+    {
+      "id": "0010B",
+      "version": "2.0",
+      "name": "Loudness",
+      "sha256": "684db2e29e69e2c3001ad48f0820fcd8b17d2bc5e781d71d54af91061428905c"
+    },
+    {
+      "id": "0084B",
+      "version": "1.0",
+      "name": "Audio Peaks (TP)",
+      "sha256": "dead2c1efe845f12597ce4f12548d80a8c2080abd6eac685cf2d552d4f56b96c"
+    },
+    {
+      "id": "0004F",
+      "version": "2.0",
+      "name": "Audio Channel Count",
+      "sha256": "ee28e7236377e7fc998ff6dab698269423ce5d0d3add620adec19012e96b106e"
+    },
+    {
+      "id": "0008B",
+      "version": "2.0",
+      "name": "Audio Dropouts",
+      "sha256": "7ef8e6a99480e51a5ccffa1289ab27aeede1f43ce896e02607bbeb73d90598d7"
+    },
+    {
+      "id": "0012B",
+      "version": "2.0",
+      "name": "Audio Phase Reversal",
+      "sha256": "6e7b642fe1987364510f90801e2448f4b3d4d27bf01b6831addb8c6037c8fe0e"
+    },
+    {
+      "id": "0057B",
+      "version": "1.0",
+      "name": "Audio Clicks",
+      "sha256": "e2513825b589ff6c1997946bafc9a680a87816fb641fb54d81170968b0725d25"
+    },
+    {
+      "id": "0077B",
+      "version": "1.0",
+      "name": "Average Minimum Audio Level",
+      "sha256": "abe17b63a4a7ba93020d2f32405b94a0fc0bffcb28302c66d7888b2e3124cd13"
+    },
+    {
+      "id": "0088B",
+      "version": "1.0",
+      "name": "Audio Hum & Buzz",
+      "sha256": "1f46b9b14afec5b9cfea088a2d980dda1ecaad77082b7709b8c7b49d6f4ed956"
+    },
+    {
+      "id": "0086B",
+      "version": "1.0",
+      "name": "Audio Noise",
+      "sha256": "25b63467499c319200e8bec3c7e9bc1a1bd8bf15dc18305e9fd6ce5e9ca4e0c6"
+    },
+    {
+      "id": "0170B",
+      "version": "1.0",
+      "name": "Cross Talk",
+      "sha256": "9a85a5876d970fa4bf5309f5efb8f087c7e7aa9af4ca0f13be0e37ca858cf856"
+    },
+    {
+      "id": "0230B",
+      "version": "1.0",
+      "name": "Audio Channel Panning",
+      "sha256": "e129b0ba2e4c66fe0f250fca0dd572d5984b0d0825dbd0d8c5b5e9783463246a"
+    },
+    {
+      "id": "0095B",
+      "version": "1.0",
+      "name": "LFE/Centre Channel Assignment",
+      "sha256": "f64d58e6f0a93e289edc822bea43cb286ba57fbf47c5dba77a8ff291142a36e3"
+    },
+    {
+      "id": "0124B",
+      "version": "2.0",
+      "name": "Mono Audio",
+      "sha256": "66d079ed3cd6f4bf7b11cf0d234c2152b7034fe42b75bac0faa28fd7e96a36ca"
+    }
+  ]
+}

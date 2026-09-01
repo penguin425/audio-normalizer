@@ -145,9 +145,10 @@ Forge already provides:
   phase reversal, test tones, clicks, minimum average level, silence, true
   peak, hum/buzz, band-limited noise, cross-talk, panning, LFE/centre
   assignment, and mono delivery.
-- Schema-valid April 2026 EBU QC generic XML envelopes for calculated published
-  Items, with deterministic identifiers and sample edit units; complete
-  Scenario 1 Catalogue-specific input/output vocabularies remain future work.
+- April 2026 EBU QC Scenario 1 XML reports with deterministic identifiers,
+  sample edit units, pinned Catalogue API v2 definition hashes, exact
+  catalogue-specific input/output vocabularies, one-to-one Item results, and
+  correct check-versus-report semantics.
 - September 2025 EBU Tech 3393 reading/writing structural audits covering the
   profile declaration, bounded core ADM graph/cardinalities, identifiers,
   references, labels, object nesting, tag groups, and `chna` reconciliation.
