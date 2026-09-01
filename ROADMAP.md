@@ -89,6 +89,9 @@ Forge already provides:
   structural/audio constraints.
 - HLS MPEG-TS segment audits with discontinuity-aware programme/PID/codec
   stability and cross-segment audio PTS continuity.
+- Apple HLS fMP4 loudness rules now evaluate every audio track: non-APAC
+  tracks receive the `ludt` recommendation, while APAC tracks fail if a
+  container loudness box would override their required in-stream metadata.
 - HLS 2nd Edition draft-22 Low-Latency profile checks for Partial Segments,
   preload hints, server-control and blocking-reload declarations, delta
   updates, Rendition Reports, live-edge values, and cross-rendition

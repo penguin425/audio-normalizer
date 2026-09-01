@@ -1652,18 +1652,7 @@ fn audit_isobmff(
                 ));
             }
             if initialization && profile == HlsProfile::AppleHls {
-                let loudness = audit.properties["tracks"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .any(|track| track["loudness_box_count"].as_u64().unwrap_or(0) > 0);
-                findings.push(finding(
-                    "FORGE-APPLE-HLS-LOUDNESS-BOX",
-                    Severity::Warning,
-                    loudness,
-                    "Apple recommends loudness metadata in non-APAC fMP4",
-                    None,
-                ));
+                audit_apple_isobmff_loudness(&audit.properties, findings);
             }
             xhe_tracks
         }
@@ -1676,6 +1665,42 @@ fn audit_isobmff(
                 Some(json!(path)),
             ));
             Vec::new()
+        }
+    }
+}
+
+fn audit_apple_isobmff_loudness(properties: &Value, findings: &mut Vec<HlsFinding>) {
+    let tracks = properties["tracks"].as_array().into_iter().flatten();
+    for track in tracks.filter(|track| track["handler"].as_str() == Some("soun")) {
+        let codecs = track["codecs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        let apac = codecs.contains(&"apac");
+        let loudness_box_count = track["loudness_box_count"].as_u64().unwrap_or(0);
+        let observed = Some(json!({
+            "track_id": track["track_id"],
+            "codecs": codecs,
+            "loudness_box_count": loudness_box_count
+        }));
+        if apac {
+            findings.push(finding(
+                "FORGE-APPLE-HLS-APAC-LOUDNESS-BOX",
+                Severity::Error,
+                loudness_box_count == 0,
+                "APAC fMP4 does not use ludt; loudness and DRC metadata belong in the audio stream",
+                observed,
+            ));
+        } else {
+            findings.push(finding(
+                "FORGE-APPLE-HLS-LOUDNESS-BOX",
+                Severity::Warning,
+                loudness_box_count > 0,
+                "Apple recommends ludt loudness metadata for each non-APAC fMP4 audio track",
+                observed,
+            ));
         }
     }
 }
@@ -2359,6 +2384,59 @@ mod tests {
 
     fn full_box(version: u8, payload: Vec<u8>) -> Vec<u8> {
         [vec![version, 0, 0, 0], payload].concat()
+    }
+
+    #[test]
+    fn applies_apple_loudness_rules_per_audio_track_and_exempts_apac() {
+        let properties = json!({
+            "tracks": [
+                {"track_id": 1, "handler": "soun", "codecs": ["apac"], "loudness_box_count": 0},
+                {"track_id": 2, "handler": "soun", "codecs": ["mp4a"], "loudness_box_count": 1},
+                {"track_id": 3, "handler": "soun", "codecs": ["alac"], "loudness_box_count": 0},
+                {"track_id": 4, "handler": "vide", "codecs": ["apac"], "loudness_box_count": 1}
+            ]
+        });
+        let mut findings = Vec::new();
+        audit_apple_isobmff_loudness(&properties, &mut findings);
+
+        let apac = findings
+            .iter()
+            .filter(|item| item.rule_id == "FORGE-APPLE-HLS-APAC-LOUDNESS-BOX")
+            .collect::<Vec<_>>();
+        assert_eq!(apac.len(), 1);
+        assert!(apac[0].passed);
+        assert_eq!(apac[0].severity, Severity::Error);
+        assert_eq!(apac[0].observed.as_ref().unwrap()["track_id"], 1);
+
+        let ordinary = findings
+            .iter()
+            .filter(|item| item.rule_id == "FORGE-APPLE-HLS-LOUDNESS-BOX")
+            .collect::<Vec<_>>();
+        assert_eq!(ordinary.len(), 2);
+        assert!(ordinary
+            .iter()
+            .any(|item| item.passed && item.observed.as_ref().unwrap()["track_id"] == 2));
+        assert!(ordinary
+            .iter()
+            .any(|item| !item.passed && item.observed.as_ref().unwrap()["track_id"] == 3));
+    }
+
+    #[test]
+    fn rejects_ludt_on_apple_apac_audio() {
+        let properties = json!({
+            "tracks": [{
+                "track_id": 9,
+                "handler": "soun",
+                "codecs": ["apac"],
+                "loudness_box_count": 1
+            }]
+        });
+        let mut findings = Vec::new();
+        audit_apple_isobmff_loudness(&properties, &mut findings);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "FORGE-APPLE-HLS-APAC-LOUDNESS-BOX");
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(!findings[0].passed);
     }
 
     fn media_segment(sequence: u32, decode_time: u64) -> Vec<u8> {
