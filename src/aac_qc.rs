@@ -31,7 +31,7 @@ pub(crate) struct AscInfo {
 /// xHE-AAC is signalled as MPEG-4 Audio Object Type 42. Its decoder
 /// configuration is not a GASpecificConfig, so it must not be accepted by the
 /// legacy AAC parser merely because the outer AudioSpecificConfig is bounded.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct UsacConfigInfo {
     pub audio_object_type: u8,
     pub output_sample_rate_hz: u32,
@@ -40,8 +40,29 @@ pub(crate) struct UsacConfigInfo {
     pub output_channels: u16,
     pub frame_samples: u16,
     pub element_count: u16,
+    pub audio_preroll: Option<UsacAudioPrerollConfig>,
     pub uni_drc_config_present: bool,
     pub loudness_info_present: bool,
+    pub uni_drc_config: Option<crate::mpeg_d_drc::UniDrcConfig>,
+    pub loudness_info_set: Option<crate::mpeg_d_drc::LoudnessInfoSet>,
+    pub apple_basic_drc_profile: crate::mpeg_d_drc::AppleBasicDrcProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct UsacAudioPrerollConfig {
+    pub element_index: u16,
+    pub default_payload_length_bytes: Option<u64>,
+    pub payload_fragmentation: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct UsacIpfInspection {
+    pub valid_ipf: bool,
+    pub independency_flag: bool,
+    pub audio_preroll_present: bool,
+    pub pre_roll_frames: u8,
+    pub configuration_bytes: u16,
+    pub boundary_preroll_frames_independent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -595,6 +616,11 @@ pub(crate) fn parse_asc_bytes(bytes: &[u8]) -> Result<AscInfo, String> {
     parse_audio_specific_config(&mut BitReader::new(bytes))
 }
 
+pub(crate) fn looks_like_usac_config(bytes: &[u8]) -> bool {
+    let mut bits = BitReader::new(bytes);
+    read_audio_object_type(&mut bits).is_ok_and(|audio_object_type| audio_object_type == 42)
+}
+
 pub(crate) fn parse_usac_config_bytes(bytes: &[u8]) -> Result<UsacConfigInfo, String> {
     let mut bits = BitReader::new(bytes);
     let audio_object_type = read_audio_object_type(&mut bits)?;
@@ -662,8 +688,9 @@ pub(crate) fn parse_usac_config_bytes(bytes: &[u8]) -> Result<UsacConfigInfo, St
     }
     let sbr = core_sbr_frame_length_index >= 2;
     let mut described_channels = 0_u16;
-    let mut uni_drc_config_present = false;
-    for _ in 0..element_count {
+    let mut uni_drc_config = None;
+    let mut audio_preroll = None;
+    for element_index in 0..element_count {
         match bits.read(2)? {
             0 => {
                 described_channels = described_channels.saturating_add(1);
@@ -690,17 +717,57 @@ pub(crate) fn parse_usac_config_bytes(bytes: &[u8]) -> Result<UsacConfigInfo, St
                 if extension_bytes >= 768 {
                     return Err("USAC extension-element config exceeds 767 bytes".into());
                 }
-                if bits.bit()? {
-                    read_escape_value(&mut bits, 8, 16, 0)?;
+                let default_payload_length_bytes = if bits.bit()? {
+                    Some(
+                        read_escape_value(&mut bits, 8, 16, 0)?
+                            .checked_add(1)
+                            .ok_or("USAC default extension payload length overflow")?,
+                    )
+                } else {
+                    None
+                };
+                let payload_fragmentation = bits.bit()?;
+                let byte_count = usize::try_from(extension_bytes)
+                    .map_err(|_| "USAC extension length overflow")?;
+                if extension_type == 3 {
+                    if audio_preroll.is_some() {
+                        return Err(
+                            "USAC contains duplicate audio pre-roll extension elements".into()
+                        );
+                    }
+                    if byte_count != 0 {
+                        return Err(
+                            "USAC audio pre-roll extension has non-empty configuration".into()
+                        );
+                    }
+                    audio_preroll = Some(UsacAudioPrerollConfig {
+                        element_index: u16::try_from(element_index).unwrap(),
+                        default_payload_length_bytes,
+                        payload_fragmentation,
+                    });
+                } else if extension_type == 4 && byte_count > 0 {
+                    if uni_drc_config.is_some() {
+                        return Err(
+                            "USAC contains duplicate uniDrcConfig extension elements".into()
+                        );
+                    }
+                    let payload = read_bit_bytes(&mut bits, byte_count)?;
+                    uni_drc_config = Some(
+                        crate::mpeg_d_drc::parse_uni_drc_config(
+                            &payload,
+                            output_sample_rate_hz,
+                            output_channels,
+                            frame_samples,
+                        )
+                        .map_err(|error| format!("invalid uniDrcConfig: {error}"))?,
+                    );
+                } else {
+                    bits.skip(
+                        byte_count
+                            .checked_mul(8)
+                            .ok_or("USAC extension bit length overflow")?,
+                    )?;
                 }
-                bits.bit()?;
-                bits.skip(
-                    usize::try_from(extension_bytes)
-                        .map_err(|_| "USAC extension length overflow")?
-                        .checked_mul(8)
-                        .ok_or("USAC extension bit length overflow")?,
-                )?;
-                uni_drc_config_present |= extension_type == 4 && extension_bytes > 0;
             }
             _ => unreachable!(),
         }
@@ -714,7 +781,7 @@ pub(crate) fn parse_usac_config_bytes(bytes: &[u8]) -> Result<UsacConfigInfo, St
         ));
     }
 
-    let mut loudness_info_present = false;
+    let mut loudness_info_set = None;
     if bits.bit()? {
         let extension_count = read_escape_value(&mut bits, 2, 4, 8)?
             .checked_add(1)
@@ -736,6 +803,15 @@ pub(crate) fn parse_usac_config_bytes(bytes: &[u8]) -> Result<UsacConfigInfo, St
                         return Err("USAC fill extension contains a non-0xa5 byte".into());
                     }
                 }
+            } else if extension_type == 2 && byte_count > 0 {
+                if loudness_info_set.is_some() {
+                    return Err("USAC contains duplicate loudnessInfoSet extensions".into());
+                }
+                let payload = read_bit_bytes(&mut bits, byte_count)?;
+                loudness_info_set = Some(
+                    crate::mpeg_d_drc::parse_loudness_info_set(&payload)
+                        .map_err(|error| format!("invalid loudnessInfoSet: {error}"))?,
+                );
             } else {
                 bits.skip(
                     byte_count
@@ -743,12 +819,22 @@ pub(crate) fn parse_usac_config_bytes(bytes: &[u8]) -> Result<UsacConfigInfo, St
                         .ok_or("USAC config-extension bit length overflow")?,
                 )?;
             }
-            loudness_info_present |= extension_type == 2 && extension_bytes > 0;
         }
     }
     if !bits.remaining_bits_are_zero() {
         return Err("USAC AudioSpecificConfig has non-padding trailing bits".into());
     }
+
+    if let (Some(config), Some(loudness)) = (&uni_drc_config, &loudness_info_set) {
+        crate::mpeg_d_drc::validate_metadata_pair(config, loudness)
+            .map_err(|error| format!("inconsistent MPEG-D DRC metadata: {error}"))?;
+    }
+    let apple_basic_drc_profile = crate::mpeg_d_drc::evaluate_apple_basic_profile(
+        uni_drc_config.as_ref(),
+        loudness_info_set.as_ref(),
+    );
+    let uni_drc_config_present = uni_drc_config.is_some();
+    let loudness_info_present = loudness_info_set.is_some();
 
     Ok(UsacConfigInfo {
         audio_object_type,
@@ -758,9 +844,137 @@ pub(crate) fn parse_usac_config_bytes(bytes: &[u8]) -> Result<UsacConfigInfo, St
         output_channels,
         frame_samples,
         element_count: element_count as u16,
+        audio_preroll,
         uni_drc_config_present,
         loudness_info_present,
+        uni_drc_config,
+        loudness_info_set,
+        apple_basic_drc_profile,
     })
+}
+
+pub(crate) fn inspect_usac_ipf(
+    sample: &[u8],
+    preroll: &UsacAudioPrerollConfig,
+) -> Result<UsacIpfInspection, String> {
+    if preroll.element_index != 0 {
+        return Err("USAC audio pre-roll is not the first configured element".into());
+    }
+    if preroll.payload_fragmentation {
+        return Err(
+            "fragmented USAC audio pre-roll payload cannot establish an IPF boundary".into(),
+        );
+    }
+    if preroll.default_payload_length_bytes.is_some() {
+        return Err("USAC audio pre-roll uses an unsupported default payload length".into());
+    }
+    let mut bits = BitReader::new(sample);
+    let independency_flag = bits.bit()?;
+    let audio_preroll_present = bits.bit()?;
+    let use_default_length = bits.bit()?;
+    if use_default_length {
+        return Err(
+            "USAC audio pre-roll frame unexpectedly selects a default payload length".into(),
+        );
+    }
+    if !audio_preroll_present {
+        return Ok(UsacIpfInspection {
+            valid_ipf: false,
+            independency_flag,
+            audio_preroll_present,
+            pre_roll_frames: 0,
+            configuration_bytes: 0,
+            boundary_preroll_frames_independent: false,
+        });
+    }
+    let initial_length = bits.read(8)?;
+    let payload_length = if initial_length == 255 {
+        initial_length
+            .checked_add(bits.read(16)?)
+            .and_then(|value| value.checked_sub(2))
+            .ok_or("USAC audio pre-roll payload length overflow")?
+    } else {
+        initial_length
+    };
+    if payload_length == 0 {
+        return Err("USAC audio pre-roll payload is empty".into());
+    }
+    let payload_bits = usize::try_from(payload_length)
+        .map_err(|_| "USAC audio pre-roll length does not fit memory")?
+        .checked_mul(8)
+        .ok_or("USAC audio pre-roll bit length overflow")?;
+    let mut payload = bits.sub_reader(payload_bits)?;
+    let mut configuration_bytes = payload.read(4)?;
+    if configuration_bytes == 15 {
+        let addition = payload.read(4)?;
+        configuration_bytes += addition;
+        if addition == 15 {
+            configuration_bytes += payload.read(8)?;
+        }
+    }
+    for _ in 0..configuration_bytes {
+        payload.read(8)?;
+    }
+    payload.read(1)?; // applyCrossfade
+    if payload.bit()? {
+        return Err("USAC audio pre-roll reserved bit is non-zero".into());
+    }
+    let mut pre_roll_frames = payload.read(2)?;
+    if pre_roll_frames == 3 {
+        pre_roll_frames += payload.read(4)?;
+    }
+    if pre_roll_frames > 3 {
+        return Err("USAC audio pre-roll frame count exceeds the USAC limit of three".into());
+    }
+    let mut preroll_independency_flags = Vec::with_capacity(
+        usize::try_from(pre_roll_frames).map_err(|_| "USAC pre-roll frame count overflow")?,
+    );
+    for _ in 0..pre_roll_frames {
+        let initial_frame_length = payload.read(16)?;
+        let frame_length = if initial_frame_length == 65_535 {
+            initial_frame_length
+                .checked_add(payload.read(16)?)
+                .ok_or("USAC pre-roll access-unit length overflow")?
+        } else {
+            initial_frame_length
+        };
+        if frame_length == 0 {
+            return Err("USAC pre-roll access unit is empty".into());
+        }
+        let access_unit_bits = usize::try_from(frame_length)
+            .map_err(|_| "USAC pre-roll access-unit length does not fit memory")?
+            .checked_mul(8)
+            .ok_or("USAC pre-roll access-unit bit length overflow")?;
+        let mut access_unit = payload.sub_reader(access_unit_bits)?;
+        preroll_independency_flags.push(access_unit.bit()?);
+        access_unit.skip(access_unit.remaining())?;
+    }
+    if payload.remaining() > 7 || !payload.remaining_bits_are_zero() {
+        return Err("USAC audio pre-roll payload has invalid trailing bits".into());
+    }
+    let boundary_preroll_frames_independent = preroll_independency_flags
+        .first()
+        .zip(preroll_independency_flags.last())
+        .is_some_and(|(first, last)| *first && *last);
+    Ok(UsacIpfInspection {
+        valid_ipf: independency_flag
+            && configuration_bytes > 0
+            && pre_roll_frames > 0
+            && boundary_preroll_frames_independent,
+        independency_flag,
+        audio_preroll_present,
+        pre_roll_frames: u8::try_from(pre_roll_frames).unwrap(),
+        configuration_bytes: u16::try_from(configuration_bytes).unwrap(),
+        boundary_preroll_frames_independent,
+    })
+}
+
+fn read_bit_bytes(bits: &mut BitReader<'_>, byte_count: usize) -> Result<Vec<u8>, String> {
+    let mut payload = Vec::with_capacity(byte_count);
+    for _ in 0..byte_count {
+        payload.push(u8::try_from(bits.read(8)?).unwrap());
+    }
+    Ok(payload)
 }
 
 const USAC_SAMPLE_RATES: [Option<u32>; 31] = [
@@ -1319,6 +1533,8 @@ mod tests {
 
     #[test]
     fn parses_bounded_xhe_aac_usac_and_metadata_extensions() {
+        let (drc_payload, loudness_payload) =
+            crate::mpeg_d_drc::test_support::apple_basic_payloads();
         let mut bits = BitWriter::default();
         bits.write(31, 5); // escaped Audio Object Type
         bits.write(10, 6); // 32 + 10 = USAC (42)
@@ -1327,30 +1543,122 @@ mod tests {
         bits.write(3, 5); // USAC 48 kHz
         bits.write(1, 3); // 1024 samples, no SBR
         bits.write(2, 5); // USAC stereo
-        bits.write_escape(1, 4, 8, 16); // two elements minus one
+        bits.write_escape(2, 4, 8, 16); // three elements minus one
+        bits.write(3, 2); // audio pre-roll extension element
+        bits.write_escape(3, 4, 8, 16);
+        bits.write_escape(0, 4, 8, 16); // no extension configuration
+        bits.write(0, 1); // no default payload length
+        bits.write(0, 1); // no payload fragmentation
         bits.write(1, 2); // channel-pair element
         bits.write(0, 1); // xHE tw_mdct
         bits.write(1, 1); // noise filling
         bits.write(3, 2); // extension element
         bits.write_escape(4, 4, 8, 16); // MPEG-D UniDRC
-        bits.write_escape(1, 4, 8, 16); // one config byte
+        bits.write_escape(drc_payload.len() as u64, 4, 8, 16);
         bits.write(0, 1); // no default payload length
         bits.write(0, 1); // payload fragmentation flag
-        bits.write(0, 8); // bounded UniDRC configuration payload
+        for byte in drc_payload {
+            bits.write(u64::from(byte), 8);
+        }
         bits.write(1, 1); // usacConfigExtensionPresent
         bits.write_escape(0, 2, 4, 8); // one extension minus one
         bits.write_escape(2, 4, 8, 16); // loudnessInfoSet
-        bits.write_escape(1, 4, 8, 16); // one payload byte
-        bits.write(0, 8);
+        bits.write_escape(loudness_payload.len() as u64, 4, 8, 16);
+        for byte in loudness_payload {
+            bits.write(u64::from(byte), 8);
+        }
 
         let config = parse_usac_config_bytes(&bits.bytes()).unwrap();
         assert_eq!(config.audio_object_type, 42);
         assert_eq!(config.output_sample_rate_hz, 48_000);
         assert_eq!(config.output_channels, 2);
         assert_eq!(config.frame_samples, 1_024);
-        assert_eq!(config.element_count, 2);
+        assert_eq!(config.element_count, 3);
+        assert_eq!(config.audio_preroll.as_ref().unwrap().element_index, 0);
         assert!(config.uni_drc_config_present);
         assert!(config.loudness_info_present);
+        assert!(config.apple_basic_drc_profile.compliant);
+        assert_eq!(config.uni_drc_config.unwrap().instructions.len(), 4);
+    }
+
+    #[test]
+    fn identifies_a_complete_usac_immediate_playout_frame() {
+        let mut sample = BitWriter::default();
+        sample.write(1, 1); // usacIndependencyFlag
+        sample.write(1, 1); // audio pre-roll present
+        sample.write(0, 1); // explicit payload length
+        sample.write(5, 8); // five-byte audio pre-roll payload
+        sample.write(1, 4); // one-byte replacement configuration
+        sample.write(0, 8);
+        sample.write(0, 1); // no crossfade
+        sample.write(0, 1); // reserved
+        sample.write(1, 2); // one pre-roll frame
+        sample.write(1, 16); // one-byte access unit
+        sample.write(0x80, 8);
+
+        let config = UsacConfigInfo {
+            audio_object_type: 42,
+            output_sample_rate_hz: 48_000,
+            core_sbr_frame_length_index: 1,
+            channel_configuration_index: 2,
+            output_channels: 2,
+            frame_samples: 1_024,
+            element_count: 2,
+            audio_preroll: Some(UsacAudioPrerollConfig {
+                element_index: 0,
+                default_payload_length_bytes: None,
+                payload_fragmentation: false,
+            }),
+            uni_drc_config_present: false,
+            loudness_info_present: false,
+            uni_drc_config: None,
+            loudness_info_set: None,
+            apple_basic_drc_profile: crate::mpeg_d_drc::evaluate_apple_basic_profile(None, None),
+        };
+        let inspection =
+            inspect_usac_ipf(&sample.bytes(), config.audio_preroll.as_ref().unwrap()).unwrap();
+        assert!(inspection.valid_ipf);
+        assert_eq!(inspection.pre_roll_frames, 1);
+        assert_eq!(inspection.configuration_bytes, 1);
+        assert!(inspection.boundary_preroll_frames_independent);
+
+        let mut missing_config = BitWriter::default();
+        missing_config.write(1, 1);
+        missing_config.write(1, 1);
+        missing_config.write(0, 1);
+        missing_config.write(4, 8);
+        missing_config.write(0, 4); // configLen must be greater than zero for an IPF
+        missing_config.write(0, 1);
+        missing_config.write(0, 1);
+        missing_config.write(1, 2);
+        missing_config.write(1, 16);
+        missing_config.write(0x80, 8);
+        let inspection = inspect_usac_ipf(
+            &missing_config.bytes(),
+            config.audio_preroll.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert!(!inspection.valid_ipf);
+
+        let mut dependent_preroll = BitWriter::default();
+        dependent_preroll.write(1, 1);
+        dependent_preroll.write(1, 1);
+        dependent_preroll.write(0, 1);
+        dependent_preroll.write(5, 8);
+        dependent_preroll.write(1, 4);
+        dependent_preroll.write(0, 8);
+        dependent_preroll.write(0, 1);
+        dependent_preroll.write(0, 1);
+        dependent_preroll.write(1, 2);
+        dependent_preroll.write(1, 16);
+        dependent_preroll.write(0, 8); // copied AU is not independently decodable
+        let inspection = inspect_usac_ipf(
+            &dependent_preroll.bytes(),
+            config.audio_preroll.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert!(!inspection.valid_ipf);
+        assert!(!inspection.boundary_preroll_frames_independent);
     }
 
     #[test]

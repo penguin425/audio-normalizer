@@ -58,6 +58,7 @@ struct Track {
     drc_boxes: Vec<String>,
     aac_config: Option<crate::aac_qc::AscInfo>,
     usac_config: Option<crate::aac_qc::UsacConfigInfo>,
+    usac_config_error: Option<String>,
     edit_media_time: Option<i64>,
     edit_segment_duration: Option<u64>,
     sample_group_types: Vec<String>,
@@ -611,16 +612,43 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
                         "fragmented": fragmented
                     })),
                 ));
-                let metadata_present = usac.uni_drc_config_present && usac.loudness_info_present;
+                bitstream.push(check(
+                    "FORGE-ISOBMFF-XHE-AAC-UNIDRC-STRUCTURE",
+                    usac.uni_drc_config.is_some(),
+                    "xHE-AAC carries a structurally valid, bounded MPEG-D uniDrcConfig payload",
+                    Some(json!({
+                        "track_id": track.id,
+                        "uni_drc_config": usac.uni_drc_config
+                    })),
+                ));
+                bitstream.push(check(
+                    "FORGE-ISOBMFF-XHE-AAC-LOUDNESS-STRUCTURE",
+                    usac.loudness_info_set.is_some(),
+                    "xHE-AAC carries a structurally valid, bounded MPEG-D loudnessInfoSet payload",
+                    Some(json!({
+                        "track_id": track.id,
+                        "loudness_info_set": usac.loudness_info_set
+                    })),
+                ));
+                bitstream.push(check(
+                    "FORGE-ISOBMFF-XHE-AAC-APPLE-BASIC-DRC",
+                    usac.apple_basic_drc_profile.compliant,
+                    "xHE-AAC metadata satisfies Apple's Basic DRC Metadata Profile",
+                    Some(json!({
+                        "track_id": track.id,
+                        "profile": usac.apple_basic_drc_profile
+                    })),
+                ));
+                let metadata_present = usac.apple_basic_drc_profile.compliant;
                 bitstream.push(check(
                     "FORGE-ISOBMFF-XHE-AAC-INSTREAM-METADATA",
                     metadata_present,
-                    "xHE-AAC carries bounded in-stream MPEG-D UniDRC and loudnessInfo configuration extensions",
+                    "xHE-AAC carries valid in-stream MPEG-D metadata conforming to Apple's Basic DRC Metadata Profile",
                     Some(json!({
                         "track_id": track.id,
                         "uni_drc_config_present": usac.uni_drc_config_present,
                         "loudness_info_present": usac.loudness_info_present,
-                        "payload_profile_validation": "not evaluated"
+                        "apple_basic_drc_profile": usac.apple_basic_drc_profile
                     })),
                 ));
                 if let (Some(access_units), Some(stts_duration)) =
@@ -882,6 +910,7 @@ pub(crate) fn audit(path: &Path, mut file: File, file_size: u64) -> Result<Conta
             .flat_map(|fragment| fragment.decode_times.iter())
             .map(|(track_id, time)| json!({"track_id": track_id, "time": time}))
             .collect::<Vec<_>>(),
+        "fragment_first_samples": fragment_first_samples_json(&state.fragments),
         "fragment_movie_relative": state.fragments.iter()
             .all(|fragment| fragment.movie_relative == Some(true)),
         "movie_duration": state.movie_duration,
@@ -3378,10 +3407,19 @@ fn parse_stsd(
                             .iter()
                             .find(|(kind, _)| kind == "esds")
                             .and_then(|(_, payload)| decoder_specific_info(payload).ok());
-                        let usac = decoder_config
-                            .and_then(|bytes| crate::aac_qc::parse_usac_config_bytes(bytes).ok());
+                        let usac_signalled =
+                            decoder_config.is_some_and(crate::aac_qc::looks_like_usac_config);
+                        let (usac, usac_error) = if usac_signalled {
+                            match decoder_config.map(crate::aac_qc::parse_usac_config_bytes) {
+                                Some(Ok(value)) => (Some(value), None),
+                                Some(Err(error)) => (None, Some(error)),
+                                None => unreachable!(),
+                            }
+                        } else {
+                            (None, None)
+                        };
                         let asc = decoder_config.and_then(|bytes| {
-                            (usac.is_none())
+                            (!usac_signalled)
                                 .then(|| crate::aac_qc::parse_asc_bytes(bytes).ok())
                                 .flatten()
                         });
@@ -3389,12 +3427,15 @@ fn parse_stsd(
                             "FORGE-ISOBMFF-AAC-ASC",
                             asc.is_some() || usac.is_some(),
                             "mp4a sample entry contains a bounded AAC or MPEG-D USAC AudioSpecificConfig",
-                            asc.as_ref()
-                                .map(|value| json!(value))
+                            usac_error
+                                .as_ref()
+                                .map(|error| json!({"usac_error": error}))
+                                .or_else(|| asc.as_ref().map(|value| json!(value)))
                                 .or_else(|| usac.as_ref().map(|value| json!(value))),
                         ));
                         track.aac_config = asc;
                         track.usac_config = usac;
+                        track.usac_config_error = usac_error;
                     }
                 }
                 Err(()) => {
@@ -5143,6 +5184,28 @@ fn parse_counted_entries(body: &[u8], width: usize) -> Option<Vec<&[u8]>> {
     Some(body[8..].chunks_exact(width).collect())
 }
 
+fn fragment_first_samples_json(fragments: &[Fragment]) -> Vec<Value> {
+    fragments
+        .iter()
+        .enumerate()
+        .flat_map(|(fragment_index, fragment)| {
+            fragment.tracks.iter().filter_map(move |track| {
+                let sample = track.samples.first()?;
+                let flags = track.sample_flags.first().copied()?;
+                Some(json!({
+                    "fragment_index": fragment_index,
+                    "sequence": fragment.sequence,
+                    "track_id": track.track_id,
+                    "offset": sample.offset,
+                    "size": sample.size,
+                    "flags": flags,
+                    "is_sync_sample": flags & 0x0001_0000 == 0
+                }))
+            })
+        })
+        .collect()
+}
+
 fn track_json(track: &Track) -> Value {
     json!({
         "track_id": track.id,
@@ -6073,6 +6136,8 @@ mod tests {
     }
 
     fn xhe_aac_asc(with_required_metadata: bool) -> Vec<u8> {
+        let (drc_payload, loudness_payload) =
+            crate::mpeg_d_drc::test_support::apple_basic_payloads();
         let mut output = Vec::<u8>::new();
         let mut position = 0_usize;
         let mut write = |value: u64, width: usize| {
@@ -6092,22 +6157,41 @@ mod tests {
         write(3, 5); // USAC 48 kHz
         write(1, 3); // 1024 samples without SBR
         write(2, 5); // USAC stereo
-        write(u64::from(with_required_metadata), 4); // one or two elements minus one
+        write(if with_required_metadata { 2 } else { 1 }, 4);
+        write(3, 2); // audio pre-roll extension element
+        write(3, 4); // audio pre-roll type
+        write(0, 4); // no extension configuration
+        write(0, 1); // no default payload length
+        write(0, 1); // no payload fragmentation
         write(1, 2); // CPE
         write(0, 1); // tw_mdct
         write(1, 1); // noise filling
         if with_required_metadata {
             write(3, 2); // extension element
             write(4, 4); // UniDRC
-            write(1, 4); // one byte
+            if drc_payload.len() < 15 {
+                write(drc_payload.len() as u64, 4);
+            } else {
+                write(15, 4);
+                write((drc_payload.len() - 15) as u64, 8);
+            }
             write(0, 1); // no default payload length
             write(0, 1); // payload fragmentation flag
-            write(0, 8); // bounded configuration payload
+            for byte in drc_payload {
+                write(u64::from(byte), 8);
+            }
             write(1, 1); // config extensions present
             write(0, 2); // one extension minus one
             write(2, 4); // loudnessInfoSet
-            write(1, 4); // one byte
-            write(0, 8);
+            if loudness_payload.len() < 15 {
+                write(loudness_payload.len() as u64, 4);
+            } else {
+                write(15, 4);
+                write((loudness_payload.len() - 15) as u64, 8);
+            }
+            for byte in loudness_payload {
+                write(u64::from(byte), 8);
+            }
         } else {
             write(0, 1); // no config extensions
         }
@@ -7168,6 +7252,9 @@ mod tests {
             check.rule_id == "FORGE-ISOBMFF-XHE-AAC-INSTREAM-METADATA" && check.passed
         }));
         assert!(checks.iter().any(|check| {
+            check.rule_id == "FORGE-ISOBMFF-XHE-AAC-APPLE-BASIC-DRC" && check.passed
+        }));
+        assert!(checks.iter().any(|check| {
             check.rule_id == "FORGE-ISOBMFF-XHE-AAC-SAMPLE-TIMING" && check.passed
         }));
         let config = &result.properties["tracks"][0]["xhe_aac_usac_config"];
@@ -7176,6 +7263,7 @@ mod tests {
         assert_eq!(config["output_channels"], 2);
         assert_eq!(config["uni_drc_config_present"], true);
         assert_eq!(config["loudness_info_present"], true);
+        assert_eq!(config["apple_basic_drc_profile"]["compliant"], true);
     }
 
     #[test]

@@ -30,10 +30,14 @@ Forge already provides:
   SeekHead/Cues, CRC-32, codec-private data, and Opus gapless timing.
 - Dependency-free ADTS and LOAS/LATM AAC QC, including ASC SBR/PS signalling,
   decoded timing, and ISO-BMFF edit-list/sample-group gapless reconciliation.
-  ISO-BMFF xHE-AAC additionally parses bounded MPEG-D USAC Audio Object Type 42
-  configuration, checks fMP4/sample timing, and requires UniDRC plus
-  `loudnessInfoSet` extension presence while explicitly leaving payload-profile
-  interpretation for future work.
+  ISO-BMFF xHE-AAC additionally parses bounded MPEG-D USAC Audio Object Type 42,
+  UniDRC, and `loudnessInfoSet` syntax; validates IDs, downmix/dependency/gain-set
+  references, sample timing, and Apple's Basic DRC Metadata Profile (Anchor
+  Loudness, BS.1770 peak metadata, four required effect sets, and target
+  coverage). HLS QC verifies Immediate Playout Frames from resolved first-sample
+  bytes and reconciles `EXT-X-INDEPENDENT-SEGMENTS`; container QC can compare
+  programme, anchor, sample-peak, and true-peak metadata with independent
+  decoded PCM renders.
 - Dependency-free AC-3/E-AC-3 elementary-stream QC for bounded syncframes,
   complete BSI, `dialnorm`, interpreted DRC gain words, channel mode, strict
   Atmos/JOC Extension Type A signalling, six-block access-unit and

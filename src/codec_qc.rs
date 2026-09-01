@@ -1,6 +1,8 @@
 //! Automated codec-delivery metadata extraction and decoded-audio QC.
 
+use crate::container_qc::ContainerAudit;
 use crate::normalize::{self, Analysis, DialogueMeasurement};
+use serde::Serialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -33,6 +35,141 @@ pub struct CodecDeliveryQc {
     pub true_peak_drift_db: Option<f64>,
     pub duration_drift_seconds: Option<f64>,
     pub roundtrip_pass: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct XheDecodedMetadataQc {
+    pub track_id: u64,
+    pub tolerance_lu_db: f64,
+    pub apple_basic_drc_profile_passed: bool,
+    pub decoded_program_lufs: f64,
+    pub metadata_program_lkfs: Option<f64>,
+    pub program_deviation_lu: Option<f64>,
+    pub program_pass: Option<bool>,
+    pub decoded_anchor_lufs: Option<f64>,
+    pub metadata_anchor_lkfs: Option<f64>,
+    pub anchor_deviation_lu: Option<f64>,
+    pub anchor_pass: Option<bool>,
+    pub decoded_sample_peak_dbfs: f64,
+    pub metadata_sample_peak_dbfs: Option<f64>,
+    pub sample_peak_deviation_db: Option<f64>,
+    pub sample_peak_pass: Option<bool>,
+    pub decoded_true_peak_dbtp: f64,
+    pub metadata_true_peak_dbtp: Option<f64>,
+    pub true_peak_deviation_db: Option<f64>,
+    pub true_peak_pass: Option<bool>,
+    pub fully_reconciled: bool,
+    pub passed: bool,
+}
+
+pub fn evaluate_xhe_decoded_metadata(
+    audit: &ContainerAudit,
+    decoded_program: &Analysis,
+    decoded_anchor: Option<&Analysis>,
+    tolerance: f64,
+) -> Result<XheDecodedMetadataQc, String> {
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err("xHE-AAC metadata tolerance must be a finite non-negative number".into());
+    }
+    let tracks = audit.properties["tracks"]
+        .as_array()
+        .ok_or("container audit has no track inventory")?;
+    let xhe_tracks = tracks
+        .iter()
+        .filter(|track| track["xhe_aac_usac_config"]["audio_object_type"].as_u64() == Some(42))
+        .collect::<Vec<_>>();
+    if xhe_tracks.len() != 1 {
+        return Err(format!(
+            "decoded-reference reconciliation requires exactly one xHE-AAC track, found {}",
+            xhe_tracks.len()
+        ));
+    }
+    let track = xhe_tracks[0];
+    let track_id = track["track_id"]
+        .as_u64()
+        .ok_or("xHE-AAC track has no numeric track ID")?;
+    let config = &track["xhe_aac_usac_config"];
+    let apple_basic_drc_profile_passed = config["apple_basic_drc_profile"]["compliant"]
+        .as_bool()
+        .unwrap_or(false);
+    let base = config["loudness_info_set"]["track"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| {
+            entry["drc_set_id"].as_u64() == Some(0)
+                && entry["eq_set_id"].as_u64() == Some(0)
+                && entry["downmix_id"].as_u64() == Some(0)
+        })
+        .ok_or("xHE-AAC metadata has no base-layout loudnessInfo entry")?;
+    let measurements = base["measurements"]
+        .as_array()
+        .ok_or("xHE-AAC base loudnessInfo has no measurements")?;
+    let metadata_program_lkfs = loudness_measurement(measurements, 1);
+    let metadata_anchor_lkfs = loudness_measurement(measurements, 2);
+    let metadata_sample_peak_dbfs = base["sample_peak_level_dbfs"].as_f64();
+    let metadata_true_peak_dbtp = (base["true_peak_measurement_system"].as_u64() == Some(2))
+        .then(|| base["true_peak_level_dbtp"].as_f64())
+        .flatten();
+
+    let program_deviation_lu =
+        metadata_program_lkfs.map(|metadata| decoded_program.lufs - metadata);
+    let program_pass = program_deviation_lu.map(|deviation| deviation.abs() <= tolerance);
+    let decoded_anchor_lufs = decoded_anchor.map(|analysis| analysis.lufs);
+    let anchor_deviation_lu = decoded_anchor_lufs
+        .zip(metadata_anchor_lkfs)
+        .map(|(decoded, metadata)| decoded - metadata);
+    let anchor_pass = anchor_deviation_lu.map(|deviation| deviation.abs() <= tolerance);
+    let sample_peak_deviation_db =
+        metadata_sample_peak_dbfs.map(|metadata| decoded_program.sample_peak_db() - metadata);
+    let sample_peak_pass = sample_peak_deviation_db.map(|deviation| deviation.abs() <= tolerance);
+    let true_peak_deviation_db =
+        metadata_true_peak_dbtp.map(|metadata| decoded_program.true_peak_db() - metadata);
+    let true_peak_pass = true_peak_deviation_db.map(|deviation| deviation.abs() <= tolerance);
+    let peak_reconciled = sample_peak_pass == Some(true) || true_peak_pass == Some(true);
+    let fully_reconciled = anchor_pass.is_some()
+        && peak_reconciled
+        && program_pass != Some(false)
+        && sample_peak_pass != Some(false)
+        && true_peak_pass != Some(false);
+    let passed = apple_basic_drc_profile_passed
+        && fully_reconciled
+        && anchor_pass == Some(true)
+        && program_pass != Some(false);
+
+    Ok(XheDecodedMetadataQc {
+        track_id,
+        tolerance_lu_db: tolerance,
+        apple_basic_drc_profile_passed,
+        decoded_program_lufs: decoded_program.lufs,
+        metadata_program_lkfs,
+        program_deviation_lu,
+        program_pass,
+        decoded_anchor_lufs,
+        metadata_anchor_lkfs,
+        anchor_deviation_lu,
+        anchor_pass,
+        decoded_sample_peak_dbfs: decoded_program.sample_peak_db(),
+        metadata_sample_peak_dbfs,
+        sample_peak_deviation_db,
+        sample_peak_pass,
+        decoded_true_peak_dbtp: decoded_program.true_peak_db(),
+        metadata_true_peak_dbtp,
+        true_peak_deviation_db,
+        true_peak_pass,
+        fully_reconciled,
+        passed,
+    })
+}
+
+fn loudness_measurement(measurements: &[Value], method_definition: u64) -> Option<f64> {
+    measurements
+        .iter()
+        .find(|measurement| {
+            measurement["method_definition"].as_u64() == Some(method_definition)
+                && measurement["measurement_system"].as_u64() == Some(2)
+        })
+        .and_then(|measurement| measurement["value"].as_f64())
 }
 
 pub fn probe_and_evaluate(
@@ -221,7 +358,28 @@ fn find_number(value: &Value, keys: &[&str]) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::container_qc::ContainerAudit;
+    use crate::wav::PcmKind;
     use serde_json::json;
+
+    fn analysis(lufs: f64) -> Analysis {
+        let minus_one_db = 10_f32.powf(-1.0 / 20.0);
+        Analysis {
+            sample_rate: 48_000,
+            channels: 2,
+            channel_roles: Vec::new(),
+            frames: 48_000,
+            kind: PcmKind::F32,
+            lufs,
+            max_momentary_lufs: lufs,
+            max_short_term_lufs: lufs,
+            loudness_range_lu: 0.0,
+            rms_db: lufs,
+            sample_peak: minus_one_db,
+            true_peak: minus_one_db,
+            loudness_blocks: Vec::new(),
+        }
+    }
 
     #[test]
     fn parses_stream_and_nested_delivery_metadata() {
@@ -253,5 +411,47 @@ mod tests {
     #[test]
     fn rejects_probe_without_audio_stream() {
         assert!(parse_probe(Path::new("ffprobe"), &json!({})).is_err());
+    }
+
+    #[test]
+    fn reconciles_xhe_metadata_with_independent_pcm_measurements() {
+        let audit = ContainerAudit {
+            schema: "test",
+            generator: "test",
+            path: "input.mp4".into(),
+            format: "isobmff".into(),
+            passed: true,
+            layers: Vec::new(),
+            properties: json!({
+                "tracks": [{
+                    "track_id": 1,
+                    "xhe_aac_usac_config": {
+                        "audio_object_type": 42,
+                        "apple_basic_drc_profile": {"compliant": true},
+                        "loudness_info_set": {"track": [{
+                            "drc_set_id": 0,
+                            "eq_set_id": 0,
+                            "downmix_id": 0,
+                            "sample_peak_level_dbfs": -1.0,
+                            "true_peak_level_dbtp": -1.0,
+                            "true_peak_measurement_system": 2,
+                            "measurements": [
+                                {"method_definition": 1, "measurement_system": 2, "value": -24.0},
+                                {"method_definition": 2, "measurement_system": 2, "value": -24.0}
+                            ]
+                        }]}
+                    }
+                }]
+            }),
+        };
+        let programme = analysis(-24.0);
+        let anchor = analysis(-24.0);
+        let qc = evaluate_xhe_decoded_metadata(&audit, &programme, Some(&anchor), 0.01).unwrap();
+        assert!(qc.fully_reconciled);
+        assert!(qc.passed);
+
+        let incomplete = evaluate_xhe_decoded_metadata(&audit, &programme, None, 0.01).unwrap();
+        assert!(!incomplete.fully_reconciled);
+        assert!(!incomplete.passed);
     }
 }
