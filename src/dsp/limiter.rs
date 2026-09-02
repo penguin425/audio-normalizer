@@ -272,18 +272,14 @@ impl TruePeakLimiter {
         if self.envelope == 1.0 && self.hold_frames == 0 && detected <= self.ceiling {
             return;
         }
-        let required = if detected > self.ceiling {
-            (self.ceiling / detected) * 0.9999
-        } else {
-            1.0
-        };
         // A continuing over-ceiling detection must renew the hold even when
         // it does not demand a new minimum. Releasing between periodic peaks
         // modulates the delayed signal and can create a new inter-sample peak.
-        if required < self.envelope {
-            self.envelope = required;
-            self.hold_frames = self.lookahead_frames;
-        } else if required < 1.0 {
+        if detected > self.ceiling {
+            let required = (self.ceiling / detected) * 0.9999;
+            if required < self.envelope {
+                self.envelope = required;
+            }
             self.hold_frames = self.lookahead_frames;
         } else if self.hold_frames > 0 {
             self.hold_frames -= 1;
