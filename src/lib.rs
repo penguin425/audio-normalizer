@@ -28,6 +28,7 @@ pub mod ac4_adapter;
 pub mod adm;
 pub mod adm_interactivity_qc;
 pub mod adm_presentation_qc;
+pub mod adm_semantics_qc;
 pub mod aes31_qc;
 mod alac_qc;
 pub mod analysis;

@@ -1,0 +1,420 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/adm-semantics-report-v1",
+  "title": "Forge ADM semantics QC report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "validator",
+    "adm_standard",
+    "usage_guideline",
+    "input_path",
+    "input_bytes",
+    "input_sha256",
+    "axml_bytes",
+    "limits",
+    "counts",
+    "requested_presentation_intent",
+    "inferred_presentation_mode",
+    "expected_default_programme_id",
+    "default_programme_id",
+    "normative_passed",
+    "requested_policy_passed",
+    "rendered_audio_verified",
+    "renderer_capacity_verified",
+    "tag_semantics_authoritative",
+    "scope_note",
+    "passed",
+    "dialogue_contents",
+    "alternative_value_set_references",
+    "importance",
+    "tag_groups",
+    "rules"
+  ],
+  "properties": {
+    "schema": {"const": "https://penguin425.github.io/audio-normalizer/schema/adm-semantics-report-v1"},
+    "schema_version": {"const": 1},
+    "validator": {"const": "forge-adm-semantics-qc-1"},
+    "adm_standard": {"const": "ITU-R BS.2076-3"},
+    "usage_guideline": {"const": "Report ITU-R BS.2388-7"},
+    "input_path": {"type": "string", "minLength": 1},
+    "input_bytes": {"type": "integer", "minimum": 1},
+    "input_sha256": {"$ref": "#/$defs/sha256"},
+    "axml_bytes": {"type": "integer", "minimum": 1, "maximum": 67108864},
+    "limits": {"$ref": "#/$defs/limits"},
+    "counts": {"$ref": "#/$defs/counts"},
+    "requested_presentation_intent": {"enum": ["auto", "fixed", "interactive"]},
+    "inferred_presentation_mode": {
+      "enum": [
+        "no-programme",
+        "single-fixed",
+        "interactive-complementary",
+        "fixed-programme-alternatives",
+        "hybrid-multiple-programmes-and-complementary"
+      ]
+    },
+    "expected_default_programme_id": {"$ref": "#/$defs/nullableString"},
+    "default_programme_id": {"$ref": "#/$defs/nullableString"},
+    "normative_passed": {"type": "boolean"},
+    "requested_policy_passed": {"type": "boolean"},
+    "rendered_audio_verified": {"const": false},
+    "renderer_capacity_verified": {"const": false},
+    "tag_semantics_authoritative": {"const": false},
+    "scope_note": {
+      "const": "Metadata semantics only: this report does not render audio, prove a renderer's capacity, or establish loudness or true-peak compliance."
+    },
+    "passed": {"type": "boolean"},
+    "dialogue_contents": {
+      "type": "array",
+      "maxItems": 65535,
+      "items": {"$ref": "#/$defs/dialogueAudit"}
+    },
+    "alternative_value_set_references": {
+      "type": "array",
+      "maxItems": 131070,
+      "items": {"$ref": "#/$defs/avsAudit"}
+    },
+    "importance": {"$ref": "#/$defs/importance"},
+    "tag_groups": {
+      "type": "array",
+      "maxItems": 250000,
+      "items": {"$ref": "#/$defs/tagGroup"}
+    },
+    "rules": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 250000,
+      "items": {"$ref": "#/$defs/rule"}
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "nullableString": {"type": ["string", "null"]},
+    "nullableByte": {"type": ["integer", "null"], "minimum": 0, "maximum": 10},
+    "nullableU8": {"type": ["integer", "null"], "minimum": 0, "maximum": 255},
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_programmes",
+        "max_contents",
+        "max_objects",
+        "max_report_items",
+        "max_axml_bytes",
+        "max_xml_nodes"
+      ],
+      "properties": {
+        "max_programmes": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "max_contents": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "max_objects": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "max_report_items": {"type": "integer", "minimum": 1, "maximum": 250000},
+        "max_axml_bytes": {"type": "integer", "minimum": 1, "maximum": 67108864},
+        "max_xml_nodes": {"type": "integer", "minimum": 1, "maximum": 1000000}
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "programmes",
+        "contents",
+        "objects",
+        "pack_formats",
+        "block_formats",
+        "alternative_value_sets",
+        "alternative_value_set_references",
+        "complementary_object_references",
+        "tag_groups",
+        "tags",
+        "xml_nodes",
+        "report_items"
+      ],
+      "properties": {
+        "programmes": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "contents": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "objects": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "pack_formats": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "block_formats": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "alternative_value_sets": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "alternative_value_set_references": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "complementary_object_references": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "tag_groups": {"type": "integer", "minimum": 0, "maximum": 250000},
+        "tags": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "xml_nodes": {"type": "integer", "minimum": 1, "maximum": 1000000},
+        "report_items": {"type": "integer", "minimum": 1, "maximum": 250000}
+      }
+    },
+    "dialogueAudit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "content_id",
+        "content_name",
+        "dialogue_present",
+        "raw_value",
+        "dialogue_value",
+        "kind_attribute",
+        "raw_kind_value",
+        "kind_value",
+        "content_kind",
+        "passed"
+      ],
+      "properties": {
+        "content_id": {"type": "string", "minLength": 1},
+        "content_name": {"type": "string", "minLength": 1},
+        "dialogue_present": {"type": "boolean"},
+        "raw_value": {"$ref": "#/$defs/nullableString"},
+        "dialogue_value": {"type": ["integer", "null"], "minimum": 0, "maximum": 2},
+        "kind_attribute": {
+          "enum": ["nonDialogueContentKind", "dialogueContentKind", "mixedContentKind", null]
+        },
+        "raw_kind_value": {"$ref": "#/$defs/nullableString"},
+        "kind_value": {"$ref": "#/$defs/nullableU8"},
+        "content_kind": {
+          "enum": [
+            "undefined",
+            "music",
+            "effects",
+            "music-and-effects",
+            "storyline-dialogue",
+            "voiceover",
+            "spoken-subtitle",
+            "audio-description-visually-impaired",
+            "commentary",
+            "emergency",
+            "complete-main",
+            "mixed",
+            "hearing-impaired",
+            "complete-main-with-audio-description-visually-impaired",
+            null
+          ]
+        },
+        "passed": {"type": "boolean"}
+      }
+    },
+    "avsAudit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "parent_element",
+        "parent_id",
+        "parent_name",
+        "unique_object_groups",
+        "references_resolve_to_owner_objects",
+        "passed",
+        "references"
+      ],
+      "properties": {
+        "parent_element": {"enum": ["audioProgramme", "audioContent"]},
+        "parent_id": {"type": "string", "minLength": 1},
+        "parent_name": {"type": "string", "minLength": 1},
+        "unique_object_groups": {"type": "boolean"},
+        "references_resolve_to_owner_objects": {"type": "boolean"},
+        "passed": {"type": "boolean"},
+        "references": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 250000,
+          "items": {"$ref": "#/$defs/avsReference"}
+        }
+      }
+    },
+    "avsReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "object_key",
+        "owner_object_id",
+        "resolves_locally",
+        "owner_matches_id"
+      ],
+      "properties": {
+        "id": {"type": "string"},
+        "object_key": {"$ref": "#/$defs/nullableString"},
+        "owner_object_id": {"$ref": "#/$defs/nullableString"},
+        "resolves_locally": {"type": "boolean"},
+        "owner_matches_id": {"type": "boolean"}
+      }
+    },
+    "importance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "audio_object_explicit",
+        "audio_object_unspecified",
+        "audio_pack_format_explicit",
+        "audio_pack_format_unspecified",
+        "audio_block_format_explicit",
+        "audio_block_format_unspecified",
+        "invalid_values",
+        "audio_block_format_values_are_informational",
+        "entries",
+        "object_threshold_plan"
+      ],
+      "properties": {
+        "audio_object_explicit": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "audio_object_unspecified": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "audio_pack_format_explicit": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "audio_pack_format_unspecified": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "audio_block_format_explicit": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "audio_block_format_unspecified": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "invalid_values": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "audio_block_format_values_are_informational": {"const": true},
+        "entries": {
+          "type": "array",
+          "maxItems": 250000,
+          "items": {"$ref": "#/$defs/importanceEntry"}
+        },
+        "object_threshold_plan": {
+          "anyOf": [
+            {"$ref": "#/$defs/objectThresholdPlan"},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "importanceEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "element",
+        "element_id",
+        "element_name",
+        "raw_value",
+        "value",
+        "semantic_effect",
+        "recommended_use",
+        "valid"
+      ],
+      "properties": {
+        "element": {"enum": ["audioObject", "audioPackFormat", "audioBlockFormat"]},
+        "element_id": {"$ref": "#/$defs/nullableString"},
+        "element_name": {"$ref": "#/$defs/nullableString"},
+        "raw_value": {"type": "string"},
+        "value": {"$ref": "#/$defs/nullableByte"},
+        "semantic_effect": {"enum": ["content", "format-quality", "informational"]},
+        "recommended_use": {"type": "string", "minLength": 1},
+        "valid": {"type": "boolean"}
+      }
+    },
+    "objectThresholdPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_object_count",
+        "starting_object_count",
+        "achievable_without_protected_object_discard",
+        "selected_threshold",
+        "resulting_object_count",
+        "protected_importance_10",
+        "protected_unspecified_or_invalid",
+        "discard_candidates",
+        "steps",
+        "requires_renderer_or_merge",
+        "note"
+      ],
+      "properties": {
+        "target_object_count": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "starting_object_count": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "achievable_without_protected_object_discard": {"type": "boolean"},
+        "selected_threshold": {"$ref": "#/$defs/nullableByte"},
+        "resulting_object_count": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "protected_importance_10": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "protected_unspecified_or_invalid": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "discard_candidates": {
+          "type": "array",
+          "maxItems": 65535,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 11,
+          "items": {"$ref": "#/$defs/thresholdStep"}
+        },
+        "requires_renderer_or_merge": {"type": "boolean"},
+        "note": {
+          "const": "Object-count planning uses only explicit audioObject importance values. Objects with missing or invalid importance and objects at importance 10 remain protected; nested rendering, pack quality, track count, merging, and audio results require a renderer-aware stage."
+        }
+      }
+    },
+    "thresholdStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["threshold", "retained_object_count", "discard_candidate_count"],
+      "properties": {
+        "threshold": {"type": "integer", "minimum": 0, "maximum": 10},
+        "retained_object_count": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "discard_candidate_count": {"type": "integer", "minimum": 0, "maximum": 65535}
+      }
+    },
+    "tagGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "tags", "references", "semantic_authority", "passed"],
+      "properties": {
+        "index": {"type": "integer", "minimum": 1, "maximum": 250000},
+        "tags": {
+          "type": "array",
+          "maxItems": 250000,
+          "items": {"$ref": "#/$defs/tagValue"}
+        },
+        "references": {
+          "type": "array",
+          "maxItems": 250000,
+          "items": {"$ref": "#/$defs/tagReference"}
+        },
+        "semantic_authority": {"const": false},
+        "passed": {"type": "boolean"}
+      }
+    },
+    "tagValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["class", "value"],
+      "properties": {
+        "class": {"$ref": "#/$defs/nullableString"},
+        "value": {"type": "string"}
+      }
+    },
+    "tagReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["element", "id", "resolves_locally"],
+      "properties": {
+        "element": {"enum": ["audioProgramme", "audioContent", "audioObject"]},
+        "id": {"type": "string"},
+        "resolves_locally": {"type": "boolean"}
+      }
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "authority",
+        "section",
+        "classification",
+        "subject",
+        "requirement",
+        "observed",
+        "enforced",
+        "passed"
+      ],
+      "properties": {
+        "rule_id": {"type": "string", "minLength": 1},
+        "authority": {"type": "string", "minLength": 1},
+        "section": {"type": "string", "minLength": 1},
+        "classification": {"enum": ["normative", "guidance", "policy", "informational"]},
+        "subject": {"type": "string", "minLength": 1},
+        "requirement": {"type": "string", "minLength": 1},
+        "observed": {"type": "string", "minLength": 1},
+        "enforced": {"type": "boolean"},
+        "passed": {"type": "boolean"}
+      }
+    }
+  }
+}
