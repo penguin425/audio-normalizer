@@ -425,6 +425,92 @@ reconstructs logical ADM state and verifies declared changed-ID transitions
 using canonical element comparisons. A later profile layer can apply BS.2168
 constraints to that reconstructed S-ADM state.
 
+### Immediate measurement-correctness gates
+
+New format and workflow support must not hide edge cases in the measurement
+core. Before the next normative feature release, Forge will:
+
+- use the strict `>` absolute and relative BS.1770 gating comparisons in
+  batch, rolling, and album paths, with identical threshold/ULP fixtures and
+  constant-extra-memory aggregation;
+- finalize file LRA with the EBU-specified 1.5 seconds of post-signal silence
+  without changing integrated loudness, true peak, duration, or timeline, and
+  align percentile selection with the pinned Tech 3342 reference algorithm;
+- measure true peak in a domain of at least 192 kHz for every accepted input
+  rate, evaluate finite-file leading/trailing filter response, retain peak
+  state in `f64`, and use a scalar oracle plus EBU/ITU fixtures to prove
+  chunking and CPU/GPU equivalence;
+- separate loudness-target tolerance from the strict true-peak ceiling, reserve
+  for integer quantization/dither, and require decode-and-remeasure evidence
+  for delivery-codec ceiling claims;
+- reject non-finite PCM before updating DSP state and fail closed on corrupt
+  decode packets by default; any future concealment mode must preserve timing
+  and report every concealed interval; and
+- represent unknown and scene-based channel layouts explicitly instead of
+  silently treating them as Main channels, requiring a declared speaker
+  mapping or renderer before applying BS.1770 channel weights.
+
+### Immediate operational gates
+
+New standards coverage must not outrun the safety of the ordinary file and
+service workflows. Before adding another broad parser surface, Forge will:
+
+- build one deterministic `OutputPlan` before decoding, covering audio,
+  reports, timelines, manifests, and state files; reject path, symlink,
+  hard-link, case-folding, and duplicate-output collisions; and publish every
+  file with atomic replace or atomic no-clobber semantics as requested;
+- hold a sibling process lock for each batch/watch state file and share a
+  bounded, symlink-safe discovery policy across the normal CLI, batch, and
+  watch workflows;
+- make metadata handling explicit through `preserve`, `strict`, and `strip`
+  policies, report every preserved/mapped/recomputed/dropped field, adjust
+  sample-indexed BWF/DAW timing with exact rational arithmetic after
+  resampling, and make metadata-only library jobs resumable;
+- require encrypted transport (or an explicitly declared trusted proxy) for
+  non-loopback bearer authentication, add scoped constant-time token handling,
+  and route every external codec/renderer through one bounded subprocess
+  broker with output limits, deadlines, cancellation, and process-tree
+  cleanup; and
+- pin every GitHub Action and reproducibility-sensitive toolchain to immutable
+  revisions, reject symbolic workflow references in CI, and run scheduled
+  advisory checks.
+
+### Newly identified integrity gates
+
+The following gaps were found by tracing the current decode, render, batch,
+and configuration paths rather than by adding another format checklist:
+
+- bind every two-pass analysis to the exact bytes later rendered. Carry an
+  `AnalyzedInput` identity (content hash plus platform file identity where
+  available), verify it before publication, and fail without touching an
+  existing output when a path is replaced, overwritten, or changed through a
+  hard link between analysis and render;
+- centralize finite/range validation in `Plan::validate()` and
+  `validate_for(format)` and call it from the CLI, configuration loader, and
+  every public normalize/write entry point before decoding or creating an
+  output;
+- replace extension-only dispatch with one codec/container registry and an
+  `InputDescriptor` that records container, codec, and selected audio-track
+  identity. Preserve the source codec by default where possible and require an
+  explicit request before a lossless-to-lossy conversion;
+- probe the exact encoder and muxer capability before decoding, rather than
+  treating a successful `ffmpeg -version` as proof that AAC, ALAC, or Vorbis
+  output is available;
+- make batch publication crash-recoverable with a hash-bound
+  `ReadyToPublish` checkpoint, a semantic operation fingerprint containing the
+  analysis revision, codec, and encoder identity, and an opt-in bounded
+  `--keep-going` failure report; and
+- sync the parent directory after atomic publication, make `--dry-run`
+  read-only unless `--warm-cache` is explicit, and treat a closed output pipe
+  as a normal CLI termination.
+
+Measurement follow-up after the immediate corrections will use an exact
+rational 100 ms block clock at uncommon sample rates, preserve integer and
+`f64` input precision until the DSP boundary, and offer a strict reproducible
+mode with fixed coefficients and reduction order. Sample-rate conversion and
+dither will gain measurable passband, alias, noise, determinism, and
+asset-bound seed contracts before new quality modes are added.
+
 ## Provisional release sequence
 
 The order below is an implementation plan, not a standards requirement. Each
@@ -433,7 +519,19 @@ certification or coverage beyond its fixtures.
 
 | Release | Scope | Classification |
 | --- | --- | --- |
+| v0.189.1 | Correct strict BS.1770 gate boundaries, split loudness tolerance from the true-peak ceiling, and fail closed on non-finite PCM or corrupt decode packets | Measurement correctness and input integrity |
+| v0.189.2 | Correct file LRA finalization, guarantee a 192 kHz-or-higher finite-file true-peak measurement domain, and reject ambiguous speaker/scene layouts | Measurement correctness and interoperability |
+| v0.189.3 | Use an exact rational block clock, retain high-resolution integer/`f64` input precision, and add a deterministic reference-analysis mode | Measurement correctness and reproducibility |
 | v0.190 | Native file-based ADM BS.2168 Level 0/1/2 validation, including declarations, graph constraints, block timing, CHNA/essence reconciliation, and derived limits | Normative |
+| v0.190.1 | Make REST/gRPC request limits effective during decode: bounded streaming/spooling, cooperative deadline and cancellation checks, global memory/temp quotas, and worker permits retained until actual completion | Product safety and resource control |
+| v0.190.2 | Add a whole-invocation output plan, atomic no-clobber report publication, state-file process locks, and bounded symlink-safe discovery shared by CLI, batch, and watch modes | Filesystem safety and recoverability |
+| v0.190.3 | Add explicit metadata-fidelity policies, full-container metadata discovery, exact resampling-time conversion, and restartable metadata-only library transactions | Metadata integrity and workflow recovery |
+| v0.190.4 | Require a secure non-loopback service boundary and centralize external codec/renderer execution behind bounded, cancellable process-tree supervision | Service and subprocess security |
+| v0.190.5 | Bind two-pass analysis to the rendered input bytes and validate every public `Plan` and format-specific numeric setting before decode or output creation | Input integrity and API safety |
+| v0.190.6 | Introduce a codec/container/track registry, lossless-safe defaults, exact encoder/muxer preflight, versioned config parity, and multi-audio-track selection | Codec interoperability and product contract |
+| v0.190.7 | Add crash-consistent batch publication, semantic job fingerprints, bounded `--keep-going`, parent-directory durability, and side-effect-free dry runs | Recoverability and operations |
+| v0.190.8 | Add ITU-R BS.1864-1 international programme-exchange presets for programme- and explicitly ranged dialogue-based −24 LKFS measurement | Normative profile |
+| v0.190.9 | Decode and validate uncompressed PCM Wave Audio essence in SMPTE ST 382:2023 MXF, including wrapping, descriptor, quantization, channel-ID, and BWF mapping evidence | Normative subset |
 | v0.191 | Deterministic personalization endpoint enumeration plus bounded renderer-adapter evidence and independent BS.1770 measurement | Engineering QC built on normative metadata rules |
 | v0.192 | Apply the BS.2168 validator to reconstructed S-ADM state and enforce the S-ADM-specific emission-profile constraints | Normative |
 | v0.193 | Execute and hash-pin AOMedia OAR renders for every supported IAMF Mix Presentation and output layout | Interoperability evidence |
@@ -447,9 +545,47 @@ certification or coverage beyond its fixtures.
 | v0.201 | Copy-to-new-file remediation for static gain and true-peak limiting, followed by independent final-output verification | Engineering workflow |
 | v0.202 | Stereo prerecorded audio-description dip planning with EBU TR 084-scoped evidence | Industry guidance |
 | v0.203 | Calibrated rolling safe-listening dose; never infer acoustic SPL from LUFS or dBFS alone | Conditional normative calculation |
+| v0.204 | Complete the profile-neutral BS.2076-3 ADM validator and resolve version-pinned BS.2094-2 common definitions across DirectSpeakers, Matrix, Objects, HOA, and Binaural | Normative |
+| v0.205 | Complete BS.2088-2 and BS.1352-4 BWF migration QC for `ubxt`, including UTF-8/fixed-field validation and explicit `bext`/`ubxt` conflict evidence | Normative container validation plus specified migration guidance |
+| v0.206 | Audit BS.2388-7 `audioFormatCustom` identity and placement while preserving unknown payloads as opaque data | Industry guidance; payload semantics remain out of scope |
+| v0.207 | Deterministically generate S-ADM emission frames from validated ADM, then prove reconstructed-state equivalence and re-run BS.2125/BS.2168 validation | Engineering conversion built on normative validators |
+| v0.208 | Add an explicit dry-run ADM emission squeezer with source/output graph hashes and independent render, duration, loudness, and true-peak comparison | Engineering remediation workflow |
+| v0.209 | Publish cross-platform loudness conformance evidence for every release binary, bound to official fixture hashes, algorithm revision, CPU/backend, and commit | Conformance evidence |
+| v0.210 | Add versioned analysis/timeline schemas, structured machine errors, effective-config output, schema catalogue, completions, and man pages while retaining legacy output | Product contract |
+| v0.211 | Register every untrusted parser for continuous fuzzing, property/metamorphic DSP tests, sanitizer coverage, and reproducible failure corpora | Quality and security |
+| v0.212 | Update DASH QC to ISO/IEC 23009-1:2026 Edition 6 with a pinned official schema and explicit edition/hash evidence | Normative subset |
+| v0.213 | Complete the supported ISO/IEC 23003-4:2025 MPEG-D DRC syntax, reference graph, and opaque-unknown-extension handling | Normative subset |
+| v0.214 | Enumerate supported MPEG-D DRC/downmix selections through a hash-pinned decoder adapter and independently measure each rendered endpoint | Interoperability evidence |
+| v0.215 | Run legally distributable ISO/IEC 14496-26:2024 MPEG-4 Audio conformance vectors for every declared supported Audio Object Type | Conformance evidence |
+| v0.216 | Validate and decode ISO/IEC 23003-5 uncompressed `ipcm`/`fpcm` in ISO-BMFF, including sample tables, fragments, endianness, word length, and channel layout | Normative subset |
+| v0.217 | Write non-fragmented, then separately fragmented, MP4 PCM and prove sample count, channel order, PCM hash, timing, loudness, and true peak after re-read | Engineering output with normative container checks |
+| v0.218 | Replace unbounded stdin/service buffering with a capability-aware `Read + Seek` media source, bounded replay spool, and streaming service transport | Product architecture |
+| v0.219 | Emit replayable normalization recipes with effective settings, algorithm/backend, encoder identity, input/output hashes, and all-platform reproducible archives | Reproducibility |
+| v0.220 | Introduce an additive Rust/C/Python API v2 with opaque builders, stable error kinds, cancellation, progress, and explicit threading contracts | API architecture |
+| v0.221 | Add share-safe evidence identity policies that redact paths, URL secrets, and subprocess output while retaining deterministic opaque asset IDs | Privacy |
+| v0.222 | Emit low-cardinality pipeline events and an optional OpenTelemetry bridge for decode, measure, encode, verify, queue, cache, and spill stages | Observability |
+| v0.223 | Spill gated loudness/LRA state to a bounded external store for exact multi-day measurements instead of rejecting after one million blocks | Exact long-form measurement |
+| v0.224 | Remove per-decoder-chunk range-analysis allocations and extend benchmarks to multichannel RF64/BW64, stdin, services, and slow-spill storage | Performance engineering |
+| v0.225 | Group recursive libraries into deterministic albums from explicit manifests, directories, or release identifiers, then publish each album as a recoverable generation | Library workflow and atomic publication |
+| v0.226 | Normalize synchronized dialogue/music/effects stem sets from their reference mix, applying one shared gain and, when requested, one linked limiter envelope | Production workflow |
+| v0.227 | Add bounded catalogue query, verify, diff, prune, backup, and deterministic full-export commands | Operations and asset provenance |
+| v0.228 | Add durable asynchronous REST/gRPC jobs, idempotency, graceful draining, OpenAPI 3.1, standard gRPC health, and optional reflection | Service operations and API contract |
+| v0.229 | Convert every versioned QC report to SARIF, JUnit, and a self-contained WCAG 2.2-oriented offline HTML report without losing rule IDs or time evidence | Interoperability and accessibility |
+| v0.230 | Extend local NMOS snapshot QC from IS-04/IS-05 to stable IS-08 channel mapping and IS-11 stream compatibility, with version-pinned schemas and cross-resource evidence | Normative subset |
+| v0.231 | Complete AAC programme-config-element channel mapping and Ogg Opus projection mapping-family 3 before claiming those uncommon layouts as fully interoperable | Codec interoperability |
+| v0.232 | Execute IMF OPL Audio Routing/Mixing Macros over resolved PCM essence and independently measure every resulting delivery output | Normative rendering subset and interoperability evidence |
+| v0.233 | Add AES31-4-2024 XML Audio Decision List import and schema/XSLT interoperability over the existing AES31 semantic model | Normative project interchange |
+| v0.234 | Validate declared ITU-R BS.1738-1/BS.2102 exchange scenarios and 4/8/12/16/32-track role allocations without inferring roles from PCM | Normative delivery QC |
+| v0.235 | Add an AES TD1009 dialogue-quality audit: PDLR and time-local dialogue/background evidence plus derived stereo and mono endpoint checks, explicitly informative and human-reviewed | Industry guidance and non-normative QC |
+| v0.236 | Complete the EBU live-meter surface, including momentary/short-term histories, maxima, exact update cadence, and conformance fixtures | Measurement workflow |
+| v0.237 | Publish measurable sample-rate-conversion and dither quality contracts, asset-bound reproducible seeds, and optional high-pass/noise-shaped modes | DSP quality and reproducibility |
+| v0.238 | Benchmark-gate true-peak tile pruning, AArch64/Wasm multichannel lanes, and persistent GPU batch scheduling; retain the scalar oracle and deterministic fallback | Performance engineering |
 
 Primary sources for this sequence are
 [ITU-R BS.2168-0](https://www.itu.int/rec/R-REC-BS.2168-0-202502-I/en),
+[ITU-R BS.1864-1](https://www.itu.int/rec/R-REC-BS.1864-1-202311-I/en),
+[ITU-R BS.2076-3](https://www.itu.int/rec/R-REC-BS.2076-3-202502-I/en),
+[ITU-R BS.2094-2](https://www.itu.int/rec/R-REC-BS.2094-2-202502-I/en),
 [ITU-R BS.2127-1](https://www.itu.int/rec/R-REC-BS.2127-1-202311-I/en),
 [IAMF v1.1](https://aomediacodec.github.io/iamf/latest-approved.html), the
 [AOMedia OAR](https://github.com/AOMediaCodec/oar),
@@ -462,8 +598,37 @@ Primary sources for this sequence are
 [ST 2127-2](https://pub.smpte.org/doc/st2127-2/20240308-pub/st2127-2-2024.pdf),
 [ITU-R BS.2143](https://www.itu.int/rec/R-REC-BS.2143/en),
 [SMPTE ST 2116](https://pub.smpte.org/latest/st2116/st2116-2019.pdf),
+[SMPTE ST 382:2023](https://pub.smpte.org/latest/st382/st382-2023.pdf),
+[SMPTE ST 2067-100](https://pub.smpte.org/pub/st2067-100/st2067-100-2014.pdf),
+[SMPTE ST 2067-103:2021](https://pub.smpte.org/doc/st2067-103/20201109-pub/st2067-103-2021.pdf),
+[AES31-4-2024](https://www.aes.org/publications/standards/preview.cfm?ID=104),
+[ITU-R BS.1738-1](https://www.itu.int/rec/R-REC-BS.1738-1-201510-I/en),
+[ITU-R BS.2102-0](https://www.itu.int/rec/R-REC-BS.2102-0-201701-I/en),
+[AES TD1009](https://www.aes.org/wp-content/uploads/2025/12/5297fea6-25ba-4865-92f6-dc1d0ba52ce4.pdf),
 [EBU TR 084](https://tech.ebu.ch/publications/tr084), and
-[ITU-T H.870](https://www.itu.int/rec/T-REC-H.870-202203-I/en).
+[ITU-T H.870](https://www.itu.int/rec/T-REC-H.870-202203-I/en),
+[ITU-R BS.2088-2](https://www.itu.int/rec/R-REC-BS.2088-2-202511-I/en),
+[ITU-R BS.1352-4](https://www.itu.int/rec/R-REC-BS.1352-4-202305-I/en),
+[Report ITU-R BS.2388-7](https://www.itu.int/pub/R-REP-BS.2388-7-2026), and
+[Report ITU-R BS.2555-0](https://www.itu.int/pub/R-REP-BS.2555-2025), the
+[AMWA NMOS specification index](https://specs.amwa.tv/nmos/),
+[RFC 6750 bearer-token requirements](https://www.rfc-editor.org/rfc/rfc6750.html),
+and [GitHub Actions secure-use guidance](https://docs.github.com/en/actions/reference/security/secure-use).
+
+The March 2026 ITU-R WP 6B work programme still treats the next ADM
+interactive-control Recommendation and the next BS.2076 revision as working
+documents. Six-degree-of-freedom audio requirements are likewise still under
+development, and IAMF Object Audio and Single Position remain draft material.
+Forge will monitor these items but will not label an implementation normative
+until the final identifiers, carriage rules, examples, and test material are
+published. The standards watch is based on the
+[March 2026 WP 6B meeting report](https://www.itu.int/md/R23-WP6B-C-0175/en),
+[WP 6C 6DoF work](https://www.itu.int/md/R23-WP6C-C-0158/en), and the
+[approved](https://aomediacodec.github.io/iamf/latest-approved.html) versus
+[draft](https://aomediacodec.github.io/iamf/latest-draft.html) IAMF texts.
+The IETF Matroska loudness-tag work and ISO/IEC 23000-19 CMAF fourth edition
+also remain watch-only until they leave Internet-Draft and committee-draft
+status respectively; draft syntax will not be emitted by default.
 
 AI mastering, blind DRC restoration, generated alternatives, preference
 learning, and psychological-state adaptation remain experimental. They must be
