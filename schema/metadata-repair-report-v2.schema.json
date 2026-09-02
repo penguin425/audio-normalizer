@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/metadata-repair-report-v2.schema.json",
+  "title": "Forge metadata repair report v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "validator", "classification", "mode", "source", "destination",
+    "source_bytes", "output_bytes", "source_sha256", "output_sha256", "limits",
+    "source_format", "before", "after", "actions", "warnings", "passed", "changed",
+    "unknown_bytes_preserved", "atomic_replace"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "validator": {"const": "forge-metadata-repair-2"},
+    "classification": {"type": "string", "minLength": 1},
+    "mode": {"enum": ["validate", "repair"]},
+    "source": {"type": "string", "minLength": 1},
+    "destination": {"type": "string", "minLength": 1},
+    "source_bytes": {"type": "integer", "minimum": 0},
+    "output_bytes": {"type": "integer", "minimum": 0},
+    "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "output_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_input_bytes", "max_output_bytes", "max_metadata_chunk_bytes", "max_xml_bytes", "max_chunks"],
+      "properties": {
+        "max_input_bytes": {"type": "integer", "minimum": 1},
+        "max_output_bytes": {"type": "integer", "minimum": 1},
+        "max_metadata_chunk_bytes": {"type": "integer", "minimum": 1},
+        "max_xml_bytes": {"type": "integer", "minimum": 1},
+        "max_chunks": {"type": "integer", "minimum": 1}
+      }
+    },
+    "source_format": {"type": "string", "minLength": 1},
+    "before": {"type": "object"},
+    "after": {"type": "object"},
+    "adm_before": {"type": ["object", "null"]},
+    "adm_after": {"type": ["object", "null"]},
+    "isobmff_loudness": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": [
+        "track_id", "codecs", "decoded_reference", "decoded_reference_sha256",
+        "reference_is_source", "sample_rate_hz", "channels", "frames",
+        "decoded_samples", "max_decoded_samples", "measured_program_loudness_lufs",
+        "encoded_program_loudness_lkfs", "program_quantization_error_lu",
+        "measured_sample_peak_dbfs", "encoded_sample_peak_dbfs",
+        "sample_peak_quantization_error_db", "measured_true_peak_dbtp",
+        "encoded_true_peak_dbtp", "true_peak_quantization_error_db",
+        "mdat_preserved", "replaced_existing_ludt", "moov_size_delta",
+        "adjusted_chunk_offsets", "metadata_round_trip_passed", "passed"
+      ],
+      "properties": {
+        "track_id": {"type": "integer", "minimum": 1, "maximum": 4294967295},
+        "codecs": {"type": "array", "items": {"type": "string"}},
+        "decoded_reference": {"type": "string", "minLength": 1},
+        "decoded_reference_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "reference_is_source": {"type": "boolean"},
+        "sample_rate_hz": {"type": "integer", "minimum": 1},
+        "channels": {"type": "integer", "minimum": 1},
+        "frames": {"type": "integer", "minimum": 1},
+        "decoded_samples": {"type": "integer", "minimum": 1},
+        "max_decoded_samples": {"type": "integer", "minimum": 1, "maximum": 4000000000},
+        "measured_program_loudness_lufs": {"type": "number"},
+        "encoded_program_loudness_lkfs": {"type": "number"},
+        "program_quantization_error_lu": {"type": "number"},
+        "measured_sample_peak_dbfs": {"type": "number"},
+        "encoded_sample_peak_dbfs": {"type": "number"},
+        "sample_peak_quantization_error_db": {"type": "number"},
+        "measured_true_peak_dbtp": {"type": "number"},
+        "encoded_true_peak_dbtp": {"type": "number"},
+        "true_peak_quantization_error_db": {"type": "number"},
+        "source_mdat_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "output_mdat_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "mdat_preserved": {"type": "boolean"},
+        "replaced_existing_ludt": {"type": "boolean"},
+        "moov_size_delta": {"type": "integer"},
+        "adjusted_chunk_offsets": {"type": "integer", "minimum": 0},
+        "metadata_round_trip_passed": {"type": "boolean"},
+        "passed": {"type": "boolean"},
+        "album_loudness": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": [
+            "references", "reference_count", "max_album_references",
+            "total_reference_bytes", "total_decoded_samples", "max_decoded_samples",
+            "complete_gating_blocks", "measured_program_loudness_lufs",
+            "encoded_program_loudness_lkfs", "program_quantization_error_lu",
+            "measured_sample_peak_dbfs", "encoded_sample_peak_dbfs",
+            "sample_peak_quantization_error_db", "measured_true_peak_dbtp",
+            "encoded_true_peak_dbtp", "true_peak_quantization_error_db"
+          ],
+          "properties": {
+            "references": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 10000,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "path", "sha256", "track_reference", "input_bytes", "sample_rate_hz",
+                  "channels", "frames", "decoded_samples", "complete_gating_blocks"
+                ],
+                "properties": {
+                  "path": {"type": "string", "minLength": 1},
+                  "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                  "track_reference": {"type": "boolean"},
+                  "input_bytes": {"type": "integer", "minimum": 1},
+                  "sample_rate_hz": {"type": "integer", "minimum": 1},
+                  "channels": {"type": "integer", "minimum": 1},
+                  "frames": {"type": "integer", "minimum": 1},
+                  "decoded_samples": {"type": "integer", "minimum": 1},
+                  "complete_gating_blocks": {"type": "integer", "minimum": 0}
+                }
+              }
+            },
+            "reference_count": {"type": "integer", "minimum": 1, "maximum": 10000},
+            "max_album_references": {"type": "integer", "minimum": 1, "maximum": 10000},
+            "total_reference_bytes": {"type": "integer", "minimum": 1},
+            "total_decoded_samples": {"type": "integer", "minimum": 1},
+            "max_decoded_samples": {"type": "integer", "minimum": 1, "maximum": 4000000000},
+            "complete_gating_blocks": {"type": "integer", "minimum": 1, "maximum": 1000000},
+            "measured_program_loudness_lufs": {"type": "number"},
+            "encoded_program_loudness_lkfs": {"type": "number"},
+            "program_quantization_error_lu": {"type": "number"},
+            "measured_sample_peak_dbfs": {"type": "number"},
+            "encoded_sample_peak_dbfs": {"type": "number"},
+            "sample_peak_quantization_error_db": {"type": "number"},
+            "measured_true_peak_dbtp": {"type": "number"},
+            "encoded_true_peak_dbtp": {"type": "number"},
+            "true_peak_quantization_error_db": {"type": "number"}
+          }
+        }
+      }
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "changed", "detail"],
+        "properties": {
+          "kind": {"type": "string", "minLength": 1},
+          "changed": {"type": "boolean"},
+          "detail": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "passed": {"type": "boolean"},
+    "changed": {"type": "boolean"},
+    "unknown_bytes_preserved": {"type": "boolean"},
+    "atomic_replace": {"type": "boolean"}
+  }
+}

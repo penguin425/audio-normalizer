@@ -13,12 +13,15 @@ use crate::isobmff_loudness_repair::{self, DecodedLoudness, EncodedLoudness, Tar
 use crate::metadata;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const VALIDATOR: &str = "forge-metadata-repair-1";
+pub const SCHEMA_VERSION_V2: u32 = 2;
+pub const VALIDATOR_V2: &str = "forge-metadata-repair-2";
 pub const DEFAULT_MAX_INPUT_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_MAX_METADATA_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
@@ -26,6 +29,8 @@ pub const DEFAULT_MAX_XML_BYTES: u64 = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_CHUNKS: u32 = 100_000;
 pub const DEFAULT_MAX_DECODED_SAMPLES: u64 = 500_000_000;
 pub const HARD_MAX_DECODED_SAMPLES: u64 = 4_000_000_000;
+pub const DEFAULT_MAX_ALBUM_REFERENCES: u32 = 1_000;
+pub const HARD_MAX_ALBUM_REFERENCES: u32 = 10_000;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -56,6 +61,24 @@ pub struct BwfLoudness {
 pub struct IsobmffLoudnessRepair {
     #[serde(default)]
     pub decoded_reference: Option<PathBuf>,
+    #[serde(default = "default_max_decoded_samples")]
+    pub max_decoded_samples: u64,
+}
+
+/// Schema-v2 ISO-BMFF loudness repair with optional album-level `alou` data.
+///
+/// `album_decoded_references`, when present, is the complete ordered album and
+/// must include the selected track's decoded reference exactly once. The
+/// decoded-sample and input-byte limits apply to the aggregate unique set.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IsobmffLoudnessRepairV2 {
+    #[serde(default)]
+    pub decoded_reference: Option<PathBuf>,
+    #[serde(default)]
+    pub album_decoded_references: Option<Vec<PathBuf>>,
+    #[serde(default = "default_max_album_references")]
+    pub max_album_references: u32,
     #[serde(default = "default_max_decoded_samples")]
     pub max_decoded_samples: u64,
 }
@@ -150,6 +173,39 @@ pub struct IsobmffLoudnessEvidence {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct IsobmffAlbumReferenceEvidence {
+    pub path: String,
+    pub sha256: String,
+    pub track_reference: bool,
+    pub input_bytes: u64,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub frames: u64,
+    pub decoded_samples: u64,
+    pub complete_gating_blocks: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IsobmffAlbumLoudnessEvidence {
+    pub references: Vec<IsobmffAlbumReferenceEvidence>,
+    pub reference_count: u32,
+    pub max_album_references: u32,
+    pub total_reference_bytes: u64,
+    pub total_decoded_samples: u64,
+    pub max_decoded_samples: u64,
+    pub complete_gating_blocks: u64,
+    pub measured_program_loudness_lufs: f64,
+    pub encoded_program_loudness_lkfs: f64,
+    pub program_quantization_error_lu: f64,
+    pub measured_sample_peak_dbfs: f64,
+    pub encoded_sample_peak_dbfs: f64,
+    pub sample_peak_quantization_error_db: f64,
+    pub measured_true_peak_dbtp: f64,
+    pub encoded_true_peak_dbtp: f64,
+    pub true_peak_quantization_error_db: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct MetadataRepairReport {
     pub schema_version: u32,
     pub validator: &'static str,
@@ -189,6 +245,42 @@ pub struct ExtendedMetadataRepairReport {
     pub isobmff_loudness: Option<IsobmffLoudnessEvidence>,
 }
 
+/// Schema-v2 ISO-BMFF evidence. The schema-v1 track evidence remains
+/// byte-for-byte compatible and album evidence is added only in v2 output.
+#[derive(Debug, Clone, Serialize)]
+pub struct IsobmffLoudnessEvidenceV2 {
+    #[serde(flatten)]
+    pub track: IsobmffLoudnessEvidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album_loudness: Option<IsobmffAlbumLoudnessEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExtendedMetadataRepairReportV2 {
+    #[serde(flatten)]
+    pub report: MetadataRepairReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isobmff_loudness: Option<IsobmffLoudnessEvidenceV2>,
+}
+
+/// Versioned command-line report without changing the existing schema-v1 Rust
+/// return type.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum VersionedMetadataRepairReport {
+    V1(ExtendedMetadataRepairReport),
+    V2(ExtendedMetadataRepairReportV2),
+}
+
+impl VersionedMetadataRepairReport {
+    pub fn report(&self) -> &MetadataRepairReport {
+        match self {
+            Self::V1(value) => &value.report,
+            Self::V2(value) => &value.report,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct WaveChunkInfo {
     id: [u8; 4],
@@ -203,8 +295,56 @@ struct PreparedIsobmffLoudness {
     reference_is_source: bool,
     measured: DecodedLoudness,
     encoded: EncodedLoudness,
+    album: Option<PreparedAlbumLoudness>,
     source_mdat_sha256: Option<String>,
     max_decoded_samples: u64,
+}
+
+struct PreparedAlbumLoudness {
+    encoded: EncodedLoudness,
+    evidence: IsobmffAlbumLoudnessEvidence,
+}
+
+#[derive(Debug, Clone)]
+enum IsobmffOptions {
+    V1(IsobmffLoudnessRepair),
+    V2(IsobmffLoudnessRepairV2),
+}
+
+impl IsobmffOptions {
+    fn decoded_reference(&self) -> Option<&PathBuf> {
+        match self {
+            Self::V1(value) => value.decoded_reference.as_ref(),
+            Self::V2(value) => value.decoded_reference.as_ref(),
+        }
+    }
+
+    fn max_decoded_samples(&self) -> u64 {
+        match self {
+            Self::V1(value) => value.max_decoded_samples,
+            Self::V2(value) => value.max_decoded_samples,
+        }
+    }
+
+    fn album_decoded_references(&self) -> Option<&[PathBuf]> {
+        match self {
+            Self::V1(_) => None,
+            Self::V2(value) => value.album_decoded_references.as_deref(),
+        }
+    }
+
+    fn max_album_references(&self) -> u32 {
+        match self {
+            Self::V1(_) => 1,
+            Self::V2(value) => value.max_album_references,
+        }
+    }
+}
+
+struct InternalMetadataRepairReport {
+    report: MetadataRepairReport,
+    isobmff_loudness: Option<IsobmffLoudnessEvidence>,
+    album_loudness: Option<IsobmffAlbumLoudnessEvidence>,
 }
 
 /// Read a JSON/TOML request and produce a bounded repair report.
@@ -228,7 +368,23 @@ pub fn evaluate_extended_file(path: &Path) -> Result<ExtendedMetadataRepairRepor
     let text = fs::read_to_string(path)
         .map_err(|error| format!("read metadata repair request {}: {error}", path.display()))?;
     let (spec, isobmff_loudness) = parse_extended_spec(path, &text)?;
-    evaluate_internal(path, spec, isobmff_loudness)
+    let options = isobmff_loudness.map(IsobmffOptions::V1);
+    into_v1_report(evaluate_internal(path, spec, options)?)
+}
+
+/// Read a schema-v1 or schema-v2 request and retain the matching report
+/// contract. The CLI uses this entry point so v1 consumers remain unchanged.
+pub fn evaluate_versioned_file(path: &Path) -> Result<VersionedMetadataRepairReport, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("read metadata repair request {}: {error}", path.display()))?;
+    let (spec, isobmff_loudness) = parse_versioned_spec(path, &text)?;
+    let schema_version = spec.schema_version;
+    let report = evaluate_internal(path, spec, isobmff_loudness)?;
+    match schema_version {
+        SCHEMA_VERSION => into_v1_report(report).map(VersionedMetadataRepairReport::V1),
+        SCHEMA_VERSION_V2 => Ok(VersionedMetadataRepairReport::V2(into_v2_report(report))),
+        _ => unreachable!("validated schema version"),
+    }
 }
 
 /// Evaluate one request.  The destination is always a separate path; this is
@@ -237,7 +393,13 @@ pub fn evaluate(
     request_path: &Path,
     spec: MetadataRepairSpec,
 ) -> Result<MetadataRepairReport, String> {
-    evaluate_internal(request_path, spec, None).map(|extended| extended.report)
+    if spec.schema_version != SCHEMA_VERSION {
+        return Err(format!(
+            "evaluate supports schema_version {SCHEMA_VERSION}; use evaluate_versioned_file for schema_version {}",
+            spec.schema_version
+        ));
+    }
+    evaluate_internal(request_path, spec, None).map(|internal| internal.report)
 }
 
 /// Evaluate one ISO-BMFF loudness repair without extending the shape of the
@@ -247,14 +409,39 @@ pub fn evaluate_isobmff_loudness(
     spec: MetadataRepairSpec,
     options: IsobmffLoudnessRepair,
 ) -> Result<ExtendedMetadataRepairReport, String> {
-    evaluate_internal(request_path, spec, Some(options))
+    if spec.schema_version != SCHEMA_VERSION {
+        return Err(format!(
+            "evaluate_isobmff_loudness supports schema_version {SCHEMA_VERSION}; use the schema-v2 API for schema_version {}",
+            spec.schema_version
+        ));
+    }
+    into_v1_report(evaluate_internal(
+        request_path,
+        spec,
+        Some(IsobmffOptions::V1(options)),
+    )?)
+}
+
+/// Evaluate schema-v2 track and optional album ISO-BMFF loudness repair.
+pub fn evaluate_isobmff_loudness_v2(
+    request_path: &Path,
+    spec: MetadataRepairSpec,
+    options: IsobmffLoudnessRepairV2,
+) -> Result<ExtendedMetadataRepairReportV2, String> {
+    if spec.schema_version != SCHEMA_VERSION_V2 {
+        return Err(format!(
+            "evaluate_isobmff_loudness_v2 requires schema_version {SCHEMA_VERSION_V2}; found {}",
+            spec.schema_version
+        ));
+    }
+    evaluate_internal(request_path, spec, Some(IsobmffOptions::V2(options))).map(into_v2_report)
 }
 
 fn evaluate_internal(
     request_path: &Path,
     spec: MetadataRepairSpec,
-    isobmff_options: Option<IsobmffLoudnessRepair>,
-) -> Result<ExtendedMetadataRepairReport, String> {
+    isobmff_options: Option<IsobmffOptions>,
+) -> Result<InternalMetadataRepairReport, String> {
     validate_spec(&spec, isobmff_options.as_ref())?;
     let base = request_path.parent().unwrap_or_else(|| Path::new("."));
     let source = resolve(base, &spec.source);
@@ -315,44 +502,9 @@ fn evaluate_internal(
     }
 
     let prepared_isobmff = if let Some(options) = &isobmff_options {
-        let target = isobmff_loudness_repair::select_target(&before)?;
-        let reference = options
-            .decoded_reference
-            .as_ref()
-            .map(|path| resolve(base, path))
-            .unwrap_or_else(|| source.clone());
-        let reference_meta = fs::metadata(&reference).map_err(|error| {
-            format!(
-                "stat ISO-BMFF decoded reference {}: {error}",
-                reference.display()
-            )
-        })?;
-        if reference_meta.len() > spec.max_input_bytes {
-            return Err(format!(
-                "ISO-BMFF decoded reference {} is {} bytes, above max_input_bytes {}",
-                reference.display(),
-                reference_meta.len(),
-                spec.max_input_bytes
-            ));
-        }
-        let reference_is_source = same_path(&source, &reference)?;
-        let measured =
-            isobmff_loudness_repair::measure_reference(&reference, options.max_decoded_samples)?;
-        isobmff_loudness_repair::validate_reference_geometry(&target, &measured)?;
-        let encoded = isobmff_loudness_repair::encode_measurement(&measured)?;
-        let reference_sha256 = sha256_file(&reference, spec.max_input_bytes)?;
-        let source_mdat_sha256 =
-            isobmff_loudness_repair::mdat_sha256(&source, spec.max_input_bytes, spec.max_chunks)?;
-        Some(PreparedIsobmffLoudness {
-            target,
-            reference,
-            reference_sha256,
-            reference_is_source,
-            measured,
-            encoded,
-            source_mdat_sha256,
-            max_decoded_samples: options.max_decoded_samples,
-        })
+        Some(prepare_isobmff_loudness(
+            base, &source, &before, &spec, options,
+        )?)
     } else {
         None
     };
@@ -382,7 +534,7 @@ fn evaluate_internal(
                     output,
                     prepared.target.track_id,
                     &prepared.encoded,
-                    None,
+                    prepared.album.as_ref().map(|album| &album.encoded),
                     isobmff_loudness_repair::RewriteLimits {
                         max_input_bytes: spec.max_input_bytes,
                         max_moov_bytes: spec.max_metadata_chunk_bytes,
@@ -401,8 +553,9 @@ fn evaluate_internal(
             kind: "isobmff-loudness",
             changed: result.changed,
             detail: format!(
-                "{} ISO-BMFF ludt/tlou for audio track {}; moov delta {:+} byte(s), adjusted {} chunk offset(s)",
+                "{} ISO-BMFF {} for audio track {}; moov delta {:+} byte(s), adjusted {} chunk offset(s)",
                 if result.replaced_existing { "replaced" } else { "inserted" },
+                if prepared.album.is_some() { "ludt/tlou+alou" } else { "ludt/tlou" },
                 prepared.target.track_id,
                 result.moov_size_delta,
                 result.adjusted_chunk_offsets
@@ -450,7 +603,7 @@ fn evaluate_internal(
     }
     let after = container_qc::audit(&destination)?;
     let adm_after = read_adm_profile(&destination, &after.format)?;
-    let isobmff_loudness = if let Some(prepared) = prepared_isobmff {
+    let (isobmff_loudness, album_loudness) = if let Some(prepared) = prepared_isobmff {
         let rewrite =
             isobmff_rewrite.expect("prepared ISO-BMFF loudness mutation has rewrite evidence");
         let output_mdat_sha256 = isobmff_loudness_repair::mdat_sha256(
@@ -463,7 +616,7 @@ fn evaluate_internal(
             &after,
             prepared.target.track_id,
             &prepared.encoded,
-            None,
+            prepared.album.as_ref().map(|album| &album.encoded),
         );
         let passed = mdat_preserved && metadata_round_trip_passed;
         if !mdat_preserved {
@@ -478,7 +631,7 @@ fn evaluate_internal(
                     .into(),
             );
         }
-        Some(IsobmffLoudnessEvidence {
+        let evidence = IsobmffLoudnessEvidence {
             track_id: prepared.target.track_id,
             codecs: prepared.target.codecs,
             decoded_reference: prepared.reference.to_string_lossy().into_owned(),
@@ -509,9 +662,10 @@ fn evaluate_internal(
             adjusted_chunk_offsets: rewrite.adjusted_chunk_offsets,
             metadata_round_trip_passed,
             passed,
-        })
+        };
+        (Some(evidence), prepared.album.map(|album| album.evidence))
     } else {
-        None
+        (None, None)
     };
     let passed = before.passed
         && after.passed
@@ -530,12 +684,16 @@ fn evaluate_internal(
     }
     if changed && source_format == "isobmff" {
         warnings.push(
-            "ISO-BMFF media payloads were hash-verified byte-for-byte; only ludt/tlou, ancestor sizes, and required stco/co64 offsets changed".into(),
+            "ISO-BMFF media payloads were hash-verified byte-for-byte; only ludt loudness metadata, ancestor sizes, and required stco/co64 offsets changed".into(),
         );
     }
     let report = MetadataRepairReport {
-        schema_version: SCHEMA_VERSION,
-        validator: VALIDATOR,
+        schema_version: spec.schema_version,
+        validator: if spec.schema_version == SCHEMA_VERSION_V2 {
+            VALIDATOR_V2
+        } else {
+            VALIDATOR
+        },
         classification: "bounded metadata repair; delivery requires post-repair QC review",
         mode: spec.mode,
         source: source.to_string_lossy().into_owned(),
@@ -563,9 +721,276 @@ fn evaluate_internal(
         unknown_bytes_preserved: true,
         atomic_replace: spec.atomic_replace,
     };
-    Ok(ExtendedMetadataRepairReport {
+    Ok(InternalMetadataRepairReport {
         report,
         isobmff_loudness,
+        album_loudness,
+    })
+}
+
+fn into_v1_report(
+    report: InternalMetadataRepairReport,
+) -> Result<ExtendedMetadataRepairReport, String> {
+    if report.album_loudness.is_some() {
+        return Err("schema_version 1 cannot emit album loudness evidence".into());
+    }
+    Ok(ExtendedMetadataRepairReport {
+        report: report.report,
+        isobmff_loudness: report.isobmff_loudness,
+    })
+}
+
+fn into_v2_report(report: InternalMetadataRepairReport) -> ExtendedMetadataRepairReportV2 {
+    let album_loudness = report.album_loudness;
+    ExtendedMetadataRepairReportV2 {
+        report: report.report,
+        isobmff_loudness: report
+            .isobmff_loudness
+            .map(|track| IsobmffLoudnessEvidenceV2 {
+                track,
+                album_loudness,
+            }),
+    }
+}
+
+fn prepare_isobmff_loudness(
+    base: &Path,
+    source: &Path,
+    before: &ContainerAudit,
+    spec: &MetadataRepairSpec,
+    options: &IsobmffOptions,
+) -> Result<PreparedIsobmffLoudness, String> {
+    let target = isobmff_loudness_repair::select_target(before)?;
+    let reference = options
+        .decoded_reference()
+        .map(|path| resolve(base, path))
+        .unwrap_or_else(|| source.to_path_buf());
+    let reference_meta = fs::metadata(&reference).map_err(|error| {
+        format!(
+            "stat ISO-BMFF decoded reference {}: {error}",
+            reference.display()
+        )
+    })?;
+    if !reference_meta.is_file() {
+        return Err(format!(
+            "ISO-BMFF decoded reference is not a regular file: {}",
+            reference.display()
+        ));
+    }
+    if reference_meta.len() > spec.max_input_bytes {
+        return Err(format!(
+            "ISO-BMFF decoded reference {} is {} bytes, above max_input_bytes {}",
+            reference.display(),
+            reference_meta.len(),
+            spec.max_input_bytes
+        ));
+    }
+    let reference_is_source = same_path(source, &reference)?;
+    let analyzed =
+        isobmff_loudness_repair::analyze_reference(&reference, options.max_decoded_samples())?;
+    isobmff_loudness_repair::validate_encodable_measurement(&reference, &analyzed.loudness)?;
+    isobmff_loudness_repair::validate_reference_geometry(&target, &analyzed.loudness)?;
+    let measured = analyzed.loudness.clone();
+    let encoded = isobmff_loudness_repair::encode_measurement(&measured)?;
+    let reference_sha256 = sha256_file(&reference, spec.max_input_bytes)?;
+    let album = if let Some(album_references) = options.album_decoded_references() {
+        Some(prepare_album_loudness(
+            base,
+            &reference,
+            &reference_sha256,
+            reference_meta.len(),
+            analyzed,
+            album_references,
+            options.max_album_references(),
+            options.max_decoded_samples(),
+            spec.max_input_bytes,
+        )?)
+    } else {
+        None
+    };
+    let source_mdat_sha256 =
+        isobmff_loudness_repair::mdat_sha256(source, spec.max_input_bytes, spec.max_chunks)?;
+    Ok(PreparedIsobmffLoudness {
+        target,
+        reference,
+        reference_sha256,
+        reference_is_source,
+        measured,
+        encoded,
+        album,
+        source_mdat_sha256,
+        max_decoded_samples: options.max_decoded_samples(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_album_loudness(
+    base: &Path,
+    track_reference: &Path,
+    track_sha256: &str,
+    track_input_bytes: u64,
+    track_analysis: isobmff_loudness_repair::ReferenceMeasurement,
+    album_references: &[PathBuf],
+    max_album_references: u32,
+    max_decoded_samples: u64,
+    max_input_bytes: u64,
+) -> Result<PreparedAlbumLoudness, String> {
+    let track_canonical = fs::canonicalize(track_reference).map_err(|error| {
+        format!(
+            "canonicalize ISO-BMFF decoded reference {}: {error}",
+            track_reference.display()
+        )
+    })?;
+    let mut seen = HashSet::with_capacity(album_references.len());
+    let mut resolved = Vec::with_capacity(album_references.len());
+    let mut total_reference_bytes = 0_u64;
+    let mut track_matches = 0_u32;
+    for path in album_references {
+        let path = resolve(base, path);
+        let canonical = fs::canonicalize(&path).map_err(|error| {
+            format!(
+                "canonicalize album decoded reference {}: {error}",
+                path.display()
+            )
+        })?;
+        if !seen.insert(canonical.clone()) {
+            return Err(format!(
+                "album_decoded_references contains duplicate file {}",
+                path.display()
+            ));
+        }
+        let metadata = fs::metadata(&canonical)
+            .map_err(|error| format!("stat album decoded reference {}: {error}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "album decoded reference is not a regular file: {}",
+                path.display()
+            ));
+        }
+        total_reference_bytes = total_reference_bytes
+            .checked_add(metadata.len())
+            .ok_or("album decoded reference byte count overflow")?;
+        let is_track = canonical == track_canonical;
+        track_matches += u32::from(is_track);
+        resolved.push((path, canonical, metadata.len(), is_track));
+    }
+    if track_matches != 1 {
+        return Err(format!(
+            "album_decoded_references must contain the selected track decoded reference exactly once; found {track_matches}"
+        ));
+    }
+    if total_reference_bytes > max_input_bytes {
+        return Err(format!(
+            "album decoded references total {total_reference_bytes} bytes, above aggregate max_input_bytes {max_input_bytes}"
+        ));
+    }
+
+    let mut total_decoded_samples = track_analysis.loudness.decoded_samples;
+    let mut track_analysis = Some(track_analysis);
+    let mut gating_blocks = Vec::new();
+    let mut sample_peak_dbfs = f64::NEG_INFINITY;
+    let mut true_peak_dbtp = f64::NEG_INFINITY;
+    let mut evidence = Vec::with_capacity(resolved.len());
+    for (path, _canonical, input_bytes, is_track) in resolved {
+        let analysis = if is_track {
+            track_analysis
+                .take()
+                .expect("validated album list contains the track reference once")
+        } else {
+            let remaining = max_decoded_samples
+                .checked_sub(total_decoded_samples)
+                .filter(|remaining| *remaining != 0)
+                .ok_or_else(|| {
+                    format!(
+                        "album decoded references exceed aggregate max_decoded_samples ({max_decoded_samples})"
+                    )
+                })?;
+            isobmff_loudness_repair::analyze_reference(&path, remaining).map_err(|error| {
+                format!(
+                    "album decoded references exceed aggregate max_decoded_samples ({max_decoded_samples}) or could not be measured: {error}"
+                )
+            })?
+        };
+        if !is_track {
+            total_decoded_samples = total_decoded_samples
+                .checked_add(analysis.loudness.decoded_samples)
+                .ok_or("album decoded sample count overflow")?;
+        }
+        if total_decoded_samples > max_decoded_samples {
+            return Err(format!(
+                "album decoded references total {total_decoded_samples} samples, above aggregate max_decoded_samples {max_decoded_samples}"
+            ));
+        }
+        let block_count = analysis.gating_blocks.len();
+        let combined_blocks = gating_blocks
+            .len()
+            .checked_add(block_count)
+            .ok_or("album gating block count overflow")?;
+        if combined_blocks > crate::dsp::lufs::MAX_LOUDNESS_BLOCKS {
+            return Err(format!(
+                "album loudness exceeds the {} complete-gating-block limit",
+                crate::dsp::lufs::MAX_LOUDNESS_BLOCKS
+            ));
+        }
+        sample_peak_dbfs = sample_peak_dbfs.max(analysis.loudness.sample_peak_dbfs);
+        true_peak_dbtp = true_peak_dbtp.max(analysis.loudness.true_peak_dbtp);
+        gating_blocks.extend(analysis.gating_blocks);
+        let sha256 = if is_track {
+            track_sha256.to_owned()
+        } else {
+            sha256_file(&path, max_input_bytes)?
+        };
+        evidence.push(IsobmffAlbumReferenceEvidence {
+            path: path.to_string_lossy().into_owned(),
+            sha256,
+            track_reference: is_track,
+            input_bytes: if is_track {
+                track_input_bytes
+            } else {
+                input_bytes
+            },
+            sample_rate_hz: analysis.loudness.sample_rate_hz,
+            channels: analysis.loudness.channels,
+            frames: analysis.loudness.frames,
+            decoded_samples: analysis.loudness.decoded_samples,
+            complete_gating_blocks: u64::try_from(block_count)
+                .map_err(|_| "album gating block count exceeds u64")?,
+        });
+    }
+    let integrated_lufs = crate::dsp::lufs::gated_lufs(&gating_blocks);
+    if !integrated_lufs.is_finite() || !sample_peak_dbfs.is_finite() || !true_peak_dbtp.is_finite()
+    {
+        return Err(
+            "album decoded references do not contain finite loudness and peak measurements".into(),
+        );
+    }
+    let encoded =
+        isobmff_loudness_repair::encode_values(integrated_lufs, sample_peak_dbfs, true_peak_dbtp)?;
+    let complete_gating_blocks =
+        u64::try_from(gating_blocks.len()).map_err(|_| "album gating block count exceeds u64")?;
+    let reference_count =
+        u32::try_from(evidence.len()).map_err(|_| "album reference count exceeds u32")?;
+    debug_assert!(reference_count <= max_album_references);
+    Ok(PreparedAlbumLoudness {
+        evidence: IsobmffAlbumLoudnessEvidence {
+            references: evidence,
+            reference_count,
+            max_album_references,
+            total_reference_bytes,
+            total_decoded_samples,
+            max_decoded_samples,
+            complete_gating_blocks,
+            measured_program_loudness_lufs: integrated_lufs,
+            encoded_program_loudness_lkfs: encoded.program_loudness_lkfs,
+            program_quantization_error_lu: encoded.program_loudness_lkfs - integrated_lufs,
+            measured_sample_peak_dbfs: sample_peak_dbfs,
+            encoded_sample_peak_dbfs: encoded.sample_peak_dbfs,
+            sample_peak_quantization_error_db: encoded.sample_peak_dbfs - sample_peak_dbfs,
+            measured_true_peak_dbtp: true_peak_dbtp,
+            encoded_true_peak_dbtp: encoded.true_peak_dbtp,
+            true_peak_quantization_error_db: encoded.true_peak_dbtp - true_peak_dbtp,
+        },
+        encoded,
     })
 }
 
@@ -573,6 +998,25 @@ fn parse_extended_spec(
     path: &Path,
     text: &str,
 ) -> Result<(MetadataRepairSpec, Option<IsobmffLoudnessRepair>), String> {
+    let (spec, options) = parse_versioned_spec(path, text)?;
+    if spec.schema_version != SCHEMA_VERSION {
+        return Err(format!(
+            "evaluate_extended_file supports schema_version {SCHEMA_VERSION}; found {}",
+            spec.schema_version
+        ));
+    }
+    let options = match options {
+        None => None,
+        Some(IsobmffOptions::V1(value)) => Some(value),
+        Some(IsobmffOptions::V2(_)) => unreachable!("schema-v1 parser selected v1 options"),
+    };
+    Ok((spec, options))
+}
+
+fn parse_versioned_spec(
+    path: &Path,
+    text: &str,
+) -> Result<(MetadataRepairSpec, Option<IsobmffOptions>), String> {
     match path.extension().and_then(|value| value.to_str()) {
         Some("json") => {
             let mut value: serde_json::Value = serde_json::from_str(text)
@@ -580,12 +1024,30 @@ fn parse_extended_spec(
             let object = value
                 .as_object_mut()
                 .ok_or("metadata repair JSON request must be an object")?;
-            let isobmff_loudness = object
-                .remove("isobmff_loudness")
-                .map(serde_json::from_value::<Option<IsobmffLoudnessRepair>>)
-                .transpose()
-                .map_err(|error| format!("parse metadata repair JSON isobmff_loudness: {error}"))?
-                .flatten();
+            let schema_version = object
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|version| u32::try_from(version).ok())
+                .ok_or("metadata repair JSON schema_version must be an unsigned integer")?;
+            let raw_options = object.remove("isobmff_loudness");
+            let isobmff_loudness = match (schema_version, raw_options) {
+                (_, None) => None,
+                (SCHEMA_VERSION, Some(raw)) => serde_json::from_value::<
+                    Option<IsobmffLoudnessRepair>,
+                >(raw)
+                .map(|value| value.map(IsobmffOptions::V1))
+                .map_err(|error| format!("parse metadata repair JSON isobmff_loudness: {error}"))?,
+                (SCHEMA_VERSION_V2, Some(raw)) => serde_json::from_value::<
+                    Option<IsobmffLoudnessRepairV2>,
+                >(raw)
+                .map(|value| value.map(IsobmffOptions::V2))
+                .map_err(|error| format!("parse metadata repair JSON isobmff_loudness: {error}"))?,
+                (version, Some(_)) => {
+                    return Err(format!(
+                        "unsupported metadata repair schema_version {version}; expected {SCHEMA_VERSION} or {SCHEMA_VERSION_V2}"
+                    ));
+                }
+            };
             let spec = serde_json::from_value(value)
                 .map_err(|error| format!("parse metadata repair JSON: {error}"))?;
             Ok((spec, isobmff_loudness))
@@ -596,11 +1058,30 @@ fn parse_extended_spec(
             let table = value
                 .as_table_mut()
                 .ok_or("metadata repair TOML request must be a table")?;
-            let isobmff_loudness = table
-                .remove("isobmff_loudness")
-                .map(|value| value.try_into::<IsobmffLoudnessRepair>())
-                .transpose()
-                .map_err(|error| format!("parse metadata repair TOML isobmff_loudness: {error}"))?;
+            let schema_version = table
+                .get("schema_version")
+                .and_then(toml::Value::as_integer)
+                .and_then(|version| u32::try_from(version).ok())
+                .ok_or("metadata repair TOML schema_version must be an unsigned integer")?;
+            let raw_options = table.remove("isobmff_loudness");
+            let isobmff_loudness = match (schema_version, raw_options) {
+                (_, None) => None,
+                (SCHEMA_VERSION, Some(raw)) => Some(IsobmffOptions::V1(
+                    raw.try_into::<IsobmffLoudnessRepair>().map_err(|error| {
+                        format!("parse metadata repair TOML isobmff_loudness: {error}")
+                    })?,
+                )),
+                (SCHEMA_VERSION_V2, Some(raw)) => Some(IsobmffOptions::V2(
+                    raw.try_into::<IsobmffLoudnessRepairV2>().map_err(|error| {
+                        format!("parse metadata repair TOML isobmff_loudness: {error}")
+                    })?,
+                )),
+                (version, Some(_)) => {
+                    return Err(format!(
+                        "unsupported metadata repair schema_version {version}; expected {SCHEMA_VERSION} or {SCHEMA_VERSION_V2}"
+                    ));
+                }
+            };
             let spec = value
                 .try_into::<MetadataRepairSpec>()
                 .map_err(|error| format!("parse metadata repair TOML: {error}"))?;
@@ -612,13 +1093,22 @@ fn parse_extended_spec(
 
 fn validate_spec(
     spec: &MetadataRepairSpec,
-    isobmff_options: Option<&IsobmffLoudnessRepair>,
+    isobmff_options: Option<&IsobmffOptions>,
 ) -> Result<(), String> {
-    if spec.schema_version != SCHEMA_VERSION {
+    if !matches!(spec.schema_version, SCHEMA_VERSION | SCHEMA_VERSION_V2) {
         return Err(format!(
-            "unsupported metadata repair schema_version {}; expected {}",
-            spec.schema_version, SCHEMA_VERSION
+            "unsupported metadata repair schema_version {}; expected {SCHEMA_VERSION} or {SCHEMA_VERSION_V2}",
+            spec.schema_version
         ));
+    }
+    if matches!(isobmff_options, Some(IsobmffOptions::V1(_)))
+        && spec.schema_version != SCHEMA_VERSION
+        || matches!(isobmff_options, Some(IsobmffOptions::V2(_)))
+            && spec.schema_version != SCHEMA_VERSION_V2
+    {
+        return Err(
+            "metadata repair schema_version does not match isobmff_loudness contract".into(),
+        );
     }
     if spec.source.as_os_str().is_empty() || spec.destination.as_os_str().is_empty() {
         return Err("metadata repair source and destination must not be empty".into());
@@ -637,21 +1127,49 @@ fn validate_spec(
         return Err("metadata repair max_chunks must be positive".into());
     }
     if let Some(options) = isobmff_options {
-        if options.max_decoded_samples == 0
-            || options.max_decoded_samples > HARD_MAX_DECODED_SAMPLES
+        if options.max_decoded_samples() == 0
+            || options.max_decoded_samples() > HARD_MAX_DECODED_SAMPLES
         {
             return Err(format!(
                 "metadata repair isobmff_loudness.max_decoded_samples must be 1..={HARD_MAX_DECODED_SAMPLES}"
             ));
         }
         if options
-            .decoded_reference
-            .as_ref()
+            .decoded_reference()
             .is_some_and(|path| path.as_os_str().is_empty())
         {
             return Err(
                 "metadata repair isobmff_loudness.decoded_reference must not be empty".into(),
             );
+        }
+        if let IsobmffOptions::V2(options) = options {
+            if options.max_album_references == 0
+                || options.max_album_references > HARD_MAX_ALBUM_REFERENCES
+            {
+                return Err(format!(
+                    "metadata repair isobmff_loudness.max_album_references must be 1..={HARD_MAX_ALBUM_REFERENCES}"
+                ));
+            }
+            if let Some(references) = &options.album_decoded_references {
+                if references.is_empty() {
+                    return Err(
+                        "metadata repair isobmff_loudness.album_decoded_references must not be empty when present".into(),
+                    );
+                }
+                let count = u32::try_from(references.len())
+                    .map_err(|_| "album decoded reference count exceeds u32")?;
+                if count > options.max_album_references {
+                    return Err(format!(
+                        "metadata repair album_decoded_references has {count} entries, above max_album_references {}",
+                        options.max_album_references
+                    ));
+                }
+                if references.iter().any(|path| path.as_os_str().is_empty()) {
+                    return Err(
+                        "metadata repair album_decoded_references paths must not be empty".into(),
+                    );
+                }
+            }
         }
     }
     if (spec.ensure_bwf_v2 || spec.bwf_loudness.is_some()) && spec.max_metadata_chunk_bytes < 602 {
@@ -713,6 +1231,10 @@ fn default_max_chunks() -> u32 {
 
 fn default_max_decoded_samples() -> u64 {
     DEFAULT_MAX_DECODED_SAMPLES
+}
+
+fn default_max_album_references() -> u32 {
+    DEFAULT_MAX_ALBUM_REFERENCES
 }
 
 fn resolve(base: &Path, path: &Path) -> PathBuf {
@@ -1289,8 +1811,11 @@ mod tests {
     }
 
     fn pcm_mp4(path: &Path) {
+        pcm_mp4_with(path, 48_000, 0.1);
+    }
+
+    fn pcm_mp4_with(path: &Path, frames: u32, amplitude: f32) {
         const SAMPLE_RATE: u32 = 48_000;
-        const FRAMES: u32 = 48_000;
         let ftyp = mp4_box(
             b"ftyp",
             [b"M4A ".as_slice(), &[0, 0, 0, 0], b"isom"].concat(),
@@ -1313,7 +1838,7 @@ mod tests {
                 0,
                 [
                     1_u32.to_be_bytes(),
-                    FRAMES.to_be_bytes(),
+                    frames.to_be_bytes(),
                     1_u32.to_be_bytes(),
                 ]
                 .concat(),
@@ -1321,7 +1846,7 @@ mod tests {
         );
         let stsz = mp4_box(
             b"stsz",
-            mp4_full_box(0, [4_u32.to_be_bytes(), FRAMES.to_be_bytes()].concat()),
+            mp4_full_box(0, [4_u32.to_be_bytes(), frames.to_be_bytes()].concat()),
         );
         let stsc = mp4_box(
             b"stsc",
@@ -1330,7 +1855,7 @@ mod tests {
                 [
                     1_u32.to_be_bytes(),
                     1_u32.to_be_bytes(),
-                    FRAMES.to_be_bytes(),
+                    frames.to_be_bytes(),
                     1_u32.to_be_bytes(),
                 ]
                 .concat(),
@@ -1350,7 +1875,7 @@ mod tests {
             );
             let mut tkhd = vec![0_u8; 84];
             tkhd[12..16].copy_from_slice(&1_u32.to_be_bytes());
-            tkhd[20..24].copy_from_slice(&FRAMES.to_be_bytes());
+            tkhd[20..24].copy_from_slice(&frames.to_be_bytes());
             let tkhd = mp4_box(b"tkhd", tkhd);
             let mdhd = mp4_box(
                 b"mdhd",
@@ -1359,7 +1884,7 @@ mod tests {
                     [
                         vec![0; 8],
                         SAMPLE_RATE.to_be_bytes().to_vec(),
-                        FRAMES.to_be_bytes().to_vec(),
+                        frames.to_be_bytes().to_vec(),
                         vec![0; 4],
                     ]
                     .concat(),
@@ -1377,7 +1902,7 @@ mod tests {
                     [
                         vec![0; 8],
                         SAMPLE_RATE.to_be_bytes().to_vec(),
-                        FRAMES.to_be_bytes().to_vec(),
+                        frames.to_be_bytes().to_vec(),
                         vec![0; 80],
                     ]
                     .concat(),
@@ -1391,10 +1916,10 @@ mod tests {
         let placeholder = make_moov(0);
         let chunk_offset = u32::try_from(ftyp.len() + placeholder.len() + 8).unwrap();
         let moov = make_moov(chunk_offset);
-        let mut pcm = Vec::with_capacity(FRAMES as usize * 4);
-        for frame in 0..FRAMES {
+        let mut pcm = Vec::with_capacity(frames as usize * 4);
+        for frame in 0..frames {
             let phase = std::f32::consts::TAU * 440.0 * frame as f32 / SAMPLE_RATE as f32;
-            let sample = (phase.sin() * 0.1 * i16::MAX as f32).round() as i16;
+            let sample = (phase.sin() * amplitude * i16::MAX as f32).round() as i16;
             pcm.extend_from_slice(&sample.to_le_bytes());
             pcm.extend_from_slice(&sample.to_le_bytes());
         }
@@ -1419,6 +1944,29 @@ mod tests {
             &chunks,
         )
         .unwrap();
+    }
+
+    fn repair_spec(
+        source: PathBuf,
+        destination: PathBuf,
+        schema_version: u32,
+    ) -> MetadataRepairSpec {
+        MetadataRepairSpec {
+            schema_version,
+            source,
+            destination,
+            mode: RepairMode::Repair,
+            ensure_bwf_v2: false,
+            bwf_loudness: None,
+            adm_version: None,
+            overwrite: false,
+            atomic_replace: true,
+            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            max_metadata_chunk_bytes: DEFAULT_MAX_METADATA_CHUNK_BYTES,
+            max_xml_bytes: DEFAULT_MAX_XML_BYTES,
+            max_chunks: DEFAULT_MAX_CHUNKS,
+        }
     }
 
     #[test]
@@ -1559,11 +2107,249 @@ mod tests {
     }
 
     #[test]
+    fn schema_v2_repairs_album_loudness_from_combined_complete_blocks() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("quiet.m4a");
+        let loud = directory.path().join("loud.m4a");
+        let destination = directory.path().join("destination.m4a");
+        let request = directory.path().join("request.json");
+        pcm_mp4_with(&source, 192_000, 0.01);
+        pcm_mp4_with(&loud, 48_000, 0.5);
+
+        let quiet_analysis =
+            isobmff_loudness_repair::analyze_reference(&source, 1_000_000).unwrap();
+        let loud_analysis = isobmff_loudness_repair::analyze_reference(&loud, 1_000_000).unwrap();
+        let mut combined_blocks = quiet_analysis.gating_blocks.clone();
+        combined_blocks.extend_from_slice(&loud_analysis.gating_blocks);
+        let expected_lufs = crate::dsp::lufs::gated_lufs(&combined_blocks);
+        let equal_track_mean_square = [
+            quiet_analysis.loudness.integrated_lufs,
+            loud_analysis.loudness.integrated_lufs,
+        ]
+        .into_iter()
+        .map(|value| 10.0_f64.powf((value + 0.691) / 10.0))
+        .sum::<f64>()
+            / 2.0;
+        let equal_track_lufs = -0.691 + 10.0 * equal_track_mean_square.log10();
+        assert!((expected_lufs - equal_track_lufs).abs() > 2.0);
+
+        let request_json = serde_json::json!({
+            "schema_version": 2,
+            "source": "quiet.m4a",
+            "destination": "destination.m4a",
+            "atomic_replace": true,
+            "isobmff_loudness": {
+                "album_decoded_references": ["quiet.m4a", "loud.m4a"],
+                "max_album_references": 2,
+                "max_decoded_samples": 600_000
+            }
+        });
+        let request_schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../schema/metadata-repair-request-v2.schema.json"
+        ))
+        .unwrap();
+        assert!(jsonschema::validator_for(&request_schema)
+            .unwrap()
+            .is_valid(&request_json));
+        fs::write(&request, serde_json::to_vec_pretty(&request_json).unwrap()).unwrap();
+
+        let report = evaluate_versioned_file(&request).unwrap();
+        let VersionedMetadataRepairReport::V2(report) = report else {
+            panic!("schema v2 request returned a v1 report");
+        };
+        assert!(report.report.passed, "{report:#?}");
+        assert!(report.report.changed);
+        assert_eq!(report.report.schema_version, 2);
+        assert_eq!(report.report.validator, VALIDATOR_V2);
+        let report_json = serde_json::to_value(&report).unwrap();
+        let report_schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../schema/metadata-repair-report-v2.schema.json"
+        ))
+        .unwrap();
+        assert!(
+            jsonschema::validator_for(&report_schema)
+                .unwrap()
+                .is_valid(&report_json),
+            "{report_json:#}"
+        );
+        let evidence = report.isobmff_loudness.unwrap();
+        assert!(evidence.track.mdat_preserved);
+        assert!(evidence.track.metadata_round_trip_passed);
+        assert_eq!(
+            evidence.track.source_mdat_sha256,
+            evidence.track.output_mdat_sha256
+        );
+        let album = evidence.album_loudness.unwrap();
+        assert_eq!(album.reference_count, 2);
+        assert_eq!(album.max_album_references, 2);
+        assert_eq!(
+            album
+                .references
+                .iter()
+                .filter(|item| item.track_reference)
+                .count(),
+            1
+        );
+        assert_eq!(
+            album.complete_gating_blocks,
+            u64::try_from(combined_blocks.len()).unwrap()
+        );
+        assert!((album.measured_program_loudness_lufs - expected_lufs).abs() < 1e-12);
+        let expected_encoded = isobmff_loudness_repair::encode_values(
+            expected_lufs,
+            quiet_analysis
+                .loudness
+                .sample_peak_dbfs
+                .max(loud_analysis.loudness.sample_peak_dbfs),
+            quiet_analysis
+                .loudness
+                .true_peak_dbtp
+                .max(loud_analysis.loudness.true_peak_dbtp),
+        )
+        .unwrap();
+        assert_eq!(
+            album.encoded_program_loudness_lkfs,
+            expected_encoded.program_loudness_lkfs
+        );
+        let scopes = report.report.after.properties["tracks"][0]["loudness"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["scope"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(scopes, vec!["track", "album"]);
+        assert!(destination.exists());
+    }
+
+    #[test]
+    fn schema_v1_rejects_album_fields_and_v2_bounds_album_references() {
+        let v1 = serde_json::json!({
+            "schema_version": 1,
+            "source": "source.m4a",
+            "destination": "destination.m4a",
+            "isobmff_loudness": {
+                "album_decoded_references": ["source.m4a"]
+            }
+        });
+        let v1_schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../schema/metadata-repair-request-v1.schema.json"
+        ))
+        .unwrap();
+        assert!(!jsonschema::validator_for(&v1_schema).unwrap().is_valid(&v1));
+        let error = parse_versioned_spec(Path::new("request.json"), &v1.to_string()).unwrap_err();
+        assert!(error.contains("unknown field"), "{error}");
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.m4a");
+        let companion = directory.path().join("companion.m4a");
+        pcm_mp4_with(&source, 24_000, 0.1);
+        pcm_mp4_with(&companion, 24_000, 0.2);
+        let request_path = directory.path().join("request.json");
+
+        let duplicate = evaluate_isobmff_loudness_v2(
+            &request_path,
+            repair_spec(
+                source.clone(),
+                directory.path().join("duplicate.m4a"),
+                SCHEMA_VERSION_V2,
+            ),
+            IsobmffLoudnessRepairV2 {
+                decoded_reference: None,
+                album_decoded_references: Some(vec![source.clone(), source.clone()]),
+                max_album_references: 2,
+                max_decoded_samples: 200_000,
+            },
+        )
+        .unwrap_err();
+        assert!(duplicate.contains("duplicate file"), "{duplicate}");
+
+        let missing = evaluate_isobmff_loudness_v2(
+            &request_path,
+            repair_spec(
+                source.clone(),
+                directory.path().join("missing.m4a"),
+                SCHEMA_VERSION_V2,
+            ),
+            IsobmffLoudnessRepairV2 {
+                decoded_reference: None,
+                album_decoded_references: Some(vec![companion.clone()]),
+                max_album_references: 2,
+                max_decoded_samples: 200_000,
+            },
+        )
+        .unwrap_err();
+        assert!(missing.contains("exactly once; found 0"), "{missing}");
+
+        let too_many = validate_spec(
+            &repair_spec(
+                source.clone(),
+                directory.path().join("too-many.m4a"),
+                SCHEMA_VERSION_V2,
+            ),
+            Some(&IsobmffOptions::V2(IsobmffLoudnessRepairV2 {
+                decoded_reference: None,
+                album_decoded_references: Some(vec![source.clone(), companion.clone()]),
+                max_album_references: 1,
+                max_decoded_samples: 200_000,
+            })),
+        )
+        .unwrap_err();
+        assert!(
+            too_many.contains("above max_album_references 1"),
+            "{too_many}"
+        );
+
+        let source_bytes = fs::metadata(&source).unwrap().len();
+        let companion_bytes = fs::metadata(&companion).unwrap().len();
+        let mut byte_limited_spec = repair_spec(
+            source.clone(),
+            directory.path().join("byte-limited.m4a"),
+            SCHEMA_VERSION_V2,
+        );
+        byte_limited_spec.max_input_bytes = source_bytes + companion_bytes / 2;
+        let byte_limit = evaluate_isobmff_loudness_v2(
+            &request_path,
+            byte_limited_spec,
+            IsobmffLoudnessRepairV2 {
+                decoded_reference: None,
+                album_decoded_references: Some(vec![source.clone(), companion.clone()]),
+                max_album_references: 2,
+                max_decoded_samples: 200_000,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            byte_limit.contains("aggregate max_input_bytes"),
+            "{byte_limit}"
+        );
+
+        let sample_limit = evaluate_isobmff_loudness_v2(
+            &request_path,
+            repair_spec(
+                source.clone(),
+                directory.path().join("sample-limited.m4a"),
+                SCHEMA_VERSION_V2,
+            ),
+            IsobmffLoudnessRepairV2 {
+                decoded_reference: None,
+                album_decoded_references: Some(vec![source, companion]),
+                max_album_references: 2,
+                max_decoded_samples: 60_000,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            sample_limit.contains("aggregate max_decoded_samples (60000)"),
+            "{sample_limit}"
+        );
+    }
+
+    #[test]
     fn isobmff_decoded_sample_limit_is_enforced() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source.m4a");
         pcm_mp4(&source);
-        let error = isobmff_loudness_repair::measure_reference(&source, 100).unwrap_err();
+        let error = isobmff_loudness_repair::analyze_reference(&source, 100).unwrap_err();
         assert!(error.contains("exceeds max_decoded_samples (100)"));
     }
 

@@ -32,6 +32,12 @@ pub(crate) struct DecodedLoudness {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ReferenceMeasurement {
+    pub loudness: DecodedLoudness,
+    pub gating_blocks: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct EncodedLoudness {
     pub program_code: u8,
     pub sample_peak_code: u16,
@@ -159,10 +165,10 @@ pub(crate) fn select_target(audit: &ContainerAudit) -> Result<TargetTrack, Strin
     })
 }
 
-pub(crate) fn measure_reference(
+pub(crate) fn analyze_reference(
     path: &Path,
     max_decoded_samples: u64,
-) -> Result<DecodedLoudness, String> {
+) -> Result<ReferenceMeasurement, String> {
     if max_decoded_samples == 0 {
         return Err("ISO-BMFF loudness max_decoded_samples must be positive".into());
     }
@@ -222,10 +228,43 @@ pub(crate) fn measure_reference(
         sample_peak_dbfs: linear_db(measured.sample_peak),
         true_peak_dbtp: linear_db(measured.true_peak),
     };
+    if measured
+        .ebu
+        .gating_blocks
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return Err(format!(
+            "{}: decoded reference contains an invalid BS.1770 gating block",
+            path.display()
+        ));
+    }
     for (name, value) in [
         ("integrated loudness", result.integrated_lufs),
         ("sample peak", result.sample_peak_dbfs),
         ("true peak", result.true_peak_dbtp),
+    ] {
+        if value.is_nan() || value == f64::INFINITY {
+            return Err(format!(
+                "{}: decoded reference {name} is invalid",
+                path.display()
+            ));
+        }
+    }
+    Ok(ReferenceMeasurement {
+        loudness: result,
+        gating_blocks: measured.ebu.gating_blocks,
+    })
+}
+
+pub(crate) fn validate_encodable_measurement(
+    path: &Path,
+    measured: &DecodedLoudness,
+) -> Result<(), String> {
+    for (name, value) in [
+        ("integrated loudness", measured.integrated_lufs),
+        ("sample peak", measured.sample_peak_dbfs),
+        ("true peak", measured.true_peak_dbtp),
     ] {
         if !value.is_finite() {
             return Err(format!(
@@ -234,7 +273,7 @@ pub(crate) fn measure_reference(
             ));
         }
     }
-    Ok(result)
+    Ok(())
 }
 
 pub(crate) fn validate_reference_geometry(
@@ -261,16 +300,28 @@ pub(crate) fn validate_reference_geometry(
 }
 
 pub(crate) fn encode_measurement(measured: &DecodedLoudness) -> Result<EncodedLoudness, String> {
-    let program_code_f = ((measured.integrated_lufs + 57.75) * 4.0).round();
+    encode_values(
+        measured.integrated_lufs,
+        measured.sample_peak_dbfs,
+        measured.true_peak_dbtp,
+    )
+}
+
+pub(crate) fn encode_values(
+    integrated_lufs: f64,
+    sample_peak_dbfs: f64,
+    true_peak_dbtp: f64,
+) -> Result<EncodedLoudness, String> {
+    let program_code_f = ((integrated_lufs + 57.75) * 4.0).round();
     if !(0.0..=255.0).contains(&program_code_f) {
         return Err(format!(
             "integrated loudness {:.3} LUFS is outside the ISO/MPEG methodValue range -57.75..=6.0 LKFS",
-            measured.integrated_lufs
+            integrated_lufs
         ));
     }
     let program_code = program_code_f as u8;
-    let sample_peak_code = encode_peak("sample peak", measured.sample_peak_dbfs)?;
-    let true_peak_code = encode_peak("true peak", measured.true_peak_dbtp)?;
+    let sample_peak_code = encode_peak("sample peak", sample_peak_dbfs)?;
+    let true_peak_code = encode_peak("true peak", true_peak_dbtp)?;
     Ok(EncodedLoudness {
         program_code,
         sample_peak_code,

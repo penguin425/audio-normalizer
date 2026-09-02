@@ -8,6 +8,15 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.185.0 - 2026-09-02
+
+### Added
+
+- Add metadata-repair schema v2 for deriving ISO-BMFF album `alou` from the
+  combined population of complete BS.1770 gating blocks across bounded decoded
+  references, with aggregate byte/sample limits and per-reference hash
+  evidence.
+
 ## 0.184.0 - 2026-09-01
 
 ### Added

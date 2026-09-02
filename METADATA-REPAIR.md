@@ -25,15 +25,28 @@ exact copy.  `mode: "repair"` (the default) supports:
   peak, and true-peak metadata.  Values use MPEG-D's 0.25 LU and 1/32 dB
   quantization with BS.1770/accurate provenance.  For an fMP4 initialization
   segment, set `decoded_reference` to a bounded PCM or complete encoded render.
+  Schema v2 can also set `album_decoded_references` to the complete ordered
+  album. It derives `alou` from the combined population of complete 400 ms
+  BS.1770 gating blocks, never from an equal-weight average of track values.
 * MXF and unsupported containers are validate-and-copy only.  A mutation
   request fails closed rather than risking partition or offset corruption.
 
-The ISO-BMFF writer supports exactly one audio track.  It buffers only `moov`,
-preserves existing album loudness, hashes every `mdat` payload before and after,
-and adjusts unfragmented `stco/co64` entries when `moov` grows.  It refuses
+The ISO-BMFF writer supports exactly one audio track per destination. It
+buffers only `moov`, hashes every `mdat` payload before and after, and adjusts
+unfragmented `stco/co64` entries when `moov` grows. It refuses
 APAC, xHE-AAC and presentation codecs, media files containing `moof`, unknown
 `saio/iloc/tfra` offset mechanisms, and 32-bit offset overflow.  Those cases
 need a presentation-aware muxer rather than an implicit metadata patch.
+
+For schema v2, the album list must contain the selected track reference exactly
+once after canonical path resolution; aliases and duplicates are rejected. The
+default `max_album_references` is 1000 (hard maximum 10000), while
+`max_input_bytes` and `max_decoded_samples` are aggregate limits over the
+unique reference set. Combined analysis is also capped at one million complete
+gating blocks. This follows the complete 400 ms / 75%-overlap gating population
+defined by [ITU-R BS.1770-5](https://www.itu.int/rec/R-REC-BS.1770-5-202311-I)
+and the album-metadata guidance in
+[EBU R 128 s2](https://tech.ebu.ch/publications/r128s2).
 
 `container_qc::audit` and the ADM production-profile validator run before and
 after every copy.  Reports include source/output SHA-256 values, action IDs,
@@ -48,3 +61,9 @@ resource/I/O error.  The contract is versioned by
 [`metadata-repair-request-v1.schema.json`](schema/metadata-repair-request-v1.schema.json)
 and
 [`metadata-repair-report-v1.schema.json`](schema/metadata-repair-report-v1.schema.json).
+Schema v2 adds bounded album references and structured album measurement
+evidence in
+[`metadata-repair-request-v2.schema.json`](schema/metadata-repair-request-v2.schema.json)
+and
+[`metadata-repair-report-v2.schema.json`](schema/metadata-repair-report-v2.schema.json);
+schema v1 remains accepted unchanged.

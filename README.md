@@ -98,8 +98,8 @@ Release archives include focused commands such as `forge-live`,
 current build's format, encoder, runtime, and CPU capabilities.
 `forge-adm-presentation-qc` audits every ADM programme and complementary-object
 render through the EBU reference renderer. `forge-metadata-repair` can add
-measured ISO-BMFF `ludt/tlou`
-loudness metadata without re-encoding media. Other commands cover IMF, AES31,
+measured ISO-BMFF `ludt/tlou` and combined-album `alou` loudness metadata
+without re-encoding media. Other commands cover IMF, AES31,
 RTP/AES67/ST 2110, NMOS, codec adapters, remediation, and multi-delivery
 workflows.
 

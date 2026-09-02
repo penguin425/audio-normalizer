@@ -105,7 +105,9 @@ cp schema/binaural-qc-request-v1.schema.json \
 cp schema/remediation-request-v1.schema.json \
    schema/remediation-report-v1.schema.json "$staging/schema/"
 cp schema/metadata-repair-request-v1.schema.json \
-   schema/metadata-repair-report-v1.schema.json "$staging/schema/"
+   schema/metadata-repair-report-v1.schema.json \
+   schema/metadata-repair-request-v2.schema.json \
+   schema/metadata-repair-report-v2.schema.json "$staging/schema/"
 cp schema/audio-anomaly-provider-v1.schema.json \
    schema/anomaly-provider-audit-v1.schema.json \
    schema/model-qc-v1.schema.json \
