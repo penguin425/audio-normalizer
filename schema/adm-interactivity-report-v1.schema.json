@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/adm-interactivity-report-v1",
+  "title": "Forge ADM interactivity QC report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "validator",
+    "adm_standard",
+    "emission_profile_standard",
+    "profile",
+    "profile_scope",
+    "input_path",
+    "input_bytes",
+    "input_sha256",
+    "axml_bytes",
+    "limits",
+    "object_count",
+    "configuration_count",
+    "interactive_configuration_count",
+    "continuous_audio_compliance_verified",
+    "endpoint_rendering_required",
+    "scope_note",
+    "passed",
+    "configurations"
+  ],
+  "properties": {
+    "schema": {"const": "https://penguin425.github.io/audio-normalizer/schema/adm-interactivity-report-v1"},
+    "schema_version": {"const": 1},
+    "validator": {"const": "forge-adm-interactivity-qc-1"},
+    "adm_standard": {"const": "ITU-R BS.2076-3"},
+    "emission_profile_standard": {"enum": ["ITU-R BS.2168-0", null]},
+    "profile": {"enum": ["safety", "bs2168-emission-ranges"]},
+    "profile_scope": {
+      "enum": [
+        "Object-level BS.2076-3 gain/position semantics plus Forge's explicit-upper-envelope safety policy",
+        "Object-level BS.2168-0 audioObjectInteraction attribute and range subset; not full emission-profile validation"
+      ]
+    },
+    "input_path": {"type": "string", "minLength": 1},
+    "input_bytes": {"type": "integer", "minimum": 1},
+    "input_sha256": {"$ref": "#/$defs/sha256"},
+    "axml_bytes": {"type": "integer", "minimum": 1, "maximum": 67108864},
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_objects", "max_configurations", "max_axml_bytes", "max_xml_nodes"],
+      "properties": {
+        "max_objects": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "max_configurations": {"type": "integer", "minimum": 1, "maximum": 16384},
+        "max_axml_bytes": {"type": "integer", "minimum": 1, "maximum": 67108864},
+        "max_xml_nodes": {"type": "integer", "minimum": 1, "maximum": 1000000}
+      }
+    },
+    "object_count": {"type": "integer", "minimum": 1, "maximum": 65535},
+    "configuration_count": {"type": "integer", "minimum": 1, "maximum": 16384},
+    "interactive_configuration_count": {"type": "integer", "minimum": 0, "maximum": 16384},
+    "continuous_audio_compliance_verified": {"const": false},
+    "endpoint_rendering_required": {"type": "boolean"},
+    "scope_note": {
+      "const": "Object-level metadata range audit only; resolve nested gains, render, and independently measure bounded personalization cases before asserting loudness or true-peak compliance."
+    },
+    "passed": {"type": "boolean"},
+    "configurations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16384,
+      "items": {"$ref": "#/$defs/configuration"}
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "nullableNumber": {"type": ["number", "null"]},
+    "nullableString": {"type": ["string", "null"]},
+    "nullableBoolean": {"type": ["boolean", "null"]},
+    "gain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["raw", "unit", "linear", "db", "negative_infinity_db"],
+      "properties": {
+        "raw": {"type": "string", "minLength": 1},
+        "unit": {"enum": ["linear", "dB"]},
+        "linear": {"type": "number", "minimum": 0},
+        "db": {"$ref": "#/$defs/nullableNumber"},
+        "negative_infinity_db": {"type": "boolean"}
+      }
+    },
+    "positionBoundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["coordinate", "bound", "value"],
+      "properties": {
+        "coordinate": {"type": "string", "minLength": 1},
+        "bound": {"enum": ["min", "max"]},
+        "value": {"type": "number"}
+      }
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rule_id", "standard", "requirement", "observed", "passed"],
+      "properties": {
+        "rule_id": {"type": "string", "minLength": 1},
+        "standard": {"type": "string", "minLength": 1},
+        "requirement": {"type": "string", "minLength": 1},
+        "observed": {"type": "string", "minLength": 1},
+        "passed": {"type": "boolean"}
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "object_id",
+        "object_name",
+        "alternative_value_set_id",
+        "interaction_inherited",
+        "interact",
+        "interaction_present",
+        "on_off_interact_present",
+        "on_off_interact",
+        "gain_interact_present",
+        "gain_interact",
+        "position_interact_present",
+        "position_interact",
+        "default_gain",
+        "gain_minimum",
+        "gain_maximum",
+        "position_ranges",
+        "passed",
+        "rules"
+      ],
+      "properties": {
+        "object_id": {"type": "string", "minLength": 1},
+        "object_name": {"type": "string", "minLength": 1},
+        "alternative_value_set_id": {"$ref": "#/$defs/nullableString"},
+        "interaction_inherited": {"type": "boolean"},
+        "interact": {"type": "boolean"},
+        "interaction_present": {"type": "boolean"},
+        "on_off_interact_present": {"type": "boolean"},
+        "on_off_interact": {"$ref": "#/$defs/nullableBoolean"},
+        "gain_interact_present": {"type": "boolean"},
+        "gain_interact": {"type": "boolean"},
+        "position_interact_present": {"type": "boolean"},
+        "position_interact": {"type": "boolean"},
+        "default_gain": {"$ref": "#/$defs/gain"},
+        "gain_minimum": {"anyOf": [{"$ref": "#/$defs/gain"}, {"type": "null"}]},
+        "gain_maximum": {"anyOf": [{"$ref": "#/$defs/gain"}, {"type": "null"}]},
+        "position_ranges": {
+          "type": "array",
+          "maxItems": 6,
+          "items": {"$ref": "#/$defs/positionBoundary"}
+        },
+        "passed": {"type": "boolean"},
+        "rules": {
+          "type": "array",
+          "minItems": 7,
+          "items": {"$ref": "#/$defs/rule"}
+        }
+      }
+    }
+  }
+}
