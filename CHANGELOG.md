@@ -8,6 +8,43 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.189.0 - 2026-09-02
+
+### Added
+
+- Validate S-ADM frame structure by its normative XML paths and require the
+  exact ITU-R BS.2125-1 root-frame version declaration.
+- Reconstruct ADM definitions across logical S-ADM frames and verify declared
+  `new`, `changed`, `extended`, and `expired` ID status transitions after
+  Divided-Frame chunks have been combined.
+
+### Changed
+
+- Clarify that current IAMF conformance fixtures are structural checks rather
+  than automated OAR renders, and record the provisional standards-first
+  implementation sequence through v0.203.
+
+### Fixed
+
+- Reject misplaced frame headers, frame formats, transport mappings, payloads,
+  and malformed or duplicate `changedIDs` entries without confusing ordinary
+  ADM payload references for change declarations.
+- Reject foreign-namespace lookalikes, ambiguous payload-container shapes,
+  multiple XML roots, out-of-root content, and misplaced XML declarations;
+  bound frame count and XML bytes, depth, elements, attributes, and text.
+- Compare canonical ADM definitions so harmless attribute ordering,
+  formatting whitespace, comments, processing instructions, entities, and
+  namespace-prefix spelling do not create false state changes. Treat legacy
+  `ltime` as `lstart` and compare supported timing spellings with exact
+  rational arithmetic, including signed local start values.
+- Enforce `new` as the first appearance in the complete flow, including after
+  an earlier `expired` declaration, and include bounded state-error evidence in
+  the report.
+- Reject XML 1.0 well-formedness edge cases not rejected by the streaming
+  tokenizer, preserve meaningful whitespace during state comparison, and
+  bound namespace expansion and canonical state memory. Recurrence and
+  divided-frame grouping now remain linear in the number of supplied frames.
+
 ## 0.188.0 - 2026-09-02
 
 ### Added

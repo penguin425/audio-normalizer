@@ -76,4 +76,10 @@ Some binaries require the Cargo features listed in [`Cargo.toml`](Cargo.toml).
 Use `<command> --help` for its inputs, limits, output schemas, and exit codes.
 `forge-sadm-qc` accepts S-ADM XML frame documents in transport order; divided
 chunks with a shared base `frameFormatID` must be adjacent and ordered by chunk
-index.
+index. It validates the normative frame paths and version declaration, then
+reconstructs logical ADM state and checks any declared `changedIDs` status
+transitions after all chunks for a logical frame have been combined. XML
+parsing and flow reconstruction use fixed file, byte, depth, element,
+attribute, text, namespace-expansion, and canonical-state limits. Non-document
+or malformed XML, namespace lookalikes, and known S-ADM elements at invalid
+paths are rejected before a QC report is produced.

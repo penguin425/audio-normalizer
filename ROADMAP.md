@@ -74,19 +74,21 @@ Forge already provides:
   table or `moof`/`traf`/`trun` decapsulation, supported codec-config
   4CC/frame/roll/decoder semantics, complete Audio Element parameter,
   scalable-channel/expanded-layout and Ambisonics validation, descriptor ID
-  uniqueness, audio-frame linking, plus external OAR v1.0.0
-  presentation-render loudness, true-peak, duration, and reference checks.
+  uniqueness and audio-frame linking. The structural report explicitly does
+  not claim an OAR render; separately supplied renderer outputs can be
+  measured with `forge-presentation-qc`.
   Fragmented carriage resolves `trex`/`tfhd` defaults, signed data offsets,
   sample-description changes, decode-time continuity, fragment sample groups,
   sync/CTS constraints, and pinned AOMedia interoperability vectors. Encrypted
   carriage validates `enca`/`sinf`/`frma`/`schm`/`schi`/`tenc`,
   `cenc`/`cbcs` full-sample policy, IV geometry, and `senc` or paired
   `saiz`/`saio` sample coverage without accepting keys or parsing ciphertext.
-- Pinned AOMedia OAR/IAMF verification across 42 artifacts from 14 libiamf
+- Pinned IAMF structural verification across 42 artifacts from 14 libiamf
   v1.1.0 vectors, covering standalone, unfragmented, and fragmented carriage,
   LPCM, channel-based and Ambisonics elements, localized annotations, anchored
   loudness, parameter animation, intentionally invalid metadata, and exact
-  retained upstream packaging findings without claiming renderer parity.
+  retained upstream packaging findings. It does not yet automate OAR rendering
+  or claim renderer parity.
 - Bounded MPEG-TS/M2TS QC for packet layout, continuity, PAT/PMT CRC and
   programme maps, audio PES headers, and PTS continuity.
 - Bounded SMPTE ST 377-1 MXF QC for KLV framing, partitions and links,
@@ -418,8 +420,56 @@ S-ADM flow QC groups Divided-Frame chunks into logical frames, validates FF,
 IF, MF, and DF type sequences and recurrence declarations, and compares frame
 timing with exact decimal/sample arithmetic, including legacy date-bearing
 timestamps.
-The remaining S-ADM correctness work is path-aware XML structure and
-`frame/@version` validation followed by changed-ID state reconstruction.
+It also validates normative XML paths and the BS.2125-1 frame version, then
+reconstructs logical ADM state and verifies declared changed-ID transitions
+using canonical element comparisons. A later profile layer can apply BS.2168
+constraints to that reconstructed S-ADM state.
+
+## Provisional release sequence
+
+The order below is an implementation plan, not a standards requirement. Each
+normative item must name the exact supported clauses and must not imply
+certification or coverage beyond its fixtures.
+
+| Release | Scope | Classification |
+| --- | --- | --- |
+| v0.190 | Native file-based ADM BS.2168 Level 0/1/2 validation, including declarations, graph constraints, block timing, CHNA/essence reconciliation, and derived limits | Normative |
+| v0.191 | Deterministic personalization endpoint enumeration plus bounded renderer-adapter evidence and independent BS.1770 measurement | Engineering QC built on normative metadata rules |
+| v0.192 | Apply the BS.2168 validator to reconstructed S-ADM state and enforce the S-ADM-specific emission-profile constraints | Normative |
+| v0.193 | Execute and hash-pin AOMedia OAR renders for every supported IAMF Mix Presentation and output layout | Interoperability evidence |
+| v0.194 | SMPTE ST 2131 MXF ADM/RIFF Generic Stream validation | Normative |
+| v0.195 | SMPTE ST 2067-204 IMF ADM Audio Track File validation | Normative |
+| v0.196 | SMPTE ST 2127-1/-10 MGA S-ADM-in-MXF carriage validation | Normative |
+| v0.197 | SMPTE ST 2067-203 IMF S-ADM Mode A validation | Normative |
+| v0.198 | SMPTE ST 2110-41 and ST 2127-2 S-ADM-over-IP PCAP/SDP validation | Normative |
+| v0.199 | Unified `forge-delivery-qc` DAG with shared detection, hashing, decoding, and explicit `pass`/`fail`/`not_run`/`error` states | Product architecture |
+| v0.200 | ITU-R BS.2143 / SMPTE ST 2116 AES3/AM824 S-ADM burst validation | Normative |
+| v0.201 | Copy-to-new-file remediation for static gain and true-peak limiting, followed by independent final-output verification | Engineering workflow |
+| v0.202 | Stereo prerecorded audio-description dip planning with EBU TR 084-scoped evidence | Industry guidance |
+| v0.203 | Calibrated rolling safe-listening dose; never infer acoustic SPL from LUFS or dBFS alone | Conditional normative calculation |
+
+Primary sources for this sequence are
+[ITU-R BS.2168-0](https://www.itu.int/rec/R-REC-BS.2168-0-202502-I/en),
+[ITU-R BS.2127-1](https://www.itu.int/rec/R-REC-BS.2127-1-202311-I/en),
+[IAMF v1.1](https://aomediacodec.github.io/iamf/latest-approved.html), the
+[AOMedia OAR](https://github.com/AOMediaCodec/oar),
+[SMPTE ST 2131:2026](https://pub.smpte.org/pub/st2131/st2131-2026-05.pdf),
+[ST 2067-204:2026](https://pub.smpte.org/doc/st2067-204/20260527-pub/st2067-204-2026-05.pdf),
+[ST 2127-1](https://pub.smpte.org/doc/st2127-1/20220309-pub/st2127-1-2022.pdf),
+[ST 2127-10](https://pub.smpte.org/doc/st2127-10/20220309-pub/st2127-10-2022.pdf),
+[ST 2067-203](https://pub.smpte.org/latest/st2067-203/st2067-203-2023.pdf),
+[ST 2110-41](https://pub.smpte.org/doc/st2110-41/20240308-pub/st2110-41-2024.pdf),
+[ST 2127-2](https://pub.smpte.org/doc/st2127-2/20240308-pub/st2127-2-2024.pdf),
+[ITU-R BS.2143](https://www.itu.int/rec/R-REC-BS.2143/en),
+[SMPTE ST 2116](https://pub.smpte.org/latest/st2116/st2116-2019.pdf),
+[EBU TR 084](https://tech.ebu.ch/publications/tr084), and
+[ITU-T H.870](https://www.itu.int/rec/T-REC-H.870-202203-I/en).
+
+AI mastering, blind DRC restoration, generated alternatives, preference
+learning, and psychological-state adaptation remain experimental. They must be
+opt-in and separated from standards-compliance results until their datasets,
+model provenance, operating domain, and failure behaviour are independently
+validated.
 
 ## P1 — professional delivery expansion
 
