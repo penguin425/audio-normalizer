@@ -1876,8 +1876,14 @@ fn verify_analysis_at_level(
         actual_level,
         deviation,
         level_ok: deviation <= tolerance,
-        true_peak_ok: output.true_peak_db() <= plan.ceiling_db + tolerance,
+        true_peak_ok: true_peak_within_ceiling(output.true_peak_db(), plan.ceiling_db),
     }
+}
+
+/// True Peak ceilings are maxima, not target values. Loudness verification
+/// tolerance must therefore never permit a decoded output above the ceiling.
+pub(crate) fn true_peak_within_ceiling(true_peak_db: f64, ceiling_db: f64) -> bool {
+    true_peak_db <= ceiling_db
 }
 
 fn analysis_level(analysis: &Analysis, mode: Mode) -> f64 {
@@ -2397,11 +2403,10 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
 
 /// Album loudness from the combined population of all complete gating blocks.
 pub fn album_lufs(analyses: &[Analysis]) -> f64 {
-    lufs::gated_lufs(
-        &analyses
+    lufs::gated_lufs_iter(
+        analyses
             .iter()
-            .flat_map(|an| an.loudness_blocks.iter().copied())
-            .collect::<Vec<_>>(),
+            .flat_map(|analysis| analysis.loudness_blocks.iter().copied()),
     )
 }
 
@@ -2822,9 +2827,9 @@ fn normalize_album_corrected_with_optional_analyses(
             .iter()
             .map(Analysis::true_peak_db)
             .fold(f64::NEG_INFINITY, f64::max);
-        let album_passed = album_deviation <= tolerance
-            && worst_true_peak <= plan.ceiling_db + tolerance
-            && verifications.iter().all(Verification::passed);
+        let album_passed =
+            album_measurements_pass(album_deviation, worst_true_peak, plan.ceiling_db, tolerance)
+                && verifications.iter().all(Verification::passed);
         if album_passed {
             let write_album_tags = formats.iter().copied().any(writes_album_loudness_tags);
             let metadata_outputs = if write_album_tags {
@@ -2892,11 +2897,21 @@ fn normalize_album_corrected_with_optional_analyses(
             actual_level: actual_album_lufs,
             deviation: album_deviation,
             level_ok: album_deviation <= tolerance,
-            true_peak_ok: worst_true_peak <= plan.ceiling_db + tolerance,
+            true_peak_ok: true_peak_within_ceiling(worst_true_peak, plan.ceiling_db),
         };
         gain = corrected_gain(gain, &album_verification, plan)?;
     }
     unreachable!("the inclusive retry loop always returns")
+}
+
+fn album_measurements_pass(
+    loudness_deviation: f64,
+    worst_true_peak_db: f64,
+    ceiling_db: f64,
+    loudness_tolerance: f64,
+) -> bool {
+    loudness_deviation <= loudness_tolerance
+        && true_peak_within_ceiling(worst_true_peak_db, ceiling_db)
 }
 
 fn gain_db(gain: f32) -> f64 {
@@ -4417,6 +4432,38 @@ mod tests {
         assert!(matches!(measured, Cow::Borrowed(_)));
         assert!(std::ptr::eq(measured.as_ref(), &known));
         assert!(known_or_analyze_output(&missing_output, None).is_err());
+    }
+
+    #[test]
+    fn album_loudness_uses_the_same_strict_gate_without_collecting_tracks() {
+        let absolute_gate = 10.0_f64.powf((-70.0 + 0.691) / 10.0);
+        let relative_gate = 2.0_f64.powi(-20);
+        let loud = 19.0 * relative_gate;
+        let mut first = analysis(-16.0, -3.0);
+        first.loudness_blocks = vec![absolute_gate, relative_gate];
+        let mut second = analysis(-16.0, -3.0);
+        second.loudness_blocks = vec![loud];
+
+        let expected = lufs::gated_lufs(&[absolute_gate, relative_gate, loud]);
+        assert_eq!(album_lufs(&[first, second]), expected);
+        assert_eq!(expected, -0.691 + 10.0 * loud.log10());
+    }
+
+    #[test]
+    fn single_verification_never_applies_loudness_tolerance_to_true_peak() {
+        let output = analysis(-16.4, -0.75);
+        let verification = verify_analysis_at_level(&output, -16.0, &plan(), 0.5);
+
+        assert!(verification.level_ok);
+        assert!(!verification.true_peak_ok);
+        assert!(!verification.passed());
+        assert!(true_peak_within_ceiling(-1.0, -1.0));
+    }
+
+    #[test]
+    fn album_verification_never_applies_loudness_tolerance_to_true_peak() {
+        assert!(album_measurements_pass(0.4, -1.0, -1.0, 0.5));
+        assert!(!album_measurements_pass(0.4, -0.75, -1.0, 0.5));
     }
 
     #[test]

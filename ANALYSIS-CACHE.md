@@ -31,7 +31,7 @@ input hash, canonical result-payload hash, generator version, measurement
 standard, and algorithm revision are retained in the entry. Cache v1 records
 normative ITU-R BS.1770-5 / EBU R 128 measurements; caching does not alter
 gating, channel weighting, units, or normalization targets.
-`forge-bs1770-5-r1` is the current implementation revision and changes
+`forge-bs1770-5-r2` is the current implementation revision and changes
 whenever a result-affecting core algorithm changes.
 
 The JSON compatibility boundary is

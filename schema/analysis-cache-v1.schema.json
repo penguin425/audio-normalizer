@@ -29,7 +29,7 @@
       "const": "ITU-R BS.1770-5 / EBU R 128"
     },
     "algorithm_revision": {
-      "const": "forge-bs1770-5-r1"
+      "const": "forge-bs1770-5-r2"
     },
     "created_unix_seconds": {
       "type": "integer",

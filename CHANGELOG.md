@@ -8,6 +8,23 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.189.1 - 2026-09-03
+
+### Fixed
+
+- Apply the ITU-R BS.1770 absolute and relative integrated-loudness gates with
+  strict threshold comparisons in track, rolling, and album measurements, and
+  combine album block populations without an additional aggregate allocation.
+- Treat the true-peak ceiling as a strict maximum in single-file, album,
+  multi-delivery, and segment verification instead of widening it by the
+  loudness-target tolerance.
+- Renew the true-peak limiter hold throughout sustained limiting so release
+  modulation cannot create a new inter-sample peak, and invalidate analysis
+  caches produced by the previous gate implementation.
+- Reject NaN and infinite PCM before any analysis state changes, and fail
+  closed on corrupt decoder packets instead of silently shortening the
+  programme and measuring different audio.
+
 ## 0.189.0 - 2026-09-02
 
 ### Added

@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const ANALYSIS_CACHE_SCHEMA_V1: &str =
     "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v1";
 pub const MEASUREMENT_STANDARD: &str = "ITU-R BS.1770-5 / EBU R 128";
-pub const ALGORITHM_REVISION: &str = "forge-bs1770-5-r1";
+pub const ALGORITHM_REVISION: &str = "forge-bs1770-5-r2";
 
 const LAYOUT_VERSION: &str = "v1";
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;

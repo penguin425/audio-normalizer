@@ -264,6 +264,7 @@ impl TruePeakLimiter {
         reduction_db(self.minimum_envelope)
     }
 
+    #[inline(always)]
     fn update_envelope(&mut self, detected: f32) {
         // The common defensive-limiter case never reaches the ceiling. With a
         // fully released envelope, the complete update below is an identity;
@@ -271,13 +272,14 @@ impl TruePeakLimiter {
         if self.envelope == 1.0 && self.hold_frames == 0 && detected <= self.ceiling {
             return;
         }
-        let required = if detected > self.ceiling {
-            (self.ceiling / detected) * 0.9999
-        } else {
-            1.0
-        };
-        if required < self.envelope {
-            self.envelope = required;
+        // A continuing over-ceiling detection must renew the hold even when
+        // it does not demand a new minimum. Releasing between periodic peaks
+        // modulates the delayed signal and can create a new inter-sample peak.
+        if detected > self.ceiling {
+            let required = (self.ceiling / detected) * 0.9999;
+            if required < self.envelope {
+                self.envelope = required;
+            }
             self.hold_frames = self.lookahead_frames;
         } else if self.hold_frames > 0 {
             self.hold_frames -= 1;
@@ -464,6 +466,34 @@ mod tests {
             "{} > {}",
             meter.peak(),
             ceiling
+        );
+    }
+
+    #[test]
+    fn sustained_limiting_renews_hold_and_preserves_the_strict_ceiling() {
+        let sample_rate = 48_000;
+        let ceiling_db = -6.0;
+        let ceiling = 10.0_f64.powf(ceiling_db / 20.0) as f32;
+        let input = (0..sample_rate as usize * 2)
+            .map(|index| {
+                (index as f64 * std::f64::consts::TAU * 997.0 / sample_rate as f64).sin() as f32
+            })
+            .collect::<Vec<_>>();
+        let mut limiter =
+            TruePeakLimiter::new(sample_rate, 1, ceiling_db, LimiterConfig::default()).unwrap();
+        let mut output = Vec::with_capacity(input.len());
+        for chunk in input.chunks(317) {
+            output.extend(limiter.process(&[chunk.to_vec()]).unwrap().remove(0));
+        }
+        output.extend(limiter.finish().remove(0));
+
+        let mut meter = TruePeakMeter::for_sample_rate(sample_rate);
+        meter.process(&output);
+        assert_eq!(output.len(), input.len());
+        assert!(
+            meter.peak() <= ceiling,
+            "{} dBTP exceeded the strict {ceiling_db} dBTP ceiling",
+            20.0 * f64::from(meter.peak()).log10(),
         );
     }
 
