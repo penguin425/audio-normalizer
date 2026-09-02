@@ -264,6 +264,7 @@ impl TruePeakLimiter {
         reduction_db(self.minimum_envelope)
     }
 
+    #[inline(always)]
     fn update_envelope(&mut self, detected: f32) {
         // The common defensive-limiter case never reaches the ceiling. With a
         // fully released envelope, the complete update below is an identity;
@@ -279,10 +280,10 @@ impl TruePeakLimiter {
         // A continuing over-ceiling detection must renew the hold even when
         // it does not demand a new minimum. Releasing between periodic peaks
         // modulates the delayed signal and can create a new inter-sample peak.
-        if required < 1.0 {
-            if required < self.envelope {
-                self.envelope = required;
-            }
+        if required < self.envelope {
+            self.envelope = required;
+            self.hold_frames = self.lookahead_frames;
+        } else if required < 1.0 {
             self.hold_frames = self.lookahead_frames;
         } else if self.hold_frames > 0 {
             self.hold_frames -= 1;
