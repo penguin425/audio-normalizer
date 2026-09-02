@@ -276,13 +276,13 @@ impl TruePeakLimiter {
         } else {
             1.0
         };
-        if required < self.envelope {
-            self.envelope = required;
-        }
         // A continuing over-ceiling detection must renew the hold even when
         // it does not demand a new minimum. Releasing between periodic peaks
         // modulates the delayed signal and can create a new inter-sample peak.
         if required < 1.0 {
+            if required < self.envelope {
+                self.envelope = required;
+            }
             self.hold_frames = self.lookahead_frames;
         } else if self.hold_frames > 0 {
             self.hold_frames -= 1;
