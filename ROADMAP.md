@@ -441,6 +441,11 @@ re-render from the original input without compounding lossy generations.
   default gains and position-pair structure, and optionally applies the
   BS.2168-0 emission-profile interactivity subset. Reports explicitly state
   that metadata inspection has not verified continuous rendered audio.
+- `forge-adm-semantics-qc` validates dialogue-kind enumerations and
+  alternative-value-set ownership, resolves the lowest-ID fallback programme,
+  distinguishes fixed and complementary interactive authoring patterns, and
+  produces a conservative importance-threshold plan. Tags and metadata object
+  counts are never presented as authoritative render evidence.
 - `forge-downmix-qc` now measures deterministic WAVE-order stereo/5.1/7.1.4
   profiles with explicit matrices, loudness/true-peak deltas, and clip-risk
   gates. User-selected speaker layouts remain future renderer-adapter work.
@@ -467,6 +472,7 @@ re-render from the original input without compounding lossy generations.
 
 The relevant open references include
 [ITU-R BS.2076-3](https://www.itu.int/rec/R-REC-BS.2076-3-202502-I/en),
+[Report ITU-R BS.2388-7](https://www.itu.int/pub/R-REP-BS.2388-7-2026),
 [ITU-R BS.2168-0](https://www.itu.int/rec/R-REC-BS.2168-0-202502-I/en),
 [ITU-R BS.2127-1](https://www.itu.int/rec/R-REC-BS.2127-1-202311-I/en), and the
 [2025 EBU Tech 3393 ADM Production Profile](https://tech.ebu.ch/publications/tech3393).

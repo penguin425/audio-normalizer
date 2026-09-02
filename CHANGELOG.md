@@ -8,6 +8,18 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.187.0 - 2026-09-02
+
+### Added
+
+- Add bounded ADM semantics QC for dialogue kinds, alternative-value-set
+  selection references, deterministic default programme selection, explicit
+  presentation intent, importance-threshold planning, and non-authoritative
+  tag inventories.
+- Separate normative metadata failures from opt-in operator policies and mark
+  all reports as metadata-only evidence rather than renderer or audio
+  compliance proof.
+
 ## 0.186.0 - 2026-09-02
 
 ### Added
