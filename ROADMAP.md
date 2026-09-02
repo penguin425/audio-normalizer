@@ -596,6 +596,12 @@ certification or coverage beyond its fixtures.
 | v0.236 | Complete the EBU live-meter surface, including momentary/short-term histories, maxima, exact update cadence, and conformance fixtures | Measurement workflow |
 | v0.237 | Publish measurable sample-rate-conversion and dither quality contracts, asset-bound reproducible seeds, and optional high-pass/noise-shaped modes | DSP quality and reproducibility |
 | v0.238 | Benchmark-gate true-peak tile pruning, AArch64/Wasm multichannel lanes, and persistent GPU batch scheduling; retain the scalar oracle and deterministic fallback | Performance engineering |
+| v0.239 | Import, validate, and round-trip EBU QC Data Model/XSD 2026-04 reports, including the semantic checklist and optional Scenario 1 constraints; retire the obsolete generic `Output/Name=CheckResult` encoding | Normative report interoperability |
+| v0.240 | Receive bounded live ST 2110-30:2025/AES67 L16/L24 PCM from SDP/RTP, with reorder/loss evidence and explicit `not_run` when PTP conformance cannot be observed | Normative transport subset plus operational receiver policy |
+| v0.241 | Add an optional MXL v1.0.2 same-host Float32 audio adapter with bounded continuous-flow reads, wrap handling, cancellation, and no mandatory native build dependency | Open SDK interoperability; non-normative |
+| v0.242 | Validate and activate AMWA BCP-007-03 NMOS/MXL resources over the MXL adapter without implementing an unrestricted NMOS controller | Normative control-plane subset |
+| v0.243 | Sign copy-to-new-file outputs with C2PA 2.4 lineage, normalization actions, recipe/QC digests, user-managed credentials, and independent post-signature verification | Normative provenance container plus explicit trust policy |
+| v0.244 | Publish live receiver/sender health through AMWA BCP-008-01/-02 and IS-12 subscriptions, with deterministic transition timing and transport counters | Normative monitoring surface |
 
 Primary sources for this sequence are
 [ITU-R BS.2168-0](https://www.itu.int/rec/R-REC-BS.2168-0-202502-I/en),
@@ -621,6 +627,14 @@ Primary sources for this sequence are
 [ITU-R BS.1738-1](https://www.itu.int/rec/R-REC-BS.1738-1-201510-I/en),
 [ITU-R BS.2102-0](https://www.itu.int/rec/R-REC-BS.2102-0-201701-I/en),
 [AES TD1009](https://www.aes.org/wp-content/uploads/2025/12/5297fea6-25ba-4865-92f6-dc1d0ba52ce4.pdf),
+[EBU QC Data Model/XSD 2026-04](https://github.com/ebu/qc/releases/tag/2026-04),
+[SMPTE ST 2110-30:2025](https://doi.org/10.5594/SMPTE.ST2110-30.2025),
+[AES67-2023](https://www.aes.org/publications/standards/preview.cfm?ID=96),
+[MXL v1.0.2](https://github.com/dmf-mxl/mxl/releases/tag/v1.0.2),
+[AMWA BCP-007-03](https://specs.amwa.tv/bcp-007-03/),
+[AMWA BCP-008-01](https://specs.amwa.tv/bcp-008-01/releases/v1.0.0/docs/Overview.html),
+[AMWA BCP-008-02](https://specs.amwa.tv/bcp-008-02/releases/v1.0.0/docs/Overview.html),
+[AMWA IS-12](https://specs.amwa.tv/is-12/releases/v1.0.1/docs/Overview.html),
 [EBU TR 084](https://tech.ebu.ch/publications/tr084), and
 [ITU-T H.870](https://www.itu.int/rec/T-REC-H.870-202203-I/en),
 [ITU-R BS.2088-2](https://www.itu.int/rec/R-REC-BS.2088-2-202511-I/en),
