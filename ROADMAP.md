@@ -410,10 +410,16 @@ Forge already provides:
 
 ## P0 — next correctness and interoperability work
 
-No known P0 correctness item remains open. Output verification measures the
-exact quantized PCM accepted by native WAVE/FLAC encoders and re-decodes every
-codec-dependent completed output, measures final true peak, and can iteratively
-re-render from the original input without compounding lossy generations.
+Output verification measures the exact quantized PCM accepted by native
+WAVE/FLAC encoders and re-decodes every codec-dependent completed output,
+measures final true peak, and can iteratively re-render from the original input
+without compounding lossy generations.
+S-ADM flow QC groups Divided-Frame chunks into logical frames, validates FF,
+IF, MF, and DF type sequences and recurrence declarations, and compares frame
+timing with exact decimal/sample arithmetic, including legacy date-bearing
+timestamps.
+The remaining S-ADM correctness work is path-aware XML structure and
+`frame/@version` validation followed by changed-ID state reconstruction.
 
 ## P1 — professional delivery expansion
 
