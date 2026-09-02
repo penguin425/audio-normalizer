@@ -8,6 +8,18 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.186.0 - 2026-09-02
+
+### Added
+
+- Add bounded ADM personalization metadata QC for parent and
+  `alternativeValueSet` gain/position ranges, including explicit unbounded
+  gain detection and an optional, explicitly scoped ITU-R BS.2168-0
+  emission-profile range subset.
+- Mark reports as metadata-only evidence so continuous loudness and true-peak
+  compliance cannot be inferred without independently measured endpoint
+  renders.
+
 ## 0.185.0 - 2026-09-02
 
 ### Added

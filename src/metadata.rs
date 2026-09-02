@@ -247,6 +247,14 @@ pub fn read_bext(path: &Path) -> Result<Option<Vec<u8>>, String> {
 }
 
 pub fn read_wave_chunk(path: &Path, wanted: [u8; 4]) -> Result<Option<Vec<u8>>, String> {
+    read_wave_chunk_limited(path, wanted, usize::MAX)
+}
+
+pub(crate) fn read_wave_chunk_limited(
+    path: &Path,
+    wanted: [u8; 4],
+    maximum_bytes: usize,
+) -> Result<Option<Vec<u8>>, String> {
     let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
     let Some((offset, size)) = scan_wave_chunks(&mut file, |id, offset, size| {
         Ok((id == wanted).then_some((offset, size)))
@@ -254,12 +262,18 @@ pub fn read_wave_chunk(path: &Path, wanted: [u8; 4]) -> Result<Option<Vec<u8>>, 
     else {
         return Ok(None);
     };
-    let size = usize::try_from(size).map_err(|_| "bext chunk is too large".to_string())?;
+    if size > maximum_bytes as u64 {
+        return Err(format!(
+            "WAVE {} chunk contains {size} bytes, exceeding the configured limit {maximum_bytes}",
+            String::from_utf8_lossy(&wanted)
+        ));
+    }
+    let size = usize::try_from(size).map_err(|_| "WAVE chunk is too large".to_string())?;
     let mut body = vec![0; size];
     file.seek(SeekFrom::Start(offset))
-        .map_err(|error| format!("seek bext: {error}"))?;
+        .map_err(|error| format!("seek WAVE chunk: {error}"))?;
     file.read_exact(&mut body)
-        .map_err(|error| format!("read bext: {error}"))?;
+        .map_err(|error| format!("read WAVE chunk: {error}"))?;
     Ok(Some(body))
 }
 

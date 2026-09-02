@@ -436,6 +436,11 @@ re-render from the original input without compounding lossy generations.
   loudness, true peak, duration, and channel geometry. Expansion, process
   output, timeout, decoded samples, and retained files are bounded; hashes bind
   the input, renderer, and every render to the versioned evidence report.
+- `forge-adm-interactivity-qc` resolves parent and `alternativeValueSet`
+  interaction metadata, rejects implicit or incomplete gain envelopes, checks
+  default gains and position-pair structure, and optionally applies the
+  BS.2168-0 emission-profile interactivity subset. Reports explicitly state
+  that metadata inspection has not verified continuous rendered audio.
 - `forge-downmix-qc` now measures deterministic WAVE-order stereo/5.1/7.1.4
   profiles with explicit matrices, loudness/true-peak deltas, and clip-risk
   gates. User-selected speaker layouts remain future renderer-adapter work.
@@ -451,15 +456,19 @@ re-render from the original input without compounding lossy generations.
   replacement is not exposed; `atomic_replace` applies only to the destination.
 - Separate dialogue, effects, music, audio-description, and clean-audio stem
   loudness checks.
-- Personalization-range safety: verify that user gain/interactivity limits
-  cannot violate loudness or true-peak constraints.
+- Add a bounded personalization renderer adapter and independently measure its
+  declared interaction cases. Treat true-peak upper bounds and gated
+  integrated-loudness coverage separately; do not infer a continuous loudness
+  guarantee from metadata or a single default render.
 - Hearing-accessibility profiles should use explicit audiograms and validated
   fitting rules; keep them separate from mastering normalization.
 - Safe-listening exposure estimates must identify headphone calibration and
   uncertainty and must not infer SPL from digital level alone.
 
 The relevant open references include
-[ITU-R BS.2127-1](https://www.itu.int/rec/R-REC-BS.2127-1-202311-I/en) and the
+[ITU-R BS.2076-3](https://www.itu.int/rec/R-REC-BS.2076-3-202502-I/en),
+[ITU-R BS.2168-0](https://www.itu.int/rec/R-REC-BS.2168-0-202502-I/en),
+[ITU-R BS.2127-1](https://www.itu.int/rec/R-REC-BS.2127-1-202311-I/en), and the
 [2025 EBU Tech 3393 ADM Production Profile](https://tech.ebu.ch/publications/tech3393).
 
 ## P2 — research and optional perceptual features
