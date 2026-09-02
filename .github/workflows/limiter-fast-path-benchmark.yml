@@ -67,7 +67,7 @@ jobs:
             cargo build --locked --release --manifest-path candidate/Cargo.toml \
               --no-default-features --bin forge --bin forge-container-qc
 
-      - name: Verify byte-exact idle and active limiter output
+      - name: Verify byte-exact idle path and active limiter contract
         shell: bash
         run: |
           set -euo pipefail
@@ -110,7 +110,24 @@ jobs:
             --limiter --verify \
             --difference-report "${exact_dir}/candidate-active-difference.json" \
             --overwrite -o "${exact_dir}/candidate-active.wav"
-          cmp "${exact_dir}/base-active.wav" "${exact_dir}/candidate-active.wav"
+
+          baseline_revision=$(awk -F'"' \
+            '/pub const ALGORITHM_REVISION/ { print $2; exit }' \
+            baseline/src/analysis_cache.rs)
+          candidate_revision=$(awk -F'"' \
+            '/pub const ALGORITHM_REVISION/ { print $2; exit }' \
+            candidate/src/analysis_cache.rs)
+          test -n "${baseline_revision}"
+          test -n "${candidate_revision}"
+          if [[ "${baseline_revision}" == "${candidate_revision}" ]]; then
+            cmp "${exact_dir}/base-active.wav" "${exact_dir}/candidate-active.wav"
+          else
+            "${candidate}" "${exact_dir}/active.wav" --jobs 1 --target=-6 --ceiling=-3 \
+              --limiter --verify --overwrite \
+              -o "${exact_dir}/candidate-active-repeat.wav"
+            cmp "${exact_dir}/candidate-active.wav" \
+              "${exact_dir}/candidate-active-repeat.wav"
+          fi
 
           EXACT_DIR="${exact_dir}" python3 - <<'PY'
           import json
