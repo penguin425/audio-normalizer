@@ -74,3 +74,6 @@ The release contains the main `forge` normalizer plus focused binaries:
 
 Some binaries require the Cargo features listed in [`Cargo.toml`](Cargo.toml).
 Use `<command> --help` for its inputs, limits, output schemas, and exit codes.
+`forge-sadm-qc` accepts S-ADM XML frame documents in transport order; divided
+chunks with a shared base `frameFormatID` must be adjacent and ordered by chunk
+index.

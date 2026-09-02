@@ -8,6 +8,24 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.188.0 - 2026-09-02
+
+### Added
+
+- Classify complete S-ADM flows as Full-Frame, Intermediate-Frame,
+  Mixed-Frame, or Divided-Frame and validate type-specific `countToFull`,
+  `numMetadataChunks`, and `countToSameChunk` declarations.
+- Validate decimal, sample-based, and legacy date-bearing S-ADM times with
+  exact rational arithmetic instead of floating-point tolerances.
+
+### Fixed
+
+- Group ordered Divided-Frame chunks by their shared base `frameFormatID`
+  before checking frame indices and timing, so conforming sparse chunk flows
+  are no longer rejected as duplicate or non-contiguous frames.
+- Accept a `divided` first frame in a Divided-Frame flow and reject invalid,
+  duplicate, out-of-order, or missing final chunk indices.
+
 ## 0.187.0 - 2026-09-02
 
 ### Added
