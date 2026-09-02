@@ -18,6 +18,9 @@ tags and keeps public compatibility commitments in
 - Treat the true-peak ceiling as a strict maximum in single-file, album,
   multi-delivery, and segment verification instead of widening it by the
   loudness-target tolerance.
+- Renew the true-peak limiter hold throughout sustained limiting so release
+  modulation cannot create a new inter-sample peak, and invalidate analysis
+  caches produced by the previous gate implementation.
 - Reject NaN and infinite PCM before any analysis state changes, and fail
   closed on corrupt decoder packets instead of silently shortening the
   programme and measuring different audio.

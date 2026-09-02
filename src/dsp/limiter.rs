@@ -278,6 +278,11 @@ impl TruePeakLimiter {
         };
         if required < self.envelope {
             self.envelope = required;
+        }
+        // A continuing over-ceiling detection must renew the hold even when
+        // it does not demand a new minimum. Releasing between periodic peaks
+        // modulates the delayed signal and can create a new inter-sample peak.
+        if required < 1.0 {
             self.hold_frames = self.lookahead_frames;
         } else if self.hold_frames > 0 {
             self.hold_frames -= 1;
@@ -464,6 +469,34 @@ mod tests {
             "{} > {}",
             meter.peak(),
             ceiling
+        );
+    }
+
+    #[test]
+    fn sustained_limiting_renews_hold_and_preserves_the_strict_ceiling() {
+        let sample_rate = 48_000;
+        let ceiling_db = -6.0;
+        let ceiling = 10.0_f64.powf(ceiling_db / 20.0) as f32;
+        let input = (0..sample_rate as usize * 2)
+            .map(|index| {
+                (index as f64 * std::f64::consts::TAU * 997.0 / sample_rate as f64).sin() as f32
+            })
+            .collect::<Vec<_>>();
+        let mut limiter =
+            TruePeakLimiter::new(sample_rate, 1, ceiling_db, LimiterConfig::default()).unwrap();
+        let mut output = Vec::with_capacity(input.len());
+        for chunk in input.chunks(317) {
+            output.extend(limiter.process(&[chunk.to_vec()]).unwrap().remove(0));
+        }
+        output.extend(limiter.finish().remove(0));
+
+        let mut meter = TruePeakMeter::for_sample_rate(sample_rate);
+        meter.process(&output);
+        assert_eq!(output.len(), input.len());
+        assert!(
+            meter.peak() <= ceiling,
+            "{} dBTP exceeded the strict {ceiling_db} dBTP ceiling",
+            20.0 * f64::from(meter.peak()).log10(),
         );
     }
 

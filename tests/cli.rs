@@ -76,7 +76,7 @@ fn sqlite_catalogue_records_normalization_hashes_and_exports_provenance() {
     assert_eq!(row.1.len(), 64);
     assert_eq!(row.2.len(), 64);
     assert_eq!(row.3, "ITU-R BS.1770-5 / EBU R 128");
-    assert_eq!(row.4, "forge-bs1770-5-r1");
+    assert_eq!(row.4, "forge-bs1770-5-r2");
 
     let report_value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
