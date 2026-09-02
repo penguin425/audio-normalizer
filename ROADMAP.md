@@ -493,16 +493,28 @@ and configuration paths rather than by adding another format checklist:
   `InputDescriptor` that records container, codec, and selected audio-track
   identity. Preserve the source codec by default where possible and require an
   explicit request before a lossless-to-lossy conversion;
+- make QC consume the same bounded decode stream, selected time range, and
+  channel-layout evidence as normalization. A report must not mix full-file QC
+  with range-only loudness or silently discard a user layout override;
+- reconstruct every EBML lace size with checked signed arithmetic before
+  validating Matroska payload boundaries, then feed each recovered frame to
+  the same native codec validator used for standalone streams;
+- distinguish AAC header-derived nominal/core sample counts from samples that
+  were actually decoded. Corrupt or uninspected ADTS/LOAS payloads must never
+  be reported as decoded evidence;
 - probe the exact encoder and muxer capability before decoding, rather than
   treating a successful `ffmpeg -version` as proof that AAC, ALAC, or Vorbis
   output is available;
 - make batch publication crash-recoverable with a hash-bound
   `ReadyToPublish` checkpoint, a semantic operation fingerprint containing the
   analysis revision, codec, and encoder identity, and an opt-in bounded
-  `--keep-going` failure report; and
+  `--keep-going` failure report;
 - sync the parent directory after atomic publication, make `--dry-run`
   read-only unless `--warm-cache` is explicit, and treat a closed output pipe
-  as a normal CLI termination.
+  as a normal CLI termination; and
+- enable immutable GitHub Releases and generate every platform archive from a
+  single manifest whose contract test proves that each bundled executable has
+  all of the schemas it can emit.
 
 Measurement follow-up after the immediate corrections will use an exact
 rational 100 ms block clock at uncommon sample rates, preserve integer and
@@ -532,6 +544,10 @@ certification or coverage beyond its fixtures.
 | v0.190.7 | Add crash-consistent batch publication, semantic job fingerprints, bounded `--keep-going`, parent-directory durability, and side-effect-free dry runs | Recoverability and operations |
 | v0.190.8 | Add ITU-R BS.1864-1 international programme-exchange presets for programme- and explicitly ranged dialogue-based −24 LKFS measurement | Normative profile |
 | v0.190.9 | Decode and validate uncompressed PCM Wave Audio essence in SMPTE ST 382:2023 MXF, including wrapping, descriptor, quantization, channel-ID, and BWF mapping evidence | Normative subset |
+| v0.190.10 | Make normalization and QC share one bounded decode stream, time range, track selection, and channel-layout provenance | Measurement and QC consistency |
+| v0.190.11 | Fully reconstruct checked EBML lacing and validate each Matroska audio frame with the corresponding standalone codec validator | Container and codec integrity |
+| v0.190.12 | Separate AAC nominal/core timing from decoded evidence, then add real ADTS/LOAS payload decode cross-checks | Honest evidence and codec integrity |
+| v0.190.13 | Enable immutable GitHub Releases and build every OS archive from one contract-tested binary/schema/document manifest | Supply-chain and packaging integrity |
 | v0.191 | Deterministic personalization endpoint enumeration plus bounded renderer-adapter evidence and independent BS.1770 measurement | Engineering QC built on normative metadata rules |
 | v0.192 | Apply the BS.2168 validator to reconstructed S-ADM state and enforce the S-ADM-specific emission-profile constraints | Normative |
 | v0.193 | Execute and hash-pin AOMedia OAR renders for every supported IAMF Mix Presentation and output layout | Interoperability evidence |
@@ -613,7 +629,8 @@ Primary sources for this sequence are
 [Report ITU-R BS.2555-0](https://www.itu.int/pub/R-REP-BS.2555-2025), the
 [AMWA NMOS specification index](https://specs.amwa.tv/nmos/),
 [RFC 6750 bearer-token requirements](https://www.rfc-editor.org/rfc/rfc6750.html),
-and [GitHub Actions secure-use guidance](https://docs.github.com/en/actions/reference/security/secure-use).
+[GitHub Actions secure-use guidance](https://docs.github.com/en/actions/reference/security/secure-use),
+and [GitHub immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases).
 
 The March 2026 ITU-R WP 6B work programme still treats the next ADM
 interactive-control Recommendation and the next BS.2076 revision as working
