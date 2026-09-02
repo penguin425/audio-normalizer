@@ -392,6 +392,26 @@ impl StreamingAnalyzer {
         if planar.iter().any(|channel| channel.len() != chunk_frames) {
             return Err("stream channel length mismatch".into());
         }
+        // Validate the complete chunk before advancing any recursive filter,
+        // window, peak, CUDA, or timeline state. Scan each planar channel
+        // contiguously, then choose the lexicographically first (frame,
+        // channel) location so the diagnostic is backend-independent.
+        let first_non_finite = planar
+            .iter()
+            .enumerate()
+            .filter_map(|(channel, samples)| {
+                samples
+                    .iter()
+                    .position(|sample| !sample.is_finite())
+                    .map(|frame| (frame, channel))
+            })
+            .min();
+        if let Some((frame, channel)) = first_non_finite {
+            return Err(format!(
+                "non-finite sample at frame {}, channel {channel}",
+                self.frames.saturating_add(frame)
+            ));
+        }
         let momentary_window = ((self.sample_rate as usize * 4) / 10).max(1);
         let short_term_window = (self.sample_rate as usize * 3).max(1);
         let hop = (self.sample_rate as usize / 10).max(1);
@@ -1235,27 +1255,39 @@ fn window_mean_squares(
 
 /// Apply the BS.1770 absolute and relative gates to a population of blocks.
 pub fn gated_lufs(block_ms: &[f64]) -> f64 {
-    if block_ms.is_empty() {
-        return f64::NEG_INFINITY;
-    }
+    gated_lufs_iter(block_ms.iter().copied())
+}
 
+/// Apply the BS.1770 gates without materializing a combined block population.
+///
+/// The iterator must be cloneable because the relative threshold is derived
+/// from the absolute-gated population before the final gate can be applied.
+pub(crate) fn gated_lufs_iter<I>(block_ms: I) -> f64
+where
+    I: Clone + Iterator<Item = f64>,
+{
     let abs_gate_ms = 10.0_f64.powf((-70.0 + 0.691) / 10.0);
-    let abs_gated: Vec<f64> = block_ms
-        .iter()
-        .copied()
-        .filter(|&m| m >= abs_gate_ms)
-        .collect();
-    if abs_gated.is_empty() {
+    let (absolute_sum, absolute_count) = block_ms
+        .clone()
+        .filter(|&value| value > abs_gate_ms)
+        .fold((0.0, 0_usize), |(sum, count), value| {
+            (sum + value, count + 1)
+        });
+    if absolute_count == 0 {
         return f64::NEG_INFINITY;
     }
-    let mean_ms: f64 = abs_gated.iter().sum::<f64>() / abs_gated.len() as f64;
+    let mean_ms = absolute_sum / absolute_count as f64;
     let rel_gate_ms = mean_ms / 10.0; // -10 dB in the linear domain
     let gate = abs_gate_ms.max(rel_gate_ms);
-    let final_set: Vec<f64> = block_ms.iter().copied().filter(|&m| m >= gate).collect();
-    let used = if final_set.is_empty() {
+    let (final_sum, final_count) = block_ms
+        .filter(|&value| value > gate)
+        .fold((0.0, 0_usize), |(sum, count), value| {
+            (sum + value, count + 1)
+        });
+    let used = if final_count == 0 {
         mean_ms
     } else {
-        final_set.iter().sum::<f64>() / final_set.len() as f64
+        final_sum / final_count as f64
     };
     -0.691 + 10.0 * used.log10()
 }
@@ -1321,7 +1353,7 @@ pub fn rolling_gated_loudness_extrema(
 
 fn gated_lufs_from_fenwick(coordinates: &[f64], counts: &Fenwick, sums: &Fenwick) -> f64 {
     let absolute_gate = 10.0_f64.powf((-70.0 + 0.691) / 10.0);
-    let absolute_index = coordinates.partition_point(|value| *value < absolute_gate);
+    let absolute_index = coordinates.partition_point(|value| *value <= absolute_gate);
     let absolute_count = counts.suffix(absolute_index);
     if absolute_count < 0.5 {
         return f64::NEG_INFINITY;
@@ -1330,7 +1362,7 @@ fn gated_lufs_from_fenwick(coordinates: &[f64], counts: &Fenwick, sums: &Fenwick
     let absolute_mean = absolute_sum / absolute_count;
     let relative_gate = absolute_mean / 10.0;
     let gate = absolute_gate.max(relative_gate);
-    let final_index = coordinates.partition_point(|value| *value < gate);
+    let final_index = coordinates.partition_point(|value| *value <= gate);
     let final_count = counts.suffix(final_index);
     let used = if final_count < 0.5 {
         absolute_mean
@@ -1501,6 +1533,42 @@ mod tests {
     }
 
     #[test]
+    fn integrated_gate_excludes_the_absolute_threshold_and_includes_only_values_above_it() {
+        let gate = 10.0_f64.powf((-70.0 + 0.691) / 10.0);
+        let below = f64::from_bits(gate.to_bits() - 1);
+        let above = f64::from_bits(gate.to_bits() + 1);
+
+        for value in [below, gate] {
+            let batch = gated_lufs(&[value]);
+            assert!(batch.is_infinite() && batch.is_sign_negative());
+            let rolling = rolling_gated_loudness_extrema(&[value], 1).unwrap();
+            assert!(rolling.0.is_infinite() && rolling.0.is_sign_negative());
+            assert!(rolling.1.is_infinite() && rolling.1.is_sign_negative());
+        }
+
+        let expected = mean_square_to_lufs(above);
+        assert_eq!(gated_lufs(&[above]), expected);
+        let rolling = rolling_gated_loudness_extrema(&[above], 1).unwrap();
+        assert!((rolling.0 - expected).abs() < 1.0e-12);
+        assert!((rolling.1 - expected).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn integrated_gate_excludes_a_block_exactly_on_the_relative_threshold() {
+        // Binary powers and integer multiples make this relation exact:
+        // mean([threshold, 19 * threshold]) / 10 == threshold.
+        let threshold = 2.0_f64.powi(-20);
+        let loud = 19.0 * threshold;
+        assert_eq!((threshold + loud) / 2.0 / 10.0, threshold);
+
+        let expected = mean_square_to_lufs(loud);
+        assert_eq!(gated_lufs(&[threshold, loud]), expected);
+        let rolling = rolling_gated_loudness_extrema(&[threshold, loud], 2).unwrap();
+        assert!((rolling.0 - expected).abs() < 1.0e-12);
+        assert!((rolling.1 - expected).abs() < 1.0e-12);
+    }
+
+    #[test]
     fn shared_loudness_windows_match_vecdeque_sums_bit_exactly() {
         for (momentary_limit, short_term_limit) in [(1, 1), (1, 2), (2, 7), (7, 31), (31, 127)] {
             let mut candidate = LoudnessWindows::new(momentary_limit, short_term_limit);
@@ -1654,6 +1722,53 @@ mod tests {
         assert!((streamed.rms_db - whole_rms).abs() < 1e-9);
         assert_eq!(streamed.sample_peak, whole_peak);
         assert_eq!(streamed.true_peak, whole_true_peak);
+    }
+
+    #[test]
+    fn streaming_analyzer_rejects_non_finite_chunks_before_mutating_state() {
+        let roles = vec![ChannelRole::Main, ChannelRole::Main];
+        let prefix = vec![vec![0.1; 137], vec![-0.2; 137]];
+        let suffix = vec![vec![0.3; 211], vec![-0.4; 211]];
+        let rejected = vec![
+            vec![0.5, 0.5, f32::INFINITY, 0.5],
+            vec![0.25, f32::NAN, 0.25, f32::NEG_INFINITY],
+        ];
+
+        let mut candidate = StreamingAnalyzer::new(48_000, roles.clone());
+        candidate.process(&prefix).unwrap();
+        let error = candidate.process(&rejected).unwrap_err();
+        assert_eq!(error, "non-finite sample at frame 138, channel 1");
+        candidate.process(&suffix).unwrap();
+
+        let mut reference = StreamingAnalyzer::new(48_000, roles);
+        reference.process(&prefix).unwrap();
+        reference.process(&suffix).unwrap();
+
+        let candidate = candidate.finish();
+        let reference = reference.finish();
+        assert_eq!(candidate.frames, reference.frames);
+        assert_eq!(
+            candidate.weighted_mean_square.to_bits(),
+            reference.weighted_mean_square.to_bits()
+        );
+        assert_eq!(candidate.rms_db.to_bits(), reference.rms_db.to_bits());
+        assert_eq!(
+            candidate.sample_peak.to_bits(),
+            reference.sample_peak.to_bits()
+        );
+        assert_eq!(candidate.true_peak.to_bits(), reference.true_peak.to_bits());
+        assert_eq!(
+            candidate.ebu.integrated_lufs.to_bits(),
+            reference.ebu.integrated_lufs.to_bits()
+        );
+        assert_eq!(candidate.ebu.gating_blocks, reference.ebu.gating_blocks);
+
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut analyzer = StreamingAnalyzer::new(48_000, vec![ChannelRole::Main]);
+            let error = analyzer.process(&[vec![0.0, value]]).unwrap_err();
+            assert_eq!(error, "non-finite sample at frame 1, channel 0");
+            assert_eq!(analyzer.finish().frames, 0);
+        }
     }
 
     #[test]

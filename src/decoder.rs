@@ -27,6 +27,13 @@ const MAX_PARALLEL_FLAC_PCM_BYTES: usize = 32 * 1024 * 1024;
 // staying below the analyzer's 16,384-frame True Peak task threshold.
 const TARGET_SYMPHONIA_STREAM_CHUNK_FRAMES: usize = 4_096;
 
+/// Convert every packet decoder failure, including a recoverable Symphonia
+/// `DecodeError`, into a failed normalization input. Silently dropping a packet
+/// changes programme duration and can materially change loudness measurements.
+fn require_decoded_packet<T>(decoded: symphonia::core::errors::Result<T>) -> Result<T, String> {
+    decoded.map_err(|error| error.to_string())
+}
+
 #[derive(Debug, Clone)]
 pub struct StreamInfo {
     pub sample_rate: u32,
@@ -223,12 +230,8 @@ fn decode_symphonia(
             continue;
         }
 
-        let decoded = match decoder.decode(&packet) {
-            Ok(d) => d,
-            // Skip a single corrupt frame rather than aborting the whole file.
-            Err(Error::DecodeError(_)) => continue,
-            Err(e) => return Err(format!("{}: decode: {e}", path.display())),
-        };
+        let decoded = require_decoded_packet(decoder.decode(&packet))
+            .map_err(|error| format!("{}: decode: {error}", path.display()))?;
 
         let spec = decoded.spec();
         let ch = spec.channels().count();
@@ -732,11 +735,8 @@ where
         if packet.track_id != track.id {
             continue;
         }
-        let decoded = match decoder.decode(&packet) {
-            Ok(decoded) => decoded,
-            Err(Error::DecodeError(_)) => continue,
-            Err(error) => return Err(format!("{}: decode: {error}", path.display())),
-        };
+        let decoded = require_decoded_packet(decoder.decode(&packet))
+            .map_err(|error| format!("{}: decode: {error}", path.display()))?;
         let spec = decoded.spec();
         let decoded_channels = spec.channels().count();
         if decoded_channels == 0 {
@@ -856,7 +856,6 @@ enum FlacPacketStatus {
         spec: symphonia::core::audio::AudioSpec,
         frames: usize,
     },
-    Skipped,
     Error(String),
 }
 
@@ -920,8 +919,6 @@ fn decode_parallel_flac_batch(
     buffers: &mut [Vec<Vec<f32>>],
 ) -> Vec<FlacPacketStatus> {
     use rayon::prelude::*;
-    use symphonia::core::errors::Error;
-
     debug_assert!(!decoders.is_empty());
     debug_assert!(buffers.len() >= packets.len());
     if packets.is_empty() {
@@ -937,26 +934,24 @@ fn decode_parallel_flac_batch(
             packet_chunk
                 .iter()
                 .zip(buffer_chunk)
-                .map(|(packet, planar)| match decoder.decode(packet) {
-                    Ok(decoded) => {
-                        let spec = decoded.spec().clone();
-                        let frames = decoded.frames();
-                        if frames == 0 {
-                            planar.clear();
-                        } else {
-                            decoded.copy_to_vecs_planar::<f32>(planar);
+                .map(
+                    |(packet, planar)| match require_decoded_packet(decoder.decode(packet)) {
+                        Ok(decoded) => {
+                            let spec = decoded.spec().clone();
+                            let frames = decoded.frames();
+                            if frames == 0 {
+                                planar.clear();
+                            } else {
+                                decoded.copy_to_vecs_planar::<f32>(planar);
+                            }
+                            FlacPacketStatus::Decoded { spec, frames }
                         }
-                        FlacPacketStatus::Decoded { spec, frames }
-                    }
-                    Err(Error::DecodeError(_)) => {
-                        planar.clear();
-                        FlacPacketStatus::Skipped
-                    }
-                    Err(error) => {
-                        planar.clear();
-                        FlacPacketStatus::Error(error.to_string())
-                    }
-                })
+                        Err(error) => {
+                            planar.clear();
+                            FlacPacketStatus::Error(error)
+                        }
+                    },
+                )
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>()
@@ -1034,7 +1029,6 @@ where
             let statuses = decode_parallel_flac_batch(&mut decoders, &packets, &mut buffers);
             for (status, planar) in statuses.into_iter().zip(&mut buffers) {
                 match status {
-                    FlacPacketStatus::Skipped => continue,
                     FlacPacketStatus::Error(error) => {
                         return Err(format!("{}: decode: {error}", path.display()));
                     }
@@ -1245,6 +1239,14 @@ mod tests {
     use super::*;
     use symphonia::core::audio::layouts::{CHANNEL_LAYOUT_MONO, CHANNEL_LAYOUT_STEREO};
     use symphonia::core::codecs::audio::AudioCodecParameters;
+    use symphonia::core::errors::Error;
+
+    #[test]
+    fn packet_decode_errors_are_fail_closed() {
+        let error =
+            require_decoded_packet::<()>(Err(Error::DecodeError("corrupt packet"))).unwrap_err();
+        assert_eq!(error, "malformed stream: corrupt packet");
+    }
 
     fn output_format() -> SymphoniaOutputFormat {
         SymphoniaOutputFormat {

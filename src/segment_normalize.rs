@@ -525,8 +525,8 @@ fn render_segment(
         * 1000.0;
     let codec_loudness_passed =
         codec_loudness_deviation_lu <= settings.verification_tolerance_lu_db;
-    let true_peak_passed = decoded_analysis.true_peak_db()
-        <= settings.ceiling_dbtp + settings.verification_tolerance_lu_db;
+    let true_peak_passed =
+        decoded_true_peak_passed(decoded_analysis.true_peak_db(), settings.ceiling_dbtp);
     let duration_passed = duration_deviation_ms <= settings.duration_tolerance_ms;
     let passed = codec_loudness_passed && true_peak_passed && duration_passed;
     let staged_file = normalization_diff::inspect_file(staged.path())?;
@@ -561,6 +561,10 @@ fn render_segment(
         published: passed,
         passed,
     })
+}
+
+fn decoded_true_peak_passed(true_peak_dbtp: f64, ceiling_dbtp: f64) -> bool {
+    normalize::true_peak_within_ceiling(true_peak_dbtp, ceiling_dbtp)
 }
 
 fn apply_smoothed_gain(
@@ -1456,5 +1460,11 @@ mod tests {
         assert!(validate_request(&request)
             .unwrap_err()
             .contains("max_decoded_samples_per_segment"));
+    }
+
+    #[test]
+    fn decoded_true_peak_never_uses_the_loudness_tolerance() {
+        assert!(decoded_true_peak_passed(-1.0, -1.0));
+        assert!(!decoded_true_peak_passed(-0.75, -1.0));
     }
 }

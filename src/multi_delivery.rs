@@ -259,9 +259,13 @@ pub fn run(
                 let profile_peak_headroom = true_peak
                     .is_finite()
                     .then_some(preset.ceiling_db - true_peak);
-                let conservative_profile_bounds_passed = verification.output.lufs
-                    <= preset.target_lufs + request.verify_tolerance_lu_db
-                    && true_peak <= preset.ceiling_db + request.verify_tolerance_lu_db;
+                let conservative_profile_bounds_passed = profile_bounds_passed(
+                    verification.output.lufs,
+                    true_peak,
+                    preset.target_lufs,
+                    preset.ceiling_db,
+                    request.verify_tolerance_lu_db,
+                );
                 Ok(DeliveryEvidence {
                     id: delivery.id.clone(),
                     format: format_name(*format).into(),
@@ -550,6 +554,17 @@ fn profile_evidence(delivery: &DeliveryRequest, preset: Preset) -> ProfileEviden
     }
 }
 
+fn profile_bounds_passed(
+    loudness_lufs: f64,
+    true_peak_dbtp: f64,
+    target_lufs: f64,
+    ceiling_dbtp: f64,
+    loudness_tolerance: f64,
+) -> bool {
+    loudness_lufs <= target_lufs + loudness_tolerance
+        && normalize::true_peak_within_ceiling(true_peak_dbtp, ceiling_dbtp)
+}
+
 fn write_report(path: &Path, report: &MultiDeliveryReport) -> Result<(), String> {
     let staged = AtomicOutput::new(path)?;
     let mut file = File::create(staged.path())
@@ -560,4 +575,15 @@ fn write_report(path: &Path, report: &MultiDeliveryReport) -> Result<(), String>
         .map_err(|error| format!("write {}: {error}", path.display()))?;
     drop(file);
     staged.commit()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_bounds_never_apply_loudness_tolerance_to_true_peak() {
+        assert!(profile_bounds_passed(-14.4, -1.0, -14.0, -1.0, 0.5));
+        assert!(!profile_bounds_passed(-14.4, -0.75, -14.0, -1.0, 0.5));
+    }
 }
