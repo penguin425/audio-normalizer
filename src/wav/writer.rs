@@ -359,7 +359,16 @@ fn write_container_header(
             // ds64 itself adds 36 bytes to the RIFF payload.
             output.write_all(&(riff_payload_size + 36).to_le_bytes())?;
             output.write_all(&data_size.to_le_bytes())?;
-            output.write_all(&sample_count.to_le_bytes())?;
+            // ITU-R BS.2088 reserves this field in BW64; it is the sample
+            // count only for RF64.
+            output.write_all(
+                &if container == WavContainer::Rf64 {
+                    sample_count
+                } else {
+                    0
+                }
+                .to_le_bytes(),
+            )?;
             output.write_all(&0u32.to_le_bytes())
         }
         WavContainer::Auto => unreachable!("auto container is resolved before writing"),
@@ -511,6 +520,17 @@ mod tests {
             let mut actual = [0; 4];
             file.read_exact(&mut actual).unwrap();
             assert_eq!(actual, magic);
+            file.seek(SeekFrom::Start(36)).unwrap();
+            let mut ds64_third_field = [0; 8];
+            file.read_exact(&mut ds64_third_field).unwrap();
+            assert_eq!(
+                u64::from_le_bytes(ds64_third_field),
+                if container == WavContainer::Rf64 {
+                    480
+                } else {
+                    0
+                }
+            );
             let decoded = WavReader::open(file.path()).unwrap();
             assert_eq!((decoded.channels, decoded.frames), (2, 480));
         }

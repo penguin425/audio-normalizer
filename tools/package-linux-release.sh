@@ -31,6 +31,7 @@ for binary in \
   forge-adm-presentation-qc \
   forge-adm-interactivity-qc \
   forge-adm-semantics-qc \
+  forge-adm-emission-qc \
   forge-downmix-qc \
   forge-binaural-qc \
   forge-remediate \
@@ -101,7 +102,8 @@ cp schema/dts-adapter-request-v1.schema.json \
    schema/dts-adapter-report-v1.schema.json "$staging/schema/"
 cp schema/adm-presentation-report-v1.schema.json \
    schema/adm-interactivity-report-v1.schema.json \
-   schema/adm-semantics-report-v1.schema.json "$staging/schema/"
+   schema/adm-semantics-report-v1.schema.json \
+   schema/adm-emission-report-v1.schema.json "$staging/schema/"
 cp schema/downmix-qc-request-v1.schema.json \
    schema/downmix-qc-report-v1.schema.json "$staging/schema/"
 cp schema/binaural-qc-request-v1.schema.json \
@@ -125,7 +127,7 @@ cp schema/audio-anomaly-provider-v1.schema.json \
 cp README.md CHANGELOG.md COMPATIBILITY.md CONTRIBUTING.md SECURITY.md DOCUMENTATION.md \
    PERFORMANCE.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md \
    BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md \
-   MPEGH-ADAPTER.md DTS-ADAPTER.md ADM-PRESENTATION-QC.md ADM-INTERACTIVITY-QC.md ADM-SEMANTICS-QC.md ANOMALY-ADAPTER.md \
+   MPEGH-ADAPTER.md DTS-ADAPTER.md ADM-PRESENTATION-QC.md ADM-INTERACTIVITY-QC.md ADM-SEMANTICS-QC.md ADM-EMISSION-QC.md ANOMALY-ADAPTER.md \
    SERVICE-METRICS.md C-API.md HOST-ADAPTERS.md NEXT-GENERATION-PLAN.md \
    VST3-ADAPTER.md AU-ADAPTER.md IMMERSIVE-DOWNMIX.md BINAURAL-QC.md REMEDIATION.md METADATA-REPAIR.md ROADMAP.md LICENSE "$staging/"
 

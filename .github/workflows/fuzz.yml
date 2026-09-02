@@ -6,6 +6,7 @@ on:
       - ".github/workflows/fuzz.yml"
       - "fuzz/**"
       - "src/adm.rs"
+      - "src/adm/**"
       - "src/audio_compare.rs"
       - "src/anomaly_provider.rs"
       - "src/onnx_provider.rs"
@@ -28,6 +29,7 @@ on:
       - ".github/workflows/fuzz.yml"
       - "fuzz/**"
       - "src/adm.rs"
+      - "src/adm/**"
       - "src/audio_compare.rs"
       - "src/anomaly_provider.rs"
       - "src/onnx_provider.rs"
@@ -59,10 +61,12 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
 
       - name: Install nightly Rust
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-09-03
+        with:
+          toolchain: nightly
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
@@ -74,6 +78,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for target in wave_reader container_qc adm_profile manifest_compare audio_compare dsd hls_qc dash_qc imf_qc rtp_qc nmos_qc anomaly_provider anomaly_audit onnx_provider remote_range; do
+          for target in wave_reader container_qc adm_profile adm_emission manifest_compare audio_compare dsd hls_qc dash_qc imf_qc rtp_qc nmos_qc anomaly_provider anomaly_audit onnx_provider remote_range; do
             cargo fuzz run "$target" -- -runs=1000
           done

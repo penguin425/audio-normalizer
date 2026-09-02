@@ -30,6 +30,12 @@ on:
       - "wasm/**"
       - "src/c_api.rs"
       - "src/lib.rs"
+      - "src/atomic.rs"
+      - "src/adm.rs"
+      - "src/adm/**"
+      - "src/wav/reader.rs"
+      - "src/wav/writer.rs"
+      - "src/container_qc.rs"
       - "src/bin/forge-doctor.rs"
       - "tests/doctor_cli.rs"
       - "schema/doctor-report-v1.schema.json"
@@ -43,6 +49,7 @@ on:
       - "ADM-PRESENTATION-QC.md"
       - "ADM-INTERACTIVITY-QC.md"
       - "ADM-SEMANTICS-QC.md"
+      - "ADM-EMISSION-QC.md"
       - "tools/benchmark.py"
       - "tools/build-pgo-forge.sh"
       - "tools/train-pgo.py"
@@ -65,6 +72,7 @@ on:
       - "schema/adm-presentation-report-v1.schema.json"
       - "schema/adm-interactivity-report-v1.schema.json"
       - "schema/adm-semantics-report-v1.schema.json"
+      - "schema/adm-emission-report-v1.schema.json"
       - "src/multi_delivery.rs"
       - "src/bin/forge-multi-delivery.rs"
       - "src/segment_normalize.rs"
@@ -84,6 +92,9 @@ on:
       - "src/adm_semantics_qc.rs"
       - "src/bin/forge-adm-semantics-qc.rs"
       - "tests/adm_semantics_qc_cli.rs"
+      - "src/adm/emission.rs"
+      - "src/bin/forge-adm-emission-qc.rs"
+      - "tests/adm_emission_qc_cli.rs"
       - "src/sadm.rs"
       - "src/bin/forge-sadm-qc.rs"
       - "tests/sadm_qc_cli.rs"
@@ -380,6 +391,7 @@ jobs:
              "target/${{ matrix.target }}/release/forge-adm-presentation-qc" \
              "target/${{ matrix.target }}/release/forge-adm-interactivity-qc" \
              "target/${{ matrix.target }}/release/forge-adm-semantics-qc" \
+             "target/${{ matrix.target }}/release/forge-adm-emission-qc" \
              "target/${{ matrix.target }}/release/forge-downmix-qc" \
              "target/${{ matrix.target }}/release/forge-binaural-qc" \
              "target/${{ matrix.target }}/release/forge-remediate" \
@@ -443,7 +455,8 @@ jobs:
              schema/dts-adapter-report-v1.schema.json "$staging/schema/"
           cp schema/adm-presentation-report-v1.schema.json \
              schema/adm-interactivity-report-v1.schema.json \
-             schema/adm-semantics-report-v1.schema.json "$staging/schema/"
+             schema/adm-semantics-report-v1.schema.json \
+             schema/adm-emission-report-v1.schema.json "$staging/schema/"
           cp schema/downmix-qc-request-v1.schema.json \
              schema/downmix-qc-report-v1.schema.json "$staging/schema/"
           cp schema/binaural-qc-request-v1.schema.json \
@@ -464,7 +477,7 @@ jobs:
              schema/service-analysis-v1.schema.json \
              schema/service-error-v1.schema.json \
              schema/service-health-v1.schema.json "$staging/schema/"
-          cp README.md CHANGELOG.md COMPATIBILITY.md CONTRIBUTING.md SECURITY.md DOCUMENTATION.md PERFORMANCE.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md MPEGH-ADAPTER.md DTS-ADAPTER.md ADM-PRESENTATION-QC.md ADM-INTERACTIVITY-QC.md ADM-SEMANTICS-QC.md ANOMALY-ADAPTER.md SERVICE-METRICS.md C-API.md HOST-ADAPTERS.md VST3-ADAPTER.md AU-ADAPTER.md IMMERSIVE-DOWNMIX.md BINAURAL-QC.md REMEDIATION.md METADATA-REPAIR.md NEXT-GENERATION-PLAN.md ROADMAP.md LICENSE "$staging/"
+          cp README.md CHANGELOG.md COMPATIBILITY.md CONTRIBUTING.md SECURITY.md DOCUMENTATION.md PERFORMANCE.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md MPEGH-ADAPTER.md DTS-ADAPTER.md ADM-PRESENTATION-QC.md ADM-INTERACTIVITY-QC.md ADM-SEMANTICS-QC.md ADM-EMISSION-QC.md ANOMALY-ADAPTER.md SERVICE-METRICS.md C-API.md HOST-ADAPTERS.md VST3-ADAPTER.md AU-ADAPTER.md IMMERSIVE-DOWNMIX.md BINAURAL-QC.md REMEDIATION.md METADATA-REPAIR.md NEXT-GENERATION-PLAN.md ROADMAP.md LICENSE "$staging/"
           tar -czf "${staging}.tar.gz" "$staging"
 
       - name: Package Windows binary
@@ -473,7 +486,7 @@ jobs:
         run: |
           $staging = "forge-v${{ needs.validate.outputs.version }}-${{ matrix.asset }}"
           New-Item -ItemType Directory -Path $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/forge.exe","target/${{ matrix.target }}/release/forge-live.exe","target/${{ matrix.target }}/release/forge-doctor.exe","target/${{ matrix.target }}/release/forge-compare.exe","target/${{ matrix.target }}/release/forge-audio-compare.exe","target/${{ matrix.target }}/release/forge-container-qc.exe","target/${{ matrix.target }}/release/forge-streaming-qc.exe","target/${{ matrix.target }}/release/forge-presentation-qc.exe","target/${{ matrix.target }}/release/forge-adm-presentation-qc.exe","target/${{ matrix.target }}/release/forge-adm-interactivity-qc.exe","target/${{ matrix.target }}/release/forge-adm-semantics-qc.exe","target/${{ matrix.target }}/release/forge-downmix-qc.exe","target/${{ matrix.target }}/release/forge-binaural-qc.exe","target/${{ matrix.target }}/release/forge-remediate.exe","target/${{ matrix.target }}/release/forge-metadata-repair.exe","target/${{ matrix.target }}/release/forge-sadm-qc.exe","target/${{ matrix.target }}/release/forge-dialogue-provider.exe","target/${{ matrix.target }}/release/forge-anomaly-provider.exe","target/${{ matrix.target }}/release/forge-onnx-provider.exe","target/${{ matrix.target }}/release/forge-remote-qc.exe","target/${{ matrix.target }}/release/forge-service.exe","target/${{ matrix.target }}/release/forge-provenance-qc.exe","target/${{ matrix.target }}/release/forge-imf-qc.exe","target/${{ matrix.target }}/release/forge-aes31-qc.exe","target/${{ matrix.target }}/release/forge-rtp-qc.exe","target/${{ matrix.target }}/release/forge-nmos-qc.exe","target/${{ matrix.target }}/release/forge-st2022-7-qc.exe","target/${{ matrix.target }}/release/forge-report.exe","target/${{ matrix.target }}/release/forge-multi-delivery.exe","target/${{ matrix.target }}/release/forge-segment-normalize.exe","target/${{ matrix.target }}/release/forge-ac4-qc.exe","target/${{ matrix.target }}/release/forge-mpegh-qc.exe","target/${{ matrix.target }}/release/forge-dts-qc.exe" $staging
+          Copy-Item "target/${{ matrix.target }}/release/forge.exe","target/${{ matrix.target }}/release/forge-live.exe","target/${{ matrix.target }}/release/forge-doctor.exe","target/${{ matrix.target }}/release/forge-compare.exe","target/${{ matrix.target }}/release/forge-audio-compare.exe","target/${{ matrix.target }}/release/forge-container-qc.exe","target/${{ matrix.target }}/release/forge-streaming-qc.exe","target/${{ matrix.target }}/release/forge-presentation-qc.exe","target/${{ matrix.target }}/release/forge-adm-presentation-qc.exe","target/${{ matrix.target }}/release/forge-adm-interactivity-qc.exe","target/${{ matrix.target }}/release/forge-adm-semantics-qc.exe","target/${{ matrix.target }}/release/forge-adm-emission-qc.exe","target/${{ matrix.target }}/release/forge-downmix-qc.exe","target/${{ matrix.target }}/release/forge-binaural-qc.exe","target/${{ matrix.target }}/release/forge-remediate.exe","target/${{ matrix.target }}/release/forge-metadata-repair.exe","target/${{ matrix.target }}/release/forge-sadm-qc.exe","target/${{ matrix.target }}/release/forge-dialogue-provider.exe","target/${{ matrix.target }}/release/forge-anomaly-provider.exe","target/${{ matrix.target }}/release/forge-onnx-provider.exe","target/${{ matrix.target }}/release/forge-remote-qc.exe","target/${{ matrix.target }}/release/forge-service.exe","target/${{ matrix.target }}/release/forge-provenance-qc.exe","target/${{ matrix.target }}/release/forge-imf-qc.exe","target/${{ matrix.target }}/release/forge-aes31-qc.exe","target/${{ matrix.target }}/release/forge-rtp-qc.exe","target/${{ matrix.target }}/release/forge-nmos-qc.exe","target/${{ matrix.target }}/release/forge-st2022-7-qc.exe","target/${{ matrix.target }}/release/forge-report.exe","target/${{ matrix.target }}/release/forge-multi-delivery.exe","target/${{ matrix.target }}/release/forge-segment-normalize.exe","target/${{ matrix.target }}/release/forge-ac4-qc.exe","target/${{ matrix.target }}/release/forge-mpegh-qc.exe","target/${{ matrix.target }}/release/forge-dts-qc.exe" $staging
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.library }}" "$staging/forge-live.clap"
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.library }}" "$staging/${{ matrix.library }}"
           $importLibrary = Get-ChildItem "target/${{ matrix.target }}/release" -Filter "forge_normalizer*.lib" | Select-Object -First 1
@@ -500,13 +513,13 @@ jobs:
           Copy-Item "schema/ac4-adapter-request-v1.schema.json","schema/ac4-adapter-response-v1.schema.json","schema/ac4-adapter-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/mpegh-adapter-request-v1.schema.json","schema/mpegh-adapter-response-v1.schema.json","schema/mpegh-adapter-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/dts-adapter-request-v1.schema.json","schema/dts-adapter-response-v1.schema.json","schema/dts-adapter-report-v1.schema.json" "$staging/schema/"
-          Copy-Item "schema/adm-presentation-report-v1.schema.json","schema/adm-interactivity-report-v1.schema.json","schema/adm-semantics-report-v1.schema.json" "$staging/schema/"
+          Copy-Item "schema/adm-presentation-report-v1.schema.json","schema/adm-interactivity-report-v1.schema.json","schema/adm-semantics-report-v1.schema.json","schema/adm-emission-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/downmix-qc-request-v1.schema.json","schema/downmix-qc-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/binaural-qc-request-v1.schema.json","schema/binaural-qc-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/remediation-request-v1.schema.json","schema/remediation-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/metadata-repair-request-v1.schema.json","schema/metadata-repair-report-v1.schema.json","schema/metadata-repair-request-v2.schema.json","schema/metadata-repair-report-v2.schema.json" "$staging/schema/"
           Copy-Item "schema/audio-anomaly-provider-v1.schema.json","schema/anomaly-provider-audit-v1.schema.json","schema/model-qc-v1.schema.json","schema/onnx-anomaly-model-v1.schema.json","schema/onnx-feature-frames-v1.schema.json","schema/remote-range-v1.schema.json","schema/remote-qc-v1.schema.json","schema/service-analysis-v1.schema.json","schema/service-error-v1.schema.json","schema/service-health-v1.schema.json" "$staging/schema/"
-          Copy-Item "README.md","CHANGELOG.md","COMPATIBILITY.md","CONTRIBUTING.md","SECURITY.md","DOCUMENTATION.md","PERFORMANCE.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","MULTI-DELIVERY.md","SEGMENT-NORMALIZATION.md","AC4-ADAPTER.md","MPEGH-ADAPTER.md","DTS-ADAPTER.md","ADM-PRESENTATION-QC.md","ADM-INTERACTIVITY-QC.md","ADM-SEMANTICS-QC.md","ANOMALY-ADAPTER.md","SERVICE-METRICS.md","C-API.md","HOST-ADAPTERS.md","VST3-ADAPTER.md","AU-ADAPTER.md","IMMERSIVE-DOWNMIX.md","BINAURAL-QC.md","REMEDIATION.md","METADATA-REPAIR.md","NEXT-GENERATION-PLAN.md","ROADMAP.md","LICENSE" $staging
+          Copy-Item "README.md","CHANGELOG.md","COMPATIBILITY.md","CONTRIBUTING.md","SECURITY.md","DOCUMENTATION.md","PERFORMANCE.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","MULTI-DELIVERY.md","SEGMENT-NORMALIZATION.md","AC4-ADAPTER.md","MPEGH-ADAPTER.md","DTS-ADAPTER.md","ADM-PRESENTATION-QC.md","ADM-INTERACTIVITY-QC.md","ADM-SEMANTICS-QC.md","ADM-EMISSION-QC.md","ANOMALY-ADAPTER.md","SERVICE-METRICS.md","C-API.md","HOST-ADAPTERS.md","VST3-ADAPTER.md","AU-ADAPTER.md","IMMERSIVE-DOWNMIX.md","BINAURAL-QC.md","REMEDIATION.md","METADATA-REPAIR.md","NEXT-GENERATION-PLAN.md","ROADMAP.md","LICENSE" $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
 
       - name: Upload packaged binary

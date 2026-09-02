@@ -7,11 +7,16 @@
 
 use crate::dsp::convert;
 use crate::wav::{default_channel_roles, AudioBuffer, ChannelRole, PcmKind, WaveFormat};
+use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
+
+const MAX_PROBE_CHUNKS: usize = 100_000;
+const MAX_DS64_TABLE_ENTRIES: usize = 100_000;
+type Ds64Table = BTreeMap<[u8; 4], VecDeque<u64>>;
 
 #[derive(Debug)]
 pub enum WavReadError {
@@ -30,6 +35,7 @@ struct ParsedFormat {
     sample_rate: u32,
     channels: u16,
     bits: u16,
+    valid_bits: u16,
     channel_mask: Option<u32>,
 }
 
@@ -139,6 +145,7 @@ impl WavReader {
             sample_rate,
             channels,
             bits,
+            valid_bits: _valid_bits,
             channel_mask,
         } = fmt.ok_or(WavReadError::BadFormat("missing fmt chunk"))?;
         if channels == 0 {
@@ -178,44 +185,113 @@ impl WavReader {
     /// Read only the RIFF headers required for streaming decode.
     pub fn probe<P: AsRef<Path>>(path: P) -> Result<WavStreamInfo, WavReadError> {
         let mut file = File::open(path)?;
+        Self::probe_file(&mut file)
+    }
+
+    /// Read the streaming-decode headers from an already-open file descriptor.
+    ///
+    /// The descriptor is rewound before probing and is never reopened by path.
+    pub(crate) fn probe_file(file: &mut File) -> Result<WavStreamInfo, WavReadError> {
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Err(WavReadError::BadFormat("input is not a regular file"));
+        }
+        let file_size = metadata.len();
+        if file_size < 12 {
+            return Err(WavReadError::Truncated);
+        }
+        file.seek(SeekFrom::Start(0))?;
         let mut riff = [0u8; 12];
         file.read_exact(&mut riff)?;
         if !matches!(&riff[..4], b"RIFF" | b"RF64" | b"BW64") || &riff[8..] != b"WAVE" {
             return Err(WavReadError::NotWave);
         }
+        let uses_ds64 = matches!(&riff[..4], b"RF64" | b"BW64");
         let mut parsed_format: Option<(ParsedFormat, PcmKind)> = None;
         let mut ds64_data_size: Option<u64> = None;
+        let mut ds64_table = Ds64Table::new();
+        let mut offset = 12_u64;
+        let mut chunk_count = 0_usize;
         loop {
+            if offset == file_size {
+                return Err(WavReadError::NoDataChunk);
+            }
+            if chunk_count >= MAX_PROBE_CHUNKS {
+                return Err(WavReadError::BadFormat(
+                    "WAVE chunk count exceeds safety limit",
+                ));
+            }
+            let header_end = offset.checked_add(8).ok_or(WavReadError::Truncated)?;
+            if header_end > file_size {
+                return Err(WavReadError::Truncated);
+            }
+            file.seek(SeekFrom::Start(offset))?;
             let mut header = [0u8; 8];
             file.read_exact(&mut header)?;
+            chunk_count += 1;
+            let id: [u8; 4] = header[..4].try_into().unwrap();
             let declared_size = u32::from_le_bytes(header[4..8].try_into().unwrap());
-            let body_offset = file.stream_position()?;
-            if &header[..4] == b"fmt " {
-                if declared_size > 65_536 {
-                    return Err(WavReadError::BadFormat(
-                        "fmt chunk exceeds 64 KiB safety limit",
-                    ));
-                }
-                let mut body = vec![0; declared_size as usize];
+            let body_offset = header_end;
+            if id == *b"ds64" && !uses_ds64 {
+                return Err(WavReadError::BadFormat(
+                    "RIFF input must not contain a ds64 chunk",
+                ));
+            }
+            if declared_size == u32::MAX && !uses_ds64 {
+                return Err(WavReadError::BadFormat(
+                    "RIFF chunk must not use the RF64/BW64 size sentinel",
+                ));
+            }
+            let effective_size = if declared_size != u32::MAX {
+                u64::from(declared_size)
+            } else if id == *b"data" {
+                ds64_data_size.ok_or(WavReadError::BadFormat(
+                    "RF64/BW64 data chunk is missing ds64",
+                ))?
+            } else {
+                ds64_table
+                    .get_mut(&id)
+                    .and_then(VecDeque::pop_front)
+                    .ok_or(WavReadError::BadFormat(
+                        "RF64/BW64 sentinel chunk is missing a ds64 table entry",
+                    ))?
+            };
+            if id == *b"fmt " && effective_size > 65_536 {
+                return Err(WavReadError::BadFormat(
+                    "fmt chunk exceeds 64 KiB safety limit",
+                ));
+            }
+            let body_end = body_offset
+                .checked_add(effective_size)
+                .ok_or(WavReadError::Truncated)?;
+            if body_end > file_size {
+                return Err(WavReadError::Truncated);
+            }
+            let next = body_end
+                .checked_add(effective_size & 1)
+                .ok_or(WavReadError::Truncated)?;
+            if next > file_size {
+                return Err(WavReadError::Truncated);
+            }
+
+            if id == *b"fmt " {
+                let length = usize::try_from(effective_size)
+                    .map_err(|_| WavReadError::BadFormat("fmt chunk is too large"))?;
+                let mut body = vec![0; length];
+                file.seek(SeekFrom::Start(body_offset))?;
                 file.read_exact(&mut body)?;
                 let parsed = parse_fmt(&body)?;
                 let kind = pick_kind(parsed.wave_format, parsed.real_tag, parsed.bits)?;
                 parsed_format = Some((parsed, kind));
-            } else if &header[..4] == b"ds64" {
-                if declared_size < 16 {
+            } else if id == *b"ds64" {
+                if effective_size < 28 {
                     return Err(WavReadError::BadFormat("ds64 chunk too short"));
                 }
-                let mut prefix = [0u8; 16];
-                file.read_exact(&mut prefix)?;
-                ds64_data_size = Some(u64::from_le_bytes(prefix[8..16].try_into().unwrap()));
-            } else if &header[..4] == b"data" {
-                let data_size = if declared_size == u32::MAX {
-                    ds64_data_size.ok_or(WavReadError::BadFormat(
-                        "RF64/BW64 data chunk is missing ds64",
-                    ))?
-                } else {
-                    declared_size as u64
-                };
+                file.seek(SeekFrom::Start(body_offset))?;
+                let (data_size, table) = read_probe_ds64(file, effective_size)?;
+                ds64_data_size = Some(data_size);
+                ds64_table = table;
+            } else if id == *b"data" {
                 let (parsed, kind) =
                     parsed_format.ok_or(WavReadError::BadFormat("data precedes fmt chunk"))?;
                 let channel_roles = parsed
@@ -228,16 +304,46 @@ impl WavReader {
                     kind,
                     channel_roles,
                     data_offset: body_offset,
-                    data_size,
+                    data_size: effective_size,
                 });
             }
-            let next = body_offset
-                .checked_add(declared_size as u64)
-                .and_then(|offset| offset.checked_add((declared_size & 1) as u64))
-                .ok_or(WavReadError::Truncated)?;
-            file.seek(SeekFrom::Start(next))?;
+            offset = next;
         }
     }
+}
+
+fn read_probe_ds64(file: &mut File, chunk_size: u64) -> Result<(u64, Ds64Table), WavReadError> {
+    let mut fixed = [0_u8; 28];
+    file.read_exact(&mut fixed)?;
+    let table_length = u32::from_le_bytes(fixed[24..28].try_into().unwrap());
+    let table_length_usize = usize::try_from(table_length)
+        .map_err(|_| WavReadError::BadFormat("ds64 table count does not fit this platform"))?;
+    if table_length_usize > MAX_DS64_TABLE_ENTRIES {
+        return Err(WavReadError::BadFormat(
+            "ds64 table count exceeds safety limit",
+        ));
+    }
+    let table_bytes = u64::from(table_length)
+        .checked_mul(12)
+        .ok_or(WavReadError::Truncated)?;
+    let required_size = 28_u64
+        .checked_add(table_bytes)
+        .ok_or(WavReadError::Truncated)?;
+    if chunk_size != required_size {
+        return Err(WavReadError::BadFormat(
+            "ds64 size does not match its table length",
+        ));
+    }
+
+    let mut table = Ds64Table::new();
+    for _ in 0..table_length_usize {
+        let mut entry = [0_u8; 12];
+        file.read_exact(&mut entry)?;
+        let id: [u8; 4] = entry[..4].try_into().unwrap();
+        let size = u64::from_le_bytes(entry[4..12].try_into().unwrap());
+        table.entry(id).or_default().push_back(size);
+    }
+    Ok((u64::from_le_bytes(fixed[8..16].try_into().unwrap()), table))
 }
 
 fn parse_fmt(body: &[u8]) -> Result<ParsedFormat, WavReadError> {
@@ -255,14 +361,51 @@ fn parse_fmt(body: &[u8]) -> Result<ParsedFormat, WavReadError> {
     let wformat = WaveFormat::from_tag(tag).ok_or(WavReadError::UnsupportedFormatTag(tag))?;
 
     // Resolve the *real* format tag for extensible files.
-    let (real_tag, channel_mask) = if let WaveFormat::Extensible = wformat {
-        if body.len() < 40 {
+    let (real_tag, valid_bits, channel_mask) = if let WaveFormat::Extensible = wformat {
+        if body.len() < 18 {
             return Err(WavReadError::BadFormat("extensible fmt too short"));
         }
-        // SubFormat GUID: first two bytes are the underlying format tag.
-        (read_u16_at(body, 24)?, Some(read_u32_at(body, 20)?))
+        let extension_size = usize::from(read_u16_at(body, 16)?);
+        if extension_size < 22 || body.len() != 18 + extension_size {
+            return Err(WavReadError::BadFormat(
+                "extensible fmt cbSize does not match the chunk size",
+            ));
+        }
+        let valid_bits = read_u16_at(body, 18)?;
+        if valid_bits == 0 || valid_bits > bits {
+            return Err(WavReadError::BadFormat(
+                "extensible valid bits must be between 1 and the container bits",
+            ));
+        }
+        const PCM_SUBFORMAT: [u8; 16] = [
+            1, 0, 0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71,
+        ];
+        const FLOAT_SUBFORMAT: [u8; 16] = [
+            3, 0, 0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71,
+        ];
+        let subformat: [u8; 16] = body[24..40].try_into().unwrap();
+        let real_tag = if subformat == PCM_SUBFORMAT {
+            0x0001
+        } else if subformat == FLOAT_SUBFORMAT {
+            0x0003
+        } else {
+            return Err(WavReadError::BadFormat(
+                "unsupported WAVE_FORMAT_EXTENSIBLE SubFormat GUID",
+            ));
+        };
+        (real_tag, valid_bits, Some(read_u32_at(body, 20)?))
     } else {
-        (tag, None)
+        if tag == 0x0001 && !matches!(body.len(), 16 | 18) {
+            return Err(WavReadError::BadFormat(
+                "legacy PCM fmt must contain 16 bytes or an 18-byte zero cbSize form",
+            ));
+        }
+        if tag == 0x0001 && body.len() == 18 && read_u16_at(body, 16)? != 0 {
+            return Err(WavReadError::BadFormat(
+                "legacy PCM fmt extension must have cbSize zero",
+            ));
+        }
+        (tag, bits, None)
     };
 
     Ok(ParsedFormat {
@@ -271,6 +414,7 @@ fn parse_fmt(body: &[u8]) -> Result<ParsedFormat, WavReadError> {
         sample_rate: rate,
         channels,
         bits,
+        valid_bits,
         channel_mask,
     })
 }
@@ -385,6 +529,70 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    fn mono_s16_fmt() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1_u16.to_le_bytes());
+        body.extend_from_slice(&1_u16.to_le_bytes());
+        body.extend_from_slice(&48_000_u32.to_le_bytes());
+        body.extend_from_slice(&96_000_u32.to_le_bytes());
+        body.extend_from_slice(&2_u16.to_le_bytes());
+        body.extend_from_slice(&16_u16.to_le_bytes());
+        body
+    }
+
+    fn extensible_pcm_fmt(valid_bits: u16) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0xfffe_u16.to_le_bytes());
+        body.extend_from_slice(&2_u16.to_le_bytes());
+        body.extend_from_slice(&48_000_u32.to_le_bytes());
+        body.extend_from_slice(&288_000_u32.to_le_bytes());
+        body.extend_from_slice(&6_u16.to_le_bytes());
+        body.extend_from_slice(&24_u16.to_le_bytes());
+        body.extend_from_slice(&22_u16.to_le_bytes());
+        body.extend_from_slice(&valid_bits.to_le_bytes());
+        body.extend_from_slice(&3_u32.to_le_bytes());
+        body.extend_from_slice(&[
+            1, 0, 0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71,
+        ]);
+        body
+    }
+
+    fn append_probe_chunk(bytes: &mut Vec<u8>, id: [u8; 4], declared: u32, body: &[u8]) {
+        bytes.extend_from_slice(&id);
+        bytes.extend_from_slice(&declared.to_le_bytes());
+        bytes.extend_from_slice(body);
+        if body.len() & 1 == 1 {
+            bytes.push(0);
+        }
+    }
+
+    fn bw64_probe_fixture(
+        table: &[([u8; 4], u64)],
+        chunks: &[([u8; 4], u32, Vec<u8>)],
+        data_size: u64,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::from(&b"BW64\xff\xff\xff\xffWAVE"[..]);
+        let mut ds64 = vec![0_u8; 28];
+        ds64[8..16].copy_from_slice(&data_size.to_le_bytes());
+        ds64[24..28].copy_from_slice(&u32::try_from(table.len()).unwrap().to_le_bytes());
+        for (id, size) in table {
+            ds64.extend_from_slice(id);
+            ds64.extend_from_slice(&size.to_le_bytes());
+        }
+        append_probe_chunk(
+            &mut bytes,
+            *b"ds64",
+            u32::try_from(ds64.len()).unwrap(),
+            &ds64,
+        );
+        for (id, declared, body) in chunks {
+            append_probe_chunk(&mut bytes, *id, *declared, body);
+        }
+        let riff_size = u64::try_from(bytes.len() - 8).unwrap();
+        bytes[20..28].copy_from_slice(&riff_size.to_le_bytes());
+        bytes
+    }
+
     #[test]
     fn wave_mask_identifies_lfe_and_surround_by_position() {
         // FL, FR, LFE, SL, SR: LFE is deliberately not channel index 3.
@@ -418,6 +626,114 @@ mod tests {
     }
 
     #[test]
+    fn extensible_pcm_requires_consistent_extension_valid_bits_and_exact_guid() {
+        let valid = parse_fmt(&extensible_pcm_fmt(20)).unwrap();
+        assert_eq!(valid.real_tag, 1);
+        assert_eq!(valid.bits, 24);
+        assert_eq!(valid.valid_bits, 20);
+        assert_eq!(valid.channel_mask, Some(3));
+
+        let mut cb_size_zero = extensible_pcm_fmt(20);
+        cb_size_zero[16..18].copy_from_slice(&0_u16.to_le_bytes());
+        assert!(parse_fmt(&cb_size_zero).is_err());
+
+        let mut bogus_guid = extensible_pcm_fmt(20);
+        bogus_guid[26] = 1;
+        assert!(parse_fmt(&bogus_guid).is_err());
+
+        for invalid in [0, 25] {
+            assert!(parse_fmt(&extensible_pcm_fmt(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_pcm_accepts_only_canonical_fmt_chunk_sizes() {
+        assert!(parse_fmt(&mono_s16_fmt()).is_ok());
+
+        let mut zero_cb_size = mono_s16_fmt();
+        zero_cb_size.extend_from_slice(&0_u16.to_le_bytes());
+        assert!(parse_fmt(&zero_cb_size).is_ok());
+
+        let mut nonzero_cb_size = mono_s16_fmt();
+        nonzero_cb_size.extend_from_slice(&1_u16.to_le_bytes());
+        assert!(parse_fmt(&nonzero_cb_size).is_err());
+
+        let mut trailing_garbage = mono_s16_fmt();
+        trailing_garbage.extend_from_slice(&[0; 24]);
+        assert!(parse_fmt(&trailing_garbage).is_err());
+    }
+
+    #[test]
+    fn public_reader_apis_reject_packed_20_bit_pcm() {
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&1_u16.to_le_bytes());
+        fmt.extend_from_slice(&1_u16.to_le_bytes());
+        fmt.extend_from_slice(&48_000_u32.to_le_bytes());
+        fmt.extend_from_slice(&144_000_u32.to_le_bytes());
+        fmt.extend_from_slice(&3_u16.to_le_bytes());
+        fmt.extend_from_slice(&20_u16.to_le_bytes());
+
+        let mut bytes = b"RIFF\0\0\0\0WAVE".to_vec();
+        append_probe_chunk(&mut bytes, *b"fmt ", fmt.len() as u32, &fmt);
+        append_probe_chunk(&mut bytes, *b"data", 3, &[0; 3]);
+        let riff_size = u32::try_from(bytes.len() - 8).unwrap();
+        bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
+
+        assert!(matches!(
+            WavReader::read_bytes(&bytes),
+            Err(WavReadError::BadFormat("unsupported PCM bit depth"))
+        ));
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("packed-20.wav");
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            WavReader::probe(&path),
+            Err(WavReadError::BadFormat("unsupported PCM bit depth"))
+        ));
+        assert!(matches!(
+            WavReader::open(path),
+            Err(WavReadError::BadFormat("unsupported PCM bit depth"))
+        ));
+    }
+
+    #[test]
+    fn probe_restricts_ds64_and_sentinel_sizes_to_large_wave_containers() {
+        let chunks = [
+            (*b"fmt ", 16, mono_s16_fmt()),
+            (*b"data", u32::MAX, vec![0; 2]),
+        ];
+        for container in [*b"BW64", *b"RF64"] {
+            let mut bytes = bw64_probe_fixture(&[], &chunks, 2);
+            bytes[..4].copy_from_slice(&container);
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("large.wav");
+            std::fs::write(&path, bytes).unwrap();
+            assert!(WavReader::probe(path).is_ok());
+        }
+
+        let mut disguised = bw64_probe_fixture(&[], &chunks, 2);
+        disguised[..4].copy_from_slice(b"RIFF");
+        let riff_size = u32::try_from(disguised.len() - 8).unwrap();
+        disguised[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("riff-ds64.wav");
+        std::fs::write(&path, disguised).unwrap();
+        assert!(WavReader::probe(path).is_err());
+
+        let mut regular = b"RIFF\0\0\0\0WAVE".to_vec();
+        append_probe_chunk(&mut regular, *b"JUNK", 3, &[0; 3]);
+        append_probe_chunk(&mut regular, *b"fmt ", 16, &mono_s16_fmt());
+        append_probe_chunk(&mut regular, *b"data", 2, &[0; 2]);
+        let riff_size = u32::try_from(regular.len() - 8).unwrap();
+        regular[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("riff-junk.wav");
+        std::fs::write(&path, regular).unwrap();
+        assert!(WavReader::probe(path).is_ok());
+    }
+
+    #[test]
     fn probe_rejects_oversized_format_chunk_before_allocating_it() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("oversized.wav");
@@ -429,6 +745,106 @@ mod tests {
             Err(WavReadError::BadFormat(
                 "fmt chunk exceeds 64 KiB safety limit"
             ))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_file_uses_the_open_descriptor_after_path_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.wav");
+        let moved_path = directory.path().join("opened.wav");
+        let mut wave = b"RIFF\x2c\0\0\0WAVEfmt \x10\0\0\0".to_vec();
+        wave.extend_from_slice(&1_u16.to_le_bytes());
+        wave.extend_from_slice(&1_u16.to_le_bytes());
+        wave.extend_from_slice(&48_000_u32.to_le_bytes());
+        wave.extend_from_slice(&96_000_u32.to_le_bytes());
+        wave.extend_from_slice(&2_u16.to_le_bytes());
+        wave.extend_from_slice(&16_u16.to_le_bytes());
+        wave.extend_from_slice(b"data\x08\0\0\0\0\0\0\0\0\0\0\0");
+        std::fs::write(&path, wave).unwrap();
+
+        let mut opened = File::open(&path).unwrap();
+        opened.seek(SeekFrom::End(0)).unwrap();
+        std::fs::rename(&path, &moved_path).unwrap();
+        std::fs::write(&path, b"not-a-wave!!").unwrap();
+
+        let info = WavReader::probe_file(&mut opened).unwrap();
+        assert_eq!(info.sample_rate, 48_000);
+        assert_eq!(info.channels, 1);
+        assert_eq!(info.data_size, 8);
+        assert!(matches!(
+            WavReader::probe(&path),
+            Err(WavReadError::NotWave)
+        ));
+    }
+
+    #[test]
+    fn probe_resolves_fifo_ds64_sizes_for_sentinel_ancillary_chunks() {
+        let bytes = bw64_probe_fixture(
+            &[(*b"axml", 3), (*b"axml", 5)],
+            &[
+                (*b"axml", u32::MAX, b"one".to_vec()),
+                (*b"axml", u32::MAX, b"three".to_vec()),
+                (*b"fmt ", 16, mono_s16_fmt()),
+                (*b"data", u32::MAX, vec![0; 4]),
+            ],
+            4,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sentinel-ancillary.bw64");
+        std::fs::write(&path, bytes).unwrap();
+
+        let info = WavReader::probe(path).unwrap();
+        assert_eq!(info.sample_rate, 48_000);
+        assert_eq!(info.channels, 1);
+        assert_eq!(info.data_size, 4);
+    }
+
+    #[test]
+    fn probe_rejects_sentinel_ancillary_without_a_ds64_table_entry() {
+        let bytes = bw64_probe_fixture(
+            &[],
+            &[
+                (*b"axml", u32::MAX, b"xml".to_vec()),
+                (*b"fmt ", 16, mono_s16_fmt()),
+                (*b"data", u32::MAX, vec![0; 4]),
+            ],
+            4,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing-table-entry.bw64");
+        std::fs::write(&path, bytes).unwrap();
+
+        assert!(matches!(
+            WavReader::probe(path),
+            Err(WavReadError::BadFormat(
+                "RF64/BW64 sentinel chunk is missing a ds64 table entry"
+            ))
+        ));
+    }
+
+    #[test]
+    fn probe_rejects_chunk_bodies_and_pads_beyond_the_descriptor_length() {
+        let directory = tempfile::tempdir().unwrap();
+        let body_path = directory.path().join("truncated-body.wav");
+        let mut body = Vec::from(&b"RIFF\0\0\0\0WAVEJUNK\x04\0\0\0\x01\x02"[..]);
+        let riff_size = u32::try_from(body.len() - 8).unwrap();
+        body[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        std::fs::write(&body_path, body).unwrap();
+        assert!(matches!(
+            WavReader::probe(body_path),
+            Err(WavReadError::Truncated)
+        ));
+
+        let pad_path = directory.path().join("missing-pad.wav");
+        let mut pad = Vec::from(&b"RIFF\0\0\0\0WAVEJUNK\x03\0\0\0\x01\x02\x03"[..]);
+        let riff_size = u32::try_from(pad.len() - 8).unwrap();
+        pad[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        std::fs::write(&pad_path, pad).unwrap();
+        assert!(matches!(
+            WavReader::probe(pad_path),
+            Err(WavReadError::Truncated)
         ));
     }
 

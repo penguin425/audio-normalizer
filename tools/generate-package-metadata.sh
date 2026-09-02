@@ -78,6 +78,7 @@ cat >"${dist_dir}/forge-scoop.json" <<EOF
     "forge-adm-presentation-qc.exe",
     "forge-adm-interactivity-qc.exe",
     "forge-adm-semantics-qc.exe",
+    "forge-adm-emission-qc.exe",
     "forge-downmix-qc.exe",
     "forge-binaural-qc.exe",
     "forge-remediate.exe",

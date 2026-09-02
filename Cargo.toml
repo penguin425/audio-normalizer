@@ -97,6 +97,10 @@ name = "forge-adm-semantics-qc"
 path = "src/bin/forge-adm-semantics-qc.rs"
 
 [[bin]]
+name = "forge-adm-emission-qc"
+path = "src/bin/forge-adm-emission-qc.rs"
+
+[[bin]]
 name = "forge-downmix-qc"
 path = "src/bin/forge-downmix-qc.rs"
 

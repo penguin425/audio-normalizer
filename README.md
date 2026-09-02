@@ -100,7 +100,8 @@ current build's format, encoder, runtime, and CPU capabilities.
 render through the EBU reference renderer; `forge-adm-interactivity-qc` audits
 bounded personalization ranges, and `forge-adm-semantics-qc` checks dialogue,
 selection, importance, and tag semantics without claiming rendered-audio
-compliance.
+compliance. `forge-adm-emission-qc` checks AXML-carried file-based ADM against
+a selected ITU-R BS.2168 Level 0, 1, or 2 profile.
 `forge-metadata-repair` can add
 measured ISO-BMFF `ludt/tlou` and combined-album `alou` loudness metadata
 without re-encoding media. Other commands cover IMF, AES31,

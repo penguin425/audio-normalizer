@@ -6,6 +6,9 @@
 //! emission profile, renders it to a BS.2051 layout, and then measures the
 //! rendered loudspeaker signals with Forge's BS.1770 engine.
 
+pub mod emission;
+mod wave_input;
+
 use crate::metadata;
 use crate::normalize::{self, Analysis};
 use quick_xml::events::Event;

@@ -316,7 +316,15 @@ fn audit_wave(
                 if let Some(body) =
                     read_control_chunk(path, file, offset, size, &mut wrapper, "ds64")?
                 {
-                    parse_ds64(&body, chunk_index, &mut state, &mut wrapper, large);
+                    let sample_count_field = state.container == "RF64";
+                    parse_ds64(
+                        &body,
+                        chunk_index,
+                        &mut state,
+                        &mut wrapper,
+                        large,
+                        sample_count_field,
+                    );
                 }
             }
             b"fmt " => {
@@ -1320,6 +1328,7 @@ fn parse_ds64(
     state: &mut WaveState,
     wrapper: &mut Vec<AuditCheck>,
     large: bool,
+    sample_count_field: bool,
 ) {
     let valid_size = body.len() >= 28;
     wrapper.push(check(
@@ -1345,7 +1354,8 @@ fn parse_ds64(
     if valid_size {
         state.ds64_riff_size = Some(u64::from_le_bytes(body[0..8].try_into().unwrap()));
         state.ds64_data_size = Some(u64::from_le_bytes(body[8..16].try_into().unwrap()));
-        state.ds64_sample_count = Some(u64::from_le_bytes(body[16..24].try_into().unwrap()));
+        state.ds64_sample_count =
+            sample_count_field.then(|| u64::from_le_bytes(body[16..24].try_into().unwrap()));
         let table_length = u32::from_le_bytes(body[24..28].try_into().unwrap()) as usize;
         let required = 28_usize.saturating_add(table_length.saturating_mul(12));
         let table_fits = body.len() >= required;
@@ -1494,8 +1504,39 @@ mod tests {
             let path = directory.path().join(format!("{container:?}.wav"));
             WavWriter::write_with_options(&path, &audio, PcmKind::S24, false, container, None)
                 .unwrap();
+            let mut bytes = std::fs::read(&path).unwrap();
+            assert_eq!(
+                u64::from_le_bytes(bytes[36..44].try_into().unwrap()),
+                if container == WavContainer::Rf64 {
+                    101
+                } else {
+                    0
+                }
+            );
+            let initial_audit = audit(&path).unwrap();
+            assert!(initial_audit.passed, "{container:?}: {initial_audit:#?}");
+
+            bytes[36..44].copy_from_slice(&102_u64.to_le_bytes());
+            std::fs::write(&path, bytes).unwrap();
             let audit = audit(&path).unwrap();
-            assert!(audit.passed, "{container:?}: {audit:#?}");
+            if container == WavContainer::Rf64 {
+                assert!(!audit.passed, "{audit:#?}");
+                assert!(
+                    audit
+                        .layers
+                        .iter()
+                        .flat_map(|layer| &layer.checks)
+                        .any(|check| check.rule_id == "FORGE-WAVE-DS64-SAMPLE-XCHECK"
+                            && !check.passed)
+                );
+            } else {
+                assert!(audit.passed, "{audit:#?}");
+                assert!(audit
+                    .layers
+                    .iter()
+                    .flat_map(|layer| &layer.checks)
+                    .all(|check| check.rule_id != "FORGE-WAVE-DS64-SAMPLE-XCHECK"));
+            }
         }
     }
 
