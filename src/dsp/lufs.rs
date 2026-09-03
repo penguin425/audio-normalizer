@@ -51,7 +51,7 @@ const LOUDNESS_CLOCK_TICKS_PER_SECOND: u128 = 10;
 // 3-second window re-scan costs only 0.86% amortized work instead of 13.7% at
 // the previous 2^20-frame cadence.
 const FAST_WINDOW_REBASE_FRAMES: usize = 1 << 24;
-const _: () = assert!(FAST_WINDOW_REBASE_FRAMES % 1_024 == 0);
+const _: () = assert!(FAST_WINDOW_REBASE_FRAMES.is_multiple_of(1_024));
 // `10^((-70 + 0.691) / 10)` committed as IEEE-754 bits so the gate does not
 // depend on the platform `pow` implementation.
 const ABSOLUTE_GATE_MEAN_SQUARE: f64 = f64::from_bits(0x3e7f_791e_c6e1_d5b7);
