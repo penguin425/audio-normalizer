@@ -88,11 +88,23 @@ impl AtomicOutput {
     /// implementation to an atomic path replacement.
     pub(crate) fn adopt_path_writer_output(&mut self) -> Result<(), String> {
         let path = self.temporary.path().to_owned();
+        let owned_identity = identity_from_open_file(self.temporary.as_file(), &path)
+            .map_err(|error| format!("identify owned staging file {}: {error}", path.display()))?;
         let observed = open_regular_stage(&path, false)?;
-        let replacement = open_regular_stage(&path, true)?;
         let observed_identity = identity_from_open_file(&observed, &path).map_err(|error| {
             format!("identify trusted writer output {}: {error}", path.display())
         })?;
+
+        // Most metadata operations either make no change or update the
+        // existing inode in place. Keep the caller-owned handle in that common
+        // case: commit performs its own final path binding, and needlessly
+        // reopening/rebinding every ordinary WAV/FLAC output adds measurable
+        // fixed filesystem overhead to short jobs.
+        if owned_identity == observed_identity {
+            return Ok(());
+        }
+
+        let replacement = open_regular_stage(&path, true)?;
         let replacement_identity =
             identity_from_open_file(&replacement, &path).map_err(|error| {
                 format!("identify adopted writer output {}: {error}", path.display())
