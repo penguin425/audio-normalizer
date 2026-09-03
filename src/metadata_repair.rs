@@ -474,6 +474,562 @@ impl VersionedMetadataRepairReport {
     }
 }
 
+/// Parsed metadata-repair request with an optional, preflighted JSON-report
+/// destination.
+///
+/// The command-line tool prepares this plan before repair starts. It rejects
+/// observed path or file-identity aliases between the report and the request,
+/// media source, repair destination, or decoded references.
+pub struct VersionedMetadataRepairPlan {
+    execution_base: PathBuf,
+    report_base: PathBuf,
+    spec: MetadataRepairSpec,
+    isobmff_options: Option<IsobmffOptions>,
+    report_output: Option<ReportOutputPlan>,
+}
+
+impl VersionedMetadataRepairPlan {
+    /// Execute the already-parsed request exactly once.
+    pub fn execute(self) -> Result<ExecutedVersionedMetadataRepair, String> {
+        if let Some(output) = &self.report_output {
+            // Repeat the non-mutating check immediately before repair. Path
+            // bindings can change after the initial CLI preflight.
+            output.validate()?;
+        }
+        let schema_version = self.spec.schema_version;
+        let report = evaluate_internal_with_bases(
+            &self.execution_base,
+            &self.report_base,
+            self.spec,
+            self.isobmff_options,
+        )?;
+        let report = match schema_version {
+            SCHEMA_VERSION => into_v1_report(report).map(VersionedMetadataRepairReport::V1),
+            SCHEMA_VERSION_V2 => Ok(VersionedMetadataRepairReport::V2(into_v2_report(report))),
+            _ => unreachable!("validated schema version"),
+        }?;
+        Ok(ExecutedVersionedMetadataRepair {
+            report,
+            report_output: self.report_output,
+        })
+    }
+}
+
+/// Result of a one-shot prepared repair, retaining any pre-created report
+/// staging file until the report is returned or published.
+pub struct ExecutedVersionedMetadataRepair {
+    report: VersionedMetadataRepairReport,
+    report_output: Option<ReportOutputPlan>,
+}
+
+impl ExecutedVersionedMetadataRepair {
+    /// Borrow the completed version-matched report for serialization.
+    pub fn report(&self) -> &VersionedMetadataRepairReport {
+        &self.report
+    }
+
+    /// Return the completed report, dropping any unused staging file.
+    pub fn into_report(self) -> VersionedMetadataRepairReport {
+        self.report
+    }
+
+    /// Serialize pretty JSON with a trailing newline and atomically publish it
+    /// to the preflighted report path.
+    ///
+    /// Serialization completes before report publication begins. A temporary
+    /// file in the same directory is fully written, synced, and
+    /// rebound to its owned handle before its final atomic rename. A final
+    /// report-path symlink is always rejected. The containing directory must
+    /// still be trusted against replacement in the small interval between the
+    /// last identity check and the pathname-based rename. On successful
+    /// replacement, existing Unix mode bits or Windows read-only state are
+    /// retained; ACLs and extended attributes are not copied. New reports use
+    /// the private temporary file's permissions (normally `0600` on Unix).
+    /// The completed report is returned after publication so callers cannot
+    /// publish the same execution twice.
+    pub fn publish_report(self) -> Result<VersionedMetadataRepairReport, String> {
+        self.publish_serialized_report(false)
+    }
+
+    /// Serialize compact JSON with a trailing newline and atomically publish
+    /// it to the preflighted report path.
+    pub fn publish_compact_report(self) -> Result<VersionedMetadataRepairReport, String> {
+        self.publish_serialized_report(true)
+    }
+
+    fn publish_serialized_report(
+        mut self,
+        compact: bool,
+    ) -> Result<VersionedMetadataRepairReport, String> {
+        let mut bytes = if compact {
+            serde_json::to_vec(&self.report)
+        } else {
+            serde_json::to_vec_pretty(&self.report)
+        }
+        .map_err(|error| format!("serialize metadata repair report: {error}"))?;
+        bytes.push(b'\n');
+        let output = self
+            .report_output
+            .as_mut()
+            .ok_or("metadata repair plan has no report output path")?;
+        output.publish(&bytes)?;
+        Ok(self.report)
+    }
+}
+
+#[derive(Clone)]
+struct ProtectedReportPath {
+    description: String,
+    path: PathBuf,
+    must_exist: bool,
+}
+
+struct ReportOutputPlan {
+    path: PathBuf,
+    protected: Vec<ProtectedReportPath>,
+    existing_permissions: Option<fs::Permissions>,
+    staging: Option<tempfile::NamedTempFile>,
+}
+
+impl ReportOutputPlan {
+    fn prepare(
+        path: &Path,
+        request_path: &Path,
+        execution_base: &Path,
+        preparation_cwd: &Path,
+        spec: &MetadataRepairSpec,
+        isobmff_options: Option<&IsobmffOptions>,
+    ) -> Result<Self, String> {
+        if path.as_os_str().is_empty() {
+            return Err("metadata repair report output path must not be empty".into());
+        }
+        let path = absolute_path_from(path, preparation_cwd);
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        if !parent.is_dir() {
+            return Err(format!(
+                "metadata repair report output directory does not exist: {}",
+                parent.display()
+            ));
+        }
+        if path.file_name().is_none() {
+            return Err(format!(
+                "metadata repair report output must name a file: {}",
+                path.display()
+            ));
+        }
+
+        let mut protected = vec![
+            ProtectedReportPath {
+                description: "request file".into(),
+                path: request_path.to_owned(),
+                must_exist: true,
+            },
+            ProtectedReportPath {
+                description: "source".into(),
+                path: resolve(execution_base, &spec.source),
+                must_exist: true,
+            },
+            ProtectedReportPath {
+                description: "repair destination".into(),
+                path: resolve(execution_base, &spec.destination),
+                must_exist: false,
+            },
+        ];
+        if let Some(options) = isobmff_options {
+            if let Some(reference) = options.decoded_reference() {
+                protected.push(ProtectedReportPath {
+                    description: "decoded reference".into(),
+                    path: resolve(execution_base, reference),
+                    must_exist: true,
+                });
+            }
+            if let Some(references) = options.album_decoded_references() {
+                protected.extend(references.iter().enumerate().map(|(index, reference)| {
+                    ProtectedReportPath {
+                        description: format!("album decoded reference {index}"),
+                        path: resolve(execution_base, reference),
+                        must_exist: true,
+                    }
+                }));
+            }
+        }
+        let existing_permissions = fs::symlink_metadata(&path)
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.permissions());
+        let mut plan = Self {
+            path,
+            protected,
+            existing_permissions,
+            staging: None,
+        };
+        plan.validate()?;
+        let parent = plan.path.parent().unwrap_or_else(|| Path::new("."));
+        let staging = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+            format!(
+                "create atomic metadata repair report beside {}: {error}",
+                plan.path.display()
+            )
+        })?;
+        plan.staging = Some(staging);
+        Ok(plan)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        self.validate_output().map(drop)
+    }
+
+    fn publish(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.validate()?;
+        {
+            let temp = self
+                .staging
+                .as_mut()
+                .ok_or("metadata repair report has already been published")?;
+            temp.write_all(bytes).map_err(|error| {
+                format!(
+                    "write atomic metadata repair report for {}: {error}",
+                    self.path.display()
+                )
+            })?;
+            temp.as_file_mut().sync_all().map_err(|error| {
+                format!(
+                    "sync atomic metadata repair report for {}: {error}",
+                    self.path.display()
+                )
+            })?;
+        }
+
+        // Bind the still-accessible private stage before applying a preserved
+        // mode that may remove read access. Retain this no-follow handle until
+        // persist so permission preservation never weakens the ownership
+        // check or introduces a new read-permission requirement.
+        let _bound_stage = self.bound_staging_file()?;
+        if let Some(permissions) = &self.existing_permissions {
+            self.staging
+                .as_ref()
+                .expect("validated report plan retains its staging file")
+                .as_file()
+                .set_permissions(permissions.clone())
+                .map_err(|error| {
+                    format!(
+                        "preserve metadata repair report permissions for {}: {error}",
+                        self.path.display()
+                    )
+                })?;
+        }
+        self.staging
+            .as_ref()
+            .expect("validated report plan retains its staging file")
+            .as_file()
+            .sync_all()
+            .map_err(|error| {
+                format!(
+                    "sync atomic metadata repair report permissions for {}: {error}",
+                    self.path.display()
+                )
+            })?;
+        // The final-component check is repeated after all temporary bytes have
+        // been written. `persist` then replaces that component rather than
+        // following a symlink or modifying a hard-linked inode in place.
+        let output = self.validate_output()?;
+
+        // MoveFileEx cannot replace a read-only destination. Clear only that
+        // attribute through a handle whose identity matches the output just
+        // inspected, restore it on failure, and apply the captured attributes
+        // to the successfully persisted handle below.
+        #[cfg(windows)]
+        let readonly_output_handle = make_readonly_report_replaceable(
+            &self.path,
+            output.identity.as_ref(),
+            self.existing_permissions.as_ref(),
+        )?;
+        #[cfg(not(windows))]
+        let _ = output;
+
+        let temp = self
+            .staging
+            .take()
+            .expect("validated report plan retains its staging file");
+        let _persisted = match temp.persist(&self.path) {
+            Ok(file) => file,
+            Err(error) => {
+                let primary_error = format!(
+                    "atomically publish metadata repair report {}: {}",
+                    self.path.display(),
+                    error.error
+                );
+                #[cfg(windows)]
+                return Err(restore_readonly_report_after_error(
+                    readonly_output_handle.as_ref(),
+                    self.existing_permissions.as_ref(),
+                    &self.path,
+                    primary_error,
+                ));
+                #[cfg(not(windows))]
+                return Err(primary_error);
+            }
+        };
+
+        #[cfg(windows)]
+        if let Some(permissions) = &self.existing_permissions {
+            _persisted
+                .set_permissions(permissions.clone())
+                .map_err(|error| {
+                    format!(
+                        "restore metadata repair report permissions for {}: {error}",
+                        self.path.display()
+                    )
+                })?;
+            _persisted.sync_all().map_err(|error| {
+                format!(
+                    "sync restored metadata repair report permissions for {}: {error}",
+                    self.path.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn validate_output(&self) -> Result<InspectedReportPath, String> {
+        let output = inspect_report_path(&self.path, false, "report output")?;
+        let output_metadata = fs::symlink_metadata(&self.path).ok();
+        let output_is_link = output_metadata
+            .as_ref()
+            .is_some_and(report_metadata_is_link);
+        if let Some(metadata) = &output_metadata {
+            if !output_is_link && !metadata.is_file() {
+                return Err(format!(
+                    "metadata repair report output is not a regular file: {}",
+                    self.path.display()
+                ));
+            }
+        }
+
+        for protected in &self.protected {
+            let candidate = inspect_report_path(
+                &protected.path,
+                protected.must_exist,
+                &protected.description,
+            )?;
+            let same_route = report_paths_equal(&output.resolved, &candidate.resolved);
+            let same_file = output.identity.is_some() && output.identity == candidate.identity;
+            if same_route || same_file {
+                return Err(format!(
+                    "metadata repair report output aliases the {}: {}",
+                    protected.description,
+                    self.path.display()
+                ));
+            }
+        }
+        if output_is_link {
+            return Err(format!(
+                "metadata repair report output must not be a symbolic link or reparse point: {}",
+                self.path.display()
+            ));
+        }
+        Ok(output)
+    }
+
+    fn bound_staging_file(&self) -> Result<File, String> {
+        let temp = self
+            .staging
+            .as_ref()
+            .ok_or("metadata repair report has already been published")?;
+        let path = temp.path();
+        let current = open_regular_report_stage(path)?;
+        let confirmation = open_regular_report_stage(path)?;
+        let owned_identity = opened_file_identity(temp.as_file(), path).map_err(|error| {
+            format!(
+                "identify owned metadata repair report staging file {}: {error}",
+                path.display()
+            )
+        })?;
+        let current_identity = opened_file_identity(&current, path).map_err(|error| {
+            format!(
+                "identify current metadata repair report staging file {}: {error}",
+                path.display()
+            )
+        })?;
+        let confirmation_identity = opened_file_identity(&confirmation, path).map_err(|error| {
+            format!(
+                "confirm metadata repair report staging file identity {}: {error}",
+                path.display()
+            )
+        })?;
+        if owned_identity != current_identity || current_identity != confirmation_identity {
+            return Err(format!(
+                "refuse to publish metadata repair report {}: staging path no longer identifies the owned file",
+                self.path.display()
+            ));
+        }
+        Ok(confirmation)
+    }
+}
+
+#[cfg(windows)]
+fn report_metadata_is_link(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink() || metadata.file_attributes() & 0x0000_0400 != 0
+}
+
+#[cfg(not(windows))]
+fn report_metadata_is_link(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+fn open_regular_report_stage(path: &Path) -> Result<File, String> {
+    require_regular_report_stage(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(windows)]
+    options.custom_flags(0x0020_0000);
+    let file = options.open(path).map_err(|error| {
+        format!(
+            "open metadata repair report staging path {}: {error}",
+            path.display()
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "inspect opened metadata repair report staging path {}: {error}",
+            path.display()
+        )
+    })?;
+    #[cfg(windows)]
+    if metadata.file_attributes() & 0x0000_0400 != 0 {
+        return Err(format!(
+            "refuse reparse-point metadata repair report staging path {}",
+            path.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "refuse non-regular metadata repair report staging path {}",
+            path.display()
+        ));
+    }
+    require_regular_report_stage(path)?;
+    Ok(file)
+}
+
+fn require_regular_report_stage(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "inspect metadata repair report staging path {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "refuse non-regular metadata repair report staging path {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_regular_report_attribute_file(path: &Path) -> Result<File, String> {
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let mut options = OpenOptions::new();
+    options
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path).map_err(|error| {
+        format!(
+            "open metadata repair report attributes {}: {error}",
+            path.display()
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "inspect metadata repair report attribute handle {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.file_attributes() & 0x0000_0400 != 0 || !metadata.is_file() {
+        return Err(format!(
+            "metadata repair report output changed to a link or non-regular file: {}",
+            path.display()
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn make_readonly_report_replaceable(
+    path: &Path,
+    expected_identity: Option<&FileIdentity>,
+    existing_permissions: Option<&fs::Permissions>,
+) -> Result<Option<File>, String> {
+    let Some(permissions) = existing_permissions else {
+        return Ok(None);
+    };
+    if !permissions.readonly() {
+        return Ok(None);
+    }
+    let Some(expected_identity) = expected_identity else {
+        return Ok(None);
+    };
+    let attributes = open_regular_report_attribute_file(path)?;
+    let attribute_identity = opened_file_identity(&attributes, path).map_err(|error| {
+        format!(
+            "identify metadata repair report attribute handle {}: {error}",
+            path.display()
+        )
+    })?;
+    if &attribute_identity != expected_identity {
+        return Err(format!(
+            "metadata repair report output changed before updating its read-only attribute: {}",
+            path.display()
+        ));
+    }
+    let mut replaceable_permissions = permissions.clone();
+    replaceable_permissions.set_readonly(false);
+    attributes
+        .set_permissions(replaceable_permissions)
+        .map_err(|error| {
+            format!(
+                "temporarily make metadata repair report replaceable {}: {error}",
+                path.display()
+            )
+        })?;
+    Ok(Some(attributes))
+}
+
+#[cfg(windows)]
+fn restore_readonly_report_after_error(
+    output_handle: Option<&File>,
+    existing_permissions: Option<&fs::Permissions>,
+    path: &Path,
+    primary_error: String,
+) -> String {
+    let (Some(output_handle), Some(permissions)) = (output_handle, existing_permissions) else {
+        return primary_error;
+    };
+    match output_handle.set_permissions(permissions.clone()) {
+        Ok(()) => primary_error,
+        Err(restore_error) => format!(
+            "{primary_error}; additionally failed to restore the read-only attribute for {}: {restore_error}",
+            path.display()
+        ),
+    }
+}
+
+struct InspectedReportPath {
+    resolved: PathBuf,
+    identity: Option<FileIdentity>,
+}
+
 #[derive(Debug, Clone)]
 struct WaveChunkInfo {
     id: [u8; 4],
@@ -483,7 +1039,7 @@ struct WaveChunkInfo {
 
 struct PreparedIsobmffLoudness {
     target: TargetTrack,
-    reference: PathBuf,
+    reported_reference: PathBuf,
     reference_snapshot: FileSnapshot,
     reference_is_source: bool,
     measured: DecodedLoudness,
@@ -593,16 +1149,71 @@ pub fn evaluate_extended_file(path: &Path) -> Result<ExtendedMetadataRepairRepor
 /// Read a schema-v1 or schema-v2 request and retain the matching report
 /// contract. The CLI uses this entry point so v1 consumers remain unchanged.
 pub fn evaluate_versioned_file(path: &Path) -> Result<VersionedMetadataRepairReport, String> {
-    let text = fs::read_to_string(path)
-        .map_err(|error| format!("read metadata repair request {}: {error}", path.display()))?;
-    let (spec, isobmff_loudness) = parse_versioned_spec(path, &text)?;
-    let schema_version = spec.schema_version;
-    let report = evaluate_internal(path, spec, isobmff_loudness)?;
-    match schema_version {
-        SCHEMA_VERSION => into_v1_report(report).map(VersionedMetadataRepairReport::V1),
-        SCHEMA_VERSION_V2 => Ok(VersionedMetadataRepairReport::V2(into_v2_report(report))),
-        _ => unreachable!("validated schema version"),
-    }
+    Ok(prepare_versioned_file(path, None)?.execute()?.into_report())
+}
+
+/// Parse and preflight a schema-v1 or schema-v2 request before creating its
+/// repair destination.
+///
+/// When `report_output` is present, it is checked against every request-owned
+/// path before any repair work starts, and a final-component report symlink is
+/// always rejected. The returned plan retains the parsed request and a frozen
+/// request-parent directory so execution neither reopens the request nor
+/// depends on the process working directory changing later.
+pub fn prepare_versioned_file(
+    path: &Path,
+    report_output: Option<&Path>,
+) -> Result<VersionedMetadataRepairPlan, String> {
+    let preparation_cwd = std::env::current_dir()
+        .map_err(|error| format!("resolve metadata repair preparation directory: {error}"))?;
+    prepare_versioned_file_from(path, report_output, &preparation_cwd)
+}
+
+fn prepare_versioned_file_from(
+    path: &Path,
+    report_output: Option<&Path>,
+    preparation_cwd: &Path,
+) -> Result<VersionedMetadataRepairPlan, String> {
+    // Freeze the request parent once so later process-wide CWD changes cannot
+    // redirect request-relative media paths. Keep the caller's base spelling
+    // separately so report strings retain the legacy representation.
+    let request_path = path.to_owned();
+    let execution_request_path = frozen_request_path(path, preparation_cwd)?;
+    let execution_base = execution_request_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_owned();
+    let report_base = request_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_owned();
+    let text = fs::read_to_string(&execution_request_path).map_err(|error| {
+        format!(
+            "read metadata repair request {}: {error}",
+            request_path.display()
+        )
+    })?;
+    let (spec, isobmff_options) = parse_versioned_spec(&request_path, &text)?;
+    validate_spec(&spec, isobmff_options.as_ref())?;
+    let report_output = report_output
+        .map(|output| {
+            ReportOutputPlan::prepare(
+                output,
+                &execution_request_path,
+                &execution_base,
+                preparation_cwd,
+                &spec,
+                isobmff_options.as_ref(),
+            )
+        })
+        .transpose()?;
+    Ok(VersionedMetadataRepairPlan {
+        execution_base,
+        report_base,
+        spec,
+        isobmff_options,
+        report_output,
+    })
 }
 
 /// Evaluate one request.  The destination is always a separate path; this is
@@ -660,10 +1271,21 @@ fn evaluate_internal(
     spec: MetadataRepairSpec,
     isobmff_options: Option<IsobmffOptions>,
 ) -> Result<InternalMetadataRepairReport, String> {
-    validate_spec(&spec, isobmff_options.as_ref())?;
     let base = request_path.parent().unwrap_or_else(|| Path::new("."));
-    let source = resolve(base, &spec.source);
-    let destination = resolve(base, &spec.destination);
+    evaluate_internal_with_bases(base, base, spec, isobmff_options)
+}
+
+fn evaluate_internal_with_bases(
+    execution_base: &Path,
+    report_base: &Path,
+    spec: MetadataRepairSpec,
+    isobmff_options: Option<IsobmffOptions>,
+) -> Result<InternalMetadataRepairReport, String> {
+    validate_spec(&spec, isobmff_options.as_ref())?;
+    let source = resolve(execution_base, &spec.source);
+    let destination = resolve(execution_base, &spec.destination);
+    let reported_source = resolve(report_base, &spec.source);
+    let reported_destination = resolve(report_base, &spec.destination);
     let source_snapshot = FileSnapshot::capture(&source, spec.max_input_bytes, "metadata source")?;
     let source_bytes = source_snapshot.len;
     reject_protected_destination(&destination, &[&source_snapshot])?;
@@ -685,13 +1307,17 @@ fn evaluate_internal(
         spec.max_input_bytes,
         "metadata source changed before initial audit",
     )?;
-    let before = container_qc::audit(source_snapshot.stable_path())?;
+    let mut before = container_qc::audit(source_snapshot.stable_path())?;
+    before.path = reported_source.to_string_lossy().into_owned();
     source_snapshot.verify(
         spec.max_input_bytes,
         "metadata source changed during initial audit",
     )?;
     let source_format = before.format.clone();
-    let adm_before = read_adm_profile(source_snapshot.stable_path(), &source_format)?;
+    let mut adm_before = read_adm_profile(source_snapshot.stable_path(), &source_format)?;
+    if let Some(profile) = &mut adm_before {
+        profile.path = reported_source.to_string_lossy().into_owned();
+    }
     source_snapshot.verify(
         spec.max_input_bytes,
         "metadata source changed while reading its ADM profile",
@@ -723,7 +1349,8 @@ fn evaluate_internal(
 
     let prepared_isobmff = if let Some(options) = &isobmff_options {
         Some(prepare_isobmff_loudness(
-            base,
+            execution_base,
+            report_base,
             &source_snapshot,
             &before,
             &spec,
@@ -854,8 +1481,12 @@ fn evaluate_internal(
             spec.max_output_bytes
         ));
     }
-    let after = container_qc::audit(&destination)?;
-    let adm_after = read_adm_profile(&destination, &after.format)?;
+    let mut after = container_qc::audit(&destination)?;
+    after.path = reported_destination.to_string_lossy().into_owned();
+    let mut adm_after = read_adm_profile(&destination, &after.format)?;
+    if let Some(profile) = &mut adm_after {
+        profile.path = reported_destination.to_string_lossy().into_owned();
+    }
     verify_protected_inputs(
         &protected_inputs(&source_snapshot, prepared_isobmff.as_ref()),
         spec.max_input_bytes,
@@ -904,7 +1535,7 @@ fn evaluate_internal(
         let evidence = IsobmffLoudnessEvidence {
             track_id: prepared.target.track_id,
             codecs: prepared.target.codecs,
-            decoded_reference: prepared.reference.to_string_lossy().into_owned(),
+            decoded_reference: prepared.reported_reference.to_string_lossy().into_owned(),
             decoded_reference_sha256: prepared.reference_snapshot.sha256,
             reference_is_source: prepared.reference_is_source,
             sample_rate_hz: prepared.measured.sample_rate_hz,
@@ -971,8 +1602,8 @@ fn evaluate_internal(
         },
         classification: "bounded metadata repair; delivery requires post-repair QC review",
         mode: spec.mode,
-        source: source.to_string_lossy().into_owned(),
-        destination: destination.to_string_lossy().into_owned(),
+        source: reported_source.to_string_lossy().into_owned(),
+        destination: reported_destination.to_string_lossy().into_owned(),
         source_bytes,
         output_bytes,
         source_sha256: source_snapshot.sha256,
@@ -1029,7 +1660,8 @@ fn into_v2_report(report: InternalMetadataRepairReport) -> ExtendedMetadataRepai
 }
 
 fn prepare_isobmff_loudness(
-    base: &Path,
+    execution_base: &Path,
+    report_base: &Path,
     source: &FileSnapshot,
     before: &ContainerAudit,
     spec: &MetadataRepairSpec,
@@ -1038,8 +1670,12 @@ fn prepare_isobmff_loudness(
     let target = isobmff_loudness_repair::select_target(before)?;
     let reference = options
         .decoded_reference()
-        .map(|path| resolve(base, path))
+        .map(|path| resolve(execution_base, path))
         .unwrap_or_else(|| source.path.clone());
+    let reported_reference = options
+        .decoded_reference()
+        .map(|path| resolve(report_base, path))
+        .unwrap_or_else(|| resolve(report_base, &spec.source));
     let reference_snapshot = FileSnapshot::capture(
         &reference,
         spec.max_input_bytes,
@@ -1064,7 +1700,8 @@ fn prepare_isobmff_loudness(
     let encoded = isobmff_loudness_repair::encode_measurement(&measured)?;
     let album = if let Some(album_references) = options.album_decoded_references() {
         Some(prepare_album_loudness(
-            base,
+            execution_base,
+            report_base,
             &reference_snapshot,
             analyzed,
             album_references,
@@ -1090,7 +1727,7 @@ fn prepare_isobmff_loudness(
     )?;
     Ok(PreparedIsobmffLoudness {
         target,
-        reference,
+        reported_reference,
         reference_snapshot,
         reference_is_source,
         measured,
@@ -1103,7 +1740,8 @@ fn prepare_isobmff_loudness(
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_album_loudness(
-    base: &Path,
+    execution_base: &Path,
+    report_base: &Path,
     track_snapshot: &FileSnapshot,
     track_analysis: isobmff_loudness_repair::ReferenceMeasurement,
     album_references: &[PathBuf],
@@ -1116,7 +1754,8 @@ fn prepare_album_loudness(
     let mut total_reference_bytes = 0_u64;
     let mut track_matches = 0_u32;
     for path in album_references {
-        let path = resolve(base, path);
+        let reported_path = resolve(report_base, path);
+        let path = resolve(execution_base, path);
         // Pass the remaining aggregate budget into capture. Its opened-handle
         // metadata check runs before creating/copying a private snapshot, so a
         // long reference list cannot consume references * max_input_bytes of
@@ -1148,7 +1787,7 @@ fn prepare_album_loudness(
             )?
         };
         track_matches += u32::from(is_track);
-        resolved.push((path, snapshot, is_track));
+        resolved.push((path, reported_path, snapshot, is_track));
     }
     if track_matches != 1 {
         return Err(format!(
@@ -1164,7 +1803,7 @@ fn prepare_album_loudness(
     let mut true_peak_dbtp = f64::NEG_INFINITY;
     let mut evidence = Vec::with_capacity(resolved.len());
     let mut protected_inputs = Vec::with_capacity(resolved.len());
-    for (path, snapshot, is_track) in resolved {
+    for (path, reported_path, snapshot, is_track) in resolved {
         snapshot.verify(
             max_input_bytes,
             "album decoded reference changed before measurement",
@@ -1225,7 +1864,7 @@ fn prepare_album_loudness(
         true_peak_dbtp = true_peak_dbtp.max(analysis.loudness.true_peak_dbtp);
         gating_blocks.extend(analysis.gating_blocks);
         evidence.push(IsobmffAlbumReferenceEvidence {
-            path: path.to_string_lossy().into_owned(),
+            path: reported_path.to_string_lossy().into_owned(),
             sha256: snapshot.sha256.clone(),
             track_reference: is_track,
             input_bytes: if is_track {
@@ -1529,6 +2168,207 @@ fn resolve(base: &Path, path: &Path) -> PathBuf {
     } else {
         base.join(path)
     }
+}
+
+fn absolute_path_from(path: &Path, preparation_cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_owned()
+    } else {
+        preparation_cwd.join(path)
+    }
+}
+
+fn frozen_request_path(path: &Path, preparation_cwd: &Path) -> Result<PathBuf, String> {
+    let absolute = absolute_path_from(path, preparation_cwd);
+    let file_name = absolute.file_name().ok_or_else(|| {
+        format!(
+            "metadata repair request must name a file: {}",
+            path.display()
+        )
+    })?;
+    let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
+    let frozen_parent = fs::canonicalize(parent).map_err(|error| {
+        format!(
+            "resolve metadata repair request directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    Ok(frozen_parent.join(file_name))
+}
+
+#[cfg(windows)]
+fn report_paths_equal(left: &Path, right: &Path) -> bool {
+    // Win32 commonly ignores case and trailing spaces/dots in each component.
+    // Reject those aliases conservatively even when a volume exposes stricter
+    // semantics; an existing target is additionally checked by file identity.
+    fn normalized(path: &Path) -> String {
+        path.to_string_lossy()
+            .replace('/', "\\")
+            .split('\\')
+            .map(|component| {
+                component
+                    .trim_end_matches(|character| character == ' ' || character == '.')
+                    .to_lowercase()
+            })
+            .collect::<Vec<_>>()
+            .join("\\")
+    }
+    normalized(left) == normalized(right)
+}
+
+#[cfg(target_os = "macos")]
+fn report_paths_equal(left: &Path, right: &Path) -> bool {
+    // Default macOS filesystems are case-insensitive. Rejecting a case-only
+    // distinction is conservative even on a case-sensitive volume.
+    left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn report_paths_equal(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
+fn inspect_report_path(
+    path: &Path,
+    must_exist: bool,
+    description: &str,
+) -> Result<InspectedReportPath, String> {
+    let resolved = resolve_report_target(path, 0).map_err(|error| {
+        format!(
+            "resolve metadata repair {description} {}: {error}",
+            path.display()
+        )
+    })?;
+    // Metadata inspection does not open file contents and therefore cannot
+    // block on an existing FIFO. On Unix it also provides the stable
+    // device/inode identity without unnecessarily requiring read access.
+    let identity = match fs::metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                if !must_exist {
+                    return Ok(InspectedReportPath {
+                        resolved,
+                        identity: None,
+                    });
+                }
+                return Err(format!(
+                    "metadata repair {description} is not a regular file: {}",
+                    path.display()
+                ));
+            }
+            Some(report_path_identity(&metadata, &resolved, description)?)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !must_exist => None,
+        Err(error) => {
+            return Err(format!(
+                "inspect metadata repair {description} {}: {error}",
+                path.display()
+            ))
+        }
+    };
+    Ok(InspectedReportPath { resolved, identity })
+}
+
+fn report_path_identity(
+    metadata: &fs::Metadata,
+    resolved: &Path,
+    description: &str,
+) -> Result<FileIdentity, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let _ = (resolved, description);
+        Ok(FileIdentity::Unix {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        let _ = metadata;
+        let mut options = OpenOptions::new();
+        // A zero-access handle is sufficient for file identity and avoids
+        // requiring permission to read report bytes merely for preflight.
+        options.access_mode(0).custom_flags(0x0020_0000);
+        let file = options.open(resolved).map_err(|error| {
+            format!(
+                "open metadata repair {description} identity {}: {error}",
+                resolved.display()
+            )
+        })?;
+        let opened_metadata = file.metadata().map_err(|error| {
+            format!(
+                "inspect metadata repair {description} identity {}: {error}",
+                resolved.display()
+            )
+        })?;
+        if opened_metadata.file_attributes() & 0x0000_0400 != 0 || !opened_metadata.is_file() {
+            return Err(format!(
+                "metadata repair {description} changed while it was inspected: {}",
+                resolved.display()
+            ));
+        }
+        opened_file_identity(&file, resolved).map_err(|error| {
+            format!(
+                "identify metadata repair {description} {}: {error}",
+                resolved.display()
+            )
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (metadata, description);
+        Ok(FileIdentity::Canonical(resolved.to_owned()))
+    }
+}
+
+/// Resolve an existing target, a dangling final symlink, or a not-yet-created
+/// final component into one comparable absolute path. Parents must already
+/// exist, matching the output contract of the repairer and report publisher.
+fn resolve_report_target(path: &Path, symlink_depth: u8) -> std::io::Result<PathBuf> {
+    const MAX_SYMLINK_DEPTH: u8 = 40;
+    if symlink_depth >= MAX_SYMLINK_DEPTH {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "too many symbolic links",
+        ));
+    }
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    match fs::canonicalize(&absolute) {
+        Ok(canonical) => return Ok(canonical),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        Err(_) => {}
+    }
+
+    if let Ok(metadata) = fs::symlink_metadata(&absolute) {
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&absolute)?;
+            let target = if target.is_absolute() {
+                target
+            } else {
+                absolute
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(target)
+            };
+            return resolve_report_target(&target, symlink_depth + 1);
+        }
+    }
+
+    let file_name = absolute.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path does not name a final file component",
+        )
+    })?;
+    let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent)?;
+    Ok(parent.join(file_name))
 }
 
 fn verify_protected_inputs(
@@ -2475,6 +3315,271 @@ mod tests {
         }
     }
 
+    #[test]
+    fn report_publish_rejects_a_swapped_stage_and_preserves_existing_report() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        let destination = directory.path().join("destination.bin");
+        let request = directory.path().join("request.json");
+        let report = directory.path().join("report.json");
+        let displaced_stage = directory.path().join("displaced-stage.json");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&request, b"request").unwrap();
+        fs::write(&report, b"existing report").unwrap();
+        let spec = repair_spec(
+            PathBuf::from("source.bin"),
+            PathBuf::from("destination.bin"),
+            SCHEMA_VERSION,
+        );
+        let mut plan = ReportOutputPlan::prepare(
+            &report,
+            &request,
+            directory.path(),
+            directory.path(),
+            &spec,
+            None,
+        )
+        .unwrap();
+        let stage = plan.staging.as_ref().unwrap().path().to_owned();
+
+        fs::rename(&stage, &displaced_stage).unwrap();
+        fs::write(&stage, b"unowned replacement stage").unwrap();
+
+        let error = plan.publish(b"new report").unwrap_err();
+        assert!(
+            error.contains("staging path no longer identifies the owned file"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&report).unwrap(), b"existing report");
+        assert_eq!(fs::read(&stage).unwrap(), b"unowned replacement stage");
+        assert_eq!(fs::read(&displaced_stage).unwrap(), b"new report");
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_publish_preserves_write_only_mode_without_reopening_contents() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        let destination = directory.path().join("destination.bin");
+        let request = directory.path().join("request.json");
+        let report = directory.path().join("report.json");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&request, b"request").unwrap();
+        fs::write(&report, b"existing report").unwrap();
+        fs::set_permissions(&report, fs::Permissions::from_mode(0o200)).unwrap();
+        let spec = repair_spec(
+            PathBuf::from("source.bin"),
+            PathBuf::from("destination.bin"),
+            SCHEMA_VERSION,
+        );
+        let mut plan = ReportOutputPlan::prepare(
+            &report,
+            &request,
+            directory.path(),
+            directory.path(),
+            &spec,
+            None,
+        )
+        .unwrap();
+
+        plan.publish(b"new report").unwrap();
+
+        assert_eq!(fs::metadata(&report).unwrap().mode() & 0o777, 0o200);
+        fs::set_permissions(&report, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read(&report).unwrap(), b"new report");
+        assert!(!destination.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn report_path_aliases_include_win32_trailing_dot_and_space_rules() {
+        assert!(report_paths_equal(
+            Path::new(r"C:\delivery\report.json"),
+            Path::new(r"c:\DELIVERY. \REPORT.JSON. ")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn report_publish_replaces_and_restores_a_readonly_report() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        let destination = directory.path().join("destination.bin");
+        let request = directory.path().join("request.json");
+        let report = directory.path().join("report.json");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&request, b"request").unwrap();
+        fs::write(&report, b"existing report").unwrap();
+        let mut permissions = fs::metadata(&report).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&report, permissions).unwrap();
+        let spec = repair_spec(
+            PathBuf::from("source.bin"),
+            PathBuf::from("destination.bin"),
+            SCHEMA_VERSION,
+        );
+        let mut plan = ReportOutputPlan::prepare(
+            &report,
+            &request,
+            directory.path(),
+            directory.path(),
+            &spec,
+            None,
+        )
+        .unwrap();
+
+        plan.publish(b"new report").unwrap();
+
+        assert_eq!(fs::read(&report).unwrap(), b"new report");
+        assert!(fs::metadata(&report).unwrap().permissions().readonly());
+        let mut cleanup_permissions = fs::metadata(&report).unwrap().permissions();
+        cleanup_permissions.set_readonly(false);
+        fs::set_permissions(&report, cleanup_permissions).unwrap();
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn prepared_relative_request_uses_its_frozen_execution_base() {
+        let directory = tempfile::tempdir().unwrap();
+        let preparation_directory = directory.path().join("cwd-a");
+        let other_directory = directory.path().join("cwd-b");
+        fs::create_dir(&preparation_directory).unwrap();
+        fs::create_dir(&other_directory).unwrap();
+        let source = preparation_directory.join("source.wav");
+        let destination = preparation_directory.join("destination.wav");
+        let other_source = other_directory.join("source.wav");
+        let other_destination = other_directory.join("destination.wav");
+        fixture(
+            &source,
+            vec![WaveChunk {
+                id: *b"axml",
+                body: br#"<audioFormatExtended/>"#.to_vec(),
+            }],
+        );
+        classic_stereo_wave(&other_source);
+        fs::write(
+            preparation_directory.join("request.json"),
+            r#"{
+              "schema_version": 1,
+              "source": "source.wav",
+              "destination": "destination.wav",
+              "mode": "validate",
+              "overwrite": true,
+              "atomic_replace": true
+            }"#,
+        )
+        .unwrap();
+
+        // Injecting the preparation directory tests the same frozen context
+        // as the public entry point without mutating process-wide CWD while
+        // the Rust test harness may be running other tests.
+        let plan =
+            prepare_versioned_file_from(Path::new("request.json"), None, &preparation_directory)
+                .unwrap();
+        let report = plan.execute().unwrap().into_report();
+
+        assert_eq!(fs::read(&destination).unwrap(), fs::read(&source).unwrap());
+        assert!(!other_destination.exists());
+        assert_eq!(report.report().source, "source.wav");
+        assert_eq!(report.report().destination, "destination.wav");
+        assert_eq!(report.report().before.path, "source.wav");
+        assert_eq!(report.report().after.path, "destination.wav");
+        assert_eq!(
+            report.report().adm_before.as_ref().unwrap().path,
+            "source.wav"
+        );
+        assert_eq!(
+            report.report().adm_after.as_ref().unwrap().path,
+            "destination.wav"
+        );
+    }
+
+    #[test]
+    fn prepared_relative_isobmff_requests_preserve_report_path_spelling() {
+        let directory = tempfile::tempdir().unwrap();
+        let preparation_directory = directory.path().join("cwd-a");
+        fs::create_dir(&preparation_directory).unwrap();
+        pcm_mp4(&preparation_directory.join("source.m4a"));
+        classic_stereo_wave(&preparation_directory.join("reference.wav"));
+        classic_stereo_wave_with(&preparation_directory.join("other.wav"), 48_000, 0.2);
+
+        fs::write(
+            preparation_directory.join("request-v1.json"),
+            r#"{
+              "schema_version": 1,
+              "source": "source.m4a",
+              "destination": "destination-v1.m4a",
+              "atomic_replace": true,
+              "isobmff_loudness": {
+                "decoded_reference": "reference.wav"
+              }
+            }"#,
+        )
+        .unwrap();
+        let v1 =
+            prepare_versioned_file_from(Path::new("request-v1.json"), None, &preparation_directory)
+                .unwrap()
+                .execute()
+                .unwrap()
+                .into_report();
+        let VersionedMetadataRepairReport::V1(v1) = v1 else {
+            panic!("schema v1 request returned a v2 report");
+        };
+        assert_eq!(v1.report.source, "source.m4a");
+        assert_eq!(v1.report.destination, "destination-v1.m4a");
+        assert_eq!(v1.report.before.path, "source.m4a");
+        assert_eq!(v1.report.after.path, "destination-v1.m4a");
+        assert_eq!(
+            v1.isobmff_loudness.unwrap().decoded_reference,
+            "reference.wav"
+        );
+
+        fs::write(
+            preparation_directory.join("request-v2.json"),
+            r#"{
+              "schema_version": 2,
+              "source": "source.m4a",
+              "destination": "destination-v2.m4a",
+              "atomic_replace": true,
+              "isobmff_loudness": {
+                "decoded_reference": "reference.wav",
+                "album_decoded_references": ["reference.wav", "other.wav"],
+                "max_album_references": 2
+              }
+            }"#,
+        )
+        .unwrap();
+        let v2 =
+            prepare_versioned_file_from(Path::new("request-v2.json"), None, &preparation_directory)
+                .unwrap()
+                .execute()
+                .unwrap()
+                .into_report();
+        let VersionedMetadataRepairReport::V2(v2) = v2 else {
+            panic!("schema v2 request returned a v1 report");
+        };
+        assert_eq!(v2.report.source, "source.m4a");
+        assert_eq!(v2.report.destination, "destination-v2.m4a");
+        assert_eq!(v2.report.before.path, "source.m4a");
+        assert_eq!(v2.report.after.path, "destination-v2.m4a");
+        let evidence = v2.isobmff_loudness.unwrap();
+        assert_eq!(evidence.track.decoded_reference, "reference.wav");
+        let paths = evidence
+            .album_loudness
+            .unwrap()
+            .references
+            .into_iter()
+            .map(|reference| reference.path)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec!["reference.wav".to_string(), "other.wav".to_string()]
+        );
+    }
+
     fn scan_test_wave(path: &Path) -> Result<(Vec<WaveChunkInfo>, [u8; 12]), String> {
         let mut file = File::open(path).unwrap();
         let file_size = file.metadata().unwrap().len();
@@ -2671,6 +3776,7 @@ mod tests {
         };
 
         let error = match prepare_album_loudness(
+            directory.path(),
             directory.path(),
             &track_snapshot,
             track_analysis,

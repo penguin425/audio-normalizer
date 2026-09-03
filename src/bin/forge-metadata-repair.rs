@@ -1,5 +1,4 @@
 use clap::Parser;
-use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -33,22 +32,31 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<bool, String> {
-    let report = forge_normalizer::metadata_repair::evaluate_versioned_file(&cli.request)?;
-    let mut bytes = if cli.compact {
-        serde_json::to_vec(&report)
+    let plan = forge_normalizer::metadata_repair::prepare_versioned_file(
+        &cli.request,
+        cli.output.as_deref(),
+    )?;
+    let execution = plan.execute()?;
+    let report = if cli.output.is_some() {
+        if cli.compact {
+            execution.publish_compact_report()?
+        } else {
+            execution.publish_report()?
+        }
     } else {
-        serde_json::to_vec_pretty(&report)
-    }
-    .map_err(|error| format!("serialize metadata repair report: {error}"))?;
-    bytes.push(b'\n');
-    if let Some(path) = &cli.output {
-        fs::write(path, bytes).map_err(|error| format!("write {}: {error}", path.display()))?;
-    } else {
+        let mut bytes = if cli.compact {
+            serde_json::to_vec(execution.report())
+        } else {
+            serde_json::to_vec_pretty(execution.report())
+        }
+        .map_err(|error| format!("serialize metadata repair report: {error}"))?;
+        bytes.push(b'\n');
         io::stdout()
             .lock()
             .write_all(&bytes)
             .map_err(|error| format!("write stdout: {error}"))?;
-    }
+        execution.into_report()
+    };
     eprintln!(
         "forge-metadata-repair: {} ({}, {} action(s))",
         if report.report().passed {

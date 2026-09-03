@@ -58,6 +58,19 @@ uses a temporary file in the destination directory and renames it only after
 the output has been flushed.  The source is never replaced by this API;
 `overwrite: true` is required to replace an existing destination.
 
+When `--output` is used, the report destination is preflighted before the
+repair begins and checked again immediately before publication. It must not
+resolve to the request, source, repair destination, or any explicit decoded
+reference through path normalization, a hard link, or a symlink. Its final
+component must be a regular file or not yet exist; report-output symlinks are
+always rejected, as are Windows reparse points. The report is written to a
+sibling temporary file and atomically published. Failures detected before the
+final rename preserve an existing report's bytes; successful publication
+retains Unix mode bits or the Windows read-only state unless the operating
+system reports an error. ACLs and extended attributes are not copied. The
+containing output directory remains a trust boundary against hostile concurrent
+renames.
+
 Exit status 0 means both audits passed, status 1 emits a report requiring
 review, and status 2 denotes a malformed request, unsupported mutation, or
 resource/I/O error.  The contract is versioned by
