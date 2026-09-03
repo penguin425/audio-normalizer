@@ -434,13 +434,38 @@ jobs:
               not Path("baseline/src/stable_input.rs").is_file()
               and Path("candidate/src/stable_input.rs").is_file()
           )
+          def measurement_revision(root):
+              prefix = 'pub const MEASUREMENT_ALGORITHM_REVISION: &str = "'
+              for line in (root / "src/bound_analysis.rs").read_text(
+                  encoding="utf-8"
+              ).splitlines():
+                  if line.startswith(prefix) and line.endswith('";'):
+                      return line[len(prefix):-2]
+              raise AssertionError(f"missing measurement revision in {root}")
+
+          baseline_revision = measurement_revision(Path("baseline"))
+          candidate_revision = measurement_revision(Path("candidate"))
+          measurement_migration = (
+              baseline_revision == "forge-bs1770-5-r3"
+              and candidate_revision == "forge-bs1770-5-r4"
+          )
           # v0.189.3 deliberately adds a private copy plus content hashes and
           # live-source revalidation around the pre-existing decode work. Give
           # that one-time integrity migration a measured, bounded allowance;
           # once StableInput is present in the base, the original tight
           # regression limits automatically apply again.
-          analysis_limit = 5.0 if stable_input_migration else 3.0
-          normalization_aggregate_limit = 3.0 if stable_input_migration else 1.0
+          # v0.189.5 similarly permits at most 5% for the one-time r3 -> r4
+          # numerically stable accumulation migration. Candidate self-parity
+          # and the exact revision pair are enforced earlier in this job.
+          analysis_limit = (
+              5.0 if stable_input_migration or measurement_migration else 3.0
+          )
+          normalization_case_limit = 5.0 if measurement_migration else 3.0
+          normalization_aggregate_limit = (
+              5.0
+              if measurement_migration
+              else 3.0 if stable_input_migration else 1.0
+          )
           normalization_pooled = []
           normalization_paired = []
           for mode in ("default", "jobs_1"):
@@ -451,7 +476,11 @@ jobs:
                       values = summary[metric]
                       pooled = values["pooled_change_percent"]
                       paired = values["median_paired_round_change_percent"]
-                      limit = analysis_limit if case == "analyze" else 3.0
+                      limit = (
+                          analysis_limit
+                          if case == "analyze"
+                          else normalization_case_limit
+                      )
                       assert pooled <= limit, (mode, case, metric, "pooled", pooled)
                       assert paired <= limit, (mode, case, metric, "paired", paired)
                       if case == "normalize":
@@ -485,6 +514,8 @@ jobs:
           )
           if stable_input_migration:
               print("applied one-time StableInput integrity migration limits")
+          if measurement_migration:
+              print("applied one-time r3 -> r4 measurement migration limits")
           print(f"pooled normalization change: {pooled_aggregate:+.3f}%")
           print(f"paired normalization change: {paired_aggregate:+.3f}%")
           PY
