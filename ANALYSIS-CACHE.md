@@ -22,7 +22,8 @@ and a canonical request descriptor:
 - an explicit channel-role override, including positioned-channel azimuth and
   elevation;
 - source start and duration in seconds;
-- timeline interval in milliseconds; or
+- timeline interval in milliseconds;
+- analysis engine (`fast` or `reference`); and
 - requested output sample rate and `fast`, `balanced`, or `best` resampling
   quality.
 
@@ -30,18 +31,19 @@ Consequently identical bytes that select the same decoder route share an
 entry, while changed bytes, route changes, or measurement-changing options
 cannot reuse one. The request hash,
 input hash, canonical result-payload hash, generator version, measurement
-standard, and algorithm revision are retained in the entry. Cache v2 records
+standard, and algorithm revision are retained in the entry. Cache v3 records
 normative ITU-R BS.1770-5 / EBU R 128 measurements; caching does not alter
 gating, channel weighting, units, or normalization targets.
-`forge-bs1770-5-r3` is the current implementation revision and changes
+`forge-bs1770-5-r4` is the current implementation revision and changes
 whenever a result-affecting core algorithm changes.
 
 The JSON compatibility boundary is
-[`analysis-cache-v2`](schema/analysis-cache-v2.schema.json). The immutable
-[`analysis-cache-v1`](schema/analysis-cache-v1.schema.json) remains available
-to validate historical r2 entries, but current runtimes treat them as cache
-misses. Decibel silence
-values that are mathematically negative infinity are represented as JSON
+[`analysis-cache-v3`](schema/analysis-cache-v3.schema.json). The immutable
+[`analysis-cache-v1`](schema/analysis-cache-v1.schema.json) and
+[`analysis-cache-v2`](schema/analysis-cache-v2.schema.json) schemas remain
+available for historical validation, but current runtimes treat those entries
+as cache misses. Decibel silence values that are mathematically negative
+infinity are represented as JSON
 `"-inf"`; on a validated hit Forge restores negative infinity. Linear peaks
 and gating-block mean squares use finite, non-negative values. Timeline levels
 that do not yet have a complete measurement window are `null`, so incomplete
@@ -52,7 +54,7 @@ windows remain distinct from complete silent windows.
 Recognized entries use this fixed-depth layout:
 
 ```text
-DIR/v2/aa/<64-character-input-sha256>/<64-character-request-sha256>.json
+DIR/v3/aa/<64-character-input-sha256>/<64-character-request-sha256>.json
 ```
 
 Forge creates a sibling temporary file, writes and synchronizes the complete
@@ -70,7 +72,7 @@ returning; replacement, symlink retargeting, and same-length in-place changes
 fail instead of mixing source generations.
 
 The cache never recursively interprets arbitrary files. Capacity accounting
-and eviction recognize only regular JSON files at the exact v2 layout with
+and eviction recognize only regular JSON files at the exact v3 layout with
 lower-case SHA-256 names. Unrecognized files and directories are left alone.
 
 ## Corruption and read-only behavior
@@ -83,7 +85,7 @@ observable miss:
 
 ```text
 analysis cache invalid; repaired: input.wav
-analysis cache warning: cache entry is not valid v2 JSON: ...
+analysis cache warning: cache entry is not valid v3 JSON: ...
 ```
 
 Writable mode recomputes and atomically repairs it. With

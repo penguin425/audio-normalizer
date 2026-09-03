@@ -45,6 +45,9 @@ forge input.wav -o output.flac --preset spotify --verify
 
 # Emit machine-readable analysis
 forge --analyze input.wav --json
+
+# Use the fixed-order reference meter and record its engine ID
+forge --analyze input.wav --analysis-engine reference --json
 ```
 
 Run `forge --help` for the complete option list.

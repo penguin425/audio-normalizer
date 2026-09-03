@@ -20,7 +20,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Migrate a delivery manifest from v1/v2 to the current v3 schema.
+    /// Migrate a delivery manifest from v1/v2/v3 to the current v4 schema.
     Migrate {
         input: PathBuf,
         #[arg(short, long, conflicts_with = "in_place")]
@@ -108,10 +108,10 @@ fn migrate(
         .and_then(Value::as_str)
         .ok_or_else(|| "delivery manifest requires a string schema".to_string())?;
     let (manifest, summary) = report_tools::migrate_delivery_manifest(&bytes)?;
-    if source_schema != report_tools::DELIVERY_MANIFEST_V3 {
+    if source_schema != report_tools::DELIVERY_MANIFEST_V4 {
         validate_manifest_schema(&source, source_schema, "source")?;
     }
-    validate_manifest_schema(&manifest, report_tools::DELIVERY_MANIFEST_V3, "migrated")?;
+    validate_manifest_schema(&manifest, report_tools::DELIVERY_MANIFEST_V4, "migrated")?;
     if check {
         eprintln!(
             "forge-report: {} is {} ({} assets)",

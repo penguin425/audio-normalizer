@@ -1,11 +1,14 @@
 //! Stable machine-readable analysis reports.
 
+use crate::analysis::AnalysisEngine;
 use crate::anomaly_provider::ProviderAuditDocument;
+use crate::bound_analysis::MEASUREMENT_ALGORITHM_REVISION;
 use crate::dsp::lufs::LoudnessTimelinePoint;
 use crate::normalize::{Analysis, DialogueMeasurement, DialogueSource};
 use crate::qc::{QcResult, QC_SCHEMA};
 use crate::{container_qc, container_qc::ContainerAudit};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -595,6 +598,7 @@ fn add_max_rule(
 #[derive(Debug, Clone, Serialize)]
 pub struct ComplianceRuleResult {
     pub metric: &'static str,
+    #[serde(serialize_with = "crate::db_value::serialize_db")]
     pub measured: f64,
     pub minimum: Option<f64>,
     pub maximum: Option<f64>,
@@ -653,7 +657,7 @@ pub struct ComplianceResult {
     pub passed: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AnalysisReport {
     pub path: String,
     pub duration_seconds: f64,
@@ -661,41 +665,56 @@ pub struct AnalysisReport {
     pub sample_rate_hz: u32,
     pub channels: u16,
     pub sample_format: &'static str,
+    #[serde(serialize_with = "crate::db_value::serialize_db")]
     pub integrated_lufs: f64,
+    #[serde(serialize_with = "crate::db_value::serialize_optional_db")]
     pub dialogue_lufs: Option<f64>,
     pub dialogue_duration_seconds: Option<f64>,
     pub dialogue_range_count: Option<usize>,
     pub dialogue_measurement_standard: Option<&'static str>,
     pub dialogue_measurement_method: Option<&'static str>,
     pub dialogue_source: Option<DialogueSource>,
+    #[serde(serialize_with = "crate::db_value::serialize_optional_db")]
     pub loudness_to_dialogue_ratio_lu: Option<f64>,
     pub dialogue_detector: Option<&'static str>,
     pub dialogue_detector_version: Option<&'static str>,
     pub dialogue_detection_threshold: Option<f64>,
     pub dialogue_detection_ranges_json: Option<String>,
     pub dialogue_detection_frames_json: Option<String>,
+    #[serde(serialize_with = "crate::db_value::serialize_db")]
     pub max_momentary_lufs: f64,
+    #[serde(serialize_with = "crate::db_value::serialize_db")]
     pub max_short_term_lufs: f64,
     pub loudness_range_lu: f64,
     pub loudness_range_stable: bool,
     pub loudness_range_stable_after_seconds: f64,
+    #[serde(serialize_with = "crate::db_value::serialize_db")]
     pub rms_dbfs: f64,
+    #[serde(serialize_with = "crate::db_value::serialize_db")]
     pub sample_peak_dbfs: f64,
+    #[serde(serialize_with = "crate::db_value::serialize_db")]
     pub true_peak_dbtp: f64,
+    #[serde(serialize_with = "crate::db_value::serialize_db")]
     pub peak_to_loudness_ratio_lu: f64,
     /// Complete EBU QC result set encoded as JSON so CSV remains flat.
     pub ebu_qc_results_json: Option<String>,
     pub ebu_qc_passed: Option<bool>,
+    #[serde(serialize_with = "crate::db_value::serialize_optional_db")]
     pub downmix_integrated_lufs: Option<f64>,
+    #[serde(serialize_with = "crate::db_value::serialize_optional_db")]
     pub downmix_true_peak_dbtp: Option<f64>,
     pub downmix_method: Option<&'static str>,
     pub codec: Option<String>,
+    #[serde(serialize_with = "crate::db_value::serialize_optional_db")]
     pub codec_dialnorm_lkfs: Option<f64>,
+    #[serde(serialize_with = "crate::db_value::serialize_optional_db")]
     pub codec_encoded_loudness_lufs: Option<f64>,
     pub codec_downmix_mode: Option<String>,
     pub codec_loudness_basis: Option<&'static str>,
+    #[serde(serialize_with = "crate::db_value::serialize_optional_db")]
     pub codec_dialnorm_deviation_lu: Option<f64>,
     pub codec_dialnorm_pass: Option<bool>,
+    #[serde(serialize_with = "crate::db_value::serialize_optional_db")]
     pub codec_encoded_loudness_deviation_lu: Option<f64>,
     pub codec_encoded_loudness_pass: Option<bool>,
     pub codec_qc_tolerance_lu: Option<f64>,
@@ -709,7 +728,9 @@ pub struct AnalysisReport {
     pub codec_bitrate_bps: Option<u64>,
     pub codec_drc_profile: Option<String>,
     pub codec_reference_path: Option<String>,
+    #[serde(serialize_with = "crate::db_value::serialize_optional_db")]
     pub codec_loudness_drift_lu: Option<f64>,
+    #[serde(serialize_with = "crate::db_value::serialize_optional_db")]
     pub codec_true_peak_drift_db: Option<f64>,
     pub codec_duration_drift_seconds: Option<f64>,
     pub codec_roundtrip_pass: Option<bool>,
@@ -732,7 +753,9 @@ pub struct AnalysisReport {
     pub adm_render_profile_level: Option<u8>,
     pub adm_render_layout: Option<String>,
     pub adm_render_validation_passed: Option<bool>,
+    #[serde(serialize_with = "crate::db_value::serialize_optional_db")]
     pub adm_render_integrated_lufs: Option<f64>,
+    #[serde(serialize_with = "crate::db_value::serialize_optional_db")]
     pub adm_render_true_peak_dbtp: Option<f64>,
     pub adm_render_channels: Option<u16>,
     pub adm_render_output_path: Option<String>,
@@ -740,15 +763,19 @@ pub struct AnalysisReport {
     pub compliance_standard: Option<String>,
     pub compliance_standard_version: Option<String>,
     pub compliance_loudness_basis: Option<LoudnessBasis>,
+    #[serde(serialize_with = "crate::db_value::serialize_optional_db")]
     pub compliance_target_lufs: Option<f64>,
     pub compliance_loudness_tolerance_lu: Option<f64>,
     pub compliance_lower_tolerance_lu: Option<f64>,
     pub compliance_upper_tolerance_lu: Option<f64>,
+    #[serde(serialize_with = "crate::db_value::serialize_optional_db")]
     pub compliance_max_true_peak_dbtp: Option<f64>,
     pub compliance_loudness_pass: Option<bool>,
     pub compliance_true_peak_pass: Option<bool>,
+    #[serde(serialize_with = "crate::db_value::serialize_optional_db")]
     pub compliance_max_short_term_lufs: Option<f64>,
     pub compliance_short_term_pass: Option<bool>,
+    #[serde(serialize_with = "crate::db_value::serialize_optional_db")]
     pub compliance_max_momentary_lufs: Option<f64>,
     pub compliance_momentary_pass: Option<bool>,
     pub compliance_min_loudness_range_lu: Option<f64>,
@@ -770,9 +797,13 @@ pub struct TimelineReport {
     pub path: String,
     pub start_seconds: f64,
     pub end_seconds: f64,
+    #[serde(serialize_with = "crate::db_value::serialize_optional_db")]
     pub momentary_lufs: Option<f64>,
+    #[serde(serialize_with = "crate::db_value::serialize_optional_db")]
     pub short_term_lufs: Option<f64>,
+    #[serde(serialize_with = "crate::db_value::serialize_db")]
     pub sample_peak_dbfs: f64,
+    #[serde(serialize_with = "crate::db_value::serialize_db")]
     pub true_peak_dbtp: f64,
     pub violations: Vec<&'static str>,
 }
@@ -993,6 +1024,32 @@ impl AnalysisReport {
             compliance_passed: compliance.as_ref().map(|result| result.passed),
         })
     }
+
+    fn canonicalize_for_engine(&mut self, engine: AnalysisEngine) {
+        if engine == AnalysisEngine::Reference {
+            let canonical = |value: f64| {
+                if value.is_finite() {
+                    let quantum = crate::dsp::lufs::REFERENCE_DB_QUANTUM;
+                    let rounded = (value / quantum).round() * quantum;
+                    if rounded == 0.0 {
+                        0.0
+                    } else {
+                        rounded
+                    }
+                } else {
+                    value
+                }
+            };
+            self.integrated_lufs = canonical(self.integrated_lufs);
+            self.max_momentary_lufs = canonical(self.max_momentary_lufs);
+            self.max_short_term_lufs = canonical(self.max_short_term_lufs);
+            self.loudness_range_lu = canonical(self.loudness_range_lu);
+            self.rms_dbfs = canonical(self.rms_dbfs);
+            self.sample_peak_dbfs = canonical(self.sample_peak_dbfs);
+            self.true_peak_dbtp = canonical(self.true_peak_dbtp);
+            self.peak_to_loudness_ratio_lu = canonical(self.true_peak_dbtp - self.integrated_lufs);
+        }
+    }
 }
 
 fn rule_pass(compliance: &Option<ComplianceResult>, metric: &str) -> Option<bool> {
@@ -1005,8 +1062,46 @@ fn rule_pass(compliance: &Option<ComplianceResult>, metric: &str) -> Option<bool
     })
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct AnalysisReportWire<'a> {
+    analysis_engine_id: &'static str,
+    measurement_algorithm_revision: &'static str,
+    #[serde(flatten)]
+    report: Cow<'a, AnalysisReport>,
+}
+
+impl<'a> AnalysisReportWire<'a> {
+    pub(crate) fn new(report: &'a AnalysisReport, engine: AnalysisEngine) -> Self {
+        let report = if engine == AnalysisEngine::Reference {
+            let mut report = report.clone();
+            report.canonicalize_for_engine(engine);
+            Cow::Owned(report)
+        } else {
+            Cow::Borrowed(report)
+        };
+        Self {
+            analysis_engine_id: engine.id(),
+            measurement_algorithm_revision: MEASUREMENT_ALGORITHM_REVISION,
+            report,
+        }
+    }
+}
+
 pub fn write_json<W: Write>(writer: W, reports: &[AnalysisReport]) -> Result<(), String> {
-    serde_json::to_writer_pretty(writer, reports).map_err(|error| format!("write JSON: {error}"))
+    write_json_with_engine(writer, reports, AnalysisEngine::Fast)
+}
+
+/// Write analysis JSON with explicit measurement-engine provenance.
+pub fn write_json_with_engine<W: Write>(
+    writer: W,
+    reports: &[AnalysisReport],
+    engine: AnalysisEngine,
+) -> Result<(), String> {
+    let reports = reports
+        .iter()
+        .map(|report| AnalysisReportWire::new(report, engine))
+        .collect::<Vec<_>>();
+    serde_json::to_writer_pretty(writer, &reports).map_err(|error| format!("write JSON: {error}"))
 }
 
 #[derive(Serialize)]
@@ -1021,8 +1116,10 @@ struct DeliveryManifest<'a> {
 
 #[derive(Serialize)]
 struct DeliveryAsset<'a> {
+    analysis_engine_id: &'static str,
+    measurement_algorithm_revision: &'static str,
     #[serde(flatten)]
-    report: &'a AnalysisReport,
+    report: Cow<'a, AnalysisReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     qc: Option<QcEnvelope>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1062,6 +1159,22 @@ pub fn write_manifest_with_anomaly_audits<W: Write>(
     reports: &[AnalysisReport],
     anomaly_audits: &[Option<ProviderAuditDocument>],
 ) -> Result<(), String> {
+    write_manifest_with_engine_and_anomaly_audits(
+        writer,
+        reports,
+        anomaly_audits,
+        AnalysisEngine::Fast,
+    )
+}
+
+/// Write a delivery manifest with explicit primary measurement-engine
+/// provenance and optional validated external anomaly evidence.
+pub fn write_manifest_with_engine_and_anomaly_audits<W: Write>(
+    writer: W,
+    reports: &[AnalysisReport],
+    anomaly_audits: &[Option<ProviderAuditDocument>],
+    engine: AnalysisEngine,
+) -> Result<(), String> {
     if !anomaly_audits.is_empty() && anomaly_audits.len() != reports.len() {
         return Err(format!(
             "anomaly audit count ({}) must match asset count ({})",
@@ -1089,8 +1202,11 @@ pub fn write_manifest_with_anomaly_audits<W: Write>(
             } else {
                 None
             };
+            let report = AnalysisReportWire::new(report, engine);
             Ok(DeliveryAsset {
-                report,
+                analysis_engine_id: report.analysis_engine_id,
+                measurement_algorithm_revision: report.measurement_algorithm_revision,
+                report: report.report,
                 qc,
                 container_qc,
                 model_qc: anomaly_audits
@@ -1109,7 +1225,7 @@ pub fn write_manifest_with_anomaly_audits<W: Write>(
     let passed_count = assets
         .iter()
         .filter(|asset| {
-            let report = asset.report;
+            let report = asset.report.as_ref();
             report.compliance_passed != Some(false)
                 && report.codec_dialnorm_pass != Some(false)
                 && report.codec_encoded_loudness_pass != Some(false)
@@ -1121,7 +1237,7 @@ pub fn write_manifest_with_anomaly_audits<W: Write>(
         })
         .count();
     let manifest = DeliveryManifest {
-        schema: "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v3",
+        schema: "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v4",
         generator: concat!("forge-normalizer/", env!("CARGO_PKG_VERSION")),
         asset_count: reports.len(),
         passed_count,
@@ -1133,8 +1249,17 @@ pub fn write_manifest_with_anomaly_audits<W: Write>(
 }
 
 pub fn write_ndjson<W: Write>(mut writer: W, reports: &[AnalysisReport]) -> Result<(), String> {
+    write_ndjson_with_engine(&mut writer, reports, AnalysisEngine::Fast)
+}
+
+/// Write analysis NDJSON with explicit measurement-engine provenance.
+pub fn write_ndjson_with_engine<W: Write>(
+    mut writer: W,
+    reports: &[AnalysisReport],
+    engine: AnalysisEngine,
+) -> Result<(), String> {
     for report in reports {
-        serde_json::to_writer(&mut writer, report)
+        serde_json::to_writer(&mut writer, &AnalysisReportWire::new(report, engine))
             .map_err(|error| format!("write NDJSON: {error}"))?;
         writer
             .write_all(b"\n")
@@ -1144,16 +1269,101 @@ pub fn write_ndjson<W: Write>(mut writer: W, reports: &[AnalysisReport]) -> Resu
 }
 
 pub fn write_csv<W: Write>(writer: W, reports: &[AnalysisReport]) -> Result<(), String> {
-    let mut csv = csv::Writer::from_writer(writer);
+    write_csv_with_engine(writer, reports, AnalysisEngine::Fast)
+}
+
+/// Write analysis CSV with explicit measurement-engine provenance.
+pub fn write_csv_with_engine<W: Write>(
+    writer: W,
+    reports: &[AnalysisReport],
+    engine: AnalysisEngine,
+) -> Result<(), String> {
+    let mut csv = csv::WriterBuilder::new()
+        .has_headers(false)
+        .from_writer(writer);
+    let mut expected_headers = None;
     for report in reports {
-        csv.serialize(report)
+        let report = AnalysisReportWire::new(report, engine);
+        let (headers, record) = analysis_report_csv_record(report.report.as_ref())?;
+        if let Some(expected) = &expected_headers {
+            if expected != &headers {
+                return Err("analysis CSV fields changed between records".into());
+            }
+        } else {
+            let mut prefixed = csv::StringRecord::new();
+            prefixed.push_field("analysis_engine_id");
+            prefixed.push_field("measurement_algorithm_revision");
+            prefixed.extend(headers.iter());
+            csv.write_record(&prefixed)
+                .map_err(|error| format!("write CSV header: {error}"))?;
+            expected_headers = Some(headers);
+        }
+        let mut prefixed = csv::StringRecord::new();
+        prefixed.push_field(report.analysis_engine_id);
+        prefixed.push_field(report.measurement_algorithm_revision);
+        prefixed.extend(record.iter());
+        csv.write_record(&prefixed)
             .map_err(|error| format!("write CSV: {error}"))?;
     }
     csv.flush().map_err(|error| format!("flush CSV: {error}"))
 }
 
+fn analysis_report_csv_record(
+    report: &AnalysisReport,
+) -> Result<(csv::StringRecord, csv::StringRecord), String> {
+    let mut encoded = csv::Writer::from_writer(Vec::new());
+    encoded
+        .serialize(report)
+        .map_err(|error| format!("encode CSV record: {error}"))?;
+    let encoded = encoded
+        .into_inner()
+        .map_err(|error| format!("finish CSV record: {}", error.error()))?;
+    let mut reader = csv::Reader::from_reader(encoded.as_slice());
+    let headers = reader
+        .headers()
+        .map_err(|error| format!("read CSV header: {error}"))?
+        .clone();
+    let record = reader
+        .records()
+        .next()
+        .ok_or_else(|| "analysis CSV serializer emitted no record".to_string())?
+        .map_err(|error| format!("read CSV record: {error}"))?;
+    Ok((headers, record))
+}
+
 pub fn write_timeline_json<W: Write>(writer: W, reports: &[TimelineReport]) -> Result<(), String> {
-    serde_json::to_writer_pretty(writer, reports)
+    write_timeline_json_with_engine(writer, reports, AnalysisEngine::Fast)
+}
+
+#[derive(Serialize)]
+struct TimelineReportWire<'a> {
+    analysis_engine_id: &'static str,
+    measurement_algorithm_revision: &'static str,
+    #[serde(flatten)]
+    report: &'a TimelineReport,
+}
+
+impl<'a> TimelineReportWire<'a> {
+    fn new(report: &'a TimelineReport, engine: AnalysisEngine) -> Self {
+        Self {
+            analysis_engine_id: engine.id(),
+            measurement_algorithm_revision: MEASUREMENT_ALGORITHM_REVISION,
+            report,
+        }
+    }
+}
+
+/// Write timeline JSON with explicit measurement-engine provenance.
+pub fn write_timeline_json_with_engine<W: Write>(
+    writer: W,
+    reports: &[TimelineReport],
+    engine: AnalysisEngine,
+) -> Result<(), String> {
+    let reports = reports
+        .iter()
+        .map(|report| TimelineReportWire::new(report, engine))
+        .collect::<Vec<_>>();
+    serde_json::to_writer_pretty(writer, &reports)
         .map_err(|error| format!("write timeline JSON: {error}"))
 }
 
@@ -1161,8 +1371,17 @@ pub fn write_timeline_ndjson<W: Write>(
     mut writer: W,
     reports: &[TimelineReport],
 ) -> Result<(), String> {
+    write_timeline_ndjson_with_engine(&mut writer, reports, AnalysisEngine::Fast)
+}
+
+/// Write timeline NDJSON with explicit measurement-engine provenance.
+pub fn write_timeline_ndjson_with_engine<W: Write>(
+    mut writer: W,
+    reports: &[TimelineReport],
+    engine: AnalysisEngine,
+) -> Result<(), String> {
     for report in reports {
-        serde_json::to_writer(&mut writer, report)
+        serde_json::to_writer(&mut writer, &TimelineReportWire::new(report, engine))
             .map_err(|error| format!("write timeline NDJSON: {error}"))?;
         writer
             .write_all(b"\n")
@@ -1172,8 +1391,19 @@ pub fn write_timeline_ndjson<W: Write>(
 }
 
 pub fn write_timeline_csv<W: Write>(writer: W, reports: &[TimelineReport]) -> Result<(), String> {
+    write_timeline_csv_with_engine(writer, reports, AnalysisEngine::Fast)
+}
+
+/// Write timeline CSV with explicit measurement-engine provenance.
+pub fn write_timeline_csv_with_engine<W: Write>(
+    writer: W,
+    reports: &[TimelineReport],
+    engine: AnalysisEngine,
+) -> Result<(), String> {
     let mut csv = csv::Writer::from_writer(writer);
     csv.write_record([
+        "analysis_engine_id",
+        "measurement_algorithm_revision",
         "path",
         "start_seconds",
         "end_seconds",
@@ -1194,6 +1424,8 @@ pub fn write_timeline_csv<W: Write>(writer: W, reports: &[TimelineReport]) -> Re
         let violations = serde_json::to_string(&report.violations)
             .map_err(|error| format!("encode timeline violations: {error}"))?;
         csv.write_record([
+            engine.id(),
+            MEASUREMENT_ALGORITHM_REVISION,
             report.path.as_str(),
             &start,
             &end,
@@ -1351,7 +1583,7 @@ mod tests {
         assert!(value["schema"]
             .as_str()
             .unwrap()
-            .ends_with("delivery-manifest-v3"));
+            .ends_with("delivery-manifest-v4"));
     }
 
     #[test]
@@ -1580,7 +1812,9 @@ mod tests {
         let mut output = Vec::new();
         write_csv(&mut output, &[sample_report()]).unwrap();
         let text = String::from_utf8(output).unwrap();
-        assert!(text.starts_with("path,duration_seconds,"));
+        assert!(text.starts_with(
+            "analysis_engine_id,measurement_algorithm_revision,path,duration_seconds,"
+        ));
         assert!(text.contains("\"album/track, one.wav\""));
     }
 
@@ -1595,6 +1829,32 @@ mod tests {
             2
         );
         assert!(lines[2].is_empty());
+    }
+
+    #[test]
+    fn reports_distinguish_silence_from_an_undefined_measurement() {
+        let mut report = sample_report();
+        report.integrated_lufs = f64::NEG_INFINITY;
+        report.max_momentary_lufs = f64::NEG_INFINITY;
+        report.rms_dbfs = f64::NEG_INFINITY;
+        report.sample_peak_dbfs = f64::NEG_INFINITY;
+        report.true_peak_dbtp = f64::NEG_INFINITY;
+        report.peak_to_loudness_ratio_lu = f64::NAN;
+        report.downmix_integrated_lufs = Some(f64::NEG_INFINITY);
+        report.adm_render_integrated_lufs = None;
+
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["integrated_lufs"], "-inf");
+        assert_eq!(value["rms_dbfs"], "-inf");
+        assert_eq!(value["true_peak_dbtp"], "-inf");
+        assert_eq!(value["peak_to_loudness_ratio_lu"], serde_json::Value::Null);
+        assert_eq!(value["downmix_integrated_lufs"], "-inf");
+        assert_eq!(value["adm_render_integrated_lufs"], serde_json::Value::Null);
+
+        let mut csv = Vec::new();
+        write_csv(&mut csv, &[report]).unwrap();
+        let csv = String::from_utf8(csv).unwrap();
+        assert!(csv.contains("-inf"));
     }
 
     #[test]
@@ -1636,7 +1896,9 @@ mod tests {
         let mut csv = Vec::new();
         write_timeline_csv(&mut csv, &reports).unwrap();
         let csv = String::from_utf8(csv).unwrap();
-        assert!(csv.starts_with("path,start_seconds,end_seconds,"));
+        assert!(csv.starts_with(
+            "analysis_engine_id,measurement_algorithm_revision,path,start_seconds,end_seconds,"
+        ));
         assert!(csv.contains("max_momentary_lufs"));
     }
 

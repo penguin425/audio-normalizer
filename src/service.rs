@@ -7,8 +7,9 @@
 //! bounded: chunked transfer encoding, keep-alive, implicit redirects, and
 //! path-based inputs are not accepted.
 
+use crate::analysis::AnalysisEngine;
 use crate::decoder;
-use crate::report::{AnalysisReport, ComplianceProfile};
+use crate::report::{AnalysisReport, AnalysisReportWire, ComplianceProfile};
 use crate::service_metrics::{RequestTimer, ServiceMetrics, PROMETHEUS_CONTENT_TYPE};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -23,6 +24,9 @@ use url::Url;
 
 pub const SERVICE_ANALYSIS_SCHEMA: &str =
     "https://penguin425.github.io/audio-normalizer/schema/service-analysis-v1";
+pub const SERVICE_ANALYSIS_SCHEMA_V1: &str = SERVICE_ANALYSIS_SCHEMA;
+pub const SERVICE_ANALYSIS_SCHEMA_V2: &str =
+    "https://penguin425.github.io/audio-normalizer/schema/service-analysis-v2";
 pub const SERVICE_ERROR_SCHEMA: &str =
     "https://penguin425.github.io/audio-normalizer/schema/service-error-v1";
 pub const SERVICE_HEALTH_SCHEMA: &str =
@@ -281,16 +285,23 @@ struct ErrorResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct AnalysisResponse {
+struct AnalysisResponse<'a> {
     schema: &'static str,
     generator: &'static str,
-    filename: String,
-    content_type: String,
+    filename: &'a str,
+    content_type: &'a str,
     bytes_received: usize,
     max_decoded_samples: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    compliance_profile: Option<String>,
-    report: AnalysisReport,
+    compliance_profile: Option<&'a str>,
+    report: ServiceReport<'a>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ServiceReport<'a> {
+    V1(&'a AnalysisReport),
+    V2(Box<AnalysisReportWire<'a>>),
 }
 
 fn handle_connection(
@@ -356,7 +367,22 @@ fn route(
             || Response::error(404, "not_found", "endpoint not found"),
             |metrics| Response::text(200, PROMETHEUS_CONTENT_TYPE, metrics.render_prometheus()),
         ),
-        ("POST", "/v1/analyze") => analyze_upload(request, config, &target, metrics, timer),
+        ("POST", "/v1/analyze") => analyze_upload(
+            request,
+            config,
+            &target,
+            metrics,
+            timer,
+            SERVICE_ANALYSIS_SCHEMA_V1,
+        ),
+        ("POST", "/v2/analyze") => analyze_upload(
+            request,
+            config,
+            &target,
+            metrics,
+            timer,
+            SERVICE_ANALYSIS_SCHEMA_V2,
+        ),
         _ => Response::error(404, "not_found", "endpoint not found"),
     }
 }
@@ -374,6 +400,7 @@ fn analyze_upload(
     target: &Url,
     metrics: Option<&ServiceMetrics>,
     mut timer: Option<&mut RequestTimer>,
+    response_schema: &'static str,
 ) -> Response {
     if request.body.is_empty() {
         return Response::error(400, "empty_body", "audio request body is empty");
@@ -439,6 +466,15 @@ fn analyze_upload(
     );
     let mut report = report;
     report.path = filename.clone();
+    if response_schema == SERVICE_ANALYSIS_SCHEMA_V1
+        && (!report.integrated_lufs.is_finite() || !report.true_peak_dbtp.is_finite())
+    {
+        return Response::error(
+            422,
+            "non_finite_measurement",
+            "the v1 response contract cannot represent a non-finite measurement; use /v2/analyze",
+        );
+    }
     if serde_json::to_value(&report).is_err() {
         return Response::error(
             422,
@@ -457,20 +493,28 @@ fn analyze_upload(
     if let Some(timer) = timer.as_mut() {
         timer.observe_analysis(decoded_samples, report.integrated_lufs);
     }
+    let content_type = request
+        .headers
+        .get("content-type")
+        .map_or("application/octet-stream", String::as_str);
+    let report = if response_schema == SERVICE_ANALYSIS_SCHEMA_V1 {
+        ServiceReport::V1(&report)
+    } else {
+        ServiceReport::V2(Box::new(AnalysisReportWire::new(
+            &report,
+            AnalysisEngine::Fast,
+        )))
+    };
     Response::json(
         200,
         &AnalysisResponse {
-            schema: SERVICE_ANALYSIS_SCHEMA,
+            schema: response_schema,
             generator: concat!("forge-normalizer/", env!("CARGO_PKG_VERSION")),
-            filename,
-            content_type: request
-                .headers
-                .get("content-type")
-                .cloned()
-                .unwrap_or_else(|| "application/octet-stream".into()),
+            filename: &filename,
+            content_type,
             bytes_received: request.body.len(),
             max_decoded_samples: config.max_decoded_samples,
-            compliance_profile: params.get("profile").cloned(),
+            compliance_profile: params.get("profile").map(String::as_str),
             report,
         },
     )

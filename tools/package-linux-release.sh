@@ -86,7 +86,12 @@ cp tools/benchmark.py tools/build-pgo-forge.sh tools/train-pgo.py \
 cp schema/performance-benchmark-v1.schema.json "$staging/schema/"
 cp schema/doctor-report-v1.schema.json "$staging/schema/"
 cp schema/analysis-cache-v1.schema.json \
-   schema/analysis-cache-v2.schema.json "$staging/schema/"
+   schema/analysis-cache-v2.schema.json \
+   schema/analysis-cache-v3.schema.json "$staging/schema/"
+cp schema/delivery-manifest-v1.schema.json \
+   schema/delivery-manifest-v2.schema.json \
+   schema/delivery-manifest-v3.schema.json \
+   schema/delivery-manifest-v4.schema.json "$staging/schema/"
 cp schema/multi-delivery-request-v1.schema.json \
    schema/multi-delivery-report-v1.schema.json "$staging/schema/"
 cp schema/segment-normalization-request-v1.schema.json \
@@ -124,6 +129,7 @@ cp schema/audio-anomaly-provider-v1.schema.json \
    schema/remote-range-v1.schema.json \
    schema/remote-qc-v1.schema.json \
    schema/service-analysis-v1.schema.json \
+   schema/service-analysis-v2.schema.json \
    schema/service-error-v1.schema.json \
    schema/service-health-v1.schema.json "$staging/schema/"
 cp README.md CHANGELOG.md COMPATIBILITY.md CONTRIBUTING.md SECURITY.md DOCUMENTATION.md \

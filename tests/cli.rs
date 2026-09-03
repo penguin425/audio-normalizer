@@ -76,7 +76,7 @@ fn sqlite_catalogue_records_normalization_hashes_and_exports_provenance() {
     assert_eq!(row.1.len(), 64);
     assert_eq!(row.2.len(), 64);
     assert_eq!(row.3, "ITU-R BS.1770-5 / EBU R 128");
-    assert_eq!(row.4, "forge-bs1770-5-r3");
+    assert_eq!(row.4, "forge-bs1770-5-r4");
 
     let report_value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
@@ -442,7 +442,7 @@ fn content_addressed_analysis_cache_is_reused_by_real_normalization() {
     assert!(String::from_utf8_lossy(&normalize.stderr).contains("analysis cache hit"));
     assert!(output.is_file());
 
-    let prefix = std::fs::read_dir(cache.join("v2"))
+    let prefix = std::fs::read_dir(cache.join("v3"))
         .unwrap()
         .next()
         .unwrap()
@@ -463,10 +463,69 @@ fn content_addressed_analysis_cache_is_reused_by_real_normalization() {
     let instance: serde_json::Value =
         serde_json::from_slice(&std::fs::read(entry).unwrap()).unwrap();
     let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/analysis-cache-v2.schema.json")).unwrap();
+        serde_json::from_str(include_str!("../schema/analysis-cache-v3.schema.json")).unwrap();
     assert!(jsonschema::validator_for(&schema)
         .unwrap()
         .is_valid(&instance));
+}
+
+#[test]
+fn reference_analysis_reports_engine_identity_and_uses_an_isolated_cache_entry() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("tone.wav");
+    let cache = directory.path().join("cache");
+    write_batch_test_wav(&input, 997.0);
+
+    let reference = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .args(["--analyze", "--analysis-engine", "reference", "--json"])
+        .arg("--analysis-cache")
+        .arg(&cache)
+        .output()
+        .unwrap();
+    assert!(
+        reference.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
+    let reports: serde_json::Value = serde_json::from_slice(&reference.stdout).unwrap();
+    assert_eq!(
+        reports[0]["analysis_engine_id"],
+        "forge-reference-bs1770-r1"
+    );
+    assert_eq!(
+        reports[0]["measurement_algorithm_revision"],
+        "forge-bs1770-5-r4"
+    );
+    assert!(reports[0]["integrated_lufs"].is_number());
+
+    let fast = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .args(["--analyze", "--analysis-engine", "fast", "--json"])
+        .arg("--analysis-cache")
+        .arg(&cache)
+        .output()
+        .unwrap();
+    assert!(fast.status.success());
+    let mut entry_count = 0;
+    for prefix in std::fs::read_dir(cache.join("v3")).unwrap() {
+        for content in std::fs::read_dir(prefix.unwrap().path()).unwrap() {
+            entry_count += std::fs::read_dir(content.unwrap().path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                .count();
+        }
+    }
+    assert_eq!(entry_count, 2);
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .args(["--analysis-engine", "reference"])
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("requires --analyze"));
 }
 
 #[test]
@@ -1929,7 +1988,7 @@ fn ebu_qc_writes_versioned_baseband_evidence() {
     assert!(value["schema"]
         .as_str()
         .unwrap()
-        .ends_with("delivery-manifest-v3"));
+        .ends_with("delivery-manifest-v4"));
     let results = value["assets"][0]["qc"]["results"].as_array().unwrap();
     assert_eq!(results.len(), 21);
     assert_eq!(results[0]["ebu_qc_id"], "0078B");

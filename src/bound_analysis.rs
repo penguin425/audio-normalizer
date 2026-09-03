@@ -18,7 +18,7 @@ use std::fmt;
 pub const BOUND_ANALYSIS_VERSION: u32 = 1;
 
 /// Revision of the measurement implementation represented by bound results.
-pub const MEASUREMENT_ALGORITHM_REVISION: &str = "forge-bs1770-5-r3";
+pub const MEASUREMENT_ALGORITHM_REVISION: &str = "forge-bs1770-5-r4";
 
 /// Stable classification for bound-analysis failures.
 #[non_exhaustive]

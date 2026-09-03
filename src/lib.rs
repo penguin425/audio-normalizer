@@ -52,6 +52,7 @@ pub mod container_qc;
 pub mod dash_observe;
 mod dash_patch;
 pub mod dash_qc;
+pub mod db_value;
 pub mod decoder;
 pub mod dialogue_provider;
 pub mod downmix;

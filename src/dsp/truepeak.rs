@@ -29,6 +29,85 @@ pub(super) const TAPS_PER_PHASE: usize = 16;
 const HISTORY_SAMPLES: usize = TAPS_PER_PHASE * 2;
 pub(super) type PhaseTable = [[f64; MAX_PHASES]; TAPS_PER_PHASE];
 
+// Committed f32 coefficient bits used only by the reference engine. Keeping
+// the normalized tables in source avoids platform-libm differences during
+// FIR design while retaining the established fast engine's generated tables.
+const REFERENCE_PHASE_2X: [[u32; 2]; TAPS_PER_PHASE] = [
+    [0x80000000, 0xb9693f62],
+    [0x3a287d88, 0x3ac0a1fc],
+    [0xbb3ff93f, 0xbbae2986],
+    [0x3c1369ca, 0x3c6c9fdc],
+    [0xbcb64a3c, 0xbd0839e8],
+    [0x3d47a36c, 0x3d9153f7],
+    [0xbdd65ad5, 0xbe261528],
+    [0x3e93fea7, 0x3f6582d5],
+    [0x3f6582d5, 0x3e93fea7],
+    [0xbe261528, 0xbdd65ad5],
+    [0x3d9153f7, 0x3d47a36c],
+    [0xbd0839e8, 0xbcb64a3c],
+    [0x3c6c9fdc, 0x3c1369ca],
+    [0xbbae2986, 0xbb3ff93f],
+    [0x3ac0a1fc, 0x3a287d88],
+    [0xb9693f62, 0x80000000],
+];
+
+const REFERENCE_PHASE_3X: [[u32; 3]; TAPS_PER_PHASE] = [
+    [0x80000000, 0xb94ec97e, 0xb96d6afa],
+    [0x39e72c3f, 0x3acbb521, 0x3aa779fd],
+    [0xbb02b317, 0xbbc3c891, 0xbb8dcf86],
+    [0x3bc7caee, 0x3c897b42, 0x3c398052],
+    [0xbc762cf5, 0xbd2123be, 0xbcd0b945],
+    [0x3d062e28, 0x3dabe36a, 0x3d5c7123],
+    [0xbd8e75d0, 0xbe3b77b2, 0xbdff95ad],
+    [0x3e3ae71f, 0x3f20567b, 0x3f74032a],
+    [0x3f74032a, 0x3f20567b, 0x3e3ae71f],
+    [0xbdff95ad, 0xbe3b77b2, 0xbd8e75d0],
+    [0x3d5c7123, 0x3dabe36a, 0x3d062e28],
+    [0xbcd0b945, 0xbd2123be, 0xbc762cf5],
+    [0x3c398052, 0x3c897b42, 0x3bc7caee],
+    [0xbb8dcf86, 0xbbc3c891, 0xbb02b317],
+    [0x3aa779fd, 0x3acbb521, 0x39e72c3f],
+    [0xb96d6afa, 0xb94ec97e, 0x80000000],
+];
+
+const REFERENCE_PHASE_4X: [[u32; 4]; TAPS_PER_PHASE] = [
+    [0x80000000, 0xb9136527, 0xb9930501, 0xb9564d55],
+    [0x39ae4cf1, 0x3aa1eacc, 0x3aeefd95, 0x3a8d559b],
+    [0xbac459b3, 0xbba0e68a, 0xbbd6346a, 0xbb683f30],
+    [0x3b95ba9b, 0x3c6600eb, 0x3c90a9de, 0x3c1539a3],
+    [0xbc3829b0, 0xbd082066, 0xbd25a3cf, 0xbca61b9c],
+    [0x3cc85018, 0x3d91781a, 0x3daef748, 0x3d2ead51],
+    [0xbd538f23, 0xbe1c13f0, 0xbe41bded, 0xbdcc51cb],
+    [0x3e07ad84, 0x3eeaea3c, 0x3f46f1c3, 0x3f7936ed],
+    [0x3f7936ed, 0x3f46f1c3, 0x3eeaea3c, 0x3e07ad84],
+    [0xbdcc51cb, 0xbe41bded, 0xbe1c13f0, 0xbd538f23],
+    [0x3d2ead51, 0x3daef748, 0x3d91781a, 0x3cc85018],
+    [0xbca61b9c, 0xbd25a3cf, 0xbd082066, 0xbc3829b0],
+    [0x3c1539a3, 0x3c90a9de, 0x3c6600eb, 0x3b95ba9b],
+    [0xbb683f30, 0xbbd6346a, 0xbba0e68a, 0xbac459b3],
+    [0x3a8d559b, 0x3aeefd95, 0x3aa1eacc, 0x39ae4cf1],
+    [0xb9564d55, 0xb9930501, 0xb9136527, 0x80000000],
+];
+
+const REFERENCE_PHASE_5X: [[u32; 5]; TAPS_PER_PHASE] = [
+    [0x80000000, 0xb8da8441, 0xb9748501, 0xb9a20ce7, 0xb93e2bcc],
+    [0x398b7eb5, 0x3a815128, 0x3adc23c7, 0x3aefabdc, 0x3a71a1aa],
+    [0xba9cca00, 0xbb833d29, 0xbbcccc1b, 0xbbcec74b, 0xbb431f45],
+    [0x3b6ecafd, 0x3c3dacb9, 0x3c8d3049, 0x3c88a21a, 0x3bf82c3c],
+    [0xbc12b328, 0xbce1e9e9, 0xbd238d16, 0xbd1a6c8d, 0xbc894460],
+    [0x3c9f5b0b, 0x3d71cdd5, 0x3dad2149, 0x3da25859, 0x3d1001d2],
+    [0xbd27ca80, 0xbe00aca7, 0xbe3bf0d2, 0xbe35ef44, 0xbda96f13],
+    [0x3dd47e5b, 0x3eb68807, 0x3f206275, 0x3f5a7bd0, 0x3f7ba50c],
+    [0x3f7ba50c, 0x3f5a7bd0, 0x3f206275, 0x3eb68807, 0x3dd47e5b],
+    [0xbda96f13, 0xbe35ef44, 0xbe3bf0d2, 0xbe00aca7, 0xbd27ca80],
+    [0x3d1001d2, 0x3da25859, 0x3dad2149, 0x3d71cdd5, 0x3c9f5b0b],
+    [0xbc894460, 0xbd1a6c8d, 0xbd238d16, 0xbce1e9e9, 0xbc12b328],
+    [0x3bf82c3c, 0x3c88a21a, 0x3c8d3049, 0x3c3dacb9, 0x3b6ecafd],
+    [0xbb431f45, 0xbbcec74b, 0xbbcccc1b, 0xbb833d29, 0xba9cca00],
+    [0x3a71a1aa, 0x3aefabdc, 0x3adc23c7, 0x3a815128, 0x398b7eb5],
+    [0xb93e2bcc, 0xb9a20ce7, 0xb9748501, 0xb8da8441, 0x80000000],
+];
+
 pub(super) fn phase_table(factor: usize) -> &'static PhaseTable {
     static TABLES: OnceLock<[OnceLock<PhaseTable>; MAX_PHASES + 1]> = OnceLock::new();
     assert!(
@@ -37,6 +116,35 @@ pub(super) fn phase_table(factor: usize) -> &'static PhaseTable {
     );
     TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()))[factor]
         .get_or_init(|| build_phase_table(factor))
+}
+
+pub(super) fn reference_phase_table(factor: usize) -> Result<&'static PhaseTable, String> {
+    static TABLE_2X: OnceLock<PhaseTable> = OnceLock::new();
+    static TABLE_3X: OnceLock<PhaseTable> = OnceLock::new();
+    static TABLE_4X: OnceLock<PhaseTable> = OnceLock::new();
+    static TABLE_5X: OnceLock<PhaseTable> = OnceLock::new();
+    match factor {
+        1 => Err("a 1x true-peak domain does not use an interpolation table".into()),
+        2 => Ok(TABLE_2X.get_or_init(|| build_reference_phase_table(&REFERENCE_PHASE_2X))),
+        3 => Ok(TABLE_3X.get_or_init(|| build_reference_phase_table(&REFERENCE_PHASE_3X))),
+        4 => Ok(TABLE_4X.get_or_init(|| build_reference_phase_table(&REFERENCE_PHASE_4X))),
+        5 => Ok(TABLE_5X.get_or_init(|| build_reference_phase_table(&REFERENCE_PHASE_5X))),
+        _ => Err(format!(
+            "reference true-peak coefficients do not support {factor}x interpolation"
+        )),
+    }
+}
+
+fn build_reference_phase_table<const FACTOR: usize>(
+    bits: &[[u32; FACTOR]; TAPS_PER_PHASE],
+) -> PhaseTable {
+    let mut table = [[0.0; MAX_PHASES]; TAPS_PER_PHASE];
+    for tap in 0..TAPS_PER_PHASE {
+        for phase in 0..FACTOR {
+            table[tap][phase] = f64::from(f32::from_bits(bits[tap][phase]));
+        }
+    }
+    table
 }
 
 fn interpolation_bound_scale(factor: usize) -> f64 {
@@ -170,6 +278,7 @@ pub struct TruePeakMeter {
     pruning_probe_delay: u8,
     #[cfg(target_arch = "x86_64")]
     use_avx2_fma: bool,
+    force_scalar: bool,
     peak: f32,
 }
 
@@ -203,6 +312,33 @@ impl TruePeakMeter {
         Self::with_leading_padding(sample_rate, true)
     }
 
+    /// Construct a finite meter with committed coefficient bits and scalar
+    /// tap/phase ordering for reproducible reference analysis.
+    pub(crate) fn for_finite_reference_sample_rate(sample_rate: u32) -> Result<Self, String> {
+        let factor = oversample_factor(sample_rate);
+        let table = if factor > 1 {
+            Some(reference_phase_table(factor)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            history: [0.0; HISTORY_SAMPLES],
+            cursor: 0,
+            initialized: true,
+            factor,
+            table,
+            interpolation_bound_scale: 0.0,
+            pruning_active: false,
+            pruning_probe_max: 0.0,
+            pruning_probe_len: 0,
+            pruning_probe_delay: 0,
+            #[cfg(target_arch = "x86_64")]
+            use_avx2_fma: false,
+            force_scalar: true,
+            peak: 0.0,
+        })
+    }
+
     fn with_leading_padding(sample_rate: u32, zero_leading_padding: bool) -> Self {
         let factor = oversample_factor(sample_rate);
         let table = if factor > 1 {
@@ -229,6 +365,7 @@ impl TruePeakMeter {
             pruning_probe_delay: 0,
             #[cfg(target_arch = "x86_64")]
             use_avx2_fma: is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
+            force_scalar: false,
             peak: 0.0,
         }
     }
@@ -282,6 +419,16 @@ impl TruePeakMeter {
         Self::from_recent_finite_samples(sample_rate, recent, 0.0).finish_peak()
     }
 
+    pub(super) fn finite_reference_tail_peak_from_recent_samples(
+        sample_rate: u32,
+        recent: &[f32],
+    ) -> Result<f32, String> {
+        let mut meter = Self::for_finite_reference_sample_rate(sample_rate)?;
+        meter.process(recent);
+        meter.peak = 0.0;
+        Ok(meter.finish_peak())
+    }
+
     pub fn process(&mut self, samples: &[f32]) {
         if samples.is_empty() {
             return;
@@ -315,7 +462,7 @@ impl TruePeakMeter {
     /// history can be replaced directly instead of being advanced per sample.
     #[inline]
     pub(crate) fn try_skip_peak_only_block(&mut self, samples: &[f32]) -> bool {
-        if samples.is_empty() || self.factor <= 1 || !self.pruning_active {
+        if self.force_scalar || samples.is_empty() || self.factor <= 1 || !self.pruning_active {
             return false;
         }
         let (block_maximum, has_nan) = crate::dsp::simd::abs_max_and_has_nan(samples);
@@ -344,7 +491,7 @@ impl TruePeakMeter {
         block_maximum: f32,
         has_nan: bool,
     ) -> bool {
-        if samples.is_empty() || self.factor <= 1 || !self.pruning_active {
+        if self.force_scalar || samples.is_empty() || self.factor <= 1 || !self.pruning_active {
             return false;
         }
         if has_nan {
@@ -400,6 +547,9 @@ impl TruePeakMeter {
     fn interpolated_peak(&self) -> f32 {
         let history = self.history_window();
         let table = self.table.expect("oversampling meter has a phase table");
+        if self.force_scalar {
+            return interpolate_scalar_peak(history, table, self.factor);
+        }
         #[cfg(target_arch = "x86_64")]
         if self.use_avx2_fma {
             // SAFETY: the constructor performed runtime AVX2/FMA detection.
@@ -431,6 +581,14 @@ impl TruePeakMeter {
         let left_history = left.history_window();
         let right_history = right.history_window();
         let table = left.table.expect("oversampling meter has a phase table");
+        if left.force_scalar || right.force_scalar {
+            return interpolate_stereo_scalar_peaks(
+                left_history,
+                right_history,
+                table,
+                left.factor,
+            );
+        }
         #[cfg(target_arch = "x86_64")]
         if left.use_avx2_fma {
             // SAFETY: both constructors performed runtime AVX2/FMA detection.
@@ -510,6 +668,9 @@ impl TruePeakMeter {
 
     #[inline(always)]
     fn record_exact_pruning_sample(&mut self, sample: f32) {
+        if self.force_scalar {
+            return;
+        }
         self.pruning_active = false;
         if self.pruning_probe_len == 0 {
             // Exact interpolation remains the fast path for dense material.
@@ -1255,6 +1416,63 @@ mod tests {
         };
         assert_eq!(oversample_factor(sample_rate), factor);
         sample_rate
+    }
+
+    #[test]
+    fn reference_phase_tables_are_the_committed_f32_vectors() {
+        let vectors: &[(usize, Vec<Vec<u32>>)] = &[
+            (
+                2,
+                REFERENCE_PHASE_2X.iter().map(|row| row.to_vec()).collect(),
+            ),
+            (
+                3,
+                REFERENCE_PHASE_3X.iter().map(|row| row.to_vec()).collect(),
+            ),
+            (
+                4,
+                REFERENCE_PHASE_4X.iter().map(|row| row.to_vec()).collect(),
+            ),
+            (
+                5,
+                REFERENCE_PHASE_5X.iter().map(|row| row.to_vec()).collect(),
+            ),
+        ];
+        for (factor, expected) in vectors {
+            let table = reference_phase_table(*factor).unwrap();
+            for tap in 0..TAPS_PER_PHASE {
+                for phase in 0..*factor {
+                    assert_eq!(
+                        table[tap][phase].to_bits(),
+                        f64::from(f32::from_bits(expected[tap][phase])).to_bits(),
+                        "{factor}x tap {tap} phase {phase}"
+                    );
+                }
+                assert!(table[tap][*factor..].iter().all(|value| *value == 0.0));
+            }
+        }
+        assert!(reference_phase_table(6)
+            .unwrap_err()
+            .contains("do not support"));
+    }
+
+    #[test]
+    fn finite_reference_meter_is_scalar_and_chunk_invariant() {
+        let samples = (0_u64..48_137)
+            .map(|index| {
+                let code = ((index.wrapping_mul(65_537).wrapping_add(17)) & 0x00ff_ffff) as i32
+                    - 0x0080_0000;
+                code as f32 / 0x0100_0000 as f32
+            })
+            .collect::<Vec<_>>();
+        let mut whole = TruePeakMeter::for_finite_reference_sample_rate(48_000).unwrap();
+        whole.process(&samples);
+        let whole = whole.finish_peak();
+        let mut chunked = TruePeakMeter::for_finite_reference_sample_rate(48_000).unwrap();
+        for chunk in samples.chunks(257) {
+            chunked.process(chunk);
+        }
+        assert_eq!(whole.to_bits(), chunked.finish_peak().to_bits());
     }
 
     #[cfg(target_arch = "x86_64")]

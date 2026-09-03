@@ -35,6 +35,7 @@ on:
       - "schema/doctor-report-v1.schema.json"
       - "schema/analysis-cache-v1.schema.json"
       - "schema/analysis-cache-v2.schema.json"
+      - "schema/analysis-cache-v3.schema.json"
       - "PYTHON-API.md"
       - "BENCHMARKS.md"
       - "MULTI-DELIVERY.md"
@@ -140,9 +141,11 @@ on:
       - "schema/remote-range-v1.schema.json"
       - "schema/remote-qc-v1.schema.json"
       - "schema/service-analysis-v1.schema.json"
+      - "schema/service-analysis-v2.schema.json"
       - "schema/service-error-v1.schema.json"
       - "schema/service-health-v1.schema.json"
       - "schema/delivery-manifest-v3.schema.json"
+      - "schema/delivery-manifest-v4.schema.json"
       - "schema/rule-explanations-v2.schema.json"
       - "ANOMALY-ADAPTER.md"
       - "SERVICE-METRICS.md"
@@ -439,7 +442,12 @@ jobs:
           cp schema/performance-benchmark-v1.schema.json "$staging/schema/"
           cp schema/doctor-report-v1.schema.json "$staging/schema/"
           cp schema/analysis-cache-v1.schema.json \
-             schema/analysis-cache-v2.schema.json "$staging/schema/"
+             schema/analysis-cache-v2.schema.json \
+             schema/analysis-cache-v3.schema.json "$staging/schema/"
+          cp schema/delivery-manifest-v1.schema.json \
+             schema/delivery-manifest-v2.schema.json \
+             schema/delivery-manifest-v3.schema.json \
+             schema/delivery-manifest-v4.schema.json "$staging/schema/"
           cp schema/multi-delivery-request-v1.schema.json \
              schema/multi-delivery-report-v1.schema.json "$staging/schema/"
           cp schema/segment-normalization-request-v1.schema.json \
@@ -477,6 +485,7 @@ jobs:
              schema/remote-range-v1.schema.json \
              schema/remote-qc-v1.schema.json \
              schema/service-analysis-v1.schema.json \
+             schema/service-analysis-v2.schema.json \
              schema/service-error-v1.schema.json \
              schema/service-health-v1.schema.json "$staging/schema/"
           cp README.md CHANGELOG.md COMPATIBILITY.md CONTRIBUTING.md SECURITY.md DOCUMENTATION.md PERFORMANCE.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md MPEGH-ADAPTER.md DTS-ADAPTER.md ADM-PRESENTATION-QC.md ADM-INTERACTIVITY-QC.md ADM-SEMANTICS-QC.md ANOMALY-ADAPTER.md SERVICE-METRICS.md C-API.md HOST-ADAPTERS.md VST3-ADAPTER.md AU-ADAPTER.md IMMERSIVE-DOWNMIX.md BINAURAL-QC.md REMEDIATION.md METADATA-REPAIR.md NEXT-GENERATION-PLAN.md ROADMAP.md LICENSE "$staging/"
@@ -510,7 +519,8 @@ jobs:
           Copy-Item @("tools/benchmark.py","tools/test-vst3-adapter.sh","tools/test-au-adapter.sh") "$staging/tools/"
           Copy-Item schema/performance-benchmark-v1.schema.json "$staging/schema/"
           Copy-Item schema/doctor-report-v1.schema.json "$staging/schema/"
-          Copy-Item "schema/analysis-cache-v1.schema.json","schema/analysis-cache-v2.schema.json" "$staging/schema/"
+          Copy-Item "schema/analysis-cache-v1.schema.json","schema/analysis-cache-v2.schema.json","schema/analysis-cache-v3.schema.json" "$staging/schema/"
+          Copy-Item "schema/delivery-manifest-v1.schema.json","schema/delivery-manifest-v2.schema.json","schema/delivery-manifest-v3.schema.json","schema/delivery-manifest-v4.schema.json" "$staging/schema/"
           Copy-Item "schema/multi-delivery-request-v1.schema.json","schema/multi-delivery-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/segment-normalization-request-v1.schema.json","schema/segment-normalization-plan-v1.schema.json","schema/segment-normalization-report-v1.schema.json","schema/segment-normalization-plan-v2.schema.json","schema/segment-normalization-report-v2.schema.json" "$staging/schema/"
           Copy-Item "schema/ac4-adapter-request-v1.schema.json","schema/ac4-adapter-response-v1.schema.json","schema/ac4-adapter-report-v1.schema.json" "$staging/schema/"
@@ -521,7 +531,7 @@ jobs:
           Copy-Item "schema/binaural-qc-request-v1.schema.json","schema/binaural-qc-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/remediation-request-v1.schema.json","schema/remediation-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/metadata-repair-request-v1.schema.json","schema/metadata-repair-report-v1.schema.json","schema/metadata-repair-request-v2.schema.json","schema/metadata-repair-report-v2.schema.json" "$staging/schema/"
-          Copy-Item "schema/audio-anomaly-provider-v1.schema.json","schema/anomaly-provider-audit-v1.schema.json","schema/model-qc-v1.schema.json","schema/onnx-anomaly-model-v1.schema.json","schema/onnx-feature-frames-v1.schema.json","schema/remote-range-v1.schema.json","schema/remote-qc-v1.schema.json","schema/service-analysis-v1.schema.json","schema/service-error-v1.schema.json","schema/service-health-v1.schema.json" "$staging/schema/"
+          Copy-Item "schema/audio-anomaly-provider-v1.schema.json","schema/anomaly-provider-audit-v1.schema.json","schema/model-qc-v1.schema.json","schema/onnx-anomaly-model-v1.schema.json","schema/onnx-feature-frames-v1.schema.json","schema/remote-range-v1.schema.json","schema/remote-qc-v1.schema.json","schema/service-analysis-v1.schema.json","schema/service-analysis-v2.schema.json","schema/service-error-v1.schema.json","schema/service-health-v1.schema.json" "$staging/schema/"
           Copy-Item "README.md","CHANGELOG.md","COMPATIBILITY.md","CONTRIBUTING.md","SECURITY.md","DOCUMENTATION.md","PERFORMANCE.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","MULTI-DELIVERY.md","SEGMENT-NORMALIZATION.md","AC4-ADAPTER.md","MPEGH-ADAPTER.md","DTS-ADAPTER.md","ADM-PRESENTATION-QC.md","ADM-INTERACTIVITY-QC.md","ADM-SEMANTICS-QC.md","ANOMALY-ADAPTER.md","SERVICE-METRICS.md","C-API.md","HOST-ADAPTERS.md","VST3-ADAPTER.md","AU-ADAPTER.md","IMMERSIVE-DOWNMIX.md","BINAURAL-QC.md","REMEDIATION.md","METADATA-REPAIR.md","NEXT-GENERATION-PLAN.md","ROADMAP.md","LICENSE" $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
 

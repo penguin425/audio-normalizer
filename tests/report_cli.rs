@@ -4,6 +4,7 @@ use std::process::Command;
 
 const V2: &str = "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v2";
 const V3: &str = "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v3";
+const V4: &str = "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v4";
 
 fn legacy_manifest(path: &std::path::Path) {
     let rules = serde_json::to_string(&json!([
@@ -92,7 +93,7 @@ fn migrate_check_and_atomic_in_place_are_idempotent() {
         .unwrap();
     assert!(migrated.status.success());
     let value: Value = serde_json::from_slice(&fs::read(&input).unwrap()).unwrap();
-    assert_eq!(value["schema"], V3);
+    assert_eq!(value["schema"], V4);
     assert_eq!(
         value["assets"][0]["qc"]["schema"],
         forge_normalizer::qc::QC_SCHEMA
@@ -681,7 +682,7 @@ fn explain_reports_model_qc_as_non_normative_with_stable_rule_id() {
     fs::write(
         &input,
         serde_json::to_vec(&json!({
-            "schema": "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v3",
+            "schema": V3,
             "generator": "forge-normalizer/0.112.0",
             "asset_count": 1,
             "passed_count": 1,

@@ -90,7 +90,7 @@ fn emitted_delivery_manifest_conforms_to_published_schema() {
     report::write_manifest(&mut output, &reports).expect("manifest serialization");
     let instance: Value = serde_json::from_slice(&output).expect("manifest JSON");
     let schema: Value =
-        serde_json::from_str(include_str!("../schema/delivery-manifest-v3.schema.json"))
+        serde_json::from_str(include_str!("../schema/delivery-manifest-v4.schema.json"))
             .expect("schema JSON");
     let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
     let errors: Vec<_> = validator
@@ -180,7 +180,7 @@ fn model_qc_is_embedded_as_advisory_evidence_without_failing_normative_totals() 
     report::write_manifest_with_anomaly_audits(&mut output, &[report], &[Some(audit)]).unwrap();
     let instance: Value = serde_json::from_slice(&output).unwrap();
     let schema: Value =
-        serde_json::from_str(include_str!("../schema/delivery-manifest-v3.schema.json")).unwrap();
+        serde_json::from_str(include_str!("../schema/delivery-manifest-v4.schema.json")).unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
     let errors: Vec<_> = validator
         .iter_errors(&instance)
@@ -268,7 +268,7 @@ fn emitted_all_qc_explanations_conform_to_v2_schema() {
 }
 
 #[test]
-fn migrated_legacy_manifest_conforms_to_v3_schema() {
+fn migrated_legacy_manifest_conforms_to_v4_schema() {
     let legacy_qc = serde_json::to_string(&json!([{
         "ebu_qc_id": "0005B",
         "version": "1.0",
@@ -308,7 +308,7 @@ fn migrated_legacy_manifest_conforms_to_v3_schema() {
     .unwrap();
     let (instance, _) = forge_normalizer::report_tools::migrate_delivery_manifest(&input).unwrap();
     let schema: Value =
-        serde_json::from_str(include_str!("../schema/delivery-manifest-v3.schema.json"))
+        serde_json::from_str(include_str!("../schema/delivery-manifest-v4.schema.json"))
             .expect("schema JSON");
     let validator = jsonschema::validator_for(&schema).expect("valid JSON Schema");
     let errors: Vec<_> = validator

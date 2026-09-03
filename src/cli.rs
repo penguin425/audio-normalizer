@@ -158,6 +158,14 @@ pub struct Cli {
     #[arg(long = "analyze")]
     pub analyze_only: bool,
 
+    /// Measurement engine: fast production path or deterministic reference path.
+    #[arg(
+        long = "analysis-engine",
+        value_parser = ["fast", "reference"],
+        default_value = "fast"
+    )]
+    pub analysis_engine: String,
+
     /// Print analyze results as a JSON array to stdout.
     #[arg(
         long,
@@ -728,6 +736,7 @@ struct NormalizationConfig {
 #[serde(default, deny_unknown_fields)]
 struct AnalysisConfig {
     enabled: Option<bool>,
+    engine: Option<String>,
     compliance: Option<String>,
     dialogue_ranges: Option<PathBuf>,
     start_seconds: Option<f64>,
@@ -855,6 +864,12 @@ impl Cli {
             &mut self.analyze_only,
             analysis.enabled,
         );
+        set_if_implicit(
+            matches,
+            "analysis_engine",
+            &mut self.analysis_engine,
+            analysis.engine,
+        );
         let configured_compliance = analysis.compliance.map(|value| {
             if value.ends_with(".json") || value.ends_with(".toml") {
                 resolve_path(config_path, PathBuf::from(value))
@@ -952,6 +967,7 @@ impl Cli {
         set_if_implicit(matches, "bwf", &mut self.bwf, output.bwf);
         if !self.analyze_only
             && (self.compliance.is_some()
+                || self.analysis_engine != "fast"
                 || self.dialogue_ranges.is_some()
                 || self.start_seconds.is_some()
                 || self.duration_seconds.is_some()
@@ -985,6 +1001,11 @@ impl Cli {
 
     fn validate_config_values(&self) -> Result<(), String> {
         validate_choice("normalization.mode", &self.mode, &["lufs", "peak", "rms"])?;
+        validate_choice(
+            "analysis.engine",
+            &self.analysis_engine,
+            &["fast", "reference"],
+        )?;
         if let Some(preset) = &self.preset {
             validate_choice(
                 "normalization.preset",

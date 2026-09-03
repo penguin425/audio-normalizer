@@ -39,7 +39,7 @@ fn dsf_analysis_normalization_and_manifest_are_read_only_and_auditable() {
         forge_normalizer::dsd::CONVERSION_POLICY
     );
     let manifest_schema: Value =
-        serde_json::from_str(include_str!("../schema/delivery-manifest-v3.schema.json")).unwrap();
+        serde_json::from_str(include_str!("../schema/delivery-manifest-v4.schema.json")).unwrap();
     let validator = jsonschema::validator_for(&manifest_schema).unwrap();
     let errors: Vec<_> = validator
         .iter_errors(&delivery)
