@@ -15,8 +15,9 @@ other specialized or newly encoded-output measurements remain uncached.
 
 ## Identity and measurement provenance
 
-Every lookup streams the complete input file through SHA-256. The address also
-contains a canonical request descriptor:
+Every lookup captures the complete input into a private, bounded SHA-256
+snapshot. The address also contains the decoder route, measurement revision,
+and a canonical request descriptor:
 
 - an explicit channel-role override, including positioned-channel azimuth and
   elevation;
@@ -25,8 +26,9 @@ contains a canonical request descriptor:
 - requested output sample rate and `fast`, `balanced`, or `best` resampling
   quality.
 
-Consequently identical bytes at different paths share an entry, while changed
-bytes or measurement-changing options cannot reuse one. The request hash,
+Consequently identical bytes that select the same decoder route share an
+entry, while changed bytes, route changes, or measurement-changing options
+cannot reuse one. The request hash,
 input hash, canonical result-payload hash, generator version, measurement
 standard, and algorithm revision are retained in the entry. Cache v2 records
 normative ITU-R BS.1770-5 / EBU R 128 measurements; caching does not alter
@@ -62,9 +64,10 @@ one Forge process, entry commits and capacity pruning are serialized while the
 expensive hashing and analysis remain parallel. Separate processes may share a
 cache; eviction is best-effort FIFO by file modification time, so a concurrent
 process can legitimately turn an expected hit into a miss.
-Inputs are expected to remain stable while Forge runs. Writable and read-only
-misses hash again after measurement and fail instead of publishing when the
-ordinary start/end content hashes differ.
+Analysis and later rendering read only the captured snapshot. Cache hits,
+writable misses, and read-only misses rebind and hash the live source before
+returning; replacement, symlink retargeting, and same-length in-place changes
+fail instead of mixing source generations.
 
 The cache never recursively interprets arbitrary files. Capacity accounting
 and eviction recognize only regular JSON files at the exact v2 layout with
@@ -95,7 +98,8 @@ are errors rather than silent cache bypasses.
 - Gating-block and timeline arrays are each limited to 1,000,000 values.
 - Channel-role arrays are limited to 1,024 values.
 - Eviction scans at most 100,000 recognized entries at the fixed layout depth.
-- Input hashing uses a 1 MiB buffer and analysis remains streaming.
+- Input capture and hashing use fixed-size buffers and analysis remains
+  streaming.
 - `--analysis-cache-max-mib MIB` bounds recognized entry bytes and defaults to
   1024 MiB. A result larger than either the per-entry or cache limit is used
   but not stored.

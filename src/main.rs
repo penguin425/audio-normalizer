@@ -7,6 +7,7 @@ use forge_normalizer::analysis_cache::{
     AnalysisCache, AnalysisCachePolicy, CacheDisposition, Cached,
 };
 use forge_normalizer::batch::{BatchAssetSpec, BatchJob, BatchProgressEvent};
+use forge_normalizer::bound_analysis::BoundAnalysis;
 use forge_normalizer::catalogue::{Catalogue, CatalogueAsset, CatalogueRecord};
 use forge_normalizer::cli;
 use forge_normalizer::codec_qc;
@@ -25,6 +26,7 @@ use forge_normalizer::qc::{self, QcOptions};
 use forge_normalizer::report::{
     self, AnalysisReport, CodecMetadata, ComplianceProfile, TimelineReport,
 };
+use forge_normalizer::stable_input::{StableInput, StableInputOptions};
 use forge_normalizer::watch::{WatchCandidate, WatchFolder};
 use forge_normalizer::wav::{named_channel_layout, ChannelRole, PcmKind, WavContainer};
 use rayon::{prelude::*, ThreadPoolBuilder};
@@ -610,7 +612,6 @@ fn run_paths(
         output_sample_rate: cli.sample_rate_hz,
         resample_quality: ResampleQuality::parse(&cli.resample_quality),
     };
-    let analysis_cache = cache_options.open()?;
     if let Some(preset) = preset {
         eprintln!(
             "preset {}: {:.1} LUFS, {:.1} dBTP ({})",
@@ -650,6 +651,8 @@ fn run_paths(
             "--limiter-lookahead must be >= 1 ms and --limiter-release must be > 0 ms".into(),
         );
     }
+    plan.validate()?;
+    let analysis_cache = cache_options.open()?;
 
     if cli.write_tags {
         return write_loudness_tags(
@@ -660,6 +663,15 @@ fn run_paths(
     }
 
     let (outputs, formats) = resolve_outputs_and_formats(&cli, &relative_paths)?;
+    if !cli.analyze_only && !cli.gain_only {
+        for format in &formats {
+            if cli.dry_run {
+                plan.validate_format_request(*format)?;
+            } else {
+                plan.validate_for_format(*format)?;
+            }
+        }
+    }
     validate_catalogue_paths(&cli, catalogue_options, &outputs, stdin_requested)?;
     let mut catalogue = catalogue_options
         .database
@@ -1519,6 +1531,9 @@ fn run_paths(
         if cli.dry_run {
             let analyses = if let Some(analyses) = cached_analyses {
                 analyses
+                    .into_iter()
+                    .map(|cached| cached.analysis.analysis().clone())
+                    .collect()
             } else {
                 cli.inputs
                     .iter()
@@ -1542,17 +1557,25 @@ fn run_paths(
         }
         prepare_output_directories(&outputs)?;
         if cli.verify {
-            let corrected = if let Some(analyses) = cached_analyses.as_deref() {
-                normalize::normalize_album_preanalyzed_corrected_with_roles(
-                    &cli.inputs,
+            let corrected = if let Some(cached) = cached_analyses.as_deref() {
+                let stable_inputs = cached
+                    .iter()
+                    .map(|cached| cached.input.clone())
+                    .collect::<Vec<_>>();
+                let bound_analyses = cached
+                    .iter()
+                    .map(|cached| cached.analysis.clone())
+                    .collect::<Vec<_>>();
+                normalize::normalize_album_bound_corrected(
+                    &stable_inputs,
                     &outputs,
                     &plan,
                     &formats,
                     cli.verify_tolerance,
                     cli.verify_retries as usize,
-                    channel_roles_override.as_deref(),
-                    analyses,
-                )?
+                    &bound_analyses,
+                )
+                .map_err(|error| error.to_string())?
             } else {
                 normalize::normalize_album_corrected_with_roles(
                     &cli.inputs,
@@ -1649,15 +1672,23 @@ fn run_paths(
             return Ok(());
         }
         let results = if cli.difference_report.is_some() {
-            if let Some(analyses) = cached_analyses.as_deref() {
-                normalize::normalize_album_preanalyzed_audited_with_roles(
-                    &cli.inputs,
+            if let Some(cached) = cached_analyses.as_deref() {
+                let stable_inputs = cached
+                    .iter()
+                    .map(|cached| cached.input.clone())
+                    .collect::<Vec<_>>();
+                let bound_analyses = cached
+                    .iter()
+                    .map(|cached| cached.analysis.clone())
+                    .collect::<Vec<_>>();
+                normalize::normalize_album_bound_audited(
+                    &stable_inputs,
                     &outputs,
                     &plan,
                     &formats,
-                    channel_roles_override.as_deref(),
-                    analyses,
-                )?
+                    &bound_analyses,
+                )
+                .map_err(|error| error.to_string())?
             } else {
                 normalize::normalize_album_audited_with_roles(
                     &cli.inputs,
@@ -1671,15 +1702,23 @@ fn run_paths(
             .map(|(analysis, gain, render)| (analysis, gain, Some(render)))
             .collect::<Vec<_>>()
         } else {
-            if let Some(analyses) = cached_analyses.as_deref() {
-                normalize::normalize_album_preanalyzed_with_roles(
-                    &cli.inputs,
+            if let Some(cached) = cached_analyses.as_deref() {
+                let stable_inputs = cached
+                    .iter()
+                    .map(|cached| cached.input.clone())
+                    .collect::<Vec<_>>();
+                let bound_analyses = cached
+                    .iter()
+                    .map(|cached| cached.analysis.clone())
+                    .collect::<Vec<_>>();
+                normalize::normalize_album_bound(
+                    &stable_inputs,
                     &outputs,
                     &plan,
                     &formats,
-                    channel_roles_override.as_deref(),
-                    analyses,
-                )?
+                    &bound_analyses,
+                )
+                .map_err(|error| error.to_string())?
             } else {
                 normalize::normalize_album_with_roles(
                     &cli.inputs,
@@ -1901,14 +1940,15 @@ fn run_paths(
                     let output = &outputs[asset_index];
                     prepare_output_directories(std::slice::from_ref(output))?;
                     if let Some(analyses) = cached_analyses.as_ref() {
-                        normalize::normalize_one_preanalyzed_staged_with_roles(
-                            &cli.inputs[asset_index],
+                        let cached = &analyses[asset_index - wave_start];
+                        normalize::normalize_one_bound_staged(
+                            &cached.input,
                             output,
                             &plan,
                             formats[asset_index],
-                            channel_roles_override.as_deref(),
-                            &analyses[asset_index - wave_start],
+                            &cached.analysis,
                         )
+                        .map_err(|error| error.to_string())
                     } else {
                         normalize::normalize_one_staged_with_roles(
                             &cli.inputs[asset_index],
@@ -2034,17 +2074,12 @@ fn run_paths(
             let cached_analysis = analysis_cache
                 .as_ref()
                 .map(|cache| {
-                    analyze_for_plan_cached(
-                        Some(cache),
-                        input,
-                        channel_roles_override.as_deref(),
-                        &plan,
-                    )
+                    analyze_for_plan_cached(cache, input, channel_roles_override.as_deref(), &plan)
                 })
                 .transpose()?;
             if cli.gain_only || cli.dry_run {
                 let an = if let Some(analysis) = cached_analysis {
-                    analysis
+                    analysis.analysis.analysis().clone()
                 } else {
                     normalize::analyze_file_for_plan(
                         input,
@@ -2062,16 +2097,16 @@ fn run_paths(
                 prepare_output_directories(std::slice::from_ref(output))?;
                 if cli.verify {
                     let corrected = if let Some(analysis) = cached_analysis.as_ref() {
-                        normalize::normalize_one_preanalyzed_corrected_with_roles(
-                            input,
+                        normalize::normalize_one_bound_corrected(
+                            &analysis.input,
                             output,
                             &plan,
                             *fmt,
                             cli.verify_tolerance,
                             cli.verify_retries as usize,
-                            channel_roles_override.as_deref(),
-                            analysis,
-                        )?
+                            &analysis.analysis,
+                        )
+                        .map_err(|error| error.to_string())?
                     } else {
                         normalize::normalize_one_corrected_with_roles(
                             input,
@@ -2115,14 +2150,14 @@ fn run_paths(
                 } else {
                     if cli.difference_report.is_some() {
                         let (an, gain, render) = if let Some(analysis) = cached_analysis.as_ref() {
-                            normalize::normalize_one_preanalyzed_audited_with_roles(
-                                input,
+                            normalize::normalize_one_bound_audited(
+                                &analysis.input,
                                 output,
                                 &plan,
                                 *fmt,
-                                channel_roles_override.as_deref(),
-                                analysis,
-                            )?
+                                &analysis.analysis,
+                            )
+                            .map_err(|error| error.to_string())?
                         } else {
                             normalize::normalize_one_audited_with_roles(
                                 input,
@@ -2152,14 +2187,14 @@ fn run_paths(
                         )?);
                     } else {
                         let (an, gain) = if let Some(analysis) = cached_analysis.as_ref() {
-                            normalize::normalize_one_preanalyzed_with_roles(
-                                input,
+                            normalize::normalize_one_bound(
+                                &analysis.input,
                                 output,
                                 &plan,
                                 *fmt,
-                                channel_roles_override.as_deref(),
-                                analysis,
-                            )?
+                                &analysis.analysis,
+                            )
+                            .map_err(|error| error.to_string())?
                         } else {
                             normalize::normalize_one_with_roles(
                                 input,
@@ -2757,20 +2792,34 @@ struct IndexedAnalysisError {
     message: String,
 }
 
+struct CachedPlanAnalysis {
+    input: StableInput,
+    analysis: BoundAnalysis,
+}
+
 fn analyze_many_for_plan_cached(
     cache: &AnalysisCache,
     inputs: &[PathBuf],
     channel_roles: Option<&[ChannelRole]>,
     plan: &Plan,
-) -> Result<Vec<Analysis>, IndexedAnalysisError> {
+) -> Result<Vec<CachedPlanAnalysis>, IndexedAnalysisError> {
     let cached = inputs
         .par_iter()
-        .map(|input| cache.analyze_for_plan(input, channel_roles, plan))
+        .map(|path| {
+            let options = StableInputOptions::new(u64::MAX).map_err(|error| error.to_string())?;
+            let input =
+                StableInput::from_path(path, &options).map_err(|error| error.to_string())?;
+            let cached = cache.analyze_stable_for_plan(&input, channel_roles, plan)?;
+            Ok((input, cached))
+        })
         .collect::<Vec<_>>();
     let mut analyses = Vec::with_capacity(inputs.len());
     for (index, (input, result)) in inputs.iter().zip(cached).enumerate() {
         match result {
-            Ok(cached) => analyses.push(observe_cache(input, cached)),
+            Ok((stable, cached)) => analyses.push(CachedPlanAnalysis {
+                input: stable,
+                analysis: observe_cache(input, cached),
+            }),
             Err(message) => return Err(IndexedAnalysisError { index, message }),
         }
     }
@@ -2778,17 +2827,20 @@ fn analyze_many_for_plan_cached(
 }
 
 fn analyze_for_plan_cached(
-    cache: Option<&AnalysisCache>,
+    cache: &AnalysisCache,
     input: &Path,
     channel_roles: Option<&[ChannelRole]>,
     plan: &Plan,
-) -> Result<Analysis, String> {
-    if let Some(cache) = cache {
-        return cache
-            .analyze_for_plan(input, channel_roles, plan)
-            .map(|cached| observe_cache(input, cached));
-    }
-    normalize::analyze_file_for_plan(input, channel_roles, plan)
+) -> Result<CachedPlanAnalysis, String> {
+    let options = StableInputOptions::new(u64::MAX).map_err(|error| error.to_string())?;
+    let stable = StableInput::from_path(input, &options).map_err(|error| error.to_string())?;
+    let analysis = cache
+        .analyze_stable_for_plan(&stable, channel_roles, plan)
+        .map(|cached| observe_cache(input, cached))?;
+    Ok(CachedPlanAnalysis {
+        input: stable,
+        analysis,
+    })
 }
 
 fn analyze_file_cached(

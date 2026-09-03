@@ -5,6 +5,7 @@ use forge_normalizer::normalize::{
 };
 use forge_normalizer::preset::{Preset, ProfileEvidence};
 use forge_normalizer::realtime::{RealtimeGainConfig, RealtimeGainProcessor, RealtimeMeter};
+use forge_normalizer::stable_input::{StableInput, StableInputOptions};
 use forge_normalizer::watch::{WatchCandidate, WatchFolder, WATCH_FOLDER_SCHEMA_V1};
 use forge_normalizer::wav::{
     default_channel_roles, AudioBuffer, ChannelRole, PcmKind, WavContainer, WavReader, WavWriter,
@@ -54,6 +55,8 @@ fn documented_public_api_works_from_a_downstream_crate() {
     };
     let gain = compute_gain(&analysis, &plan);
     assert!(gain.is_finite() && gain > 0.0);
+    plan.validate_format_request(OutputFormat::Wav)
+        .expect("validate public format request");
     apply_gain_and_protect(&mut audio, gain, &plan);
 
     let temporary = tempfile::tempdir().expect("temporary directory");
@@ -70,6 +73,30 @@ fn documented_public_api_works_from_a_downstream_crate() {
         (normalized.sample_rate, normalized.channels),
         (sample_rate, 2)
     );
+
+    let stable_options = StableInputOptions::new(8 * 1024 * 1024).expect("stable input options");
+    let stable_input =
+        StableInput::from_path(&wave_path, &stable_options).expect("capture stable public input");
+    let bound_analysis =
+        forge_normalizer::normalize::analyze_stable_input_for_plan(&stable_input, None, &plan)
+            .expect("analyze stable public input");
+    assert_eq!(
+        bound_analysis.input_binding().sha256(),
+        stable_input.sha256()
+    );
+    bound_analysis
+        .validate_for_plan(&stable_input, &plan)
+        .expect("validate public bound analysis");
+    let bound_path = temporary.path().join("bound.wav");
+    forge_normalizer::normalize::normalize_one_bound(
+        &stable_input,
+        &bound_path,
+        &plan,
+        OutputFormat::Wav,
+        &bound_analysis,
+    )
+    .expect("normalize through public stable-input API");
+    assert!(WavReader::probe(&bound_path).is_ok());
 
     let decode_fn: fn(&Path) -> Result<AudioBuffer, String> = decoder::decode;
     let decoded = decode_fn(&wave_path).expect("decode public API");

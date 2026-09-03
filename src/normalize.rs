@@ -11,6 +11,7 @@
 
 pub use crate::analysis::{analyze, Analysis};
 use crate::atomic::AtomicOutput;
+use crate::bound_analysis::{BoundAnalysis, BoundAnalysisError};
 use crate::decoder;
 use crate::downmix;
 use crate::dsp::limiter::{LimiterConfig, LimiterStatistics, TruePeakLimiter};
@@ -21,6 +22,7 @@ use crate::metadata;
 #[cfg(feature = "mp3-encoding")]
 use crate::mp3enc;
 use crate::pcm_spool::PcmSpool;
+use crate::stable_input::{paths_alias_if_existing, StableInput, StableInputOptions};
 use crate::wav::{
     AudioBuffer, ChannelRole, PcmKind, WavContainer, WavStreamWriter, WavWriter,
     MAX_DECODE_SAMPLE_RATE_HZ, MIN_DECODE_SAMPLE_RATE_HZ,
@@ -81,6 +83,64 @@ pub struct Plan {
     /// Output-domain sample rate and converter quality.
     pub output_sample_rate: Option<u32>,
     pub resample_quality: ResampleQuality,
+}
+
+impl Plan {
+    /// Validate plan-wide numeric invariants without reading an input or
+    /// creating an output.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("target_lufs", self.target_lufs),
+            ("target_peak_db", self.target_peak_db),
+            ("target_rms_db", self.target_rms_db),
+            ("ceiling_db", self.ceiling_db),
+        ] {
+            if !value.is_finite() {
+                return Err(format!("normalization plan {name} must be finite"));
+            }
+        }
+        validate_representable_linear_db("ceiling_db", self.ceiling_db)?;
+        if let Some(max_gain_db) = self.max_gain_db {
+            if !max_gain_db.is_finite() {
+                return Err("normalization plan max_gain_db must be finite".into());
+            }
+            validate_representable_linear_db("max_gain_db", max_gain_db)?;
+        }
+        if let Some(limiter) = self.limiter {
+            if !limiter.lookahead_ms.is_finite() || limiter.lookahead_ms < 1.0 {
+                return Err(
+                    "normalization plan limiter look-ahead must be finite and >= 1 ms".into(),
+                );
+            }
+            if !limiter.release_ms.is_finite() || limiter.release_ms <= 0.0 {
+                return Err("normalization plan limiter release must be finite and > 0 ms".into());
+            }
+            let maximum_lookahead_frames =
+                MAX_DECODE_SAMPLE_RATE_HZ as f64 * limiter.lookahead_ms / 1_000.0;
+            if !maximum_lookahead_frames.is_finite()
+                || maximum_lookahead_frames >= usize::MAX as f64
+            {
+                return Err(
+                    "normalization plan limiter look-ahead exceeds the supported range".into(),
+                );
+            }
+        }
+        validate_plan_output_sample_rate(self)
+    }
+
+    /// Validate the settings used by one selected output format without
+    /// reading an input, starting an encoder, or creating an output.
+    pub fn validate_for_format(&self, format: OutputFormat) -> Result<(), String> {
+        self.validate_format_request(format)?;
+        validate_output_encoder_available(format)
+    }
+
+    /// Validate a selected output format's numeric request without requiring
+    /// that its optional encoder is present in this build.
+    pub fn validate_format_request(&self, format: OutputFormat) -> Result<(), String> {
+        self.validate()?;
+        validate_plan_format_settings(self, format, self.output_sample_rate, None)
+    }
 }
 
 /// Measurements captured from the exact float signal passed to an encoder.
@@ -267,6 +327,7 @@ pub struct NormalizationOutcome {
 pub struct StagedNormalization {
     output: AtomicOutput,
     outcome: NormalizationOutcome,
+    protected_inputs: Vec<StableInput>,
 }
 
 impl StagedNormalization {
@@ -277,7 +338,12 @@ impl StagedNormalization {
 
     /// Synchronize and atomically replace the destination with this render.
     pub fn commit(self) -> Result<NormalizationOutcome, String> {
-        let Self { output, outcome } = self;
+        let Self {
+            output,
+            outcome,
+            protected_inputs,
+        } = self;
+        verify_stable_inputs(&protected_inputs, "input changed before output publication")?;
         output.commit()?;
         Ok(outcome)
     }
@@ -777,12 +843,33 @@ fn mean_square(samples: &[f32]) -> f64 {
 
 /// Linear gain that maps `an` onto the plan's target, after ceiling protection.
 pub fn compute_gain(an: &Analysis, plan: &Plan) -> f32 {
+    try_compute_gain(an, plan).unwrap_or(1.0)
+}
+
+/// Checked gain calculation for callers that need invalid-input diagnostics.
+pub fn try_compute_gain(an: &Analysis, plan: &Plan) -> Result<f32, String> {
+    plan.validate()?;
+    if !an.true_peak.is_finite() || an.true_peak < 0.0 {
+        return Err("analysis true peak must be finite and non-negative".into());
+    }
+    let measured_level = match plan.mode {
+        Mode::Lufs => an.lufs,
+        Mode::Peak => an.sample_peak_db(),
+        Mode::Rms => an.rms_db,
+    };
+    if measured_level.is_nan() || measured_level == f64::INFINITY {
+        return Err("analysis level must be finite or negative infinity".into());
+    }
     let gain_db = match plan.mode {
         Mode::Lufs => plan.target_lufs - an.lufs,
         Mode::Peak => plan.target_peak_db - an.sample_peak_db(),
         Mode::Rms => plan.target_rms_db - an.rms_db,
     };
-    clamp_gain(10.0_f64.powf(gain_db / 20.0), an.true_peak as f64, plan)
+    Ok(clamp_gain(
+        10.0_f64.powf(gain_db / 20.0),
+        an.true_peak as f64,
+        plan,
+    ))
 }
 
 fn clamp_gain(mut lin: f64, true_peak: f64, plan: &Plan) -> f32 {
@@ -811,29 +898,132 @@ fn clamp_gain(mut lin: f64, true_peak: f64, plan: &Plan) -> f32 {
 
 /// Apply `gain` to every channel, then a safety brick-wall clip to the ceiling.
 pub fn apply_gain_and_protect(buf: &mut AudioBuffer, gain: f32, plan: &Plan) {
+    let _ = try_apply_gain_and_protect(buf, gain, plan);
+}
+
+/// Checked, transactional gain application.
+///
+/// Validation completes before the buffer is changed. If limiter processing
+/// fails, the original samples remain untouched.
+pub fn try_apply_gain_and_protect(
+    buf: &mut AudioBuffer,
+    gain: f32,
+    plan: &Plan,
+) -> Result<(), String> {
+    plan.validate()?;
+    validate_audio_buffer_geometry(buf)?;
+    validate_audio_buffer_samples(buf)?;
+    validate_supported_output_sample_rate(buf.sample_rate)?;
+    if buf.channels == 0 {
+        return Err("audio buffer must contain at least one channel".into());
+    }
+    if !gain.is_finite() || gain < 0.0 {
+        return Err("gain must be finite and non-negative".into());
+    }
     if let Some(config) = plan.limiter {
-        apply_gain(&mut buf.data, gain);
+        let mut data = buf.data.clone();
+        apply_gain(&mut data, gain);
         let mut limiter =
             TruePeakLimiter::new_finite(buf.sample_rate, buf.channels, plan.ceiling_db, config)
-                .expect("validated limiter configuration");
-        let mut output = limiter
-            .process(&buf.data)
-            .expect("AudioBuffer channel layout is internally consistent");
+                .map_err(|error| format!("create true-peak limiter: {error}"))?;
+        let mut output = limiter.process(&data)?;
         let tail = limiter.finish();
         for (channel, tail) in output.iter_mut().zip(tail) {
             channel.extend(tail);
         }
         buf.data = output;
-        return;
+        return Ok(());
     }
     let ceil_lin = 10.0_f64.powf(plan.ceiling_db / 20.0) as f32;
     for ch in buf.data.iter_mut() {
         simd::apply_gain_and_hard_clip(ch, gain, ceil_lin);
     }
+    Ok(())
 }
 
 pub fn load<P: AsRef<Path>>(path: P) -> Result<AudioBuffer, String> {
     decoder::decode(path.as_ref())
+}
+
+pub(crate) fn capture_stable_input(path: &Path) -> Result<StableInput, String> {
+    let options = StableInputOptions::new(u64::MAX).map_err(|error| error.to_string())?;
+    StableInput::from_path(path, &options).map_err(|error| error.to_string())
+}
+
+fn verify_stable_inputs(inputs: &[StableInput], context: &str) -> Result<(), String> {
+    for input in inputs {
+        input.verify_source().map_err(|error| {
+            let source = input.source_path().map_or_else(
+                || "in-memory input".to_owned(),
+                |path| path.display().to_string(),
+            );
+            format!("{context}: {source}: {error}")
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_output_aliases(inputs: &[StableInput], outputs: &[PathBuf]) -> Result<(), String> {
+    let mut keys = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        for input in inputs {
+            if input
+                .aliases_source_path(output)
+                .map_err(|error| error.to_string())?
+            {
+                return Err(format!(
+                    "output aliases a protected input: {}",
+                    output.display()
+                ));
+            }
+        }
+        for previous in &outputs[..keys.len()] {
+            if paths_alias_if_existing(previous, output).map_err(|error| error.to_string())? {
+                return Err(format!(
+                    "multiple outputs alias the same file: {} and {}",
+                    previous.display(),
+                    output.display()
+                ));
+            }
+        }
+        let key = lexical_absolute_path(output)?;
+        if keys.contains(&key) {
+            return Err(format!(
+                "multiple outputs resolve to the same path: {}",
+                output.display()
+            ));
+        }
+        keys.push(key);
+    }
+    Ok(())
+}
+
+fn lexical_absolute_path(path: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("read current directory: {error}"))?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(format!(
+                        "output path escapes its filesystem root: {}",
+                        path.display()
+                    ));
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
 }
 
 fn validate_audio_buffer_geometry(buf: &AudioBuffer) -> Result<(), String> {
@@ -859,6 +1049,21 @@ fn validate_audio_buffer_geometry(buf: &AudioBuffer) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_audio_buffer_samples(buf: &AudioBuffer) -> Result<(), String> {
+    for (channel, samples) in buf.data.iter().enumerate() {
+        if let Some((frame, _)) = samples
+            .iter()
+            .enumerate()
+            .find(|(_, sample)| !sample.is_finite())
+        {
+            return Err(format!(
+                "audio buffer contains a non-finite sample at frame {frame}, channel {channel}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn write<P: AsRef<Path>>(
     buf: &AudioBuffer,
     path: P,
@@ -866,15 +1071,21 @@ pub fn write<P: AsRef<Path>>(
     format: OutputFormat,
 ) -> Result<(), String> {
     let p = path.as_ref();
+    // Validate format-independent caller data before consulting optional
+    // encoder availability. This keeps malformed in-memory PCM a deterministic
+    // error even in builds that intentionally omit a codec feature.
+    plan.validate()?;
     validate_audio_buffer_geometry(buf)?;
-    validate_supported_output_sample_rate(buf.sample_rate)?;
-    validate_output_channel_layout(
+    validate_audio_buffer_samples(buf)?;
+    validate_plan_for_signal(
+        plan,
         format,
+        buf.sample_rate,
         buf.channels,
         &buf.channel_roles,
+        buf.source_kind,
         LayoutAliasPolicy::ExplicitLegacy,
     )?;
-    validate_output_encoder_available(format)?;
     match format {
         OutputFormat::Wav => {
             let kind = plan.output_kind.unwrap_or(buf.source_kind);
@@ -990,7 +1201,39 @@ pub fn analyze_file_for_plan<P: AsRef<Path>>(
     channel_roles: Option<&[ChannelRole]>,
     plan: &Plan,
 ) -> Result<Analysis, String> {
-    Ok(prepare_file_for_plan(path.as_ref(), channel_roles, plan, false)?.analysis)
+    plan.validate()?;
+    let input = capture_stable_input(path.as_ref())?;
+    let analysis = analyze_stable_input_for_plan_unbound(&input, channel_roles, plan)?;
+    verify_stable_inputs(
+        std::slice::from_ref(&input),
+        "input changed during analysis",
+    )?;
+    Ok(analysis)
+}
+
+/// Analyze a captured input and bind the result to its exact bytes and
+/// output-domain measurement request.
+pub fn analyze_stable_input_for_plan(
+    input: &StableInput,
+    channel_roles: Option<&[ChannelRole]>,
+    plan: &Plan,
+) -> Result<BoundAnalysis, BoundAnalysisError> {
+    plan.validate()
+        .map_err(BoundAnalysisError::invalid_request)?;
+    let analysis = analyze_stable_input_for_plan_unbound(input, channel_roles, plan)
+        .map_err(BoundAnalysisError::analysis_failed)?;
+    input
+        .verify_source()
+        .map_err(|error| BoundAnalysisError::analysis_failed(error.to_string()))?;
+    BoundAnalysis::for_output_domain(input, analysis, channel_roles, plan)
+}
+
+pub(crate) fn analyze_stable_input_for_plan_unbound(
+    input: &StableInput,
+    channel_roles: Option<&[ChannelRole]>,
+    plan: &Plan,
+) -> Result<Analysis, String> {
+    Ok(prepare_file_for_plan(input.stable_path(), channel_roles, plan, false)?.analysis)
 }
 
 struct PreparedAnalysis {
@@ -1032,7 +1275,7 @@ fn prepare_file_for_plan(
     plan: &Plan,
     capture_spool: bool,
 ) -> Result<PreparedAnalysis, String> {
-    validate_plan_output_sample_rate(plan)?;
+    plan.validate()?;
     if analysis_pipeline_enabled(plan) {
         return prepare_file_for_plan_pipelined(path, channel_roles, plan, capture_spool);
     }
@@ -1574,6 +1817,44 @@ pub fn analyze_file_range_with_roles<P: AsRef<Path>>(
     duration_seconds: Option<f64>,
     timeline_interval_ms: Option<f64>,
 ) -> Result<TimedAnalysis, String> {
+    validate_analysis_range(start_seconds, duration_seconds, timeline_interval_ms)?;
+    let input = capture_stable_input(path.as_ref())?;
+    let result = analyze_stable_input_range(
+        &input,
+        channel_roles,
+        start_seconds,
+        duration_seconds,
+        timeline_interval_ms,
+    )?;
+    verify_stable_inputs(
+        std::slice::from_ref(&input),
+        "input changed during analysis",
+    )?;
+    Ok(result)
+}
+
+pub(crate) fn analyze_stable_input_range(
+    input: &StableInput,
+    channel_roles: Option<&[ChannelRole]>,
+    start_seconds: f64,
+    duration_seconds: Option<f64>,
+    timeline_interval_ms: Option<f64>,
+) -> Result<TimedAnalysis, String> {
+    validate_analysis_range(start_seconds, duration_seconds, timeline_interval_ms)?;
+    analyze_snapshot_range(
+        input.stable_path(),
+        channel_roles,
+        start_seconds,
+        duration_seconds,
+        timeline_interval_ms,
+    )
+}
+
+fn validate_analysis_range(
+    start_seconds: f64,
+    duration_seconds: Option<f64>,
+    timeline_interval_ms: Option<f64>,
+) -> Result<(), String> {
     if !start_seconds.is_finite() || start_seconds < 0.0 {
         return Err("analysis start must be a finite non-negative number".into());
     }
@@ -1583,57 +1864,64 @@ pub fn analyze_file_range_with_roles<P: AsRef<Path>>(
     if timeline_interval_ms.is_some_and(|value| !value.is_finite() || value <= 0.0) {
         return Err("timeline interval must be a finite positive number".into());
     }
+    Ok(())
+}
 
+fn analyze_snapshot_range(
+    path: &Path,
+    channel_roles: Option<&[ChannelRole]>,
+    start_seconds: f64,
+    duration_seconds: Option<f64>,
+    timeline_interval_ms: Option<f64>,
+) -> Result<TimedAnalysis, String> {
     const RANGE_COMPLETE: &str = "__forge_analysis_range_complete__";
     let mut analyzer: Option<lufs::StreamingAnalyzer> = None;
     let mut captured_info = None;
     let mut source_frames = 0usize;
-    let decoded =
-        decoder::decode_stream_with_layout(path.as_ref(), |info, layout_provenance, chunk| {
-            captured_info.get_or_insert_with(|| info.clone());
-            let roles =
-                resolve_stream_roles(path.as_ref(), info, layout_provenance, channel_roles)?;
-            let range_start = (start_seconds * info.sample_rate as f64).round() as usize;
-            let range_end = duration_seconds.map(|duration| {
-                range_start.saturating_add((duration * info.sample_rate as f64).round() as usize)
-            });
-            let chunk_start = source_frames;
-            let chunk_end = source_frames + chunk.first().map_or(0, Vec::len);
-            source_frames = chunk_end;
-            if range_end.is_some_and(|end| chunk_start >= end) {
-                return Err(RANGE_COMPLETE.into());
-            }
-            let selected_start = range_start.saturating_sub(chunk_start);
-            let selected_end = range_end
-                .map_or(chunk_end, |end| end.min(chunk_end))
-                .saturating_sub(chunk_start);
-            if selected_start < selected_end {
-                let selected = chunk
-                    .iter()
-                    .map(|channel| channel[selected_start..selected_end].to_vec())
-                    .collect::<Vec<_>>();
-                let interval_frames = timeline_interval_ms.map(|milliseconds| {
-                    ((info.sample_rate as f64 * milliseconds / 1_000.0).round() as usize).max(1)
-                });
-                let meter = analyzer.get_or_insert_with(|| {
-                    lufs::StreamingAnalyzer::with_timeline_interval(
-                        info.sample_rate,
-                        roles,
-                        interval_frames,
-                    )
-                });
-                meter.process(&selected)?;
-            }
-            if range_end.is_some_and(|end| chunk_end >= end) {
-                Err(RANGE_COMPLETE.into())
-            } else {
-                Ok(())
-            }
+    let decoded = decoder::decode_stream_with_layout(path, |info, layout_provenance, chunk| {
+        captured_info.get_or_insert_with(|| info.clone());
+        let roles = resolve_stream_roles(path, info, layout_provenance, channel_roles)?;
+        let range_start = (start_seconds * info.sample_rate as f64).round() as usize;
+        let range_end = duration_seconds.map(|duration| {
+            range_start.saturating_add((duration * info.sample_rate as f64).round() as usize)
         });
+        let chunk_start = source_frames;
+        let chunk_end = source_frames + chunk.first().map_or(0, Vec::len);
+        source_frames = chunk_end;
+        if range_end.is_some_and(|end| chunk_start >= end) {
+            return Err(RANGE_COMPLETE.into());
+        }
+        let selected_start = range_start.saturating_sub(chunk_start);
+        let selected_end = range_end
+            .map_or(chunk_end, |end| end.min(chunk_end))
+            .saturating_sub(chunk_start);
+        if selected_start < selected_end {
+            let selected = chunk
+                .iter()
+                .map(|channel| channel[selected_start..selected_end].to_vec())
+                .collect::<Vec<_>>();
+            let interval_frames = timeline_interval_ms.map(|milliseconds| {
+                ((info.sample_rate as f64 * milliseconds / 1_000.0).round() as usize).max(1)
+            });
+            let meter = analyzer.get_or_insert_with(|| {
+                lufs::StreamingAnalyzer::with_timeline_interval(
+                    info.sample_rate,
+                    roles,
+                    interval_frames,
+                )
+            });
+            meter.process(&selected)?;
+        }
+        if range_end.is_some_and(|end| chunk_end >= end) {
+            Err(RANGE_COMPLETE.into())
+        } else {
+            Ok(())
+        }
+    });
     let info = match decoded {
         Ok(info) => info,
         Err(error) if error == RANGE_COMPLETE => {
-            captured_info.ok_or_else(|| format!("{}: no audio decoded", path.as_ref().display()))?
+            captured_info.ok_or_else(|| format!("{}: no audio decoded", path.display()))?
         }
         Err(error) => return Err(error),
     };
@@ -1641,7 +1929,7 @@ pub fn analyze_file_range_with_roles<P: AsRef<Path>>(
         .ok_or_else(|| {
             format!(
                 "{}: requested analysis range contains no audio",
-                path.as_ref().display()
+                path.display()
             )
         })?
         .finish();
@@ -1851,11 +2139,15 @@ pub fn verify_file<P: AsRef<Path>>(
     plan: &Plan,
     tolerance: f64,
 ) -> Result<Verification, String> {
+    plan.validate()?;
     if !tolerance.is_finite() || tolerance < 0.0 {
         return Err("verification tolerance must be a finite non-negative number".into());
     }
+    if !gain.is_finite() || gain <= 0.0 {
+        return Err("verification gain must be a finite positive number".into());
+    }
     let output = analyze_file(output)?;
-    Ok(verify_analysis(&output, source, gain, plan, tolerance))
+    try_verify_analysis(&output, source, gain, plan, tolerance)
 }
 
 /// Verify an encoded output against a fixed intended level.
@@ -1868,8 +2160,12 @@ pub fn verify_file_at_level<P: AsRef<Path>>(
     plan: &Plan,
     tolerance: f64,
 ) -> Result<Verification, String> {
+    plan.validate()?;
     if !tolerance.is_finite() || tolerance < 0.0 {
         return Err("verification tolerance must be a finite non-negative number".into());
+    }
+    if !expected_level.is_finite() {
+        return Err("verification expected level must be finite".into());
     }
     verify_file_at_level_with_roles(output.as_ref(), expected_level, plan, tolerance, None)
 }
@@ -1897,10 +2193,51 @@ pub fn verify_analysis(
     plan: &Plan,
     tolerance: f64,
 ) -> Verification {
+    try_verify_analysis(output, source, gain, plan, tolerance).unwrap_or_else(|_| Verification {
+        output: output.clone(),
+        expected_level: f64::NAN,
+        actual_level: f64::NAN,
+        deviation: f64::INFINITY,
+        level_ok: false,
+        true_peak_ok: false,
+    })
+}
+
+/// Checked verification for already measured source and output signals.
+pub fn try_verify_analysis(
+    output: &Analysis,
+    source: &Analysis,
+    gain: f32,
+    plan: &Plan,
+    tolerance: f64,
+) -> Result<Verification, String> {
+    plan.validate()?;
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err("verification tolerance must be a finite non-negative number".into());
+    }
+    if !gain.is_finite() || gain <= 0.0 {
+        return Err("verification gain must be a finite positive number".into());
+    }
+    if !output.true_peak.is_finite() || output.true_peak < 0.0 {
+        return Err("output analysis true peak must be finite and non-negative".into());
+    }
     let gain_db = 20.0 * (gain as f64).log10();
     let source_level = analysis_level(source, plan.mode);
+    let output_level = analysis_level(output, plan.mode);
+    if source_level.is_nan()
+        || source_level == f64::INFINITY
+        || output_level.is_nan()
+        || output_level == f64::INFINITY
+    {
+        return Err("verification levels must be finite or negative infinity".into());
+    }
     let expected_level = source_level + gain_db;
-    verify_analysis_at_level(output, expected_level, plan, tolerance)
+    Ok(verify_analysis_at_level(
+        output,
+        expected_level,
+        plan,
+        tolerance,
+    ))
 }
 
 fn verify_analysis_at_level(
@@ -1942,6 +2279,75 @@ fn level_deviation(expected: f64, actual: f64) -> f64 {
         (actual - expected).abs()
     } else {
         f64::INFINITY
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AnalysisReuse<'a> {
+    Measure,
+    Legacy(&'a Analysis),
+    Bound(&'a BoundAnalysis),
+}
+
+fn analyses_identical(left: &Analysis, right: &Analysis) -> bool {
+    left.sample_rate == right.sample_rate
+        && left.channels == right.channels
+        && left.channel_roles == right.channel_roles
+        && left.frames == right.frames
+        && left.kind == right.kind
+        && left.lufs.to_bits() == right.lufs.to_bits()
+        && left.max_momentary_lufs.to_bits() == right.max_momentary_lufs.to_bits()
+        && left.max_short_term_lufs.to_bits() == right.max_short_term_lufs.to_bits()
+        && left.loudness_range_lu.to_bits() == right.loudness_range_lu.to_bits()
+        && left.rms_db.to_bits() == right.rms_db.to_bits()
+        && left.sample_peak.to_bits() == right.sample_peak.to_bits()
+        && left.true_peak.to_bits() == right.true_peak.to_bits()
+        && left.loudness_blocks.len() == right.loudness_blocks.len()
+        && left
+            .loudness_blocks
+            .iter()
+            .zip(&right.loudness_blocks)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
+fn prepare_analysis_for_render(
+    input: &StableInput,
+    channel_roles: Option<&[ChannelRole]>,
+    plan: &Plan,
+    reuse: AnalysisReuse<'_>,
+) -> Result<(Analysis, Option<PcmSpool>, LayoutAliasPolicy), String> {
+    match reuse {
+        AnalysisReuse::Measure => {
+            let prepared = prepare_file_for_plan(input.stable_path(), channel_roles, plan, true)?;
+            let policy =
+                LayoutAliasPolicy::for_override(channel_roles, &prepared.analysis.channel_roles)?;
+            Ok((prepared.analysis, prepared.spool, policy))
+        }
+        AnalysisReuse::Legacy(expected) => {
+            // A bare Analysis has no content or request identity. Remeasure the
+            // stable bytes and require exact agreement before rendering.
+            let prepared = prepare_file_for_plan(input.stable_path(), channel_roles, plan, true)?;
+            if !analyses_identical(&prepared.analysis, expected) {
+                return Err(
+                    "unbound precomputed analysis does not match the captured input and plan"
+                        .into(),
+                );
+            }
+            let policy =
+                LayoutAliasPolicy::for_override(channel_roles, &prepared.analysis.channel_roles)?;
+            Ok((prepared.analysis, prepared.spool, policy))
+        }
+        AnalysisReuse::Bound(bound) => {
+            bound
+                .validate_for_plan(input, plan)
+                .map_err(|error| error.to_string())?;
+            let policy = if bound.used_explicit_roles() {
+                LayoutAliasPolicy::ExplicitLegacy
+            } else {
+                LayoutAliasPolicy::ExactOnly
+            };
+            Ok((bound.analysis().clone(), None, policy))
+        }
     }
 }
 
@@ -1993,11 +2399,10 @@ pub fn normalize_one_staged_with_roles<P: AsRef<Path>>(
     )
 }
 
-/// Normalize using an analysis already measured for the same input, channel
-/// roles, output sample rate, and resampling quality.
+/// Compatibility entry point accepting an unbound precomputed analysis.
 ///
-/// This is useful for durable analysis caches. The caller is responsible for
-/// preserving that content and request binding.
+/// The input is measured again from a private snapshot and must match exactly;
+/// use [`normalize_one_bound`] for efficient, content-bound cache reuse.
 pub fn normalize_one_preanalyzed_with_roles<P: AsRef<Path>>(
     input: P,
     output: P,
@@ -2018,7 +2423,10 @@ pub fn normalize_one_preanalyzed_with_roles<P: AsRef<Path>>(
     Ok((analysis, gain))
 }
 
-/// Stage one output using a content-bound analysis supplied by the caller.
+/// Stage one output using an unbound compatibility analysis.
+///
+/// The supplied value is never trusted by itself and is checked against a new
+/// measurement of the captured input before rendering.
 ///
 /// The analysis must describe the same input, channel roles, output sample
 /// rate, and resampling quality as the supplied plan.
@@ -2057,7 +2465,7 @@ pub fn normalize_one_audited_with_roles<P: AsRef<Path>>(
     ))
 }
 
-/// Audited normalization using a content-bound, precomputed analysis.
+/// Audited normalization using an unbound compatibility analysis.
 pub fn normalize_one_preanalyzed_audited_with_roles<P: AsRef<Path>>(
     input: P,
     output: P,
@@ -2079,6 +2487,80 @@ pub fn normalize_one_preanalyzed_audited_with_roles<P: AsRef<Path>>(
         analysis,
         gain,
         render.expect("audited normalization captures render statistics"),
+    ))
+}
+
+/// Normalize an immutable input using a content- and request-bound analysis.
+///
+/// Unlike the legacy `*_preanalyzed_*` entry points, this API can reuse a
+/// cached measurement without decoding again because the binding is checked
+/// before any output is created.
+pub fn normalize_one_bound(
+    input: &StableInput,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    analysis: &BoundAnalysis,
+) -> Result<(Analysis, f32), BoundAnalysisError> {
+    let staged = normalize_one_bound_staged(input, output, plan, format, analysis)?;
+    let outcome = staged.commit().map_err(BoundAnalysisError::render_failed)?;
+    Ok((outcome.source, outcome.gain))
+}
+
+/// Render a bound input without publishing its destination.
+pub fn normalize_one_bound_staged(
+    input: &StableInput,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    analysis: &BoundAnalysis,
+) -> Result<StagedNormalization, BoundAnalysisError> {
+    plan.validate_for_format(format)
+        .map_err(BoundAnalysisError::invalid_request)?;
+    analysis.validate_for_plan(input, plan)?;
+    let channel_roles = analysis.explicit_roles();
+    normalize_one_staged_stable_impl(
+        input,
+        output,
+        plan,
+        format,
+        channel_roles,
+        AnalysisReuse::Bound(analysis),
+        false,
+    )
+    .map_err(BoundAnalysisError::render_failed)
+}
+
+/// Audited bound normalization with pre-codec render statistics.
+pub fn normalize_one_bound_audited(
+    input: &StableInput,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    analysis: &BoundAnalysis,
+) -> Result<(Analysis, f32, RenderStatistics), BoundAnalysisError> {
+    plan.validate_for_format(format)
+        .map_err(BoundAnalysisError::invalid_request)?;
+    analysis.validate_for_plan(input, plan)?;
+    let channel_roles = analysis.explicit_roles();
+    let outcome = normalize_one_staged_stable_impl(
+        input,
+        output,
+        plan,
+        format,
+        channel_roles,
+        AnalysisReuse::Bound(analysis),
+        true,
+    )
+    .map_err(BoundAnalysisError::render_failed)?
+    .commit()
+    .map_err(BoundAnalysisError::render_failed)?;
+    Ok((
+        outcome.source,
+        outcome.gain,
+        outcome
+            .render
+            .expect("audited bound normalization captures render statistics"),
     ))
 }
 
@@ -2113,25 +2595,63 @@ fn normalize_one_staged_with_roles_impl(
     preanalyzed: Option<&Analysis>,
     capture_statistics: bool,
 ) -> Result<StagedNormalization, String> {
-    validate_plan_output_sample_rate(plan)?;
-    if preanalyzed.is_none() {
-        validate_output_encoder_available(format)?;
+    plan.validate()?;
+    // A legacy pre-analysis is remeasured below before it can affect a render,
+    // but it can still prove that the requested container cannot represent the
+    // caller's declared speaker layout. Preserve that fail-fast contract
+    // before an optional encoder feature or input path is consulted.
+    if let Some(analysis) = preanalyzed {
+        let alias_policy = LayoutAliasPolicy::for_override(channel_roles, &analysis.channel_roles)?;
+        validate_output_channel_layout(
+            format,
+            analysis.channels,
+            &analysis.channel_roles,
+            alias_policy,
+        )?;
     }
-    let (an, mut source_spool) = if let Some(analysis) = preanalyzed {
-        (analysis.clone(), None)
-    } else {
-        let prepared = prepare_file_for_plan(input, channel_roles, plan, true)?;
-        (prepared.analysis, prepared.spool)
-    };
-    validate_supported_output_sample_rate(an.sample_rate)?;
-    let layout_alias_policy = LayoutAliasPolicy::for_override(channel_roles, &an.channel_roles)?;
-    validate_output_channel_layout(format, an.channels, &an.channel_roles, layout_alias_policy)?;
-    validate_output_encoder_available(format)?;
+    plan.validate_for_format(format)?;
+    let stable = capture_stable_input(input)?;
+    normalize_one_staged_stable_impl(
+        &stable,
+        output,
+        plan,
+        format,
+        channel_roles,
+        preanalyzed.map_or(AnalysisReuse::Measure, AnalysisReuse::Legacy),
+        capture_statistics,
+    )
+}
+
+fn normalize_one_staged_stable_impl(
+    input: &StableInput,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    channel_roles: Option<&[ChannelRole]>,
+    reuse: AnalysisReuse<'_>,
+    capture_statistics: bool,
+) -> Result<StagedNormalization, String> {
+    plan.validate_for_format(format)?;
+    validate_output_aliases(
+        std::slice::from_ref(input),
+        std::slice::from_ref(&output.to_owned()),
+    )?;
+    let (an, mut source_spool, layout_alias_policy) =
+        prepare_analysis_for_render(input, channel_roles, plan, reuse)?;
+    validate_plan_for_signal(
+        plan,
+        format,
+        an.sample_rate,
+        an.channels,
+        &an.channel_roles,
+        an.kind,
+        layout_alias_policy,
+    )?;
     let gain = compute_gain(&an, plan);
     let staged = AtomicOutput::new(output)?;
     let rendered = normalize_stream(
         StreamSource {
-            path: input,
+            path: input.stable_path(),
             spool: source_spool.as_mut(),
         },
         staged.path(),
@@ -2148,7 +2668,7 @@ fn normalize_one_staged_with_roles_impl(
         },
     )?;
     finalize_metadata(
-        input,
+        input.stable_path(),
         staged.path(),
         format,
         None,
@@ -2163,6 +2683,7 @@ fn normalize_one_staged_with_roles_impl(
             gain,
             render: rendered.statistics,
         },
+        protected_inputs: vec![input.clone()],
     })
 }
 
@@ -2203,7 +2724,9 @@ pub fn normalize_one_corrected_with_roles<P: AsRef<Path>>(
     )
 }
 
-/// Corrected normalization using a content-bound, precomputed analysis.
+/// Corrected normalization using an unbound compatibility analysis.
+///
+/// The captured input is remeasured and must match exactly before encoding.
 #[allow(clippy::too_many_arguments)]
 pub fn normalize_one_preanalyzed_corrected_with_roles<P: AsRef<Path>>(
     input: P,
@@ -2227,6 +2750,33 @@ pub fn normalize_one_preanalyzed_corrected_with_roles<P: AsRef<Path>>(
     )
 }
 
+/// Corrected normalization from a content- and request-bound analysis.
+pub fn normalize_one_bound_corrected(
+    input: &StableInput,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    tolerance: f64,
+    max_retries: usize,
+    analysis: &BoundAnalysis,
+) -> Result<CorrectedNormalization, BoundAnalysisError> {
+    plan.validate_for_format(format)
+        .map_err(BoundAnalysisError::invalid_request)?;
+    analysis.validate_for_plan(input, plan)?;
+    let channel_roles = analysis.explicit_roles();
+    normalize_one_corrected_stable_impl(
+        input,
+        output,
+        plan,
+        format,
+        tolerance,
+        max_retries,
+        channel_roles,
+        AnalysisReuse::Bound(analysis),
+    )
+    .map_err(BoundAnalysisError::render_failed)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn normalize_one_corrected_with_optional_analysis(
     input: &Path,
@@ -2238,29 +2788,53 @@ fn normalize_one_corrected_with_optional_analysis(
     channel_roles: Option<&[ChannelRole]>,
     preanalyzed: Option<&Analysis>,
 ) -> Result<CorrectedNormalization, String> {
+    plan.validate_for_format(format)?;
     if !tolerance.is_finite() || tolerance < 0.0 {
         return Err("verification tolerance must be a finite non-negative number".into());
     }
-    validate_plan_output_sample_rate(plan)?;
-    if preanalyzed.is_none() {
-        validate_output_encoder_available(format)?;
-    }
-    let (source, mut source_spool) = if let Some(analysis) = preanalyzed {
-        (analysis.clone(), None)
-    } else {
-        let prepared = prepare_file_for_plan(input, channel_roles, plan, true)?;
-        (prepared.analysis, prepared.spool)
-    };
-    validate_supported_output_sample_rate(source.sample_rate)?;
-    let layout_alias_policy =
-        LayoutAliasPolicy::for_override(channel_roles, &source.channel_roles)?;
-    validate_output_channel_layout(
+    let stable = capture_stable_input(input)?;
+    normalize_one_corrected_stable_impl(
+        &stable,
+        output,
+        plan,
         format,
+        tolerance,
+        max_retries,
+        channel_roles,
+        preanalyzed.map_or(AnalysisReuse::Measure, AnalysisReuse::Legacy),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_one_corrected_stable_impl(
+    input: &StableInput,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    tolerance: f64,
+    max_retries: usize,
+    channel_roles: Option<&[ChannelRole]>,
+    reuse: AnalysisReuse<'_>,
+) -> Result<CorrectedNormalization, String> {
+    plan.validate_for_format(format)?;
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err("verification tolerance must be a finite non-negative number".into());
+    }
+    validate_output_aliases(
+        std::slice::from_ref(input),
+        std::slice::from_ref(&output.to_owned()),
+    )?;
+    let (source, mut source_spool, layout_alias_policy) =
+        prepare_analysis_for_render(input, channel_roles, plan, reuse)?;
+    validate_plan_for_signal(
+        plan,
+        format,
+        source.sample_rate,
         source.channels,
         &source.channel_roles,
+        source.kind,
         layout_alias_policy,
     )?;
-    validate_output_encoder_available(format)?;
     let mut gain = compute_gain(&source, plan);
     let mut intended_level = None;
     let staged = AtomicOutput::new(output)?;
@@ -2268,7 +2842,7 @@ fn normalize_one_corrected_with_optional_analysis(
     for attempt in 0..=max_retries {
         let rendered = normalize_stream(
             StreamSource {
-                path: input,
+                path: input.stable_path(),
                 spool: source_spool.as_mut(),
             },
             staged.path(),
@@ -2302,13 +2876,17 @@ fn normalize_one_corrected_with_optional_analysis(
         };
         if verification.passed() {
             finalize_metadata(
-                input,
+                input.stable_path(),
                 staged.path(),
                 format,
                 channel_roles.is_none().then_some(&verification.output),
                 verification.output.lufs,
                 None,
                 plan,
+            )?;
+            verify_stable_inputs(
+                std::slice::from_ref(input),
+                "input changed before corrected output publication",
             )?;
             staged.commit()?;
             return Ok(CorrectedNormalization {
@@ -2335,7 +2913,7 @@ fn normalize_one_corrected_with_optional_analysis(
 /// feasible for every output's level tolerance and the common true-peak
 /// ceiling. Metadata-finalized outputs are still re-decoded before commit.
 pub(crate) fn normalize_multi_delivery_corrected_with_roles(
-    input: &Path,
+    input: &StableInput,
     outputs: &[PathBuf],
     plan: &Plan,
     formats: &[OutputFormat],
@@ -2352,11 +2930,11 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
     if !tolerance.is_finite() || tolerance < 0.0 {
         return Err("verification tolerance must be a finite non-negative number".into());
     }
-    validate_plan_output_sample_rate(plan)?;
     for format in formats {
-        validate_output_encoder_available(*format)?;
+        plan.validate_for_format(*format)?;
     }
-    let prepared = prepare_file_for_plan(input, channel_roles, plan, true)?;
+    validate_output_aliases(std::slice::from_ref(input), outputs)?;
+    let prepared = prepare_file_for_plan(input.stable_path(), channel_roles, plan, true)?;
     let source = prepared.analysis;
     let mut source_spool = prepared.spool;
     if plan.mode == Mode::Lufs && !source.lufs.is_finite() {
@@ -2365,10 +2943,13 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
     let layout_alias_policy =
         LayoutAliasPolicy::for_override(channel_roles, &source.channel_roles)?;
     for format in formats {
-        validate_output_channel_layout(
+        validate_plan_for_signal(
+            plan,
             *format,
+            source.sample_rate,
             source.channels,
             &source.channel_roles,
+            source.kind,
             layout_alias_policy,
         )?;
     }
@@ -2386,7 +2967,7 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
     for attempt in 0..=max_retries {
         let rendered = normalize_streams(
             StreamSource {
-                path: input,
+                path: input.stable_path(),
                 spool: source_spool.as_mut(),
             },
             &staged_paths,
@@ -2434,7 +3015,7 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
         if verifications.iter().all(Verification::passed) {
             for ((output, format), decoded) in staged_paths.iter().zip(formats).zip(&decoded) {
                 finalize_metadata(
-                    input,
+                    input.stable_path(),
                     output,
                     *format,
                     channel_roles.is_none().then_some(decoded),
@@ -2458,6 +3039,10 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
                     "multi-delivery verification failed after final metadata was written".into(),
                 );
             }
+            verify_stable_inputs(
+                std::slice::from_ref(input),
+                "input changed before multi-delivery publication",
+            )?;
             for output in staged {
                 output.commit()?;
             }
@@ -2493,10 +3078,32 @@ pub fn album_lufs(analyses: &[Analysis]) -> f64 {
 /// Album-mode gain: a single shared gain from the album loudness, constrained
 /// by the worst (largest) true peak across all files so nothing exceeds the ceiling.
 pub fn album_gain(analyses: &[Analysis], plan: &Plan) -> f32 {
+    try_album_gain(analyses, plan).unwrap_or(1.0)
+}
+
+/// Checked album gain calculation.
+pub fn try_album_gain(analyses: &[Analysis], plan: &Plan) -> Result<f32, String> {
+    plan.validate()?;
+    if analyses.is_empty() {
+        return Err("cannot calculate gain for an empty album".into());
+    }
+    if analyses
+        .iter()
+        .any(|analysis| !analysis.true_peak.is_finite() || analysis.true_peak < 0.0)
+    {
+        return Err("album analyses contain an invalid true peak".into());
+    }
     let album_l = album_lufs(analyses);
+    if album_l.is_nan() || album_l == f64::INFINITY {
+        return Err("album loudness must be finite or negative infinity".into());
+    }
     let gain_db = plan.target_lufs - album_l;
     let worst_tp = analyses.iter().map(|a| a.true_peak).fold(0.0f32, f32::max);
-    clamp_gain(10.0_f64.powf(gain_db / 20.0), worst_tp as f64, plan)
+    Ok(clamp_gain(
+        10.0_f64.powf(gain_db / 20.0),
+        worst_tp as f64,
+        plan,
+    ))
 }
 
 /// Album mode: measure every file, compute one shared gain, then apply it to
@@ -2534,7 +3141,9 @@ pub fn normalize_album_with_roles(
     )
 }
 
-/// Album normalization using one content-bound analysis per input.
+/// Album normalization using unbound compatibility analyses.
+///
+/// Every track is remeasured from its captured input before rendering.
 pub fn normalize_album_preanalyzed_with_roles(
     inputs: &[PathBuf],
     outputs: &[PathBuf],
@@ -2578,7 +3187,7 @@ pub fn normalize_album_audited_with_roles(
     )
 }
 
-/// Audited album normalization using content-bound precomputed analyses.
+/// Audited album normalization using unbound compatibility analyses.
 pub fn normalize_album_preanalyzed_audited_with_roles(
     inputs: &[PathBuf],
     outputs: &[PathBuf],
@@ -2607,6 +3216,115 @@ pub fn normalize_album_preanalyzed_audited_with_roles(
     .collect())
 }
 
+/// Normalize an album from immutable inputs and content-bound analyses.
+///
+/// Every analysis must correspond to the input at the same index and to the
+/// supplied output-domain plan. All live sources are checked again before any
+/// destination is published.
+pub fn normalize_album_bound(
+    inputs: &[StableInput],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    analyses: &[BoundAnalysis],
+) -> Result<Vec<(Analysis, f32)>, BoundAnalysisError> {
+    let channel_roles = validate_bound_album_request(inputs, outputs, plan, formats, analyses)?;
+    normalize_album_stable_impl(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        channel_roles.as_deref(),
+        None,
+        Some(analyses),
+        false,
+    )
+    .map(|results| {
+        results
+            .into_iter()
+            .map(|(analysis, gain, _)| (analysis, gain))
+            .collect()
+    })
+    .map_err(BoundAnalysisError::render_failed)
+}
+
+/// Audited album normalization from immutable inputs and bound analyses.
+pub fn normalize_album_bound_audited(
+    inputs: &[StableInput],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    analyses: &[BoundAnalysis],
+) -> Result<Vec<(Analysis, f32, RenderStatistics)>, BoundAnalysisError> {
+    let channel_roles = validate_bound_album_request(inputs, outputs, plan, formats, analyses)?;
+    normalize_album_stable_impl(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        channel_roles.as_deref(),
+        None,
+        Some(analyses),
+        true,
+    )
+    .map(|results| {
+        results
+            .into_iter()
+            .map(|(analysis, gain, render)| {
+                (
+                    analysis,
+                    gain,
+                    render.expect("audited bound album normalization captures statistics"),
+                )
+            })
+            .collect()
+    })
+    .map_err(BoundAnalysisError::render_failed)
+}
+
+fn validate_bound_album_request(
+    inputs: &[StableInput],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    analyses: &[BoundAnalysis],
+) -> Result<Option<Vec<ChannelRole>>, BoundAnalysisError> {
+    if inputs.is_empty() {
+        return Err(BoundAnalysisError::invalid_request(
+            "cannot normalize an empty album",
+        ));
+    }
+    if inputs.len() != outputs.len()
+        || inputs.len() != formats.len()
+        || inputs.len() != analyses.len()
+    {
+        return Err(BoundAnalysisError::invalid_request(
+            "bound album input/output/format/analysis count mismatch",
+        ));
+    }
+    for format in formats {
+        plan.validate_for_format(*format)
+            .map_err(BoundAnalysisError::invalid_request)?;
+    }
+    for (input, analysis) in inputs.iter().zip(analyses) {
+        analysis.validate_for_plan(input, plan)?;
+    }
+    validate_output_aliases(inputs, outputs).map_err(BoundAnalysisError::invalid_request)?;
+    let channel_roles = analyses
+        .first()
+        .and_then(BoundAnalysis::explicit_roles)
+        .map(<[ChannelRole]>::to_vec);
+    if analyses
+        .iter()
+        .any(|analysis| analysis.explicit_roles() != channel_roles.as_deref())
+    {
+        return Err(BoundAnalysisError::invalid_request(
+            "bound album analyses must use one common explicit channel layout",
+        ));
+    }
+    Ok(channel_roles)
+}
+
 fn normalize_album_with_roles_impl(
     inputs: &[PathBuf],
     outputs: &[PathBuf],
@@ -2622,45 +3340,124 @@ fn normalize_album_with_roles_impl(
     if inputs.len() != outputs.len() {
         return Err("album input/output count mismatch".into());
     }
+    if inputs.len() != formats.len() {
+        return Err("album input/format count mismatch".into());
+    }
     if preanalyzed.is_some_and(|analyses| analyses.len() != inputs.len()) {
         return Err("album precomputed analysis/input count mismatch".into());
     }
-    validate_plan_output_sample_rate(plan)?;
-    if preanalyzed.is_none() {
-        for format in formats {
-            validate_output_encoder_available(*format)?;
-        }
+    for format in formats {
+        plan.validate_for_format(*format)?;
     }
-    let analyses = if let Some(analyses) = preanalyzed {
-        analyses.to_vec()
-    } else {
-        // Do not retain one raw PCM temporary file per track. Large albums can
-        // otherwise exhaust file descriptors or temporary storage before the
-        // shared gain is known. The plan-aware analyzer still removes the old
-        // extra source-rate analysis pass when resampling.
-        let measured = inputs
-            .par_iter()
-            .map(|path| analyze_file_for_plan(path, channel_roles, plan))
-            .collect::<Vec<_>>();
-        measured.into_iter().collect::<Result<Vec<_>, _>>()?
-    };
-    for analysis in &analyses {
-        validate_supported_output_sample_rate(analysis.sample_rate)?;
-    }
-    let layout_alias_policies = analyses
-        .iter()
-        .map(|analysis| LayoutAliasPolicy::for_override(channel_roles, &analysis.channel_roles))
+    let captured = inputs
+        .par_iter()
+        .map(|path| capture_stable_input(path))
+        .collect::<Vec<_>>()
+        .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
-    for (index, analysis) in analyses.iter().enumerate() {
-        validate_output_channel_layout(
-            formats.get(index).copied().unwrap_or(OutputFormat::Wav),
-            analysis.channels,
-            &analysis.channel_roles,
-            layout_alias_policies[index],
-        )?;
+    normalize_album_stable_impl(
+        &captured,
+        outputs,
+        plan,
+        formats,
+        channel_roles,
+        preanalyzed,
+        None,
+        capture_statistics,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_album_stable_impl(
+    captured: &[StableInput],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    channel_roles: Option<&[ChannelRole]>,
+    preanalyzed: Option<&[Analysis]>,
+    bound_analyses: Option<&[BoundAnalysis]>,
+    capture_statistics: bool,
+) -> Result<Vec<(Analysis, f32, Option<RenderStatistics>)>, String> {
+    if captured.is_empty() {
+        return Err("cannot normalize an empty album".into());
+    }
+    if captured.len() != outputs.len() {
+        return Err("album input/output count mismatch".into());
+    }
+    if captured.len() != formats.len() {
+        return Err("album input/format count mismatch".into());
+    }
+    if preanalyzed.is_some() && bound_analyses.is_some() {
+        return Err("album analysis reuse modes are mutually exclusive".into());
+    }
+    if preanalyzed.is_some_and(|analyses| analyses.len() != captured.len())
+        || bound_analyses.is_some_and(|analyses| analyses.len() != captured.len())
+    {
+        return Err("album precomputed analysis/input count mismatch".into());
     }
     for format in formats {
-        validate_output_encoder_available(*format)?;
+        plan.validate_for_format(*format)?;
+    }
+    validate_output_aliases(captured, outputs)?;
+    let analyses = if let Some(bound) = bound_analyses {
+        captured
+            .iter()
+            .zip(bound)
+            .map(|(input, analysis)| {
+                analysis
+                    .validate_for_plan(input, plan)
+                    .map(|_| analysis.analysis().clone())
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let measured = captured
+            .par_iter()
+            .map(|input| analyze_stable_input_for_plan_unbound(input, channel_roles, plan))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(expected) = preanalyzed {
+            if measured
+                .iter()
+                .zip(expected)
+                .any(|(measured, expected)| !analyses_identical(measured, expected))
+            {
+                return Err(
+                    "one or more unbound album analyses do not match the captured inputs and plan"
+                        .into(),
+                );
+            }
+        }
+        measured
+    };
+    let layout_alias_policies = if let Some(bound) = bound_analyses {
+        bound
+            .iter()
+            .map(|analysis| {
+                if analysis.used_explicit_roles() {
+                    LayoutAliasPolicy::ExplicitLegacy
+                } else {
+                    LayoutAliasPolicy::ExactOnly
+                }
+            })
+            .collect()
+    } else {
+        analyses
+            .iter()
+            .map(|analysis| LayoutAliasPolicy::for_override(channel_roles, &analysis.channel_roles))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (index, analysis) in analyses.iter().enumerate() {
+        validate_plan_for_signal(
+            plan,
+            formats[index],
+            analysis.sample_rate,
+            analysis.channels,
+            &analysis.channel_roles,
+            analysis.kind,
+            layout_alias_policies[index],
+        )?;
     }
     let gain = album_gain(&analyses, plan);
     let album_output_lufs = album_lufs(&analyses) + gain_db(gain);
@@ -2673,15 +3470,15 @@ fn normalize_album_with_roles_impl(
         .iter()
         .map(|output| output.path().to_owned())
         .collect::<Vec<_>>();
-    let rendered = inputs
+    let rendered = captured
         .par_iter()
         .zip(staged_paths.par_iter())
         .enumerate()
         .map(|(i, (input, output))| {
-            let fmt = formats.get(i).copied().unwrap_or(OutputFormat::Wav);
+            let fmt = formats[i];
             normalize_stream(
                 StreamSource {
-                    path: input,
+                    path: input.stable_path(),
                     spool: None,
                 },
                 output,
@@ -2718,15 +3515,15 @@ fn normalize_album_with_roles_impl(
         })
         .transpose()?;
     let album_metadata = metadata_outputs.as_deref().map(album_loudness_metadata);
-    let finalized = inputs
+    let finalized = captured
         .par_iter()
         .zip(staged_paths.par_iter())
         .enumerate()
         .map(|(index, (input, output))| {
-            let format = formats.get(index).copied().unwrap_or(OutputFormat::Wav);
+            let format = formats[index];
             let measured = metadata_outputs.as_ref().map(|analyses| &analyses[index]);
             finalize_metadata(
-                input,
+                input.stable_path(),
                 output,
                 format,
                 measured,
@@ -2742,6 +3539,7 @@ fn normalize_album_with_roles_impl(
         .zip(statistics)
         .map(|(analysis, statistics)| (analysis, gain, statistics))
         .collect();
+    verify_stable_inputs(captured, "album input changed before output publication")?;
     for output in staged {
         output.commit()?;
     }
@@ -2791,7 +3589,7 @@ pub fn normalize_album_corrected_with_roles(
     )
 }
 
-/// Corrected album normalization using content-bound precomputed analyses.
+/// Corrected album normalization using unbound compatibility analyses.
 #[allow(clippy::too_many_arguments)]
 pub fn normalize_album_preanalyzed_corrected_with_roles(
     inputs: &[PathBuf],
@@ -2815,6 +3613,37 @@ pub fn normalize_album_preanalyzed_corrected_with_roles(
     )
 }
 
+/// Corrected album normalization from immutable inputs and bound analyses.
+#[allow(clippy::too_many_arguments)]
+pub fn normalize_album_bound_corrected(
+    inputs: &[StableInput],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    tolerance: f64,
+    max_retries: usize,
+    analyses: &[BoundAnalysis],
+) -> Result<CorrectedAlbumNormalization, BoundAnalysisError> {
+    let channel_roles = validate_bound_album_request(inputs, outputs, plan, formats, analyses)?;
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err(BoundAnalysisError::invalid_request(
+            "verification tolerance must be a finite non-negative number",
+        ));
+    }
+    normalize_album_corrected_stable_impl(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        tolerance,
+        max_retries,
+        channel_roles.as_deref(),
+        None,
+        Some(analyses),
+    )
+    .map_err(BoundAnalysisError::render_failed)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn normalize_album_corrected_with_optional_analyses(
     inputs: &[PathBuf],
@@ -2832,44 +3661,132 @@ fn normalize_album_corrected_with_optional_analyses(
     if inputs.len() != outputs.len() {
         return Err("album input/output count mismatch".into());
     }
+    if inputs.len() != formats.len() {
+        return Err("album input/format count mismatch".into());
+    }
     if !tolerance.is_finite() || tolerance < 0.0 {
         return Err("verification tolerance must be a finite non-negative number".into());
     }
     if preanalyzed.is_some_and(|analyses| analyses.len() != inputs.len()) {
         return Err("album precomputed analysis/input count mismatch".into());
     }
-    validate_plan_output_sample_rate(plan)?;
-    if preanalyzed.is_none() {
-        for format in formats {
-            validate_output_encoder_available(*format)?;
-        }
+    for format in formats {
+        plan.validate_for_format(*format)?;
     }
-    let sources = if let Some(analyses) = preanalyzed {
-        analyses.to_vec()
-    } else {
-        let measured = inputs
-            .par_iter()
-            .map(|path| analyze_file_for_plan(path, channel_roles, plan))
-            .collect::<Vec<_>>();
-        measured.into_iter().collect::<Result<Vec<_>, _>>()?
-    };
-    for source in &sources {
-        validate_supported_output_sample_rate(source.sample_rate)?;
-    }
-    let layout_alias_policies = sources
-        .iter()
-        .map(|source| LayoutAliasPolicy::for_override(channel_roles, &source.channel_roles))
+    let captured = inputs
+        .par_iter()
+        .map(|path| capture_stable_input(path))
+        .collect::<Vec<_>>()
+        .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
-    for (index, source) in sources.iter().enumerate() {
-        validate_output_channel_layout(
-            formats.get(index).copied().unwrap_or(OutputFormat::Wav),
-            source.channels,
-            &source.channel_roles,
-            layout_alias_policies[index],
-        )?;
+    normalize_album_corrected_stable_impl(
+        &captured,
+        outputs,
+        plan,
+        formats,
+        tolerance,
+        max_retries,
+        channel_roles,
+        preanalyzed,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_album_corrected_stable_impl(
+    captured: &[StableInput],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    tolerance: f64,
+    max_retries: usize,
+    channel_roles: Option<&[ChannelRole]>,
+    preanalyzed: Option<&[Analysis]>,
+    bound_analyses: Option<&[BoundAnalysis]>,
+) -> Result<CorrectedAlbumNormalization, String> {
+    if captured.is_empty() {
+        return Err("cannot correct an empty album".into());
+    }
+    if captured.len() != outputs.len() {
+        return Err("album input/output count mismatch".into());
+    }
+    if captured.len() != formats.len() {
+        return Err("album input/format count mismatch".into());
+    }
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err("verification tolerance must be a finite non-negative number".into());
+    }
+    if preanalyzed.is_some() && bound_analyses.is_some() {
+        return Err("album analysis reuse modes are mutually exclusive".into());
+    }
+    if preanalyzed.is_some_and(|analyses| analyses.len() != captured.len())
+        || bound_analyses.is_some_and(|analyses| analyses.len() != captured.len())
+    {
+        return Err("album precomputed analysis/input count mismatch".into());
     }
     for format in formats {
-        validate_output_encoder_available(*format)?;
+        plan.validate_for_format(*format)?;
+    }
+    validate_output_aliases(captured, outputs)?;
+    let sources = if let Some(bound) = bound_analyses {
+        captured
+            .iter()
+            .zip(bound)
+            .map(|(input, analysis)| {
+                analysis
+                    .validate_for_plan(input, plan)
+                    .map(|_| analysis.analysis().clone())
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let measured = captured
+            .par_iter()
+            .map(|input| analyze_stable_input_for_plan_unbound(input, channel_roles, plan))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(expected) = preanalyzed {
+            if measured
+                .iter()
+                .zip(expected)
+                .any(|(measured, expected)| !analyses_identical(measured, expected))
+            {
+                return Err(
+                    "one or more unbound album analyses do not match the captured inputs and plan"
+                        .into(),
+                );
+            }
+        }
+        measured
+    };
+    let layout_alias_policies = if let Some(bound) = bound_analyses {
+        bound
+            .iter()
+            .map(|analysis| {
+                if analysis.used_explicit_roles() {
+                    LayoutAliasPolicy::ExplicitLegacy
+                } else {
+                    LayoutAliasPolicy::ExactOnly
+                }
+            })
+            .collect()
+    } else {
+        sources
+            .iter()
+            .map(|source| LayoutAliasPolicy::for_override(channel_roles, &source.channel_roles))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (index, source) in sources.iter().enumerate() {
+        validate_plan_for_signal(
+            plan,
+            formats[index],
+            source.sample_rate,
+            source.channels,
+            &source.channel_roles,
+            source.kind,
+            layout_alias_policies[index],
+        )?;
     }
     let mut gain = album_gain(&sources, plan);
     let mut intended_album_lufs = None;
@@ -2885,15 +3802,15 @@ fn normalize_album_corrected_with_optional_analyses(
 
     for attempt in 0..=max_retries {
         let album_output_lufs = album_lufs(&sources) + gain_db(gain);
-        let rendered = inputs
+        let rendered = captured
             .par_iter()
             .zip(staged_paths.par_iter())
             .enumerate()
             .map(|(index, (input, output))| {
-                let format = formats.get(index).copied().unwrap_or(OutputFormat::Wav);
+                let format = formats[index];
                 normalize_stream(
                     StreamSource {
-                        path: input,
+                        path: input.stable_path(),
                         spool: None,
                     },
                     output,
@@ -2976,14 +3893,14 @@ fn normalize_album_corrected_with_optional_analyses(
                 None
             };
             let album_metadata = metadata_outputs.as_deref().map(album_loudness_metadata);
-            for (index, (input, output)) in inputs.iter().zip(&staged_paths).enumerate() {
-                let format = formats.get(index).copied().unwrap_or(OutputFormat::Wav);
+            for (index, (input, output)) in captured.iter().zip(&staged_paths).enumerate() {
+                let format = formats[index];
                 let measured = metadata_outputs
                     .as_ref()
                     .map(|analyses| &analyses[index])
                     .or_else(|| channel_roles.is_none().then_some(&decoded[index]));
                 finalize_metadata(
-                    input,
+                    input.stable_path(),
                     output,
                     format,
                     measured,
@@ -2992,6 +3909,10 @@ fn normalize_album_corrected_with_optional_analyses(
                     plan,
                 )?;
             }
+            verify_stable_inputs(
+                captured,
+                "album input changed before corrected output publication",
+            )?;
             for output in staged {
                 output.commit()?;
             }
@@ -4400,6 +5321,215 @@ impl LayoutAliasPolicy {
     }
 }
 
+fn validate_representable_linear_db(name: &str, value: f64) -> Result<(), String> {
+    let linear = 10.0_f64.powf(value / 20.0) as f32;
+    if linear.is_finite() && linear > 0.0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "normalization plan {name} is outside the representable linear f32 range"
+        ))
+    }
+}
+
+fn validate_mp3_sample_rate(sample_rate: u32) -> Result<(), String> {
+    if matches!(
+        sample_rate,
+        8_000 | 11_025 | 12_000 | 16_000 | 22_050 | 24_000 | 32_000 | 44_100 | 48_000
+    ) {
+        Ok(())
+    } else {
+        Err(format!(
+            "MP3 output sample rate {sample_rate} Hz is unsupported; use 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, or 48000 Hz"
+        ))
+    }
+}
+
+fn validate_mp3_bitrate(bitrate_kbps: i32, sample_rate: Option<u32>) -> Result<(), String> {
+    const MPEG1: &[i32] = &[
+        32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    ];
+    const MPEG2: &[i32] = &[8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+    let allowed = match sample_rate {
+        Some(32_000 | 44_100 | 48_000) => MPEG1,
+        Some(8_000 | 11_025 | 12_000 | 16_000 | 22_050 | 24_000) => MPEG2,
+        Some(sample_rate) => {
+            validate_mp3_sample_rate(sample_rate)?;
+            unreachable!("validated MP3 sample rate belongs to an MPEG family")
+        }
+        None => {
+            if MPEG1.contains(&bitrate_kbps) || MPEG2.contains(&bitrate_kbps) {
+                return Ok(());
+            }
+            return Err("MP3 bitrate is not a supported MPEG CBR value".into());
+        }
+    };
+    if allowed.contains(&bitrate_kbps) {
+        Ok(())
+    } else {
+        Err(format!(
+            "MP3 bitrate {bitrate_kbps} kbps is unsupported at {} Hz",
+            sample_rate.expect("sample rate selected an MPEG family")
+        ))
+    }
+}
+
+fn validate_aac_sample_rate(sample_rate: u32) -> Result<(), String> {
+    const AAC_SAMPLE_RATES: [u32; 12] = [
+        8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 64_000, 88_200,
+        96_000,
+    ];
+    if AAC_SAMPLE_RATES.contains(&sample_rate) {
+        Ok(())
+    } else {
+        Err(format!(
+            "AAC encoder cannot preserve unsupported sample rate {sample_rate} Hz"
+        ))
+    }
+}
+
+fn aac_bitrate_range(sample_rate: u32, channels: u16) -> (i32, i32) {
+    let maximum = (u64::from(sample_rate) * 6 * u64::from(channels) / 1_000).min(1_024) as i32;
+    (8, maximum)
+}
+
+fn vorbis_bitrate_range(sample_rate: u32, channels: u16) -> Option<(i32, i32)> {
+    let (minimum_per_channel_bps, maximum_per_channel_bps) = match (sample_rate, channels) {
+        (8_000..=8_999, 2) => (6_000_i64, 32_000_i64),
+        (8_000..=8_999, 1 | 6 | 8) => (8_000, 42_000),
+        (9_000..=14_999, 2) => (8_000, 44_000),
+        (9_000..=14_999, 1 | 6 | 8) => (12_000, 50_000),
+        (15_000..=18_999, 2) => (12_000, 86_000),
+        (15_000..=18_999, 1 | 6 | 8) => (16_000, 100_000),
+        (19_000..=25_999, 2) => (15_000, 86_000),
+        (19_000..=25_999, 1 | 6 | 8) => (16_000, 90_000),
+        (26_000..=39_999, 2) => (18_000, 190_000),
+        (26_000..=39_999, 1 | 6 | 8) => (30_000, 190_000),
+        (40_000..=50_000, 2) => (22_500, 250_001),
+        (40_000..=70_000, 6) => (14_000, 240_001),
+        (40_000..=50_000, 1 | 8) => (32_000, 240_001),
+        _ => return None,
+    };
+    let channels = i64::from(channels);
+    let exact_minimum_kbps = (minimum_per_channel_bps * channels + 999).checked_div(1_000)?;
+    let minimum_kbps = (exact_minimum_kbps + 7).checked_div(8)?.checked_mul(8)?;
+    let maximum_kbps = (maximum_per_channel_bps * channels)
+        .checked_div(1_000)?
+        .min(1_024);
+    Some((
+        i32::try_from(minimum_kbps).ok()?,
+        i32::try_from(maximum_kbps).ok()?,
+    ))
+}
+
+fn validate_plan_format_settings(
+    plan: &Plan,
+    format: OutputFormat,
+    sample_rate: Option<u32>,
+    channels: Option<u16>,
+) -> Result<(), String> {
+    match format {
+        OutputFormat::Wav | OutputFormat::Flac | OutputFormat::Alac => Ok(()),
+        OutputFormat::Mp3 => {
+            if let Some(sample_rate) = sample_rate {
+                validate_mp3_sample_rate(sample_rate)?;
+            }
+            validate_mp3_bitrate(plan.mp3_bitrate, sample_rate)?;
+            if !(0..=9).contains(&plan.mp3_quality) {
+                return Err("MP3 encoder quality must be between 0 and 9".into());
+            }
+            Ok(())
+        }
+        OutputFormat::Opus => {
+            let bitrate_bps = plan
+                .mp3_bitrate
+                .checked_mul(1_000)
+                .ok_or_else(|| "Opus bitrate exceeds the supported range".to_string())?;
+            if !(500..=512_000).contains(&bitrate_bps) {
+                return Err(
+                    "Opus bitrate must be between 1 and 512 kbps at the integer-kbps API".into(),
+                );
+            }
+            Ok(())
+        }
+        OutputFormat::M4a => {
+            if let Some(sample_rate) = sample_rate {
+                validate_aac_sample_rate(sample_rate)?;
+            }
+            let (minimum, maximum) = match (sample_rate, channels) {
+                (Some(sample_rate), Some(channels)) => aac_bitrate_range(sample_rate, channels),
+                _ => (8, 1_024),
+            };
+            if !(minimum..=maximum).contains(&plan.mp3_bitrate) {
+                return Err(format!(
+                    "AAC bitrate must be between {minimum} and {maximum} kbps for the selected signal"
+                ));
+            }
+            Ok(())
+        }
+        OutputFormat::Vorbis => {
+            if let Some(sample_rate) = sample_rate {
+                if !(8_000..=70_000).contains(&sample_rate) {
+                    return Err(format!(
+                        "Vorbis managed-bitrate encoding does not support {sample_rate} Hz"
+                    ));
+                }
+            }
+            if let (Some(sample_rate), Some(channels)) = (sample_rate, channels) {
+                let (minimum, maximum) =
+                    vorbis_bitrate_range(sample_rate, channels).ok_or_else(|| {
+                        format!(
+                            "Vorbis {channels}-channel managed-bitrate encoding does not support {sample_rate} Hz"
+                        )
+                    })?;
+                if !(minimum..=maximum).contains(&plan.mp3_bitrate) {
+                    return Err(format!(
+                        "Vorbis {channels}-channel bitrate at {sample_rate} Hz must be between {minimum} and {maximum} kbps"
+                    ));
+                }
+            } else if !(8..=1_024).contains(&plan.mp3_bitrate) {
+                return Err("Vorbis bitrate must be between 8 and 1024 kbps".into());
+            }
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_plan_for_signal(
+    plan: &Plan,
+    format: OutputFormat,
+    sample_rate: u32,
+    channels: u16,
+    roles: &[ChannelRole],
+    source_kind: PcmKind,
+    alias_policy: LayoutAliasPolicy,
+) -> Result<(), String> {
+    plan.validate()?;
+    validate_supported_output_sample_rate(sample_rate)?;
+    if plan
+        .output_sample_rate
+        .is_some_and(|requested| requested != sample_rate)
+    {
+        return Err(format!(
+            "plan output sample rate does not match the {sample_rate} Hz output-domain signal"
+        ));
+    }
+    if channels == 0 {
+        return Err("output signal must contain at least one channel".into());
+    }
+    validate_output_channel_layout(format, channels, roles, alias_policy)?;
+    validate_plan_format_settings(plan, format, Some(sample_rate), Some(channels))?;
+    validate_output_encoder_available(format)?;
+    if format == OutputFormat::Wav
+        && plan.dither
+        && plan.output_kind.unwrap_or(source_kind).is_float()
+    {
+        return Err("WAVE dither requires an integer PCM output kind".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_output_encoder_available(format: OutputFormat) -> Result<(), String> {
     match format {
         #[cfg(not(feature = "mp3-encoding"))]
@@ -4896,6 +6026,236 @@ mod tests {
             output_sample_rate: None,
             resample_quality: ResampleQuality::Balanced,
         }
+    }
+
+    fn write_mono_tone(path: &Path, amplitude: f32) {
+        let frames = 48_000;
+        let samples = (0..frames)
+            .map(|frame| {
+                amplitude * (std::f32::consts::TAU * 440.0 * frame as f32 / 48_000.0).sin()
+            })
+            .collect::<Vec<_>>();
+        WavWriter::write(
+            path,
+            &AudioBuffer {
+                sample_rate: 48_000,
+                channels: 1,
+                frames,
+                data: vec![samples],
+                channel_roles: default_channel_roles(1),
+                source_kind: PcmKind::F32,
+            },
+            PcmKind::S16,
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn every_non_finite_plan_value_fails_before_input_or_output_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing_input = directory.path().join("missing.wav");
+        let output = directory.path().join("existing.wav");
+        let mut cases = Vec::new();
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut value = plan();
+            value.target_lufs = invalid;
+            cases.push(("target_lufs", value));
+            let mut value = plan();
+            value.target_peak_db = invalid;
+            cases.push(("target_peak_db", value));
+            let mut value = plan();
+            value.target_rms_db = invalid;
+            cases.push(("target_rms_db", value));
+            let mut value = plan();
+            value.ceiling_db = invalid;
+            cases.push(("ceiling_db", value));
+            let mut value = plan();
+            value.max_gain_db = Some(invalid);
+            cases.push(("max_gain_db", value));
+            let mut value = plan();
+            value.limiter = Some(LimiterConfig {
+                lookahead_ms: invalid,
+                release_ms: 100.0,
+            });
+            cases.push(("limiter look-ahead", value));
+            let mut value = plan();
+            value.limiter = Some(LimiterConfig {
+                lookahead_ms: 5.0,
+                release_ms: invalid,
+            });
+            cases.push(("limiter release", value));
+        }
+
+        for (field, invalid_plan) in cases {
+            std::fs::write(&output, b"existing destination").unwrap();
+            let error = normalize_one(&missing_input, &output, &invalid_plan, OutputFormat::Wav)
+                .unwrap_err();
+            assert!(error.contains(field), "{field}: {error}");
+            assert_eq!(std::fs::read(&output).unwrap(), b"existing destination");
+        }
+    }
+
+    #[test]
+    fn format_numeric_settings_fail_before_input_or_output_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing_input = directory.path().join("missing.wav");
+        let output = directory.path().join("existing.bin");
+        let cases = [
+            (OutputFormat::Mp3, 7, 2, "MP3 bitrate"),
+            (OutputFormat::Mp3, 192, 10, "quality"),
+            (OutputFormat::Opus, 513, 2, "Opus bitrate"),
+            (OutputFormat::M4a, 1_025, 2, "AAC bitrate"),
+            (OutputFormat::Vorbis, 1_025, 2, "Vorbis bitrate"),
+        ];
+        for (format, bitrate, quality, diagnostic) in cases {
+            let mut invalid_plan = plan();
+            invalid_plan.mp3_bitrate = bitrate;
+            invalid_plan.mp3_quality = quality;
+            std::fs::write(&output, b"existing destination").unwrap();
+            let error = normalize_one(&missing_input, &output, &invalid_plan, format).unwrap_err();
+            assert!(error.contains(diagnostic), "{format:?}: {error}");
+            assert_eq!(std::fs::read(&output).unwrap(), b"existing destination");
+        }
+    }
+
+    #[test]
+    fn non_finite_pcm_is_rejected_without_mutation_or_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("existing.wav");
+        for kind in [
+            PcmKind::U8,
+            PcmKind::S16,
+            PcmKind::S24,
+            PcmKind::S32,
+            PcmKind::F32,
+            PcmKind::F64,
+        ] {
+            for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut buffer = AudioBuffer {
+                    sample_rate: 48_000,
+                    channels: 1,
+                    frames: 3,
+                    data: vec![vec![0.25, invalid, -0.25]],
+                    channel_roles: default_channel_roles(1),
+                    source_kind: kind,
+                };
+                let original = buffer.data.clone();
+                std::fs::write(&output, b"existing destination").unwrap();
+                let error = write(&buffer, &output, &plan(), OutputFormat::Wav).unwrap_err();
+                assert!(error.contains("non-finite sample"), "{kind:?}: {error}");
+                assert_eq!(std::fs::read(&output).unwrap(), b"existing destination");
+
+                assert!(try_apply_gain_and_protect(&mut buffer, 1.0, &plan()).is_err());
+                for (actual, expected) in buffer.data[0].iter().zip(&original[0]) {
+                    assert_eq!(actual.to_bits(), expected.to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn staged_commit_rejects_same_length_source_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("source.wav");
+        let replacement = directory.path().join("replacement.wav");
+        let output = directory.path().join("output.wav");
+        write_mono_tone(&input, 0.1);
+        write_mono_tone(&replacement, 0.2);
+        assert_eq!(
+            std::fs::metadata(&input).unwrap().len(),
+            std::fs::metadata(&replacement).unwrap().len()
+        );
+        std::fs::write(&output, b"existing destination").unwrap();
+
+        let staged =
+            normalize_one_staged_with_roles(&input, &output, &plan(), OutputFormat::Wav, None)
+                .unwrap();
+        std::fs::copy(&replacement, &input).unwrap();
+        let error = staged.commit().unwrap_err();
+        assert!(error.contains("input changed"), "{error}");
+        assert_eq!(std::fs::read(&output).unwrap(), b"existing destination");
+    }
+
+    #[test]
+    fn bound_album_rejects_a_changed_second_track_before_any_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.wav");
+        let second = directory.path().join("second.wav");
+        let replacement = directory.path().join("replacement.wav");
+        let first_output = directory.path().join("first-output.wav");
+        let second_output = directory.path().join("second-output.wav");
+        write_mono_tone(&first, 0.1);
+        write_mono_tone(&second, 0.15);
+        write_mono_tone(&replacement, 0.2);
+        let options = StableInputOptions::new(u64::MAX).unwrap();
+        let inputs = vec![
+            StableInput::from_path(&first, &options).unwrap(),
+            StableInput::from_path(&second, &options).unwrap(),
+        ];
+        let analyses = inputs
+            .iter()
+            .map(|input| analyze_stable_input_for_plan(input, None, &plan()).unwrap())
+            .collect::<Vec<_>>();
+        std::fs::write(&first_output, b"first destination").unwrap();
+        std::fs::write(&second_output, b"second destination").unwrap();
+        std::fs::copy(&replacement, &second).unwrap();
+
+        let error = normalize_album_bound(
+            &inputs,
+            &[first_output.clone(), second_output.clone()],
+            &plan(),
+            &[OutputFormat::Wav, OutputFormat::Wav],
+            &analyses,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("input changed"));
+        assert_eq!(std::fs::read(&first_output).unwrap(), b"first destination");
+        assert_eq!(
+            std::fs::read(&second_output).unwrap(),
+            b"second destination"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn album_rejects_input_output_and_output_output_hardlink_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.wav");
+        let second = directory.path().join("second.wav");
+        let output_a = directory.path().join("a.wav");
+        let output_b = directory.path().join("b.wav");
+        write_mono_tone(&first, 0.1);
+        write_mono_tone(&second, 0.2);
+        std::fs::hard_link(&second, &output_a).unwrap();
+        std::fs::write(&output_b, b"second destination").unwrap();
+        let second_before = std::fs::read(&second).unwrap();
+
+        let error = normalize_album(
+            &[first.clone(), second.clone()],
+            &[output_a.clone(), output_b.clone()],
+            &plan(),
+            &[OutputFormat::Wav, OutputFormat::Wav],
+        )
+        .unwrap_err();
+        assert!(error.contains("aliases a protected input"), "{error}");
+        assert_eq!(std::fs::read(&second).unwrap(), second_before);
+        assert_eq!(std::fs::read(&output_b).unwrap(), b"second destination");
+
+        std::fs::remove_file(&output_a).unwrap();
+        std::fs::write(&output_a, b"shared destination").unwrap();
+        std::fs::remove_file(&output_b).unwrap();
+        std::fs::hard_link(&output_a, &output_b).unwrap();
+        let error = normalize_album(
+            &[first, second],
+            &[output_a.clone(), output_b.clone()],
+            &plan(),
+            &[OutputFormat::Wav, OutputFormat::Wav],
+        )
+        .unwrap_err();
+        assert!(error.contains("multiple outputs alias"), "{error}");
+        assert_eq!(std::fs::read(&output_a).unwrap(), b"shared destination");
+        assert_eq!(std::fs::read(&output_b).unwrap(), b"shared destination");
     }
 
     #[test]
