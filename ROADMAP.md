@@ -601,6 +601,11 @@ The first two slices target no more than 2% wall-time regression on the common
 analysis path. Enabling compensated accumulation may use up to 5%, while the
 existing 48 kHz stereo release gate remains 15%. Any deliberate numeric change
 will increment the analysis revision and ship with a fixed migration fixture.
+Candidate benchmarks will require baseline report identity only when the
+analysis revision is unchanged; an approved revision change instead uses that
+migration fixture, while candidate worker-count and backend parity remains
+byte-exact. Performance gates will prefer round-paired statistics and separate
+unchanged controls from paths whose normative work factor changed.
 
 ## Provisional release sequence
 
