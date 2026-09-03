@@ -269,10 +269,6 @@ impl BoundInput {
             snapshot.as_file_mut(),
             self.max_input_bytes.get(),
         )?;
-        snapshot
-            .as_file_mut()
-            .sync_all()
-            .map_err(|error| StableInputError::io("sync private input snapshot", error))?;
         if copied != self.binding.byte_len() || snapshot_sha256 != *self.binding.sha256() {
             return Err(StableInputError::source_changed(
                 "source changed while its private snapshot was captured",
@@ -359,10 +355,6 @@ impl StableInput {
             .as_file_mut()
             .write_all(bytes)
             .map_err(|error| StableInputError::io("write private input snapshot", error))?;
-        snapshot
-            .as_file_mut()
-            .sync_all()
-            .map_err(|error| StableInputError::io("sync private input snapshot", error))?;
         let (snapshot_len, snapshot_sha256) = hash_open_file(
             snapshot.as_file(),
             options.max_input_bytes.get(),
@@ -405,10 +397,6 @@ impl StableInput {
                 "source length changed while its private snapshot was captured",
             ));
         }
-        snapshot
-            .as_file_mut()
-            .sync_all()
-            .map_err(|error| StableInputError::io("sync private input snapshot", error))?;
         let source = LiveSource {
             path: path.to_owned(),
             canonical: opened.canonical,
@@ -658,6 +646,9 @@ fn ensure_within_limit(
 }
 
 fn create_snapshot(source_name_hint: Option<&Path>) -> Result<NamedTempFile, StableInputError> {
+    // The snapshot is process-local scratch state, not a restartable artifact.
+    // Completed writes are immediately visible to its open file descriptor;
+    // durability flushes belong only to final output publication.
     let mut builder = Builder::new();
     builder.prefix("forge-stable-input-");
     let suffix = source_name_hint.and_then(snapshot_suffix);

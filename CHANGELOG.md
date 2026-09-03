@@ -42,6 +42,9 @@ tags and keeps public compatibility commitments in
 - Derive multi-delivery source hashes from the exact snapshot that was
   normalized, and bind segment request, manifest, and audio reads to bounded
   snapshots instead of independently reopening mutable paths.
+- Avoid durability flushes for process-local input snapshots while retaining
+  complete content hashing and live-source verification, reducing the latency
+  added by stable input capture.
 
 ## 0.189.2 - 2026-09-03
 
