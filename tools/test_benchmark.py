@@ -52,6 +52,45 @@ class BenchmarkTests(unittest.TestCase):
             schedule[4:8],
         )
 
+    def test_paired_change_reduces_each_balanced_block_before_comparing(self):
+        result = {
+            "schedule": paired_benchmark.alternating_schedule(2),
+            "baseline_samples": [
+                {"wall_seconds": value} for value in (10.0, 10.0, 100.0, 100.0)
+            ],
+            "candidate_samples": [
+                {"wall_seconds": value} for value in (11.0, 11.0, 101.0, 101.0)
+            ],
+        }
+        changes = paired_benchmark.paired_round_changes(
+            result, lambda sample: sample["wall_seconds"]
+        )
+        self.assertEqual(len(changes), 2)
+        self.assertAlmostEqual(changes[0], 10.0)
+        self.assertAlmostEqual(changes[1], 1.0)
+        self.assertAlmostEqual(
+            paired_benchmark.paired_median_change_percent(
+                result, lambda sample: sample["wall_seconds"]
+            ),
+            5.5,
+        )
+
+    def test_paired_change_rejects_an_unbalanced_block(self):
+        result = {
+            "schedule": [
+                paired_benchmark.BASELINE,
+                paired_benchmark.BASELINE,
+                paired_benchmark.BASELINE,
+                paired_benchmark.CANDIDATE,
+            ],
+            "baseline_samples": [{"value": 1.0}] * 3,
+            "candidate_samples": [{"value": 1.0}],
+        }
+        with self.assertRaisesRegex(ValueError, "not balanced"):
+            paired_benchmark.paired_round_changes(
+                result, lambda sample: sample["value"]
+            )
+
     def test_repeated_measurements_use_medians_and_maximum_rss(self):
         summary = benchmark.aggregate_measurements([
             {

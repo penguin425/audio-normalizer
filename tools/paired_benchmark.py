@@ -13,12 +13,13 @@ import argparse
 import json
 import os
 import platform
+import statistics
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import benchmark
 
@@ -40,6 +41,72 @@ def alternating_schedule(rounds: int, *, inverted: bool = False) -> list[str]:
         else:
             schedule.extend((CANDIDATE, BASELINE, BASELINE, CANDIDATE))
     return schedule
+
+
+def paired_round_changes(
+    result: dict[str, Any],
+    value: Callable[[dict[str, Any]], float],
+) -> list[float]:
+    """Return one baseline/candidate change for each balanced four-run block.
+
+    Each B-C-C-B or C-B-B-C block brackets both binaries against the same
+    short hosted-runner interval. Reducing within the block before comparing
+    prevents monotonic runner drift from being misclassified as a binary
+    regression, which pooling all baseline and candidate samples separately
+    cannot guarantee.
+    """
+
+    schedule = result["schedule"]
+    baseline_samples = result["baseline_samples"]
+    candidate_samples = result["candidate_samples"]
+    if len(schedule) % 4 != 0:
+        raise ValueError("paired benchmark schedule is not a whole number of blocks")
+
+    baseline_index = 0
+    candidate_index = 0
+    changes = []
+    for start in range(0, len(schedule), 4):
+        block = schedule[start : start + 4]
+        if block.count(BASELINE) != 2 or block.count(CANDIDATE) != 2:
+            raise ValueError("paired benchmark block is not balanced")
+        baseline_values = []
+        candidate_values = []
+        for label in block:
+            if label == BASELINE:
+                if baseline_index >= len(baseline_samples):
+                    raise ValueError("paired benchmark is missing a baseline sample")
+                baseline_values.append(value(baseline_samples[baseline_index]))
+                baseline_index += 1
+            elif label == CANDIDATE:
+                if candidate_index >= len(candidate_samples):
+                    raise ValueError("paired benchmark is missing a candidate sample")
+                candidate_values.append(value(candidate_samples[candidate_index]))
+                candidate_index += 1
+            else:
+                raise ValueError(f"unknown paired benchmark schedule label: {label}")
+        baseline_value = statistics.fmean(baseline_values)
+        candidate_value = statistics.fmean(candidate_values)
+        if baseline_value <= 0.0:
+            raise ValueError("paired benchmark baseline value must be positive")
+        changes.append((candidate_value / baseline_value - 1.0) * 100.0)
+
+    if baseline_index != len(baseline_samples):
+        raise ValueError("paired benchmark has unused baseline samples")
+    if candidate_index != len(candidate_samples):
+        raise ValueError("paired benchmark has unused candidate samples")
+    return changes
+
+
+def paired_median_change_percent(
+    result: dict[str, Any],
+    value: Callable[[dict[str, Any]], float],
+) -> float:
+    """Return the median percent change across balanced schedule blocks."""
+
+    changes = paired_round_changes(result, value)
+    if not changes:
+        raise ValueError("paired benchmark has no complete blocks")
+    return statistics.median(changes)
 
 
 def parse_args() -> argparse.Namespace:

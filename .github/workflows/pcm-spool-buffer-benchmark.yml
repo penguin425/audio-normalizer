@@ -217,14 +217,18 @@ jobs:
             run_benchmark "${mode}"
           done
 
-      - name: Summarize pooled medians
+      - name: Summarize paired comparisons
         if: always()
         shell: bash
         run: |
           python3 - <<'PY'
           import json
           import statistics
+          import sys
           from pathlib import Path
+
+          sys.path.insert(0, "candidate/tools")
+          import paired_benchmark
 
           summary = {"system": {}, "modes": {}, "complete": True}
           for mode in ("default", "one"):
@@ -255,6 +259,14 @@ jobs:
                           "candidate": candidate_value,
                           "change_percent": (candidate_value / base_value - 1.0) * 100.0,
                       }
+                  row["metrics"]["wall_seconds"]["pooled_change_percent"] = row[
+                      "metrics"
+                  ]["wall_seconds"]["change_percent"]
+                  row["metrics"]["wall_seconds"]["change_percent"] = (
+                      paired_benchmark.paired_median_change_percent(
+                          result, lambda sample: sample["wall_seconds"]
+                      )
+                  )
                   base_cpu = statistics.median(
                       sample["user_cpu_seconds"] + sample["system_cpu_seconds"]
                       for sample in baseline
@@ -268,6 +280,16 @@ jobs:
                       "candidate": candidate_cpu,
                       "change_percent": (candidate_cpu / base_cpu - 1.0) * 100.0,
                   }
+                  row["metrics"]["total_cpu_seconds"]["pooled_change_percent"] = row[
+                      "metrics"
+                  ]["total_cpu_seconds"]["change_percent"]
+                  row["metrics"]["total_cpu_seconds"]["change_percent"] = (
+                      paired_benchmark.paired_median_change_percent(
+                          result,
+                          lambda sample: sample["user_cpu_seconds"]
+                          + sample["system_cpu_seconds"],
+                      )
+                  )
                   rows[case_id] = row
               summary["modes"][mode] = rows
 
@@ -353,14 +375,28 @@ jobs:
                   metrics = row["metrics"]
                   wall = metrics["wall_seconds"]["change_percent"]
                   cpu = metrics["total_cpu_seconds"]["change_percent"]
+                  pooled_wall = metrics["wall_seconds"]["pooled_change_percent"]
+                  pooled_cpu = metrics["total_cpu_seconds"]["pooled_change_percent"]
                   rss = metrics["peak_rss_bytes"]
                   rss_delta = rss["candidate"] - rss["baseline"]
-                  # Multicore wall time on hosted runners can move independently
-                  # of aggregate CPU (the unchanged FLAC control did so during
-                  # calibration). Keep broad per-case tripwires, then enforce
-                  # path-specific and pooled gates below.
+                  # The balanced-block statistic is authoritative. Retain
+                  # separately pooled medians only as broad tripwires for a
+                  # gross regression that somehow affects every unpaired
+                  # sample while escaping the round-paired comparisons.
                   assert wall <= 10.0, (mode, case_id, "wall", wall)
                   assert cpu <= 8.0, (mode, case_id, "cpu", cpu)
+                  assert pooled_wall <= 20.0, (
+                      mode,
+                      case_id,
+                      "pooled wall",
+                      pooled_wall,
+                  )
+                  assert pooled_cpu <= 20.0, (
+                      mode,
+                      case_id,
+                      "pooled CPU",
+                      pooled_cpu,
+                  )
                   assert rss_delta <= 132 * 1024 * 1024, (
                       mode,
                       case_id,
@@ -419,7 +455,11 @@ jobs:
           python3 - <<'PY'
           import json
           import statistics
+          import sys
           from pathlib import Path
+
+          sys.path.insert(0, "candidate/tools")
+          import paired_benchmark
 
           def measurement_revision(root):
               prefix = 'pub const MEASUREMENT_ALGORITHM_REVISION: &str = "'
@@ -436,6 +476,7 @@ jobs:
           )
           isolated_limit = 8.0 if measurement_migration else 5.0
           average_limit = 5.0 if measurement_migration else 3.0
+          pooled_limit = 20.0 if measurement_migration else 15.0
           changes = []
           for mode in ("default", "one"):
               path = Path(f"long-{mode}.json")
@@ -457,8 +498,17 @@ jobs:
                   ):
                       base_value = statistics.median(map(getter, baseline))
                       candidate_value = statistics.median(map(getter, candidate))
-                      change = (candidate_value / base_value - 1.0) * 100.0
+                      pooled_change = (candidate_value / base_value - 1.0) * 100.0
+                      change = paired_benchmark.paired_median_change_percent(
+                          result, getter
+                      )
                       assert change <= isolated_limit, (mode, case_id, metric, change)
+                      assert pooled_change <= pooled_limit, (
+                          mode,
+                          case_id,
+                          f"pooled {metric}",
+                          pooled_change,
+                      )
                       changes.append(change)
                   rss_delta = max(
                       sample["peak_rss_bytes"] for sample in candidate
