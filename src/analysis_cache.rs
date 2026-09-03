@@ -6,15 +6,18 @@
 
 use crate::analysis::Analysis;
 use crate::atomic::AtomicOutput;
+use crate::bound_analysis::{
+    decoder_route_descriptor, BoundAnalysis, MEASUREMENT_ALGORITHM_REVISION,
+};
 use crate::dsp::lufs::LoudnessTimelinePoint;
 use crate::dsp::resample::ResampleQuality;
 use crate::normalize::{self, Plan, TimedAnalysis};
+use crate::stable_input::{StableInput, StableInputOptions};
 use crate::wav::{ChannelRole, PcmKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,10 +27,9 @@ pub const ANALYSIS_CACHE_SCHEMA_V1: &str =
 pub const ANALYSIS_CACHE_SCHEMA_V2: &str =
     "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v2";
 pub const MEASUREMENT_STANDARD: &str = "ITU-R BS.1770-5 / EBU R 128";
-pub const ALGORITHM_REVISION: &str = "forge-bs1770-5-r3";
+pub const ALGORITHM_REVISION: &str = MEASUREMENT_ALGORITHM_REVISION;
 
 const LAYOUT_VERSION: &str = "v2";
-const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CHANNELS: usize = 1024;
 const MAX_SCAN_ENTRIES: usize = 100_000;
@@ -107,7 +109,8 @@ impl AnalysisCache {
         path: &Path,
         channel_roles: Option<&[ChannelRole]>,
     ) -> Result<Cached<Analysis>, String> {
-        self.analyze_range(path, channel_roles, 0.0, None, None)
+        let input = capture_stable_input(path)?;
+        self.analyze_stable_range(&input, channel_roles, 0.0, None, None)
             .map(|cached| Cached {
                 value: cached.value.analysis,
                 disposition: cached.disposition,
@@ -131,9 +134,35 @@ impl AnalysisCache {
             timeline_interval_ms,
         };
         validate_request(&request)?;
-        self.lookup_or_compute(path, request, || {
-            normalize::analyze_file_range_with_roles(
-                path,
+        let input = capture_stable_input(path)?;
+        self.analyze_stable_range(
+            &input,
+            channel_roles,
+            start_seconds,
+            duration_seconds,
+            timeline_interval_ms,
+        )
+    }
+
+    /// Analyze a range from an already captured immutable input.
+    pub fn analyze_stable_range(
+        &self,
+        input: &StableInput,
+        channel_roles: Option<&[ChannelRole]>,
+        start_seconds: f64,
+        duration_seconds: Option<f64>,
+        timeline_interval_ms: Option<f64>,
+    ) -> Result<Cached<TimedAnalysis>, String> {
+        let request = RequestRecord::Range {
+            channel_roles: channel_roles.map(roles_to_records),
+            start_seconds,
+            duration_seconds,
+            timeline_interval_ms,
+        };
+        validate_request(&request)?;
+        self.lookup_or_compute(input, request, || {
+            normalize::analyze_stable_input_range(
+                input,
                 channel_roles,
                 start_seconds,
                 duration_seconds,
@@ -149,40 +178,64 @@ impl AnalysisCache {
         channel_roles: Option<&[ChannelRole]>,
         plan: &Plan,
     ) -> Result<Cached<Analysis>, String> {
+        plan.validate()?;
+        let input = capture_stable_input(path)?;
+        self.analyze_stable_for_plan(&input, channel_roles, plan)
+            .map(|cached| Cached {
+                value: cached.value.analysis().clone(),
+                disposition: cached.disposition,
+                warning: cached.warning,
+            })
+    }
+
+    /// Analyze, or load from cache, an output-domain signal while preserving
+    /// the content and request binding required for safe rendering.
+    pub fn analyze_stable_for_plan(
+        &self,
+        input: &StableInput,
+        channel_roles: Option<&[ChannelRole]>,
+        plan: &Plan,
+    ) -> Result<Cached<BoundAnalysis>, String> {
+        plan.validate()?;
         let request = RequestRecord::OutputDomain {
             channel_roles: channel_roles.map(roles_to_records),
             output_sample_rate_hz: plan.output_sample_rate,
             resample_quality: plan.resample_quality,
         };
         validate_request(&request)?;
-        self.lookup_or_compute(path, request, || {
-            normalize::analyze_file_for_plan(path, channel_roles, plan).map(|analysis| {
-                TimedAnalysis {
+        self.lookup_or_compute(input, request, || {
+            normalize::analyze_stable_input_for_plan_unbound(input, channel_roles, plan).map(
+                |analysis| TimedAnalysis {
                     analysis,
                     timeline: Vec::new(),
-                }
-            })
+                },
+            )
         })
-        .map(|cached| Cached {
-            value: cached.value.analysis,
-            disposition: cached.disposition,
-            warning: cached.warning,
+        .and_then(|cached| {
+            BoundAnalysis::for_output_domain(input, cached.value.analysis, channel_roles, plan)
+                .map(|value| Cached {
+                    value,
+                    disposition: cached.disposition,
+                    warning: cached.warning,
+                })
+                .map_err(|error| error.to_string())
         })
     }
 
     fn lookup_or_compute(
         &self,
-        input: &Path,
+        input: &StableInput,
         request: RequestRecord,
         compute: impl FnOnce() -> Result<TimedAnalysis, String>,
     ) -> Result<Cached<TimedAnalysis>, String> {
-        let input_sha256 = hash_file(input)?;
+        let input_sha256 = input.binding().sha256_hex();
         let request_bytes = serde_json::to_vec(&request)
             .map_err(|error| format!("encode analysis cache request: {error}"))?;
-        let request_sha256 = hash_bytes(&request_bytes);
+        let request_sha256 = hash_bound_request(input, &request_bytes);
         let path = self.entry_path(&input_sha256, &request_sha256);
         let invalid = match self.load(&path, &input_sha256, &request_sha256, &request)? {
             LoadResult::Hit(value) => {
+                input.verify_source().map_err(|error| error.to_string())?;
                 return Ok(Cached {
                     value,
                     disposition: CacheDisposition::Hit,
@@ -195,13 +248,7 @@ impl AnalysisCache {
 
         let value = compute()?;
         validate_timed_analysis(&value)?;
-        let hash_after_analysis = hash_file(input)?;
-        if hash_after_analysis != input_sha256 {
-            return Err(format!(
-                "{} changed while its analysis cache entry was being measured",
-                input.display()
-            ));
-        }
+        input.verify_source().map_err(|error| error.to_string())?;
         if self.policy.read_only {
             return Ok(Cached {
                 value,
@@ -258,6 +305,7 @@ impl AnalysisCache {
             .map_err(|_| "analysis cache mutation lock is poisoned".to_string())?;
         self.store(&path, &bytes)?;
         self.prune(&path)?;
+        input.verify_source().map_err(|error| error.to_string())?;
         Ok(Cached {
             value,
             disposition: if invalid.is_some() {
@@ -824,21 +872,23 @@ fn parse_pcm_kind(value: &str) -> Result<PcmKind, String> {
     }
 }
 
-fn hash_file(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path)
-        .map_err(|error| format!("open {} for content hash: {error}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; HASH_BUFFER_BYTES];
-    loop {
-        let count = file
-            .read(&mut buffer)
-            .map_err(|error| format!("hash {}: {error}", path.display()))?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    Ok(hex_digest(&hasher.finalize()))
+fn capture_stable_input(path: &Path) -> Result<StableInput, String> {
+    let options = StableInputOptions::new(u64::MAX).map_err(|error| error.to_string())?;
+    StableInput::from_path(path, &options).map_err(|error| error.to_string())
+}
+
+fn hash_bound_request(input: &StableInput, request_bytes: &[u8]) -> String {
+    let route = decoder_route_descriptor(input);
+    let mut digest = Sha256::new();
+    digest.update(b"forge-analysis-cache-request-binding-v1\0");
+    digest.update(input.binding().version().to_le_bytes());
+    digest.update((route.len() as u64).to_le_bytes());
+    digest.update(route.as_bytes());
+    digest.update((MEASUREMENT_ALGORITHM_REVISION.len() as u64).to_le_bytes());
+    digest.update(MEASUREMENT_ALGORITHM_REVISION.as_bytes());
+    digest.update((request_bytes.len() as u64).to_le_bytes());
+    digest.update(request_bytes);
+    hex_digest(&digest.finalize())
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
@@ -873,7 +923,8 @@ fn is_cache_filename(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wav::{AudioBuffer, WavWriter};
+    use crate::normalize::Mode;
+    use crate::wav::{AudioBuffer, WavContainer, WavWriter};
     use rayon::prelude::*;
 
     fn wav(path: &Path, amplitude: f32) {
@@ -901,6 +952,26 @@ mod tests {
             false,
         )
         .unwrap();
+    }
+
+    fn plan() -> Plan {
+        Plan {
+            mode: Mode::Lufs,
+            target_lufs: -16.0,
+            target_peak_db: -1.0,
+            target_rms_db: -18.0,
+            ceiling_db: -1.0,
+            max_gain_db: None,
+            dither: false,
+            output_kind: None,
+            mp3_bitrate: 192,
+            mp3_quality: 2,
+            limiter: None,
+            wav_container: WavContainer::Auto,
+            bwf: false,
+            output_sample_rate: None,
+            resample_quality: ResampleQuality::Balanced,
+        }
     }
 
     #[test]
@@ -1018,6 +1089,57 @@ mod tests {
                 .unwrap()
                 .disposition,
             CacheDisposition::Hit
+        );
+    }
+
+    #[test]
+    fn output_domain_hits_return_content_and_request_bound_analysis() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tone.wav");
+        wav(&path, 0.1);
+        let input = capture_stable_input(&path).unwrap();
+        let cache = AnalysisCache::new(
+            directory.path().join("cache"),
+            AnalysisCachePolicy::default(),
+        )
+        .unwrap();
+
+        let stored = cache
+            .analyze_stable_for_plan(&input, None, &plan())
+            .unwrap();
+        assert_eq!(stored.disposition, CacheDisposition::Stored);
+        assert_eq!(stored.value.input_binding(), input.binding());
+        stored.value.validate_for_plan(&input, &plan()).unwrap();
+
+        let hit = cache
+            .analyze_stable_for_plan(&input, None, &plan())
+            .unwrap();
+        assert_eq!(hit.disposition, CacheDisposition::Hit);
+        assert_eq!(hit.value.input_binding(), input.binding());
+        assert_eq!(stored.value.request_sha256(), hit.value.request_sha256());
+    }
+
+    #[test]
+    fn decoder_route_is_part_of_the_cache_address_without_changing_v2_schema() {
+        let wav_options = StableInputOptions::new(64)
+            .unwrap()
+            .with_source_name_hint("same.wav");
+        let flac_options = StableInputOptions::new(64)
+            .unwrap()
+            .with_source_name_hint("same.flac");
+        let wav_input = StableInput::from_bytes(b"identical", &wav_options).unwrap();
+        let flac_input = StableInput::from_bytes(b"identical", &flac_options).unwrap();
+        let request = RequestRecord::OutputDomain {
+            channel_roles: None,
+            output_sample_rate_hz: None,
+            resample_quality: ResampleQuality::Balanced,
+        };
+        let bytes = serde_json::to_vec(&request).unwrap();
+
+        assert_eq!(wav_input.binding(), flac_input.binding());
+        assert_ne!(
+            hash_bound_request(&wav_input, &bytes),
+            hash_bound_request(&flac_input, &bytes)
         );
     }
 
@@ -1228,15 +1350,16 @@ mod tests {
             duration_seconds: None,
             timeline_interval_ms: None,
         };
+        let stable = capture_stable_input(&input).unwrap();
         let error = cache
-            .lookup_or_compute(&input, request, || {
+            .lookup_or_compute(&stable, request, || {
                 let measured =
-                    normalize::analyze_file_range_with_roles(&input, None, 0.0, None, None)?;
+                    normalize::analyze_stable_input_range(&stable, None, 0.0, None, None)?;
                 fs::write(&input, b"changed during analysis").unwrap();
                 Ok(measured)
             })
             .unwrap_err();
-        assert!(error.contains("changed while"));
+        assert!(error.contains("changed"), "{error}");
         assert!(cache.recognized_entries().unwrap().is_empty());
     }
 }

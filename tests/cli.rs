@@ -374,6 +374,32 @@ fn recursive_dry_run_preserves_relative_directories() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[cfg(not(feature = "opus-encoding"))]
+#[test]
+fn dry_run_validates_an_optional_codec_request_without_requiring_its_encoder() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("tone.wav");
+    let output = directory.path().join("would-be.opus");
+    write_batch_test_wav(&input, 440.0);
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .arg("--dry-run")
+        .arg("--format")
+        .arg("opus")
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!output.exists());
+}
+
 #[test]
 fn content_addressed_analysis_cache_is_reused_by_real_normalization() {
     let directory = tempfile::tempdir().unwrap();

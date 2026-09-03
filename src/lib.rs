@@ -39,6 +39,7 @@ pub mod atsc_a85_service;
 pub mod audio_compare;
 pub mod batch;
 pub mod binaural_qc;
+pub mod bound_analysis;
 mod bwf_xml_qc;
 pub mod c_api;
 pub mod catalogue;
@@ -109,6 +110,7 @@ pub mod service;
 #[cfg(feature = "grpc-service")]
 pub mod service_grpc;
 pub mod service_metrics;
+pub mod stable_input;
 pub mod watch;
 pub mod wav;
 mod wavpack_qc;

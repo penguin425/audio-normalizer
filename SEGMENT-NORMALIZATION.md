@@ -151,6 +151,7 @@ Limits are part of the method and manifest:
 
 - request: at most 4 MiB;
 - pass-one plan: at most 16 MiB when consumed;
+- encoded audio input: at most 4 GiB per segment;
 - ordered segments: 2 to 4096;
 - decoded samples per segment: default 50,000,000, hard maximum 200,000,000;
 - smoothing: 1 to 10,000 ms, capped to half of each segment;

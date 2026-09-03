@@ -8,6 +8,41 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.189.3 - 2026-09-03
+
+### Added
+
+- Add bounded `StableInput` snapshots with versioned SHA-256
+  `InputContentBinding`, typed capture/verification errors, in-memory input
+  support, and live-source identity checks.
+- Add `BoundAnalysis` and bound single-file/album normalization APIs so a
+  reusable measurement carries its input bytes, decoder route, effective
+  channel layout, resampling request, and measurement revision.
+- Add checked gain and PCM-protection entry points, plus side-effect-free
+  `Plan` and output-format request validation for applications that need
+  explicit diagnostics.
+
+### Fixed
+
+- Keep analysis, cache hits, metadata copying, rendering, and codec correction
+  on one immutable input snapshot. Single-file, album,
+  batch/watch, segment, and multi-delivery publication now rejects source
+  replacement, same-length mutation, and protected hard-link aliases before
+  committing an output.
+- Stop trusting legacy unbound precomputed `Analysis` values for rendering;
+  compatibility entry points remeasure the captured bytes and require an
+  exact match, while the additive bound APIs safely reuse cache results.
+- Include the decoder route and measurement revision in analysis-cache
+  addressing, and preserve explicit channel-layout requests through
+  post-encode verification.
+- Validate every plan-wide finite value, limiter setting, codec bitrate,
+  encoder quality, output sample rate, channel geometry, and public PCM
+  buffer before decoding, starting an optional encoder, or touching a
+  destination. Non-finite PCM rejection is transactional.
+- Derive multi-delivery source hashes from the exact snapshot that was
+  normalized, and bind segment request, manifest, and audio reads to bounded
+  snapshots instead of independently reopening mutable paths.
+
 ## 0.189.2 - 2026-09-03
 
 ### Fixed

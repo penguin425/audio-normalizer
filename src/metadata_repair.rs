@@ -11,6 +11,9 @@ use crate::adm::{self, ProductionProfileMode, ProductionProfileResult};
 use crate::container_qc::{self, ContainerAudit};
 use crate::isobmff_loudness_repair::{self, DecodedLoudness, EncodedLoudness, TargetTrack};
 use crate::metadata;
+use crate::stable_input::{
+    identity_from_open_file, BoundInput, StableFileIdentity, StableInput, StableInputOptions,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -36,182 +39,95 @@ pub const HARD_MAX_DECODED_SAMPLES: u64 = 4_000_000_000;
 pub const DEFAULT_MAX_ALBUM_REFERENCES: u32 = 1_000;
 pub const HARD_MAX_ALBUM_REFERENCES: u32 = 10_000;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum FileIdentity {
-    #[cfg(unix)]
-    Unix { device: u64, inode: u64 },
-    #[cfg(windows)]
-    Windows { volume: u32, index: u64 },
-    #[cfg(not(any(unix, windows)))]
-    Canonical(PathBuf),
+type FileIdentity = StableFileIdentity;
+
+enum FileSnapshotState {
+    Bound(BoundInput),
+    Captured(StableInput),
 }
 
 struct FileSnapshot {
     path: PathBuf,
-    canonical: PathBuf,
-    _handle: File,
-    stable: tempfile::NamedTempFile,
     identity: FileIdentity,
     len: u64,
     sha256: String,
+    state: FileSnapshotState,
 }
 
 impl FileSnapshot {
     fn capture(path: &Path, max_bytes: u64, description: &str) -> Result<Self, String> {
-        let snapshot =
-            Self::bind(path, max_bytes, description)?.snapshot_contents(max_bytes, description)?;
-        snapshot.verify(
-            max_bytes,
-            &format!("{description} path changed while it was snapshotted"),
-        )?;
-        Ok(snapshot)
+        Self::bind(path, max_bytes, description)?.snapshot_contents(max_bytes, description)
     }
 
     /// Bind a path, open identity, length, and content hash without copying
     /// the payload. Album entries that resolve to the already-snapshotted
     /// selected track use this form so that track bytes are not stored twice.
     fn bind(path: &Path, max_bytes: u64, description: &str) -> Result<Self, String> {
-        let handle = File::open(path)
-            .map_err(|error| format!("open {description} {}: {error}", path.display()))?;
-        let canonical = fs::canonicalize(path)
-            .map_err(|error| format!("canonicalize {description} {}: {error}", path.display()))?;
-        let metadata = handle
-            .metadata()
-            .map_err(|error| format!("stat {description} {}: {error}", path.display()))?;
-        if !metadata.is_file() {
-            return Err(format!(
-                "{description} is not a regular file: {}",
-                path.display()
-            ));
-        }
-        if metadata.len() > max_bytes {
-            return Err(format!(
-                "{description} {} is {} bytes, above the configured byte limit {max_bytes}",
-                path.display(),
-                metadata.len()
-            ));
-        }
-        let identity = file_identity(&handle, &metadata, &canonical)?;
-        let sha256 = sha256_open_file(&handle, &canonical, max_bytes)?;
-        let suffix = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(|extension| format!(".{extension}"))
-            .unwrap_or_default();
-        let mut stable = tempfile::Builder::new()
-            .prefix("forge-metadata-input-")
-            .suffix(&suffix)
-            .tempfile()
-            .map_err(|error| format!("create private {description} snapshot: {error}"))?;
-        stable
-            .as_file_mut()
-            .sync_all()
-            .map_err(|error| format!("sync private {description} binding: {error}"))?;
-        let snapshot = Self {
+        let options = StableInputOptions::new(max_bytes)
+            .map_err(|error| format!("configure {description}: {error}"))?;
+        let bound = BoundInput::bind(path, &options)
+            .map_err(|error| format!("bind {description} {}: {error}", path.display()))?;
+        Ok(Self {
             path: path.to_owned(),
-            canonical,
-            _handle: handle,
-            stable,
-            identity,
-            len: metadata.len(),
-            sha256,
-        };
-        snapshot.verify(
-            max_bytes,
-            &format!("{description} path changed while it was opened"),
-        )?;
-        Ok(snapshot)
+            identity: bound.identity().clone(),
+            len: bound.byte_len(),
+            sha256: bound.binding().sha256_hex(),
+            state: FileSnapshotState::Bound(bound),
+        })
     }
 
-    fn snapshot_contents(mut self, max_bytes: u64, description: &str) -> Result<Self, String> {
-        let mut input = self
-            ._handle
-            .try_clone()
-            .map_err(|error| format!("clone {description} {}: {error}", self.path.display()))?;
-        input
-            .seek(SeekFrom::Start(0))
-            .map_err(|error| format!("seek {description} {}: {error}", self.path.display()))?;
-        let copied = std::io::copy(
-            &mut input.take(max_bytes.saturating_add(1)),
-            self.stable.as_file_mut(),
-        )
-        .map_err(|error| format!("snapshot {description} {}: {error}", self.path.display()))?;
-        if copied != self.len || copied > max_bytes {
+    fn snapshot_contents(self, max_bytes: u64, description: &str) -> Result<Self, String> {
+        if self.len > max_bytes {
             return Err(format!(
-                "{description} {} changed size while it was snapshotted",
-                self.path.display()
+                "{description} {} is {} bytes, above the configured byte limit {max_bytes}",
+                self.path.display(),
+                self.len
             ));
         }
-        self.stable
-            .as_file_mut()
-            .sync_all()
-            .map_err(|error| format!("sync private {description} snapshot: {error}"))?;
-        let stable_sha256 = sha256_open_file(self.stable.as_file(), self.stable.path(), max_bytes)?;
-        let source_sha256_after = sha256_open_file(&self._handle, &self.canonical, max_bytes)?;
-        if stable_sha256 != self.sha256 || source_sha256_after != self.sha256 {
-            return Err(format!(
-                "{description} changed while it was snapshotted: {}",
-                self.path.display()
-            ));
-        }
-        Ok(self)
+        let Self {
+            path,
+            identity,
+            len,
+            sha256,
+            state,
+        } = self;
+        let stable = match state {
+            FileSnapshotState::Bound(bound) => bound
+                .snapshot()
+                .map_err(|error| format!("snapshot {description} {}: {error}", path.display()))?,
+            FileSnapshotState::Captured(stable) => stable,
+        };
+        Ok(Self {
+            path,
+            identity,
+            len,
+            sha256,
+            state: FileSnapshotState::Captured(stable),
+        })
     }
 
     fn verify(&self, max_bytes: u64, context: &str) -> Result<(), String> {
-        let handle = File::open(&self.path)
-            .map_err(|error| format!("{context}: {}: {error}", self.path.display()))?;
-        let metadata = handle
-            .metadata()
-            .map_err(|error| format!("{context}: {}: {error}", self.path.display()))?;
-        let current_canonical = fs::canonicalize(&self.path)
-            .map_err(|error| format!("{context}: {}: {error}", self.path.display()))?;
-        let identity = file_identity(&handle, &metadata, &current_canonical)?;
-        let sha256 = sha256_open_file(&handle, &current_canonical, max_bytes)?;
-        if identity != self.identity || metadata.len() != self.len || sha256 != self.sha256 {
-            return Err(format!("{context}: {}", self.path.display()));
+        if self.len > max_bytes {
+            return Err(format!(
+                "{context}: {} exceeds the configured byte limit {max_bytes}",
+                self.path.display()
+            ));
         }
-        Ok(())
+        let result = match &self.state {
+            FileSnapshotState::Bound(bound) => bound.verify_source(),
+            FileSnapshotState::Captured(stable) => stable.verify_source(),
+        };
+        result.map_err(|error| format!("{context}: {}: {error}", self.path.display()))
     }
 
     fn stable_path(&self) -> &Path {
-        self.stable.path()
+        match &self.state {
+            FileSnapshotState::Captured(stable) => stable.stable_path(),
+            FileSnapshotState::Bound(_) => {
+                panic!("metadata input contents must be captured before decoding")
+            }
+        }
     }
-}
-
-fn file_identity(
-    file: &File,
-    metadata: &fs::Metadata,
-    canonical: &Path,
-) -> Result<FileIdentity, String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let _ = (file, canonical);
-        Ok(FileIdentity::Unix {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-    #[cfg(windows)]
-    {
-        let _ = (metadata, canonical);
-        let (volume, index) = windows_file_identity(file)?;
-        Ok(FileIdentity::Windows { volume, index })
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (file, metadata);
-        Ok(FileIdentity::Canonical(canonical.to_owned()))
-    }
-}
-
-#[cfg(windows)]
-fn windows_file_identity(file: &File) -> Result<(u32, u64), String> {
-    let information = windows_file_information(file)?;
-    Ok((
-        information.dwVolumeSerialNumber,
-        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
-    ))
 }
 
 #[cfg(windows)]
@@ -276,7 +192,7 @@ fn open_verified_file_snapshot(
     let metadata = file
         .metadata()
         .map_err(|error| format!("restat decoded reference {}: {error}", path.display()))?;
-    let identity = file_identity(&file, &metadata, path)?;
+    let identity = identity_from_open_file(&file, path).map_err(|error| error.to_string())?;
     if &identity != expected_identity || metadata.len() != expected_len {
         return Err(format!(
             "decoded reference changed while preparing album loudness: {}",
@@ -1627,11 +1543,7 @@ fn verify_protected_inputs(
 }
 
 fn opened_file_identity(file: &File, path: &Path) -> Result<FileIdentity, String> {
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("stat metadata repair path {}: {error}", path.display()))?;
-    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
-    file_identity(file, &metadata, &canonical)
+    identity_from_open_file(file, path).map_err(|error| error.to_string())
 }
 
 fn reject_open_protected_destination(
@@ -2631,9 +2543,8 @@ mod tests {
         let path = directory.path().join("reference.bin");
         fs::write(&path, [0x11; 64]).unwrap();
         let handle = File::open(&path).unwrap();
-        let metadata = handle.metadata().unwrap();
         let canonical = fs::canonicalize(&path).unwrap();
-        let identity = file_identity(&handle, &metadata, &canonical).unwrap();
+        let identity = identity_from_open_file(&handle, &canonical).unwrap();
         let before = sha256_file(&canonical, 64).unwrap();
 
         fs::write(&canonical, [0x22; 64]).unwrap();

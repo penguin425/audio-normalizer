@@ -144,6 +144,11 @@ Forge already provides:
 - Rust source compatibility from the v0.94.0 baseline, with an explicit
   pre-1.0 stability contract, all-feature `cargo-semver-checks` gating against
   the latest release tag, and a downstream-style public API contract test.
+- Content-addressed `StableInput` snapshots and additive `BoundAnalysis` APIs
+  bind cache reuse and every normalization pass to one exact encoded byte
+  stream, decoder route, channel-layout request, resampling domain, and
+  measurement revision. Live sources and protected aliases are rechecked
+  before output publication.
 - Versioned C ABI v1 for bounded local-file analysis with a fixed
   caller-owned result layout, UTF-8 error contract, decoded-sample limit,
   packaged header/shared libraries, and real C consumer tests on Linux,
@@ -540,8 +545,7 @@ asset-bound seed contracts before new quality modes are added.
 
 ### Input-integrity delivery slices
 
-The v0.189.3 input-binding work will land in four dependent, reviewable
-changes:
+The v0.189.3 input-binding work landed in four dependent, reviewable changes:
 
 1. extract the identity, stable-copy, hash, no-follow open, and live-source
    verification logic into one `StableInput` primitive shared by metadata
@@ -612,7 +616,8 @@ unchanged controls from paths whose normative work factor changed.
 The order below is an implementation plan, not a standards requirement. Each
 normative item must name the exact supported clauses and must not imply
 certification or coverage beyond its fixtures.
-v0.189.1 and v0.189.2 are the completed baseline; later entries are planned.
+v0.189.1 through v0.189.3 are the completed baseline; later entries are
+planned.
 
 | Release | Scope | Classification |
 | --- | --- | --- |

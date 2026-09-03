@@ -226,9 +226,14 @@ pub fn run(
         output_sample_rate: None,
         resample_quality: ResampleQuality::Balanced,
     };
-    let source_file = normalization_diff::inspect_file(input)?;
+    let input_snapshot = normalize::capture_stable_input(input)?;
+    let source_file = FileEvidence {
+        path: input.to_string_lossy().into_owned(),
+        bytes: input_snapshot.byte_len(),
+        sha256: input_snapshot.binding().sha256_hex(),
+    };
     let result = normalize::normalize_multi_delivery_corrected_with_roles(
-        input,
+        &input_snapshot,
         &outputs,
         &plan,
         &formats,

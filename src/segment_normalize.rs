@@ -11,6 +11,7 @@ use crate::dsp::resample::ResampleQuality;
 use crate::dsp::simd;
 use crate::normalization_diff::{self, FileEvidence, MeasurementEvidence};
 use crate::normalize::{self, Analysis, Mode, OutputFormat, Plan};
+use crate::stable_input::{paths_alias_if_existing, StableInput, StableInputOptions};
 use crate::wav::{
     AudioBuffer, ChannelRole, WavContainer, MAX_DECODE_SAMPLE_RATE_HZ, MIN_DECODE_SAMPLE_RATE_HZ,
 };
@@ -31,6 +32,7 @@ pub const ALGORITHM_REVISION: &str = "smoothstep-db-boundary-layout-provenance-v
 
 const MAX_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_AUDIO_INPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_SEGMENTS: usize = 4096;
 const MAX_CHANNELS: usize = 32;
 const DEFAULT_MAX_DECODED_SAMPLES: u64 = 50_000_000;
@@ -246,16 +248,28 @@ pub fn create_plan(
     if path_key(&request_path) == path_key(&manifest_path) {
         return Err("segment plan aliases its request file".into());
     }
+    if paths_alias_if_existing(&request_path, &manifest_path).map_err(|error| error.to_string())? {
+        return Err("segment plan aliases its request file".into());
+    }
     if manifest_path.exists() && !overwrite {
         return Err(format!(
             "{} already exists (use --overwrite to replace it)",
             manifest_path.display()
         ));
     }
-    let request_binding_before = normalization_diff::inspect_file(&request_path)?;
-    let request = load_bounded::<SegmentNormalizationRequest>(&request_path, MAX_REQUEST_BYTES)?;
+    let request_input = capture_stable_input(&request_path, MAX_REQUEST_BYTES, "segment request")?;
+    let request_binding = stable_file_evidence(&request_input, &request_path);
+    let request = load_bounded::<SegmentNormalizationRequest>(
+        request_input.stable_path(),
+        MAX_REQUEST_BYTES,
+    )?;
     validate_request(&request)?;
     let format = parse_format(&request.format)?;
+    let plan_settings = PlanSettings::from(&request);
+    // Planning measures and records the requested operation but does not
+    // encode. Keep manifests portable to a render host that has the optional
+    // codec while still rejecting malformed format settings up front.
+    normalization_plan(&plan_settings).validate_format_request(format)?;
     let base = request_path.parent().unwrap_or_else(|| Path::new("."));
     let mut inputs = Vec::with_capacity(request.segments.len());
     let mut outputs = Vec::with_capacity(request.segments.len());
@@ -264,20 +278,14 @@ pub fn create_plan(
         outputs.push(resolved_path(&resolve_from(base, &segment.output))?);
     }
     validate_plan_paths(&request_path, &manifest_path, &inputs, &outputs, format)?;
-    if let Some(parent) = manifest_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("create {}: {error}", parent.display()))?;
-    }
 
     let mut measured = Vec::with_capacity(inputs.len());
     let mut layout = None;
     for input in &inputs {
-        let binding_before = normalization_diff::inspect_file(input)?;
+        let stable = capture_stable_input(input, MAX_AUDIO_INPUT_BYTES, "segment audio input")?;
+        let binding = stable_file_evidence(&stable, input);
         let buffer = decode_segment(
-            input,
+            stable.stable_path(),
             request.max_decoded_samples_per_segment,
             channel_roles,
         )?;
@@ -310,17 +318,14 @@ pub fn create_plan(
         }
         let maximum_safe_gain_db = maximum_safe_gain_db(&analysis, &request);
         let desired_gain_db = (request.target_lufs - analysis.lufs).min(maximum_safe_gain_db);
-        let binding_after = normalization_diff::inspect_file(input)?;
-        if binding_before.bytes != binding_after.bytes
-            || binding_before.sha256 != binding_after.sha256
-        {
-            return Err(format!(
-                "{} changed while the pass-one plan was measured",
+        stable.verify_source().map_err(|error| {
+            format!(
+                "{} changed while the pass-one plan was measured: {error}",
                 input.display()
-            ));
-        }
+            )
+        })?;
         measured.push((
-            binding_after,
+            binding,
             MeasurementEvidence::from(&analysis),
             desired_gain_db,
             maximum_safe_gain_db,
@@ -365,14 +370,14 @@ pub fn create_plan(
             manual_review_recommended: review,
         });
     }
-    let request_binding_after = normalization_diff::inspect_file(&request_path)?;
-    if request_binding_before.bytes != request_binding_after.bytes
-        || request_binding_before.sha256 != request_binding_after.sha256
-    {
-        return Err(format!(
-            "{} changed while the pass-one plan was created",
+    request_input.verify_source().map_err(|error| {
+        format!(
+            "{} changed while the pass-one plan was created: {error}",
             request_path.display()
-        ));
+        )
+    })?;
+    for segment in &segments {
+        verify_file_binding(Path::new(&segment.input.path), &segment.input)?;
     }
     let plan = SegmentNormalizationPlan {
         schema: PLAN_SCHEMA.into(),
@@ -386,8 +391,8 @@ pub fn create_plan(
             processing_bound: "inputs are decoded and rendered one segment at a time under the manifest's per-segment decoded-sample limit".into(),
             maximum_segments: MAX_SEGMENTS,
         },
-        request: request_binding_after,
-        settings: PlanSettings::from(&request),
+        request: request_binding,
+        settings: plan_settings,
         layout,
         manual_review_recommended: segments
             .iter()
@@ -395,6 +400,22 @@ pub fn create_plan(
         segments,
     };
     validate_plan(&plan)?;
+    request_input.verify_source().map_err(|error| {
+        format!(
+            "{} changed before the pass-one plan was published: {error}",
+            request_path.display()
+        )
+    })?;
+    for segment in &plan.segments {
+        verify_file_binding(Path::new(&segment.input.path), &segment.input)?;
+    }
+    if let Some(parent) = manifest_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    }
     write_json_atomic(&manifest_path, &plan)?;
     Ok(plan)
 }
@@ -408,12 +429,32 @@ pub fn render_plan(
     let report_path = resolved_path(report_path)?;
     validate_json_path(&manifest_path, "segment plan")?;
     validate_json_path(&report_path, "segment report")?;
-    let plan = load_bounded::<SegmentNormalizationPlan>(&manifest_path, MAX_MANIFEST_BYTES)?;
+    let manifest_input = capture_stable_input(&manifest_path, MAX_MANIFEST_BYTES, "segment plan")?;
+    let plan =
+        load_bounded::<SegmentNormalizationPlan>(manifest_input.stable_path(), MAX_MANIFEST_BYTES)?;
     validate_plan(&plan)?;
     let format = parse_format(&plan.settings.format)?;
     validate_render_paths(&manifest_path, &report_path, &plan, format, overwrite)?;
-    normalize::validate_output_encoder_available(format)?;
-    verify_request_binding_and_intent(&plan)?;
+    let render_plan = normalization_plan(&plan.settings);
+    render_plan.validate_for_format(format)?;
+    let request_input = verify_request_binding_and_intent(&plan)?;
+    manifest_input.verify_source().map_err(|error| {
+        format!(
+            "segment plan changed before rendering {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    // Capture and hash every source before publishing anything. Individual
+    // renders take another immutable snapshot and recheck the live source at
+    // their own publication boundary.
+    for segment in &plan.segments {
+        let input = capture_stable_input(
+            Path::new(&segment.input.path),
+            MAX_AUDIO_INPUT_BYTES,
+            "segment audio input",
+        )?;
+        verify_stable_file_binding(&input, &segment.input)?;
+    }
     if let Some(parent) = report_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -429,12 +470,6 @@ pub fn render_plan(
         }
     }
 
-    // Hash every source before publishing anything. This makes stale plans and
-    // obvious catalogue changes fail before a partial render can be visible.
-    for segment in &plan.segments {
-        verify_file_binding(Path::new(&segment.input.path), &segment.input)?;
-    }
-
     let roles = plan
         .layout
         .channel_roles
@@ -442,11 +477,17 @@ pub fn render_plan(
         .cloned()
         .map(ChannelRole::from)
         .collect::<Vec<_>>();
-    let render_plan = normalization_plan(&plan.settings);
     let mut rendered = Vec::with_capacity(plan.segments.len());
     for segment in &plan.segments {
+        let input = capture_stable_input(
+            Path::new(&segment.input.path),
+            MAX_AUDIO_INPUT_BYTES,
+            "segment audio input",
+        )?;
+        verify_stable_file_binding(&input, &segment.input)?;
         rendered.push(render_segment(
             segment,
+            &input,
             &plan.settings,
             &roles,
             &render_plan,
@@ -465,19 +506,29 @@ pub fn render_plan(
             publication: "each output is staged beside its destination and atomically replaced only after its own verification; the ordered set is not a filesystem transaction",
             verification: "re-decoded output loudness is compared with the exact smoothed pre-codec signal; decoded true peak and duration are bounded",
         },
-        plan: normalization_diff::inspect_file(&manifest_path)?,
+        plan: stable_file_evidence(&manifest_input, &manifest_path),
         settings: plan.settings,
         layout: plan.layout,
         passed: rendered.iter().all(|segment| segment.passed),
         segments: rendered,
         published_segments,
     };
+    manifest_input.verify_source().map_err(|error| {
+        format!(
+            "segment plan changed before report publication {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    request_input
+        .verify_source()
+        .map_err(|error| format!("segment request changed before report publication: {error}"))?;
     write_json_atomic(&report_path, &report)?;
     Ok(report)
 }
 
 fn render_segment(
     segment: &PlannedSegment,
+    input: &StableInput,
     settings: &PlanSettings,
     roles: &[ChannelRole],
     plan: &Plan,
@@ -485,9 +536,9 @@ fn render_segment(
 ) -> Result<RenderedSegment, String> {
     let input_path = Path::new(&segment.input.path);
     let output_path = Path::new(&segment.output_path);
-    let before = verify_file_binding(input_path, &segment.input)?;
+    verify_stable_file_binding(input, &segment.input)?;
     let mut buffer = decode_segment(
-        input_path,
+        input.stable_path(),
         settings.max_decoded_samples_per_segment,
         Some(roles),
     )?;
@@ -502,14 +553,13 @@ fn render_segment(
         settings.ceiling_dbtp,
     )?;
     let intended = normalize::analyze(&buffer);
-    let after = verify_file_binding(input_path, &segment.input)?;
-    if before.sha256 != after.sha256 || before.bytes != after.bytes {
-        return Err(format!(
-            "{} changed while segment {} was decoded",
+    input.verify_source().map_err(|error| {
+        format!(
+            "{} changed while segment {} was decoded: {error}",
             input_path.display(),
             segment.id
-        ));
-    }
+        )
+    })?;
 
     let staged = AtomicOutput::new(output_path)?;
     normalize::write(&buffer, staged.path(), plan, format)?;
@@ -543,6 +593,13 @@ fn render_segment(
         sha256: staged_file.sha256,
     };
     if passed {
+        input.verify_source().map_err(|error| {
+            format!(
+                "{} changed before segment {} publication: {error}",
+                input_path.display(),
+                segment.id
+            )
+        })?;
         staged.commit()?;
     }
     Ok(RenderedSegment {
@@ -988,22 +1045,60 @@ fn validate_plan_paths(
     let request_key = path_key(request);
     let manifest_key = path_key(manifest);
     let mut input_keys = HashSet::new();
+    let mut input_paths: Vec<PathBuf> = Vec::with_capacity(inputs.len());
     for input in inputs {
         if !input.is_file() {
             return Err(format!("segment input is not a file: {}", input.display()));
         }
         let key = path_key(input);
-        if key == request_key || key == manifest_key || !input_keys.insert(key) {
+        let aliases_control = paths_alias_if_existing(input, request)
+            .map_err(|error| error.to_string())?
+            || paths_alias_if_existing(input, manifest).map_err(|error| error.to_string())?;
+        let aliases_input = input_paths.iter().try_fold(false, |found, previous| {
+            if found {
+                Ok(true)
+            } else {
+                paths_alias_if_existing(previous, input).map_err(|error| error.to_string())
+            }
+        })?;
+        if key == request_key
+            || key == manifest_key
+            || aliases_control
+            || aliases_input
+            || !input_keys.insert(key)
+        {
             return Err(format!("segment input path collision: {}", input.display()));
         }
+        input_paths.push(input.to_owned());
     }
     let mut output_keys = HashSet::new();
+    let mut output_paths: Vec<PathBuf> = Vec::with_capacity(outputs.len());
     for output in outputs {
         validate_output_extension(output, format)?;
         let key = path_key(output);
+        let aliases_control = paths_alias_if_existing(output, request)
+            .map_err(|error| error.to_string())?
+            || paths_alias_if_existing(output, manifest).map_err(|error| error.to_string())?;
+        let aliases_input = input_paths.iter().try_fold(false, |found, input| {
+            if found {
+                Ok(true)
+            } else {
+                paths_alias_if_existing(input, output).map_err(|error| error.to_string())
+            }
+        })?;
+        let aliases_output = output_paths.iter().try_fold(false, |found, previous| {
+            if found {
+                Ok(true)
+            } else {
+                paths_alias_if_existing(previous, output).map_err(|error| error.to_string())
+            }
+        })?;
         if key == request_key
             || key == manifest_key
             || input_keys.contains(&key)
+            || aliases_control
+            || aliases_input
+            || aliases_output
             || !output_keys.insert(key)
         {
             return Err(format!(
@@ -1011,6 +1106,7 @@ fn validate_plan_paths(
                 output.display()
             ));
         }
+        output_paths.push(output.to_owned());
     }
     Ok(())
 }
@@ -1041,23 +1137,65 @@ fn validate_render_paths(
         ));
     }
     let mut input_keys = HashSet::new();
+    let mut input_paths: Vec<PathBuf> = Vec::with_capacity(plan.segments.len());
     for segment in &plan.segments {
         let input = resolved_path(Path::new(&segment.input.path))?;
         let key = path_key(&input);
-        if key == manifest_key || key == report_key || key == request_key || !input_keys.insert(key)
+        let aliases_control = paths_alias_if_existing(&input, manifest)
+            .map_err(|error| error.to_string())?
+            || paths_alias_if_existing(&input, report).map_err(|error| error.to_string())?
+            || paths_alias_if_existing(&input, Path::new(&plan.request.path))
+                .map_err(|error| error.to_string())?;
+        let aliases_input = input_paths.iter().try_fold(false, |found, previous| {
+            if found {
+                Ok(true)
+            } else {
+                paths_alias_if_existing(previous, &input).map_err(|error| error.to_string())
+            }
+        })?;
+        if key == manifest_key
+            || key == report_key
+            || key == request_key
+            || aliases_control
+            || aliases_input
+            || !input_keys.insert(key)
         {
             return Err(format!("segment input path collision: {}", input.display()));
         }
+        input_paths.push(input);
     }
     let mut output_keys = HashSet::new();
+    let mut output_paths: Vec<PathBuf> = Vec::with_capacity(plan.segments.len());
     for segment in &plan.segments {
         let output = resolved_path(Path::new(&segment.output_path))?;
         validate_output_extension(&output, format)?;
         let key = path_key(&output);
+        let aliases_control = paths_alias_if_existing(&output, manifest)
+            .map_err(|error| error.to_string())?
+            || paths_alias_if_existing(&output, report).map_err(|error| error.to_string())?
+            || paths_alias_if_existing(&output, Path::new(&plan.request.path))
+                .map_err(|error| error.to_string())?;
+        let aliases_input = input_paths.iter().try_fold(false, |found, input| {
+            if found {
+                Ok(true)
+            } else {
+                paths_alias_if_existing(input, &output).map_err(|error| error.to_string())
+            }
+        })?;
+        let aliases_output = output_paths.iter().try_fold(false, |found, previous| {
+            if found {
+                Ok(true)
+            } else {
+                paths_alias_if_existing(previous, &output).map_err(|error| error.to_string())
+            }
+        })?;
         if key == manifest_key
             || key == report_key
             || key == request_key
             || input_keys.contains(&key)
+            || aliases_control
+            || aliases_input
+            || aliases_output
             || !output_keys.insert(key)
         {
             return Err(format!(
@@ -1065,6 +1203,7 @@ fn validate_render_paths(
                 output.display()
             ));
         }
+        output_paths.push(output.clone());
         if output.exists() && !overwrite {
             return Err(format!(
                 "{} already exists (use --overwrite to replace it)",
@@ -1075,10 +1214,16 @@ fn validate_render_paths(
     Ok(())
 }
 
-fn verify_request_binding_and_intent(plan: &SegmentNormalizationPlan) -> Result<(), String> {
+fn verify_request_binding_and_intent(
+    plan: &SegmentNormalizationPlan,
+) -> Result<StableInput, String> {
     let request_path = resolved_path(Path::new(&plan.request.path))?;
-    verify_file_binding(&request_path, &plan.request)?;
-    let request = load_bounded::<SegmentNormalizationRequest>(&request_path, MAX_REQUEST_BYTES)?;
+    let request_input = capture_stable_input(&request_path, MAX_REQUEST_BYTES, "segment request")?;
+    verify_stable_file_binding(&request_input, &plan.request)?;
+    let request = load_bounded::<SegmentNormalizationRequest>(
+        request_input.stable_path(),
+        MAX_REQUEST_BYTES,
+    )?;
     validate_request(&request)?;
     if PlanSettings::from(&request) != plan.settings {
         return Err("segment plan settings do not match the bound request".into());
@@ -1100,7 +1245,10 @@ fn verify_request_binding_and_intent(plan: &SegmentNormalizationPlan) -> Result<
             ));
         }
     }
-    Ok(())
+    request_input.verify_source().map_err(|error| {
+        format!("segment request changed while its intent was verified: {error}")
+    })?;
+    Ok(request_input)
 }
 
 fn verify_source_measurement(segment: &PlannedSegment, analysis: &Analysis) -> Result<(), String> {
@@ -1126,14 +1274,40 @@ fn verify_source_measurement(segment: &PlannedSegment, analysis: &Analysis) -> R
 }
 
 fn verify_file_binding(path: &Path, expected: &FileEvidence) -> Result<FileEvidence, String> {
-    let actual = normalization_diff::inspect_file(path)?;
-    if actual.bytes != expected.bytes || actual.sha256 != expected.sha256 {
+    let input = capture_stable_input(path, MAX_AUDIO_INPUT_BYTES, "segment audio input")?;
+    verify_stable_file_binding(&input, expected)?;
+    Ok(stable_file_evidence(&input, path))
+}
+
+fn capture_stable_input(
+    path: &Path,
+    max_input_bytes: u64,
+    description: &str,
+) -> Result<StableInput, String> {
+    let options = StableInputOptions::new(max_input_bytes)
+        .map_err(|error| format!("configure {description}: {error}"))?;
+    StableInput::from_path(path, &options)
+        .map_err(|error| format!("capture {description} {}: {error}", path.display()))
+}
+
+fn stable_file_evidence(input: &StableInput, display_path: &Path) -> FileEvidence {
+    FileEvidence {
+        path: display_path.to_string_lossy().into_owned(),
+        bytes: input.byte_len(),
+        sha256: input.binding().sha256_hex(),
+    }
+}
+
+fn verify_stable_file_binding(input: &StableInput, expected: &FileEvidence) -> Result<(), String> {
+    if input.byte_len() != expected.bytes || input.binding().sha256_hex() != expected.sha256 {
         return Err(format!(
             "segment input does not match the plan binding: {}",
-            path.display()
+            expected.path
         ));
     }
-    Ok(actual)
+    input
+        .verify_source()
+        .map_err(|error| format!("segment input changed: {}: {error}", expected.path))
 }
 
 fn apply_channel_roles(

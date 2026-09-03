@@ -45,8 +45,9 @@ The `Rust API compatibility` CI job:
 4. fails the pull request when `cargo-semver-checks` reports a denied change.
 
 `tests/public_api.rs` is compiled as a downstream crate and exercises the
-main analysis, normalization, WAV, preset, and real-time entry points. It
-complements structural API inspection with ordinary consumer code.
+main analysis, stable-input/bound-analysis, normalization, WAV, preset, and
+real-time entry points. It complements structural API inspection with ordinary
+consumer code.
 
 No static checker can recognize every Rust or behavioural compatibility
 break. Reviewers must still assess public type changes, generic and lifetime
