@@ -39,7 +39,7 @@ jobs:
       - name: Install Rust 1.97.0
         uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
 
-      - name: Test exact running-window arithmetic
+      - name: Test exact loudness arithmetic and migration fixture
         shell: bash
         env:
           CARGO_INCREMENTAL: "0"
@@ -49,11 +49,23 @@ jobs:
           set -euo pipefail
           cargo test --locked --manifest-path candidate/Cargo.toml \
             --no-default-features --lib \
-            fixed_running_window_matches_vecdeque_sum_bit_exactly \
+            compensated_loudness_windows_match_naive_window_sums \
             -- --nocapture
           cargo test --locked --manifest-path candidate/Cargo.toml \
             --no-default-features --lib \
             incomplete_trailing_hop_does_not_create_a_block \
+            -- --nocapture
+          cargo test --locked --manifest-path candidate/Cargo.toml \
+            --no-default-features --lib \
+            rational_block_clock_matches_odd_rate_integer_oracles \
+            -- --nocapture
+          cargo test --locked --manifest-path candidate/Cargo.toml \
+            --no-default-features --lib \
+            rational_block_clock_has_no_one_hour_phase_drift \
+            -- --nocapture
+          cargo test --locked --manifest-path candidate/Cargo.toml \
+            --no-default-features --lib \
+            reference_analysis_is_chunk_invariant_and_canonicalized \
             -- --nocapture
           cargo test --locked --manifest-path candidate/Cargo.toml \
             --no-default-features --lib \
@@ -74,10 +86,31 @@ jobs:
             cargo build --locked --release --manifest-path candidate/Cargo.toml \
               --no-default-features --bin forge --bin forge-container-qc
 
-      - name: Verify exact analysis and rendered output
+      - name: Verify revision-aware exact analysis and rendered output
         shell: bash
         run: |
           set -euo pipefail
+          baseline_revision="$(
+            sed -n 's/^pub const MEASUREMENT_ALGORITHM_REVISION: &str = "\(.*\)";$/\1/p' \
+              baseline/src/bound_analysis.rs
+          )"
+          candidate_revision="$(
+            sed -n 's/^pub const MEASUREMENT_ALGORITHM_REVISION: &str = "\(.*\)";$/\1/p' \
+              candidate/src/bound_analysis.rs
+          )"
+          test -n "${baseline_revision}"
+          test -n "${candidate_revision}"
+          require_baseline_identity=true
+          if [[ "${baseline_revision}" != "${candidate_revision}" ]]; then
+            if [[ "${baseline_revision}" != "forge-bs1770-5-r3" || \
+                  "${candidate_revision}" != "forge-bs1770-5-r4" ]]; then
+              echo "Unapproved measurement migration: ${baseline_revision} -> ${candidate_revision}" >&2
+              exit 1
+            fi
+            require_baseline_identity=false
+            echo "Using approved r3 -> r4 fixed-oracle migration fixture"
+          fi
+
           exact_dir="${RUNNER_TEMP}/exact-output"
           mkdir "${exact_dir}"
           EXACT_DIR="${exact_dir}" python3 - <<'PY'
@@ -99,14 +132,21 @@ jobs:
             > "${exact_dir}/candidate.json"
           "${candidate}" "${exact_dir}/stereo.wav" --jobs 1 --analyze --json \
             > "${exact_dir}/candidate-one.json"
-          cmp "${exact_dir}/base.json" "${exact_dir}/candidate.json"
           cmp "${exact_dir}/candidate.json" "${exact_dir}/candidate-one.json"
+          if [[ "${require_baseline_identity}" == true ]]; then
+            cmp "${exact_dir}/base.json" "${exact_dir}/candidate.json"
+          fi
 
           "${baseline}" "${exact_dir}/stereo.wav" --verify --overwrite \
             -o "${exact_dir}/base.wav"
           "${candidate}" "${exact_dir}/stereo.wav" --verify --overwrite \
             -o "${exact_dir}/candidate.wav"
-          cmp "${exact_dir}/base.wav" "${exact_dir}/candidate.wav"
+          "${candidate}" "${exact_dir}/stereo.wav" --jobs 1 --verify --overwrite \
+            -o "${exact_dir}/candidate-one.wav"
+          cmp "${exact_dir}/candidate.wav" "${exact_dir}/candidate-one.wav"
+          if [[ "${require_baseline_identity}" == true ]]; then
+            cmp "${exact_dir}/base.wav" "${exact_dir}/candidate.wav"
+          fi
 
       - name: Run default-worker benchmarks in both orders
         shell: bash
