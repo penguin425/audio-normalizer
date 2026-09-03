@@ -164,7 +164,7 @@ pub struct Cli {
         value_parser = ["fast", "reference"],
         default_value = "fast"
     )]
-    pub analysis_engine: String,
+    analysis_engine: String,
 
     /// Print analyze results as a JSON array to stdout.
     #[arg(
@@ -763,6 +763,11 @@ struct OutputConfig {
 }
 
 impl Cli {
+    /// Return the selected loudness-analysis engine name.
+    pub fn analysis_engine(&self) -> &str {
+        &self.analysis_engine
+    }
+
     pub fn parse_with_config() -> Result<Self, String> {
         let matches = Self::command().get_matches();
         Self::from_matches_with_config(&matches)

@@ -555,7 +555,7 @@ fn run_paths(
 
     let (expanded, relative_paths) = expand_inputs(&cli.inputs, cli.recursive)?;
     cli.inputs = expanded;
-    let analysis_engine = cli.analysis_engine.parse::<AnalysisEngine>()?;
+    let analysis_engine = cli.analysis_engine().parse::<AnalysisEngine>()?;
     if analysis_engine == AnalysisEngine::Reference && !cli.analyze_only {
         return Err("--analysis-engine reference requires --analyze".into());
     }
