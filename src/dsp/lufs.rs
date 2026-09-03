@@ -47,9 +47,11 @@ pub const MAX_LOUDNESS_TIMELINE_POINTS: usize = 1_000_000;
 const MIN_PARALLEL_TRUE_PEAK_FRAMES: usize = 16_384;
 const LOUDNESS_CLOCK_TICKS_PER_SECOND: u128 = 10;
 // Rebuild common-path rolling sums at an absolute, chunk-independent cadence.
-// The bounded drift between rebases is far below meter tolerance, while one
-// rebase per ~22 seconds at 48 kHz keeps the amortized work negligible.
-const FAST_WINDOW_REBASE_FRAMES: usize = 1 << 20;
+// At 48 kHz this bounds drift to about 5.8 minutes of binary64 updates while a
+// 3-second window re-scan costs only 0.86% amortized work instead of 13.7% at
+// the previous 2^20-frame cadence.
+const FAST_WINDOW_REBASE_FRAMES: usize = 1 << 24;
+const _: () = assert!(FAST_WINDOW_REBASE_FRAMES % 1_024 == 0);
 // `10^((-70 + 0.691) / 10)` committed as IEEE-754 bits so the gate does not
 // depend on the platform `pow` implementation.
 const ABSOLUTE_GATE_MEAN_SQUARE: f64 = f64::from_bits(0x3e7f_791e_c6e1_d5b7);
@@ -463,6 +465,24 @@ impl LoudnessWindows {
         short_term_sum: &mut CompensatedSum,
         value: f64,
     ) {
+        self.push_fast_untracked(momentary_sum, short_term_sum, value);
+        self.fast_updates = self.fast_updates.wrapping_add(1);
+        if self.fast_updates & (FAST_WINDOW_REBASE_FRAMES - 1) == 0 {
+            self.rebase_fast_sums(momentary_sum, short_term_sum);
+        }
+    }
+
+    /// Ordered common-path update without a separate frame counter.
+    ///
+    /// The fixed stereo analyzer already owns an absolute frame ordinal and
+    /// uses it to schedule the same periodic rebase.
+    #[inline(always)]
+    fn push_fast_untracked(
+        &mut self,
+        momentary_sum: &mut CompensatedSum,
+        short_term_sum: &mut CompensatedSum,
+        value: f64,
+    ) {
         let len = self.values.len();
         if len < self.short_term_limit {
             let momentary_expired =
@@ -491,11 +511,6 @@ impl LoudnessWindows {
             if self.cursor == self.short_term_limit {
                 self.cursor = 0;
             }
-        }
-
-        self.fast_updates = self.fast_updates.wrapping_add(1);
-        if self.fast_updates & (FAST_WINDOW_REBASE_FRAMES - 1) == 0 {
-            self.rebase_fast_sums(momentary_sum, short_term_sum);
         }
     }
 
@@ -803,11 +818,23 @@ impl StreamingAnalyzer {
                 let weighted = weight0 * filtered0 * filtered0 + weight1 * filtered1 * filtered1;
                 let raw0 = sample0 as f64;
                 let raw1 = sample1 as f64;
-                self.raw_sum_squares.add_ordered(raw0 * raw0 + raw1 * raw1);
-                self.weighted_sum_squares.add_ordered(weighted);
-                self.windows
-                    .push_fast(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
-                self.frames += 1;
+                let next_frame = self.frames + 1;
+                let completed_partial = self.raw_sum_squares.add_ordered_frame_pair(
+                    &mut self.weighted_sum_squares,
+                    raw0 * raw0 + raw1 * raw1,
+                    weighted,
+                    next_frame,
+                );
+                self.windows.push_fast_untracked(
+                    &mut self.momentary_sum,
+                    &mut self.short_term_sum,
+                    weighted,
+                );
+                if completed_partial && next_frame & (FAST_WINDOW_REBASE_FRAMES - 1) == 0 {
+                    self.windows
+                        .rebase_fast_sums(&mut self.momentary_sum, &mut self.short_term_sum);
+                }
+                self.frames = next_frame;
                 if self.windows.momentary_len() == momentary_window {
                     self.max_momentary_sum = self
                         .max_momentary_sum
@@ -1243,13 +1270,25 @@ impl StreamingAnalyzer {
                 let weighted = weight0 * filtered0 * filtered0 + weight1 * filtered1 * filtered1;
                 let raw0 = sample0 as f64;
                 let raw1 = sample1 as f64;
-                self.raw_sum_squares.add_ordered(raw0 * raw0 + raw1 * raw1);
+                let next_frame = self.frames + 1;
+                let completed_partial = self.raw_sum_squares.add_ordered_frame_pair(
+                    &mut self.weighted_sum_squares,
+                    raw0 * raw0 + raw1 * raw1,
+                    weighted,
+                    next_frame,
+                );
                 self.sample_peak = self.sample_peak.max(sample0.abs());
                 self.sample_peak = self.sample_peak.max(sample1.abs());
-                self.weighted_sum_squares.add_ordered(weighted);
-                self.windows
-                    .push_fast(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
-                self.frames += 1;
+                self.windows.push_fast_untracked(
+                    &mut self.momentary_sum,
+                    &mut self.short_term_sum,
+                    weighted,
+                );
+                if completed_partial && next_frame & (FAST_WINDOW_REBASE_FRAMES - 1) == 0 {
+                    self.windows
+                        .rebase_fast_sums(&mut self.momentary_sum, &mut self.short_term_sum);
+                }
+                self.frames = next_frame;
                 if self.windows.momentary_len() == momentary_window {
                     self.max_momentary_sum = self
                         .max_momentary_sum
@@ -2356,7 +2395,7 @@ mod tests {
         }
 
         // Exercise the absolute-cadence branch without making the unit test
-        // process one million otherwise redundant frames.
+        // process a complete production interval of redundant frames.
         candidate.fast_updates = FAST_WINDOW_REBASE_FRAMES - 1;
         let value = value_at(4_097);
         candidate.push_fast(
@@ -2411,6 +2450,32 @@ mod tests {
             .total();
         assert!((candidate_short_term_sum.ordered_total() - expected_short).abs() < 1.0e-11);
         assert!((candidate_momentary_sum.ordered_total() - expected_momentary).abs() < 1.0e-11);
+    }
+
+    #[test]
+    fn extended_fast_window_cadence_stays_within_one_nanoloudness_unit() {
+        let momentary_limit = 19_200;
+        let short_term_limit = 144_000;
+        let mut windows = LoudnessWindows::new(momentary_limit, short_term_limit);
+        let mut momentary_sum = CompensatedSum::new();
+        let mut short_term_sum = CompensatedSum::new();
+        let values = [1.0e-12, 0.1, 1.0 / 3.0, 0.987_654_321];
+        for index in 0..FAST_WINDOW_REBASE_FRAMES - 1 {
+            windows.push_fast_untracked(&mut momentary_sum, &mut short_term_sum, values[index & 3]);
+        }
+
+        let before_momentary =
+            mean_square_to_lufs(momentary_sum.ordered_total() / momentary_limit as f64);
+        let before_short_term =
+            mean_square_to_lufs(short_term_sum.ordered_total() / short_term_limit as f64);
+        windows.rebase_fast_sums(&mut momentary_sum, &mut short_term_sum);
+        let rebased_momentary =
+            mean_square_to_lufs(momentary_sum.ordered_total() / momentary_limit as f64);
+        let rebased_short_term =
+            mean_square_to_lufs(short_term_sum.ordered_total() / short_term_limit as f64);
+
+        assert!((before_momentary - rebased_momentary).abs() < REFERENCE_DB_QUANTUM);
+        assert!((before_short_term - rebased_short_term).abs() < REFERENCE_DB_QUANTUM);
     }
 
     #[test]
@@ -3059,8 +3124,8 @@ mod tests {
     }
 
     #[test]
-    fn fast_analysis_is_chunk_invariant_across_partial_and_rebase_boundaries() {
-        let frames = FAST_WINDOW_REBASE_FRAMES + 137;
+    fn fast_analysis_is_chunk_invariant_across_partial_boundaries() {
+        let frames = usize::from(BlockCompensatedSum::VALUES_PER_PARTIAL) * 4 + 137;
         let left = (0..frames)
             .map(|frame| {
                 (((frame as f64 * 0.071).sin() * 0.31) + ((frame as f64 * 0.000_31).cos() * 0.07))

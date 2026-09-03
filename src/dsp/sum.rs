@@ -90,7 +90,7 @@ pub(crate) struct BlockCompensatedSum {
 }
 
 impl BlockCompensatedSum {
-    const VALUES_PER_PARTIAL: u16 = 1_024;
+    pub(crate) const VALUES_PER_PARTIAL: u16 = 1_024;
 
     pub(crate) const fn new() -> Self {
         Self {
@@ -109,6 +109,38 @@ impl BlockCompensatedSum {
             self.completed.add(self.partial);
             self.partial = 0.0;
             self.partial_values = 0;
+        }
+    }
+
+    /// Add one value to two reductions on an absolute one-based frame grid.
+    ///
+    /// The two independent floating-point reductions retain exactly the same
+    /// arithmetic and merge order as two [`Self::add_ordered`] calls. The
+    /// caller-provided ordinal is the counter for this dedicated fixed-layout
+    /// path, avoiding duplicate loop-carried state in both accumulators.
+    ///
+    /// An accumulator advanced through this method must use it exclusively;
+    /// `value_ordinal` starts at one and increases by one for every call.
+    #[inline(always)]
+    pub(crate) fn add_ordered_frame_pair(
+        &mut self,
+        other: &mut Self,
+        value: f64,
+        other_value: f64,
+        value_ordinal: usize,
+    ) -> bool {
+        debug_assert_eq!(self.partial_values, 0);
+        debug_assert_eq!(other.partial_values, 0);
+        self.partial += value;
+        other.partial += other_value;
+        if value_ordinal.is_multiple_of(usize::from(Self::VALUES_PER_PARTIAL)) {
+            self.completed.add(self.partial);
+            other.completed.add(other.partial);
+            self.partial = 0.0;
+            other.partial = 0.0;
+            true
+        } else {
+            false
         }
     }
 
@@ -189,5 +221,47 @@ mod tests {
         let split = accumulate(&[17, 2_031, 5, 4_096, 2_044]);
         assert_eq!(whole.to_bits(), split.to_bits());
         assert!(whole > 9.0);
+    }
+
+    #[test]
+    fn paired_blocked_sums_match_independent_reductions_bit_for_bit() {
+        let values = (0_usize..8_193)
+            .map(|index| {
+                let left = ((index.wrapping_mul(97) % 1_009) + 1) as f64 / 1_009.0;
+                let right = ((index.wrapping_mul(193) % 2_003) + 1) as f64 / 2_003.0;
+                (left, right)
+            })
+            .collect::<Vec<_>>();
+        let mut expected_left = BlockCompensatedSum::new();
+        let mut expected_right = BlockCompensatedSum::new();
+        let mut paired_left = BlockCompensatedSum::new();
+        let mut paired_right = BlockCompensatedSum::new();
+        for (index, &(left, right)) in values.iter().enumerate() {
+            expected_left.add_ordered(left);
+            expected_right.add_ordered(right);
+            let completed =
+                paired_left.add_ordered_frame_pair(&mut paired_right, left, right, index + 1);
+            assert_eq!(completed, (index + 1).is_multiple_of(1_024));
+        }
+        assert_eq!(paired_left.completed, expected_left.completed);
+        assert_eq!(
+            paired_left.partial.to_bits(),
+            expected_left.partial.to_bits()
+        );
+        assert_eq!(paired_right.completed, expected_right.completed);
+        assert_eq!(
+            paired_right.partial.to_bits(),
+            expected_right.partial.to_bits()
+        );
+        assert_eq!(paired_left.partial_values, 0);
+        assert_eq!(paired_right.partial_values, 0);
+        assert_eq!(
+            paired_left.total().to_bits(),
+            expected_left.total().to_bits()
+        );
+        assert_eq!(
+            paired_right.total().to_bits(),
+            expected_right.total().to_bits()
+        );
     }
 }

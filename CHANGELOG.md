@@ -30,6 +30,10 @@ tags and keeps public compatibility commitments in
   chunk-independent partials with compensated aggregation and periodic
   rolling-window rebasing; the reference path remains strictly compensated
   per value. The measurement revision is now `forge-bs1770-5-r4`.
+- Keep the reproducible stereo fast path within its performance budget by
+  sharing the absolute frame ordinal across paired energy reductions and
+  amortizing compensated rolling-window rebases over `2^24` frames. A full
+  interval remains within one nanoloudness unit of a compensated rebase.
 
 ## 0.189.4 - 2026-09-03
 
