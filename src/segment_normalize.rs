@@ -561,8 +561,9 @@ fn render_segment(
         )
     })?;
 
-    let staged = AtomicOutput::new(output_path)?;
+    let mut staged = AtomicOutput::new(output_path)?;
     normalize::write(&buffer, staged.path(), plan, format)?;
+    staged.adopt_path_writer_output()?;
     let padding = u64::from(intended.sample_rate)
         .checked_mul(u64::from(intended.channels))
         .and_then(|value| value.checked_mul(2))

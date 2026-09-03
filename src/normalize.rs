@@ -2648,7 +2648,7 @@ fn normalize_one_staged_stable_impl(
         layout_alias_policy,
     )?;
     let gain = compute_gain(&an, plan);
-    let staged = AtomicOutput::new(output)?;
+    let mut staged = AtomicOutput::new(output)?;
     let rendered = normalize_stream(
         StreamSource {
             path: input.stable_path(),
@@ -2669,7 +2669,7 @@ fn normalize_one_staged_stable_impl(
     )?;
     finalize_metadata(
         input.stable_path(),
-        staged.path(),
+        &mut staged,
         format,
         None,
         an.lufs + gain_db(gain),
@@ -2837,7 +2837,7 @@ fn normalize_one_corrected_stable_impl(
     )?;
     let mut gain = compute_gain(&source, plan);
     let mut intended_level = None;
-    let staged = AtomicOutput::new(output)?;
+    let mut staged = AtomicOutput::new(output)?;
 
     for attempt in 0..=max_retries {
         let rendered = normalize_stream(
@@ -2877,7 +2877,7 @@ fn normalize_one_corrected_stable_impl(
         if verification.passed() {
             finalize_metadata(
                 input.stable_path(),
-                staged.path(),
+                &mut staged,
                 format,
                 channel_roles.is_none().then_some(&verification.output),
                 verification.output.lufs,
@@ -2955,7 +2955,7 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
     }
     let mut gain = compute_gain(&source, plan);
     let mut expected_level = None;
-    let staged: Vec<AtomicOutput> = outputs
+    let mut staged: Vec<AtomicOutput> = outputs
         .iter()
         .map(|output| AtomicOutput::new(output))
         .collect::<Result<_, _>>()?;
@@ -3013,7 +3013,7 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
             .map(|output| verify_analysis_at_level(output, expected, plan, tolerance))
             .collect::<Vec<_>>();
         if verifications.iter().all(Verification::passed) {
-            for ((output, format), decoded) in staged_paths.iter().zip(formats).zip(&decoded) {
+            for ((output, format), decoded) in staged.iter_mut().zip(formats).zip(&decoded) {
                 finalize_metadata(
                     input.stable_path(),
                     output,
@@ -3462,7 +3462,7 @@ fn normalize_album_stable_impl(
     let gain = album_gain(&analyses, plan);
     let album_output_lufs = album_lufs(&analyses) + gain_db(gain);
     let write_album_tags = formats.iter().copied().any(writes_album_loudness_tags);
-    let staged: Vec<AtomicOutput> = outputs
+    let mut staged: Vec<AtomicOutput> = outputs
         .iter()
         .map(|output| AtomicOutput::new(output))
         .collect::<Result<_, _>>()?;
@@ -3517,7 +3517,7 @@ fn normalize_album_stable_impl(
     let album_metadata = metadata_outputs.as_deref().map(album_loudness_metadata);
     let finalized = captured
         .par_iter()
-        .zip(staged_paths.par_iter())
+        .zip(staged.par_iter_mut())
         .enumerate()
         .map(|(index, (input, output))| {
             let format = formats[index];
@@ -3791,7 +3791,7 @@ fn normalize_album_corrected_stable_impl(
     let mut gain = album_gain(&sources, plan);
     let mut intended_album_lufs = None;
     let mut intended_track_levels = None;
-    let staged: Vec<AtomicOutput> = outputs
+    let mut staged: Vec<AtomicOutput> = outputs
         .iter()
         .map(|output| AtomicOutput::new(output))
         .collect::<Result<_, _>>()?;
@@ -3893,7 +3893,7 @@ fn normalize_album_corrected_stable_impl(
                 None
             };
             let album_metadata = metadata_outputs.as_deref().map(album_loudness_metadata);
-            for (index, (input, output)) in captured.iter().zip(&staged_paths).enumerate() {
+            for (index, (input, output)) in captured.iter().zip(&mut staged).enumerate() {
                 let format = formats[index];
                 let measured = metadata_outputs
                     .as_ref()
@@ -3999,42 +3999,54 @@ fn album_loudness_metadata(analyses: &[Analysis]) -> AlbumLoudnessMetadata {
 
 fn finalize_metadata(
     input: &Path,
-    output: &Path,
+    output: &mut AtomicOutput,
     format: OutputFormat,
     measured_output: Option<&Analysis>,
     _track_lufs: f64,
     album: Option<AlbumLoudnessMetadata>,
     plan: &Plan,
 ) -> Result<(), String> {
-    metadata::copy_metadata(input, output)?;
+    let output_path = output.path().to_owned();
+    metadata::copy_metadata(input, &output_path)?;
+    output.adopt_path_writer_output()?;
     if format == OutputFormat::Wav && plan.bwf {
-        let measured = known_or_analyze_output(output, measured_output)?;
-        metadata::update_bwf_loudness(output, &measured)?;
+        let measured = known_or_analyze_output(&output_path, measured_output)?;
+        metadata::update_bwf_loudness(&output_path, &measured)?;
+        output.adopt_path_writer_output()?;
     }
     if format == OutputFormat::Opus {
         #[cfg(feature = "opus-encoding")]
         {
             let track_lufs = measured_output.map_or(_track_lufs, |measured| measured.lufs);
-            crate::opus::rewrite_r128_tags(output, track_lufs, album.map(|album| album.lufs))?;
+            crate::opus::rewrite_r128_tags(
+                &output_path,
+                track_lufs,
+                album.map(|album| album.lufs),
+            )?;
+            output.adopt_path_writer_output()?;
         }
     }
     if matches!(
         format,
         OutputFormat::M4a | OutputFormat::Alac | OutputFormat::Vorbis
     ) {
-        let measured = known_or_analyze_output(output, measured_output)?;
+        let measured = known_or_analyze_output(&output_path, measured_output)?;
         metadata::write_replaygain(
-            output,
+            &output_path,
             measured.lufs,
             measured.true_peak,
             album.map(|album| (album.lufs, album.true_peak)),
         )?;
+        output.adopt_path_writer_output()?;
         if matches!(format, OutputFormat::M4a | OutputFormat::Alac) {
-            metadata::write_isobmff_loudness_metadata(
-                output,
+            let replaced = metadata::write_isobmff_loudness_metadata(
+                &output_path,
                 &measured,
                 album.map(|album| (album.lufs, album.sample_peak, album.true_peak)),
             )?;
+            if replaced {
+                output.adopt_path_writer_output()?;
+            }
         }
     }
     Ok(())

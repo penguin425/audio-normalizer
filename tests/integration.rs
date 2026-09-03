@@ -317,9 +317,9 @@ fn dialogue_detector_rejects_broadband_noise() {
     let _ = std::fs::remove_file(input);
 }
 
-#[cfg(feature = "aac-encoding")]
+#[cfg(feature = "ffmpeg-encoding")]
 #[test]
-fn aac_m4a_roundtrips_gaplessly_and_writes_loudness_tags() {
+fn aac_m4a_adopts_metadata_rewrite_and_roundtrips_gaplessly() {
     let input = tmp_path("forge_it_aac_input.wav");
     let output = tmp_path("forge_it_aac_output.m4a");
     let buffer = synth_sine(44_100, 4.0, 0.1, 997.0, 2);
@@ -329,6 +329,10 @@ fn aac_m4a_roundtrips_gaplessly_and_writes_loudness_tags() {
     input_tag
         .save_to_path(&input, WriteOptions::default())
         .unwrap();
+    // Native loudness metadata is written through a nested AtomicOutput that
+    // replaces the outer stage inode. Publishing must explicitly adopt that
+    // trusted replacement while still atomically replacing this destination.
+    std::fs::write(&output, b"existing destination").unwrap();
     let plan = Plan {
         mode: Mode::Lufs,
         target_lufs: -16.0,

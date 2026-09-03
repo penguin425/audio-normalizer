@@ -3,9 +3,14 @@
 //! This module intentionally does not depend on libopus. Metadata-only
 //! normalization must remain available when Opus encoding is not compiled in.
 
+use crate::stable_input::identity_from_open_file;
 use ogg::{PacketReader, PacketWriteEndInfo, PacketWriter};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::BufReader;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 pub type R128Tags = (Option<i16>, Option<i16>);
@@ -41,13 +46,39 @@ pub fn read_r128_tags(path: &Path) -> Result<R128Tags, String> {
         .ok_or_else(|| format!("{}: missing OpusTags", path.display()))
 }
 
-/// Rewrite every sequential Opus logical stream and verify the persisted tags.
+/// Rewrite every sequential Opus logical stream through a validated sibling.
+///
+/// The final path component must be a regular file rather than a link or
+/// Windows reparse point. Publication also verifies that it still identifies
+/// the file that was parsed. As with other pathname-based atomic replacement,
+/// the containing directory must be trusted against a hostile rename in the
+/// small interval between that verification and the final rename.
 pub fn rewrite_r128_tags(
     path: &Path,
     track_lufs: f64,
     album_lufs: Option<f64>,
 ) -> Result<(), String> {
-    let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    rewrite_r128_tags_with_hooks(path, track_lufs, album_lufs, || Ok(()), |_| Ok(()))
+}
+
+fn rewrite_r128_tags_with_hooks<F, G>(
+    path: &Path,
+    track_lufs: f64,
+    album_lufs: Option<f64>,
+    before_source_revalidation: F,
+    before_stage_revalidation: G,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+    G: FnOnce(&Path) -> Result<(), String>,
+{
+    let file = open_regular_opus_file(path)?;
+    let source_identity = identity_from_open_file(&file, path)
+        .map_err(|error| format!("identify opened Opus file {}: {error}", path.display()))?;
+    let source_permissions = file
+        .metadata()
+        .map_err(|error| format!("inspect {} permissions: {error}", path.display()))?
+        .permissions();
     let mut reader = PacketReader::new(BufReader::new(file));
     let parent = path
         .parent()
@@ -104,23 +135,237 @@ pub fn rewrite_r128_tags(
     if rewritten == 0 {
         return Err(format!("{}: missing OpusTags", path.display()));
     }
-    temporary.persist(path).map_err(|error| {
-        format!(
-            "replace {} after OpusTags update: {}",
-            path.display(),
-            error.error
-        )
-    })?;
 
+    // Validate the complete replacement before it can displace the caller's
+    // file. This keeps a metadata-only rewrite transactional even if an Ogg
+    // writer regression produces malformed tags.
     let expected = (r128_gain(track_lufs), album_lufs.and_then(r128_gain));
-    let round_trip = read_all_r128_tags(path)?;
+    let round_trip = read_all_r128_tags(temporary.path())?;
     if round_trip.len() != rewritten || round_trip.iter().any(|tags| *tags != expected) {
         return Err(format!(
             "{}: RFC 7845 loudness metadata changed during write/read round trip",
             path.display()
         ));
     }
+
+    // Synchronize the actual inode that will be renamed into place, rather
+    // than relying on a stale handle held by an outer staging transaction.
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("sync OpusTags replacement for {}: {error}", path.display()))?;
+
+    before_source_revalidation()?;
+    let current = open_regular_opus_file(path)?;
+    let current_identity = identity_from_open_file(&current, path)
+        .map_err(|error| format!("re-identify Opus file {}: {error}", path.display()))?;
+    if current_identity != source_identity {
+        return Err(format!(
+            "refuse to replace {}: source path changed while OpusTags were rewritten",
+            path.display()
+        ));
+    }
+
+    before_stage_revalidation(temporary.path())?;
+
+    // Bind the still-accessible private stage before applying a preserved mode
+    // that may remove read access. Retain the no-follow handle until persist
+    // so ACL-backed source readability is not accidentally required on the
+    // newly-created replacement.
+    let _bound_stage = verify_owned_opus_stage(&temporary)?;
+    temporary
+        .as_file()
+        .set_permissions(source_permissions.clone())
+        .map_err(|error| format!("preserve {} permissions: {error}", path.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("sync OpusTags permissions for {}: {error}", path.display()))?;
+
+    // MoveFileEx cannot replace a read-only destination. Temporarily clear
+    // only that bit through an attribute-capable handle bound to the verified
+    // source identity. Restore it on failure and apply it to the published
+    // handle on success. `tempfile::persist` deliberately resets its Windows
+    // temporary file to FILE_ATTRIBUTE_NORMAL.
+    #[cfg(windows)]
+    let readonly_source_handle =
+        make_readonly_source_replaceable(path, &source_identity, &source_permissions)?;
+
+    let _persisted = match temporary.persist(path) {
+        Ok(file) => file,
+        Err(error) => {
+            let error = format!(
+                "replace {} after OpusTags update: {}",
+                path.display(),
+                error.error
+            );
+            #[cfg(windows)]
+            let error = restore_readonly_after_error(
+                readonly_source_handle.as_ref(),
+                &source_permissions,
+                path,
+                error,
+            );
+            return Err(error);
+        }
+    };
+
+    #[cfg(windows)]
+    {
+        _persisted
+            .set_permissions(source_permissions)
+            .map_err(|error| {
+                format!(
+                    "restore {} permissions after OpusTags update: {error}",
+                    path.display()
+                )
+            })?;
+        _persisted.sync_all().map_err(|error| {
+            format!(
+                "sync restored permissions after OpusTags update for {}: {error}",
+                path.display()
+            )
+        })?;
+    }
     Ok(())
+}
+
+fn verify_owned_opus_stage(temporary: &tempfile::NamedTempFile) -> Result<File, String> {
+    let path = temporary.path();
+    let current = open_regular_opus_file(path)?;
+    let owned_identity = identity_from_open_file(temporary.as_file(), path)
+        .map_err(|error| format!("identify owned OpusTags stage {}: {error}", path.display()))?;
+    let current_identity = identity_from_open_file(&current, path).map_err(|error| {
+        format!(
+            "identify current OpusTags stage {}: {error}",
+            path.display()
+        )
+    })?;
+    if current_identity != owned_identity {
+        return Err(format!(
+            "refuse to publish {}: OpusTags staging path no longer identifies the owned file",
+            path.display()
+        ));
+    }
+    Ok(current)
+}
+
+fn open_regular_opus_file(path: &Path) -> Result<File, String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(windows)]
+    options.custom_flags(0x0020_0000);
+
+    let file = options
+        .open(path)
+        .map_err(|error| format!("open Opus file {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect opened Opus file {}: {error}", path.display()))?;
+    #[cfg(windows)]
+    if metadata.file_attributes() & 0x0000_0400 != 0 {
+        return Err(format!(
+            "refuse OpusTags rewrite through reparse point {}",
+            path.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "refuse OpusTags rewrite of non-regular file {}",
+            path.display()
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_regular_opus_attribute_file(path: &Path) -> Result<File, String> {
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let mut options = OpenOptions::new();
+    options
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options
+        .open(path)
+        .map_err(|error| format!("open Opus file attributes {}: {error}", path.display()))?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "inspect opened Opus attribute handle {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.file_attributes() & 0x0000_0400 != 0 {
+        return Err(format!(
+            "refuse OpusTags rewrite through reparse point {}",
+            path.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "refuse OpusTags rewrite of non-regular file {}",
+            path.display()
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn make_readonly_source_replaceable(
+    path: &Path,
+    source_identity: &crate::stable_input::StableFileIdentity,
+    source_permissions: &std::fs::Permissions,
+) -> Result<Option<File>, String> {
+    if !source_permissions.readonly() {
+        return Ok(None);
+    }
+    let attributes = open_regular_opus_attribute_file(path)?;
+    let attribute_identity = identity_from_open_file(&attributes, path)
+        .map_err(|error| format!("identify Opus attribute handle {}: {error}", path.display()))?;
+    if &attribute_identity != source_identity {
+        return Err(format!(
+            "refuse to replace {}: source path changed before updating its read-only attribute",
+            path.display()
+        ));
+    }
+    let mut replaceable_permissions = source_permissions.clone();
+    replaceable_permissions.set_readonly(false);
+    attributes
+        .set_permissions(replaceable_permissions)
+        .map_err(|error| {
+            format!(
+                "temporarily make {} replaceable for OpusTags update: {error}",
+                path.display()
+            )
+        })?;
+    Ok(Some(attributes))
+}
+
+#[cfg(windows)]
+fn restore_readonly_after_error(
+    source_handle: Option<&File>,
+    source_permissions: &std::fs::Permissions,
+    path: &Path,
+    primary_error: String,
+) -> String {
+    let Some(source_handle) = source_handle else {
+        return primary_error;
+    };
+    match source_handle.set_permissions(source_permissions.clone()) {
+        Ok(()) => primary_error,
+        Err(restore_error) => format!(
+            "{primary_error}; additionally failed to restore the read-only attribute for {}: {restore_error}",
+            path.display()
+        ),
+    }
 }
 
 fn read_all_r128_tags(path: &Path) -> Result<Vec<R128Tags>, String> {
@@ -336,8 +581,130 @@ mod tests {
                 .write_packet(b"not-tags".to_vec(), 33, PacketWriteEndInfo::EndStream, 0)
                 .unwrap();
         }
+        let before = std::fs::read(temporary.path()).unwrap();
         let error = rewrite_r128_tags(temporary.path(), -18.0, None).unwrap_err();
         assert!(error.contains("missing OpusTags"));
+        assert_eq!(std::fs::read(temporary.path()).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_preserves_unix_access_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = temporary.reopen().unwrap();
+            let mut writer = PacketWriter::new(BufWriter::new(file));
+            write_stream(&mut writer, 55, -18.0, None);
+        }
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        rewrite_r128_tags(temporary.path(), -16.0, None).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(temporary.path()).unwrap().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_rejects_source_path_replacement_before_publish() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.opus");
+        let original = directory.path().join("original.opus");
+        let replacement = directory.path().join("replacement.opus");
+        {
+            let file = File::create(&path).unwrap();
+            let mut writer = PacketWriter::new(BufWriter::new(file));
+            write_stream(&mut writer, 66, -18.0, None);
+        }
+        {
+            let file = File::create(&replacement).unwrap();
+            let mut writer = PacketWriter::new(BufWriter::new(file));
+            write_stream(&mut writer, 77, -20.0, Some(-21.0));
+        }
+        let original_bytes = std::fs::read(&path).unwrap();
+        let replacement_bytes = std::fs::read(&replacement).unwrap();
+
+        let error = rewrite_r128_tags_with_hooks(
+            &path,
+            -16.0,
+            None,
+            || {
+                std::fs::rename(&path, &original).map_err(|error| error.to_string())?;
+                std::fs::rename(&replacement, &path).map_err(|error| error.to_string())?;
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("source path changed"), "{error}");
+        assert_eq!(std::fs::read(&original).unwrap(), original_bytes);
+        assert_eq!(std::fs::read(&path).unwrap(), replacement_bytes);
+    }
+
+    #[test]
+    fn rewrite_rejects_replaced_private_stage_before_publish() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.opus");
+        {
+            let file = File::create(&path).unwrap();
+            let mut writer = PacketWriter::new(BufWriter::new(file));
+            write_stream(&mut writer, 78, -18.0, None);
+        }
+        let source_bytes = std::fs::read(&path).unwrap();
+
+        let error = rewrite_r128_tags_with_hooks(
+            &path,
+            -16.0,
+            None,
+            || Ok(()),
+            |stage_path| {
+                let mut replacement = tempfile::NamedTempFile::new_in(stage_path.parent().unwrap())
+                    .map_err(|error| error.to_string())?;
+                replacement
+                    .write_all(b"swapped private stage")
+                    .map_err(|error| error.to_string())?;
+                replacement
+                    .persist(stage_path)
+                    .map_err(|error| error.error.to_string())?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("staging path no longer identifies the owned file"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), source_bytes);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rewrite_preserves_windows_readonly_attribute() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("readonly.opus");
+        {
+            let file = File::create(&path).unwrap();
+            let mut writer = PacketWriter::new(BufWriter::new(file));
+            write_stream(&mut writer, 88, -18.0, None);
+        }
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+
+        rewrite_r128_tags(&path, -16.0, None).unwrap();
+
+        assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
+        let mut cleanup_permissions = std::fs::metadata(&path).unwrap().permissions();
+        cleanup_permissions.set_readonly(false);
+        std::fs::set_permissions(&path, cleanup_permissions).unwrap();
     }
 
     #[test]

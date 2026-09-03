@@ -8,6 +8,34 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.189.4 - 2026-09-03
+
+### Added
+
+- Add one-shot `prepare_versioned_file`, `VersionedMetadataRepairPlan`, and
+  `ExecutedVersionedMetadataRepair` APIs for preflighted metadata repair and
+  atomic report publication.
+
+### Fixed
+
+- Bind atomic normalization publication to the staged file actually produced
+  by trusted path-based metadata writers. Unexpected staging-path replacement
+  is rejected, including in single-track, album, multi-delivery, and segment
+  workflows.
+- Validate rewritten Opus tags before replacement, synchronize the replacement
+  file, preserve basic platform permissions, and keep a failed rewrite from
+  publishing malformed metadata.
+- Reject `forge-metadata-repair --output` aliases observed during preflight
+  and immediately before publication, including normalized paths, hard links,
+  symlinks, Windows reparse points, and common platform filename aliases to the
+  request, media source, repair destination, or decoded references. Reports are
+  staged before repair and atomically replaced so failures detected before
+  replacement preserve existing report bytes.
+- Keep gRPC worker permits and cancellation registrations until detached
+  blocking analysis actually exits after a timeout or client disconnect. Add
+  bounded cancellation checkpoints and classify disconnected requests as
+  cancellations instead of server errors.
+
 ## 0.189.3 - 2026-09-03
 
 ### Added

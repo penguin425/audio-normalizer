@@ -429,6 +429,41 @@ fn flac_outputs_are_redecoded_and_verified() {
     assert_eq!(report["passed"], true);
 }
 
+#[cfg(feature = "ffmpeg-encoding")]
+#[test]
+fn alac_outputs_adopt_nested_atomic_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut request = prepare(directory.path());
+    request["format"] = json!("alac");
+    request["segments"][0]["output"] = json!("outputs/quiet.m4a");
+    request["segments"][1]["output"] = json!("outputs/loud.m4a");
+    fs::write(
+        directory.path().join("request.json"),
+        serde_json::to_vec_pretty(&request).unwrap(),
+    )
+    .unwrap();
+
+    let planning = plan(directory.path(), false);
+    assert!(
+        planning.status.success(),
+        "{}",
+        String::from_utf8_lossy(&planning.stderr)
+    );
+    let result = render(directory.path(), false);
+
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(directory.path().join("outputs/quiet.m4a").is_file());
+    assert!(directory.path().join("outputs/loud.m4a").is_file());
+    let report: Value =
+        serde_json::from_slice(&fs::read(directory.path().join("report.json")).unwrap()).unwrap();
+    assert_eq!(report["published_segments"], 2);
+    assert_eq!(report["passed"], true);
+}
+
 #[test]
 fn accepts_a_toml_request_with_bounded_defaults() {
     let directory = tempfile::tempdir().unwrap();
