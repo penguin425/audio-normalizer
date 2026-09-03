@@ -132,8 +132,9 @@ pub fn evaluate(path: &Path, spec: DownmixQcSpec) -> Result<DownmixQcReport, Str
             spec.max_input_bytes
         ));
     }
-    let mut source = crate::decoder::decode_limited(&source_path, spec.max_decoded_samples)
-        .map_err(|error| format!("decode downmix source {}: {error}", source_path.display()))?;
+    let (mut source, layout_provenance) =
+        crate::decoder::decode_limited_with_layout(&source_path, spec.max_decoded_samples)
+            .map_err(|error| format!("decode downmix source {}: {error}", source_path.display()))?;
     if source.channels as usize != input_layout.channels() {
         return Err(format!(
             "input layout {} requires {} channels, decoded {}",
@@ -143,8 +144,16 @@ pub fn evaluate(path: &Path, spec: DownmixQcSpec) -> Result<DownmixQcReport, Str
         ));
     }
     // The spec is the auditable layout authority when a legacy WAVE file has
-    // an absent or ambiguous channel mask.
-    source.channel_roles = input_layout.roles();
+    // an absent or ambiguous channel mask. Keep decoder provenance until this
+    // explicit assignment has been checked against the decoded channel count.
+    let explicit_roles = input_layout.roles();
+    source.channel_roles = normalize::resolve_decoded_channel_roles(
+        &source_path,
+        source.channels,
+        &source.channel_roles,
+        layout_provenance,
+        Some(&explicit_roles),
+    )?;
     let source_analysis = normalize::analyze(&source);
     let source_measurement = measurement(input_layout.as_str(), &source_analysis);
     let limits = QcLimits {
@@ -341,7 +350,7 @@ fn default_max_decoded_samples() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wav::{default_channel_roles, PcmKind, WavWriter};
+    use crate::wav::{ChannelRole, PcmKind, WavWriter};
 
     #[test]
     fn rejects_upmixing_to_seven_one_four() {
@@ -366,10 +375,13 @@ mod tests {
             channels: 6,
             frames,
             data: vec![vec![0.9; frames]; 6],
-            channel_roles: default_channel_roles(6),
+            channel_roles: vec![ChannelRole::Main; 6],
             source_kind: PcmKind::F32,
         };
         WavWriter::write(&source_path, &source, PcmKind::F32, false).unwrap();
+        let legacy_error =
+            crate::decoder::decode_limited(&source_path, DEFAULT_MAX_DECODED_SAMPLES).unwrap_err();
+        assert!(legacy_error.contains("ambiguous channel layout"));
         let spec_path = work.path().join("downmix.json");
         fs::write(
             &spec_path,

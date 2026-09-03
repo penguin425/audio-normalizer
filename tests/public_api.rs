@@ -75,6 +75,29 @@ fn documented_public_api_works_from_a_downstream_crate() {
     let decoded = decode_fn(&wave_path).expect("decode public API");
     assert_eq!((decoded.frames, decoded.channels), (frames, 2));
 
+    let mut streamed_frames = 0;
+    decoder::decode_stream_with_layout(&wave_path, |info, provenance, planar| {
+        assert_eq!(info.channels, 2);
+        assert_eq!(provenance, decoder::ChannelLayoutProvenance::KnownSpeakers);
+        streamed_frames += planar[0].len();
+        Ok(())
+    })
+    .expect("stream through provenance-aware public decoder API");
+    assert_eq!(streamed_frames, frames);
+
+    let mut owned_frames = 0;
+    decoder::decode_stream_owned_with_layout(&wave_path, |info, provenance, mut planar| {
+        assert_eq!(info.channels, 2);
+        assert_eq!(provenance, decoder::ChannelLayoutProvenance::KnownSpeakers);
+        owned_frames += planar[0].len();
+        for channel in &mut planar {
+            channel.clear();
+        }
+        Ok(planar)
+    })
+    .expect("stream through owned provenance-aware public decoder API");
+    assert_eq!(owned_frames, frames);
+
     let cache = AnalysisCache::new(
         temporary.path().join("analysis-cache"),
         AnalysisCachePolicy::default(),

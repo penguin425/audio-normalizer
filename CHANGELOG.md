@@ -8,6 +8,89 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.189.2 - 2026-09-03
+
+### Fixed
+
+- Follow EBU Tech 3342 loudness-range population rules at the end of finite
+  programmes, including the 1.5-second post-signal silence, inclusive gates,
+  and rank-based percentiles, without extending integrated loudness or other
+  measurements. Explicit dialogue ranges no longer append that programme-level
+  LRA tail when deriving dialogue loudness.
+- Measure finite-signal True Peak with zero-valued boundaries and a complete
+  FIR tail, and select the smallest integer oversampling factor that reaches at
+  least 192 kHz for supported 8–384 kHz inputs. Arbitrary factors retain a
+  scalar oracle and use SIMD where available; stereo scheduling avoids the
+  parallel-pass overhead at the common 48 kHz rate. Offline limiting now
+  protects the same boundary response without emitting or counting virtual
+  samples, and timeline reports attribute the EOF response only to their final
+  real interval.
+- Preserve decoder channel-layout provenance and reject ambiguous or
+  scene-based speaker weighting unless the caller supplies an explicit layout.
+  Route 6.1 stereo downmixes through their centre-back-aware matrix.
+  Publish analysis-cache schema/layout v2 and segment plan/report schemas v2,
+  preserving the immutable v1 schemas while requiring old cache entries and
+  pre-0.189.2 segment plans to be regenerated.
+- Inspect RFC 9639 FLAC channel-mask comments across metadata revisions and
+  use every complete standard mask as authoritative speaker evidence during
+  analysis. Malformed, conflicting, partial, or reserved-bit masks remain
+  ambiguous, while normalization fails before creating an output when its
+  writer cannot preserve the measured speaker order.
+- Preserve exact channel roles for conventional multichannel Ogg Opus and
+  uncompressed DSF/DSDIFF inputs instead of replacing known positions with a
+  generic channel count. FFmpeg-backed AAC and ALAC output is limited to mono
+  or stereo until its written layout can be recovered authoritatively;
+  Vorbis validates its sample-rate, channel-count, and managed-bitrate tuple
+  against the libvorbis setup tables before starting FFmpeg.
+- Reject placeholder channel layouts synthesized for ISO-BMFF PCM/FLAC and
+  legacy multichannel ALAC, and keep native and browser decode limits aligned.
+  Legacy public decode/load adapters now reject layouts whose provenance they
+  cannot return, while additive layout-aware adapters preserve that evidence.
+  C ABI v1, Python, and browser analysis now document their lack of a layout
+  override; browser limits distinguish the 32-channel decoder ceiling from
+  the two-channel implicit-layout ceiling.
+- Detect RIFF, RF64, and BW64 WAVE input by its file signature as well as its
+  suffix. Reject zero-channel, structurally inconsistent, partial-frame,
+  data-before-format, and duplicate-format/data inputs before decoding, and
+  apply decoded-sample limits to the same data chunk that is actually read.
+  Honour the declared RIFF or `ds64` boundary, require `ds64` first in large
+  containers, and accept valid extensible-format payloads longer than the
+  mandatory 22-byte extension. Emit and account for the required RIFF pad byte
+  after odd-length PCM data, including in RF64/BW64 `ds64.riffSize`.
+- Treat every complete standard WAVE speaker mask as authoritative during
+  analysis, restoring exact positional roles even for sparse layouts. Output
+  still fails closed unless the selected writer can preserve that order.
+  Public writers validate sample rate, buffer geometry, header arithmetic,
+  metadata chunk identifiers, and codec configuration before touching the
+  destination; FFmpeg-backed buffer writes publish from a staging file.
+- Detect duplicate hard-linked album references and same-size content changes
+  around decoded-reference measurement. WAVE metadata repair now rejects
+  malformed declared boundaries or out-of-container bytes rather than copying
+  an unverifiable byte range.
+- Bind metadata-repair sources and decoded album references to private,
+  hash-verified snapshots, apply aggregate snapshot limits, and reject output
+  aliases, symlinks, multiply-linked destinations, and no-clobber races before
+  publication.
+- Distinguish MPEG dual-channel audio from conventional stereo and joint
+  stereo. Dual-channel inputs now require an explicit layout, and a semantic
+  mode change within one stream is rejected before the changed PCM is exposed.
+  AAC and MP3 writers reject sample-rate or bitrate requests that their native
+  encoders would otherwise silently resample, clamp, or round. AAC excludes
+  its 7.35 kHz mode, and ALAC/FLAC reject rates outside Forge's shared
+  8–384 kHz decode and measurement contract before opening the destination.
+- Reject non-finite IEEE-float samples in browser and C-ABI WAVE analysis
+  before analyzer state changes, matching the native streaming contract.
+- Omit undefined ReplayGain and RFC 7845 R128 gain fields for silent
+  programmes or material too short for integrated loudness, instead of
+  serializing infinity or a misleading zero gain.
+- Generate release SBOMs with a checksum-pinned Syft binary instead of
+  executing a mutable installer inside the privileged publication job. Tag
+  builds must resolve to protected `main` and are rechecked against the remote
+  immediately before publication; future GitHub Releases are immutable.
+- Correct the EBU R 128 s2 adapted-streaming compliance range to −20…−16 LUFS,
+  and treat the AES77 music-track and interstitial `+0.2 LU` values as upper
+  tolerances rather than symmetric tolerances.
+
 ## 0.189.1 - 2026-09-03
 
 ### Fixed

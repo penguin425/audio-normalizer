@@ -31,6 +31,35 @@ fn write_tone(path: &Path, amplitude: f32, sample_rate: u32) {
     .unwrap();
 }
 
+fn write_maskless_51_tone(path: &Path, amplitude: f32, sample_rate: u32) {
+    let channels = 6_u16;
+    let frames = sample_rate as usize * 2;
+    let block_align = channels * 2;
+    let data_size = u32::from(block_align) * u32::try_from(frames).unwrap();
+    let mut bytes = Vec::with_capacity(44 + data_size as usize);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36_u32 + data_size).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16_u32.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&channels.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+    bytes.extend_from_slice(&block_align.to_le_bytes());
+    bytes.extend_from_slice(&16_u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_size.to_le_bytes());
+    for frame in 0..frames {
+        let sample =
+            amplitude as f64 * (TAU * 1_000.0 * frame as f64 / sample_rate as f64 + 0.3).sin();
+        let quantized = (sample * f64::from(i16::MAX)).round() as i16;
+        for _ in 0..channels {
+            bytes.extend_from_slice(&quantized.to_le_bytes());
+        }
+    }
+    fs::write(path, bytes).unwrap();
+}
+
 fn request() -> Value {
     json!({
         "schema": REQUEST_SCHEMA,
@@ -77,6 +106,19 @@ fn plan(directory: &Path, overwrite: bool) -> Output {
     command.output().unwrap()
 }
 
+fn plan_with_layout(directory: &Path, layout: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_forge-segment-normalize"))
+        .arg("plan")
+        .arg("--request")
+        .arg(directory.join("request.json"))
+        .arg("--manifest")
+        .arg(directory.join("plan.json"))
+        .arg("--channel-layout")
+        .arg(layout)
+        .output()
+        .unwrap()
+}
+
 fn render(directory: &Path, overwrite: bool) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_forge-segment-normalize"));
     command
@@ -119,7 +161,11 @@ fn two_pass_wav_render_has_a_shared_boundary_and_schema_valid_evidence() {
     let plan_value: Value =
         serde_json::from_slice(&fs::read(directory.path().join("plan.json")).unwrap()).unwrap();
     assert_eq!(plan_value["schema"], PLAN_SCHEMA);
-    assert_eq!(plan_value["method"]["id"], "forge-segment-normalization-v1");
+    assert_eq!(
+        plan_value["generator"],
+        concat!("forge-normalizer/", env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(plan_value["method"]["id"], "forge-segment-normalization-v2");
     assert_eq!(
         plan_value["segments"][0]["end_gain_db"],
         plan_value["segments"][1]["start_gain_db"]
@@ -127,7 +173,7 @@ fn two_pass_wav_render_has_a_shared_boundary_and_schema_valid_evidence() {
     assert_eq!(plan_value["manual_review_recommended"], true);
     assert_schema(
         &plan_value,
-        include_str!("../schema/segment-normalization-plan-v1.schema.json"),
+        include_str!("../schema/segment-normalization-plan-v2.schema.json"),
     );
 
     let rendered = render(directory.path(), false);
@@ -148,7 +194,7 @@ fn two_pass_wav_render_has_a_shared_boundary_and_schema_valid_evidence() {
         .all(|segment| segment["passed"] == true && segment["published"] == true));
     assert_schema(
         &report,
-        include_str!("../schema/segment-normalization-report-v1.schema.json"),
+        include_str!("../schema/segment-normalization-report-v2.schema.json"),
     );
 
     let quiet_input = WavReader::open(directory.path().join("inputs/quiet.wav")).unwrap();
@@ -169,6 +215,81 @@ fn two_pass_wav_render_has_a_shared_boundary_and_schema_valid_evidence() {
         "{}",
         String::from_utf8_lossy(&replaced.stderr)
     );
+}
+
+#[test]
+fn maskless_five_one_plan_requires_an_override_and_remains_renderable() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("inputs")).unwrap();
+    write_maskless_51_tone(&directory.path().join("inputs/quiet.wav"), 0.04, 48_000);
+    write_maskless_51_tone(&directory.path().join("inputs/loud.wav"), 0.16, 48_000);
+    let mut request = request();
+    request["max_decoded_samples_per_segment"] = json!(1_000_000);
+    fs::write(
+        directory.path().join("request.json"),
+        serde_json::to_vec_pretty(&request).unwrap(),
+    )
+    .unwrap();
+
+    let rejected = plan(directory.path(), false);
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("ambiguous 6-channel layout"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(!directory.path().join("plan.json").exists());
+
+    let planned = plan_with_layout(directory.path(), "5.1");
+    assert!(
+        planned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let rendered = render(directory.path(), false);
+    assert!(
+        rendered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rendered.stderr)
+    );
+    let report: Value =
+        serde_json::from_slice(&fs::read(directory.path().join("report.json")).unwrap()).unwrap();
+    assert_eq!(report["passed"], true);
+    assert_eq!(report["published_segments"], 2);
+}
+
+#[test]
+fn pre_layout_provenance_plan_is_rejected_before_publication() {
+    let directory = tempfile::tempdir().unwrap();
+    prepare(directory.path());
+    assert!(plan(directory.path(), false).status.success());
+
+    let plan_path = directory.path().join("plan.json");
+    let mut value: Value = serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
+    value["schema"] =
+        json!("https://penguin425.github.io/audio-normalizer/schema/segment-normalization-plan-v1");
+    value["method"]["id"] = json!("forge-segment-normalization-v1");
+    value["method"]["algorithm_revision"] = json!("smoothstep-db-boundary-v1");
+    fs::write(&plan_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+    fs::create_dir(directory.path().join("outputs")).unwrap();
+    let quiet_output = directory.path().join("outputs/quiet.wav");
+    let loud_output = directory.path().join("outputs/loud.wav");
+    fs::write(&quiet_output, b"preserve quiet").unwrap();
+    fs::write(&loud_output, b"preserve loud").unwrap();
+
+    let result = render(directory.path(), true);
+
+    assert_eq!(result.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("unsupported segment normalization plan method or schema"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(fs::read(quiet_output).unwrap(), b"preserve quiet");
+    assert_eq!(fs::read(loud_output).unwrap(), b"preserve loud");
+    assert!(!directory.path().join("report.json").exists());
 }
 
 #[test]

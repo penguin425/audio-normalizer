@@ -42,11 +42,28 @@ extern "C" {
     ) -> c_int;
     fn lame_encode_flush(gfp: LameT, mp3buf: *mut u8, mp3buf_size: c_int) -> c_int;
     fn lame_get_lametag_frame(gfp: LameT, buffer: *mut u8, size: usize) -> usize;
+    fn lame_get_brate(gfp: LameT) -> c_int;
+    fn lame_get_out_samplerate(gfp: LameT) -> c_int;
     fn lame_close(gfp: LameT) -> c_int;
 }
 
 const VBR_OFF: c_int = 0;
 const LAME_OKAY: c_int = 0;
+
+fn validate_mp3_configuration(sample_rate: u32, bitrate_kbps: i32) -> Result<(), String> {
+    if !matches!(
+        sample_rate,
+        8_000 | 11_025 | 12_000 | 16_000 | 22_050 | 24_000 | 32_000 | 44_100 | 48_000
+    ) {
+        return Err(format!(
+            "MP3 output sample rate {sample_rate} Hz is unsupported; use 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, or 48000 Hz"
+        ));
+    }
+    if !(8..=320).contains(&bitrate_kbps) {
+        return Err("MP3 bitrate must be between 8 and 320 kbps".into());
+    }
+    Ok(())
+}
 
 pub struct Mp3StreamWriter {
     gfp: LameT,
@@ -66,25 +83,44 @@ impl Mp3StreamWriter {
         if !(1..=2).contains(&channels) {
             return Err("MP3 output supports only mono or stereo".into());
         }
+        validate_mp3_configuration(sample_rate, bitrate_kbps)?;
         let gfp = unsafe { lame_init() };
         if gfp.is_null() {
             return Err("lame_init() returned null".into());
         }
-        let result = unsafe {
-            lame_set_in_samplerate(gfp, sample_rate as c_int);
-            lame_set_num_channels(gfp, channels as c_int);
-            lame_set_out_samplerate(gfp, sample_rate as c_int);
-            lame_set_brate(gfp, bitrate_kbps);
-            lame_set_VBR(gfp, VBR_OFF);
-            lame_set_quality(gfp, quality.clamp(0, 9));
-            lame_set_bWriteVbrTag(gfp, 1);
-            lame_init_params(gfp)
+        let (settings_ok, result) = unsafe {
+            let settings_ok = lame_set_in_samplerate(gfp, sample_rate as c_int) == LAME_OKAY
+                && lame_set_num_channels(gfp, channels as c_int) == LAME_OKAY
+                && lame_set_out_samplerate(gfp, sample_rate as c_int) == LAME_OKAY
+                && lame_set_brate(gfp, bitrate_kbps) == LAME_OKAY
+                && lame_set_VBR(gfp, VBR_OFF) == LAME_OKAY
+                && lame_set_quality(gfp, quality.clamp(0, 9)) == LAME_OKAY
+                && lame_set_bWriteVbrTag(gfp, 1) == LAME_OKAY;
+            (settings_ok, settings_ok.then(|| lame_init_params(gfp)))
         };
-        if result != LAME_OKAY {
+        if !settings_ok || result != Some(LAME_OKAY) {
             unsafe {
                 lame_close(gfp);
             }
-            return Err("lame_init_params() failed".into());
+            return Err("configure LAME encoder failed".into());
+        }
+        let actual_sample_rate = unsafe { lame_get_out_samplerate(gfp) };
+        if actual_sample_rate != sample_rate as c_int {
+            unsafe {
+                lame_close(gfp);
+            }
+            return Err(format!(
+                "LAME selected {actual_sample_rate} Hz instead of requested {sample_rate} Hz"
+            ));
+        }
+        let actual_bitrate = unsafe { lame_get_brate(gfp) };
+        if actual_bitrate != bitrate_kbps {
+            unsafe {
+                lame_close(gfp);
+            }
+            return Err(format!(
+                "LAME selected {actual_bitrate} kbps instead of requested {bitrate_kbps} kbps"
+            ));
         }
         let output =
             File::create(path).map_err(|error| format!("create {}: {error}", path.display()))?;
@@ -187,6 +223,10 @@ pub fn encode_mp3(buf: &AudioBuffer, bitrate_kbps: i32, quality: i32) -> Result<
     if channels > 2 {
         return Err("MP3 output supports only mono or stereo".into());
     }
+    validate_mp3_configuration(buf.sample_rate, bitrate_kbps)?;
+    if buf.data.len() != channels {
+        return Err("channel count does not match audio planes".into());
+    }
     for ch in &buf.data {
         if ch.len() != buf.frames {
             return Err("channel length mismatch".into());
@@ -207,20 +247,35 @@ pub fn encode_mp3(buf: &AudioBuffer, bitrate_kbps: i32, quality: i32) -> Result<
     let mut out: Vec<u8> = Vec::with_capacity(buf.frames / 8);
 
     unsafe {
-        lame_set_in_samplerate(gfp, buf.sample_rate as c_int);
-        lame_set_num_channels(gfp, channels as c_int);
+        let settings_ok = lame_set_in_samplerate(gfp, buf.sample_rate as c_int) == LAME_OKAY
+            && lame_set_num_channels(gfp, channels as c_int) == LAME_OKAY
         // 0 = keep the input sample rate (no resampling).
-        lame_set_out_samplerate(gfp, buf.sample_rate as c_int);
-        lame_set_brate(gfp, bitrate_kbps as c_int);
-        lame_set_VBR(gfp, VBR_OFF);
+            && lame_set_out_samplerate(gfp, buf.sample_rate as c_int) == LAME_OKAY
+            && lame_set_brate(gfp, bitrate_kbps as c_int) == LAME_OKAY
+            && lame_set_VBR(gfp, VBR_OFF) == LAME_OKAY
         // Clamp quality to LAME's 0..=9 range; 0 is best/slowest, 2 is a great default.
-        lame_set_quality(gfp, quality.clamp(0, 9));
+            && lame_set_quality(gfp, quality.clamp(0, 9)) == LAME_OKAY
         // Reserve a first-frame Info/LAME tag and backpatch it after flushing.
-        lame_set_bWriteVbrTag(gfp, 1);
+            && lame_set_bWriteVbrTag(gfp, 1) == LAME_OKAY;
 
-        if lame_init_params(gfp) != LAME_OKAY {
+        if !settings_ok || lame_init_params(gfp) != LAME_OKAY {
             lame_close(gfp);
-            return Err("lame_init_params() failed".into());
+            return Err("configure LAME encoder failed".into());
+        }
+        let actual_sample_rate = lame_get_out_samplerate(gfp);
+        if actual_sample_rate != buf.sample_rate as c_int {
+            lame_close(gfp);
+            return Err(format!(
+                "LAME selected {actual_sample_rate} Hz instead of requested {} Hz",
+                buf.sample_rate
+            ));
+        }
+        let actual_bitrate = lame_get_brate(gfp);
+        if actual_bitrate != bitrate_kbps {
+            lame_close(gfp);
+            return Err(format!(
+                "LAME selected {actual_bitrate} kbps instead of requested {bitrate_kbps} kbps"
+            ));
         }
 
         let mut pos: usize = 0;
@@ -281,4 +336,47 @@ pub fn write_mp3<P: AsRef<Path>>(
     let p = path.as_ref();
     let bytes = encode_mp3(buf, bitrate_kbps, quality)?;
     std::fs::write(p, &bytes).map_err(|e| format!("write {}: {e}", p.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wav::{default_channel_roles, PcmKind};
+
+    #[test]
+    fn encode_rejects_missing_or_extra_planes_before_calling_lame() {
+        for (channels, data) in [(2, vec![vec![0.0]]), (1, vec![vec![0.0], vec![0.0]])] {
+            let audio = AudioBuffer {
+                sample_rate: 48_000,
+                channels,
+                frames: 1,
+                data,
+                channel_roles: default_channel_roles(channels),
+                source_kind: PcmKind::F32,
+            };
+            assert_eq!(
+                encode_mp3(&audio, 192, 2).unwrap_err(),
+                "channel count does not match audio planes"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_configuration_is_rejected_before_output_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("existing.mp3");
+        std::fs::write(&destination, b"keep me").unwrap();
+
+        let error = Mp3StreamWriter::create(&destination, 12_345, 2, 192, 2)
+            .err()
+            .unwrap();
+        assert!(error.contains("sample rate"), "{error}");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"keep me");
+
+        let error = Mp3StreamWriter::create(&destination, 48_000, 2, 321, 2)
+            .err()
+            .unwrap();
+        assert!(error.contains("bitrate"), "{error}");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"keep me");
+    }
 }

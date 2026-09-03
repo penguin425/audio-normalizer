@@ -1,5 +1,23 @@
 //! WAV (RIFF/WAVE) demuxer and muxer.
 
+/// Bounds shared by every decoder entry point, including the browser build.
+pub(crate) const MIN_DECODE_SAMPLE_RATE_HZ: u32 = 8_000;
+pub(crate) const MAX_DECODE_SAMPLE_RATE_HZ: u32 = 384_000;
+
+/// How confidently a decoder can bind PCM planes to physical speakers.
+///
+/// The layout-preserving decoder APIs return this sidecar because a channel
+/// count alone cannot identify a multichannel speaker layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelLayoutProvenance {
+    /// Every decoded channel is bound to a known physical speaker.
+    KnownSpeakers,
+    /// The container did not completely identify the speaker assignment.
+    Unknown,
+    /// The channels describe a scene (for example Ambisonics), not speakers.
+    SceneBased,
+}
+
 pub mod format;
 pub mod reader;
 pub mod writer;

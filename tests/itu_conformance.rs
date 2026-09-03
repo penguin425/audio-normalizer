@@ -4,7 +4,9 @@
 //! `tools/test-itu-conformance.sh`; it is never committed to the repository.
 
 use forge_normalizer::normalize;
+use forge_normalizer::wav::{default_channel_roles, WavReader};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[test]
@@ -31,7 +33,19 @@ fn assert_case(path: &Path) {
         .file_name()
         .and_then(|value| value.to_str())
         .expect("UTF-8 test filename");
-    let analysis = normalize::analyze_file(path)
+    let repaired = repair_known_bs2217_riff_size(path, name);
+    let analysis_path = repaired.as_ref().map_or(path, |file| file.path());
+    // The pinned BS.2217 fixtures have documented mono, stereo, or
+    // L/R/C/LFE/Ls/Rs order, but several are classic maskless WAVE files and
+    // one mono variant uses FL rather than Forge's canonical mono mask. Supply
+    // the conformance-set knowledge explicitly so production decoding can
+    // remain fail-closed for arbitrary inputs.
+    let channels = WavReader::probe_with_layout(analysis_path)
+        .unwrap_or_else(|error| panic!("failed to probe {name}: {error}"))
+        .0
+        .channels;
+    let roles = default_channel_roles(channels);
+    let analysis = normalize::analyze_file_with_roles(analysis_path, Some(&roles))
         .unwrap_or_else(|error| panic!("failed to analyze {name}: {error}"));
 
     if name.contains("ChannelCheckLFE") {
@@ -62,4 +76,33 @@ fn assert_case(path: &Path) {
         "{name}: measured {:.3} LUFS, expected {expected:.1} ±0.1 LU",
         analysis.lufs
     );
+}
+
+/// Two pinned BS.2217-2 programme fixtures omit the 8-byte `data` chunk
+/// header from RIFF.ckSize while their PCM extent itself is complete. Keep the
+/// production reader strict and repair only that field in temporary copies;
+/// the download script still authenticates every original archive.
+fn repair_known_bs2217_riff_size(path: &Path, name: &str) -> Option<tempfile::NamedTempFile> {
+    if !matches!(
+        name,
+        "1770-2 Conf Mono Voice+Music-24LKFS.wav" | "1770-2 Conf Stereo VinL+R-24LKFS.wav"
+    ) {
+        return None;
+    }
+    let mut bytes = fs::read(path).expect("read official BS.2217 fixture");
+    assert_eq!(&bytes[..4], b"RIFF");
+    assert_eq!(&bytes[60..64], b"data");
+    let data_size = u32::from_le_bytes(bytes[64..68].try_into().unwrap()) as usize;
+    assert_eq!(68_usize.checked_add(data_size), Some(bytes.len()));
+    let declared = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let actual = u32::try_from(bytes.len() - 8).expect("fixture fits RIFF");
+    assert_eq!(declared.checked_add(8), Some(actual));
+    bytes[4..8].copy_from_slice(&actual.to_le_bytes());
+
+    let mut repaired = tempfile::NamedTempFile::new().expect("create repaired fixture");
+    repaired
+        .write_all(&bytes)
+        .expect("write repaired BS.2217 fixture");
+    repaired.flush().expect("flush repaired BS.2217 fixture");
+    Some(repaired)
 }

@@ -174,46 +174,39 @@ pub(crate) fn analyze_reference(
     }
     let mut analyzer = None;
     let mut decoded_samples = 0_u64;
-    let info = crate::decoder::decode_stream(path, |info, planar| {
-        let frames = planar.first().map_or(0_usize, Vec::len);
-        if planar.iter().any(|channel| channel.len() != frames) {
-            return Err("decoded reference channel lengths differ".into());
-        }
-        let chunk_samples = u64::try_from(frames)
-            .ok()
-            .and_then(|frames| frames.checked_mul(u64::from(info.channels)))
-            .ok_or("decoded reference sample count overflow")?;
-        decoded_samples = decoded_samples
-            .checked_add(chunk_samples)
-            .ok_or("decoded reference sample count overflow")?;
-        if decoded_samples > max_decoded_samples {
-            return Err(format!(
-                "decoded reference exceeds max_decoded_samples ({max_decoded_samples})"
-            ));
-        }
-        if analyzer.is_none() {
-            if info.channels > 6
-                && info
-                    .channel_roles
-                    .iter()
-                    .all(|role| matches!(role, crate::wav::ChannelRole::Main))
-            {
+    let info =
+        crate::decoder::decode_stream_with_layout(path, |info, layout_provenance, planar| {
+            let frames = planar.first().map_or(0_usize, Vec::len);
+            if planar.iter().any(|channel| channel.len() != frames) {
+                return Err("decoded reference channel lengths differ".into());
+            }
+            let chunk_samples = u64::try_from(frames)
+                .ok()
+                .and_then(|frames| frames.checked_mul(u64::from(info.channels)))
+                .ok_or("decoded reference sample count overflow")?;
+            decoded_samples = decoded_samples
+                .checked_add(chunk_samples)
+                .ok_or("decoded reference sample count overflow")?;
+            if decoded_samples > max_decoded_samples {
                 return Err(format!(
-                    "{}: ambiguous {}-channel layout cannot be written as BS.1770 loudness metadata",
-                    path.display(),
-                    info.channels
+                    "decoded reference exceeds max_decoded_samples ({max_decoded_samples})"
                 ));
             }
-            analyzer = Some(StreamingAnalyzer::new(
-                info.sample_rate,
-                info.channel_roles.clone(),
-            ));
-        }
-        analyzer
-            .as_mut()
-            .expect("decoder callback initializes loudness analyzer")
-            .process(planar)
-    })?;
+            if analyzer.is_none() {
+                let roles = crate::normalize::resolve_decoded_channel_roles(
+                    path,
+                    info.channels,
+                    &info.channel_roles,
+                    layout_provenance,
+                    None,
+                )?;
+                analyzer = Some(StreamingAnalyzer::new(info.sample_rate, roles));
+            }
+            analyzer
+                .as_mut()
+                .expect("decoder callback initializes loudness analyzer")
+                .process(planar)
+        })?;
     let measured = analyzer
         .ok_or_else(|| format!("{}: decoded reference contains no audio", path.display()))?
         .finish();

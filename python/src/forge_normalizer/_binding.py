@@ -250,7 +250,9 @@ def analyze_file(
     """Analyze a local audio file through C ABI v1.
 
     ``max_decoded_samples`` is mandatory and bounds decoded frames multiplied
-    by channels before Forge allocates or processes unbounded audio.
+    by channels before Forge allocates or processes unbounded audio. Inputs
+    must carry an authoritative physical-speaker layout because ABI v1 has no
+    layout-override parameter.
     """
 
     path_text = _path_text(path, name="path")

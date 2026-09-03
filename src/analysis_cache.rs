@@ -21,10 +21,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const ANALYSIS_CACHE_SCHEMA_V1: &str =
     "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v1";
+pub const ANALYSIS_CACHE_SCHEMA_V2: &str =
+    "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v2";
 pub const MEASUREMENT_STANDARD: &str = "ITU-R BS.1770-5 / EBU R 128";
-pub const ALGORITHM_REVISION: &str = "forge-bs1770-5-r2";
+pub const ALGORITHM_REVISION: &str = "forge-bs1770-5-r3";
 
-const LAYOUT_VERSION: &str = "v1";
+const LAYOUT_VERSION: &str = "v2";
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CHANNELS: usize = 1024;
@@ -218,7 +220,7 @@ impl AnalysisCache {
                 .map_err(|error| format!("encode analysis cache result: {error}"))?,
         );
         let document = CacheDocument {
-            schema: ANALYSIS_CACHE_SCHEMA_V1.to_owned(),
+            schema: ANALYSIS_CACHE_SCHEMA_V2.to_owned(),
             generator: format!("forge-normalizer/{}", env!("CARGO_PKG_VERSION")),
             measurement_standard: MEASUREMENT_STANDARD.to_owned(),
             algorithm_revision: ALGORITHM_REVISION.to_owned(),
@@ -317,7 +319,7 @@ impl AnalysisCache {
             Ok(document) => document,
             Err(error) => {
                 return Ok(LoadResult::Invalid(format!(
-                    "cache entry is not valid v1 JSON: {error}"
+                    "cache entry is not valid v2 JSON: {error}"
                 )));
             }
         };
@@ -679,7 +681,7 @@ fn validate_document(
     request_hash: &str,
     request: &RequestRecord,
 ) -> Result<(), String> {
-    if document.schema != ANALYSIS_CACHE_SCHEMA_V1 {
+    if document.schema != ANALYSIS_CACHE_SCHEMA_V2 {
         return Err("cache entry has an unsupported schema".into());
     }
     if document.generator.is_empty() || document.generator.len() > 256 {
@@ -1184,9 +1186,26 @@ mod tests {
         let instance: serde_json::Value =
             serde_json::from_slice(&fs::read(entry).unwrap()).unwrap();
         let schema: serde_json::Value =
-            serde_json::from_str(include_str!("../schema/analysis-cache-v1.schema.json")).unwrap();
+            serde_json::from_str(include_str!("../schema/analysis-cache-v2.schema.json")).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         assert!(validator.validate(&instance).is_ok());
+
+        let legacy_schema: serde_json::Value =
+            serde_json::from_str(include_str!("../schema/analysis-cache-v1.schema.json")).unwrap();
+        let legacy_validator = jsonschema::validator_for(&legacy_schema).unwrap();
+        let mut legacy = instance.clone();
+        legacy["schema"] = serde_json::json!(ANALYSIS_CACHE_SCHEMA_V1);
+        legacy["algorithm_revision"] = serde_json::json!("forge-bs1770-5-r2");
+        assert!(legacy_validator.validate(&legacy).is_ok());
+        let legacy: CacheDocument = serde_json::from_value(legacy).unwrap();
+        assert!(validate_document(
+            &legacy,
+            &legacy.input_sha256,
+            &legacy.request_sha256,
+            &legacy.request,
+        )
+        .unwrap_err()
+        .contains("unsupported schema"));
 
         let mut defective = instance;
         defective["result"]["sample_peak_linear"] = serde_json::json!(-1.0);

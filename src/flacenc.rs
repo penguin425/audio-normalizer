@@ -1,6 +1,7 @@
 //! Bounded-memory, pure-Rust FLAC output.
 
 use crate::dsp::convert;
+use crate::wav::{MAX_DECODE_SAMPLE_RATE_HZ, MIN_DECODE_SAMPLE_RATE_HZ};
 use flacenc::bitsink::ByteSink;
 use flacenc::component::{BitRepr, Frame, Stream, StreamInfo};
 use flacenc::config::Encoder as EncoderConfig;
@@ -59,6 +60,11 @@ impl FlacStreamWriter {
         bits: u16,
         dither: bool,
     ) -> Result<Self, String> {
+        if !(MIN_DECODE_SAMPLE_RATE_HZ..=MAX_DECODE_SAMPLE_RATE_HZ).contains(&sample_rate) {
+            return Err(format!(
+                "FLAC sample rate {sample_rate} Hz is outside Forge's supported {MIN_DECODE_SAMPLE_RATE_HZ}..={MAX_DECODE_SAMPLE_RATE_HZ} Hz range"
+            ));
+        }
         if !(1..=8).contains(&channels) {
             return Err(format!(
                 "FLAC output supports 1..=8 channels, got {channels}"
@@ -330,6 +336,23 @@ impl Drop for FlacStreamWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_sample_rates_preserve_existing_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing.flac");
+        for sample_rate in [7_999, 384_001] {
+            std::fs::write(&path, b"existing destination").unwrap();
+            let error = FlacStreamWriter::create(&path, sample_rate, 2, 16, false)
+                .err()
+                .expect("unsupported FLAC rate must fail before opening the destination");
+            assert!(
+                error.contains(&format!("sample rate {sample_rate} Hz")),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"existing destination");
+        }
+    }
 
     fn encoded_with_threads(threads: usize, chunks: &[usize], bits: u16, dither: bool) -> Vec<u8> {
         let directory = tempfile::tempdir().unwrap();

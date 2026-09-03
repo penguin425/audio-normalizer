@@ -1,7 +1,10 @@
 //! RIFF/WAVE, RF64, and BW64 streaming muxer.
 
 use crate::dsp::convert;
-use crate::wav::{default_channel_roles, named_channel_layout, AudioBuffer, ChannelRole, PcmKind};
+use crate::wav::{
+    default_channel_roles, named_channel_layout, AudioBuffer, ChannelRole, PcmKind,
+    MAX_DECODE_SAMPLE_RATE_HZ, MIN_DECODE_SAMPLE_RATE_HZ,
+};
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
@@ -54,6 +57,7 @@ pub struct WavStreamWriter {
     rngs: Vec<u64>,
     encoded: Vec<u8>,
     remaining_frames: usize,
+    data_padding: bool,
 }
 
 impl WavStreamWriter {
@@ -136,11 +140,17 @@ impl WavStreamWriter {
             .and_then(|samples| samples.checked_mul(kind.bytes_per_sample() as u64))
             .ok_or_else(|| WavWriteError::Io(io::Error::other("audio data size overflow")))?;
         let fmt = format_chunk(sample_rate, channels, kind, channel_roles)?;
-        let metadata_size: usize = metadata_chunks
-            .iter()
-            .map(|chunk| 8 + chunk.body.len() + (chunk.body.len() & 1))
-            .sum();
-        let riff_payload_size = 4u64 + fmt.len() as u64 + metadata_size as u64 + 8 + data_size;
+        let metadata_size = validate_metadata_chunks(metadata_chunks)?;
+        let riff_payload_size =
+            4_u64
+                .checked_add(u64::try_from(fmt.len()).map_err(|_| {
+                    WavWriteError::Io(io::Error::other("WAVE fmt chunk size overflow"))
+                })?)
+                .and_then(|size| size.checked_add(metadata_size))
+                .and_then(|size| size.checked_add(8))
+                .and_then(|size| size.checked_add(data_size))
+                .and_then(|size| size.checked_add(data_size & 1))
+                .ok_or_else(|| WavWriteError::Io(io::Error::other("WAVE file size overflow")))?;
         let container = match requested_container {
             WavContainer::Auto if riff_payload_size <= u32::MAX as u64 => WavContainer::Riff,
             WavContainer::Auto => WavContainer::Rf64,
@@ -151,6 +161,11 @@ impl WavStreamWriter {
             }
             value => value,
         };
+        if matches!(container, WavContainer::Rf64 | WavContainer::Bw64) {
+            riff_payload_size.checked_add(36).ok_or_else(|| {
+                WavWriteError::Io(io::Error::other("RF64/BW64 file size overflow"))
+            })?;
+        }
 
         let mut file = File::create(path)?;
         write_container_header(
@@ -162,11 +177,6 @@ impl WavStreamWriter {
         )?;
         file.write_all(&fmt)?;
         for chunk in metadata_chunks {
-            if matches!(&chunk.id, b"fmt " | b"data" | b"ds64") {
-                return Err(WavWriteError::Io(io::Error::other(
-                    "reserved WAVE chunk cannot be supplied as metadata",
-                )));
-            }
             write_chunk(&mut file, &chunk.id, &chunk.body)?;
         }
         file.write_all(b"data")?;
@@ -186,6 +196,7 @@ impl WavStreamWriter {
             rngs: convert::dither_rngs(channels as usize),
             encoded: Vec::new(),
             remaining_frames: frames,
+            data_padding: data_size & 1 != 0,
         })
     }
 
@@ -240,7 +251,17 @@ impl WavStreamWriter {
     }
 
     fn validate_chunk(&self, planar: &[Vec<f32>]) -> Result<usize, WavWriteError> {
+        if planar.len() != self.rngs.len() {
+            return Err(WavWriteError::Io(io::Error::other(
+                "channel count does not match WAVE output",
+            )));
+        }
         let frames = planar.first().map_or(0, Vec::len);
+        if planar.iter().any(|channel| channel.len() != frames) {
+            return Err(WavWriteError::Io(io::Error::other(
+                "channel lengths do not match",
+            )));
+        }
         if frames > self.remaining_frames {
             return Err(WavWriteError::Io(io::Error::other(
                 "more frames decoded than expected",
@@ -275,9 +296,33 @@ impl WavStreamWriter {
                 "fewer frames decoded than expected",
             )));
         }
+        if self.data_padding {
+            self.file.write_all(&[0])?;
+        }
         self.file.flush()?;
         Ok(())
     }
+}
+
+fn validate_metadata_chunks(chunks: &[WaveChunk]) -> Result<u64, WavWriteError> {
+    let mut total = 0_u64;
+    for chunk in chunks {
+        if matches!(&chunk.id, b"fmt " | b"data" | b"ds64") {
+            return Err(WavWriteError::Io(io::Error::other(
+                "reserved WAVE chunk cannot be supplied as metadata",
+            )));
+        }
+        let body_size = u32::try_from(chunk.body.len())
+            .map_err(|_| WavWriteError::Io(io::Error::other("WAVE metadata chunk is too large")))?;
+        let encoded_size = 8_u64
+            .checked_add(u64::from(body_size))
+            .and_then(|size| size.checked_add(u64::from(body_size & 1)))
+            .ok_or_else(|| WavWriteError::Io(io::Error::other("WAVE metadata size overflow")))?;
+        total = total
+            .checked_add(encoded_size)
+            .ok_or_else(|| WavWriteError::Io(io::Error::other("WAVE metadata size overflow")))?;
+    }
+    Ok(total)
 }
 
 impl WavWriter {
@@ -317,6 +362,16 @@ impl WavWriter {
         container: WavContainer,
         metadata_chunks: &[WaveChunk],
     ) -> Result<(), WavWriteError> {
+        if buffer.data.len() != usize::from(buffer.channels)
+            || buffer
+                .data
+                .iter()
+                .any(|channel| channel.len() != buffer.frames)
+        {
+            return Err(WavWriteError::Io(io::Error::other(
+                "audio buffer geometry does not match its channel/frame declaration",
+            )));
+        }
         let mut writer = WavStreamWriter::create_with_metadata(
             path.as_ref(),
             buffer.sample_rate,
@@ -372,13 +427,23 @@ fn format_chunk(
     kind: PcmKind,
     roles: &[ChannelRole],
 ) -> io::Result<Vec<u8>> {
+    if !(MIN_DECODE_SAMPLE_RATE_HZ..=MAX_DECODE_SAMPLE_RATE_HZ).contains(&sample_rate) {
+        return Err(io::Error::other(
+            "WAVE sample rate is outside the supported 8000..=384000 Hz range",
+        ));
+    }
     let real_tag = if kind.is_float() {
         0x0003u16
     } else {
         0x0001u16
     };
     let bits = kind.bits_per_sample();
-    let block_align = (channels as u32 * kind.bytes_per_sample() as u32) as u16;
+    let block_align = u16::try_from(
+        u32::from(channels)
+            .checked_mul(kind.bytes_per_sample() as u32)
+            .ok_or_else(|| io::Error::other("WAVE block align overflow"))?,
+    )
+    .map_err(|_| io::Error::other("WAVE block align exceeds 16 bits"))?;
     let bytes_per_second = sample_rate
         .checked_mul(block_align as u32)
         .ok_or_else(|| io::Error::other("WAV byte rate overflow"))?;
@@ -415,7 +480,8 @@ fn channel_mask(roles: &[ChannelRole]) -> io::Result<u32> {
         ("5.1.4", 0x0002_d03f),
         ("7.1.4", 0x0002_d63f),
     ] {
-        if named_channel_layout(name).as_deref() == Some(roles) {
+        let exact = crate::wav::reader::roles_from_wave_mask(mask, mask.count_ones() as u16);
+        if named_channel_layout(name).as_deref() == Some(roles) || exact == roles {
             return Ok(mask);
         }
     }
@@ -463,6 +529,127 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom};
 
     #[test]
+    fn invalid_metadata_is_rejected_before_existing_destination_is_opened() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("existing.wav");
+        for id in [*b"fmt ", *b"data", *b"ds64"] {
+            std::fs::write(&destination, b"existing destination").unwrap();
+            let error = match WavStreamWriter::create_with_metadata(
+                &destination,
+                48_000,
+                1,
+                32,
+                PcmKind::S16,
+                false,
+                WavContainer::Riff,
+                &default_channel_roles(1),
+                &[WaveChunk {
+                    id,
+                    body: vec![1, 2, 3],
+                }],
+            ) {
+                Ok(_) => panic!("reserved metadata chunk unexpectedly accepted"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("reserved WAVE chunk"));
+            assert_eq!(
+                std::fs::read(&destination).unwrap(),
+                b"existing destination"
+            );
+        }
+        assert_eq!(
+            validate_metadata_chunks(&[WaveChunk {
+                id: *b"JUNK",
+                body: vec![1],
+            }])
+            .unwrap(),
+            10
+        );
+    }
+
+    #[test]
+    fn invalid_format_geometry_is_rejected_before_destination_is_opened() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("existing.wav");
+        for sample_rate in [
+            0,
+            MIN_DECODE_SAMPLE_RATE_HZ - 1,
+            MAX_DECODE_SAMPLE_RATE_HZ + 1,
+        ] {
+            std::fs::write(&destination, b"existing destination").unwrap();
+            assert!(
+                WavStreamWriter::create(&destination, sample_rate, 1, 32, PcmKind::S16, false,)
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read(&destination).unwrap(),
+                b"existing destination"
+            );
+        }
+
+        std::fs::write(&destination, b"existing destination").unwrap();
+        let channels = u16::MAX;
+        let roles = vec![ChannelRole::Main; usize::from(channels)];
+        assert!(WavStreamWriter::create_with_metadata(
+            &destination,
+            48_000,
+            channels,
+            1,
+            PcmKind::F64,
+            false,
+            WavContainer::Rf64,
+            &roles,
+            &[],
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"existing destination"
+        );
+    }
+
+    #[test]
+    fn invalid_full_buffer_geometry_preserves_existing_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("existing.wav");
+        std::fs::write(&destination, b"existing destination").unwrap();
+        let buffer = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 2,
+            frames: 32,
+            data: vec![vec![0.0; 32]],
+            channel_roles: default_channel_roles(2),
+            source_kind: PcmKind::F32,
+        };
+        assert!(WavWriter::write(&destination, &buffer, PcmKind::F32, false).is_err());
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"existing destination"
+        );
+    }
+
+    #[test]
+    fn invalid_stream_chunk_shape_does_not_write_or_advance_state() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut writer =
+            WavStreamWriter::create(file.path(), 48_000, 2, 32, PcmKind::F32, false).unwrap();
+        let header_bytes = std::fs::metadata(file.path()).unwrap().len();
+
+        assert!(writer.write_chunk(&[vec![0.0; 32]]).is_err());
+        assert!(writer.write_chunk(&[vec![0.0; 32], vec![0.0; 31]]).is_err());
+        assert_eq!(writer.remaining_frames, 32);
+        assert!(writer.last_encoded_chunk().is_empty());
+        assert_eq!(std::fs::metadata(file.path()).unwrap().len(), header_bytes);
+
+        writer.write_chunk(&[vec![0.0; 32], vec![0.0; 32]]).unwrap();
+        writer.finish().unwrap();
+        assert_eq!(
+            std::fs::metadata(file.path()).unwrap().len(),
+            header_bytes + 32 * 2 * 4
+        );
+    }
+
+    #[test]
     fn advanced_layout_masks_are_stable() {
         assert_eq!(
             channel_mask(&named_channel_layout("6.1").unwrap()).unwrap(),
@@ -481,6 +668,21 @@ mod tests {
         assert_eq!(persisted[1], ChannelRole::positioned(30, 0));
         assert_eq!(persisted[3], ChannelRole::Lfe);
         assert_eq!(persisted[7], ChannelRole::positioned(90, 0));
+
+        for (name, mask) in [
+            ("5.1", 0x0000_003f),
+            ("6.1", 0x0000_070f),
+            ("7.1", 0x0000_063f),
+            ("5.1.4", 0x0002_d03f),
+            ("7.1.4", 0x0002_d63f),
+        ] {
+            let generic = named_channel_layout(name).unwrap();
+            let exact = crate::wav::reader::roles_from_wave_mask(mask, generic.len() as u16);
+            assert_eq!(channel_mask(&generic).unwrap(), mask, "generic {name}");
+            assert_eq!(channel_mask(&exact).unwrap(), mask, "exact {name}");
+            assert_eq!(persisted_channel_roles(&generic).unwrap(), exact, "{name}");
+            assert_eq!(persisted_channel_roles(&exact).unwrap(), exact, "{name}");
+        }
     }
 
     #[test]
@@ -513,6 +715,52 @@ mod tests {
             assert_eq!(actual, magic);
             let decoded = WavReader::open(file.path()).unwrap();
             assert_eq!((decoded.channels, decoded.frames), (2, 480));
+        }
+    }
+
+    #[test]
+    fn odd_u8_data_is_padded_and_roundtrips_in_every_container() {
+        let buffer = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 1,
+            frames: 3,
+            data: vec![vec![-1.0, 0.0, 1.0]],
+            channel_roles: default_channel_roles(1),
+            source_kind: PcmKind::U8,
+        };
+        for container in [WavContainer::Riff, WavContainer::Rf64, WavContainer::Bw64] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            WavWriter::write_with_options(
+                file.path(),
+                &buffer,
+                PcmKind::U8,
+                false,
+                container,
+                None,
+            )
+            .unwrap();
+
+            let bytes = std::fs::read(file.path()).unwrap();
+            assert_eq!(bytes.len() & 1, 0, "{container:?}");
+            assert_eq!(bytes.last(), Some(&0), "{container:?}");
+            match container {
+                WavContainer::Riff => assert_eq!(
+                    u64::from(u32::from_le_bytes(bytes[4..8].try_into().unwrap())),
+                    bytes.len() as u64 - 8
+                ),
+                WavContainer::Rf64 | WavContainer::Bw64 => {
+                    assert_eq!(
+                        u64::from_le_bytes(bytes[20..28].try_into().unwrap()),
+                        bytes.len() as u64 - 8
+                    );
+                    assert_eq!(u64::from_le_bytes(bytes[28..36].try_into().unwrap()), 3);
+                }
+                WavContainer::Auto => unreachable!(),
+            }
+
+            let decoded = WavReader::open(file.path()).unwrap();
+            assert_eq!(decoded.source_kind, PcmKind::U8, "{container:?}");
+            assert_eq!((decoded.channels, decoded.frames), (1, 3));
         }
     }
 

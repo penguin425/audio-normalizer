@@ -152,8 +152,8 @@ pub fn evaluate(path: &Path, spec: BinauralQcSpec) -> Result<BinauralQcReport, S
     {
         enforce_input_bytes(candidate, spec.max_input_bytes)?;
     }
-    let mut source = crate::decoder::decode_limited(&source_path, spec.max_decoded_samples)
-        .map_err(|error| format!("decode binaural source {}: {error}", source_path.display()))?;
+    let (mut source, source_layout_provenance) =
+        decode_audio(&source_path, spec.max_decoded_samples, "source")?;
     if source.channels as usize != input_layout.channels() {
         return Err(format!(
             "input layout {} requires {} channels, decoded {}",
@@ -162,31 +162,47 @@ pub fn evaluate(path: &Path, spec: BinauralQcSpec) -> Result<BinauralQcReport, S
             source.channels
         ));
     }
-    source.channel_roles = input_layout.roles();
+    apply_explicit_layout(
+        &source_path,
+        &mut source,
+        source_layout_provenance,
+        input_layout,
+    )?;
     let source_analysis = normalize::analyze(&source);
 
-    let mut rendered = decode_audio(&rendered_path, spec.max_decoded_samples, "rendered")?;
+    let (mut rendered, rendered_layout_provenance) =
+        decode_audio(&rendered_path, spec.max_decoded_samples, "rendered")?;
     if rendered.channels != 2 {
         return Err(format!(
             "binaural renderer output must be stereo (2 channels), decoded {}",
             rendered.channels
         ));
     }
-    rendered.channel_roles = Layout::Stereo.roles();
+    apply_explicit_layout(
+        &rendered_path,
+        &mut rendered,
+        rendered_layout_provenance,
+        Layout::Stereo,
+    )?;
     let rendered_analysis = normalize::analyze(&rendered);
     let reference = reference_path
         .as_deref()
         .map(|path| decode_audio(path, spec.max_decoded_samples, "reference"))
         .transpose()?;
     let (reference_analysis, reference_measurement) = match reference {
-        Some(mut audio) => {
+        Some((mut audio, layout_provenance)) => {
             if audio.channels != 2 {
                 return Err(format!(
                     "binaural reference must be stereo (2 channels), decoded {}",
                     audio.channels
                 ));
             }
-            audio.channel_roles = Layout::Stereo.roles();
+            apply_explicit_layout(
+                reference_path.as_deref().expect("reference was decoded"),
+                &mut audio,
+                layout_provenance,
+                Layout::Stereo,
+            )?;
             let analysis = normalize::analyze(&audio);
             let measurement = measurement("binaural", &analysis);
             (Some(analysis), Some(measurement))
@@ -256,9 +272,30 @@ pub fn evaluate(path: &Path, spec: BinauralQcSpec) -> Result<BinauralQcReport, S
     })
 }
 
-fn decode_audio(path: &Path, max_decoded_samples: u64, label: &str) -> Result<AudioBuffer, String> {
-    crate::decoder::decode_limited(path, max_decoded_samples)
+fn decode_audio(
+    path: &Path,
+    max_decoded_samples: u64,
+    label: &str,
+) -> Result<(AudioBuffer, crate::decoder::ChannelLayoutProvenance), String> {
+    crate::decoder::decode_limited_with_layout(path, max_decoded_samples)
         .map_err(|error| format!("decode binaural {label} {}: {error}", path.display()))
+}
+
+fn apply_explicit_layout(
+    path: &Path,
+    audio: &mut AudioBuffer,
+    layout_provenance: crate::decoder::ChannelLayoutProvenance,
+    layout: Layout,
+) -> Result<(), String> {
+    let explicit_roles = layout.roles();
+    audio.channel_roles = normalize::resolve_decoded_channel_roles(
+        path,
+        audio.channels,
+        &audio.channel_roles,
+        layout_provenance,
+        Some(&explicit_roles),
+    )?;
+    Ok(())
 }
 
 fn measurement(layout: &'static str, analysis: &crate::analysis::Analysis) -> Measurement {
@@ -438,7 +475,7 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wav::{AudioBuffer, PcmKind, WavWriter};
+    use crate::wav::{AudioBuffer, ChannelRole, PcmKind, WavWriter};
 
     fn evidence() -> RendererEvidence {
         RendererEvidence {
@@ -523,5 +560,56 @@ mod tests {
         assert!(report.passed);
         assert_eq!(report.output_layout, "binaural");
         assert!(report.reference_drift.unwrap().passed);
+    }
+
+    #[test]
+    fn maskless_five_one_source_uses_the_explicit_spec_layout() {
+        let work = tempfile::tempdir().unwrap();
+        let source_path = work.path().join("source.wav");
+        let rendered_path = work.path().join("rendered.wav");
+        let frames = 48_000;
+        let source = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 6,
+            frames,
+            data: vec![vec![0.01; frames]; 6],
+            channel_roles: vec![ChannelRole::Main; 6],
+            source_kind: PcmKind::F32,
+        };
+        let output = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 2,
+            frames,
+            data: vec![vec![0.01; frames]; 2],
+            channel_roles: Layout::Stereo.roles(),
+            source_kind: PcmKind::F32,
+        };
+        WavWriter::write(&source_path, &source, PcmKind::F32, false).unwrap();
+        WavWriter::write(&rendered_path, &output, PcmKind::F32, false).unwrap();
+        let legacy_error =
+            crate::decoder::decode_limited(&source_path, DEFAULT_MAX_DECODED_SAMPLES).unwrap_err();
+        assert!(legacy_error.contains("ambiguous channel layout"));
+
+        let report = evaluate(
+            &work.path().join("binaural.json"),
+            BinauralQcSpec {
+                schema_version: 1,
+                source: source_path.file_name().unwrap().into(),
+                rendered: rendered_path.file_name().unwrap().into(),
+                reference: None,
+                input_layout: "5.1".into(),
+                renderer: evidence(),
+                max_duration_delta_seconds: 0.001,
+                max_loudness_delta_lu: 1.0,
+                max_true_peak_delta_db: 1.0,
+                true_peak_ceiling_dbtp: 0.0,
+                max_clipped_samples: 0,
+                max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+                max_decoded_samples: DEFAULT_MAX_DECODED_SAMPLES,
+            },
+        )
+        .unwrap();
+        assert!(report.passed);
+        assert_eq!(report.source_measurement.layout, "5.1");
     }
 }

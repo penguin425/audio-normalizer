@@ -94,6 +94,10 @@ FORGE_NORMALIZER_API size_t forge_normalizer_live_config_v1_size(void);
  * frames-times-channels. path_utf8 must be NUL-terminated UTF-8. result_size
  * must be at least forge_normalizer_analysis_v1_size().
  *
+ * The input must identify an authoritative physical-speaker layout. Because
+ * ABI v1 has no layout-override parameter, ambiguous multichannel or
+ * scene-based inputs fail instead of using guessed BS.1770 channel weights.
+ *
  * error_buffer is optional. When non-NULL with positive capacity, Forge
  * always writes a NUL-terminated UTF-8 message (empty on success). result
  * must be correctly aligned for ForgeAnalysisV1. All storage remains owned by

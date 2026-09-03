@@ -85,11 +85,15 @@ cp tools/benchmark.py tools/build-pgo-forge.sh tools/train-pgo.py \
    tools/test-vst3-adapter.sh tools/test-au-adapter.sh "$staging/tools/"
 cp schema/performance-benchmark-v1.schema.json "$staging/schema/"
 cp schema/doctor-report-v1.schema.json "$staging/schema/"
+cp schema/analysis-cache-v1.schema.json \
+   schema/analysis-cache-v2.schema.json "$staging/schema/"
 cp schema/multi-delivery-request-v1.schema.json \
    schema/multi-delivery-report-v1.schema.json "$staging/schema/"
 cp schema/segment-normalization-request-v1.schema.json \
    schema/segment-normalization-plan-v1.schema.json \
-   schema/segment-normalization-report-v1.schema.json "$staging/schema/"
+   schema/segment-normalization-report-v1.schema.json \
+   schema/segment-normalization-plan-v2.schema.json \
+   schema/segment-normalization-report-v2.schema.json "$staging/schema/"
 cp schema/ac4-adapter-request-v1.schema.json \
    schema/ac4-adapter-response-v1.schema.json \
    schema/ac4-adapter-report-v1.schema.json "$staging/schema/"

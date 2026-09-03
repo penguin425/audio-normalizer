@@ -5,6 +5,8 @@
 //! this ignored test.
 
 use forge_normalizer::normalize;
+use forge_normalizer::wav::default_channel_roles;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const CASES: &[(&str, f64)] = &[
@@ -53,7 +55,13 @@ fn tech_3341_integrated_loudness_cases() {
 
     for &(name, expected) in CASES {
         let path = fixture(&root, name);
-        let analysis = normalize::analyze_file(&path)
+        let repaired = repair_known_ebu_waveex_riff_size(&path, name);
+        let analysis_path = repaired.as_ref().map_or(path.as_path(), |file| file.path());
+        // The official five-channel fixture predates WAVE_FORMAT_EXTENSIBLE and
+        // carries no speaker mask. Supply its documented L/R/C/Ls/Rs order so
+        // production decoding can remain fail-closed for ambiguous files.
+        let roles = (name == "seq-3341-6-5channels-16bit.wav").then(|| default_channel_roles(5));
+        let analysis = normalize::analyze_file_with_roles(analysis_path, roles.as_deref())
             .unwrap_or_else(|error| panic!("failed to analyze {}: {error}", path.display()));
         let error = (analysis.lufs - expected).abs();
         assert!(
@@ -62,6 +70,32 @@ fn tech_3341_integrated_loudness_cases() {
             analysis.lufs
         );
     }
+}
+
+/// The official v5 six-channel WAVEEX asset omits its 12-byte `fact` chunk
+/// from RIFF.ckSize even though the chunk is physically present before
+/// `data`. Keep the production reader strict, retain the archive checksum in
+/// the download script, and repair only that container length in a temporary
+/// test copy so this suite remains a DSP conformance test.
+fn repair_known_ebu_waveex_riff_size(path: &Path, name: &str) -> Option<tempfile::NamedTempFile> {
+    if name != "seq-3341-6-6channels-WAVEEX-16bit.wav" {
+        return None;
+    }
+    let mut bytes = std::fs::read(path).expect("read official EBU WAVEEX fixture");
+    assert_eq!(&bytes[..4], b"RIFF");
+    assert_eq!(&bytes[60..64], b"fact");
+    assert_eq!(&bytes[72..76], b"data");
+    let declared = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let actual = u32::try_from(bytes.len() - 8).expect("fixture fits RIFF");
+    assert_eq!(declared.checked_add(12), Some(actual));
+    bytes[4..8].copy_from_slice(&actual.to_le_bytes());
+
+    let mut repaired = tempfile::NamedTempFile::new().expect("create repaired fixture");
+    repaired
+        .write_all(&bytes)
+        .expect("write repaired EBU WAVEEX fixture");
+    repaired.flush().expect("flush repaired EBU WAVEEX fixture");
+    Some(repaired)
 }
 
 #[test]

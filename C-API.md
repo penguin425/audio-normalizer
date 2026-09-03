@@ -35,6 +35,11 @@ this contract.
   must not overlap either the path string or the result.
 - `max_decoded_samples` bounds decoded frames multiplied by channels and must
   be greater than zero.
+- File analysis requires an authoritative speaker layout in the input. C ABI
+  v1 has no layout-override field, so ambiguous or scene-based inputs fail
+  instead of being measured with guessed BS.1770 channel weights.
+- Decoded IEEE-float PCM containing NaN or positive/negative infinity fails
+  before analysis; no partial measurement is returned.
 - Error text is UTF-8, always NUL-terminated when capacity is positive, may be
   truncated on a character boundary, and is empty on success.
 - File-analysis calls are independent and may run concurrently. A streaming

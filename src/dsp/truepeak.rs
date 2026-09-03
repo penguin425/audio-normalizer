@@ -7,10 +7,10 @@
 //! unity DC gain; this is the same approach the ITU reference takes and gives
 //! accurate inter-sample peaks at a fraction of the cost of a full oversampled
 //! reconstruction. ITU-R BS.1770-5 permits proportionately less oversampling at
-//! higher input rates, so the meter uses 4x below 96 kHz, 2x below 192 kHz, and
-//! sample peak at 192 kHz and above.
+//! higher input rates, so the meter selects the smallest integral factor whose
+//! measurement domain reaches at least 192 kHz.
 //!
-//! Each normalized 2x/4x coefficient table is computed once via a `OnceLock`.
+//! Each normalized coefficient table is computed once via a `OnceLock`.
 
 use crate::wav::AudioBuffer;
 use rayon::prelude::*;
@@ -22,24 +22,29 @@ use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-pub(super) const MAX_PHASES: usize = 4;
+const TRUE_PEAK_DOMAIN_HZ: u32 = 192_000;
+pub(super) const MAX_PHASES: usize = 24;
+const SIMD_PHASES: usize = 4;
 pub(super) const TAPS_PER_PHASE: usize = 16;
 const HISTORY_SAMPLES: usize = TAPS_PER_PHASE * 2;
 pub(super) type PhaseTable = [[f64; MAX_PHASES]; TAPS_PER_PHASE];
 
 pub(super) fn phase_table(factor: usize) -> &'static PhaseTable {
-    static X2: OnceLock<PhaseTable> = OnceLock::new();
-    static X4: OnceLock<PhaseTable> = OnceLock::new();
-    match factor {
-        2 => X2.get_or_init(|| build_phase_table(2)),
-        4 => X4.get_or_init(|| build_phase_table(4)),
-        _ => unreachable!("true-peak interpolation factor must be 2 or 4"),
-    }
+    static TABLES: OnceLock<[OnceLock<PhaseTable>; MAX_PHASES + 1]> = OnceLock::new();
+    assert!(
+        (2..=MAX_PHASES).contains(&factor),
+        "true-peak interpolation factor must be between 2 and {MAX_PHASES}"
+    );
+    TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()))[factor]
+        .get_or_init(|| build_phase_table(factor))
 }
 
 fn interpolation_bound_scale(factor: usize) -> f64 {
-    static X2: OnceLock<f64> = OnceLock::new();
-    static X4: OnceLock<f64> = OnceLock::new();
+    static SCALES: OnceLock<[OnceLock<f64>; MAX_PHASES + 1]> = OnceLock::new();
+    assert!(
+        (2..=MAX_PHASES).contains(&factor),
+        "true-peak interpolation factor must be between 2 and {MAX_PHASES}"
+    );
     let build = || {
         let table = phase_table(factor);
         let mut maximum_l1 = 0.0_f64;
@@ -56,11 +61,7 @@ fn interpolation_bound_scale(factor: usize) -> f64 {
         // using it to skip interpolation.
         maximum_l1 * (1.0 + 64.0 * f64::EPSILON)
     };
-    match factor {
-        2 => *X2.get_or_init(build),
-        4 => *X4.get_or_init(build),
-        _ => unreachable!("true-peak interpolation factor must be 2 or 4"),
-    }
+    *SCALES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()))[factor].get_or_init(build)
 }
 
 /// Conservative upper bound for the True Peak of a signal whose largest
@@ -84,7 +85,7 @@ pub(crate) fn upper_bound_from_sample_peak(sample_rate: u32, sample_peak: f32) -
 }
 
 fn build_phase_table(factor: usize) -> PhaseTable {
-    debug_assert!(matches!(factor, 2 | 4));
+    debug_assert!((2..=MAX_PHASES).contains(&factor));
     let coefficients = {
         let len = factor * TAPS_PER_PHASE;
         let center = (len - 1) as f64 / 2.0;
@@ -148,9 +149,9 @@ pub fn measure_true_peak(buf: &AudioBuffer) -> f32 {
     buf.data
         .par_iter()
         .map(|ch| {
-            let mut meter = TruePeakMeter::for_sample_rate(buf.sample_rate);
+            let mut meter = TruePeakMeter::for_finite_sample_rate(buf.sample_rate);
             meter.process(ch);
-            meter.peak()
+            meter.finish_peak()
         })
         .reduce(|| 0.0f32, f32::max)
 }
@@ -161,6 +162,7 @@ pub struct TruePeakMeter {
     cursor: usize,
     initialized: bool,
     factor: usize,
+    table: Option<&'static PhaseTable>,
     interpolation_bound_scale: f64,
     pruning_active: bool,
     pruning_probe_max: f32,
@@ -188,17 +190,34 @@ impl TruePeakMeter {
     /// Construct a meter using the minimum BS.1770 oversampling ratio that
     /// reaches the 192 kHz true-peak measurement domain.
     pub fn for_sample_rate(sample_rate: u32) -> Self {
+        Self::with_leading_padding(sample_rate, false)
+    }
+
+    /// Construct a meter for a finite signal, treating samples before its
+    /// beginning as zero. Consume it with [`Self::finish_peak`] to include the
+    /// complete FIR response after the last programme sample.
+    ///
+    /// The existing constructors retain their streaming edge extension for
+    /// compatibility; finite-file analyzers should opt into this constructor.
+    pub fn for_finite_sample_rate(sample_rate: u32) -> Self {
+        Self::with_leading_padding(sample_rate, true)
+    }
+
+    fn with_leading_padding(sample_rate: u32, zero_leading_padding: bool) -> Self {
         let factor = oversample_factor(sample_rate);
-        if factor > 1 {
+        let table = if factor > 1 {
             // Build the shared FIR table before this meter reaches a processing
             // callback. Subsequent `process` calls are allocation-free.
-            let _ = phase_table(factor);
-        }
+            Some(phase_table(factor))
+        } else {
+            None
+        };
         Self {
             history: [0.0; HISTORY_SAMPLES],
             cursor: 0,
-            initialized: false,
+            initialized: zero_leading_padding,
             factor,
+            table,
             interpolation_bound_scale: if factor > 1 {
                 interpolation_bound_scale(factor)
             } else {
@@ -223,15 +242,44 @@ impl TruePeakMeter {
         any(target_os = "linux", target_os = "windows")
     ))]
     pub(super) fn from_recent_samples(sample_rate: u32, recent: &[f32], peak_floor: f32) -> Self {
+        Self::from_recent_samples_with_padding(sample_rate, recent, peak_floor, false)
+    }
+
+    /// Rebuild finite-signal history from its retained suffix. This supports
+    /// accelerator handoff as well as isolated EOF-response measurement. Zero
+    /// padding remains exact for prefixes shorter than the retained 15 samples
+    /// and is pushed out before the first finishing zero is evaluated.
+    pub(super) fn from_recent_finite_samples(
+        sample_rate: u32,
+        recent: &[f32],
+        peak_floor: f32,
+    ) -> Self {
+        Self::from_recent_samples_with_padding(sample_rate, recent, peak_floor, true)
+    }
+
+    fn from_recent_samples_with_padding(
+        sample_rate: u32,
+        recent: &[f32],
+        peak_floor: f32,
+        zero_leading_padding: bool,
+    ) -> Self {
         debug_assert!(recent.len() < TAPS_PER_PHASE);
-        let mut meter = Self::for_sample_rate(sample_rate);
+        let mut meter = Self::with_leading_padding(sample_rate, zero_leading_padding);
         meter.process(recent);
-        // Replaying only the retained suffix seeds the exact 16-tap history for
-        // the *next* sample, but its artificial repeated first sample is not a
-        // real part of the stream. CUDA already measured the complete prefix,
-        // so discard any warm-up peak and restore that authoritative value.
+        // Replaying only the retained suffix seeds the history needed by the
+        // next real sample or first finishing zero. The caller already
+        // measured the complete prefix (or wants only its future response),
+        // so discard any replay peak and restore the authoritative floor.
         meter.peak = peak_floor;
         meter
+    }
+
+    /// Measure only the post-signal FIR response reconstructed from the final
+    /// samples of a finite signal. Peaks produced while replaying the retained
+    /// suffix are deliberately discarded: its artificial leading-zero edge is
+    /// not present in the original stream.
+    pub(super) fn finite_tail_peak_from_recent_samples(sample_rate: u32, recent: &[f32]) -> f32 {
+        Self::from_recent_finite_samples(sample_rate, recent, 0.0).finish_peak()
     }
 
     pub fn process(&mut self, samples: &[f32]) {
@@ -244,6 +292,21 @@ impl TruePeakMeter {
         for &sample in samples {
             self.process_peak_only_sample(sample);
         }
+    }
+
+    /// Finish a finite measurement and return its maximum True Peak.
+    ///
+    /// The 16-tap polyphase FIR is advanced with 15 virtual zeros so every
+    /// convolution window containing a programme sample is measured. The
+    /// method consumes the meter to prevent further samples being appended
+    /// after the finite boundary.
+    pub fn finish_peak(mut self) -> f32 {
+        if self.factor > 1 && self.initialized {
+            for _ in 0..TAPS_PER_PHASE - 1 {
+                self.process_peak_only_sample(0.0);
+            }
+        }
+        self.peak
     }
 
     /// Advance a complete peak-only block after one conservative SIMD
@@ -334,6 +397,99 @@ impl TruePeakMeter {
     }
 
     #[inline(always)]
+    fn interpolated_peak(&self) -> f32 {
+        let history = self.history_window();
+        let table = self.table.expect("oversampling meter has a phase table");
+        #[cfg(target_arch = "x86_64")]
+        if self.use_avx2_fma {
+            // SAFETY: the constructor performed runtime AVX2/FMA detection.
+            unsafe {
+                match self.factor {
+                    2 => return maximum_abs(&interpolate_2x_avx2_fma(history, table)[..2]),
+                    4 => return maximum_abs(&interpolate_avx2_fma(history, table)),
+                    5 => return interpolate_5x_avx2_fma_peak(history, table),
+                    _ => return interpolate_tiled_avx2_fma_peak(history, table, self.factor),
+                }
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: Advanced SIMD is part of the AArch64 architecture.
+        return unsafe {
+            match self.factor {
+                2 => maximum_abs(&interpolate_2x_neon(history, table)[..2]),
+                4 => maximum_abs(&interpolate_neon(history, table)),
+                5 => interpolate_5x_neon_peak(history, table),
+                _ => interpolate_tiled_neon_peak(history, table, self.factor),
+            }
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        interpolate_scalar_peak(history, table, self.factor)
+    }
+
+    #[inline(always)]
+    fn interpolated_stereo_peaks(left: &Self, right: &Self) -> (f32, f32) {
+        let left_history = left.history_window();
+        let right_history = right.history_window();
+        let table = left.table.expect("oversampling meter has a phase table");
+        #[cfg(target_arch = "x86_64")]
+        if left.use_avx2_fma {
+            // SAFETY: both constructors performed runtime AVX2/FMA detection.
+            unsafe {
+                match left.factor {
+                    2 => {
+                        let values =
+                            interpolate_stereo_2x_avx2_fma(left_history, right_history, table);
+                        return (maximum_abs(&values.0[..2]), maximum_abs(&values.1[..2]));
+                    }
+                    4 => {
+                        let values =
+                            interpolate_stereo_avx2_fma(left_history, right_history, table);
+                        return (maximum_abs(&values.0), maximum_abs(&values.1));
+                    }
+                    5 => {
+                        return interpolate_stereo_5x_avx2_fma_peaks(
+                            left_history,
+                            right_history,
+                            table,
+                        );
+                    }
+                    _ => {
+                        return interpolate_stereo_tiled_avx2_fma_peaks(
+                            left_history,
+                            right_history,
+                            table,
+                            left.factor,
+                        );
+                    }
+                }
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: Advanced SIMD is part of the AArch64 architecture.
+        return unsafe {
+            match left.factor {
+                2 => {
+                    let values = interpolate_stereo_2x_neon(left_history, right_history, table);
+                    (maximum_abs(&values.0[..2]), maximum_abs(&values.1[..2]))
+                }
+                4 => {
+                    let values = interpolate_stereo_neon(left_history, right_history, table);
+                    (maximum_abs(&values.0), maximum_abs(&values.1))
+                }
+                5 => interpolate_stereo_5x_neon_peaks(left_history, right_history, table),
+                _ => interpolate_stereo_tiled_neon_peaks(
+                    left_history,
+                    right_history,
+                    table,
+                    left.factor,
+                ),
+            }
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        interpolate_stereo_scalar_peaks(left_history, right_history, table, left.factor)
+    }
+
+    #[inline(always)]
     fn sample_within_pruning_bound(&self, sample: f32, peak_floor: f32) -> bool {
         f64::from(sample).abs() * self.interpolation_bound_scale <= f64::from(peak_floor)
     }
@@ -388,37 +544,7 @@ impl TruePeakMeter {
             // callers. Restart the probe so a later peak-only call cannot rely
             // on samples it did not classify.
             self.invalidate_pruning_probe();
-            let history = self.history_window();
-            let table = phase_table(self.factor);
-            #[cfg(target_arch = "x86_64")]
-            let interpolated = if self.use_avx2_fma {
-                // SAFETY: the constructor performed runtime AVX2/FMA detection.
-                unsafe {
-                    if self.factor == 2 {
-                        interpolate_2x_avx2_fma(history, table)
-                    } else {
-                        interpolate_avx2_fma(history, table)
-                    }
-                }
-            } else {
-                interpolate_scalar(history, table, self.factor)
-            };
-            #[cfg(target_arch = "aarch64")]
-            let interpolated = {
-                // SAFETY: Advanced SIMD is part of the AArch64 architecture.
-                unsafe {
-                    if self.factor == 2 {
-                        interpolate_2x_neon(history, table)
-                    } else {
-                        interpolate_neon(history, table)
-                    }
-                }
-            };
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-            let interpolated = interpolate_scalar(history, table, self.factor);
-            for value in &interpolated[..self.factor] {
-                frame_peak = frame_peak.max(value.abs() as f32);
-            }
+            frame_peak = frame_peak.max(self.interpolated_peak());
         }
         self.peak = self.peak.max(frame_peak);
         frame_peak
@@ -438,37 +564,7 @@ impl TruePeakMeter {
                 self.peak = peak_floor;
                 return true;
             }
-            let history = self.history_window();
-            let table = phase_table(self.factor);
-            #[cfg(target_arch = "x86_64")]
-            let interpolated = if self.use_avx2_fma {
-                // SAFETY: the constructor performed runtime AVX2/FMA detection.
-                unsafe {
-                    if self.factor == 2 {
-                        interpolate_2x_avx2_fma(history, table)
-                    } else {
-                        interpolate_avx2_fma(history, table)
-                    }
-                }
-            } else {
-                interpolate_scalar(history, table, self.factor)
-            };
-            #[cfg(target_arch = "aarch64")]
-            let interpolated = {
-                // SAFETY: Advanced SIMD is part of the AArch64 architecture.
-                unsafe {
-                    if self.factor == 2 {
-                        interpolate_2x_neon(history, table)
-                    } else {
-                        interpolate_neon(history, table)
-                    }
-                }
-            };
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-            let interpolated = interpolate_scalar(history, table, self.factor);
-            for value in &interpolated[..self.factor] {
-                frame_peak = frame_peak.max(value.abs() as f32);
-            }
+            frame_peak = frame_peak.max(self.interpolated_peak());
         }
         self.peak = self.peak.max(frame_peak);
         if self.factor > 1 {
@@ -502,44 +598,9 @@ impl TruePeakMeter {
             right.push_history(right_sample);
             left.invalidate_pruning_probe();
             right.invalidate_pruning_probe();
-            let left_history = left.history_window();
-            let right_history = right.history_window();
-            let table = phase_table(left.factor);
-            #[cfg(target_arch = "x86_64")]
-            let (left_interpolated, right_interpolated) = if left.use_avx2_fma {
-                // SAFETY: both meters run on this process and the constructor
-                // performed runtime AVX2/FMA detection.
-                unsafe {
-                    if left.factor == 2 {
-                        interpolate_stereo_2x_avx2_fma(left_history, right_history, table)
-                    } else {
-                        interpolate_stereo_avx2_fma(left_history, right_history, table)
-                    }
-                }
-            } else {
-                interpolate_stereo_scalar(left_history, right_history, table, left.factor)
-            };
-            #[cfg(target_arch = "aarch64")]
-            let (left_interpolated, right_interpolated) = {
-                // SAFETY: Advanced SIMD is part of the AArch64 architecture.
-                unsafe {
-                    if left.factor == 2 {
-                        interpolate_stereo_2x_neon(left_history, right_history, table)
-                    } else {
-                        interpolate_stereo_neon(left_history, right_history, table)
-                    }
-                }
-            };
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-            let (left_interpolated, right_interpolated) =
-                interpolate_stereo_scalar(left_history, right_history, table, left.factor);
-
-            for value in &left_interpolated[..left.factor] {
-                left_frame_peak = left_frame_peak.max(value.abs() as f32);
-            }
-            for value in &right_interpolated[..right.factor] {
-                right_frame_peak = right_frame_peak.max(value.abs() as f32);
-            }
+            let interpolated = Self::interpolated_stereo_peaks(left, right);
+            left_frame_peak = left_frame_peak.max(interpolated.0);
+            right_frame_peak = right_frame_peak.max(interpolated.1);
         }
         left.peak = left.peak.max(left_frame_peak);
         right.peak = right.peak.max(right_frame_peak);
@@ -585,103 +646,14 @@ impl TruePeakMeter {
             return (true, true);
         }
 
-        let left_history = left.history_window();
-        let right_history = right.history_window();
-        let table = phase_table(left.factor);
         if !skip_left && !skip_right {
-            #[cfg(target_arch = "x86_64")]
-            let (left_interpolated, right_interpolated) = if left.use_avx2_fma {
-                // SAFETY: both constructors performed runtime AVX2/FMA detection.
-                unsafe {
-                    if left.factor == 2 {
-                        interpolate_stereo_2x_avx2_fma(left_history, right_history, table)
-                    } else {
-                        interpolate_stereo_avx2_fma(left_history, right_history, table)
-                    }
-                }
-            } else {
-                interpolate_stereo_scalar(left_history, right_history, table, left.factor)
-            };
-            #[cfg(target_arch = "aarch64")]
-            let (left_interpolated, right_interpolated) = {
-                // SAFETY: Advanced SIMD is part of the AArch64 architecture.
-                unsafe {
-                    if left.factor == 2 {
-                        interpolate_stereo_2x_neon(left_history, right_history, table)
-                    } else {
-                        interpolate_stereo_neon(left_history, right_history, table)
-                    }
-                }
-            };
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-            let (left_interpolated, right_interpolated) =
-                interpolate_stereo_scalar(left_history, right_history, table, left.factor);
-            for value in &left_interpolated[..left.factor] {
-                left_frame_peak = left_frame_peak.max(value.abs() as f32);
-            }
-            for value in &right_interpolated[..right.factor] {
-                right_frame_peak = right_frame_peak.max(value.abs() as f32);
-            }
+            let interpolated = Self::interpolated_stereo_peaks(left, right);
+            left_frame_peak = left_frame_peak.max(interpolated.0);
+            right_frame_peak = right_frame_peak.max(interpolated.1);
         } else if !skip_left {
-            #[cfg(target_arch = "x86_64")]
-            let interpolated = if left.use_avx2_fma {
-                // SAFETY: the constructor performed runtime AVX2/FMA detection.
-                unsafe {
-                    if left.factor == 2 {
-                        interpolate_2x_avx2_fma(left_history, table)
-                    } else {
-                        interpolate_avx2_fma(left_history, table)
-                    }
-                }
-            } else {
-                interpolate_scalar(left_history, table, left.factor)
-            };
-            #[cfg(target_arch = "aarch64")]
-            let interpolated = {
-                // SAFETY: Advanced SIMD is part of the AArch64 architecture.
-                unsafe {
-                    if left.factor == 2 {
-                        interpolate_2x_neon(left_history, table)
-                    } else {
-                        interpolate_neon(left_history, table)
-                    }
-                }
-            };
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-            let interpolated = interpolate_scalar(left_history, table, left.factor);
-            for value in &interpolated[..left.factor] {
-                left_frame_peak = left_frame_peak.max(value.abs() as f32);
-            }
+            left_frame_peak = left_frame_peak.max(left.interpolated_peak());
         } else {
-            #[cfg(target_arch = "x86_64")]
-            let interpolated = if right.use_avx2_fma {
-                // SAFETY: the constructor performed runtime AVX2/FMA detection.
-                unsafe {
-                    if right.factor == 2 {
-                        interpolate_2x_avx2_fma(right_history, table)
-                    } else {
-                        interpolate_avx2_fma(right_history, table)
-                    }
-                }
-            } else {
-                interpolate_scalar(right_history, table, right.factor)
-            };
-            #[cfg(target_arch = "aarch64")]
-            let interpolated = {
-                // SAFETY: Advanced SIMD is part of the AArch64 architecture.
-                unsafe {
-                    if right.factor == 2 {
-                        interpolate_2x_neon(right_history, table)
-                    } else {
-                        interpolate_neon(right_history, table)
-                    }
-                }
-            };
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-            let interpolated = interpolate_scalar(right_history, table, right.factor);
-            for value in &interpolated[..right.factor] {
-                right_frame_peak = right_frame_peak.max(value.abs() as f32);
-            }
+            right_frame_peak = right_frame_peak.max(right.interpolated_peak());
         }
         left.peak = left.peak.max(left_frame_peak);
         right.peak = right.peak.max(right_frame_peak);
@@ -701,15 +673,68 @@ impl TruePeakMeter {
 
 #[inline]
 pub(super) fn oversample_factor(sample_rate: u32) -> usize {
-    if sample_rate < 96_000 {
-        4
-    } else if sample_rate < 192_000 {
-        2
-    } else {
-        1
+    if sample_rate == 0 {
+        return MAX_PHASES;
     }
+    TRUE_PEAK_DOMAIN_HZ
+        .div_ceil(sample_rate)
+        .clamp(1, MAX_PHASES as u32) as usize
 }
 
+#[inline(always)]
+fn maximum_abs(values: &[f64]) -> f32 {
+    values
+        .iter()
+        .fold(0.0_f32, |peak, value| peak.max(value.abs() as f32))
+}
+
+#[inline]
+fn interpolate_scalar_peak(
+    history: &[f64; TAPS_PER_PHASE],
+    table: &PhaseTable,
+    factor: usize,
+) -> f32 {
+    let mut peak = 0.0_f32;
+    for phase_start in (0..factor).step_by(SIMD_PHASES) {
+        let lanes = (factor - phase_start).min(SIMD_PHASES);
+        let mut values = [0.0_f64; SIMD_PHASES];
+        for tap in 0..TAPS_PER_PHASE {
+            for lane in 0..lanes {
+                values[lane] += table[tap][phase_start + lane] * history[tap];
+            }
+        }
+        peak = peak.max(maximum_abs(&values[..lanes]));
+    }
+    peak
+}
+
+#[inline]
+fn interpolate_stereo_scalar_peaks(
+    left_history: &[f64; TAPS_PER_PHASE],
+    right_history: &[f64; TAPS_PER_PHASE],
+    table: &PhaseTable,
+    factor: usize,
+) -> (f32, f32) {
+    let mut left_peak = 0.0_f32;
+    let mut right_peak = 0.0_f32;
+    for phase_start in (0..factor).step_by(SIMD_PHASES) {
+        let lanes = (factor - phase_start).min(SIMD_PHASES);
+        let mut left_values = [0.0_f64; SIMD_PHASES];
+        let mut right_values = [0.0_f64; SIMD_PHASES];
+        for tap in 0..TAPS_PER_PHASE {
+            for lane in 0..lanes {
+                let coefficient = table[tap][phase_start + lane];
+                left_values[lane] += coefficient * left_history[tap];
+                right_values[lane] += coefficient * right_history[tap];
+            }
+        }
+        left_peak = left_peak.max(maximum_abs(&left_values[..lanes]));
+        right_peak = right_peak.max(maximum_abs(&right_values[..lanes]));
+    }
+    (left_peak, right_peak)
+}
+
+#[cfg(test)]
 #[inline]
 fn interpolate_scalar(
     history: &[f64; TAPS_PER_PHASE],
@@ -717,31 +742,18 @@ fn interpolate_scalar(
     factor: usize,
 ) -> [f64; MAX_PHASES] {
     let mut output = [0.0; MAX_PHASES];
-    for tap in 0..TAPS_PER_PHASE {
-        for phase in 0..factor {
-            output[phase] += table[tap][phase] * history[tap];
+    // Four-phase tiles keep the common scalar fallback compact while safely
+    // covering non-power-of-two ratios up to 24x. Each phase retains the same
+    // tap accumulation order as the 2x/4x implementations.
+    for phase_start in (0..factor).step_by(SIMD_PHASES) {
+        let phase_end = (phase_start + SIMD_PHASES).min(factor);
+        for tap in 0..TAPS_PER_PHASE {
+            for phase in phase_start..phase_end {
+                output[phase] += table[tap][phase] * history[tap];
+            }
         }
     }
     output
-}
-
-#[inline]
-fn interpolate_stereo_scalar(
-    left_history: &[f64; TAPS_PER_PHASE],
-    right_history: &[f64; TAPS_PER_PHASE],
-    table: &PhaseTable,
-    factor: usize,
-) -> ([f64; MAX_PHASES], [f64; MAX_PHASES]) {
-    let mut left_output = [0.0; MAX_PHASES];
-    let mut right_output = [0.0; MAX_PHASES];
-    for tap in 0..TAPS_PER_PHASE {
-        for phase in 0..factor {
-            let coefficient = table[tap][phase];
-            left_output[phase] += coefficient * left_history[tap];
-            right_output[phase] += coefficient * right_history[tap];
-        }
-    }
-    (left_output, right_output)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -749,14 +761,14 @@ fn interpolate_stereo_scalar(
 unsafe fn interpolate_2x_avx2_fma(
     history: &[f64; TAPS_PER_PHASE],
     table: &PhaseTable,
-) -> [f64; MAX_PHASES] {
+) -> [f64; SIMD_PHASES] {
     let mut accumulator = _mm_setzero_pd();
     for tap in 0..TAPS_PER_PHASE {
         let sample = _mm_set1_pd(*history.get_unchecked(tap));
         let coefficients = _mm_loadu_pd(table.get_unchecked(tap).as_ptr());
         accumulator = _mm_fmadd_pd(sample, coefficients, accumulator);
     }
-    let mut output = [0.0; MAX_PHASES];
+    let mut output = [0.0; SIMD_PHASES];
     _mm_storeu_pd(output.as_mut_ptr(), accumulator);
     output
 }
@@ -766,16 +778,60 @@ unsafe fn interpolate_2x_avx2_fma(
 unsafe fn interpolate_avx2_fma(
     history: &[f64; TAPS_PER_PHASE],
     table: &PhaseTable,
-) -> [f64; MAX_PHASES] {
+) -> [f64; SIMD_PHASES] {
     let mut accumulator = _mm256_setzero_pd();
     for tap in 0..TAPS_PER_PHASE {
         let sample = _mm256_set1_pd(*history.get_unchecked(tap));
         let coefficients = _mm256_loadu_pd(table.get_unchecked(tap).as_ptr());
         accumulator = _mm256_fmadd_pd(sample, coefficients, accumulator);
     }
-    let mut output = [0.0; MAX_PHASES];
+    let mut output = [0.0; SIMD_PHASES];
     _mm256_storeu_pd(output.as_mut_ptr(), accumulator);
     output
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn interpolate_5x_avx2_fma_peak(history: &[f64; TAPS_PER_PHASE], table: &PhaseTable) -> f32 {
+    let mut first_four = _mm256_setzero_pd();
+    let mut fifth = 0.0_f64;
+    for tap in 0..TAPS_PER_PHASE {
+        let sample = *history.get_unchecked(tap);
+        let coefficients = table.get_unchecked(tap);
+        first_four = _mm256_fmadd_pd(
+            _mm256_set1_pd(sample),
+            _mm256_loadu_pd(coefficients.as_ptr()),
+            first_four,
+        );
+        fifth = sample.mul_add(*coefficients.get_unchecked(4), fifth);
+    }
+    let mut values = [0.0; SIMD_PHASES];
+    _mm256_storeu_pd(values.as_mut_ptr(), first_four);
+    maximum_abs(&values).max(fifth.abs() as f32)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn interpolate_tiled_avx2_fma_peak(
+    history: &[f64; TAPS_PER_PHASE],
+    table: &PhaseTable,
+    factor: usize,
+) -> f32 {
+    debug_assert!((2..=MAX_PHASES).contains(&factor));
+    let mut peak = 0.0_f32;
+    for phase_start in (0..factor).step_by(SIMD_PHASES) {
+        let mut accumulator = _mm256_setzero_pd();
+        for tap in 0..TAPS_PER_PHASE {
+            let sample = _mm256_set1_pd(*history.get_unchecked(tap));
+            let coefficients = _mm256_loadu_pd(table.get_unchecked(tap).as_ptr().add(phase_start));
+            accumulator = _mm256_fmadd_pd(sample, coefficients, accumulator);
+        }
+        let mut values = [0.0; SIMD_PHASES];
+        _mm256_storeu_pd(values.as_mut_ptr(), accumulator);
+        let valid_lanes = (factor - phase_start).min(SIMD_PHASES);
+        peak = peak.max(maximum_abs(&values[..valid_lanes]));
+    }
+    peak
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -784,7 +840,7 @@ unsafe fn interpolate_stereo_2x_avx2_fma(
     left_history: &[f64; TAPS_PER_PHASE],
     right_history: &[f64; TAPS_PER_PHASE],
     table: &PhaseTable,
-) -> ([f64; MAX_PHASES], [f64; MAX_PHASES]) {
+) -> ([f64; SIMD_PHASES], [f64; SIMD_PHASES]) {
     let mut left_accumulator = _mm_setzero_pd();
     let mut right_accumulator = _mm_setzero_pd();
     for tap in 0..TAPS_PER_PHASE {
@@ -794,8 +850,8 @@ unsafe fn interpolate_stereo_2x_avx2_fma(
         left_accumulator = _mm_fmadd_pd(left_sample, coefficients, left_accumulator);
         right_accumulator = _mm_fmadd_pd(right_sample, coefficients, right_accumulator);
     }
-    let mut left_output = [0.0; MAX_PHASES];
-    let mut right_output = [0.0; MAX_PHASES];
+    let mut left_output = [0.0; SIMD_PHASES];
+    let mut right_output = [0.0; SIMD_PHASES];
     _mm_storeu_pd(left_output.as_mut_ptr(), left_accumulator);
     _mm_storeu_pd(right_output.as_mut_ptr(), right_accumulator);
     (left_output, right_output)
@@ -807,7 +863,7 @@ unsafe fn interpolate_stereo_avx2_fma(
     left_history: &[f64; TAPS_PER_PHASE],
     right_history: &[f64; TAPS_PER_PHASE],
     table: &PhaseTable,
-) -> ([f64; MAX_PHASES], [f64; MAX_PHASES]) {
+) -> ([f64; SIMD_PHASES], [f64; SIMD_PHASES]) {
     let mut left_accumulator = _mm256_setzero_pd();
     let mut right_accumulator = _mm256_setzero_pd();
     for tap in 0..TAPS_PER_PHASE {
@@ -817,11 +873,86 @@ unsafe fn interpolate_stereo_avx2_fma(
         left_accumulator = _mm256_fmadd_pd(left_sample, coefficients, left_accumulator);
         right_accumulator = _mm256_fmadd_pd(right_sample, coefficients, right_accumulator);
     }
-    let mut left_output = [0.0; MAX_PHASES];
-    let mut right_output = [0.0; MAX_PHASES];
+    let mut left_output = [0.0; SIMD_PHASES];
+    let mut right_output = [0.0; SIMD_PHASES];
     _mm256_storeu_pd(left_output.as_mut_ptr(), left_accumulator);
     _mm256_storeu_pd(right_output.as_mut_ptr(), right_accumulator);
     (left_output, right_output)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn interpolate_stereo_5x_avx2_fma_peaks(
+    left_history: &[f64; TAPS_PER_PHASE],
+    right_history: &[f64; TAPS_PER_PHASE],
+    table: &PhaseTable,
+) -> (f32, f32) {
+    let mut left_first_four = _mm256_setzero_pd();
+    let mut right_first_four = _mm256_setzero_pd();
+    let mut fifth = _mm_setzero_pd();
+    for tap in 0..TAPS_PER_PHASE {
+        let coefficients = table.get_unchecked(tap);
+        let first_four_coefficients = _mm256_loadu_pd(coefficients.as_ptr());
+        let left_sample = *left_history.get_unchecked(tap);
+        let right_sample = *right_history.get_unchecked(tap);
+        left_first_four = _mm256_fmadd_pd(
+            _mm256_set1_pd(left_sample),
+            first_four_coefficients,
+            left_first_four,
+        );
+        right_first_four = _mm256_fmadd_pd(
+            _mm256_set1_pd(right_sample),
+            first_four_coefficients,
+            right_first_four,
+        );
+        fifth = _mm_fmadd_pd(
+            _mm_set_pd(right_sample, left_sample),
+            _mm_set1_pd(*coefficients.get_unchecked(4)),
+            fifth,
+        );
+    }
+    let mut left_values = [0.0; SIMD_PHASES];
+    let mut right_values = [0.0; SIMD_PHASES];
+    let mut fifth_values = [0.0; 2];
+    _mm256_storeu_pd(left_values.as_mut_ptr(), left_first_four);
+    _mm256_storeu_pd(right_values.as_mut_ptr(), right_first_four);
+    _mm_storeu_pd(fifth_values.as_mut_ptr(), fifth);
+    (
+        maximum_abs(&left_values).max(fifth_values[0].abs() as f32),
+        maximum_abs(&right_values).max(fifth_values[1].abs() as f32),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn interpolate_stereo_tiled_avx2_fma_peaks(
+    left_history: &[f64; TAPS_PER_PHASE],
+    right_history: &[f64; TAPS_PER_PHASE],
+    table: &PhaseTable,
+    factor: usize,
+) -> (f32, f32) {
+    debug_assert!((2..=MAX_PHASES).contains(&factor));
+    let mut left_peak = 0.0_f32;
+    let mut right_peak = 0.0_f32;
+    for phase_start in (0..factor).step_by(SIMD_PHASES) {
+        let mut left_accumulator = _mm256_setzero_pd();
+        let mut right_accumulator = _mm256_setzero_pd();
+        for tap in 0..TAPS_PER_PHASE {
+            let coefficients = _mm256_loadu_pd(table.get_unchecked(tap).as_ptr().add(phase_start));
+            let left_sample = _mm256_set1_pd(*left_history.get_unchecked(tap));
+            let right_sample = _mm256_set1_pd(*right_history.get_unchecked(tap));
+            left_accumulator = _mm256_fmadd_pd(left_sample, coefficients, left_accumulator);
+            right_accumulator = _mm256_fmadd_pd(right_sample, coefficients, right_accumulator);
+        }
+        let mut left_values = [0.0; SIMD_PHASES];
+        let mut right_values = [0.0; SIMD_PHASES];
+        _mm256_storeu_pd(left_values.as_mut_ptr(), left_accumulator);
+        _mm256_storeu_pd(right_values.as_mut_ptr(), right_accumulator);
+        let valid_lanes = (factor - phase_start).min(SIMD_PHASES);
+        left_peak = left_peak.max(maximum_abs(&left_values[..valid_lanes]));
+        right_peak = right_peak.max(maximum_abs(&right_values[..valid_lanes]));
+    }
+    (left_peak, right_peak)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -829,14 +960,14 @@ unsafe fn interpolate_stereo_avx2_fma(
 unsafe fn interpolate_2x_neon(
     history: &[f64; TAPS_PER_PHASE],
     table: &PhaseTable,
-) -> [f64; MAX_PHASES] {
+) -> [f64; SIMD_PHASES] {
     let mut accumulator = vdupq_n_f64(0.0);
     for tap in 0..TAPS_PER_PHASE {
         let sample = vdupq_n_f64(*history.get_unchecked(tap));
         let coefficients = vld1q_f64(table.get_unchecked(tap).as_ptr());
         accumulator = vfmaq_f64(accumulator, sample, coefficients);
     }
-    let mut output = [0.0; MAX_PHASES];
+    let mut output = [0.0; SIMD_PHASES];
     vst1q_f64(output.as_mut_ptr(), accumulator);
     output
 }
@@ -846,7 +977,7 @@ unsafe fn interpolate_2x_neon(
 unsafe fn interpolate_neon(
     history: &[f64; TAPS_PER_PHASE],
     table: &PhaseTable,
-) -> [f64; MAX_PHASES] {
+) -> [f64; SIMD_PHASES] {
     let mut low = vdupq_n_f64(0.0);
     let mut high = vdupq_n_f64(0.0);
     for tap in 0..TAPS_PER_PHASE {
@@ -855,10 +986,57 @@ unsafe fn interpolate_neon(
         low = vfmaq_f64(low, sample, vld1q_f64(coefficients.as_ptr()));
         high = vfmaq_f64(high, sample, vld1q_f64(coefficients.as_ptr().add(2)));
     }
-    let mut output = [0.0; MAX_PHASES];
+    let mut output = [0.0; SIMD_PHASES];
     vst1q_f64(output.as_mut_ptr(), low);
     vst1q_f64(output.as_mut_ptr().add(2), high);
     output
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn interpolate_5x_neon_peak(history: &[f64; TAPS_PER_PHASE], table: &PhaseTable) -> f32 {
+    let mut low = vdupq_n_f64(0.0);
+    let mut high = vdupq_n_f64(0.0);
+    let mut fifth = 0.0_f64;
+    for tap in 0..TAPS_PER_PHASE {
+        let sample_value = *history.get_unchecked(tap);
+        let sample = vdupq_n_f64(sample_value);
+        let coefficients = table.get_unchecked(tap);
+        low = vfmaq_f64(low, sample, vld1q_f64(coefficients.as_ptr()));
+        high = vfmaq_f64(high, sample, vld1q_f64(coefficients.as_ptr().add(2)));
+        fifth = sample_value.mul_add(*coefficients.get_unchecked(4), fifth);
+    }
+    let mut values = [0.0; SIMD_PHASES];
+    vst1q_f64(values.as_mut_ptr(), low);
+    vst1q_f64(values.as_mut_ptr().add(2), high);
+    maximum_abs(&values).max(fifth.abs() as f32)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn interpolate_tiled_neon_peak(
+    history: &[f64; TAPS_PER_PHASE],
+    table: &PhaseTable,
+    factor: usize,
+) -> f32 {
+    debug_assert!((2..=MAX_PHASES).contains(&factor));
+    let mut peak = 0.0_f32;
+    for phase_start in (0..factor).step_by(SIMD_PHASES) {
+        let mut low = vdupq_n_f64(0.0);
+        let mut high = vdupq_n_f64(0.0);
+        for tap in 0..TAPS_PER_PHASE {
+            let sample = vdupq_n_f64(*history.get_unchecked(tap));
+            let coefficients = table.get_unchecked(tap).as_ptr().add(phase_start);
+            low = vfmaq_f64(low, sample, vld1q_f64(coefficients));
+            high = vfmaq_f64(high, sample, vld1q_f64(coefficients.add(2)));
+        }
+        let mut values = [0.0; SIMD_PHASES];
+        vst1q_f64(values.as_mut_ptr(), low);
+        vst1q_f64(values.as_mut_ptr().add(2), high);
+        let valid_lanes = (factor - phase_start).min(SIMD_PHASES);
+        peak = peak.max(maximum_abs(&values[..valid_lanes]));
+    }
+    peak
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -867,7 +1045,7 @@ unsafe fn interpolate_stereo_2x_neon(
     left_history: &[f64; TAPS_PER_PHASE],
     right_history: &[f64; TAPS_PER_PHASE],
     table: &PhaseTable,
-) -> ([f64; MAX_PHASES], [f64; MAX_PHASES]) {
+) -> ([f64; SIMD_PHASES], [f64; SIMD_PHASES]) {
     let mut left_accumulator = vdupq_n_f64(0.0);
     let mut right_accumulator = vdupq_n_f64(0.0);
     for tap in 0..TAPS_PER_PHASE {
@@ -877,8 +1055,8 @@ unsafe fn interpolate_stereo_2x_neon(
         left_accumulator = vfmaq_f64(left_accumulator, left_sample, coefficients);
         right_accumulator = vfmaq_f64(right_accumulator, right_sample, coefficients);
     }
-    let mut left_output = [0.0; MAX_PHASES];
-    let mut right_output = [0.0; MAX_PHASES];
+    let mut left_output = [0.0; SIMD_PHASES];
+    let mut right_output = [0.0; SIMD_PHASES];
     vst1q_f64(left_output.as_mut_ptr(), left_accumulator);
     vst1q_f64(right_output.as_mut_ptr(), right_accumulator);
     (left_output, right_output)
@@ -890,7 +1068,7 @@ unsafe fn interpolate_stereo_neon(
     left_history: &[f64; TAPS_PER_PHASE],
     right_history: &[f64; TAPS_PER_PHASE],
     table: &PhaseTable,
-) -> ([f64; MAX_PHASES], [f64; MAX_PHASES]) {
+) -> ([f64; SIMD_PHASES], [f64; SIMD_PHASES]) {
     let mut left_low = vdupq_n_f64(0.0);
     let mut left_high = vdupq_n_f64(0.0);
     let mut right_low = vdupq_n_f64(0.0);
@@ -906,13 +1084,98 @@ unsafe fn interpolate_stereo_neon(
         right_low = vfmaq_f64(right_low, right_sample, low_coefficients);
         right_high = vfmaq_f64(right_high, right_sample, high_coefficients);
     }
-    let mut left_output = [0.0; MAX_PHASES];
-    let mut right_output = [0.0; MAX_PHASES];
+    let mut left_output = [0.0; SIMD_PHASES];
+    let mut right_output = [0.0; SIMD_PHASES];
     vst1q_f64(left_output.as_mut_ptr(), left_low);
     vst1q_f64(left_output.as_mut_ptr().add(2), left_high);
     vst1q_f64(right_output.as_mut_ptr(), right_low);
     vst1q_f64(right_output.as_mut_ptr().add(2), right_high);
     (left_output, right_output)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn interpolate_stereo_5x_neon_peaks(
+    left_history: &[f64; TAPS_PER_PHASE],
+    right_history: &[f64; TAPS_PER_PHASE],
+    table: &PhaseTable,
+) -> (f32, f32) {
+    let mut left_low = vdupq_n_f64(0.0);
+    let mut left_high = vdupq_n_f64(0.0);
+    let mut right_low = vdupq_n_f64(0.0);
+    let mut right_high = vdupq_n_f64(0.0);
+    let mut fifth = vdupq_n_f64(0.0);
+    for tap in 0..TAPS_PER_PHASE {
+        let coefficients = table.get_unchecked(tap);
+        let low_coefficients = vld1q_f64(coefficients.as_ptr());
+        let high_coefficients = vld1q_f64(coefficients.as_ptr().add(2));
+        let left_sample_value = *left_history.get_unchecked(tap);
+        let right_sample_value = *right_history.get_unchecked(tap);
+        let left_sample = vdupq_n_f64(left_sample_value);
+        let right_sample = vdupq_n_f64(right_sample_value);
+        left_low = vfmaq_f64(left_low, left_sample, low_coefficients);
+        left_high = vfmaq_f64(left_high, left_sample, high_coefficients);
+        right_low = vfmaq_f64(right_low, right_sample, low_coefficients);
+        right_high = vfmaq_f64(right_high, right_sample, high_coefficients);
+        let tail_samples = vsetq_lane_f64::<1>(right_sample_value, left_sample);
+        fifth = vfmaq_f64(
+            fifth,
+            tail_samples,
+            vdupq_n_f64(*coefficients.get_unchecked(4)),
+        );
+    }
+    let mut left_values = [0.0; SIMD_PHASES];
+    let mut right_values = [0.0; SIMD_PHASES];
+    let mut fifth_values = [0.0; 2];
+    vst1q_f64(left_values.as_mut_ptr(), left_low);
+    vst1q_f64(left_values.as_mut_ptr().add(2), left_high);
+    vst1q_f64(right_values.as_mut_ptr(), right_low);
+    vst1q_f64(right_values.as_mut_ptr().add(2), right_high);
+    vst1q_f64(fifth_values.as_mut_ptr(), fifth);
+    (
+        maximum_abs(&left_values).max(fifth_values[0].abs() as f32),
+        maximum_abs(&right_values).max(fifth_values[1].abs() as f32),
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn interpolate_stereo_tiled_neon_peaks(
+    left_history: &[f64; TAPS_PER_PHASE],
+    right_history: &[f64; TAPS_PER_PHASE],
+    table: &PhaseTable,
+    factor: usize,
+) -> (f32, f32) {
+    debug_assert!((2..=MAX_PHASES).contains(&factor));
+    let mut left_peak = 0.0_f32;
+    let mut right_peak = 0.0_f32;
+    for phase_start in (0..factor).step_by(SIMD_PHASES) {
+        let mut left_low = vdupq_n_f64(0.0);
+        let mut left_high = vdupq_n_f64(0.0);
+        let mut right_low = vdupq_n_f64(0.0);
+        let mut right_high = vdupq_n_f64(0.0);
+        for tap in 0..TAPS_PER_PHASE {
+            let coefficients = table.get_unchecked(tap).as_ptr().add(phase_start);
+            let low_coefficients = vld1q_f64(coefficients);
+            let high_coefficients = vld1q_f64(coefficients.add(2));
+            let left_sample = vdupq_n_f64(*left_history.get_unchecked(tap));
+            let right_sample = vdupq_n_f64(*right_history.get_unchecked(tap));
+            left_low = vfmaq_f64(left_low, left_sample, low_coefficients);
+            left_high = vfmaq_f64(left_high, left_sample, high_coefficients);
+            right_low = vfmaq_f64(right_low, right_sample, low_coefficients);
+            right_high = vfmaq_f64(right_high, right_sample, high_coefficients);
+        }
+        let mut left_values = [0.0; SIMD_PHASES];
+        let mut right_values = [0.0; SIMD_PHASES];
+        vst1q_f64(left_values.as_mut_ptr(), left_low);
+        vst1q_f64(left_values.as_mut_ptr().add(2), left_high);
+        vst1q_f64(right_values.as_mut_ptr(), right_low);
+        vst1q_f64(right_values.as_mut_ptr().add(2), right_high);
+        let valid_lanes = (factor - phase_start).min(SIMD_PHASES);
+        left_peak = left_peak.max(maximum_abs(&left_values[..valid_lanes]));
+        right_peak = right_peak.max(maximum_abs(&right_values[..valid_lanes]));
+    }
+    (left_peak, right_peak)
 }
 
 #[cfg(test)]
@@ -939,10 +1202,37 @@ fn reference_peak(samples: &[f32], factor: usize) -> f32 {
 }
 
 #[cfg(test)]
+fn reference_finite_peak(samples: &[f32], factor: usize) -> f32 {
+    if factor == 1 {
+        return samples
+            .iter()
+            .fold(0.0_f32, |maximum, sample| maximum.max(sample.abs()));
+    }
+    let table = phase_table(factor);
+    let mut history = [0.0_f64; TAPS_PER_PHASE];
+    let mut peak = 0.0_f32;
+    for sample in samples
+        .iter()
+        .copied()
+        .chain(std::iter::repeat_n(0.0, TAPS_PER_PHASE - 1))
+    {
+        history.copy_within(0..TAPS_PER_PHASE - 1, 1);
+        history[0] = f64::from(sample);
+        peak = peak.max(sample.abs());
+        let values = interpolate_scalar(&history, table, factor);
+        for value in &values[..factor] {
+            peak = peak.max(value.abs() as f32);
+        }
+    }
+    peak
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wav::{ChannelRole, PcmKind};
 
-    fn assert_first_two_lanes_match(expected: [f64; MAX_PHASES], actual: [f64; MAX_PHASES]) {
+    fn assert_first_two_lanes_match(expected: [f64; SIMD_PHASES], actual: [f64; SIMD_PHASES]) {
         for phase in 0..2 {
             assert_eq!(
                 actual[phase].to_bits(),
@@ -954,6 +1244,148 @@ mod tests {
         }
         assert_eq!(actual[2].to_bits(), 0.0_f64.to_bits());
         assert_eq!(actual[3].to_bits(), 0.0_f64.to_bits());
+    }
+
+    fn representative_sample_rate(factor: usize) -> u32 {
+        let sample_rate = if factor == 5 {
+            // Exercise the most common non-power-of-two ratio directly.
+            44_100
+        } else {
+            TRUE_PEAK_DOMAIN_HZ.div_ceil(factor as u32)
+        };
+        assert_eq!(oversample_factor(sample_rate), factor);
+        sample_rate
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn architecture_simd_peak(
+        history: &[f64; TAPS_PER_PHASE],
+        table: &PhaseTable,
+        factor: usize,
+    ) -> f32 {
+        match factor {
+            2 => maximum_abs(&interpolate_2x_avx2_fma(history, table)[..2]),
+            4 => maximum_abs(&interpolate_avx2_fma(history, table)),
+            5 => interpolate_5x_avx2_fma_peak(history, table),
+            _ => interpolate_tiled_avx2_fma_peak(history, table, factor),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn architecture_stereo_simd_peaks(
+        left_history: &[f64; TAPS_PER_PHASE],
+        right_history: &[f64; TAPS_PER_PHASE],
+        table: &PhaseTable,
+        factor: usize,
+    ) -> (f32, f32) {
+        match factor {
+            2 => {
+                let values = interpolate_stereo_2x_avx2_fma(left_history, right_history, table);
+                (maximum_abs(&values.0[..2]), maximum_abs(&values.1[..2]))
+            }
+            4 => {
+                let values = interpolate_stereo_avx2_fma(left_history, right_history, table);
+                (maximum_abs(&values.0), maximum_abs(&values.1))
+            }
+            5 => interpolate_stereo_5x_avx2_fma_peaks(left_history, right_history, table),
+            _ => {
+                interpolate_stereo_tiled_avx2_fma_peaks(left_history, right_history, table, factor)
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn architecture_simd_peak(
+        history: &[f64; TAPS_PER_PHASE],
+        table: &PhaseTable,
+        factor: usize,
+    ) -> f32 {
+        match factor {
+            2 => maximum_abs(&interpolate_2x_neon(history, table)[..2]),
+            4 => maximum_abs(&interpolate_neon(history, table)),
+            5 => interpolate_5x_neon_peak(history, table),
+            _ => interpolate_tiled_neon_peak(history, table, factor),
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn architecture_stereo_simd_peaks(
+        left_history: &[f64; TAPS_PER_PHASE],
+        right_history: &[f64; TAPS_PER_PHASE],
+        table: &PhaseTable,
+        factor: usize,
+    ) -> (f32, f32) {
+        match factor {
+            2 => {
+                let values = interpolate_stereo_2x_neon(left_history, right_history, table);
+                (maximum_abs(&values.0[..2]), maximum_abs(&values.1[..2]))
+            }
+            4 => {
+                let values = interpolate_stereo_neon(left_history, right_history, table);
+                (maximum_abs(&values.0), maximum_abs(&values.1))
+            }
+            5 => interpolate_stereo_5x_neon_peaks(left_history, right_history, table),
+            _ => interpolate_stereo_tiled_neon_peaks(left_history, right_history, table, factor),
+        }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn tiled_simd_matches_scalar_oracle_and_ignores_partial_tail_lanes() {
+        #[cfg(target_arch = "x86_64")]
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) {
+            return;
+        }
+
+        for factor in 2..=MAX_PHASES {
+            let mut table = *phase_table(factor);
+            let tile_end = factor.div_ceil(SIMD_PHASES) * SIMD_PHASES;
+            for coefficients in &mut table {
+                coefficients[factor..tile_end].fill(f64::INFINITY);
+            }
+            for iteration in 0..16 {
+                let left_history = std::array::from_fn(|tap| {
+                    let index = tap + iteration * TAPS_PER_PHASE;
+                    (index as f64 * 0.173).sin() * 0.83 + (index as f64 * 0.071 + 0.4).cos() * 0.11
+                });
+                let right_history = std::array::from_fn(|tap| {
+                    let index = tap + iteration * TAPS_PER_PHASE;
+                    (index as f64 * 0.257 + 0.2).cos() * 0.67 - (index as f64 * 0.113).sin() * 0.19
+                });
+                let expected_left =
+                    maximum_abs(&interpolate_scalar(&left_history, &table, factor)[..factor]);
+                let expected_right =
+                    maximum_abs(&interpolate_scalar(&right_history, &table, factor)[..factor]);
+
+                // SAFETY: x86 feature support was checked above; AArch64
+                // Advanced SIMD is part of the base architecture.
+                let (actual_left, actual_stereo) = unsafe {
+                    (
+                        architecture_simd_peak(&left_history, &table, factor),
+                        architecture_stereo_simd_peaks(
+                            &left_history,
+                            &right_history,
+                            &table,
+                            factor,
+                        ),
+                    )
+                };
+                assert!(
+                    (actual_left - expected_left).abs() <= 1.0e-6,
+                    "factor {factor}, iteration {iteration}: mono {actual_left} != {expected_left}"
+                );
+                assert!(
+                    (actual_stereo.0 - expected_left).abs() <= 1.0e-6,
+                    "factor {factor}, iteration {iteration}: left {} != {expected_left}",
+                    actual_stereo.0
+                );
+                assert!(
+                    (actual_stereo.1 - expected_right).abs() <= 1.0e-6,
+                    "factor {factor}, iteration {iteration}: right {} != {expected_right}",
+                    actual_stereo.1
+                );
+            }
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1050,6 +1482,229 @@ mod tests {
             chunked.process(chunk);
         }
         assert_eq!(whole.peak(), chunked.peak());
+    }
+
+    #[test]
+    fn every_oversampling_factor_preserves_finite_chunk_semantics() {
+        let samples: Vec<f32> = (0..1021)
+            .map(|index| {
+                let first = (index as f64 * 0.173).sin();
+                let second = (index as f64 * 0.071 + 0.4).cos();
+                (0.71 * first + 0.23 * second) as f32
+            })
+            .collect();
+
+        for factor in 2..=MAX_PHASES {
+            let sample_rate = representative_sample_rate(factor);
+            let mut whole = TruePeakMeter::for_finite_sample_rate(sample_rate);
+            whole.process(&samples);
+            let whole_peak = whole.finish_peak();
+
+            let mut chunked = TruePeakMeter::for_finite_sample_rate(sample_rate);
+            for chunk in samples.chunks(37) {
+                chunked.process(chunk);
+            }
+            let chunked_peak = chunked.finish_peak();
+            assert_eq!(
+                chunked_peak.to_bits(),
+                whole_peak.to_bits(),
+                "factor {factor}, {sample_rate} Hz"
+            );
+
+            let expected = reference_finite_peak(&samples, factor);
+            assert!(
+                (whole_peak - expected).abs() <= 1.0e-6,
+                "factor {factor}, {sample_rate} Hz: {whole_peak} != {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_oversampling_factor_preserves_stereo_pair_semantics() {
+        let left: Vec<f32> = (0..641)
+            .map(|index| ((index as f64 * 0.173).sin() * 0.83) as f32)
+            .collect();
+        let right: Vec<f32> = (0..641)
+            .map(|index| ((index as f64 * 0.071 + 0.4).cos() * 0.61) as f32)
+            .collect();
+
+        for factor in 2..=MAX_PHASES {
+            let sample_rate = representative_sample_rate(factor);
+            let mut expected_left = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut expected_right = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut paired_left = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut paired_right = TruePeakMeter::for_sample_rate(sample_rate);
+            for (&left_sample, &right_sample) in left.iter().zip(&right) {
+                let expected = (
+                    expected_left.process_sample(left_sample),
+                    expected_right.process_sample(right_sample),
+                );
+                let actual = TruePeakMeter::process_stereo_sample(
+                    &mut paired_left,
+                    &mut paired_right,
+                    left_sample,
+                    right_sample,
+                );
+                assert_eq!(actual.0.to_bits(), expected.0.to_bits(), "factor {factor}");
+                assert_eq!(actual.1.to_bits(), expected.1.to_bits(), "factor {factor}");
+            }
+            assert_eq!(
+                paired_left.peak().to_bits(),
+                expected_left.peak().to_bits(),
+                "left factor {factor}"
+            );
+            assert_eq!(
+                paired_right.peak().to_bits(),
+                expected_right.peak().to_bits(),
+                "right factor {factor}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_oversampling_factor_preserves_pruning_and_future_history() {
+        let quiet: Vec<f32> = (0..1536)
+            .map(|index| ((index as f64 * 0.173).sin() * 0.001) as f32)
+            .collect();
+        let future: Vec<f32> = (0..257)
+            .map(|index| {
+                let first = (index as f64 * 0.371).sin();
+                let second = (index as f64 * 0.113 + 0.7).cos();
+                (0.73 * first + 0.19 * second) as f32
+            })
+            .collect();
+
+        for factor in 2..=MAX_PHASES {
+            let sample_rate = representative_sample_rate(factor);
+            let mut exact = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut pruned = TruePeakMeter::for_sample_rate(sample_rate);
+            let prefix = std::iter::once(0.99_f32).chain(quiet[..1024].iter().copied());
+            let mut skipped = 0_usize;
+            for sample in prefix {
+                exact.process_sample(sample);
+                skipped += usize::from(pruned.process_peak_only_sample(sample));
+            }
+            assert!(skipped > 0, "factor {factor} never armed sample pruning");
+
+            for &sample in &quiet[1024..] {
+                exact.process_sample(sample);
+            }
+            assert!(
+                pruned.try_skip_peak_only_block(&quiet[1024..]),
+                "factor {factor} did not skip a proven quiet block"
+            );
+            assert_eq!(
+                pruned.peak().to_bits(),
+                exact.peak().to_bits(),
+                "factor {factor} quiet block"
+            );
+
+            for &sample in &future {
+                exact.process_sample(sample);
+                pruned.process_peak_only_sample(sample);
+            }
+            assert_eq!(
+                pruned.peak().to_bits(),
+                exact.peak().to_bits(),
+                "factor {factor} future history"
+            );
+        }
+    }
+
+    #[test]
+    fn finite_measurement_zero_pads_both_boundaries_and_drains_tail() {
+        let samples = [
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0,
+            -1.0,
+        ];
+        let mut unfinished = TruePeakMeter::for_finite_sample_rate(48_000);
+        unfinished.process(&samples);
+        let prefix_peak = unfinished.peak();
+
+        let mut whole = TruePeakMeter::for_finite_sample_rate(48_000);
+        whole.process(&samples);
+        let whole_peak = whole.finish_peak();
+        let mut chunked = TruePeakMeter::for_finite_sample_rate(48_000);
+        for chunk in samples.chunks(3) {
+            chunked.process(chunk);
+        }
+        let chunked_peak = chunked.finish_peak();
+
+        assert!(
+            whole_peak > prefix_peak * 1.2,
+            "FIR tail {whole_peak} did not exceed unfinished prefix {prefix_peak}"
+        );
+        assert_eq!(chunked_peak.to_bits(), whole_peak.to_bits());
+        let expected = reference_finite_peak(&samples, 4);
+        assert!((whole_peak - expected).abs() <= 1.0e-6);
+
+        let buffer = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 1,
+            frames: samples.len(),
+            data: vec![samples.to_vec()],
+            channel_roles: vec![ChannelRole::Main],
+            source_kind: PcmKind::F32,
+        };
+        assert_eq!(measure_true_peak(&buffer).to_bits(), whole_peak.to_bits());
+    }
+
+    #[test]
+    fn reconstructed_finite_tail_discards_the_artificial_replay_boundary() {
+        // The retained suffix starts with a full-scale sample, but that sample
+        // followed a steady full-scale prefix in the real stream. Replaying
+        // the suffix as a new finite signal invents a zero-to-one boundary and
+        // must not attribute its peak to EOF.
+        let mut samples = vec![1.0; 32];
+        samples.extend([0.0; TAPS_PER_PHASE - 2]);
+        let recent = &samples[samples.len() - (TAPS_PER_PHASE - 1)..];
+
+        let mut full = TruePeakMeter::for_finite_sample_rate(48_000);
+        for &sample in &samples {
+            full.process_sample(sample);
+        }
+        let expected_eof_peak = (0..TAPS_PER_PHASE - 1)
+            .map(|_| full.process_sample(0.0))
+            .fold(0.0, f32::max);
+
+        let mut replay_inclusive = TruePeakMeter::for_finite_sample_rate(48_000);
+        replay_inclusive.process(recent);
+        let replay_inclusive_peak = replay_inclusive.finish_peak();
+        assert!(
+            replay_inclusive_peak > expected_eof_peak,
+            "fixture did not expose replay boundary: replay={replay_inclusive_peak}, EOF={expected_eof_peak}"
+        );
+
+        let reconstructed = TruePeakMeter::finite_tail_peak_from_recent_samples(48_000, recent);
+        assert_eq!(reconstructed.to_bits(), expected_eof_peak.to_bits());
+    }
+
+    #[test]
+    fn finite_measurement_matches_full_convolution_for_all_domain_factors() {
+        let samples = [0.81, -0.37, 0.19, -0.93, 0.44, 0.08, -0.61];
+        for (sample_rate, factor) in [
+            (8_000, 24),
+            (11_025, 18),
+            (16_000, 12),
+            (22_050, 9),
+            (32_000, 6),
+            (44_100, 5),
+            (64_000, 3),
+            (96_000, 2),
+            (192_000, 1),
+            (384_000, 1),
+        ] {
+            let mut meter = TruePeakMeter::for_finite_sample_rate(sample_rate);
+            for chunk in samples.chunks(2) {
+                meter.process(chunk);
+            }
+            let actual = meter.finish_peak();
+            let expected = reference_finite_peak(&samples, factor);
+            assert!(
+                (actual - expected).abs() <= 1.0e-6,
+                "{sample_rate} Hz: {actual} != {expected}"
+            );
+        }
     }
 
     #[test]
@@ -1419,20 +2074,22 @@ mod tests {
             .iter()
             .fold(0.0_f32, |maximum, sample| maximum.max(sample.abs()));
 
-        for sample_rate in [44_100, 48_000, 96_000, 191_999, 192_000, 384_000] {
+        for sample_rate in [
+            8_000, 32_000, 44_100, 48_000, 64_000, 88_200, 96_000, 191_999, 192_000, 384_000,
+        ] {
             for gain in [f32::MIN_POSITIVE, 0.000_123, 0.37, 1.0, 3.75, 65_536.0] {
                 let scaled = samples
                     .iter()
                     .map(|sample| *sample * gain)
                     .collect::<Vec<_>>();
-                let mut meter = TruePeakMeter::for_sample_rate(sample_rate);
+                let mut meter = TruePeakMeter::for_finite_sample_rate(sample_rate);
                 meter.process(&scaled);
                 let rounded_sample_peak_bound = source_peak * gain;
                 let upper = upper_bound_from_sample_peak(sample_rate, rounded_sample_peak_bound);
+                let actual = meter.finish_peak();
                 assert!(
-                    f64::from(meter.peak()) <= upper,
-                    "{sample_rate} Hz, gain {gain}: {} > {upper}",
-                    meter.peak()
+                    f64::from(actual) <= upper,
+                    "{sample_rate} Hz, gain {gain}: {actual} > {upper}"
                 );
             }
         }
@@ -1444,11 +2101,19 @@ mod tests {
 
     #[test]
     fn oversampling_ratio_tracks_input_sample_rate() {
-        assert_eq!(oversample_factor(44_100), 4);
-        assert_eq!(oversample_factor(95_999), 4);
+        assert_eq!(oversample_factor(0), 24);
+        assert_eq!(oversample_factor(8_000), 24);
+        assert_eq!(oversample_factor(11_025), 18);
+        assert_eq!(oversample_factor(16_000), 12);
+        assert_eq!(oversample_factor(22_050), 9);
+        assert_eq!(oversample_factor(32_000), 6);
+        assert_eq!(oversample_factor(44_100), 5);
+        assert_eq!(oversample_factor(64_000), 3);
+        assert_eq!(oversample_factor(95_999), 3);
         assert_eq!(oversample_factor(96_000), 2);
         assert_eq!(oversample_factor(191_999), 2);
         assert_eq!(oversample_factor(192_000), 1);
+        assert_eq!(oversample_factor(384_000), 1);
     }
 
     #[test]

@@ -11,7 +11,9 @@ use crate::dsp::resample::ResampleQuality;
 use crate::dsp::simd;
 use crate::normalization_diff::{self, FileEvidence, MeasurementEvidence};
 use crate::normalize::{self, Analysis, Mode, OutputFormat, Plan};
-use crate::wav::{AudioBuffer, ChannelRole, WavContainer};
+use crate::wav::{
+    AudioBuffer, ChannelRole, WavContainer, MAX_DECODE_SAMPLE_RATE_HZ, MIN_DECODE_SAMPLE_RATE_HZ,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -21,17 +23,16 @@ use std::path::{Component, Path, PathBuf};
 pub const REQUEST_SCHEMA: &str =
     "https://penguin425.github.io/audio-normalizer/schema/segment-normalization-request-v1";
 pub const PLAN_SCHEMA: &str =
-    "https://penguin425.github.io/audio-normalizer/schema/segment-normalization-plan-v1";
+    "https://penguin425.github.io/audio-normalizer/schema/segment-normalization-plan-v2";
 pub const REPORT_SCHEMA: &str =
-    "https://penguin425.github.io/audio-normalizer/schema/segment-normalization-report-v1";
-pub const METHOD_ID: &str = "forge-segment-normalization-v1";
-pub const ALGORITHM_REVISION: &str = "smoothstep-db-boundary-v1";
+    "https://penguin425.github.io/audio-normalizer/schema/segment-normalization-report-v2";
+pub const METHOD_ID: &str = "forge-segment-normalization-v2";
+pub const ALGORITHM_REVISION: &str = "smoothstep-db-boundary-layout-provenance-v2";
 
 const MAX_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SEGMENTS: usize = 4096;
 const MAX_CHANNELS: usize = 32;
-const MAX_SAMPLE_RATE_HZ: u32 = 768_000;
 const DEFAULT_MAX_DECODED_SAMPLES: u64 = 50_000_000;
 const HARD_MAX_DECODED_SAMPLES: u64 = 200_000_000;
 
@@ -275,8 +276,11 @@ pub fn create_plan(
     let mut layout = None;
     for input in &inputs {
         let binding_before = normalization_diff::inspect_file(input)?;
-        let mut buffer = decoder::decode_limited(input, request.max_decoded_samples_per_segment)?;
-        apply_channel_roles(&mut buffer, channel_roles)?;
+        let buffer = decode_segment(
+            input,
+            request.max_decoded_samples_per_segment,
+            channel_roles,
+        )?;
         let current_layout = LayoutEvidence {
             sample_rate_hz: buffer.sample_rate,
             channels: buffer.channels,
@@ -408,6 +412,7 @@ pub fn render_plan(
     validate_plan(&plan)?;
     let format = parse_format(&plan.settings.format)?;
     validate_render_paths(&manifest_path, &report_path, &plan, format, overwrite)?;
+    normalize::validate_output_encoder_available(format)?;
     verify_request_binding_and_intent(&plan)?;
     if let Some(parent) = report_path
         .parent()
@@ -481,8 +486,11 @@ fn render_segment(
     let input_path = Path::new(&segment.input.path);
     let output_path = Path::new(&segment.output_path);
     let before = verify_file_binding(input_path, &segment.input)?;
-    let mut buffer = decoder::decode_limited(input_path, settings.max_decoded_samples_per_segment)?;
-    apply_channel_roles(&mut buffer, Some(roles))?;
+    let mut buffer = decode_segment(
+        input_path,
+        settings.max_decoded_samples_per_segment,
+        Some(roles),
+    )?;
     let source = normalize::analyze(&buffer);
     verify_source_measurement(segment, &source)?;
     apply_smoothed_gain(
@@ -514,8 +522,7 @@ fn render_segment(
         .max_decoded_samples_per_segment
         .checked_add(padding)
         .ok_or_else(|| "decoded output sample limit overflow".to_string())?;
-    let mut decoded = decoder::decode_limited(staged.path(), output_limit)?;
-    apply_channel_roles(&mut decoded, Some(roles))?;
+    let decoded = decode_segment(staged.path(), output_limit, Some(roles))?;
     let decoded_analysis = normalize::analyze(&decoded);
     let codec_loudness_deviation_lu = (decoded_analysis.lufs - intended.lufs).abs();
     let duration_deviation_ms = ((decoded_analysis.frames as f64
@@ -764,8 +771,8 @@ fn validate_plan(plan: &SegmentNormalizationPlan) -> Result<(), String> {
     if !(2..=MAX_SEGMENTS).contains(&plan.segments.len()) {
         return Err("segment plan has an invalid segment count".into());
     }
-    if plan.layout.sample_rate_hz == 0
-        || plan.layout.sample_rate_hz > MAX_SAMPLE_RATE_HZ
+    if !(MIN_DECODE_SAMPLE_RATE_HZ..=MAX_DECODE_SAMPLE_RATE_HZ)
+        .contains(&plan.layout.sample_rate_hz)
         || plan.layout.channels == 0
         || plan.layout.channels as usize > MAX_CHANNELS
         || plan.layout.channel_roles.len() != plan.layout.channels as usize
@@ -1133,8 +1140,7 @@ fn apply_channel_roles(
     buffer: &mut AudioBuffer,
     channel_roles: Option<&[ChannelRole]>,
 ) -> Result<(), String> {
-    if buffer.sample_rate == 0
-        || buffer.sample_rate > MAX_SAMPLE_RATE_HZ
+    if !(MIN_DECODE_SAMPLE_RATE_HZ..=MAX_DECODE_SAMPLE_RATE_HZ).contains(&buffer.sample_rate)
         || buffer.channels == 0
         || buffer.channels as usize > MAX_CHANNELS
         || buffer.data.len() != buffer.channels as usize
@@ -1145,7 +1151,7 @@ fn apply_channel_roles(
             .any(|channel| channel.len() != buffer.frames)
     {
         return Err(format!(
-            "segment audio geometry exceeds the {MAX_CHANNELS}-channel/{MAX_SAMPLE_RATE_HZ}-Hz bounds"
+            "segment audio geometry exceeds the {MAX_CHANNELS}-channel/{MIN_DECODE_SAMPLE_RATE_HZ}..={MAX_DECODE_SAMPLE_RATE_HZ}-Hz bounds"
         ));
     }
     if let Some(roles) = channel_roles {
@@ -1159,6 +1165,24 @@ fn apply_channel_roles(
         buffer.channel_roles = roles.to_vec();
     }
     Ok(())
+}
+
+fn decode_segment(
+    path: &Path,
+    max_decoded_samples: u64,
+    channel_roles: Option<&[ChannelRole]>,
+) -> Result<AudioBuffer, String> {
+    let (mut buffer, layout_provenance) =
+        decoder::decode_limited_with_layout(path, max_decoded_samples)?;
+    let roles = normalize::resolve_decoded_channel_roles(
+        path,
+        buffer.channels,
+        &buffer.channel_roles,
+        layout_provenance,
+        channel_roles,
+    )?;
+    apply_channel_roles(&mut buffer, Some(&roles))?;
+    Ok(buffer)
 }
 
 fn finite_range(name: &str, value: f64, minimum: f64, maximum: f64) -> Result<(), String> {

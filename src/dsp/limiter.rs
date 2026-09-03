@@ -69,6 +69,7 @@ impl Default for LimiterConfig {
 
 pub struct TruePeakLimiter {
     meters: Vec<TruePeakMeter>,
+    finite_signal: bool,
     delay: Vec<Vec<f32>>,
     delay_start: usize,
     delay_len: usize,
@@ -99,6 +100,28 @@ impl TruePeakLimiter {
         ceiling_db: f64,
         config: LimiterConfig,
     ) -> Result<Self, String> {
+        Self::new_with_boundary(sample_rate, channels, ceiling_db, config, false)
+    }
+
+    /// Construct the offline finite-signal limiter used by normalization.
+    /// Boundary samples outside the programme are zero, while [`Self::new`]
+    /// retains its established streaming edge extension.
+    pub(crate) fn new_finite(
+        sample_rate: u32,
+        channels: u16,
+        ceiling_db: f64,
+        config: LimiterConfig,
+    ) -> Result<Self, String> {
+        Self::new_with_boundary(sample_rate, channels, ceiling_db, config, true)
+    }
+
+    fn new_with_boundary(
+        sample_rate: u32,
+        channels: u16,
+        ceiling_db: f64,
+        config: LimiterConfig,
+        finite_signal: bool,
+    ) -> Result<Self, String> {
         if channels == 0 {
             return Err("limiter requires at least one channel".into());
         }
@@ -114,8 +137,15 @@ impl TruePeakLimiter {
         let release_samples = sample_rate as f64 * config.release_ms / 1000.0;
         Ok(Self {
             meters: (0..channels)
-                .map(|_| TruePeakMeter::for_sample_rate(sample_rate))
+                .map(|_| {
+                    if finite_signal {
+                        TruePeakMeter::for_finite_sample_rate(sample_rate)
+                    } else {
+                        TruePeakMeter::for_sample_rate(sample_rate)
+                    }
+                })
                 .collect(),
+            finite_signal,
             delay: (0..channels)
                 .map(|_| vec![0.0; lookahead_frames + 1])
                 .collect(),
@@ -237,10 +267,28 @@ impl TruePeakLimiter {
             channel.clear();
             channel.reserve(remaining);
         }
-        while self.delay_len != 0 {
-            let detected = detect_repeated_frame(&mut self.meters, &self.last_samples);
-            self.update_envelope(detected);
-            self.emit_one(output);
+        if self.finite_signal {
+            // A programme shorter than the configured look-ahead has not yet
+            // reached the virtual output time. Advance only the detector until
+            // the first real delayed frame is due; these zeros are neither
+            // rendered nor included in the output statistics.
+            if self.delay_len != 0 {
+                for _ in self.delay_len..self.lookahead_frames {
+                    let detected = detect_zero_frame(&mut self.meters);
+                    self.update_envelope(detected);
+                }
+            }
+            while self.delay_len != 0 {
+                let detected = detect_zero_frame(&mut self.meters);
+                self.update_envelope(detected);
+                self.emit_one(output);
+            }
+        } else {
+            while self.delay_len != 0 {
+                let detected = detect_repeated_frame(&mut self.meters, &self.last_samples);
+                self.update_envelope(detected);
+                self.emit_one(output);
+            }
         }
         if self.statistics_enabled {
             self.finish_statistics_interval();
@@ -436,9 +484,39 @@ fn detect_repeated_frame(meters: &mut [TruePeakMeter], last_samples: &[f32]) -> 
     detected
 }
 
+#[inline]
+fn detect_zero_frame(meters: &mut [TruePeakMeter]) -> f32 {
+    if meters.len() == 2 {
+        let (left, right) = meters.split_at_mut(1);
+        let (left_peak, right_peak) =
+            TruePeakMeter::process_stereo_sample(&mut left[0], &mut right[0], 0.0, 0.0);
+        return 0.0_f32.max(left_peak).max(right_peak);
+    }
+
+    let mut detected = 0.0_f32;
+    for meter_pair in meters.chunks_mut(2) {
+        if meter_pair.len() == 2 {
+            let (left, right) = meter_pair.split_at_mut(1);
+            let (left_peak, right_peak) =
+                TruePeakMeter::process_stereo_sample(&mut left[0], &mut right[0], 0.0, 0.0);
+            detected = detected.max(left_peak);
+            detected = detected.max(right_peak);
+        } else {
+            detected = detected.max(meter_pair[0].process_sample(0.0));
+        }
+    }
+    detected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn finite_peak(sample_rate: u32, samples: &[f32]) -> f32 {
+        let mut meter = TruePeakMeter::for_finite_sample_rate(sample_rate);
+        meter.process(samples);
+        meter.finish_peak()
+    }
 
     #[test]
     fn chunked_limiter_preserves_frames_and_ceiling() {
@@ -459,14 +537,8 @@ mod tests {
         }
         output.extend(limiter.finish().remove(0));
         assert_eq!(output.len(), input.len());
-        let mut meter = TruePeakMeter::new();
-        meter.process(&output);
-        assert!(
-            meter.peak() <= ceiling * 1.001,
-            "{} > {}",
-            meter.peak(),
-            ceiling
-        );
+        let peak = finite_peak(sample_rate, &output);
+        assert!(peak <= ceiling * 1.001, "{} > {}", peak, ceiling);
     }
 
     #[test]
@@ -487,13 +559,51 @@ mod tests {
         }
         output.extend(limiter.finish().remove(0));
 
-        let mut meter = TruePeakMeter::for_sample_rate(sample_rate);
-        meter.process(&output);
+        let peak = finite_peak(sample_rate, &output);
         assert_eq!(output.len(), input.len());
         assert!(
-            meter.peak() <= ceiling,
+            peak <= ceiling,
             "{} dBTP exceeded the strict {ceiling_db} dBTP ceiling",
-            20.0 * f64::from(meter.peak()).log10(),
+            20.0 * f64::from(peak).log10(),
+        );
+    }
+
+    #[test]
+    fn finite_tail_is_limited_without_rendering_or_counting_virtual_zeros() {
+        let sample_rate = 48_000;
+        let ceiling_db = -1.0;
+        let ceiling = 10.0_f64.powf(ceiling_db / 20.0) as f32;
+        // This terminal pair reaches its largest reconstructed value only after
+        // EOF. It is also shorter than the configured look-ahead, exercising
+        // detector-only zero padding before the first delayed sample is emitted.
+        let mut input = vec![0.0_f32; 18];
+        input[16] = -1.0;
+        input[17] = -1.0;
+        assert!(finite_peak(sample_rate, &input) > 1.2);
+
+        let mut limiter = TruePeakLimiter::new_finite(
+            sample_rate,
+            1,
+            ceiling_db,
+            LimiterConfig {
+                lookahead_ms: 1.0,
+                release_ms: 100.0,
+            },
+        )
+        .unwrap();
+        limiter.set_statistics_interval_frames(5);
+        let mut output = limiter.process(&[input.clone()]).unwrap().remove(0);
+        let (tail, statistics) = limiter.finish_with_statistics();
+        output.extend_from_slice(&tail[0]);
+
+        assert_eq!(output.len(), input.len());
+        assert_eq!(statistics.processed_frames, input.len());
+        assert_eq!(statistics.envelope.last().unwrap().end_frame, input.len());
+        let peak = finite_peak(sample_rate, &output);
+        assert!(
+            peak <= ceiling,
+            "{} dBTP exceeded the strict {ceiling_db} dBTP ceiling",
+            20.0 * f64::from(peak).log10()
         );
     }
 

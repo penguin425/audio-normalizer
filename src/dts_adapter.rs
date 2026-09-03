@@ -4,7 +4,8 @@
 //! render.  Normative asset/presentation decoding remains in an explicitly
 //! selected licensed or reference adapter; no DTS decoder is bundled.
 
-use crate::{analysis, decoder};
+use crate::wav::{AudioBuffer, ChannelRole};
+use crate::{analysis, decoder, normalize};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -900,8 +901,17 @@ pub fn run(options: &AdapterOptions) -> Result<DtsAdapterReport, String> {
     for presentation in response.presentations {
         let rendered = resolve_render(&render_root, &presentation.rendered_path)?;
         let (rendered_sha256, rendered_bytes) = sha256_file(&rendered)?;
-        let buffer =
-            decoder::decode_limited(&rendered, options.max_decoded_samples_per_presentation)?;
+        let (buffer, layout_provenance) = decoder::decode_limited_with_layout(
+            &rendered,
+            options.max_decoded_samples_per_presentation,
+        )?;
+        let buffer = resolve_rendered_layout(
+            &rendered,
+            buffer,
+            layout_provenance,
+            &presentation.output_layout,
+            presentation.declared_channels,
+        )?;
         let measured = analysis::analyze(&buffer);
         let (rendered_after, bytes_after) = sha256_file(&rendered)?;
         if rendered_after != rendered_sha256 || bytes_after != rendered_bytes {
@@ -1203,6 +1213,14 @@ fn validate_response(
                 presentation.id
             ));
         }
+        if declared_layout_roles(&presentation.output_layout)
+            .is_some_and(|roles| roles.len() != usize::from(presentation.declared_channels))
+        {
+            return Err(format!(
+                "DTS presentation {} output layout {} conflicts with its declared {} channels",
+                presentation.id, presentation.output_layout, presentation.declared_channels
+            ));
+        }
         validate_relative_path(&presentation.rendered_path)?;
         if presentation
             .rendered_path
@@ -1218,6 +1236,66 @@ fn validate_response(
         return Err("every DTS asset must be referenced by at least one presentation".into());
     }
     Ok(())
+}
+
+fn declared_layout_roles(name: &str) -> Option<Vec<ChannelRole>> {
+    let normalized = name.trim().to_ascii_lowercase();
+    crate::downmix::Layout::parse(&normalized).map(crate::downmix::Layout::roles)
+}
+
+fn resolve_rendered_layout(
+    path: &Path,
+    mut buffer: AudioBuffer,
+    provenance: decoder::ChannelLayoutProvenance,
+    declared_layout: &str,
+    declared_channels: u16,
+) -> Result<AudioBuffer, String> {
+    if buffer.channels != declared_channels {
+        return Err(format!(
+            "DTS render {} decoded {} channels but the presentation declares {}",
+            path.display(),
+            buffer.channels,
+            declared_channels
+        ));
+    }
+
+    let declared_roles = declared_layout_roles(declared_layout);
+    if let Some(roles) = declared_roles.as_deref() {
+        if roles.len() != usize::from(declared_channels) {
+            return Err(format!(
+                "DTS render {} declares layout {declared_layout} with {} channels but the presentation declares {declared_channels}",
+                path.display(),
+                roles.len()
+            ));
+        }
+        if provenance == decoder::ChannelLayoutProvenance::KnownSpeakers
+            && !decoded_layout_matches_declared(&buffer.channel_roles, roles)
+        {
+            return Err(format!(
+                "DTS render {} decoded speaker layout conflicts with declared layout {declared_layout}",
+                path.display()
+            ));
+        }
+    }
+
+    buffer.channel_roles = normalize::resolve_decoded_channel_roles(
+        path,
+        buffer.channels,
+        &buffer.channel_roles,
+        provenance,
+        declared_roles.as_deref(),
+    )?;
+    Ok(buffer)
+}
+
+fn decoded_layout_matches_declared(
+    decoded_roles: &[ChannelRole],
+    declared_roles: &[ChannelRole],
+) -> bool {
+    decoded_roles == declared_roles
+        || (declared_roles.len() > 2
+            && crate::wav::writer::persisted_channel_roles(declared_roles)
+                .is_ok_and(|roles| roles == decoded_roles))
 }
 
 fn validate_profile(
@@ -1446,6 +1524,7 @@ fn read_bounded(file: &mut File, limit: usize, label: &str) -> Result<Vec<u8>, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wav::{named_channel_layout, PcmKind, WavWriter};
 
     #[test]
     fn converts_all_four_core_wire_formats() {
@@ -1552,6 +1631,126 @@ mod tests {
         assert!(validate_response(&value, &"a".repeat(64), &inventory)
             .unwrap_err()
             .contains("workspace"));
+
+        let mut value = response();
+        value.presentations[0].output_layout = "5.1".into();
+        assert!(validate_response(&value, &"a".repeat(64), &inventory)
+            .unwrap_err()
+            .contains("conflicts with its declared 2 channels"));
+    }
+
+    #[test]
+    fn declared_layout_resolves_a_maskless_five_one_render() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("maskless.wav");
+        let source = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 6,
+            frames: 480,
+            data: vec![vec![0.0; 480]; 6],
+            channel_roles: vec![ChannelRole::Main; 6],
+            source_kind: PcmKind::F32,
+        };
+        WavWriter::write(&path, &source, PcmKind::F32, false).unwrap();
+        let (decoded, provenance) = decoder::decode_limited_with_layout(&path, 10_000).unwrap();
+        assert_eq!(provenance, decoder::ChannelLayoutProvenance::Unknown);
+
+        let resolved = resolve_rendered_layout(&path, decoded, provenance, "5.1", 6).unwrap();
+        assert_eq!(resolved.channel_roles, named_channel_layout("5.1").unwrap());
+    }
+
+    #[test]
+    fn rendered_layout_resolution_fails_closed_on_ambiguous_evidence() {
+        let ambiguous = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 6,
+            frames: 1,
+            data: vec![vec![0.0]; 6],
+            channel_roles: vec![ChannelRole::Main; 6],
+            source_kind: PcmKind::F32,
+        };
+        let error = resolve_rendered_layout(
+            Path::new("render.wav"),
+            ambiguous.clone(),
+            decoder::ChannelLayoutProvenance::Unknown,
+            "vendor-private",
+            6,
+        )
+        .unwrap_err();
+        assert!(error.contains("ambiguous 6-channel layout"), "{error}");
+
+        let error = resolve_rendered_layout(
+            Path::new("render.wav"),
+            ambiguous.clone(),
+            decoder::ChannelLayoutProvenance::SceneBased,
+            "vendor-private",
+            6,
+        )
+        .unwrap_err();
+        assert!(error.contains("scene-based 6-channel audio"), "{error}");
+
+        let error = resolve_rendered_layout(
+            Path::new("render.wav"),
+            ambiguous.clone(),
+            decoder::ChannelLayoutProvenance::Unknown,
+            "5.1",
+            5,
+        )
+        .unwrap_err();
+        assert!(error.contains("decoded 6 channels"), "{error}");
+
+        let error = resolve_rendered_layout(
+            Path::new("render.wav"),
+            ambiguous,
+            decoder::ChannelLayoutProvenance::Unknown,
+            "stereo",
+            6,
+        )
+        .unwrap_err();
+        assert!(error.contains("layout stereo with 2 channels"), "{error}");
+    }
+
+    #[test]
+    fn rendered_layout_resolution_preserves_known_stereo() {
+        let stereo_roles = named_channel_layout("stereo").unwrap();
+        let buffer = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 2,
+            frames: 1,
+            data: vec![vec![0.0], vec![0.0]],
+            channel_roles: stereo_roles.clone(),
+            source_kind: PcmKind::F32,
+        };
+        let resolved = resolve_rendered_layout(
+            Path::new("render.wav"),
+            buffer,
+            decoder::ChannelLayoutProvenance::KnownSpeakers,
+            "stereo",
+            2,
+        )
+        .unwrap();
+        assert_eq!(resolved.channel_roles, stereo_roles);
+
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("known-7.1.4.wav");
+        let immersive_roles = named_channel_layout("7.1.4").unwrap();
+        let source = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 12,
+            frames: 1,
+            data: vec![vec![0.0]; 12],
+            channel_roles: immersive_roles.clone(),
+            source_kind: PcmKind::F32,
+        };
+        WavWriter::write(&path, &source, PcmKind::F32, false).unwrap();
+        let (decoded, provenance) = decoder::decode_limited_with_layout(&path, 100).unwrap();
+        assert_eq!(provenance, decoder::ChannelLayoutProvenance::KnownSpeakers);
+        assert_eq!(
+            decoded.channel_roles,
+            crate::wav::writer::persisted_channel_roles(&immersive_roles).unwrap()
+        );
+        let resolved = resolve_rendered_layout(&path, decoded, provenance, "7.1.4", 12).unwrap();
+        assert_eq!(resolved.channel_roles, immersive_roles);
     }
 
     fn response() -> AdapterResponse {

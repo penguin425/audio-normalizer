@@ -87,7 +87,7 @@ pub struct DsdInfo {
 #[derive(Debug, Clone, Copy)]
 enum DsdLayout {
     Dsf { block_size_per_channel: u32 },
-    Dsdiff,
+    Dsdiff { known_speakers: bool },
 }
 
 pub fn looks_like_dsd(header: &[u8]) -> bool {
@@ -95,13 +95,62 @@ pub fn looks_like_dsd(header: &[u8]) -> bool {
         || (header.len() >= 16 && &header[..4] == b"FRM8" && &header[12..16] == b"DSD ")
 }
 
+/// Probe a DSD stream whose container identifies every speaker.
+///
+/// Ambiguous layouts are rejected. Use [`probe_with_layout`] when the caller
+/// can resolve returned channel-layout provenance using external metadata.
 pub fn probe(path: &Path) -> Result<DsdInfo, String> {
+    let (info, provenance) = probe_with_layout(path)?;
+    require_known_layout(path, provenance)?;
+    Ok(info)
+}
+
+fn probe_preserving_layout(path: &Path) -> Result<DsdInfo, String> {
     let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
     let file_size = file
         .metadata()
         .map_err(|error| format!("stat {}: {error}", path.display()))?
         .len();
     parse(&mut file, file_size).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// Probe a DSD stream while retaining whether its channel roles are
+/// authoritative speaker assignments.
+pub fn probe_with_layout(
+    path: &Path,
+) -> Result<(DsdInfo, crate::decoder::ChannelLayoutProvenance), String> {
+    let info = probe_preserving_layout(path)?;
+    let provenance = dsd_layout_provenance(&info);
+    Ok((info, provenance))
+}
+
+fn dsd_layout_provenance(info: &DsdInfo) -> crate::decoder::ChannelLayoutProvenance {
+    match info.layout {
+        DsdLayout::Dsf { .. }
+        | DsdLayout::Dsdiff {
+            known_speakers: true,
+        } => crate::decoder::ChannelLayoutProvenance::KnownSpeakers,
+        DsdLayout::Dsdiff {
+            known_speakers: false,
+        } => crate::decoder::ChannelLayoutProvenance::Unknown,
+    }
+}
+
+fn require_known_layout(
+    path: &Path,
+    provenance: crate::decoder::ChannelLayoutProvenance,
+) -> Result<(), String> {
+    match provenance {
+        crate::decoder::ChannelLayoutProvenance::KnownSpeakers => Ok(()),
+        crate::decoder::ChannelLayoutProvenance::Unknown => Err(format!(
+            "{}: ambiguous channel layout; use DSD probe/decode APIs with layout provenance and supply explicit speaker roles",
+            path.display()
+        )),
+        crate::decoder::ChannelLayoutProvenance::SceneBased => Err(format!(
+            "{}: scene-based channel layout cannot be represented as speaker roles; use a DSD decode API with layout provenance",
+            path.display()
+        )),
+    }
 }
 
 fn parse(file: &mut File, file_size: u64) -> Result<DsdInfo, String> {
@@ -383,7 +432,9 @@ fn parse_dsdiff(file: &mut File, file_size: u64) -> Result<DsdInfo, String> {
         data_size,
         block_size_per_channel: None,
         chunk_count,
-        layout: DsdLayout::Dsdiff,
+        layout: DsdLayout::Dsdiff {
+            known_speakers: dff_has_known_speaker_ids(&channel_ids),
+        },
     })
 }
 
@@ -685,42 +736,114 @@ fn validate_dsf_channel_type(channel_type: u32, channels: u16) -> Result<(), Str
 }
 
 fn dsf_channel_roles(channel_type: u32, channels: u16) -> Vec<ChannelRole> {
-    use ChannelRole::{Lfe, Main, Surround};
+    use ChannelRole::Lfe;
+    let p = ChannelRole::positioned;
     match channel_type {
-        4 => vec![Main, Main, Surround, Surround],
-        5 => vec![Main, Main, Main, Lfe],
-        6 => vec![Main, Main, Main, Surround, Surround],
-        7 => vec![Main, Main, Main, Lfe, Surround, Surround],
+        1 | 2 => default_channel_roles(channels),
+        3 => vec![p(-30, 0), p(30, 0), p(0, 0)],
+        4 => vec![p(-30, 0), p(30, 0), p(-110, 0), p(110, 0)],
+        5 => vec![p(-30, 0), p(30, 0), p(0, 0), Lfe],
+        6 => vec![p(-30, 0), p(30, 0), p(0, 0), p(-110, 0), p(110, 0)],
+        7 => vec![p(-30, 0), p(30, 0), p(0, 0), Lfe, p(-110, 0), p(110, 0)],
         _ => default_channel_roles(channels),
     }
 }
 
 fn dff_channel_roles(ids: &[[u8; 4]]) -> Vec<ChannelRole> {
+    // Conventional mono/stereo are unambiguous across supported containers.
+    // Retain their public legacy representation so safe cross-format output
+    // does not require a synthetic speaker-position override.
+    if ids == [*b"SLFT"] || ids == [*b"C   "] {
+        return default_channel_roles(1);
+    }
+    if ids == [*b"SLFT", *b"SRGT"] {
+        return default_channel_roles(2);
+    }
     ids.iter()
         .map(|id| match id {
+            b"SLFT" | b"MLFT" => ChannelRole::positioned(-30, 0),
+            b"SRGT" | b"MRGT" => ChannelRole::positioned(30, 0),
+            b"C   " => ChannelRole::positioned(0, 0),
             b"LFE " => ChannelRole::Lfe,
-            b"LS  " | b"RS  " => ChannelRole::Surround,
+            b"LS  " => ChannelRole::positioned(-110, 0),
+            b"RS  " => ChannelRole::positioned(110, 0),
             _ => ChannelRole::Main,
         })
         .collect()
 }
 
-pub fn decode_stream<F>(path: &Path, consume: F) -> Result<crate::decoder::StreamInfo, String>
+fn dff_has_known_speaker_ids(ids: &[[u8; 4]]) -> bool {
+    const KNOWN: [[u8; 4]; 8] = [
+        *b"SLFT", *b"SRGT", *b"MLFT", *b"MRGT", *b"C   ", *b"LFE ", *b"LS  ", *b"RS  ",
+    ];
+    !ids.is_empty() && ids.iter().all(|id| KNOWN.contains(id))
+}
+
+/// Decode DSD in bounded chunks when the container identifies every speaker.
+///
+/// Ambiguous layouts are rejected before the consumer is called. Use
+/// [`decode_stream_with_layout`] when the caller can resolve its provenance.
+pub fn decode_stream<F>(path: &Path, mut consume: F) -> Result<crate::decoder::StreamInfo, String>
 where
     F: FnMut(&crate::decoder::StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
 {
-    let mut consume = consume;
-    decode_stream_with_declared_frames(path, |info, _, planar| consume(info, planar))
+    let (info, provenance) = probe_with_layout(path)?;
+    require_known_layout(path, provenance)?;
+    decode_stream_from_info(path, info, provenance, |info, _, _, planar| {
+        consume(info, planar)
+    })
 }
 
-pub(crate) fn decode_stream_with_declared_frames<F>(
+/// Decode DSD in bounded chunks while exposing channel-layout provenance.
+///
+/// Unlike [`decode_stream`], this API preserves ambiguous provenance so a
+/// caller with external speaker metadata can resolve it explicitly.
+pub fn decode_stream_with_layout<F>(
     path: &Path,
     mut consume: F,
 ) -> Result<crate::decoder::StreamInfo, String>
 where
-    F: FnMut(&crate::decoder::StreamInfo, Option<u64>, &mut [Vec<f32>]) -> Result<(), String>,
+    F: FnMut(
+        &crate::decoder::StreamInfo,
+        crate::decoder::ChannelLayoutProvenance,
+        &mut [Vec<f32>],
+    ) -> Result<(), String>,
 {
-    let info = probe(path)?;
+    decode_stream_with_layout_and_declared_frames(path, |info, provenance, _, planar| {
+        consume(info, provenance, planar)
+    })
+}
+
+pub(crate) fn decode_stream_with_layout_and_declared_frames<F>(
+    path: &Path,
+    consume: F,
+) -> Result<crate::decoder::StreamInfo, String>
+where
+    F: FnMut(
+        &crate::decoder::StreamInfo,
+        crate::decoder::ChannelLayoutProvenance,
+        Option<u64>,
+        &mut [Vec<f32>],
+    ) -> Result<(), String>,
+{
+    let (info, provenance) = probe_with_layout(path)?;
+    decode_stream_from_info(path, info, provenance, consume)
+}
+
+fn decode_stream_from_info<F>(
+    path: &Path,
+    info: DsdInfo,
+    layout_provenance: crate::decoder::ChannelLayoutProvenance,
+    mut consume: F,
+) -> Result<crate::decoder::StreamInfo, String>
+where
+    F: FnMut(
+        &crate::decoder::StreamInfo,
+        crate::decoder::ChannelLayoutProvenance,
+        Option<u64>,
+        &mut [Vec<f32>],
+    ) -> Result<(), String>,
+{
     let stream_info = crate::decoder::StreamInfo {
         sample_rate: info.output_sample_rate,
         channels: info.channels,
@@ -746,7 +869,7 @@ where
     let declared_frames = Some(info.output_frames);
     let mut consume_without_metadata =
         |stream_info: &crate::decoder::StreamInfo, planar: &mut [Vec<f32>]| {
-            consume(stream_info, declared_frames, planar)
+            consume(stream_info, layout_provenance, declared_frames, planar)
         };
 
     match info.layout {
@@ -759,7 +882,7 @@ where
             &stream_info,
             &mut consume_without_metadata,
         )?,
-        DsdLayout::Dsdiff => decode_dsdiff_data(
+        DsdLayout::Dsdiff { .. } => decode_dsdiff_data(
             &mut file,
             &info,
             &mut pipelines,
@@ -812,7 +935,7 @@ where
         DsdLayout::Dsf {
             block_size_per_channel,
         } => block_size_per_channel,
-        DsdLayout::Dsdiff => return Err("internal DSD layout mismatch".into()),
+        DsdLayout::Dsdiff { .. } => return Err("internal DSD layout mismatch".into()),
     };
     let block_size = block_size_per_channel as usize;
     let channels = info.channels as usize;
@@ -1679,6 +1802,145 @@ mod tests {
     }
 
     #[test]
+    fn six_channel_dsd_layouts_retain_exact_rear_bed_positions() {
+        assert_eq!(dsf_channel_roles(1, 1), default_channel_roles(1));
+        assert_eq!(dsf_channel_roles(2, 2), default_channel_roles(2));
+        assert_eq!(dff_channel_roles(&[*b"SLFT"]), default_channel_roles(1));
+        assert_eq!(
+            dff_channel_roles(&[*b"SLFT", *b"SRGT"]),
+            default_channel_roles(2)
+        );
+
+        let expected = vec![
+            ChannelRole::positioned(-30, 0),
+            ChannelRole::positioned(30, 0),
+            ChannelRole::positioned(0, 0),
+            ChannelRole::Lfe,
+            ChannelRole::positioned(-110, 0),
+            ChannelRole::positioned(110, 0),
+        ];
+        assert_eq!(dsf_channel_roles(7, 6), expected);
+        assert_eq!(
+            dff_channel_roles(&[*b"MLFT", *b"MRGT", *b"C   ", *b"LFE ", *b"LS  ", *b"RS  "]),
+            expected
+        );
+        assert_eq!(
+            expected,
+            crate::wav::reader::roles_from_wave_mask(0x003f, 6)
+        );
+        assert_ne!(
+            expected,
+            crate::wav::reader::roles_from_wave_mask(0x060f, 6),
+            "DSD rear speakers must remain distinct from a WAVE side bed"
+        );
+        assert_eq!(crate::dsp::lufs::channel_weight(expected[4]), 1.41);
+
+        let bits = vec![false, true]
+            .into_iter()
+            .cycle()
+            .take(32 * 128)
+            .collect::<Vec<_>>();
+        let channels = vec![bits; 6];
+        let directory = tempdir().unwrap();
+        let dsf_path = directory.path().join("rear-bed.dsf");
+        let dff_path = directory.path().join("rear-bed.dff");
+        fs::write(&dsf_path, make_dsf(&channels, 2_822_400)).unwrap();
+        fs::write(&dff_path, make_dsdiff(&channels, 2_822_400)).unwrap();
+        assert_eq!(probe(&dsf_path).unwrap().channel_roles, expected);
+        assert_eq!(probe(&dff_path).unwrap().channel_roles, expected);
+    }
+
+    #[test]
+    fn dsd_layout_provenance_distinguishes_standard_and_unknown_ids() {
+        use crate::decoder::ChannelLayoutProvenance::{KnownSpeakers, Unknown};
+
+        let bits = vec![false, true]
+            .into_iter()
+            .cycle()
+            .take(32 * 1024)
+            .collect::<Vec<_>>();
+        let directory = tempdir().unwrap();
+
+        let dsf_path = directory.path().join("known.dsf");
+        fs::write(&dsf_path, make_dsf(std::slice::from_ref(&bits), 2_822_400)).unwrap();
+        let mut dsf_provenance = None;
+        decode_stream_with_layout(&dsf_path, |_, provenance, _| {
+            assert!(dsf_provenance
+                .replace(provenance)
+                .is_none_or(|previous| previous == provenance));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(dsf_provenance, Some(KnownSpeakers));
+        let (_, dsf_probe_provenance) = probe_with_layout(&dsf_path).unwrap();
+        assert_eq!(dsf_probe_provenance, KnownSpeakers);
+        let (_, dsf_full_provenance) = crate::decoder::decode_with_layout(&dsf_path).unwrap();
+        assert_eq!(dsf_full_provenance, KnownSpeakers);
+
+        let dff_path = directory.path().join("unknown-id.dff");
+        let mut dff = make_dsdiff(&[bits.clone(), bits], 2_822_400);
+        let chnl = dff.windows(4).position(|window| window == b"CHNL").unwrap();
+        dff[chnl + 14..chnl + 18].copy_from_slice(b"AUX1");
+        fs::write(&dff_path, dff).unwrap();
+        let mut dff_provenance = None;
+        decode_stream_with_layout(&dff_path, |_, provenance, _| {
+            assert!(dff_provenance
+                .replace(provenance)
+                .is_none_or(|previous| previous == provenance));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(dff_provenance, Some(Unknown));
+        let (_, dff_probe_provenance) = probe_with_layout(&dff_path).unwrap();
+        assert_eq!(dff_probe_provenance, Unknown);
+        let error = probe(&dff_path).unwrap_err();
+        assert!(error.contains("ambiguous channel layout"), "{error}");
+        let (_, dff_full_provenance) = crate::decoder::decode_with_layout(&dff_path).unwrap();
+        assert_eq!(dff_full_provenance, Unknown);
+
+        let mut direct_dsd_callbacks = 0;
+        let error = decode_stream(&dff_path, |_, _| {
+            direct_dsd_callbacks += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.contains("ambiguous channel layout"), "{error}");
+        assert_eq!(direct_dsd_callbacks, 0);
+
+        for error in [
+            crate::decoder::decode(&dff_path).unwrap_err(),
+            crate::decoder::decode_limited(&dff_path, u64::MAX).unwrap_err(),
+        ] {
+            assert!(error.contains("ambiguous channel layout"), "{error}");
+        }
+        let mut legacy_callbacks = 0;
+        let error = crate::decoder::decode_stream(&dff_path, |_, _| {
+            legacy_callbacks += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.contains("ambiguous channel layout"), "{error}");
+        assert_eq!(legacy_callbacks, 0);
+    }
+
+    #[test]
+    fn dsdiff_speaker_identifier_provenance_table() {
+        let cases: &[(&[[u8; 4]], bool)] = &[
+            (&[*b"SLFT"], true),
+            (&[*b"SLFT", *b"SRGT"], true),
+            (
+                &[*b"MLFT", *b"MRGT", *b"C   ", *b"LFE ", *b"LS  ", *b"RS  "],
+                true,
+            ),
+            (&[*b"SLFT", *b"AUX1"], false),
+            (&[], false),
+        ];
+        for (ids, expected) in cases {
+            assert_eq!(dff_has_known_speaker_ids(ids), *expected, "ids={ids:?}");
+        }
+    }
+
+    #[test]
     fn dsdiff_rejects_non_raw_compression() {
         let bits = vec![false, true]
             .into_iter()
@@ -1818,7 +2080,11 @@ mod tests {
         let channel_type = match channels.len() {
             1 => 1_u32,
             2 => 2,
-            _ => panic!("test helper only supports mono/stereo"),
+            3 => 3,
+            4 => 4,
+            5 => 6,
+            6 => 7,
+            _ => panic!("test helper only supports one through six channels"),
         };
         output.extend_from_slice(&channel_type.to_le_bytes());
         output.extend_from_slice(&(channels.len() as u32).to_le_bytes());
@@ -1853,8 +2119,15 @@ mod tests {
         append_dff_chunk(&mut properties, b"FS  ", &sample_rate.to_be_bytes());
         let mut channel_body = Vec::new();
         channel_body.extend_from_slice(&(channels.len() as u16).to_be_bytes());
-        for id in [b"SLFT", b"SRGT"].iter().take(channels.len()) {
-            channel_body.extend_from_slice(*id);
+        let channel_ids: &[[u8; 4]] = match channels.len() {
+            1 => &[*b"SLFT"],
+            2 => &[*b"SLFT", *b"SRGT"],
+            5 => &[*b"MLFT", *b"MRGT", *b"C   ", *b"LS  ", *b"RS  "],
+            6 => &[*b"MLFT", *b"MRGT", *b"C   ", *b"LFE ", *b"LS  ", *b"RS  "],
+            _ => panic!("test helper does not define this DSDIFF channel layout"),
+        };
+        for id in channel_ids {
+            channel_body.extend_from_slice(id);
         }
         append_dff_chunk(&mut properties, b"CHNL", &channel_body);
         append_dff_chunk(&mut properties, b"CMPR", b"DSD \x03DSD");

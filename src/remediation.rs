@@ -168,25 +168,30 @@ pub fn evaluate(path: &Path, spec: RemediationSpec) -> Result<RemediationReport,
         ));
     }
     let source_sha256 = sha256_file_bounded(&source_path, spec.max_input_bytes)?;
-    let mut audio =
-        decoder::decode_limited(&source_path, spec.max_decoded_samples).map_err(|error| {
-            format!(
-                "decode remediation source {}: {error}",
-                source_path.display()
-            )
-        })?;
-    if let Some(layout) = spec.channel_layout.as_deref() {
-        let roles = named_channel_layout(layout)
-            .ok_or_else(|| format!("unsupported channel layout {layout}"))?;
-        if roles.len() != audio.channels as usize {
-            return Err(format!(
-                "channel layout {layout} has {} channels, decoded {}",
-                roles.len(),
-                audio.channels
-            ));
-        }
-        audio.channel_roles = roles;
-    }
+    let (mut audio, layout_provenance) =
+        decoder::decode_limited_with_layout(&source_path, spec.max_decoded_samples).map_err(
+            |error| {
+                format!(
+                    "decode remediation source {}: {error}",
+                    source_path.display()
+                )
+            },
+        )?;
+    let role_override = spec
+        .channel_layout
+        .as_deref()
+        .map(|layout| {
+            named_channel_layout(layout)
+                .ok_or_else(|| format!("unsupported channel layout {layout}"))
+        })
+        .transpose()?;
+    audio.channel_roles = normalize::resolve_decoded_channel_roles(
+        &source_path,
+        audio.channels,
+        &audio.channel_roles,
+        layout_provenance,
+        role_override.as_deref(),
+    )?;
     let analysis = normalize::analyze(&audio);
     let settings_sha256 = settings_sha256(&spec)?;
     let before = measurement(&analysis);

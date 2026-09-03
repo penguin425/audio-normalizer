@@ -60,6 +60,13 @@ channels, not bytes, and must be an integer in `1..=2**64 - 1`. The example
 allows at most one hour of 48 kHz stereo audio. Forge fails the operation if
 the decoded input exceeds the limit.
 
+File analysis also requires an authoritative physical-speaker layout. Classic
+mono/stereo WAVE and supported formats with canonical layouts work directly;
+maskless or partially masked multichannel WAVE, dual-channel MPEG audio, and
+scene-based audio raise `AnalysisError`. The Python/C ABI v1 surface has no
+layout override, so use the native Rust or CLI layout-aware workflow when
+external metadata supplies the missing speaker assignment.
+
 `path` and an optional `library` argument accept `str` or string-valued
 `os.PathLike` objects. Paths cross the C boundary as UTF-8. Byte paths and
 paths containing a NUL character are rejected.

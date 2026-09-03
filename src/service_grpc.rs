@@ -366,8 +366,17 @@ fn analyze_audio(job: AnalyzeJob) -> Result<AnalyzeResponse, Status> {
         .map_err(|_| Status::internal("could not store upload"))?;
     check_cancelled(&cancelled)?;
     let path = temporary.path().to_path_buf();
-    let decoded = decoder::decode_limited(&path, max_decoded_samples)
-        .map_err(|_| Status::invalid_argument("audio could not be decoded"))?;
+    let (mut decoded, layout_provenance) =
+        decoder::decode_limited_with_layout(&path, max_decoded_samples)
+            .map_err(|_| Status::invalid_argument("audio could not be decoded"))?;
+    decoded.channel_roles = crate::normalize::resolve_decoded_channel_roles(
+        &path,
+        decoded.channels,
+        &decoded.channel_roles,
+        layout_provenance,
+        None,
+    )
+    .map_err(|_| Status::invalid_argument("audio could not be decoded"))?;
     check_cancelled(&cancelled)?;
     let analysis = crate::analysis::analyze(&decoded);
     let mut report = profile.as_ref().map_or_else(

@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/segment-normalization-report-v2",
+  "title": "Forge segment normalization pass-two report v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "generator", "method", "plan", "settings", "layout", "segments", "published_segments", "passed"],
+  "properties": {
+    "schema": {"const": "https://penguin425.github.io/audio-normalizer/schema/segment-normalization-report-v2"},
+    "generator": {"type": "string", "pattern": "^forge-normalizer/[0-9]+\\.[0-9]+\\.[0-9]+"},
+    "method": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "classification", "algorithm_revision", "input_binding", "publication", "verification"],
+      "properties": {
+        "id": {"const": "forge-segment-normalization-v2"},
+        "classification": {"type": "string", "minLength": 1},
+        "algorithm_revision": {"const": "smoothstep-db-boundary-layout-provenance-v2"},
+        "input_binding": {"type": "string", "minLength": 1},
+        "publication": {"type": "string", "minLength": 1},
+        "verification": {"type": "string", "minLength": 1}
+      }
+    },
+    "plan": {"$ref": "#/$defs/file"},
+    "settings": {"$ref": "#/$defs/settings"},
+    "layout": {"$ref": "#/$defs/layout"},
+    "segments": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 4096,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["index", "id", "input", "output", "source", "intended_pre_codec", "decoded_output", "target_loudness_headroom_lu", "codec_loudness_deviation_lu", "duration_deviation_ms", "desired_gain_db", "maximum_safe_gain_db", "start_gain_db", "end_gain_db", "ramp_frames", "input_binding_passed", "codec_loudness_passed", "true_peak_passed", "duration_passed", "published", "passed"],
+        "properties": {
+          "index": {"type": "integer", "minimum": 0, "maximum": 4095},
+          "id": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9._-]+$"},
+          "input": {"$ref": "#/$defs/file"},
+          "output": {"$ref": "#/$defs/file"},
+          "source": {"$ref": "#/$defs/measurement"},
+          "intended_pre_codec": {"$ref": "#/$defs/measurement"},
+          "decoded_output": {"$ref": "#/$defs/measurement"},
+          "target_loudness_headroom_lu": {"type": "number"},
+          "codec_loudness_deviation_lu": {"type": "number", "minimum": 0},
+          "duration_deviation_ms": {"type": "number", "minimum": 0},
+          "desired_gain_db": {"type": "number"},
+          "maximum_safe_gain_db": {"type": "number"},
+          "start_gain_db": {"type": "number"},
+          "end_gain_db": {"type": "number"},
+          "ramp_frames": {"type": "integer", "minimum": 0},
+          "input_binding_passed": {"type": "boolean"},
+          "codec_loudness_passed": {"type": "boolean"},
+          "true_peak_passed": {"type": "boolean"},
+          "duration_passed": {"type": "boolean"},
+          "published": {"type": "boolean"},
+          "passed": {"type": "boolean"}
+        }
+      }
+    },
+    "published_segments": {"type": "integer", "minimum": 0, "maximum": 4096},
+    "passed": {"type": "boolean"}
+  },
+  "$defs": {
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sample_rate_hz", "channels", "frames", "duration_seconds", "integrated_lufs", "loudness_range_lu", "rms_dbfs", "sample_peak_dbfs", "true_peak_dbtp"],
+      "properties": {
+        "sample_rate_hz": {"type": "integer", "minimum": 8000, "maximum": 384000},
+        "channels": {"type": "integer", "minimum": 1, "maximum": 32},
+        "frames": {"type": "integer", "minimum": 1},
+        "duration_seconds": {"type": "number", "minimum": 0},
+        "integrated_lufs": {"type": ["number", "null"]},
+        "loudness_range_lu": {"type": ["number", "null"]},
+        "rms_dbfs": {"type": ["number", "null"]},
+        "sample_peak_dbfs": {"type": ["number", "null"]},
+        "true_peak_dbtp": {"type": ["number", "null"]}
+      }
+    },
+    "settings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_lufs", "ceiling_dbtp", "max_gain_db", "smoothing_ms", "verification_tolerance_lu_db", "duration_tolerance_ms", "boundary_review_threshold_db", "max_decoded_samples_per_segment", "format", "mp3_bitrate_kbps", "mp3_quality"],
+      "properties": {
+        "target_lufs": {"type": "number", "minimum": -100, "maximum": 0},
+        "ceiling_dbtp": {"type": "number", "minimum": -20, "maximum": 0},
+        "max_gain_db": {"type": ["number", "null"], "minimum": -120, "maximum": 60},
+        "smoothing_ms": {"type": "number", "minimum": 1, "maximum": 10000},
+        "verification_tolerance_lu_db": {"type": "number", "minimum": 0, "maximum": 5},
+        "duration_tolerance_ms": {"type": "number", "minimum": 0, "maximum": 10000},
+        "boundary_review_threshold_db": {"type": "number", "minimum": 0, "maximum": 60},
+        "max_decoded_samples_per_segment": {"type": "integer", "minimum": 1, "maximum": 200000000},
+        "format": {"enum": ["wav", "flac", "mp3", "opus", "m4a", "alac", "vorbis"]},
+        "mp3_bitrate_kbps": {"type": "integer", "minimum": 8, "maximum": 320},
+        "mp3_quality": {"type": "integer", "minimum": 0, "maximum": 9}
+      }
+    },
+    "layout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sample_rate_hz", "channels", "channel_roles"],
+      "properties": {
+        "sample_rate_hz": {"type": "integer", "minimum": 8000, "maximum": 384000},
+        "channels": {"type": "integer", "minimum": 1, "maximum": 32},
+        "channel_roles": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"$ref": "#/$defs/channelRole"}}
+      }
+    },
+    "channelRole": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"enum": ["main", "surround", "dual-mono", "lfe"]}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind", "azimuth_degrees", "elevation_degrees"], "properties": {"kind": {"const": "positioned"}, "azimuth_degrees": {"type": "integer", "minimum": -32768, "maximum": 32767}, "elevation_degrees": {"type": "integer", "minimum": -32768, "maximum": 32767}}}
+      ]
+    }
+  }
+}

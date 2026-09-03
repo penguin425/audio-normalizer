@@ -211,7 +211,14 @@ pub fn analyze_file(
     options: &QcOptions,
 ) -> Result<Vec<QcResult>, String> {
     options.validate()?;
-    let audio = decoder::decode(path)?;
+    let (mut audio, layout_provenance) = decoder::decode_with_layout(path)?;
+    audio.channel_roles = crate::normalize::resolve_decoded_channel_roles(
+        path,
+        audio.channels,
+        &audio.channel_roles,
+        layout_provenance,
+        Some(&analysis.channel_roles),
+    )?;
     Ok(analyze(&audio, analysis, options))
 }
 

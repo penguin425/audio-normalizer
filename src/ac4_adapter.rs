@@ -254,8 +254,17 @@ pub fn run(options: &AdapterOptions) -> Result<Ac4AdapterReport, String> {
     for presentation in response.presentations {
         let rendered = resolve_render(&render_root, &presentation.rendered_path)?;
         let (rendered_sha256, rendered_bytes) = sha256_file(&rendered)?;
-        let buffer =
-            decoder::decode_limited(&rendered, options.max_decoded_samples_per_presentation)?;
+        let (mut buffer, layout_provenance) = decoder::decode_limited_with_layout(
+            &rendered,
+            options.max_decoded_samples_per_presentation,
+        )?;
+        apply_output_layout(
+            &rendered,
+            &presentation.id,
+            &presentation.output_layout,
+            &mut buffer,
+            layout_provenance,
+        )?;
         let measured = analysis::analyze(&buffer);
         let (rendered_after, rendered_bytes_after) = sha256_file(&rendered)?;
         if rendered_after != rendered_sha256 || rendered_bytes_after != rendered_bytes {
@@ -336,6 +345,53 @@ pub fn run(options: &AdapterOptions) -> Result<Ac4AdapterReport, String> {
         passed,
         presentations: results,
     })
+}
+
+fn apply_output_layout(
+    rendered: &Path,
+    presentation_id: &str,
+    output_layout: &str,
+    buffer: &mut crate::wav::AudioBuffer,
+    layout_provenance: decoder::ChannelLayoutProvenance,
+) -> Result<(), String> {
+    let decoded_channels = usize::from(buffer.channels);
+    if buffer.data.len() != decoded_channels || buffer.channel_roles.len() != decoded_channels {
+        return Err(format!(
+            "presentation {presentation_id} render has inconsistent decoded channel metadata"
+        ));
+    }
+
+    let declared_roles = crate::wav::named_channel_layout(output_layout);
+    if let Some(roles) = declared_roles.as_deref() {
+        if roles.len() != decoded_channels {
+            return Err(format!(
+                "presentation {presentation_id} output_layout {output_layout} declares {} channels but the render decoded as {}",
+                roles.len(),
+                buffer.channels
+            ));
+        }
+        if layout_provenance == decoder::ChannelLayoutProvenance::KnownSpeakers {
+            let decoded_form = crate::wav::writer::persisted_channel_roles(roles).map_err(|error| {
+                format!(
+                    "presentation {presentation_id} output_layout {output_layout} cannot be represented as WAVE: {error}"
+                )
+            })?;
+            if buffer.channel_roles != decoded_form {
+                return Err(format!(
+                    "presentation {presentation_id} output_layout {output_layout} conflicts with the render's declared speaker layout"
+                ));
+            }
+        }
+    }
+
+    buffer.channel_roles = crate::normalize::resolve_decoded_channel_roles(
+        rendered,
+        buffer.channels,
+        &buffer.channel_roles,
+        layout_provenance,
+        declared_roles.as_deref(),
+    )?;
+    Ok(())
 }
 
 pub fn write_report(
@@ -658,6 +714,114 @@ fn read_bounded(file: &mut File, limit: usize, label: &str) -> Result<Vec<u8>, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wav::{
+        default_channel_roles, named_channel_layout, AudioBuffer, ChannelRole, PcmKind,
+    };
+
+    fn rendered_buffer(roles: Vec<ChannelRole>) -> AudioBuffer {
+        let channels = u16::try_from(roles.len()).unwrap();
+        AudioBuffer {
+            sample_rate: 48_000,
+            channels,
+            frames: 4,
+            data: vec![vec![0.0; 4]; usize::from(channels)],
+            channel_roles: roles,
+            source_kind: PcmKind::S16,
+        }
+    }
+
+    #[test]
+    fn declared_5_1_layout_resolves_a_maskless_render() {
+        let mut buffer = rendered_buffer(default_channel_roles(6));
+        apply_output_layout(
+            Path::new("render.wav"),
+            "main-en",
+            "5.1",
+            &mut buffer,
+            decoder::ChannelLayoutProvenance::Unknown,
+        )
+        .unwrap();
+        assert_eq!(buffer.channel_roles, named_channel_layout("5.1").unwrap());
+    }
+
+    #[test]
+    fn output_layout_must_match_decoded_channel_count() {
+        let mut buffer = rendered_buffer(default_channel_roles(2));
+        let error = apply_output_layout(
+            Path::new("render.wav"),
+            "main-en",
+            "5.1",
+            &mut buffer,
+            decoder::ChannelLayoutProvenance::KnownSpeakers,
+        )
+        .unwrap_err();
+        assert!(error.contains("declares 6 channels"));
+        assert!(error.contains("decoded as 2"));
+    }
+
+    #[test]
+    fn unknown_output_layout_requires_known_decoder_speakers() {
+        for provenance in [
+            decoder::ChannelLayoutProvenance::Unknown,
+            decoder::ChannelLayoutProvenance::SceneBased,
+        ] {
+            let mut buffer = rendered_buffer(default_channel_roles(6));
+            assert!(apply_output_layout(
+                Path::new("render.wav"),
+                "main-en",
+                "vendor-layout",
+                &mut buffer,
+                provenance,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn stereo_layout_accepts_matching_known_decoder_speakers() {
+        let mut buffer = rendered_buffer(default_channel_roles(2));
+        apply_output_layout(
+            Path::new("render.wav"),
+            "main-en",
+            "stereo",
+            &mut buffer,
+            decoder::ChannelLayoutProvenance::KnownSpeakers,
+        )
+        .unwrap();
+        assert_eq!(buffer.channel_roles, default_channel_roles(2));
+    }
+
+    #[test]
+    fn known_decoder_speakers_must_match_declared_layout() {
+        let mut roles = default_channel_roles(6);
+        roles[3] = ChannelRole::Main;
+        let mut buffer = rendered_buffer(roles);
+        let error = apply_output_layout(
+            Path::new("render.wav"),
+            "main-en",
+            "5.1",
+            &mut buffer,
+            decoder::ChannelLayoutProvenance::KnownSpeakers,
+        )
+        .unwrap_err();
+        assert!(error.contains("conflicts with the render's declared speaker layout"));
+    }
+
+    #[test]
+    fn immersive_wave_positions_match_the_named_layout() {
+        let declared = named_channel_layout("5.1.4").unwrap();
+        let decoded = crate::wav::writer::persisted_channel_roles(&declared).unwrap();
+        let mut buffer = rendered_buffer(decoded);
+        apply_output_layout(
+            Path::new("render.wav"),
+            "main-en",
+            "5.1.4",
+            &mut buffer,
+            decoder::ChannelLayoutProvenance::KnownSpeakers,
+        )
+        .unwrap();
+        assert_eq!(buffer.channel_roles, declared);
+    }
 
     fn response() -> AdapterResponse {
         AdapterResponse {

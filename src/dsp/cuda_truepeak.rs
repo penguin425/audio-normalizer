@@ -7,7 +7,7 @@
 //! process-wide lease bounds device memory and stream concurrency. Any setup or
 //! runtime error hands the retained history and peak back to CPU meters.
 
-use super::truepeak::{oversample_factor, phase_table, TruePeakMeter, MAX_PHASES};
+use super::truepeak::{oversample_factor, phase_table, TruePeakMeter};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice, PushKernelArg,
 };
@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 const HISTORY: usize = 15;
+const CUDA_PHASES: usize = 4;
 const CUDA_THREADS: u32 = 256;
 const MIN_CUDA_FRAMES: usize = 16_384;
 const PTX: &str = include_str!("cuda/truepeak.ptx");
@@ -101,6 +102,7 @@ pub(crate) struct CudaTruePeakWorker {
     sample_rate: u32,
     channels: usize,
     factor: usize,
+    finite_signal: bool,
     stream: Arc<CudaStream>,
     function: CudaFunction,
     samples: CudaSlice<f32>,
@@ -123,10 +125,33 @@ impl CudaTruePeakWorker {
             && channels <= u32::MAX as usize
     }
 
+    #[allow(
+        dead_code,
+        reason = "retained for streaming CUDA callers and exercised by exact backend tests"
+    )]
     pub(crate) fn new(
         sample_rate: u32,
         channels: usize,
         initial_frames: usize,
+    ) -> Result<Self, String> {
+        Self::new_with_padding(sample_rate, channels, initial_frames, false)
+    }
+
+    /// Construct a worker for finite-file analysis. Unlike the streaming
+    /// compatibility constructor, samples before the first frame are zero.
+    pub(crate) fn new_finite(
+        sample_rate: u32,
+        channels: usize,
+        initial_frames: usize,
+    ) -> Result<Self, String> {
+        Self::new_with_padding(sample_rate, channels, initial_frames, true)
+    }
+
+    fn new_with_padding(
+        sample_rate: u32,
+        channels: usize,
+        initial_frames: usize,
+        finite_signal: bool,
     ) -> Result<Self, String> {
         if !Self::eligible(sample_rate, channels, initial_frames) {
             return Err("audio chunk is not eligible for CUDA true-peak processing".into());
@@ -139,10 +164,12 @@ impl CudaTruePeakWorker {
             .map_err(|error| format!("create CUDA true-peak stream: {error}"))?;
         let factor = oversample_factor(sample_rate);
         let table = phase_table(factor);
-        let mut flattened = [0.0f64; 16 * MAX_PHASES];
+        // The checked-in CUDA kernel remains the tuned 2x/4x path. Wider
+        // integral factors use the safe CPU scalar implementation.
+        let mut flattened = [0.0f64; 16 * CUDA_PHASES];
         for tap in 0..16 {
-            for phase in 0..MAX_PHASES {
-                flattened[tap * MAX_PHASES + phase] = table[tap][phase];
+            for phase in 0..CUDA_PHASES {
+                flattened[tap * CUDA_PHASES + phase] = table[tap][phase];
             }
         }
         let coefficients = stream
@@ -165,6 +192,7 @@ impl CudaTruePeakWorker {
             sample_rate,
             channels,
             factor,
+            finite_signal,
             stream,
             function: shared.function.clone(),
             samples,
@@ -252,6 +280,10 @@ impl CudaTruePeakWorker {
         Ok(())
     }
 
+    #[allow(
+        dead_code,
+        reason = "streaming observation remains useful and is exercised by backend tests"
+    )]
     pub(crate) fn peak(&self) -> f32 {
         self.peaks.iter().copied().fold(0.0, f32::max)
     }
@@ -265,9 +297,22 @@ impl CudaTruePeakWorker {
             .iter()
             .zip(self.peaks.iter().copied())
             .map(|(recent, peak)| {
-                TruePeakMeter::from_recent_samples(self.sample_rate, recent, peak)
+                if self.finite_signal {
+                    TruePeakMeter::from_recent_finite_samples(self.sample_rate, recent, peak)
+                } else {
+                    TruePeakMeter::from_recent_samples(self.sample_rate, recent, peak)
+                }
             })
             .collect()
+    }
+
+    /// Hand the retained finite prefix to CPU meters and include the complete
+    /// 15-sample FIR tail without launching a tiny CUDA kernel.
+    pub(crate) fn finish_peak(self) -> f32 {
+        self.into_cpu_meters()
+            .into_iter()
+            .map(TruePeakMeter::finish_peak)
+            .fold(0.0, f32::max)
     }
 
     fn ensure_capacity(&mut self, frames: usize) -> Result<(), String> {
@@ -291,13 +336,22 @@ impl CudaTruePeakWorker {
     fn prepare_prefix(&mut self, planar: &[Vec<f32>]) {
         for ((destination, recent), channel) in self.prefix.iter_mut().zip(&self.recent).zip(planar)
         {
-            if recent.is_empty() {
-                destination.fill(channel[0]);
-            } else {
-                destination.fill(recent[0]);
-                destination[HISTORY - recent.len()..].copy_from_slice(recent);
-            }
+            prepare_channel_prefix(destination, recent, channel[0], self.finite_signal);
         }
+    }
+}
+
+fn prepare_channel_prefix(
+    destination: &mut [f32; HISTORY],
+    recent: &[f32],
+    first_sample: f32,
+    finite_signal: bool,
+) {
+    if recent.is_empty() {
+        destination.fill(if finite_signal { 0.0 } else { first_sample });
+    } else {
+        destination.fill(if finite_signal { 0.0 } else { recent[0] });
+        destination[HISTORY - recent.len()..].copy_from_slice(recent);
     }
 }
 
@@ -368,6 +422,20 @@ mod tests {
             recent,
             (27..42).map(|value| value as f32).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn finite_prefix_uses_zero_padding_without_changing_streaming_padding() {
+        let mut prefix = [f32::NAN; HISTORY];
+        prepare_channel_prefix(&mut prefix, &[], 0.75, true);
+        assert_eq!(prefix, [0.0; HISTORY]);
+
+        prepare_channel_prefix(&mut prefix, &[], 0.75, false);
+        assert_eq!(prefix, [0.75; HISTORY]);
+
+        prepare_channel_prefix(&mut prefix, &[0.25, -0.5], 0.75, true);
+        assert_eq!(&prefix[..HISTORY - 2], &[0.0; HISTORY - 2]);
+        assert_eq!(&prefix[HISTORY - 2..], &[0.25, -0.5]);
     }
 
     #[test]
@@ -456,6 +524,29 @@ mod tests {
         factor_two_worker.finish_chunk(&factor_two).unwrap();
         assert!(factor_two_worker.peak().is_infinite());
         assert!(!CudaTruePeakWorker::eligible(192_000, 2, frames));
+        drop(factor_two_worker);
+
+        // A finite worker uses a zero prefix and hands the 15-sample suffix to
+        // the CPU so the post-programme FIR response is included exactly.
+        let finite_frames = 16_401;
+        let mut finite = vec![vec![0.0_f32; finite_frames]; 2];
+        finite[0][finite_frames - 2] = -1.0;
+        finite[0][finite_frames - 1] = -1.0;
+        finite[1][0] = 0.83;
+        finite[1][1] = -0.71;
+        let expected = finite
+            .iter()
+            .map(|channel| {
+                let mut meter = TruePeakMeter::for_finite_sample_rate(48_000);
+                meter.process(channel);
+                meter.finish_peak()
+            })
+            .fold(0.0, f32::max);
+        let mut finite_worker = CudaTruePeakWorker::new_finite(48_000, 2, finite_frames).unwrap();
+        finite_worker.begin_chunk(&finite).unwrap();
+        finite_worker.finish_chunk(&finite).unwrap();
+        let actual = finite_worker.finish_peak();
+        assert_eq!(actual.to_bits(), expected.to_bits());
     }
 
     fn fixture_sample(channel: usize, frame: usize) -> f32 {
