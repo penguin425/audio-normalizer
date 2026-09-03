@@ -557,6 +557,13 @@ changes:
    watch workflows through the same stable source, including metadata copy,
    then verify the live source again immediately before commit.
 
+These slices are additive. Existing public `AudioBuffer`, `StreamInfo`,
+`Analysis`, `Plan`, `ChannelRole`, and `ChannelLayoutProvenance` shapes remain
+unchanged; new binding, descriptor, and exact-layout types use private fields
+and validated constructors. C ABI v1 remains loadable, while serialized
+bindings use new cache/report schemas and separate REST/gRPC versions instead
+of changing closed v1/v2 contracts in place.
+
 The acceptance corpus will replace a source with same-length bytes both by
 rename and in-place hard-link mutation, retarget symlinks, alias any album
 input and output, change only the second album track, and inject non-finite
