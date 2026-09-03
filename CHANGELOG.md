@@ -25,9 +25,11 @@ tags and keeps public compatibility commitments in
 ### Changed
 
 - Derive all 100 ms loudness-grid boundaries from exact rational indices and
-  use fixed-order compensated sums across window, channel, gate, RMS, album,
-  dialogue, and real-time energy reductions. The measurement revision is now
-  `forge-bs1770-5-r4`.
+  use fixed-order numerically stable sums across window, channel, gate, RMS,
+  album, dialogue, and real-time energy reductions. The common `f32` path uses
+  chunk-independent partials with compensated aggregation and periodic
+  rolling-window rebasing; the reference path remains strictly compensated
+  per value. The measurement revision is now `forge-bs1770-5-r4`.
 
 ## 0.189.4 - 2026-09-03
 

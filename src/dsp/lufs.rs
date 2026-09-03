@@ -11,8 +11,9 @@
 //!   * K-weighting runs once per channel in parallel (rayon).
 //!   * A shared rolling-window pass derives overlapping blocks without
 //!     cancellation-prone lifetime prefix subtraction.
-//!   * Energy reductions use fixed-order compensated sums; the separate fast
-//!     RMS path retains its established SIMD primitive.
+//!   * The reference engine uses strict per-value compensated sums. The common
+//!     `f32` path uses fixed-size ordered partials, compensated aggregation,
+//!     and periodic compensated rolling-window rebasing.
 
 #[cfg(all(
     feature = "cuda-truepeak",
@@ -26,7 +27,7 @@ use crate::dsp::kwfilter::KWeightPair;
 use crate::dsp::kwfilter::KWeightQuad;
 use crate::dsp::pcm::{self, PlanarChunkMessages};
 use crate::dsp::simd;
-use crate::dsp::sum::CompensatedSum;
+use crate::dsp::sum::{BlockCompensatedSum, CompensatedSum};
 use crate::dsp::truepeak::{oversample_factor, TruePeakMeter, TAPS_PER_PHASE};
 use crate::wav::{AudioBuffer, ChannelRole};
 use rayon::prelude::*;
@@ -45,6 +46,10 @@ pub const MAX_LOUDNESS_TIMELINE_POINTS: usize = 1_000_000;
 /// coordination costs more than the true-peak interpolation work.
 const MIN_PARALLEL_TRUE_PEAK_FRAMES: usize = 16_384;
 const LOUDNESS_CLOCK_TICKS_PER_SECOND: u128 = 10;
+// Rebuild common-path rolling sums at an absolute, chunk-independent cadence.
+// The bounded drift between rebases is far below meter tolerance, while one
+// rebase per ~22 seconds at 48 kHz keeps the amortized work negligible.
+const FAST_WINDOW_REBASE_FRAMES: usize = 1 << 20;
 // `10^((-70 + 0.691) / 10)` committed as IEEE-754 bits so the gate does not
 // depend on the platform `pow` implementation.
 const ABSOLUTE_GATE_MEAN_SQUARE: f64 = f64::from_bits(0x3e7f_791e_c6e1_d5b7);
@@ -388,6 +393,7 @@ struct LoudnessWindows {
     cursor: usize,
     momentary_limit: usize,
     short_term_limit: usize,
+    fast_updates: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -406,6 +412,7 @@ impl LoudnessWindows {
             cursor: 0,
             momentary_limit,
             short_term_limit,
+            fast_updates: 0,
         }
     }
 
@@ -448,6 +455,81 @@ impl LoudnessWindows {
         }
     }
 
+    /// Ordered common-path update with periodic compensated rebasing.
+    #[inline(always)]
+    fn push_fast(
+        &mut self,
+        momentary_sum: &mut CompensatedSum,
+        short_term_sum: &mut CompensatedSum,
+        value: f64,
+    ) {
+        let len = self.values.len();
+        if len < self.short_term_limit {
+            let momentary_expired =
+                (len >= self.momentary_limit).then(|| self.values[len - self.momentary_limit]);
+            self.values.push(value);
+            momentary_sum.add_ordered(value);
+            if let Some(expired) = momentary_expired {
+                momentary_sum.subtract_ordered(expired);
+            }
+            short_term_sum.add_ordered(value);
+        } else {
+            let short_term_expired = self.values[self.cursor];
+            let momentary_offset = self.short_term_limit - self.momentary_limit;
+            let momentary_cursor = if self.cursor + momentary_offset >= self.short_term_limit {
+                self.cursor + momentary_offset - self.short_term_limit
+            } else {
+                self.cursor + momentary_offset
+            };
+            let momentary_expired = self.values[momentary_cursor];
+            self.values[self.cursor] = value;
+            momentary_sum.add_ordered(value);
+            momentary_sum.subtract_ordered(momentary_expired);
+            short_term_sum.add_ordered(value);
+            short_term_sum.subtract_ordered(short_term_expired);
+            self.cursor += 1;
+            if self.cursor == self.short_term_limit {
+                self.cursor = 0;
+            }
+        }
+
+        self.fast_updates = self.fast_updates.wrapping_add(1);
+        if self.fast_updates & (FAST_WINDOW_REBASE_FRAMES - 1) == 0 {
+            self.rebase_fast_sums(momentary_sum, short_term_sum);
+        }
+    }
+
+    #[cold]
+    fn rebase_fast_sums(
+        &self,
+        momentary_sum: &mut CompensatedSum,
+        short_term_sum: &mut CompensatedSum,
+    ) {
+        let len = self.values.len();
+        let momentary_start = len.saturating_sub(self.momentary_limit);
+        let mut momentary = CompensatedSum::new();
+        let mut short_term = CompensatedSum::new();
+        for logical_index in 0..len {
+            let physical_index = if len == self.short_term_limit {
+                let index = self.cursor + logical_index;
+                if index >= len {
+                    index - len
+                } else {
+                    index
+                }
+            } else {
+                logical_index
+            };
+            let value = self.values[physical_index];
+            short_term.add(value);
+            if logical_index >= momentary_start {
+                momentary.add(value);
+            }
+        }
+        momentary_sum.reset_ordered(momentary.total());
+        short_term_sum.reset_ordered(short_term.total());
+    }
+
     fn momentary_len(&self) -> usize {
         self.values.len().min(self.momentary_limit)
     }
@@ -483,8 +565,8 @@ pub struct StreamingAnalyzer {
     max_momentary_sum: f64,
     max_short_term_sum: f64,
     frames: usize,
-    raw_sum_squares: CompensatedSum,
-    weighted_sum_squares: CompensatedSum,
+    raw_sum_squares: BlockCompensatedSum,
+    weighted_sum_squares: BlockCompensatedSum,
     sample_peak: f32,
     timeline_interval_frames: Option<usize>,
     timeline: Vec<LoudnessTimelinePoint>,
@@ -573,8 +655,8 @@ impl StreamingAnalyzer {
             max_momentary_sum: 0.0,
             max_short_term_sum: 0.0,
             frames: 0,
-            raw_sum_squares: CompensatedSum::new(),
-            weighted_sum_squares: CompensatedSum::new(),
+            raw_sum_squares: BlockCompensatedSum::new(),
+            weighted_sum_squares: BlockCompensatedSum::new(),
             sample_peak: 0.0,
             timeline_interval_frames: interval_frames,
             timeline: Vec::new(),
@@ -718,24 +800,23 @@ impl StreamingAnalyzer {
                 let filtered0 = filter0.process(sample0) as f64;
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let filtered1 = filter1.process(sample1) as f64;
-                let mut weighted = CompensatedSum::new();
-                weighted.add(weight0 * filtered0 * filtered0);
-                weighted.add(weight1 * filtered1 * filtered1);
-                let weighted = weighted.total();
+                let weighted = weight0 * filtered0 * filtered0 + weight1 * filtered1 * filtered1;
                 let raw0 = sample0 as f64;
-                self.raw_sum_squares.add(raw0 * raw0);
                 let raw1 = sample1 as f64;
-                self.raw_sum_squares.add(raw1 * raw1);
-                self.weighted_sum_squares.add(weighted);
+                self.raw_sum_squares.add_ordered(raw0 * raw0 + raw1 * raw1);
+                self.weighted_sum_squares.add_ordered(weighted);
                 self.windows
-                    .push(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
+                    .push_fast(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
                 self.frames += 1;
                 if self.windows.momentary_len() == momentary_window {
-                    self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum.total());
+                    self.max_momentary_sum = self
+                        .max_momentary_sum
+                        .max(self.momentary_sum.ordered_total());
                 }
                 if self.windows.short_term_len() == short_term_window {
-                    self.max_short_term_sum =
-                        self.max_short_term_sum.max(self.short_term_sum.total());
+                    self.max_short_term_sum = self
+                        .max_short_term_sum
+                        .max(self.short_term_sum.ordered_total());
                 }
                 if self.frames == self.momentary_clock.next_block_frame() {
                     if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
@@ -744,14 +825,14 @@ impl StreamingAnalyzer {
                         ));
                     }
                     self.gating_blocks
-                        .push(self.momentary_sum.total() / momentary_window as f64);
+                        .push(self.momentary_sum.ordered_total() / momentary_window as f64);
                     self.momentary_clock.advance()?;
                 }
                 if self.frames == self.short_term_clock.next_block_frame() {
                     record_program_short_term_block(
                         &mut self.short_term_blocks,
                         &mut self.short_term_clock,
-                        self.short_term_sum.total(),
+                        self.short_term_sum.ordered_total(),
                     )?;
                 }
             }
@@ -789,16 +870,19 @@ impl StreamingAnalyzer {
                     &mut self.raw_sum_squares,
                     &mut self.sample_peak,
                 );
-                self.weighted_sum_squares.add(weighted);
+                self.weighted_sum_squares.add_ordered(weighted);
                 self.windows
-                    .push(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
+                    .push_fast(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
                 self.frames += 1;
                 if self.windows.momentary_len() == momentary_window {
-                    self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum.total());
+                    self.max_momentary_sum = self
+                        .max_momentary_sum
+                        .max(self.momentary_sum.ordered_total());
                 }
                 if self.windows.short_term_len() == short_term_window {
-                    self.max_short_term_sum =
-                        self.max_short_term_sum.max(self.short_term_sum.total());
+                    self.max_short_term_sum = self
+                        .max_short_term_sum
+                        .max(self.short_term_sum.ordered_total());
                 }
                 if self.frames == self.momentary_clock.next_block_frame() {
                     if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
@@ -807,14 +891,14 @@ impl StreamingAnalyzer {
                         ));
                     }
                     self.gating_blocks
-                        .push(self.momentary_sum.total() / momentary_window as f64);
+                        .push(self.momentary_sum.ordered_total() / momentary_window as f64);
                     self.momentary_clock.advance()?;
                 }
                 if self.frames == self.short_term_clock.next_block_frame() {
                     record_program_short_term_block(
                         &mut self.short_term_blocks,
                         &mut self.short_term_clock,
-                        self.short_term_sum.total(),
+                        self.short_term_sum.ordered_total(),
                     )?;
                 }
             }
@@ -831,19 +915,23 @@ impl StreamingAnalyzer {
                 let filtered = filter.process(sample) as f64;
                 weighted.add(channel_weight(self.roles[index]) * filtered * filtered);
                 let raw = sample as f64;
-                self.raw_sum_squares.add(raw * raw);
+                self.raw_sum_squares.add_ordered(raw * raw);
                 self.sample_peak = self.sample_peak.max(sample.abs());
             }
             let weighted = weighted.total();
-            self.weighted_sum_squares.add(weighted);
+            self.weighted_sum_squares.add_ordered(weighted);
             self.windows
-                .push(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
+                .push_fast(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
             self.frames += 1;
             if self.windows.momentary_len() == momentary_window {
-                self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum.total());
+                self.max_momentary_sum = self
+                    .max_momentary_sum
+                    .max(self.momentary_sum.ordered_total());
             }
             if self.windows.short_term_len() == short_term_window {
-                self.max_short_term_sum = self.max_short_term_sum.max(self.short_term_sum.total());
+                self.max_short_term_sum = self
+                    .max_short_term_sum
+                    .max(self.short_term_sum.ordered_total());
             }
             if self.frames == self.momentary_clock.next_block_frame() {
                 if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
@@ -852,14 +940,14 @@ impl StreamingAnalyzer {
                     ));
                 }
                 self.gating_blocks
-                    .push(self.momentary_sum.total() / momentary_window as f64);
+                    .push(self.momentary_sum.ordered_total() / momentary_window as f64);
                 self.momentary_clock.advance()?;
             }
             if self.frames == self.short_term_clock.next_block_frame() {
                 record_program_short_term_block(
                     &mut self.short_term_blocks,
                     &mut self.short_term_clock,
-                    self.short_term_sum.total(),
+                    self.short_term_sum.ordered_total(),
                 )?;
             }
             if self
@@ -976,10 +1064,10 @@ impl StreamingAnalyzer {
                 self.sample_peak = self.sample_peak.max(sample_f32.abs());
                 let filtered = filter.process_f64(sample);
                 weighted.add(channel_weight(role) * filtered * filtered);
-                self.raw_sum_squares.add(sample * sample);
+                self.raw_sum_squares.add_exact(sample * sample);
             }
             let weighted = weighted.total();
-            self.weighted_sum_squares.add(weighted);
+            self.weighted_sum_squares.add_exact(weighted);
             self.windows
                 .push(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
             self.frames += 1;
@@ -1152,26 +1240,25 @@ impl StreamingAnalyzer {
                 let filtered0 = filter0.process(sample0) as f64;
                 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 let filtered1 = filter1.process(sample1) as f64;
-                let mut weighted = CompensatedSum::new();
-                weighted.add(weight0 * filtered0 * filtered0);
-                weighted.add(weight1 * filtered1 * filtered1);
-                let weighted = weighted.total();
+                let weighted = weight0 * filtered0 * filtered0 + weight1 * filtered1 * filtered1;
                 let raw0 = sample0 as f64;
-                self.raw_sum_squares.add(raw0 * raw0);
-                self.sample_peak = self.sample_peak.max(sample0.abs());
                 let raw1 = sample1 as f64;
-                self.raw_sum_squares.add(raw1 * raw1);
+                self.raw_sum_squares.add_ordered(raw0 * raw0 + raw1 * raw1);
+                self.sample_peak = self.sample_peak.max(sample0.abs());
                 self.sample_peak = self.sample_peak.max(sample1.abs());
-                self.weighted_sum_squares.add(weighted);
+                self.weighted_sum_squares.add_ordered(weighted);
                 self.windows
-                    .push(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
+                    .push_fast(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
                 self.frames += 1;
                 if self.windows.momentary_len() == momentary_window {
-                    self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum.total());
+                    self.max_momentary_sum = self
+                        .max_momentary_sum
+                        .max(self.momentary_sum.ordered_total());
                 }
                 if self.windows.short_term_len() == short_term_window {
-                    self.max_short_term_sum =
-                        self.max_short_term_sum.max(self.short_term_sum.total());
+                    self.max_short_term_sum = self
+                        .max_short_term_sum
+                        .max(self.short_term_sum.ordered_total());
                 }
                 if self.frames == self.momentary_clock.next_block_frame() {
                     if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
@@ -1180,14 +1267,14 @@ impl StreamingAnalyzer {
                         ));
                     }
                     self.gating_blocks
-                        .push(self.momentary_sum.total() / momentary_window as f64);
+                        .push(self.momentary_sum.ordered_total() / momentary_window as f64);
                     self.momentary_clock.advance()?;
                 }
                 if self.frames == self.short_term_clock.next_block_frame() {
                     record_program_short_term_block(
                         &mut self.short_term_blocks,
                         &mut self.short_term_clock,
-                        self.short_term_sum.total(),
+                        self.short_term_sum.ordered_total(),
                     )?;
                 }
             }
@@ -1217,15 +1304,19 @@ impl StreamingAnalyzer {
         momentary_window: usize,
         short_term_window: usize,
     ) -> Result<(), String> {
-        self.weighted_sum_squares.add(weighted);
+        self.weighted_sum_squares.add_ordered(weighted);
         self.windows
-            .push(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
+            .push_fast(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
         self.frames += 1;
         if self.windows.momentary_len() == momentary_window {
-            self.max_momentary_sum = self.max_momentary_sum.max(self.momentary_sum.total());
+            self.max_momentary_sum = self
+                .max_momentary_sum
+                .max(self.momentary_sum.ordered_total());
         }
         if self.windows.short_term_len() == short_term_window {
-            self.max_short_term_sum = self.max_short_term_sum.max(self.short_term_sum.total());
+            self.max_short_term_sum = self
+                .max_short_term_sum
+                .max(self.short_term_sum.ordered_total());
         }
         if self.frames == self.momentary_clock.next_block_frame() {
             if self.gating_blocks.len() == MAX_LOUDNESS_BLOCKS {
@@ -1234,14 +1325,14 @@ impl StreamingAnalyzer {
                 ));
             }
             self.gating_blocks
-                .push(self.momentary_sum.total() / momentary_window as f64);
+                .push(self.momentary_sum.ordered_total() / momentary_window as f64);
             self.momentary_clock.advance()?;
         }
         if self.frames == self.short_term_clock.next_block_frame() {
             record_program_short_term_block(
                 &mut self.short_term_blocks,
                 &mut self.short_term_clock,
-                self.short_term_sum.total(),
+                self.short_term_sum.ordered_total(),
             )?;
         }
         Ok(())
@@ -1599,7 +1690,7 @@ fn process_kweighted_frame_multichannel(
     roles: &[ChannelRole],
     planar: &[Vec<f32>],
     frame: usize,
-    raw_sum_squares: &mut CompensatedSum,
+    raw_sum_squares: &mut BlockCompensatedSum,
     sample_peak: &mut f32,
 ) -> f64 {
     debug_assert_eq!(filters.len(), roles.len());
@@ -1620,7 +1711,7 @@ fn process_kweighted_frame_multichannel(
                 let lane_filtered = filtered[lane] as f64;
                 weighted.add(channel_weight(roles[channel + lane]) * lane_filtered * lane_filtered);
                 let raw = input[lane] as f64;
-                raw_sum_squares.add(raw * raw);
+                raw_sum_squares.add_ordered(raw * raw);
                 *sample_peak = sample_peak.max(input[lane].abs());
             }
             channel += 4;
@@ -1630,7 +1721,7 @@ fn process_kweighted_frame_multichannel(
             let filtered = filters[index].process(sample) as f64;
             weighted.add(channel_weight(roles[index]) * filtered * filtered);
             let raw = sample as f64;
-            raw_sum_squares.add(raw * raw);
+            raw_sum_squares.add_ordered(raw * raw);
             *sample_peak = sample_peak.max(sample.abs());
         }
         return weighted.total();
@@ -1640,7 +1731,7 @@ fn process_kweighted_frame_multichannel(
         let filtered = filter.process(sample) as f64;
         weighted.add(channel_weight(roles[index]) * filtered * filtered);
         let raw = sample as f64;
-        raw_sum_squares.add(raw * raw);
+        raw_sum_squares.add_ordered(raw * raw);
         *sample_peak = sample_peak.max(sample.abs());
     }
     weighted.total()
@@ -2238,6 +2329,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fast_loudness_windows_rebase_to_compensated_chronological_sums() {
+        let momentary_limit = 31;
+        let short_term_limit = 127;
+        let mut candidate = LoudnessWindows::new(momentary_limit, short_term_limit);
+        let mut candidate_momentary_sum = CompensatedSum::new();
+        let mut candidate_short_term_sum = CompensatedSum::new();
+        let mut reference = VecDeque::new();
+        let value_at =
+            |index: usize| ((index.wrapping_mul(97).wrapping_add(31) % 1_009) + 1) as f64 / 1_009.0;
+
+        for index in 0..4_097 {
+            let value = value_at(index);
+            candidate.push_fast(
+                &mut candidate_momentary_sum,
+                &mut candidate_short_term_sum,
+                value,
+            );
+            reference.push_back(value);
+            if reference.len() > short_term_limit {
+                reference.pop_front();
+            }
+        }
+
+        // Exercise the absolute-cadence branch without making the unit test
+        // process one million otherwise redundant frames.
+        candidate.fast_updates = FAST_WINDOW_REBASE_FRAMES - 1;
+        let value = value_at(4_097);
+        candidate.push_fast(
+            &mut candidate_momentary_sum,
+            &mut candidate_short_term_sum,
+            value,
+        );
+        reference.push_back(value);
+        reference.pop_front();
+
+        let expected_short = reference
+            .iter()
+            .copied()
+            .collect::<CompensatedSum>()
+            .total();
+        let expected_momentary = reference
+            .iter()
+            .skip(short_term_limit - momentary_limit)
+            .copied()
+            .collect::<CompensatedSum>()
+            .total();
+        assert_eq!(candidate.fast_updates, FAST_WINDOW_REBASE_FRAMES);
+        assert_eq!(
+            candidate_short_term_sum.ordered_total().to_bits(),
+            expected_short.to_bits()
+        );
+        assert_eq!(
+            candidate_momentary_sum.ordered_total().to_bits(),
+            expected_momentary.to_bits()
+        );
+
+        for index in 4_098..14_098 {
+            let value = value_at(index);
+            candidate.push_fast(
+                &mut candidate_momentary_sum,
+                &mut candidate_short_term_sum,
+                value,
+            );
+            reference.push_back(value);
+            reference.pop_front();
+        }
+        let expected_short = reference
+            .iter()
+            .copied()
+            .collect::<CompensatedSum>()
+            .total();
+        let expected_momentary = reference
+            .iter()
+            .skip(short_term_limit - momentary_limit)
+            .copied()
+            .collect::<CompensatedSum>()
+            .total();
+        assert!((candidate_short_term_sum.ordered_total() - expected_short).abs() < 1.0e-11);
+        assert!((candidate_momentary_sum.ordered_total() - expected_momentary).abs() < 1.0e-11);
     }
 
     #[test]
@@ -2883,6 +3056,63 @@ mod tests {
         assert_eq!(whole.rms_db.to_bits(), 0xc02a_b5d2_f9d1_568f);
         assert_eq!(whole.sample_peak.to_bits(), 0x3eff_ffc0);
         assert_eq!(whole.true_peak.to_bits(), 0x3f4e_f7d8);
+    }
+
+    #[test]
+    fn fast_analysis_is_chunk_invariant_across_partial_and_rebase_boundaries() {
+        let frames = FAST_WINDOW_REBASE_FRAMES + 137;
+        let left = (0..frames)
+            .map(|frame| {
+                (((frame as f64 * 0.071).sin() * 0.31) + ((frame as f64 * 0.000_31).cos() * 0.07))
+                    as f32
+            })
+            .collect::<Vec<_>>();
+        let right = (0..frames)
+            .map(|frame| {
+                (((frame as f64 * 0.113).cos() * 0.23) - ((frame as f64 * 0.000_47).sin() * 0.05))
+                    as f32
+            })
+            .collect::<Vec<_>>();
+        let roles = vec![ChannelRole::Main, ChannelRole::Surround];
+
+        let mut whole = StreamingAnalyzer::new(48_000, roles.clone());
+        whole.process(&[left.clone(), right.clone()]).unwrap();
+        let whole = whole.finish();
+
+        let mut chunked = StreamingAnalyzer::new(48_000, roles);
+        for start in (0..frames).step_by(1_009) {
+            let end = (start + 1_009).min(frames);
+            chunked
+                .process(&[left[start..end].to_vec(), right[start..end].to_vec()])
+                .unwrap();
+        }
+        let chunked = chunked.finish();
+
+        assert_eq!(whole.frames, chunked.frames);
+        assert_eq!(
+            whole.ebu.integrated_lufs.to_bits(),
+            chunked.ebu.integrated_lufs.to_bits()
+        );
+        assert_eq!(
+            whole.ebu.max_momentary_lufs.to_bits(),
+            chunked.ebu.max_momentary_lufs.to_bits()
+        );
+        assert_eq!(
+            whole.ebu.max_short_term_lufs.to_bits(),
+            chunked.ebu.max_short_term_lufs.to_bits()
+        );
+        assert_eq!(
+            whole.ebu.loudness_range_lu.to_bits(),
+            chunked.ebu.loudness_range_lu.to_bits()
+        );
+        assert_eq!(whole.ebu.gating_blocks, chunked.ebu.gating_blocks);
+        assert_eq!(
+            whole.weighted_mean_square.to_bits(),
+            chunked.weighted_mean_square.to_bits()
+        );
+        assert_eq!(whole.rms_db.to_bits(), chunked.rms_db.to_bits());
+        assert_eq!(whole.sample_peak.to_bits(), chunked.sample_peak.to_bits());
+        assert_eq!(whole.true_peak.to_bits(), chunked.true_peak.to_bits());
     }
 
     #[test]

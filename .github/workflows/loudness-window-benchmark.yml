@@ -53,6 +53,14 @@ jobs:
             -- --nocapture
           cargo test --locked --manifest-path candidate/Cargo.toml \
             --no-default-features --lib \
+            fast_loudness_windows_rebase_to_compensated_chronological_sums \
+            -- --nocapture
+          cargo test --locked --manifest-path candidate/Cargo.toml \
+            --no-default-features --lib \
+            fast_analysis_is_chunk_invariant_across_partial_and_rebase_boundaries \
+            -- --nocapture
+          cargo test --locked --manifest-path candidate/Cargo.toml \
+            --no-default-features --lib \
             incomplete_trailing_hop_does_not_create_a_block \
             -- --nocapture
           cargo test --locked --manifest-path candidate/Cargo.toml \
