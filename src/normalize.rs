@@ -21,7 +21,10 @@ use crate::metadata;
 #[cfg(feature = "mp3-encoding")]
 use crate::mp3enc;
 use crate::pcm_spool::PcmSpool;
-use crate::wav::{AudioBuffer, ChannelRole, PcmKind, WavContainer, WavStreamWriter, WavWriter};
+use crate::wav::{
+    AudioBuffer, ChannelRole, PcmKind, WavContainer, WavStreamWriter, WavWriter,
+    MAX_DECODE_SAMPLE_RATE_HZ, MIN_DECODE_SAMPLE_RATE_HZ,
+};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -314,7 +317,24 @@ impl Verification {
 /// WAVE_FORMAT_EXTENSIBLE ordered multichannel source. Centre and surround
 /// channels use -3.01 dB coefficients and LFE is omitted.
 pub fn analyze_stereo_downmix(path: &Path) -> Result<DownmixMeasurement, String> {
-    let source = decoder::decode(path)?;
+    analyze_stereo_downmix_with_roles(path, None)
+}
+
+/// Render and measure a stereo downmix with an optional explicit source
+/// speaker layout for containers whose channel metadata is absent or
+/// ambiguous.
+pub fn analyze_stereo_downmix_with_roles(
+    path: &Path,
+    channel_roles: Option<&[ChannelRole]>,
+) -> Result<DownmixMeasurement, String> {
+    let (mut source, layout_provenance) = decoder::decode_with_layout(path)?;
+    source.channel_roles = resolve_decoded_channel_roles(
+        path,
+        source.channels,
+        &source.channel_roles,
+        layout_provenance,
+        channel_roles,
+    )?;
     if source.channels < 3 {
         return Err("stereo downmix QC requires at least three input channels".into());
     }
@@ -368,6 +388,7 @@ pub fn analyze_stereo_downmix(path: &Path) -> Result<DownmixMeasurement, String>
 fn standard_stereo_downmix_layout(source: &AudioBuffer) -> Option<downmix::Layout> {
     let layout = match source.channels {
         6 => downmix::Layout::FiveOne,
+        7 => downmix::Layout::SixOne,
         8 => downmix::Layout::SevenOne,
         10 => downmix::Layout::FiveOneFour,
         12 => downmix::Layout::SevenOneFour,
@@ -418,11 +439,14 @@ pub fn analyze_adm_presentations(
     map: &AdmPresentationMap,
 ) -> Result<AdmQcResult, String> {
     validate_adm_presentation_map(map)?;
-    let source = decoder::decode(path)?;
-    let roles = channel_roles.unwrap_or(&source.channel_roles);
-    if roles.len() != source.channels as usize {
-        return Err("channel layout does not match the ADM source".into());
-    }
+    let (source, layout_provenance) = decoder::decode_with_layout(path)?;
+    let roles = resolve_decoded_channel_roles(
+        path,
+        source.channels,
+        &source.channel_roles,
+        layout_provenance,
+        channel_roles,
+    )?;
     let axml = metadata::read_wave_chunk(path, *b"axml")?;
     let chna_present = metadata::read_wave_chunk(path, *b"chna")?.is_some();
     let axml_text = axml
@@ -490,12 +514,14 @@ pub fn detect_dialogue_ranges(
     if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
         return Err("dialogue confidence threshold must be between 0 and 1".into());
     }
-    let source = decoder::decode(path)?;
-    if let Some(roles) = channel_roles {
-        if roles.len() != source.channels as usize {
-            return Err("channel layout does not match dialogue detector input".into());
-        }
-    }
+    let (mut source, layout_provenance) = decoder::decode_with_layout(path)?;
+    source.channel_roles = resolve_decoded_channel_roles(
+        path,
+        source.channels,
+        &source.channel_roles,
+        layout_provenance,
+        channel_roles,
+    )?;
     let window = (source.sample_rate as usize / 4).max(1);
     let mut frames = Vec::new();
     for start in (0..source.frames).step_by(window) {
@@ -788,7 +814,7 @@ pub fn apply_gain_and_protect(buf: &mut AudioBuffer, gain: f32, plan: &Plan) {
     if let Some(config) = plan.limiter {
         apply_gain(&mut buf.data, gain);
         let mut limiter =
-            TruePeakLimiter::new(buf.sample_rate, buf.channels, plan.ceiling_db, config)
+            TruePeakLimiter::new_finite(buf.sample_rate, buf.channels, plan.ceiling_db, config)
                 .expect("validated limiter configuration");
         let mut output = limiter
             .process(&buf.data)
@@ -810,6 +836,29 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<AudioBuffer, String> {
     decoder::decode(path.as_ref())
 }
 
+fn validate_audio_buffer_geometry(buf: &AudioBuffer) -> Result<(), String> {
+    if buf.data.len() != usize::from(buf.channels) {
+        return Err(format!(
+            "audio buffer has {} sample planes but declares {} channels",
+            buf.data.len(),
+            buf.channels
+        ));
+    }
+    if let Some((channel, samples)) = buf
+        .data
+        .iter()
+        .enumerate()
+        .find(|(_, samples)| samples.len() != buf.frames)
+    {
+        return Err(format!(
+            "audio buffer channel {channel} has {} frames but declares {}",
+            samples.len(),
+            buf.frames
+        ));
+    }
+    Ok(())
+}
+
 pub fn write<P: AsRef<Path>>(
     buf: &AudioBuffer,
     path: P,
@@ -817,6 +866,15 @@ pub fn write<P: AsRef<Path>>(
     format: OutputFormat,
 ) -> Result<(), String> {
     let p = path.as_ref();
+    validate_audio_buffer_geometry(buf)?;
+    validate_supported_output_sample_rate(buf.sample_rate)?;
+    validate_output_channel_layout(
+        format,
+        buf.channels,
+        &buf.channel_roles,
+        LayoutAliasPolicy::ExplicitLegacy,
+    )?;
+    validate_output_encoder_available(format)?;
     match format {
         OutputFormat::Wav => {
             let kind = plan.output_kind.unwrap_or(buf.source_kind);
@@ -877,6 +935,11 @@ pub fn write<P: AsRef<Path>>(
         OutputFormat::M4a | OutputFormat::Alac | OutputFormat::Vorbis => {
             #[cfg(feature = "ffmpeg-encoding")]
             {
+                // FFmpeg may reject codec-specific constraints only after it
+                // has consumed PCM. Keep the public buffer writer
+                // transactional so such a late failure cannot clobber an
+                // existing destination.
+                let staged = AtomicOutput::new(p)?;
                 let codec = match format {
                     OutputFormat::M4a => crate::aac::FfmpegCodec::Aac,
                     OutputFormat::Alac => crate::aac::FfmpegCodec::Alac,
@@ -884,14 +947,15 @@ pub fn write<P: AsRef<Path>>(
                     _ => unreachable!(),
                 };
                 let mut writer = crate::aac::AacStreamWriter::create_codec(
-                    p,
+                    staged.path(),
                     buf.sample_rate,
                     buf.channels,
                     plan.mp3_bitrate,
                     codec,
                 )?;
                 writer.write_chunk(&buf.data)?;
-                writer.finish()
+                writer.finish()?;
+                staged.commit()
             }
             #[cfg(not(feature = "ffmpeg-encoding"))]
             {
@@ -968,6 +1032,7 @@ fn prepare_file_for_plan(
     plan: &Plan,
     capture_spool: bool,
 ) -> Result<PreparedAnalysis, String> {
+    validate_plan_output_sample_rate(plan)?;
     if analysis_pipeline_enabled(plan) {
         return prepare_file_for_plan_pipelined(path, channel_roles, plan, capture_spool);
     }
@@ -984,10 +1049,11 @@ fn prepare_file_for_plan_sequential(
     let mut converter: Option<SampleRateConverter> = None;
     let mut spool: Option<PcmSpool> = None;
     let mut resolved_roles = None;
-    let info =
-        decoder::decode_stream_with_declared_frames(path, |info, declared_frames, chunk| {
+    let info = decoder::decode_stream_with_layout_and_declared_frames(
+        path,
+        |info, layout_provenance, declared_frames, chunk| {
             if analyzer.is_none() {
-                let roles = resolve_stream_roles(path, info, channel_roles)?;
+                let roles = resolve_stream_roles(path, info, layout_provenance, channel_roles)?;
                 let output_rate = plan.output_sample_rate.unwrap_or(info.sample_rate);
                 analyzer = Some(lufs::StreamingAnalyzer::new(output_rate, roles.clone()));
                 resolved_roles = Some(roles);
@@ -1016,7 +1082,8 @@ fn prepare_file_for_plan_sequential(
             } else {
                 analyze_and_capture(chunk, analyzer.as_mut().unwrap(), &mut spool)
             }
-        })?;
+        },
+    )?;
     if let Some(converter) = converter.as_mut() {
         converter
             .finish(|output| analyze_and_capture(output, analyzer.as_mut().unwrap(), &mut spool))?;
@@ -1226,11 +1293,11 @@ fn prepare_file_for_plan_pipelined(
             let _ = result_sender.send(result);
         });
 
-        let decoded = decoder::decode_stream_owned_with_declared_frames(
+        let decoded = decoder::decode_stream_owned_with_layout_and_declared_frames(
             path,
-            |info, declared_frames, planar| {
+            |info, layout_provenance, declared_frames, planar| {
                 if !started {
-                    let roles = resolve_stream_roles(path, info, channel_roles)?;
+                    let roles = resolve_stream_roles(path, info, layout_provenance, channel_roles)?;
                     let output_rate = plan.output_sample_rate.unwrap_or(info.sample_rate);
                     let next_converter = if output_rate != info.sample_rate {
                         Some(SampleRateConverter::new_streaming(
@@ -1411,31 +1478,48 @@ fn analyze_and_capture(
 fn resolve_stream_roles(
     path: &Path,
     info: &decoder::StreamInfo,
+    layout_provenance: decoder::ChannelLayoutProvenance,
+    channel_roles: Option<&[ChannelRole]>,
+) -> Result<Vec<ChannelRole>, String> {
+    resolve_decoded_channel_roles(
+        path,
+        info.channels,
+        &info.channel_roles,
+        layout_provenance,
+        channel_roles,
+    )
+}
+
+pub(crate) fn resolve_decoded_channel_roles(
+    path: &Path,
+    channels: u16,
+    decoded_roles: &[ChannelRole],
+    layout_provenance: decoder::ChannelLayoutProvenance,
     channel_roles: Option<&[ChannelRole]>,
 ) -> Result<Vec<ChannelRole>, String> {
     if let Some(roles) = channel_roles {
-        if roles.len() != info.channels as usize {
+        if roles.len() != channels as usize {
             return Err(format!(
                 "channel layout has {} channels but input has {}",
                 roles.len(),
-                info.channels
+                channels
             ));
         }
         return Ok(roles.to_vec());
     }
-    if info.channels > 6
-        && info
-            .channel_roles
-            .iter()
-            .all(|role| matches!(role, ChannelRole::Main))
-    {
-        return Err(format!(
-            "{}: ambiguous {}-channel layout; provide --channel-layout",
+    match layout_provenance {
+        decoder::ChannelLayoutProvenance::KnownSpeakers => Ok(decoded_roles.to_vec()),
+        decoder::ChannelLayoutProvenance::Unknown => Err(format!(
+            "{}: ambiguous {}-channel layout; provide an explicit speaker layout",
             path.display(),
-            info.channels
-        ));
+            channels
+        )),
+        decoder::ChannelLayoutProvenance::SceneBased => Err(format!(
+            "{}: scene-based {}-channel audio requires a speaker renderer or an explicit speaker layout",
+            path.display(),
+            channels
+        )),
     }
-    Ok(info.channel_roles.clone())
 }
 
 fn should_capture_pcm(path: &Path, resampling: bool) -> bool {
@@ -1504,70 +1588,48 @@ pub fn analyze_file_range_with_roles<P: AsRef<Path>>(
     let mut analyzer: Option<lufs::StreamingAnalyzer> = None;
     let mut captured_info = None;
     let mut source_frames = 0usize;
-    let decoded = decoder::decode_stream(path.as_ref(), |info, chunk| {
-        captured_info.get_or_insert_with(|| info.clone());
-        if channel_roles.is_none()
-            && info.channels > 6
-            && info
-                .channel_roles
-                .iter()
-                .all(|role| matches!(role, ChannelRole::Main))
-        {
-            return Err(format!(
-                "{}: ambiguous {}-channel layout; provide --channel-layout",
-                path.as_ref().display(),
-                info.channels
-            ));
-        }
-        let roles = if let Some(roles) = channel_roles {
-            if roles.len() != info.channels as usize {
-                return Err(format!(
-                    "channel layout has {} channels but input has {}",
-                    roles.len(),
-                    info.channels
-                ));
+    let decoded =
+        decoder::decode_stream_with_layout(path.as_ref(), |info, layout_provenance, chunk| {
+            captured_info.get_or_insert_with(|| info.clone());
+            let roles =
+                resolve_stream_roles(path.as_ref(), info, layout_provenance, channel_roles)?;
+            let range_start = (start_seconds * info.sample_rate as f64).round() as usize;
+            let range_end = duration_seconds.map(|duration| {
+                range_start.saturating_add((duration * info.sample_rate as f64).round() as usize)
+            });
+            let chunk_start = source_frames;
+            let chunk_end = source_frames + chunk.first().map_or(0, Vec::len);
+            source_frames = chunk_end;
+            if range_end.is_some_and(|end| chunk_start >= end) {
+                return Err(RANGE_COMPLETE.into());
             }
-            roles.to_vec()
-        } else {
-            info.channel_roles.clone()
-        };
-        let range_start = (start_seconds * info.sample_rate as f64).round() as usize;
-        let range_end = duration_seconds.map(|duration| {
-            range_start.saturating_add((duration * info.sample_rate as f64).round() as usize)
+            let selected_start = range_start.saturating_sub(chunk_start);
+            let selected_end = range_end
+                .map_or(chunk_end, |end| end.min(chunk_end))
+                .saturating_sub(chunk_start);
+            if selected_start < selected_end {
+                let selected = chunk
+                    .iter()
+                    .map(|channel| channel[selected_start..selected_end].to_vec())
+                    .collect::<Vec<_>>();
+                let interval_frames = timeline_interval_ms.map(|milliseconds| {
+                    ((info.sample_rate as f64 * milliseconds / 1_000.0).round() as usize).max(1)
+                });
+                let meter = analyzer.get_or_insert_with(|| {
+                    lufs::StreamingAnalyzer::with_timeline_interval(
+                        info.sample_rate,
+                        roles,
+                        interval_frames,
+                    )
+                });
+                meter.process(&selected)?;
+            }
+            if range_end.is_some_and(|end| chunk_end >= end) {
+                Err(RANGE_COMPLETE.into())
+            } else {
+                Ok(())
+            }
         });
-        let chunk_start = source_frames;
-        let chunk_end = source_frames + chunk.first().map_or(0, Vec::len);
-        source_frames = chunk_end;
-        if range_end.is_some_and(|end| chunk_start >= end) {
-            return Err(RANGE_COMPLETE.into());
-        }
-        let selected_start = range_start.saturating_sub(chunk_start);
-        let selected_end = range_end
-            .map_or(chunk_end, |end| end.min(chunk_end))
-            .saturating_sub(chunk_start);
-        if selected_start < selected_end {
-            let selected = chunk
-                .iter()
-                .map(|channel| channel[selected_start..selected_end].to_vec())
-                .collect::<Vec<_>>();
-            let interval_frames = timeline_interval_ms.map(|milliseconds| {
-                ((info.sample_rate as f64 * milliseconds / 1_000.0).round() as usize).max(1)
-            });
-            let meter = analyzer.get_or_insert_with(|| {
-                lufs::StreamingAnalyzer::with_timeline_interval(
-                    info.sample_rate,
-                    roles,
-                    interval_frames,
-                )
-            });
-            meter.process(&selected)?;
-        }
-        if range_end.is_some_and(|end| chunk_end >= end) {
-            Err(RANGE_COMPLETE.into())
-        } else {
-            Ok(())
-        }
-    });
     let info = match decoded {
         Ok(info) => info,
         Err(error) if error == RANGE_COMPLETE => {
@@ -1688,71 +1750,50 @@ pub fn analyze_dialogue_ranges_for_standard_with_roles<P: AsRef<Path>>(
     validate_dialogue_ranges(ranges)?;
     let mut analyzers = (0..ranges.len()).map(|_| None).collect::<Vec<_>>();
     let mut source_frames = 0usize;
-    let info = decoder::decode_stream(path.as_ref(), |info, chunk| {
-        if channel_roles.is_none()
-            && info.channels > 6
-            && info
-                .channel_roles
-                .iter()
-                .all(|role| matches!(role, ChannelRole::Main))
-        {
-            return Err(format!(
-                "{}: ambiguous {}-channel layout; provide --channel-layout",
-                path.as_ref().display(),
-                info.channels
-            ));
-        }
-        let roles = if let Some(roles) = channel_roles {
-            if roles.len() != info.channels as usize {
-                return Err(format!(
-                    "channel layout has {} channels but input has {}",
-                    roles.len(),
-                    info.channels
-                ));
+    let info =
+        decoder::decode_stream_with_layout(path.as_ref(), |info, layout_provenance, chunk| {
+            let roles =
+                resolve_stream_roles(path.as_ref(), info, layout_provenance, channel_roles)?;
+            if source == DialogueSource::Center && info.channels < 3 {
+                return Err(
+                    "center dialogue source requires an input with a centre channel".into(),
+                );
             }
-            roles
-        } else {
-            &info.channel_roles
-        };
-        if source == DialogueSource::Center && info.channels < 3 {
-            return Err("center dialogue source requires an input with a centre channel".into());
-        }
-        let chunk_start = source_frames;
-        let chunk_end = source_frames + chunk.first().map_or(0, Vec::len);
-        source_frames = chunk_end;
-        for (range, analyzer) in ranges.iter().zip(&mut analyzers) {
-            let range_start = (range.start_seconds * info.sample_rate as f64).round() as usize;
-            let range_end =
-                range_start.saturating_add(
+            let chunk_start = source_frames;
+            let chunk_end = source_frames + chunk.first().map_or(0, Vec::len);
+            source_frames = chunk_end;
+            for (range, analyzer) in ranges.iter().zip(&mut analyzers) {
+                let range_start = (range.start_seconds * info.sample_rate as f64).round() as usize;
+                let range_end = range_start.saturating_add(
                     (range.duration_seconds * info.sample_rate as f64).round() as usize,
                 );
-            let overlap_start = chunk_start.max(range_start);
-            let overlap_end = chunk_end.min(range_end);
-            if overlap_start < overlap_end {
-                let selected_start = overlap_start - chunk_start;
-                let selected_end = overlap_end - chunk_start;
-                let selected = if source == DialogueSource::Center {
-                    vec![chunk[2][selected_start..selected_end].to_vec()]
-                } else {
-                    chunk
-                        .iter()
-                        .map(|channel| channel[selected_start..selected_end].to_vec())
-                        .collect::<Vec<_>>()
-                };
-                let selected_roles = if source == DialogueSource::Center {
-                    vec![ChannelRole::Main]
-                } else {
-                    roles.to_vec()
-                };
-                analyzer
-                    .get_or_insert_with(|| {
-                        lufs::StreamingAnalyzer::new(info.sample_rate, selected_roles)
-                    })
-                    .process(&selected)?;
+                let overlap_start = chunk_start.max(range_start);
+                let overlap_end = chunk_end.min(range_end);
+                if overlap_start < overlap_end {
+                    let selected_start = overlap_start - chunk_start;
+                    let selected_end = overlap_end - chunk_start;
+                    let selected = if source == DialogueSource::Center {
+                        vec![chunk[2][selected_start..selected_end].to_vec()]
+                    } else {
+                        chunk
+                            .iter()
+                            .map(|channel| channel[selected_start..selected_end].to_vec())
+                            .collect::<Vec<_>>()
+                    };
+                    let selected_roles = if source == DialogueSource::Center {
+                        vec![ChannelRole::Main]
+                    } else {
+                        roles.clone()
+                    };
+                    analyzer
+                        .get_or_insert_with(|| {
+                            lufs::StreamingAnalyzer::new(info.sample_rate, selected_roles)
+                        })
+                        .process(&selected)?;
+                }
             }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        })?;
     let mut weighted_energy = 0.0;
     let mut gating_blocks = Vec::new();
     let mut frames = 0usize;
@@ -1765,7 +1806,7 @@ pub fn analyze_dialogue_ranges_for_standard_with_roles<P: AsRef<Path>>(
                     index + 1
                 )
             })?
-            .finish();
+            .finish_without_lra_tail();
         weighted_energy += measured.weighted_mean_square * measured.frames as f64;
         gating_blocks.extend(measured.ebu.gating_blocks);
         frames += measured.frames;
@@ -2072,12 +2113,20 @@ fn normalize_one_staged_with_roles_impl(
     preanalyzed: Option<&Analysis>,
     capture_statistics: bool,
 ) -> Result<StagedNormalization, String> {
+    validate_plan_output_sample_rate(plan)?;
+    if preanalyzed.is_none() {
+        validate_output_encoder_available(format)?;
+    }
     let (an, mut source_spool) = if let Some(analysis) = preanalyzed {
         (analysis.clone(), None)
     } else {
         let prepared = prepare_file_for_plan(input, channel_roles, plan, true)?;
         (prepared.analysis, prepared.spool)
     };
+    validate_supported_output_sample_rate(an.sample_rate)?;
+    let layout_alias_policy = LayoutAliasPolicy::for_override(channel_roles, &an.channel_roles)?;
+    validate_output_channel_layout(format, an.channels, &an.channel_roles, layout_alias_policy)?;
+    validate_output_encoder_available(format)?;
     let gain = compute_gain(&an, plan);
     let staged = AtomicOutput::new(output)?;
     let rendered = normalize_stream(
@@ -2095,6 +2144,7 @@ fn normalize_one_staged_with_roles_impl(
             capture_statistics,
             capture_lossless_verification: false,
             verification_channel_roles: None,
+            layout_alias_policy,
         },
     )?;
     finalize_metadata(
@@ -2191,12 +2241,26 @@ fn normalize_one_corrected_with_optional_analysis(
     if !tolerance.is_finite() || tolerance < 0.0 {
         return Err("verification tolerance must be a finite non-negative number".into());
     }
+    validate_plan_output_sample_rate(plan)?;
+    if preanalyzed.is_none() {
+        validate_output_encoder_available(format)?;
+    }
     let (source, mut source_spool) = if let Some(analysis) = preanalyzed {
         (analysis.clone(), None)
     } else {
         let prepared = prepare_file_for_plan(input, channel_roles, plan, true)?;
         (prepared.analysis, prepared.spool)
     };
+    validate_supported_output_sample_rate(source.sample_rate)?;
+    let layout_alias_policy =
+        LayoutAliasPolicy::for_override(channel_roles, &source.channel_roles)?;
+    validate_output_channel_layout(
+        format,
+        source.channels,
+        &source.channel_roles,
+        layout_alias_policy,
+    )?;
+    validate_output_encoder_available(format)?;
     let mut gain = compute_gain(&source, plan);
     let mut intended_level = None;
     let staged = AtomicOutput::new(output)?;
@@ -2217,6 +2281,7 @@ fn normalize_one_corrected_with_optional_analysis(
                 capture_statistics: true,
                 capture_lossless_verification: true,
                 verification_channel_roles: channel_roles,
+                layout_alias_policy,
             },
         )?;
         let render = rendered
@@ -2287,11 +2352,25 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
     if !tolerance.is_finite() || tolerance < 0.0 {
         return Err("verification tolerance must be a finite non-negative number".into());
     }
+    validate_plan_output_sample_rate(plan)?;
+    for format in formats {
+        validate_output_encoder_available(*format)?;
+    }
     let prepared = prepare_file_for_plan(input, channel_roles, plan, true)?;
     let source = prepared.analysis;
     let mut source_spool = prepared.spool;
     if plan.mode == Mode::Lufs && !source.lufs.is_finite() {
         return Err("multi-delivery requires finite integrated source loudness".into());
+    }
+    let layout_alias_policy =
+        LayoutAliasPolicy::for_override(channel_roles, &source.channel_roles)?;
+    for format in formats {
+        validate_output_channel_layout(
+            *format,
+            source.channels,
+            &source.channel_roles,
+            layout_alias_policy,
+        )?;
     }
     let mut gain = compute_gain(&source, plan);
     let mut expected_level = None;
@@ -2320,6 +2399,7 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
                 capture_statistics: true,
                 capture_lossless_verification: true,
                 verification_channel_roles: channel_roles,
+                layout_alias_policy,
             },
         )?;
         let render = rendered
@@ -2545,6 +2625,12 @@ fn normalize_album_with_roles_impl(
     if preanalyzed.is_some_and(|analyses| analyses.len() != inputs.len()) {
         return Err("album precomputed analysis/input count mismatch".into());
     }
+    validate_plan_output_sample_rate(plan)?;
+    if preanalyzed.is_none() {
+        for format in formats {
+            validate_output_encoder_available(*format)?;
+        }
+    }
     let analyses = if let Some(analyses) = preanalyzed {
         analyses.to_vec()
     } else {
@@ -2558,6 +2644,24 @@ fn normalize_album_with_roles_impl(
             .collect::<Vec<_>>();
         measured.into_iter().collect::<Result<Vec<_>, _>>()?
     };
+    for analysis in &analyses {
+        validate_supported_output_sample_rate(analysis.sample_rate)?;
+    }
+    let layout_alias_policies = analyses
+        .iter()
+        .map(|analysis| LayoutAliasPolicy::for_override(channel_roles, &analysis.channel_roles))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (index, analysis) in analyses.iter().enumerate() {
+        validate_output_channel_layout(
+            formats.get(index).copied().unwrap_or(OutputFormat::Wav),
+            analysis.channels,
+            &analysis.channel_roles,
+            layout_alias_policies[index],
+        )?;
+    }
+    for format in formats {
+        validate_output_encoder_available(*format)?;
+    }
     let gain = album_gain(&analyses, plan);
     let album_output_lufs = album_lufs(&analyses) + gain_db(gain);
     let write_album_tags = formats.iter().copied().any(writes_album_loudness_tags);
@@ -2590,6 +2694,7 @@ fn normalize_album_with_roles_impl(
                     capture_statistics,
                     capture_lossless_verification: write_album_tags,
                     verification_channel_roles: None,
+                    layout_alias_policy: layout_alias_policies[i],
                 },
             )
         })
@@ -2733,6 +2838,12 @@ fn normalize_album_corrected_with_optional_analyses(
     if preanalyzed.is_some_and(|analyses| analyses.len() != inputs.len()) {
         return Err("album precomputed analysis/input count mismatch".into());
     }
+    validate_plan_output_sample_rate(plan)?;
+    if preanalyzed.is_none() {
+        for format in formats {
+            validate_output_encoder_available(*format)?;
+        }
+    }
     let sources = if let Some(analyses) = preanalyzed {
         analyses.to_vec()
     } else {
@@ -2742,6 +2853,24 @@ fn normalize_album_corrected_with_optional_analyses(
             .collect::<Vec<_>>();
         measured.into_iter().collect::<Result<Vec<_>, _>>()?
     };
+    for source in &sources {
+        validate_supported_output_sample_rate(source.sample_rate)?;
+    }
+    let layout_alias_policies = sources
+        .iter()
+        .map(|source| LayoutAliasPolicy::for_override(channel_roles, &source.channel_roles))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (index, source) in sources.iter().enumerate() {
+        validate_output_channel_layout(
+            formats.get(index).copied().unwrap_or(OutputFormat::Wav),
+            source.channels,
+            &source.channel_roles,
+            layout_alias_policies[index],
+        )?;
+    }
+    for format in formats {
+        validate_output_encoder_available(*format)?;
+    }
     let mut gain = album_gain(&sources, plan);
     let mut intended_album_lufs = None;
     let mut intended_track_levels = None;
@@ -2777,6 +2906,7 @@ fn normalize_album_corrected_with_optional_analyses(
                         capture_statistics: true,
                         capture_lossless_verification: true,
                         verification_channel_roles: channel_roles,
+                        layout_alias_policy: layout_alias_policies[index],
                     },
                 )
             })
@@ -3079,6 +3209,7 @@ struct StreamRenderOptions<'a> {
     capture_statistics: bool,
     capture_lossless_verification: bool,
     verification_channel_roles: Option<&'a [ChannelRole]>,
+    layout_alias_policy: LayoutAliasPolicy,
 }
 
 struct StreamSource<'a> {
@@ -3142,6 +3273,12 @@ impl NormalizedStreamWriter {
         format: OutputFormat,
         options: StreamRenderOptions<'_>,
     ) -> Result<Self, String> {
+        validate_output_channel_layout(
+            format,
+            analysis.channels,
+            &analysis.channel_roles,
+            options.layout_alias_policy,
+        )?;
         #[cfg(not(feature = "opus-encoding"))]
         let _ = (gain, options.opus_album_lufs);
         match format {
@@ -3655,7 +3792,7 @@ fn process_normalized_stream_owned(
     if let Some(spool) = source_spool {
         spool.replay_owned(&mut process)?;
     } else {
-        decoder::decode_stream_owned(input, |info, planar| {
+        decoder::decode_stream_owned_with_declared_frames(input, |info, _, planar| {
             if info.sample_rate != analysis.sample_rate {
                 return Err(format!(
                     "owned stream pipeline expected {} Hz input, got {} Hz",
@@ -3831,7 +3968,7 @@ fn process_normalized_stream(
     let mut limiter = plan
         .limiter
         .map(|config| {
-            TruePeakLimiter::new(
+            TruePeakLimiter::new_finite(
                 analysis.sample_rate,
                 analysis.channels,
                 plan.ceiling_db,
@@ -4178,10 +4315,196 @@ fn flac_bits(kind: PcmKind) -> Result<u16, String> {
 }
 
 fn flac_persisted_channel_roles(channels: u16) -> Vec<ChannelRole> {
-    match channels {
-        7 => crate::wav::named_channel_layout("6.1").expect("built-in 6.1 layout"),
-        8 => crate::wav::named_channel_layout("7.1").expect("built-in 7.1 layout"),
-        _ => crate::wav::default_channel_roles(channels),
+    crate::decoder::default_flac_channel_mask(channels)
+        .map(|mask| crate::wav::reader::roles_from_wave_mask(mask, channels))
+        .unwrap_or_default()
+}
+
+fn legacy_flac_channel_roles(channels: u16) -> Option<Vec<ChannelRole>> {
+    Some(match channels {
+        1..=6 => crate::wav::default_channel_roles(channels),
+        7 => crate::wav::named_channel_layout("6.1")?,
+        8 => crate::wav::named_channel_layout("7.1")?,
+        _ => return None,
+    })
+}
+
+fn legacy_wave_channel_roles(channels: u16) -> Option<Vec<ChannelRole>> {
+    Some(match channels {
+        1 | 2 => crate::wav::default_channel_roles(channels),
+        6 => crate::wav::named_channel_layout("5.1")?,
+        7 => crate::wav::named_channel_layout("6.1")?,
+        8 => crate::wav::named_channel_layout("7.1")?,
+        10 => crate::wav::named_channel_layout("5.1.4")?,
+        12 => crate::wav::named_channel_layout("7.1.4")?,
+        _ => return None,
+    })
+}
+
+fn wave_persisted_channel_roles(channels: u16) -> Option<Vec<ChannelRole>> {
+    let accepted = legacy_wave_channel_roles(channels)?;
+    crate::wav::writer::persisted_channel_roles(&accepted).ok()
+}
+
+fn ffmpeg_persisted_channel_roles(channels: u16) -> Option<Vec<ChannelRole>> {
+    Some(match channels {
+        1 | 2 => crate::wav::default_channel_roles(channels),
+        6 => crate::wav::reader::roles_from_wave_mask(0x0000_003f, 6),
+        8 => crate::wav::reader::roles_from_wave_mask(0x0000_063f, 8),
+        _ => return None,
+    })
+}
+
+fn legacy_ffmpeg_channel_roles(channels: u16) -> Option<Vec<ChannelRole>> {
+    Some(match channels {
+        1 | 2 => crate::wav::default_channel_roles(channels),
+        6 => crate::wav::named_channel_layout("5.1")?,
+        8 => crate::wav::named_channel_layout("7.1")?,
+        _ => return None,
+    })
+}
+
+#[cfg(feature = "opus-encoding")]
+fn legacy_opus_channel_roles(channels: u16) -> Option<Vec<ChannelRole>> {
+    Some(match channels {
+        1..=6 => crate::wav::default_channel_roles(channels),
+        7 => crate::wav::named_channel_layout("6.1")?,
+        8 => crate::wav::named_channel_layout("7.1")?,
+        _ => return None,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutAliasPolicy {
+    ExactOnly,
+    ExplicitLegacy,
+}
+
+impl LayoutAliasPolicy {
+    fn for_override(
+        channel_roles: Option<&[ChannelRole]>,
+        analyzed_roles: &[ChannelRole],
+    ) -> Result<Self, String> {
+        match channel_roles {
+            Some(roles) if roles != analyzed_roles => Err(
+                "explicit channel roles do not match the roles bound to the supplied analysis"
+                    .into(),
+            ),
+            Some(_) => Ok(Self::ExplicitLegacy),
+            None => Ok(Self::ExactOnly),
+        }
+    }
+
+    fn allows_legacy(self) -> bool {
+        self == Self::ExplicitLegacy
+    }
+}
+
+pub(crate) fn validate_output_encoder_available(format: OutputFormat) -> Result<(), String> {
+    match format {
+        #[cfg(not(feature = "mp3-encoding"))]
+        OutputFormat::Mp3 => {
+            Err("MP3 output is unavailable; rebuild with `--features mp3-encoding`".into())
+        }
+        #[cfg(not(feature = "opus-encoding"))]
+        OutputFormat::Opus => {
+            Err("Ogg Opus output is unavailable; rebuild with `--features opus-encoding`".into())
+        }
+        #[cfg(not(feature = "ffmpeg-encoding"))]
+        OutputFormat::M4a | OutputFormat::Alac | OutputFormat::Vorbis => Err(
+            "AAC/ALAC/Vorbis output is unavailable; rebuild with `--features ffmpeg-encoding`"
+                .into(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn validate_supported_output_sample_rate(sample_rate: u32) -> Result<(), String> {
+    if (MIN_DECODE_SAMPLE_RATE_HZ..=MAX_DECODE_SAMPLE_RATE_HZ).contains(&sample_rate) {
+        Ok(())
+    } else {
+        Err(format!(
+            "output sample rate {sample_rate} Hz is outside Forge's supported {MIN_DECODE_SAMPLE_RATE_HZ}..={MAX_DECODE_SAMPLE_RATE_HZ} Hz range"
+        ))
+    }
+}
+
+pub(crate) fn validate_plan_output_sample_rate(plan: &Plan) -> Result<(), String> {
+    if let Some(sample_rate) = plan.output_sample_rate {
+        validate_supported_output_sample_rate(sample_rate)?;
+    }
+    Ok(())
+}
+
+/// Reject an output before creating its encoder unless the current public
+/// channel-role model proves that the muxer will retain the same speaker order.
+/// Generic aliases are accepted only at APIs where the caller explicitly
+/// supplied the layout. Decoder-derived and unqualified precomputed layouts
+/// must carry exact speaker positions so lossy metadata cannot pass preflight.
+fn validate_output_channel_layout(
+    format: OutputFormat,
+    channels: u16,
+    roles: &[ChannelRole],
+    alias_policy: LayoutAliasPolicy,
+) -> Result<(), String> {
+    if roles.len() != usize::from(channels) {
+        return Err(format!(
+            "output channel-role count {} does not match the {channels}-channel signal",
+            roles.len()
+        ));
+    }
+    let exact = match format {
+        OutputFormat::Wav => wave_persisted_channel_roles(channels).as_deref() == Some(roles),
+        OutputFormat::Flac => {
+            (1..=8).contains(&channels) && flac_persisted_channel_roles(channels) == roles
+        }
+        OutputFormat::Opus => {
+            #[cfg(feature = "opus-encoding")]
+            {
+                crate::opus::persisted_channel_roles(channels).as_deref() == Some(roles)
+            }
+            #[cfg(not(feature = "opus-encoding"))]
+            {
+                false
+            }
+        }
+        OutputFormat::Mp3 => {
+            (1..=2).contains(&channels) && crate::wav::default_channel_roles(channels) == roles
+        }
+        OutputFormat::M4a | OutputFormat::Alac if channels > 2 => false,
+        OutputFormat::M4a | OutputFormat::Alac | OutputFormat::Vorbis => {
+            ffmpeg_persisted_channel_roles(channels).as_deref() == Some(roles)
+        }
+    };
+    let legacy = alias_policy.allows_legacy()
+        && match format {
+            OutputFormat::Wav => legacy_wave_channel_roles(channels).as_deref() == Some(roles),
+            OutputFormat::Flac => legacy_flac_channel_roles(channels).as_deref() == Some(roles),
+            OutputFormat::Opus => {
+                #[cfg(feature = "opus-encoding")]
+                {
+                    legacy_opus_channel_roles(channels).as_deref() == Some(roles)
+                }
+                #[cfg(not(feature = "opus-encoding"))]
+                {
+                    false
+                }
+            }
+            OutputFormat::Mp3 => {
+                (1..=2).contains(&channels) && crate::wav::default_channel_roles(channels) == roles
+            }
+            OutputFormat::M4a | OutputFormat::Alac if channels > 2 => false,
+            OutputFormat::M4a | OutputFormat::Alac | OutputFormat::Vorbis => {
+                legacy_ffmpeg_channel_roles(channels).as_deref() == Some(roles)
+            }
+        };
+    let preserved = exact || legacy;
+    if preserved {
+        Ok(())
+    } else {
+        Err(format!(
+            "{format:?} output cannot preserve the measured {channels}-channel speaker roles/order; provide an explicit canonical channel layout supported by the output format"
+        ))
     }
 }
 
@@ -4214,6 +4537,347 @@ mod tests {
         }
     }
 
+    #[test]
+    fn output_layout_preflight_allows_only_roles_the_writer_can_prove() {
+        let stereo = default_channel_roles(2);
+        let stereo_formats = [
+            OutputFormat::Wav,
+            OutputFormat::Flac,
+            OutputFormat::Mp3,
+            OutputFormat::M4a,
+            OutputFormat::Alac,
+            OutputFormat::Vorbis,
+        ];
+        for format in stereo_formats {
+            assert!(validate_output_channel_layout(
+                format,
+                2,
+                &stereo,
+                LayoutAliasPolicy::ExactOnly,
+            )
+            .is_ok());
+        }
+        #[cfg(feature = "opus-encoding")]
+        assert!(validate_output_channel_layout(
+            OutputFormat::Opus,
+            2,
+            &stereo,
+            LayoutAliasPolicy::ExactOnly,
+        )
+        .is_ok());
+
+        let front_left_and_center =
+            crate::wav::reader::roles_from_wave_mask((1 << 0) | (1 << 2), 2);
+        for format in [
+            OutputFormat::Wav,
+            OutputFormat::Flac,
+            OutputFormat::Mp3,
+            OutputFormat::Opus,
+            OutputFormat::M4a,
+            OutputFormat::Alac,
+            OutputFormat::Vorbis,
+        ] {
+            let error = validate_output_channel_layout(
+                format,
+                2,
+                &front_left_and_center,
+                LayoutAliasPolicy::ExactOnly,
+            )
+            .unwrap_err();
+            assert!(error.contains("cannot preserve"), "{format:?}: {error}");
+        }
+
+        let mono_lfe = [ChannelRole::Lfe];
+        for format in [OutputFormat::Wav, OutputFormat::Flac, OutputFormat::Opus] {
+            let error =
+                validate_output_channel_layout(format, 1, &mono_lfe, LayoutAliasPolicy::ExactOnly)
+                    .unwrap_err();
+            assert!(error.contains("cannot preserve"), "{error}");
+        }
+
+        let quad = default_channel_roles(4);
+        assert!(validate_output_channel_layout(
+            OutputFormat::Flac,
+            4,
+            &quad,
+            LayoutAliasPolicy::ExactOnly,
+        )
+        .is_err());
+        assert!(validate_output_channel_layout(
+            OutputFormat::Wav,
+            4,
+            &quad,
+            LayoutAliasPolicy::ExactOnly,
+        )
+        .is_err());
+
+        let five_one_four = named_channel_layout("5.1.4").unwrap();
+        assert!(validate_output_channel_layout(
+            OutputFormat::Wav,
+            10,
+            &five_one_four,
+            LayoutAliasPolicy::ExactOnly,
+        )
+        .is_err());
+        assert!(validate_output_channel_layout(
+            OutputFormat::Flac,
+            10,
+            &five_one_four,
+            LayoutAliasPolicy::ExplicitLegacy,
+        )
+        .is_err());
+        let exact_five_one_four = crate::wav::reader::roles_from_wave_mask(0x0002_d03f, 10);
+        assert!(validate_output_channel_layout(
+            OutputFormat::Wav,
+            10,
+            &exact_five_one_four,
+            LayoutAliasPolicy::ExactOnly,
+        )
+        .is_ok());
+        assert!(validate_output_channel_layout(
+            OutputFormat::Wav,
+            6,
+            &stereo,
+            LayoutAliasPolicy::ExplicitLegacy,
+        )
+        .is_err());
+
+        let wave_five_one = crate::wav::reader::roles_from_wave_mask(0x0000_003f, 6);
+        let flac_five_one = flac_persisted_channel_roles(6);
+        assert_eq!(wave_five_one, flac_five_one);
+        for format in [OutputFormat::Wav, OutputFormat::Flac] {
+            assert!(validate_output_channel_layout(
+                format,
+                6,
+                &wave_five_one,
+                LayoutAliasPolicy::ExactOnly,
+            )
+            .is_ok());
+        }
+        assert!(validate_output_channel_layout(
+            OutputFormat::M4a,
+            6,
+            &wave_five_one,
+            LayoutAliasPolicy::ExplicitLegacy,
+        )
+        .is_err());
+        assert!(validate_output_channel_layout(
+            OutputFormat::Alac,
+            6,
+            &wave_five_one,
+            LayoutAliasPolicy::ExplicitLegacy,
+        )
+        .is_err());
+        assert!(validate_output_channel_layout(
+            OutputFormat::Vorbis,
+            6,
+            &wave_five_one,
+            LayoutAliasPolicy::ExactOnly,
+        )
+        .is_ok());
+
+        let explicit_side_five_one = crate::wav::reader::roles_from_wave_mask(0x0000_060f, 6);
+        assert_ne!(explicit_side_five_one, flac_five_one);
+        assert!(validate_output_channel_layout(
+            OutputFormat::Flac,
+            6,
+            &explicit_side_five_one,
+            LayoutAliasPolicy::ExplicitLegacy,
+        )
+        .is_err());
+        assert!(validate_output_channel_layout(
+            OutputFormat::Wav,
+            6,
+            &explicit_side_five_one,
+            LayoutAliasPolicy::ExplicitLegacy,
+        )
+        .is_err());
+
+        // Decoder-derived generic metadata cannot prove positions. Explicit
+        // public API input retains the historical canonical alias contract.
+        let legacy_five_one = named_channel_layout("5.1").unwrap();
+        assert!(LayoutAliasPolicy::for_override(Some(&legacy_five_one), &wave_five_one).is_err());
+        assert_eq!(
+            LayoutAliasPolicy::for_override(Some(&legacy_five_one), &legacy_five_one).unwrap(),
+            LayoutAliasPolicy::ExplicitLegacy
+        );
+        for format in [OutputFormat::Wav, OutputFormat::Flac] {
+            assert!(validate_output_channel_layout(
+                format,
+                6,
+                &legacy_five_one,
+                LayoutAliasPolicy::ExactOnly,
+            )
+            .is_err());
+            assert!(validate_output_channel_layout(
+                format,
+                6,
+                &legacy_five_one,
+                LayoutAliasPolicy::ExplicitLegacy,
+            )
+            .is_ok());
+        }
+
+        let seven_one = ffmpeg_persisted_channel_roles(8).unwrap();
+        assert!(validate_output_channel_layout(
+            OutputFormat::M4a,
+            8,
+            &seven_one,
+            LayoutAliasPolicy::ExactOnly,
+        )
+        .is_err());
+        assert!(validate_output_channel_layout(
+            OutputFormat::Vorbis,
+            8,
+            &seven_one,
+            LayoutAliasPolicy::ExactOnly,
+        )
+        .is_ok());
+        assert!(validate_output_channel_layout(
+            OutputFormat::Alac,
+            8,
+            &seven_one,
+            LayoutAliasPolicy::ExplicitLegacy,
+        )
+        .is_err());
+
+        #[cfg(feature = "opus-encoding")]
+        {
+            let exact_opus = crate::opus::persisted_channel_roles(6).unwrap();
+            assert!(validate_output_channel_layout(
+                OutputFormat::Opus,
+                6,
+                &exact_opus,
+                LayoutAliasPolicy::ExactOnly,
+            )
+            .is_ok());
+            assert!(validate_output_channel_layout(
+                OutputFormat::Opus,
+                6,
+                &legacy_five_one,
+                LayoutAliasPolicy::ExactOnly,
+            )
+            .is_err());
+            assert!(validate_output_channel_layout(
+                OutputFormat::Opus,
+                6,
+                &legacy_five_one,
+                LayoutAliasPolicy::ExplicitLegacy,
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn unsupported_multichannel_aac_fails_before_output_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("missing-input.wav");
+        let output = directory.path().join("must-not-exist.m4a");
+        let mut cached = analysis(-23.0, -6.0);
+        cached.channels = 6;
+        cached.channel_roles = crate::wav::reader::roles_from_wave_mask(0x003f, 6);
+
+        let error = normalize_one_preanalyzed_with_roles(
+            &input,
+            &output,
+            &plan(),
+            OutputFormat::M4a,
+            None,
+            &cached,
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot preserve"), "{error}");
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn unsupported_output_sample_rates_fail_before_input_or_destination_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("missing-input.wav");
+        let output = directory.path().join("existing.wav");
+        for sample_rate in [7_999, 384_001] {
+            std::fs::write(&output, b"existing destination").unwrap();
+            let mut render_plan = plan();
+            render_plan.output_sample_rate = Some(sample_rate);
+            let error = normalize_one(&input, &output, &render_plan, OutputFormat::Wav)
+                .expect_err("unsupported output sample rate must fail before decoding");
+            assert!(
+                error.contains(&format!("sample rate {sample_rate} Hz")),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&output).unwrap(), b"existing destination");
+        }
+    }
+
+    #[test]
+    fn public_write_rejects_invalid_buffer_geometry_before_touching_any_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("existing.output");
+        let valid = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 2,
+            frames: 32,
+            data: vec![vec![0.0; 32], vec![0.0; 32]],
+            channel_roles: default_channel_roles(2),
+            source_kind: PcmKind::F32,
+        };
+        let mut missing_plane = valid.clone();
+        missing_plane.data.pop();
+        let mut short_plane = valid;
+        short_plane.data[1].pop();
+
+        for (name, buffer) in [
+            ("missing-plane", missing_plane),
+            ("short-plane", short_plane),
+        ] {
+            for format in [
+                OutputFormat::Wav,
+                OutputFormat::Flac,
+                OutputFormat::Mp3,
+                OutputFormat::Opus,
+                OutputFormat::M4a,
+                OutputFormat::Alac,
+                OutputFormat::Vorbis,
+            ] {
+                std::fs::write(&destination, b"existing destination").unwrap();
+                let error = write(&buffer, &destination, &plan(), format).unwrap_err();
+                assert!(
+                    error.contains("audio buffer"),
+                    "{name}, {format:?}: {error}"
+                );
+                assert_eq!(
+                    std::fs::read(&destination).unwrap(),
+                    b"existing destination",
+                    "{name}, {format:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "ffmpeg-encoding")]
+    #[test]
+    fn public_ffmpeg_write_failure_preserves_existing_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("existing.ogg");
+        std::fs::write(&destination, b"existing destination").unwrap();
+        let buffer = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 2,
+            frames: 32,
+            data: vec![vec![0.0; 32], vec![0.0; 32]],
+            channel_roles: default_channel_roles(2),
+            source_kind: PcmKind::F32,
+        };
+        let mut render_plan = plan();
+        render_plan.mp3_bitrate = 1;
+
+        assert!(write(&buffer, &destination, &render_plan, OutputFormat::Vorbis,).is_err());
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"existing destination"
+        );
+    }
+
     fn plan() -> Plan {
         Plan {
             mode: Mode::Lufs,
@@ -4232,6 +4896,71 @@ mod tests {
             output_sample_rate: None,
             resample_quality: ResampleQuality::Balanced,
         }
+    }
+
+    #[test]
+    fn six_one_stereo_downmix_keeps_bc_when_sr_cancels_only_the_right_output() {
+        let frames = 32;
+        let mut data = vec![vec![0.0; frames]; 7];
+        data[4].fill(0.25); // BC feeds both outputs.
+        data[6].fill(-0.25); // SR cancels BC on the right only.
+        let source = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 7,
+            frames,
+            data,
+            channel_roles: named_channel_layout("6.1").unwrap(),
+            source_kind: PcmKind::F32,
+        };
+
+        let layout = standard_stereo_downmix_layout(&source).unwrap();
+        assert_eq!(layout, downmix::Layout::SixOne);
+        let rendered = downmix::render(&source, layout, downmix::Profile::Stereo).unwrap();
+        let expected_left = 0.25 * std::f32::consts::FRAC_1_SQRT_2;
+        assert!(rendered.buffer.data[0]
+            .iter()
+            .all(|sample| (*sample - expected_left).abs() <= f32::EPSILON));
+        assert!(rendered.buffer.data[1]
+            .iter()
+            .all(|sample| sample.abs() <= f32::EPSILON));
+    }
+
+    #[test]
+    fn decoded_layout_provenance_fails_closed_without_an_override() {
+        let path = Path::new("ambiguous.wav");
+        let decoded = default_channel_roles(2);
+        let unknown = resolve_decoded_channel_roles(
+            path,
+            2,
+            &decoded,
+            decoder::ChannelLayoutProvenance::Unknown,
+            None,
+        )
+        .unwrap_err();
+        assert!(unknown.contains("ambiguous 2-channel layout"));
+
+        let scene_based = resolve_decoded_channel_roles(
+            path,
+            4,
+            &default_channel_roles(4),
+            decoder::ChannelLayoutProvenance::SceneBased,
+            None,
+        )
+        .unwrap_err();
+        assert!(scene_based.contains("speaker renderer"));
+
+        let explicit = named_channel_layout("stereo").unwrap();
+        assert_eq!(
+            resolve_decoded_channel_roles(
+                path,
+                2,
+                &decoded,
+                decoder::ChannelLayoutProvenance::Unknown,
+                Some(&explicit),
+            )
+            .unwrap(),
+            explicit
+        );
     }
 
     #[test]
@@ -4308,6 +5037,7 @@ mod tests {
             capture_statistics: true,
             capture_lossless_verification: false,
             verification_channel_roles: None,
+            layout_alias_policy: LayoutAliasPolicy::ExactOnly,
         };
         let bypass = normalize_stream(
             StreamSource {
@@ -4374,6 +5104,7 @@ mod tests {
             capture_statistics: true,
             capture_lossless_verification: true,
             verification_channel_roles: None,
+            layout_alias_policy: LayoutAliasPolicy::ExactOnly,
         };
         assert!(stream_writer_work_can_overlap(
             &[OutputFormat::Wav],
@@ -4550,6 +5281,46 @@ mod tests {
             duration_seconds: f64::NAN,
         }])
         .is_err());
+    }
+
+    #[test]
+    fn many_short_dialogue_ranges_preserve_the_selected_energy() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("many-short-ranges.wav");
+        let sample_rate = 8_192;
+        let frames_per_range = 8;
+        let range_count = 1_024;
+        let frames = frames_per_range * range_count;
+        let samples = vec![0.125; frames];
+        WavWriter::write(
+            &input,
+            &AudioBuffer {
+                sample_rate,
+                channels: 1,
+                frames,
+                data: vec![samples],
+                channel_roles: default_channel_roles(1),
+                source_kind: PcmKind::F32,
+            },
+            PcmKind::F32,
+            false,
+        )
+        .unwrap();
+        let ranges = (0..range_count)
+            .map(|index| DialogueRange {
+                start_seconds: (index * frames_per_range) as f64 / sample_rate as f64,
+                duration_seconds: frames_per_range as f64 / sample_rate as f64,
+            })
+            .collect::<Vec<_>>();
+
+        let measured = analyze_dialogue_ranges_with_roles(&input, None, &ranges).unwrap();
+        let mut reference = lufs::StreamingAnalyzer::new(sample_rate, vec![ChannelRole::Main]);
+        reference.process(&[vec![0.125; frames_per_range]]).unwrap();
+        let expected = lufs::ungated_lufs(reference.finish_without_lra_tail().weighted_mean_square);
+
+        assert_eq!(measured.range_count, range_count);
+        assert_eq!(measured.duration_seconds, 1.0);
+        assert!((measured.lufs - expected).abs() < 1.0e-12);
     }
 
     #[test]
@@ -4874,6 +5645,7 @@ mod tests {
                     capture_statistics: false,
                     capture_lossless_verification: true,
                     verification_channel_roles: None,
+                    layout_alias_policy: LayoutAliasPolicy::ExactOnly,
                 },
             )
             .unwrap();
@@ -4919,6 +5691,7 @@ mod tests {
             capture_statistics: true,
             capture_lossless_verification: true,
             verification_channel_roles: None,
+            layout_alias_policy: LayoutAliasPolicy::ExactOnly,
         };
         let separate_paths = [
             directory.path().join("separate.wav"),
@@ -5118,6 +5891,7 @@ mod tests {
             capture_statistics: false,
             capture_lossless_verification: false,
             verification_channel_roles: None,
+            layout_alias_policy: LayoutAliasPolicy::ExactOnly,
         };
 
         let mut writer = NormalizedStreamWriter::create(
@@ -5232,6 +6006,7 @@ mod tests {
                     capture_statistics: false,
                     capture_lossless_verification: true,
                     verification_channel_roles: None,
+                    layout_alias_policy: LayoutAliasPolicy::ExactOnly,
                 },
             )
             .unwrap();

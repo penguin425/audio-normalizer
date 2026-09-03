@@ -10,6 +10,8 @@ use forge_normalizer::container_qc;
 use forge_normalizer::decoder;
 use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::normalize::{self, DialogueRange, Mode, OutputFormat, Plan};
+#[cfg(feature = "opus-encoding")]
+use forge_normalizer::wav::ChannelRole;
 use forge_normalizer::wav::{
     default_channel_roles, named_channel_layout, AudioBuffer, PcmKind, WavContainer, WavReader,
     WavWriter, WaveChunk,
@@ -57,19 +59,86 @@ fn expected_r128_gain(lufs: f64) -> i16 {
 }
 
 #[test]
-fn ambiguous_multichannel_wav_requires_an_explicit_layout() {
-    let buffer = synth_sine(48_000, 0.5, 0.1, 997.0, 8);
-    let input = tmp_path("forge_it_ambiguous_8ch.wav");
+fn ambiguous_multichannel_wav_fails_closed_across_analysis_paths() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("ambiguous-8ch.wav");
+    let buffer = synth_sine(48_000, 0.6, 0.05, 997.0, 8);
     WavWriter::write(&input, &buffer, PcmKind::F32, false).unwrap();
+    let dialogue_ranges = [DialogueRange {
+        start_seconds: 0.0,
+        duration_seconds: 0.5,
+    }];
+    let resampling_plan = Plan {
+        mode: Mode::Lufs,
+        target_lufs: -18.0,
+        target_peak_db: -1.0,
+        target_rms_db: -18.0,
+        ceiling_db: -1.0,
+        max_gain_db: None,
+        dither: false,
+        output_kind: None,
+        mp3_bitrate: 192,
+        mp3_quality: 2,
+        limiter: None,
+        wav_container: WavContainer::Auto,
+        bwf: false,
+        output_sample_rate: Some(44_100),
+        resample_quality: forge_normalizer::dsp::resample::ResampleQuality::Balanced,
+    };
 
-    let error = normalize::analyze_file(&input).unwrap_err();
-    assert!(error.contains("ambiguous 8-channel layout"));
+    for (surface, result) in [
+        ("analysis", normalize::analyze_file(&input).map(|_| ())),
+        (
+            "range analysis",
+            normalize::analyze_file_range_with_roles(&input, None, 0.0, Some(0.5), None)
+                .map(|_| ()),
+        ),
+        (
+            "dialogue analysis",
+            normalize::analyze_dialogue_ranges_with_roles(&input, None, &dialogue_ranges)
+                .map(|_| ()),
+        ),
+        (
+            "output-rate analysis",
+            normalize::analyze_file_for_plan(&input, None, &resampling_plan).map(|_| ()),
+        ),
+        (
+            "legacy stereo downmix",
+            normalize::analyze_stereo_downmix(&input).map(|_| ()),
+        ),
+    ] {
+        let error = result.expect_err(surface);
+        assert!(
+            error.contains("ambiguous 8-channel layout"),
+            "{surface}: {error}"
+        );
+    }
 
     let roles = named_channel_layout("7.1").unwrap();
     let analysis = normalize::analyze_file_with_roles(&input, Some(&roles)).unwrap();
     assert_eq!(analysis.channels, 8);
-
-    let _ = std::fs::remove_file(input);
+    assert!(
+        normalize::analyze_file_range_with_roles(&input, Some(&roles), 0.0, Some(0.5), None)
+            .unwrap()
+            .analysis
+            .lufs
+            .is_finite()
+    );
+    assert!(
+        normalize::analyze_dialogue_ranges_with_roles(&input, Some(&roles), &dialogue_ranges,)
+            .unwrap()
+            .lufs
+            .is_finite()
+    );
+    assert_eq!(
+        normalize::analyze_file_for_plan(&input, Some(&roles), &resampling_plan)
+            .unwrap()
+            .sample_rate,
+        44_100
+    );
+    let downmix = normalize::analyze_stereo_downmix_with_roles(&input, Some(&roles)).unwrap();
+    assert_eq!(downmix.analysis.channels, 2);
+    assert!(downmix.analysis.lufs.is_finite());
 }
 
 #[test]
@@ -113,6 +182,7 @@ fn dialogue_loudness_uses_duration_weighted_ungated_energy() {
 fn stereo_downmix_uses_center_coefficient_and_omits_lfe() {
     let input = tmp_path("forge_it_downmix.wav");
     let mut buffer = synth_sine(48_000, 1.0, 0.0, 997.0, 6);
+    buffer.channel_roles = named_channel_layout("5.1").unwrap();
     for frame in 0..buffer.frames {
         buffer.data[2][frame] = 0.2 * (2.0 * PI * 997.0 * frame as f64 / 48_000.0).sin() as f32;
         buffer.data[3][frame] = 0.9;
@@ -131,7 +201,8 @@ fn stereo_downmix_uses_center_coefficient_and_omits_lfe() {
 #[test]
 fn adm_qc_measures_each_mapped_presentation() {
     let input = tmp_path("forge_it_adm.wav");
-    let buffer = synth_sine(48_000, 1.0, 0.05, 997.0, 6);
+    let mut buffer = synth_sine(48_000, 1.0, 0.05, 997.0, 6);
+    buffer.channel_roles = named_channel_layout("5.1").unwrap();
     WavWriter::write_with_metadata(
         &input,
         &buffer,
@@ -176,6 +247,7 @@ fn adm_qc_measures_each_mapped_presentation() {
 fn dialogue_detector_emits_auditable_merged_ranges() {
     let input = tmp_path("forge_it_dialogue_detector.wav");
     let mut buffer = synth_sine(48_000, 4.0, 0.0, 997.0, 6);
+    buffer.channel_roles = named_channel_layout("5.1").unwrap();
     for frame in 48_000..144_000 {
         buffer.data[2][frame] = 0.2 * (2.0 * PI * 180.0 * frame as f64 / 48_000.0).sin() as f32;
     }
@@ -1035,7 +1107,38 @@ fn opus_mapping_family_one_roundtrips_5_1_through_7_1() {
 
         let decoded = decoder::decode(&output).unwrap();
         assert_eq!(decoded.channels, channels);
-        assert_eq!(decoded.channel_roles, roles);
+        let p = ChannelRole::positioned;
+        let expected_roles = match channels {
+            6 => vec![
+                p(-30, 0),
+                p(30, 0),
+                p(0, 0),
+                ChannelRole::Lfe,
+                p(-110, 0),
+                p(110, 0),
+            ],
+            7 => vec![
+                p(-30, 0),
+                p(30, 0),
+                p(0, 0),
+                ChannelRole::Lfe,
+                p(180, 0),
+                p(-90, 0),
+                p(90, 0),
+            ],
+            8 => vec![
+                p(-30, 0),
+                p(30, 0),
+                p(0, 0),
+                ChannelRole::Lfe,
+                p(-135, 0),
+                p(135, 0),
+                p(-90, 0),
+                p(90, 0),
+            ],
+            _ => unreachable!(),
+        };
+        assert_eq!(decoded.channel_roles, expected_roles);
         let rms: Vec<f64> = decoded
             .data
             .iter()
@@ -1219,7 +1322,6 @@ fn roundtrip_lufs_hits_target() {
     assert!(an.lufs < -19.0 && an.lufs > -21.0, "input LUFS {}", an.lufs);
     assert!((an.max_momentary_lufs - an.lufs).abs() < 0.05);
     assert!((an.max_short_term_lufs - an.lufs).abs() < 0.05);
-    assert!(an.loudness_range_lu < 0.05);
 
     let out = WavReader::open(&outp).unwrap();
     let an2 = normalize::analyze(&out);
@@ -1227,6 +1329,14 @@ fn roundtrip_lufs_hits_target() {
         (an2.lufs - (-16.0)).abs() < 0.1,
         "output LUFS {} != -16",
         an2.lufs
+    );
+    // Static gain must not change LRA. For a short file, Tech 3342's required
+    // 1.5 s post-signal silence can make a constant tone's LRA non-zero.
+    assert!(
+        (an2.loudness_range_lu - an.loudness_range_lu).abs() < 0.01,
+        "LRA changed from {} to {} LU",
+        an.loudness_range_lu,
+        an2.loudness_range_lu
     );
     // ceiling protection: true peak must not exceed the -1 dBFS ceiling.
     assert!(

@@ -28,6 +28,9 @@ exact copy.  `mode: "repair"` (the default) supports:
   Schema v2 can also set `album_decoded_references` to the complete ordered
   album. It derives `alou` from the combined population of complete 400 ms
   BS.1770 gating blocks, never from an equal-weight average of track values.
+  Every decoded reference must carry an authoritative speaker layout;
+  ambiguous or scene-based channel order is rejected because this request
+  schema has no speaker-layout override.
 * MXF and unsupported containers are validate-and-copy only.  A mutation
   request fails closed rather than risking partition or offset corruption.
 

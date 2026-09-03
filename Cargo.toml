@@ -1,6 +1,6 @@
 [package]
 name = "forge-normalizer"
-version = "0.189.1"
+version = "0.189.2"
 edition = "2021"
 rust-version = "1.89"
 description = "Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer (WAV/MP3/FLAC/Opus/AAC/Vorbis)"
@@ -11,6 +11,11 @@ documentation = "https://docs.rs/forge-normalizer"
 readme = "README.md"
 keywords = ["audio", "loudness", "lufs", "ebu-r128", "normalization"]
 categories = ["multimedia::audio", "command-line-utilities"]
+
+[lints.clippy]
+# Binary container parsers intentionally use the iterator remainder semantics;
+# keep the Rust 1.97 `as_chunks` migration separate from this patch release.
+chunks_exact_to_as_chunks = "allow"
 
 [package.metadata.binstall]
 disabled-strategies = ["quick-install"]
@@ -223,6 +228,9 @@ prost = { version = "0.14.4", optional = true }
 tokio = { version = "1.53.1", optional = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tonic = { version = "0.14.6", optional = true, default-features = false, features = ["codegen", "router", "transport"] }
 tonic-prost = { version = "0.14.6", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 cudarc = { version = "=0.19.9", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-11040"] }

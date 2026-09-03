@@ -82,6 +82,9 @@ impl OpusStreamWriter {
         track_lufs: f64,
         album_lufs: Option<f64>,
     ) -> Result<Self, String> {
+        if input_rate == 0 {
+            return Err("Opus input sample rate must be positive".into());
+        }
         let layout = opus_layout(channels, channel_roles)?;
         if bitrate_kbps <= 0 {
             return Err("Opus bitrate must be positive".into());
@@ -94,27 +97,11 @@ impl OpusStreamWriter {
             .get_lookahead()
             .map_err(|error| format!("query Opus look-ahead: {error}"))?
             .max(0) as usize;
-        let file =
-            File::create(path).map_err(|error| format!("create {}: {error}", path.display()))?;
-        let serial = NEXT_SERIAL.fetch_add(1, Ordering::Relaxed);
-        let mut packets = PacketWriter::new(BufWriter::new(file));
-        packets
-            .write_packet(
-                opus_head(channels, pre_skip as u16, input_rate, &layout),
-                serial,
-                PacketWriteEndInfo::EndPage,
-                0,
-            )
-            .map_err(|error| format!("write OpusHead: {error}"))?;
-        packets
-            .write_packet(
-                opus_tags(track_lufs, album_lufs),
-                serial,
-                PacketWriteEndInfo::EndPage,
-                0,
-            )
-            .map_err(|error| format!("write OpusTags: {error}"))?;
 
+        // Construct and validate every input-dependent component before
+        // opening the destination. In particular, a zero/unsupported input
+        // rate must neither truncate an existing file nor reach the frame
+        // count division below.
         let resampler = if input_rate == OPUS_RATE {
             None
         } else {
@@ -133,9 +120,24 @@ impl OpusStreamWriter {
         let resampler_delay = resampler
             .as_ref()
             .map_or(0, |resampler| resampler.output_delay());
-        let expected_output_frames = ((input_frames as u128 * OPUS_RATE as u128
-            + input_rate as u128 / 2)
-            / input_rate as u128) as u64;
+        let expected_output_frames = u64::try_from(
+            (input_frames as u128 * OPUS_RATE as u128 + input_rate as u128 / 2)
+                / input_rate as u128,
+        )
+        .map_err(|_| "Opus output frame count exceeds the supported range".to_string())?;
+        let head = opus_head(channels, pre_skip as u16, input_rate, &layout);
+        let tags = opus_tags(track_lufs, album_lufs);
+
+        let file =
+            File::create(path).map_err(|error| format!("create {}: {error}", path.display()))?;
+        let serial = NEXT_SERIAL.fetch_add(1, Ordering::Relaxed);
+        let mut packets = PacketWriter::new(BufWriter::new(file));
+        packets
+            .write_packet(head, serial, PacketWriteEndInfo::EndPage, 0)
+            .map_err(|error| format!("write OpusHead: {error}"))?;
+        packets
+            .write_packet(tags, serial, PacketWriteEndInfo::EndPage, 0)
+            .map_err(|error| format!("write OpusTags: {error}"))?;
         Ok(Self {
             packets,
             encoder,
@@ -383,7 +385,7 @@ where
         let info = StreamInfo {
             sample_rate: OPUS_RATE,
             channels: parsed.channels,
-            channel_roles: internal_channel_roles(parsed.channels),
+            channel_roles: internal_channel_roles(parsed.mapping_family, parsed.channels),
             source_kind: PcmKind::F32,
         };
         if let Some(primary) = &primary_info {
@@ -827,15 +829,16 @@ fn opus_layout(channels: u16, roles: &[ChannelRole]) -> Result<OpusLayout, Strin
             to_opus_order: (0..channels as usize).collect(),
         });
     }
+    let exact_roles = family_one_channel_roles(channels).expect("validated Opus channel count");
     if channels >= 7 {
         let layout_name = if channels == 7 { "6.1" } else { "7.1" };
-        if named_channel_layout(layout_name).as_deref() != Some(roles) {
+        if named_channel_layout(layout_name).as_deref() != Some(roles) && exact_roles != roles {
             return Err(format!(
                 "{channels}-channel Opus output requires the {layout_name} channel layout"
             ));
         }
     }
-    if channels < 7 && default_channel_roles(channels) != roles {
+    if channels < 7 && default_channel_roles(channels) != roles && exact_roles != roles {
         return Err(format!(
             "{channels}-channel Opus output requires the conventional channel layout"
         ));
@@ -877,13 +880,60 @@ fn invert_permutation(permutation: &[usize]) -> Vec<usize> {
     inverse
 }
 
-fn internal_channel_roles(channels: u16) -> Vec<ChannelRole> {
-    if channels >= 7 {
-        named_channel_layout(if channels == 7 { "6.1" } else { "7.1" })
-            .expect("built-in surround layout")
+/// Speaker roles that a stream created by [`OpusStreamWriter`] persists.
+///
+/// The writer uses mapping family 0 for mono/stereo and RFC 7845 mapping
+/// family 1 for 3 through 8 channels. Keep accepting the historical generic
+/// roles at the public writer boundary, but expose the exact post-decode roles
+/// so normalization can verify that a requested output preserves semantics.
+pub(crate) fn persisted_channel_roles(channels: u16) -> Option<Vec<ChannelRole>> {
+    family_one_channel_roles(channels)
+}
+
+fn internal_channel_roles(mapping_family: u8, channels: u16) -> Vec<ChannelRole> {
+    if mapping_family == 1 {
+        family_one_channel_roles(channels).expect("validated mapping-family-1 channel count")
     } else {
         default_channel_roles(channels)
     }
+}
+
+/// RFC 7845 section 5.1.1.2 speaker locations in Forge/WAVE channel order.
+/// Mono/stereo retain their unambiguous legacy representation so mapping
+/// families 0 and 1 remain interchangeable for those channel counts.
+/// Five-channel rear beds use the conventional +/-110 degree positions, which
+/// preserve the BS.1770 +1.5 dB weighting while remaining distinct from side
+/// speakers. Seven- and eight-channel layouts retain separate rear/side beds.
+fn family_one_channel_roles(channels: u16) -> Option<Vec<ChannelRole>> {
+    use ChannelRole::Lfe;
+    let p = ChannelRole::positioned;
+    Some(match channels {
+        1 | 2 => default_channel_roles(channels),
+        3 => vec![p(-30, 0), p(30, 0), p(0, 0)],
+        4 => vec![p(-30, 0), p(30, 0), p(-110, 0), p(110, 0)],
+        5 => vec![p(-30, 0), p(30, 0), p(0, 0), p(-110, 0), p(110, 0)],
+        6 => vec![p(-30, 0), p(30, 0), p(0, 0), Lfe, p(-110, 0), p(110, 0)],
+        7 => vec![
+            p(-30, 0),
+            p(30, 0),
+            p(0, 0),
+            Lfe,
+            p(180, 0),
+            p(-90, 0),
+            p(90, 0),
+        ],
+        8 => vec![
+            p(-30, 0),
+            p(30, 0),
+            p(0, 0),
+            Lfe,
+            p(-135, 0),
+            p(135, 0),
+            p(-90, 0),
+            p(90, 0),
+        ],
+        _ => return None,
+    })
 }
 
 enum OpusEncoder {
@@ -981,6 +1031,104 @@ mod tests {
         fn assert_traits<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
 
         assert_traits::<OpusStreamWriter>();
+    }
+
+    #[test]
+    fn invalid_writer_inputs_do_not_panic_or_modify_the_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing.opus");
+        let sentinel = b"existing destination";
+        let invalid_side_layout = crate::wav::reader::roles_from_wave_mask(0x060f, 6);
+        let cases = [
+            (0, 1, default_channel_roles(1), 64, "sample rate"),
+            (OPUS_RATE, 0, Vec::new(), 64, "requires 1 or 2 channels"),
+            (OPUS_RATE, 2, default_channel_roles(1), 64, "role count"),
+            (
+                OPUS_RATE,
+                6,
+                invalid_side_layout,
+                384,
+                "conventional channel layout",
+            ),
+            (OPUS_RATE, 1, default_channel_roles(1), 0, "positive"),
+        ];
+
+        for (input_rate, channels, roles, bitrate, diagnostic) in cases {
+            std::fs::write(&path, sentinel).unwrap();
+            let result = std::panic::catch_unwind(|| {
+                OpusStreamWriter::create(
+                    &path, input_rate, FRAME_SIZE, channels, &roles, bitrate, -18.0, None,
+                )
+                .err()
+            });
+            let error = result
+                .expect("invalid Opus writer input must not panic")
+                .expect("invalid Opus writer input must return an error");
+            assert!(error.contains(diagnostic), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), sentinel);
+        }
+    }
+
+    #[test]
+    fn mapping_family_one_roles_retain_rear_and_side_positions() {
+        assert_eq!(
+            internal_channel_roles(1, 1),
+            default_channel_roles(1),
+            "mapping-family-1 mono is semantically identical to family 0"
+        );
+        assert_eq!(
+            internal_channel_roles(1, 2),
+            default_channel_roles(2),
+            "mapping-family-1 stereo is semantically identical to family 0"
+        );
+        assert_eq!(persisted_channel_roles(2), Some(default_channel_roles(2)));
+        assert!(opus_layout(6, &default_channel_roles(6)).is_ok());
+        assert!(opus_layout(7, &named_channel_layout("6.1").unwrap()).is_ok());
+
+        let rear_five_one = family_one_channel_roles(6).unwrap();
+        assert_eq!(
+            rear_five_one,
+            crate::wav::reader::roles_from_wave_mask(0x003f, 6),
+            "RFC 7845 5.1 and the conventional rear-bed WAVE layout agree"
+        );
+        assert_ne!(
+            rear_five_one,
+            crate::wav::reader::roles_from_wave_mask(0x060f, 6),
+            "rear and side 5.1 beds must not collapse to the same roles"
+        );
+        assert_eq!(crate::dsp::lufs::channel_weight(rear_five_one[4]), 1.41);
+
+        let six_one = family_one_channel_roles(7).unwrap();
+        assert_eq!(six_one[4], ChannelRole::positioned(180, 0));
+        assert_eq!(six_one[5], ChannelRole::positioned(-90, 0));
+        assert_eq!(six_one[6], ChannelRole::positioned(90, 0));
+
+        let seven_one = family_one_channel_roles(8).unwrap();
+        assert_eq!(seven_one[4], ChannelRole::positioned(-135, 0));
+        assert_eq!(seven_one[5], ChannelRole::positioned(135, 0));
+        assert_eq!(seven_one[6], ChannelRole::positioned(-90, 0));
+        assert_eq!(seven_one[7], ChannelRole::positioned(90, 0));
+    }
+
+    #[test]
+    fn six_channel_writer_round_trips_exact_mapping_family_one_roles() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("exact-roles.opus");
+        let roles = persisted_channel_roles(6).unwrap();
+        let mut writer =
+            OpusStreamWriter::create(&path, OPUS_RATE, FRAME_SIZE, 6, &roles, 384, -18.0, None)
+                .unwrap();
+        writer.write_chunk(&vec![vec![0.0; FRAME_SIZE]; 6]).unwrap();
+        writer.finish().unwrap();
+
+        let mut callback_roles = None;
+        let info = decode_stream(&path, |info, _| {
+            callback_roles.get_or_insert_with(|| info.channel_roles.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(info.channel_roles, roles);
+        assert_eq!(callback_roles, Some(roles));
     }
 
     #[test]

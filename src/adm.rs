@@ -1592,8 +1592,12 @@ fn validate_chna(input: &Path, parsed: &ParsedAdm) -> Result<Vec<AdmProfileRule>
         return Ok(rules);
     }
 
-    let channels = crate::wav::WavReader::probe(input)
+    // CHNA validation only needs the PCM track count. Speaker semantics are
+    // supplied by ADM rather than a WAVE channel mask, so maskless
+    // multichannel BW64 must remain inspectable here.
+    let channels = crate::wav::WavReader::probe_with_layout(input)
         .map_err(|error| format!("probe {} for chna validation: {error}", input.display()))?
+        .0
         .channels;
     rules.push(AdmProfileRule {
         rule_id: "BS2076-3-CHNA-TRACK-COUNT",
@@ -1788,7 +1792,8 @@ fn render_config_value() -> Value {
 mod tests {
     use super::*;
     use crate::wav::{
-        default_channel_roles, AudioBuffer, PcmKind, WavContainer, WavWriter, WaveChunk,
+        default_channel_roles, AudioBuffer, ChannelRole, PcmKind, WavContainer, WavWriter,
+        WaveChunk,
     };
 
     fn write_adm_fixture(path: &Path, axml: &[u8]) {
@@ -1879,6 +1884,47 @@ mod tests {
                 && rule.passed
                 && rule.observed.contains("3 record slot(s)")
         }));
+    }
+
+    #[test]
+    fn chna_track_count_accepts_maskless_multichannel_bw64() {
+        let work = tempfile::tempdir().unwrap();
+        let input = work.path().join("maskless-adm.bw64");
+        let channels = 6_u16;
+        let buffer = AudioBuffer {
+            sample_rate: 48_000,
+            channels,
+            frames: 8,
+            data: vec![vec![0.0; 8]; usize::from(channels)],
+            channel_roles: vec![ChannelRole::Main; usize::from(channels)],
+            source_kind: PcmKind::F32,
+        };
+        let mut chna = Vec::with_capacity(4 + usize::from(channels) * 40);
+        chna.extend_from_slice(&channels.to_le_bytes());
+        chna.extend_from_slice(&channels.to_le_bytes());
+        for track in 1..=channels {
+            chna.extend_from_slice(&track.to_le_bytes());
+            chna.extend_from_slice(format!("ATU_{track:08x}").as_bytes());
+            chna.extend_from_slice(&[0; 14]);
+            chna.extend_from_slice(&[0; 11]);
+            chna.push(0);
+        }
+        WavWriter::write_with_metadata(
+            &input,
+            &buffer,
+            PcmKind::F32,
+            false,
+            WavContainer::Bw64,
+            &[WaveChunk {
+                id: *b"chna",
+                body: chna,
+            }],
+        )
+        .unwrap();
+
+        assert!(crate::wav::WavReader::probe(&input).is_err());
+        let rules = validate_chna(&input, &ParsedAdm::default()).unwrap();
+        assert!(rules.iter().all(|rule| rule.passed), "{rules:#?}");
     }
 
     #[test]

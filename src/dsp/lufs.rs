@@ -24,7 +24,7 @@ use crate::dsp::kwfilter::KWeightPair;
 #[cfg(target_arch = "x86_64")]
 use crate::dsp::kwfilter::KWeightQuad;
 use crate::dsp::simd;
-use crate::dsp::truepeak::TruePeakMeter;
+use crate::dsp::truepeak::{oversample_factor, TruePeakMeter, TAPS_PER_PHASE};
 use crate::wav::{AudioBuffer, ChannelRole};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -41,6 +41,55 @@ pub const MAX_LOUDNESS_TIMELINE_POINTS: usize = 1_000_000;
 /// Avoid scheduling channel-pair tasks for short decoder packets where task
 /// coordination costs more than the true-peak interpolation work.
 const MIN_PARALLEL_TRUE_PEAK_FRAMES: usize = 16_384;
+
+fn should_parallelize_stereo_true_peak(
+    sample_rate: u32,
+    channel_count: usize,
+    chunk_frames: usize,
+    has_timeline: bool,
+    worker_threads: usize,
+) -> bool {
+    !has_timeline
+        && channel_count == 2
+        && oversample_factor(sample_rate) > 4
+        && chunk_frames >= MIN_PARALLEL_TRUE_PEAK_FRAMES
+        && worker_threads > 1
+}
+
+/// EBU Tech 3342 requires at least 1.5 seconds of post-signal silence before
+/// determining the final LRA of a finite file. Round up at odd sample rates so
+/// the appended duration is never shorter than the specified minimum.
+fn lra_tail_frames(sample_rate: u32) -> usize {
+    (sample_rate as usize).saturating_mul(3).div_ceil(2)
+}
+
+fn lra_tail_block_reserve(sample_rate: u32) -> usize {
+    let hop = (sample_rate as usize / 10).max(1);
+    lra_tail_frames(sample_rate).div_ceil(hop)
+}
+
+fn record_program_short_term_block(
+    sample_rate: u32,
+    blocks: &mut Vec<f64>,
+    next_block_frame: &mut usize,
+    sum: f64,
+    window: usize,
+    hop: usize,
+) -> Result<(), String> {
+    // `StreamingAnalyzer::finish` cannot report a capacity error, so reserve
+    // the maximum number of 100 ms-grid blocks that its mandatory 1.5 s LRA
+    // tail can add. Exceeding the public bound then fails during `process`
+    // instead of silently omitting the tail at end of file.
+    let program_limit = MAX_LOUDNESS_BLOCKS.saturating_sub(lra_tail_block_reserve(sample_rate));
+    if blocks.len() >= program_limit {
+        return Err(format!(
+            "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-short-term-block limit including the finite-file tail"
+        ));
+    }
+    blocks.push(sum / window as f64);
+    *next_block_frame = next_block_frame.saturating_add(hop);
+    Ok(())
+}
 
 const TRUE_PEAK_BACKEND_CPU: u8 = 0;
 #[cfg(all(
@@ -300,6 +349,10 @@ pub struct StreamingAnalyzer {
     timeline_start_frame: usize,
     interval_sample_peak: f32,
     interval_true_peak: f32,
+    // A finite true-peak measurement advances the FIR with 15 zero samples at
+    // EOF. Retain only the history needed to attribute that response to the
+    // final timeline interval; ordinary non-timeline analysis pays no cost.
+    timeline_true_peak_tail: Vec<Vec<f32>>,
 }
 
 impl StreamingAnalyzer {
@@ -356,7 +409,7 @@ impl StreamingAnalyzer {
             #[cfg(target_arch = "x86_64")]
             kweight_quads,
             true_peak_meters: (0..channels)
-                .map(|_| TruePeakMeter::for_sample_rate(sample_rate))
+                .map(|_| TruePeakMeter::for_finite_sample_rate(sample_rate))
                 .collect(),
             #[cfg(all(
                 feature = "cuda-truepeak",
@@ -381,6 +434,13 @@ impl StreamingAnalyzer {
             timeline_start_frame: 0,
             interval_sample_peak: 0.0,
             interval_true_peak: 0.0,
+            timeline_true_peak_tail: interval_frames
+                .map(|_| {
+                    (0..channels)
+                        .map(|_| Vec::with_capacity(TAPS_PER_PHASE - 1))
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -433,19 +493,17 @@ impl StreamingAnalyzer {
             self.finish_cuda_true_peak(planar);
             return result;
         }
-        // True-peak interpolation and loudness/RMS accumulation have no
-        // shared mutable state. For a long stereo chunk, let the global pool
-        // advance both exact peak meters while this worker retains the
-        // established K-weighting, window, and gating order. Short decoder
-        // packets keep the fused loop so task coordination cannot dominate.
-        // At 192 kHz and above True Peak is the sample peak already collected
-        // by the loudness pass, so a second task would only duplicate work.
-        if self.timeline_interval_frames.is_none()
-            && planar.len() == 2
-            && self.sample_rate < 192_000
-            && chunk_frames >= MIN_PARALLEL_TRUE_PEAK_FRAMES
-            && rayon::current_num_threads() > 1
-        {
+        // Measured 2x/4x interpolation is faster in the fused stereo SIMD loop:
+        // Rayon task overhead and a separate PCM pass cost more than they save.
+        // Ratios above 4x retain the benchmark-gated long-chunk split because
+        // their additional interpolation work can amortize those costs.
+        if should_parallelize_stereo_true_peak(
+            self.sample_rate,
+            planar.len(),
+            chunk_frames,
+            self.timeline_interval_frames.is_some(),
+            rayon::current_num_threads(),
+        ) {
             let mut true_peak_meters = std::mem::take(&mut self.true_peak_meters);
             let ((), result) = rayon::join(
                 || process_true_peak_channel_group(&mut true_peak_meters, planar),
@@ -553,15 +611,14 @@ impl StreamingAnalyzer {
                         self.next_momentary_block_frame.saturating_add(hop);
                 }
                 if self.frames == self.next_short_term_block_frame {
-                    if self.short_term_blocks.len() == MAX_LOUDNESS_BLOCKS {
-                        return Err(format!(
-                            "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-short-term-block limit"
-                        ));
-                    }
-                    self.short_term_blocks
-                        .push(self.short_term_sum / short_term_window as f64);
-                    self.next_short_term_block_frame =
-                        self.next_short_term_block_frame.saturating_add(hop);
+                    record_program_short_term_block(
+                        self.sample_rate,
+                        &mut self.short_term_blocks,
+                        &mut self.next_short_term_block_frame,
+                        self.short_term_sum,
+                        short_term_window,
+                        hop,
+                    )?;
                 }
             }
             return Ok(());
@@ -620,15 +677,14 @@ impl StreamingAnalyzer {
                         self.next_momentary_block_frame.saturating_add(hop);
                 }
                 if self.frames == self.next_short_term_block_frame {
-                    if self.short_term_blocks.len() == MAX_LOUDNESS_BLOCKS {
-                        return Err(format!(
-                            "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-short-term-block limit"
-                        ));
-                    }
-                    self.short_term_blocks
-                        .push(self.short_term_sum / short_term_window as f64);
-                    self.next_short_term_block_frame =
-                        self.next_short_term_block_frame.saturating_add(hop);
+                    record_program_short_term_block(
+                        self.sample_rate,
+                        &mut self.short_term_blocks,
+                        &mut self.next_short_term_block_frame,
+                        self.short_term_sum,
+                        short_term_window,
+                        hop,
+                    )?;
                 }
             }
             return Ok(());
@@ -669,15 +725,14 @@ impl StreamingAnalyzer {
                     self.next_momentary_block_frame.saturating_add(hop);
             }
             if self.frames == self.next_short_term_block_frame {
-                if self.short_term_blocks.len() == MAX_LOUDNESS_BLOCKS {
-                    return Err(format!(
-                        "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-short-term-block limit"
-                    ));
-                }
-                self.short_term_blocks
-                    .push(self.short_term_sum / short_term_window as f64);
-                self.next_short_term_block_frame =
-                    self.next_short_term_block_frame.saturating_add(hop);
+                record_program_short_term_block(
+                    self.sample_rate,
+                    &mut self.short_term_blocks,
+                    &mut self.next_short_term_block_frame,
+                    self.short_term_sum,
+                    short_term_window,
+                    hop,
+                )?;
             }
             if self
                 .timeline_interval_frames
@@ -692,6 +747,7 @@ impl StreamingAnalyzer {
                 self.record_timeline_point(momentary_window, short_term_window);
             }
         }
+        self.remember_timeline_true_peak_tail(planar);
         Ok(())
     }
 
@@ -711,7 +767,7 @@ impl StreamingAnalyzer {
                 if !CudaTruePeakWorker::eligible(self.sample_rate, planar.len(), frames) {
                     return false;
                 }
-                match CudaTruePeakWorker::new(self.sample_rate, planar.len(), frames) {
+                match CudaTruePeakWorker::new_finite(self.sample_rate, planar.len(), frames) {
                     Ok(mut worker) => match worker.begin_chunk(planar) {
                         Ok(()) => {
                             self.cuda_true_peak = CudaTruePeakState::Active(Box::new(worker));
@@ -832,15 +888,14 @@ impl StreamingAnalyzer {
                         self.next_momentary_block_frame.saturating_add(hop);
                 }
                 if self.frames == self.next_short_term_block_frame {
-                    if self.short_term_blocks.len() == MAX_LOUDNESS_BLOCKS {
-                        return Err(format!(
-                            "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-short-term-block limit"
-                        ));
-                    }
-                    self.short_term_blocks
-                        .push(self.short_term_sum / short_term_window as f64);
-                    self.next_short_term_block_frame =
-                        self.next_short_term_block_frame.saturating_add(hop);
+                    record_program_short_term_block(
+                        self.sample_rate,
+                        &mut self.short_term_blocks,
+                        &mut self.next_short_term_block_frame,
+                        self.short_term_sum,
+                        short_term_window,
+                        hop,
+                    )?;
                 }
             }
             return Ok(());
@@ -891,19 +946,119 @@ impl StreamingAnalyzer {
             self.next_momentary_block_frame = self.next_momentary_block_frame.saturating_add(hop);
         }
         if self.frames == self.next_short_term_block_frame {
-            if self.short_term_blocks.len() == MAX_LOUDNESS_BLOCKS {
-                return Err(format!(
-                    "loudness analysis exceeds the {MAX_LOUDNESS_BLOCKS}-short-term-block limit"
-                ));
-            }
-            self.short_term_blocks
-                .push(self.short_term_sum / short_term_window as f64);
-            self.next_short_term_block_frame = self.next_short_term_block_frame.saturating_add(hop);
+            record_program_short_term_block(
+                self.sample_rate,
+                &mut self.short_term_blocks,
+                &mut self.next_short_term_block_frame,
+                self.short_term_sum,
+                short_term_window,
+                hop,
+            )?;
         }
         Ok(())
     }
 
-    pub fn finish(mut self) -> StreamingMeasurements {
+    /// Advance only the K-weighting and the 3 s short-term window through the
+    /// post-signal silence required by EBU Tech 3342. Programme duration,
+    /// integrated-loudness blocks, RMS/peaks, maxima, and timeline state are
+    /// deliberately not advanced.
+    fn append_finite_lra_tail(&mut self) {
+        if self.frames == 0 {
+            return;
+        }
+        let tail_frames = lra_tail_frames(self.sample_rate);
+        let short_term_window = (self.sample_rate as usize * 3).max(1);
+        let hop = (self.sample_rate as usize / 10).max(1);
+        let mut lra_frame = self.frames;
+        for _ in 0..tail_frames {
+            let weighted = self.process_kweighted_silence_frame();
+            self.windows
+                .push(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
+            lra_frame = lra_frame.saturating_add(1);
+            if lra_frame == self.next_short_term_block_frame {
+                assert!(
+                    self.short_term_blocks.len() < MAX_LOUDNESS_BLOCKS,
+                    "finite-file LRA tail capacity must be reserved during processing"
+                );
+                self.short_term_blocks
+                    .push(self.short_term_sum / short_term_window as f64);
+                self.next_short_term_block_frame =
+                    self.next_short_term_block_frame.saturating_add(hop);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn process_kweighted_silence_frame(&mut self) -> f64 {
+        if self.timeline_interval_frames.is_none() && self.roles.len() == 2 {
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            {
+                let filtered = self
+                    .kweight_pair
+                    .as_mut()
+                    .expect("non-timeline stereo analyzer owns paired K-weighting state")
+                    .process([0.0, 0.0]);
+                return channel_weight(self.roles[0])
+                    * f64::from(filtered[0])
+                    * f64::from(filtered[0])
+                    + channel_weight(self.roles[1])
+                        * f64::from(filtered[1])
+                        * f64::from(filtered[1]);
+            }
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            {
+                let filtered0 = f64::from(self.filters[0].process(0.0));
+                let filtered1 = f64::from(self.filters[1].process(0.0));
+                return channel_weight(self.roles[0]) * filtered0 * filtered0
+                    + channel_weight(self.roles[1]) * filtered1 * filtered1;
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if self.timeline_interval_frames.is_none() && self.roles.len() >= 4 {
+            if let Some(quads) = self.kweight_quads.as_mut() {
+                let mut weighted = 0.0;
+                let mut channel = 0;
+                for quad in quads {
+                    let filtered = quad.process([0.0; 4]);
+                    for (lane, value) in filtered.into_iter().enumerate() {
+                        let value = f64::from(value);
+                        weighted += channel_weight(self.roles[channel + lane]) * value * value;
+                    }
+                    channel += 4;
+                }
+                for index in channel..self.filters.len() {
+                    let value = f64::from(self.filters[index].process(0.0));
+                    weighted += channel_weight(self.roles[index]) * value * value;
+                }
+                return weighted;
+            }
+        }
+
+        self.filters
+            .iter_mut()
+            .zip(self.roles.iter().copied())
+            .fold(0.0, |weighted, (filter, role)| {
+                let value = f64::from(filter.process(0.0));
+                weighted + channel_weight(role) * value * value
+            })
+    }
+
+    /// Finish a complete programme measurement, including the EBU Tech 3342
+    /// finite-file silence required for Loudness Range.
+    pub fn finish(self) -> StreamingMeasurements {
+        self.finish_impl(true)
+    }
+
+    /// Finish a selected region when its LRA is not consumed by the caller.
+    /// Integrated loudness, energy, duration, RMS, peaks, gating blocks, and
+    /// timeline semantics are identical to [`Self::finish`].
+    pub(crate) fn finish_without_lra_tail(self) -> StreamingMeasurements {
+        self.finish_impl(false)
+    }
+
+    fn finish_impl(mut self, append_lra_tail: bool) -> StreamingMeasurements {
+        self.merge_finite_true_peak_tail_into_timeline();
         if self.timeline_interval_frames.is_some() && self.timeline_start_frame < self.frames {
             let momentary_window = ((self.sample_rate as usize * 4) / 10).max(1);
             let short_term_window = (self.sample_rate as usize * 3).max(1);
@@ -916,24 +1071,31 @@ impl StreamingAnalyzer {
         } else {
             (self.raw_sum_squares / total_samples as f64).sqrt()
         };
-        let cpu_true_peak = self
-            .true_peak_meters
-            .iter()
-            .map(TruePeakMeter::peak)
-            .fold(0.0, f32::max);
         #[cfg(all(
             feature = "cuda-truepeak",
             any(target_os = "linux", target_os = "windows")
         ))]
-        let true_peak = match &self.cuda_true_peak {
-            CudaTruePeakState::Active(worker) => worker.peak(),
-            CudaTruePeakState::Disabled | CudaTruePeakState::Pending => cpu_true_peak,
-        };
+        let true_peak =
+            match std::mem::replace(&mut self.cuda_true_peak, CudaTruePeakState::Disabled) {
+                CudaTruePeakState::Active(worker) => worker.finish_peak(),
+                CudaTruePeakState::Disabled | CudaTruePeakState::Pending => {
+                    std::mem::take(&mut self.true_peak_meters)
+                        .into_iter()
+                        .map(TruePeakMeter::finish_peak)
+                        .fold(0.0, f32::max)
+                }
+            };
         #[cfg(not(all(
             feature = "cuda-truepeak",
             any(target_os = "linux", target_os = "windows")
         )))]
-        let true_peak = cpu_true_peak;
+        let true_peak = std::mem::take(&mut self.true_peak_meters)
+            .into_iter()
+            .map(TruePeakMeter::finish_peak)
+            .fold(0.0, f32::max);
+        if append_lra_tail {
+            self.append_finite_lra_tail();
+        }
         let mut ebu = measurements_from_blocks(self.gating_blocks, &self.short_term_blocks);
         let momentary_window = ((self.sample_rate as usize * 4) / 10).max(1);
         let short_term_window = (self.sample_rate as usize * 3).max(1);
@@ -957,6 +1119,47 @@ impl StreamingAnalyzer {
             sample_peak: self.sample_peak,
             true_peak,
             timeline: self.timeline,
+        }
+    }
+
+    fn remember_timeline_true_peak_tail(&mut self, planar: &[Vec<f32>]) {
+        for (tail, samples) in self.timeline_true_peak_tail.iter_mut().zip(planar) {
+            let retained = TAPS_PER_PHASE - 1;
+            if samples.len() >= retained {
+                tail.clear();
+                tail.extend_from_slice(&samples[samples.len() - retained..]);
+            } else {
+                let expired = tail
+                    .len()
+                    .saturating_add(samples.len())
+                    .saturating_sub(retained);
+                tail.drain(..expired);
+                tail.extend_from_slice(samples);
+            }
+        }
+    }
+
+    fn finite_true_peak_tail(&self) -> f32 {
+        self.timeline_true_peak_tail
+            .iter()
+            .map(|samples| {
+                TruePeakMeter::finite_tail_peak_from_recent_samples(self.sample_rate, samples)
+            })
+            .fold(0.0, f32::max)
+    }
+
+    fn merge_finite_true_peak_tail_into_timeline(&mut self) {
+        if self.frames == 0 || self.timeline_interval_frames.is_none() {
+            return;
+        }
+        let tail_peak = self.finite_true_peak_tail();
+        if self.timeline_start_frame < self.frames {
+            self.interval_true_peak = self.interval_true_peak.max(tail_peak);
+        } else if let Some(last) = self.timeline.last_mut() {
+            // An exact interval boundary was recorded in `process`; EOF still
+            // belongs to that final interval even though no partial point is
+            // waiting to be emitted.
+            last.true_peak_dbtp = last.true_peak_dbtp.max(amplitude_db(tail_peak));
         }
     }
 
@@ -1143,10 +1346,13 @@ pub fn measure_blocks(buf: &AudioBuffer) -> Vec<f64> {
 /// Complete EBU Mode file measurement.
 pub fn measure_ebu(buf: &AudioBuffer) -> EbuMeasurements {
     let fs = buf.sample_rate as usize;
-    let momentary_window = (0.4 * fs as f64).round() as usize;
-    let short_term_window = (3.0 * fs as f64).round() as usize;
-    let hop = (0.1 * fs as f64).round() as usize;
-    if momentary_window == 0 || hop == 0 || buf.frames < momentary_window {
+    // Match the streaming clock exactly, including for sample rates that are
+    // not divisible by 10. A rational 100 ms clock can replace both paths in
+    // one coordinated change without introducing batch/stream disagreement.
+    let momentary_window = ((fs * 4) / 10).max(1);
+    let short_term_window = (fs * 3).max(1);
+    let hop = (fs / 10).max(1);
+    if buf.frames < momentary_window {
         return EbuMeasurements {
             integrated_lufs: f64::NEG_INFINITY,
             max_momentary_lufs: f64::NEG_INFINITY,
@@ -1156,19 +1362,27 @@ pub fn measure_ebu(buf: &AudioBuffer) -> EbuMeasurements {
         };
     }
 
-    // K-weight each channel (parallel) and build prefix sums of squares.
+    let tail_frames = lra_tail_frames(buf.sample_rate);
+    let lra_frames = buf.frames.saturating_add(tail_frames);
+
+    // K-weight each channel (parallel) and build prefix sums of squares. The
+    // extra 1.5 s of filter output is visible only to the LRA population below;
+    // all other file measurements remain bounded by `buf.frames`.
     let prefixes: Vec<Vec<f64>> = buf
         .data
         .par_iter()
         .map(|ch| {
             let mut kw = KWeight::for_sample_rate(buf.sample_rate);
-            let mut filt = vec![0.0f32; ch.len()];
-            kw.process_block(ch, &mut filt);
-            let mut p = Vec::with_capacity(ch.len() + 1);
+            let mut p = Vec::with_capacity(ch.len().saturating_add(tail_frames).saturating_add(1));
             p.push(0.0);
             let mut acc = 0.0f64;
-            for &x in &filt {
-                let v = x as f64;
+            for &sample in ch {
+                let v = f64::from(kw.process(sample));
+                acc += v * v;
+                p.push(acc);
+            }
+            for _ in 0..tail_frames {
+                let v = f64::from(kw.process(0.0));
                 acc += v * v;
                 p.push(acc);
             }
@@ -1182,7 +1396,7 @@ pub fn measure_ebu(buf: &AudioBuffer) -> EbuMeasurements {
 
     let gating_blocks = window_mean_squares(&prefixes, &weights, buf.frames, momentary_window, hop);
     let short_term_blocks =
-        window_mean_squares(&prefixes, &weights, buf.frames, short_term_window, hop);
+        window_mean_squares(&prefixes, &weights, lra_frames, short_term_window, hop);
 
     let mut measurements = measurements_from_blocks(gating_blocks, &short_term_blocks);
     measurements.max_momentary_lufs =
@@ -1447,19 +1661,22 @@ pub fn loudness_range(short_term_ms: &[f64]) -> f64 {
         return 0.0;
     }
     gated.sort_by(f64::total_cmp);
-    percentile(&gated, 0.95) - percentile(&gated, 0.10)
+    rank_percentile(&gated, 95) - rank_percentile(&gated, 10)
 }
 
 fn mean_square_to_lufs(value: f64) -> f64 {
     -0.691 + 10.0 * value.log10()
 }
 
-fn percentile(sorted: &[f64], fraction: f64) -> f64 {
-    let position = fraction * (sorted.len() - 1) as f64;
-    let lower = position.floor() as usize;
-    let upper = position.ceil() as usize;
-    let mix = position - lower as f64;
-    sorted[lower] * (1.0 - mix) + sorted[upper] * mix
+fn rank_percentile(sorted: &[f64], percent: usize) -> f64 {
+    debug_assert!(!sorted.is_empty());
+    debug_assert!(percent <= 100);
+    // EBU Tech 3342's published MATLAB example selects (one-based)
+    // round((n - 1) * p / 100 + 1). For positive values MATLAB rounds a half
+    // upward, so adding 50 before integer division gives the exact zero-based
+    // rank without introducing a floating-point tie ambiguity.
+    let rank = ((sorted.len() - 1) * percent + 50) / 100;
+    sorted[rank]
 }
 
 /// RMS level (dBFS) and sample peak (0..1) across all channels, computed in
@@ -1499,6 +1716,65 @@ mod tests {
             channel_roles: vec![ChannelRole::Main],
             source_kind: PcmKind::F32,
         }
+    }
+
+    #[test]
+    fn stereo_true_peak_parallel_policy_uses_measured_oversampling_boundary() {
+        let eligible = |sample_rate| {
+            should_parallelize_stereo_true_peak(
+                sample_rate,
+                2,
+                MIN_PARALLEL_TRUE_PEAK_FRAMES,
+                false,
+                2,
+            )
+        };
+        assert!(
+            eligible(44_100),
+            "5x interpolation should use the split pass"
+        );
+        assert!(
+            eligible(32_000),
+            "6x interpolation should use the split pass"
+        );
+        assert!(!eligible(48_000), "4x interpolation should stay fused");
+        assert!(!eligible(64_000), "3x interpolation should stay fused");
+
+        assert!(!should_parallelize_stereo_true_peak(
+            44_100,
+            2,
+            MIN_PARALLEL_TRUE_PEAK_FRAMES,
+            true,
+            2,
+        ));
+        assert!(!should_parallelize_stereo_true_peak(
+            44_100,
+            2,
+            MIN_PARALLEL_TRUE_PEAK_FRAMES - 1,
+            false,
+            2,
+        ));
+        assert!(should_parallelize_stereo_true_peak(
+            44_100,
+            2,
+            MIN_PARALLEL_TRUE_PEAK_FRAMES,
+            false,
+            2,
+        ));
+        assert!(!should_parallelize_stereo_true_peak(
+            44_100,
+            2,
+            MIN_PARALLEL_TRUE_PEAK_FRAMES,
+            false,
+            1,
+        ));
+        assert!(!should_parallelize_stereo_true_peak(
+            44_100,
+            1,
+            MIN_PARALLEL_TRUE_PEAK_FRAMES,
+            false,
+            2,
+        ));
     }
 
     #[test]
@@ -1683,7 +1959,7 @@ mod tests {
     }
 
     #[test]
-    fn loudness_range_uses_tenth_and_ninety_fifth_percentiles() {
+    fn loudness_range_uses_tenth_and_ninety_fifth_rank_percentiles() {
         let blocks: Vec<f64> = (0..=100)
             .map(|step| {
                 let lufs = -30.0 + step as f64 / 10.0;
@@ -1692,6 +1968,291 @@ mod tests {
             .collect();
         let range = loudness_range(&blocks);
         assert!((range - 8.5).abs() < 0.01, "LRA = {range}");
+
+        // Tech 3342 selects an observed rank; it does not linearly interpolate
+        // between adjacent loudness levels. With four values, the 10th and
+        // 95th percentile ranks are the first and fourth values respectively.
+        let sparse: Vec<f64> = [-30.0, -29.0, -28.0, -27.0]
+            .into_iter()
+            .map(|lufs| 10.0_f64.powf((lufs + 0.691) / 10.0))
+            .collect();
+        assert!((loudness_range(&sparse) - 3.0).abs() < 1.0e-12);
+
+        // MATLAB rounds positive half-way ranks upward.
+        assert_eq!(rank_percentile(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0], 10), 1.0);
+        assert_eq!(rank_percentile(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0], 95), 5.0);
+    }
+
+    #[test]
+    fn loudness_range_includes_blocks_exactly_on_both_gates() {
+        let absolute_gate = 10.0_f64.powf((-70.0 + 0.691) / 10.0);
+        let one_lu_above = absolute_gate * 10.0_f64.powf(0.1);
+        assert!((loudness_range(&[absolute_gate, one_lu_above]) - 1.0).abs() < 1.0e-12);
+
+        // mean([threshold, 199 * threshold]) / 100 == threshold, so the
+        // quieter block lies exactly on the Tech 3342 -20 LU relative gate.
+        let threshold = 2.0_f64.powi(-18);
+        let loud = 199.0 * threshold;
+        assert_eq!((threshold + loud) / 2.0 / 100.0, threshold);
+        let expected = 10.0 * 199.0_f64.log10();
+        assert!((loudness_range(&[threshold, loud]) - expected).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn finite_lra_tail_advances_only_the_lra_state() {
+        let sample_rate = 8_000;
+        let samples = (0..2 * sample_rate as usize)
+            .map(|frame| {
+                let amplitude = if frame < sample_rate as usize {
+                    0.08
+                } else {
+                    0.4
+                };
+                ((frame as f64 * 0.37).sin() * amplitude) as f32
+            })
+            .collect::<Vec<_>>();
+        let mut analyzer = StreamingAnalyzer::with_timeline_interval(
+            sample_rate,
+            vec![ChannelRole::Main],
+            Some(800),
+        );
+        for chunk in samples.chunks(137) {
+            analyzer.process(&[chunk.to_vec()]).unwrap();
+        }
+
+        let frames = analyzer.frames;
+        let raw_sum_squares = analyzer.raw_sum_squares;
+        let weighted_sum_squares = analyzer.weighted_sum_squares;
+        let sample_peak = analyzer.sample_peak;
+        let true_peak = analyzer.true_peak_meters[0].peak();
+        let gating_blocks = analyzer.gating_blocks.clone();
+        let max_momentary_sum = analyzer.max_momentary_sum;
+        let max_short_term_sum = analyzer.max_short_term_sum;
+        let timeline = analyzer
+            .timeline
+            .iter()
+            .map(|point| (point.start_seconds, point.end_seconds))
+            .collect::<Vec<_>>();
+        assert!(analyzer.short_term_blocks.is_empty());
+
+        analyzer.append_finite_lra_tail();
+
+        assert_eq!(analyzer.short_term_blocks.len(), 6);
+        let tail_lra = loudness_range(&analyzer.short_term_blocks);
+        assert!(
+            tail_lra > 0.01,
+            "LRA {tail_lra}, blocks {:?}",
+            analyzer.short_term_blocks
+        );
+        assert_eq!(analyzer.frames, frames);
+        assert_eq!(
+            analyzer.raw_sum_squares.to_bits(),
+            raw_sum_squares.to_bits()
+        );
+        assert_eq!(
+            analyzer.weighted_sum_squares.to_bits(),
+            weighted_sum_squares.to_bits()
+        );
+        assert_eq!(analyzer.sample_peak.to_bits(), sample_peak.to_bits());
+        assert_eq!(
+            analyzer.true_peak_meters[0].peak().to_bits(),
+            true_peak.to_bits()
+        );
+        assert_eq!(analyzer.gating_blocks, gating_blocks);
+        assert_eq!(
+            analyzer.max_momentary_sum.to_bits(),
+            max_momentary_sum.to_bits()
+        );
+        assert_eq!(
+            analyzer.max_short_term_sum.to_bits(),
+            max_short_term_sum.to_bits()
+        );
+        assert_eq!(
+            analyzer
+                .timeline
+                .iter()
+                .map(|point| (point.start_seconds, point.end_seconds))
+                .collect::<Vec<_>>(),
+            timeline
+        );
+    }
+
+    #[test]
+    fn dialogue_finish_skips_lra_tail_and_preserves_consumed_measurements() {
+        let sample_rate = 8_000;
+        let samples = (0..2 * sample_rate as usize)
+            .map(|frame| {
+                let amplitude = if frame < sample_rate as usize {
+                    0.08
+                } else {
+                    0.4
+                };
+                ((frame as f64 * 0.37).sin() * amplitude) as f32
+            })
+            .collect::<Vec<_>>();
+        let analyze = || {
+            let mut analyzer = StreamingAnalyzer::new(sample_rate, vec![ChannelRole::Main]);
+            for chunk in samples.chunks(137) {
+                analyzer.process(&[chunk.to_vec()]).unwrap();
+            }
+            analyzer
+        };
+
+        let regular = analyze().finish();
+        let dialogue = analyze().finish_without_lra_tail();
+
+        assert!(regular.ebu.loudness_range_lu > 0.01);
+        assert_eq!(dialogue.ebu.loudness_range_lu, 0.0);
+        assert_eq!(dialogue.frames, regular.frames);
+        assert_eq!(
+            dialogue.weighted_mean_square.to_bits(),
+            regular.weighted_mean_square.to_bits()
+        );
+        assert_eq!(dialogue.ebu.gating_blocks, regular.ebu.gating_blocks);
+        assert_eq!(dialogue.rms_db.to_bits(), regular.rms_db.to_bits());
+        assert_eq!(
+            dialogue.sample_peak.to_bits(),
+            regular.sample_peak.to_bits()
+        );
+        assert_eq!(dialogue.true_peak.to_bits(), regular.true_peak.to_bits());
+    }
+
+    #[test]
+    fn finite_lra_tail_rounds_up_at_odd_sample_rates_and_handles_short_input() {
+        let sample_rate = 11_025;
+        let tail = lra_tail_frames(sample_rate);
+        let short_term_window = sample_rate as usize * 3;
+        assert_eq!(tail, 16_538);
+
+        let measure_block_count = |frames| {
+            let mut analyzer = StreamingAnalyzer::new(sample_rate, vec![ChannelRole::Main]);
+            for chunk in vec![0.1; frames].chunks(997) {
+                analyzer.process(&[chunk.to_vec()]).unwrap();
+            }
+            analyzer.append_finite_lra_tail();
+            analyzer.short_term_blocks.len()
+        };
+        assert_eq!(measure_block_count(0), 0);
+        assert_eq!(measure_block_count(short_term_window - tail - 1), 0);
+        assert_eq!(measure_block_count(short_term_window - tail), 1);
+    }
+
+    #[test]
+    fn finite_lra_tail_capacity_is_reserved_before_finish() {
+        let sample_rate = 1_000;
+        let reserve = lra_tail_block_reserve(sample_rate);
+        assert_eq!(reserve, 15);
+        let program_limit = MAX_LOUDNESS_BLOCKS - reserve;
+        let mut blocks = vec![0.0; program_limit];
+        let mut next = 3_000;
+        let error =
+            record_program_short_term_block(sample_rate, &mut blocks, &mut next, 0.0, 3_000, 100)
+                .unwrap_err();
+        assert!(error.contains("including the finite-file tail"));
+        assert_eq!(blocks.len(), program_limit);
+
+        blocks.pop();
+        record_program_short_term_block(sample_rate, &mut blocks, &mut next, 0.0, 3_000, 100)
+            .unwrap();
+        assert_eq!(blocks.len(), program_limit);
+    }
+
+    #[test]
+    fn odd_rate_streaming_lra_matches_whole_file_across_chunking() {
+        let sample_rate = 44_103;
+        let frames = sample_rate as usize * 4 + 137;
+        let left = (0..frames)
+            .map(|frame| {
+                let amplitude = if frame < frames / 2 { 0.05 } else { 0.35 };
+                ((frame as f64 * 0.071).sin() * amplitude) as f32
+            })
+            .collect::<Vec<_>>();
+        let right = (0..frames)
+            .map(|frame| {
+                let amplitude = if frame < frames / 3 { 0.3 } else { 0.09 };
+                ((frame as f64 * 0.113).cos() * amplitude) as f32
+            })
+            .collect::<Vec<_>>();
+        let roles = vec![ChannelRole::Main, ChannelRole::Surround];
+        let buffer = AudioBuffer {
+            sample_rate,
+            channels: 2,
+            frames,
+            data: vec![left.clone(), right.clone()],
+            channel_roles: roles.clone(),
+            source_kind: PcmKind::F32,
+        };
+        let whole = measure_ebu(&buffer);
+
+        for chunk_frames in [97, 137, 16_384] {
+            let mut analyzer = StreamingAnalyzer::new(sample_rate, roles.clone());
+            for start in (0..frames).step_by(chunk_frames) {
+                let end = (start + chunk_frames).min(frames);
+                analyzer
+                    .process(&[left[start..end].to_vec(), right[start..end].to_vec()])
+                    .unwrap();
+            }
+            let streamed = analyzer.finish().ebu;
+            assert!(
+                (streamed.integrated_lufs - whole.integrated_lufs).abs() < 1.0e-6,
+                "chunk={chunk_frames}: streamed={}, whole={}",
+                streamed.integrated_lufs,
+                whole.integrated_lufs
+            );
+            assert!(
+                (streamed.loudness_range_lu - whole.loudness_range_lu).abs() < 1.0e-6,
+                "chunk={chunk_frames}: streamed={}, whole={}",
+                streamed.loudness_range_lu,
+                whole.loudness_range_lu
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_finite_true_peak_drains_the_fir_tail() {
+        let mut samples = vec![0.0; 16];
+        samples.extend([-1.0, -1.0]);
+        let buffer = mono(samples.clone(), 48_000);
+        let expected = crate::dsp::truepeak::measure_true_peak(&buffer);
+
+        let mut analyzer = StreamingAnalyzer::new(48_000, vec![ChannelRole::Main]);
+        for chunk in samples.chunks(3) {
+            analyzer.process(&[chunk.to_vec()]).unwrap();
+        }
+        let measured = analyzer.finish();
+        assert!(expected > 1.2, "finite FIR tail peak was only {expected}");
+        assert_eq!(measured.true_peak.to_bits(), expected.to_bits());
+    }
+
+    #[test]
+    fn finite_true_peak_tail_is_attributed_to_the_last_timeline_interval() {
+        let mut samples = vec![0.0; 16];
+        samples.extend([-1.0, -1.0]);
+        let expected = crate::dsp::truepeak::measure_true_peak(&mono(samples.clone(), 48_000));
+        assert!(expected > 1.2, "finite FIR tail peak was only {expected}");
+
+        // Cover both ways a final timeline point can arise: it may already
+        // have been emitted on an exact interval boundary, or `finish` may
+        // need to emit a partial interval.
+        for interval_frames in [samples.len(), samples.len() + 7] {
+            let mut analyzer = StreamingAnalyzer::with_timeline_interval(
+                48_000,
+                vec![ChannelRole::Main],
+                Some(interval_frames),
+            );
+            for chunk in samples.chunks(3) {
+                analyzer.process(&[chunk.to_vec()]).unwrap();
+            }
+            let measured = analyzer.finish();
+
+            assert_eq!(measured.timeline.len(), 1, "interval {interval_frames}");
+            assert_eq!(
+                measured.timeline[0].true_peak_dbtp.to_bits(),
+                amplitude_db(expected).to_bits(),
+                "interval {interval_frames}"
+            );
+            assert_eq!(measured.true_peak.to_bits(), expected.to_bits());
+        }
     }
 
     #[test]
@@ -1834,14 +2395,14 @@ mod tests {
                 .build()
                 .unwrap()
                 .install(|| {
-                    let mut analyzer = StreamingAnalyzer::new(48_000, roles.clone());
+                    let mut analyzer = StreamingAnalyzer::new(44_100, roles.clone());
                     analyzer.process(&planar).unwrap();
                     analyzer.finish()
                 })
         };
 
-        // One worker forces the established fused loop; two workers meet the
-        // long-chunk threshold and split True Peak from the loudness pass.
+        // One worker forces the fused loop; two workers meet the benchmarked
+        // 5x long-chunk policy and split True Peak from the loudness pass.
         let fused = measure(1);
         let parallel = measure(2);
 

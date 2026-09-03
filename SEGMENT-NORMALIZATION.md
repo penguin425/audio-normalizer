@@ -64,6 +64,10 @@ resource limits, and manual-review flags. Existing plans are refused unless
 `--overwrite` is explicit. JSON requests are standard; a `.toml` request is
 also accepted.
 
+Plans created before Forge 0.189.2 must be regenerated. Earlier plans could
+record fallback channel roles when a container did not identify its speaker
+layout; accepting them would bypass the current fail-closed layout check.
+
 ## Deterministic boundary method
 
 For segment `i`, Forge first computes the ordinary level gain and its maximum
@@ -153,7 +157,7 @@ Limits are part of the method and manifest:
 - verification tolerance: 0 to 5 LU/dB;
 - duration tolerance: 0 to 10,000 ms;
 - identifiers: 1 to 64 ASCII letters, digits, `.`, `_`, or `-`.
-- channel count: 1 to 32; sample rate: 1 to 768,000 Hz.
+- channel count: 1 to 32; current plan sample rate: 8,000 to 384,000 Hz.
 
 The decoded-sample count is frames multiplied by channels. Choose a lower
 request value when processing untrusted or memory-constrained catalogues.
@@ -165,6 +169,12 @@ Validate each phase with:
 - `schema/segment-normalization-request-v1.schema.json`
 - `schema/segment-normalization-plan-v1.schema.json`
 - `schema/segment-normalization-report-v1.schema.json`
+- `schema/segment-normalization-plan-v2.schema.json`
+- `schema/segment-normalization-report-v2.schema.json`
+
+New plans and reports use v2 so channel-layout provenance is part of the
+method contract. The immutable v1 schemas remain published for validating
+historical documents; v1 plans must be regenerated before rendering.
 
 Both plan and report are written atomically as pretty JSON. A successful plan
 or passing render exits 0, a completed render with failed decoded evidence

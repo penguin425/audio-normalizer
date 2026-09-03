@@ -215,10 +215,18 @@ pub fn compare_paths(
     options.validate()?;
     let reference_file = inspect_file(reference_path, options.max_input_bytes)?;
     let candidate_file = inspect_file(candidate_path, options.max_input_bytes)?;
-    let reference = decoder::decode_limited(reference_path, options.max_decoded_samples)
-        .map_err(|error| format!("decode reference: {error}"))?;
-    let candidate = decoder::decode_limited(candidate_path, options.max_decoded_samples)
-        .map_err(|error| format!("decode candidate: {error}"))?;
+    // The comparison is deliberately permutation-invariant and derives its
+    // channel assignment from decoded PCM. Preserve the decoder's fail-closed
+    // layout contract for measurement paths, but do not require speaker
+    // metadata that this operation neither consumes nor trusts.
+    let reference =
+        decoder::decode_limited_with_layout(reference_path, options.max_decoded_samples)
+            .map_err(|error| format!("decode reference: {error}"))?
+            .0;
+    let candidate =
+        decoder::decode_limited_with_layout(candidate_path, options.max_decoded_samples)
+            .map_err(|error| format!("decode candidate: {error}"))?
+            .0;
     if reference.channels as usize > MAX_CHANNELS || candidate.channels as usize > MAX_CHANNELS {
         return Err(format!(
             "audio comparison supports at most {MAX_CHANNELS} channels per input"
@@ -1172,7 +1180,7 @@ fn error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wav::{ChannelRole, PcmKind};
+    use crate::wav::{ChannelRole, PcmKind, WavWriter};
 
     fn audio(channels: Vec<Vec<f32>>) -> AudioBuffer {
         AudioBuffer {
@@ -1292,5 +1300,26 @@ mod tests {
                 "offset {offset}"
             );
         }
+    }
+
+    #[test]
+    fn path_comparison_accepts_maskless_multichannel_wave() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("maskless.wav");
+        let channels = (0..6)
+            .map(|channel| {
+                programme(8_000)
+                    .into_iter()
+                    .map(|sample| sample * (channel + 1) as f32 / 6.0)
+                    .collect()
+            })
+            .collect();
+        let source = audio(channels);
+        WavWriter::write(&path, &source, PcmKind::F32, false).unwrap();
+
+        assert!(decoder::decode_limited(&path, 100_000).is_err());
+        let comparison = compare_paths(&path, &path, &AudioCompareOptions::default()).unwrap();
+        assert!(comparison.passed, "{:#?}", comparison.findings);
+        assert_eq!(comparison.channels.len(), 6);
     }
 }

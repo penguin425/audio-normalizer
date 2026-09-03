@@ -15,9 +15,12 @@ const MAX_OPUS_CHAINS: usize = 1_024;
 #[cfg(any(feature = "opus-encoding", test))]
 pub(crate) fn build_opus_tags(track_lufs: f64, album_lufs: Option<f64>) -> Vec<u8> {
     let vendor = b"Forge audio normalizer";
-    let mut comments = vec![format!("R128_TRACK_GAIN={}", r128_gain(track_lufs))];
-    if let Some(album_lufs) = album_lufs {
-        comments.push(format!("R128_ALBUM_GAIN={}", r128_gain(album_lufs)));
+    let mut comments = Vec::new();
+    if let Some(track_gain) = r128_gain(track_lufs) {
+        comments.push(format!("R128_TRACK_GAIN={track_gain}"));
+    }
+    if let Some(album_gain) = album_lufs.and_then(r128_gain) {
+        comments.push(format!("R128_ALBUM_GAIN={album_gain}"));
     }
     let mut tags = b"OpusTags".to_vec();
     tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
@@ -109,7 +112,7 @@ pub fn rewrite_r128_tags(
         )
     })?;
 
-    let expected = (Some(r128_gain(track_lufs)), album_lufs.map(r128_gain));
+    let expected = (r128_gain(track_lufs), album_lufs.and_then(r128_gain));
     let round_trip = read_all_r128_tags(path)?;
     if round_trip.len() != rewritten || round_trip.iter().any(|tags| *tags != expected) {
         return Err(format!(
@@ -153,13 +156,15 @@ fn read_all_r128_tags(path: &Path) -> Result<Vec<R128Tags>, String> {
     Ok(result)
 }
 
-fn r128_gain(lufs: f64) -> i16 {
+fn r128_gain(lufs: f64) -> Option<i16> {
     if !lufs.is_finite() {
-        return 0;
+        return None;
     }
-    ((-23.0 - lufs) * 256.0)
-        .round()
-        .clamp(i16::MIN as f64, i16::MAX as f64) as i16
+    Some(
+        ((-23.0 - lufs) * 256.0)
+            .round()
+            .clamp(i16::MIN as f64, i16::MAX as f64) as i16,
+    )
 }
 
 pub(crate) fn parse_r128_comments(data: &[u8]) -> Result<R128Tags, String> {
@@ -227,9 +232,11 @@ fn replace_r128_comments(
         }
         offset = end;
     }
-    comments.push(format!("R128_TRACK_GAIN={}", r128_gain(track_lufs)).into_bytes());
-    if let Some(album_lufs) = album_lufs {
-        comments.push(format!("R128_ALBUM_GAIN={}", r128_gain(album_lufs)).into_bytes());
+    if let Some(track_gain) = r128_gain(track_lufs) {
+        comments.push(format!("R128_TRACK_GAIN={track_gain}").into_bytes());
+    }
+    if let Some(album_gain) = album_lufs.and_then(r128_gain) {
+        comments.push(format!("R128_ALBUM_GAIN={album_gain}").into_bytes());
     }
     let mut result = b"OpusTags".to_vec();
     result.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
@@ -331,5 +338,20 @@ mod tests {
         }
         let error = rewrite_r128_tags(temporary.path(), -18.0, None).unwrap_err();
         assert!(error.contains("missing OpusTags"));
+    }
+
+    #[test]
+    fn omits_undefined_track_and_album_loudness() {
+        let tags = build_opus_tags(f64::NEG_INFINITY, Some(f64::NAN));
+        assert_eq!(parse_r128_comments(&tags).unwrap(), (None, None));
+
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = temporary.reopen().unwrap();
+            let mut writer = PacketWriter::new(BufWriter::new(file));
+            write_stream(&mut writer, 44, -18.0, Some(-20.0));
+        }
+        rewrite_r128_tags(temporary.path(), f64::NEG_INFINITY, Some(f64::INFINITY)).unwrap();
+        assert_eq!(read_r128_tags(temporary.path()).unwrap(), (None, None));
     }
 }

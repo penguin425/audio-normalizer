@@ -972,7 +972,12 @@ fn run_paths(
             }
             let downmix = cli
                 .downmix_qc
-                .then(|| normalize::analyze_stereo_downmix(input))
+                .then(|| {
+                    normalize::analyze_stereo_downmix_with_roles(
+                        input,
+                        channel_roles_override.as_deref(),
+                    )
+                })
                 .transpose()?;
             let codec_qc = codec_metadata
                 .as_ref()

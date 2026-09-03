@@ -417,8 +417,19 @@ fn analyze_upload(
         return Response::error(500, "temporary_file", "could not store upload");
     }
     let path = temporary.path().to_path_buf();
-    let decoded = match decoder::decode_limited(&path, config.max_decoded_samples) {
-        Ok(decoded) => decoded,
+    let (mut decoded, layout_provenance) =
+        match decoder::decode_limited_with_layout(&path, config.max_decoded_samples) {
+            Ok(decoded) => decoded,
+            Err(_) => return Response::error(422, "decode_failed", "audio could not be decoded"),
+        };
+    decoded.channel_roles = match crate::normalize::resolve_decoded_channel_roles(
+        &path,
+        decoded.channels,
+        &decoded.channel_roles,
+        layout_provenance,
+        None,
+    ) {
+        Ok(roles) => roles,
         Err(_) => return Response::error(422, "decode_failed", "audio could not be decoded"),
     };
     let analysis = crate::analysis::analyze(&decoded);

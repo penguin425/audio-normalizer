@@ -411,14 +411,9 @@ pub fn write_replaygain(
     track_peak: f32,
     album: Option<(f64, f32)>,
 ) -> Result<(), String> {
-    let track_gain = format!("{:+.2} dB", -18.0 - track_lufs);
-    let track_peak = format!("{:.8}", track_peak);
-    let album_values = album.map(|(album_lufs, album_peak)| {
-        (
-            format!("{:+.2} dB", -18.0 - album_lufs),
-            format!("{:.8}", album_peak),
-        )
-    });
+    let track_values = replaygain_values(track_lufs, track_peak);
+    let album_values =
+        album.and_then(|(album_lufs, album_peak)| replaygain_values(album_lufs, album_peak));
     let tagged = lofty::read_from_path(path)
         .map_err(|error| format!("read metadata {}: {error}", path.display()))?;
     let mut tag = tagged
@@ -427,8 +422,14 @@ pub fn write_replaygain(
         .cloned()
         .unwrap_or_else(|| Tag::new(tagged.primary_tag_type()));
     tag.re_map(tagged.primary_tag_type());
-    tag.insert_text(ItemKey::ReplayGainTrackGain, track_gain.clone());
-    tag.insert_text(ItemKey::ReplayGainTrackPeak, track_peak.clone());
+    tag.remove_key(ItemKey::ReplayGainTrackGain);
+    tag.remove_key(ItemKey::ReplayGainTrackPeak);
+    tag.remove_key(ItemKey::ReplayGainAlbumGain);
+    tag.remove_key(ItemKey::ReplayGainAlbumPeak);
+    if let Some((track_gain, track_peak)) = &track_values {
+        tag.insert_text(ItemKey::ReplayGainTrackGain, track_gain.clone());
+        tag.insert_text(ItemKey::ReplayGainTrackPeak, track_peak.clone());
+    }
     if let Some((album_gain, album_peak)) = &album_values {
         tag.insert_text(ItemKey::ReplayGainAlbumGain, album_gain.clone());
         tag.insert_text(ItemKey::ReplayGainAlbumPeak, album_peak.clone());
@@ -438,24 +439,35 @@ pub fn write_replaygain(
 
     let round_trip = lofty::read_from_path(path)
         .map_err(|error| format!("re-read metadata {}: {error}", path.display()))?;
-    let round_trip = round_trip
-        .primary_tag()
-        .or_else(|| round_trip.first_tag())
-        .ok_or_else(|| {
-            format!(
-                "{}: ReplayGain metadata disappeared after writing",
-                path.display()
-            )
-        })?;
-    let track_matches = round_trip.get_string(ItemKey::ReplayGainTrackGain)
-        == Some(track_gain.as_str())
-        && round_trip.get_string(ItemKey::ReplayGainTrackPeak) == Some(track_peak.as_str());
-    let album_matches = album_values
-        .as_ref()
-        .is_none_or(|(album_gain, album_peak)| {
-            round_trip.get_string(ItemKey::ReplayGainAlbumGain) == Some(album_gain.as_str())
-                && round_trip.get_string(ItemKey::ReplayGainAlbumPeak) == Some(album_peak.as_str())
-        });
+    let round_trip = round_trip.primary_tag().or_else(|| round_trip.first_tag());
+    let track_matches = track_values.as_ref().map_or_else(
+        || {
+            round_trip.is_none_or(|tag| {
+                tag.get_string(ItemKey::ReplayGainTrackGain).is_none()
+                    && tag.get_string(ItemKey::ReplayGainTrackPeak).is_none()
+            })
+        },
+        |(track_gain, track_peak)| {
+            round_trip.is_some_and(|tag| {
+                tag.get_string(ItemKey::ReplayGainTrackGain) == Some(track_gain.as_str())
+                    && tag.get_string(ItemKey::ReplayGainTrackPeak) == Some(track_peak.as_str())
+            })
+        },
+    );
+    let album_matches = album_values.as_ref().map_or_else(
+        || {
+            round_trip.is_none_or(|tag| {
+                tag.get_string(ItemKey::ReplayGainAlbumGain).is_none()
+                    && tag.get_string(ItemKey::ReplayGainAlbumPeak).is_none()
+            })
+        },
+        |(album_gain, album_peak)| {
+            round_trip.is_some_and(|tag| {
+                tag.get_string(ItemKey::ReplayGainAlbumGain) == Some(album_gain.as_str())
+                    && tag.get_string(ItemKey::ReplayGainAlbumPeak) == Some(album_peak.as_str())
+            })
+        },
+    );
     if !track_matches || !album_matches {
         return Err(format!(
             "{}: ReplayGain metadata changed during write/read round trip",
@@ -463,6 +475,28 @@ pub fn write_replaygain(
         ));
     }
     Ok(())
+}
+
+fn replaygain_values(lufs: f64, peak: f32) -> Option<(String, String)> {
+    (lufs.is_finite() && peak.is_finite() && peak >= 0.0)
+        .then(|| (format!("{:+.2} dB", -18.0 - lufs), format!("{peak:.8}")))
+}
+
+#[cfg(test)]
+mod replaygain_tests {
+    use super::replaygain_values;
+
+    #[test]
+    fn undefined_measurements_do_not_become_metadata_values() {
+        assert_eq!(
+            replaygain_values(-16.0, 0.5),
+            Some(("-2.00 dB".into(), "0.50000000".into()))
+        );
+        assert_eq!(replaygain_values(f64::NEG_INFINITY, 0.0), None);
+        assert_eq!(replaygain_values(f64::NAN, 0.5), None);
+        assert_eq!(replaygain_values(-16.0, f32::INFINITY), None);
+        assert_eq!(replaygain_values(-16.0, -0.1), None);
+    }
 }
 
 const SOUND_CHECK_DESCRIPTION: &str = "iTunNORM";

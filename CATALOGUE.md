@@ -23,7 +23,7 @@ Each row contains:
 - source sample rate, channels, frames, duration, integrated loudness, LRA,
   RMS, sample peak, and true peak;
 - `ITU-R BS.1770-5 / EBU R 128` and Forge algorithm revision
-  `forge-bs1770-5-r2`;
+  `forge-bs1770-5-r3`;
 - selected preset, compliance profile, or explicit custom target;
 - Forge package version and a structured invocation-provenance object.
 

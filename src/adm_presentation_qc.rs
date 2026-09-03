@@ -5,7 +5,8 @@
 //! step to the EBU ADM Renderer (`ear-render`). Every rendered signal is then
 //! measured independently with Forge's BS.1770 engine.
 
-use crate::{adm, analysis, decoder, metadata};
+use crate::wav::{named_channel_layout, AudioBuffer, ChannelRole};
+use crate::{adm, analysis, decoder, metadata, normalize};
 use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
 use serde::Serialize;
@@ -165,6 +166,13 @@ struct Variant {
 
 pub fn run(options: &Options) -> Result<AdmPresentationReport, String> {
     validate_options(options)?;
+    let declared_roles = bs2051_layout_roles(&options.layout).ok_or_else(|| {
+        format!(
+            "unsupported ITU-R BS.2051 output layout {}; expected one of {}",
+            options.layout,
+            BS2051_LAYOUT_NAMES.join(", ")
+        )
+    })?;
     let max_render_bytes = render_byte_limit(options.max_decoded_samples_per_presentation)?;
     let input = fs::canonicalize(&options.input)
         .map_err(|error| format!("resolve ADM input {}: {error}", options.input.display()))?;
@@ -228,8 +236,17 @@ pub fn run(options: &Options) -> Result<AdmPresentationReport, String> {
         )?;
 
         let (rendered_sha256, rendered_bytes) = sha256_file(&rendered)?;
-        let buffer =
-            decoder::decode_limited(&rendered, options.max_decoded_samples_per_presentation)?;
+        let (buffer, layout_provenance) = decoder::decode_limited_with_layout(
+            &rendered,
+            options.max_decoded_samples_per_presentation,
+        )?;
+        let buffer = resolve_rendered_layout(
+            &rendered,
+            buffer,
+            layout_provenance,
+            &options.layout,
+            &declared_roles,
+        )?;
         let measured = analysis::analyze(&buffer);
         ensure_unchanged(
             &rendered,
@@ -523,6 +540,187 @@ fn validate_options(options: &Options) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+const BS2051_LAYOUT_NAMES: [&str; 10] = [
+    "0+2+0", "0+5+0", "2+5+0", "4+5+0", "4+5+1", "3+7+0", "4+9+0", "9+10+3", "0+7+0", "4+7+0",
+];
+
+/// Channel order and nominal speaker positions emitted by `ear-render` for
+/// the fixed ITU-R BS.2051 systems. BS.2051 positive azimuth is left, while
+/// Forge's WAVE-oriented role convention uses negative azimuth for left.
+fn bs2051_layout_roles(name: &str) -> Option<Vec<ChannelRole>> {
+    use ChannelRole::Lfe;
+
+    let p = |azimuth: i16, elevation: i16| {
+        ChannelRole::positioned(if azimuth.abs() == 180 { 180 } else { -azimuth }, elevation)
+    };
+    Some(match name {
+        // These two systems have an exact conventional WAVE role model. Keep
+        // it so a trustworthy WAVE declaration from the renderer can be
+        // compared directly rather than producing a false conflict.
+        "0+2+0" => named_channel_layout("stereo").unwrap(),
+        "0+5+0" => named_channel_layout("5.1").unwrap(),
+        "2+5+0" => vec![
+            p(30, 0),
+            p(-30, 0),
+            p(0, 0),
+            Lfe,
+            p(110, 0),
+            p(-110, 0),
+            p(30, 30),
+            p(-30, 30),
+        ],
+        "4+5+0" => vec![
+            p(30, 0),
+            p(-30, 0),
+            p(0, 0),
+            Lfe,
+            p(110, 0),
+            p(-110, 0),
+            p(30, 30),
+            p(-30, 30),
+            p(110, 30),
+            p(-110, 30),
+        ],
+        "4+5+1" => vec![
+            p(30, 0),
+            p(-30, 0),
+            p(0, 0),
+            Lfe,
+            p(110, 0),
+            p(-110, 0),
+            p(30, 30),
+            p(-30, 30),
+            p(110, 30),
+            p(-110, 30),
+            p(0, -30),
+        ],
+        "3+7+0" => vec![
+            p(0, 0),
+            p(30, 0),
+            p(-30, 0),
+            p(45, 30),
+            p(-45, 30),
+            p(90, 0),
+            p(-90, 0),
+            p(135, 0),
+            p(-135, 0),
+            p(180, 45),
+            Lfe,
+            Lfe,
+        ],
+        "4+9+0" => vec![
+            p(30, 0),
+            p(-30, 0),
+            p(0, 0),
+            Lfe,
+            p(90, 0),
+            p(-90, 0),
+            p(135, 0),
+            p(-135, 0),
+            p(45, 30),
+            p(-45, 30),
+            p(135, 30),
+            p(-135, 30),
+            p(15, 0),
+            p(-15, 0),
+        ],
+        "9+10+3" => vec![
+            p(60, 0),
+            p(-60, 0),
+            p(0, 0),
+            Lfe,
+            p(135, 0),
+            p(-135, 0),
+            p(30, 0),
+            p(-30, 0),
+            p(180, 0),
+            Lfe,
+            p(90, 0),
+            p(-90, 0),
+            p(45, 30),
+            p(-45, 30),
+            p(0, 30),
+            p(0, 90),
+            p(135, 30),
+            p(-135, 30),
+            p(90, 30),
+            p(-90, 30),
+            p(180, 30),
+            p(0, -30),
+            p(45, -30),
+            p(-45, -30),
+        ],
+        "0+7+0" => vec![
+            p(30, 0),
+            p(-30, 0),
+            p(0, 0),
+            Lfe,
+            p(90, 0),
+            p(-90, 0),
+            p(135, 0),
+            p(-135, 0),
+        ],
+        "4+7+0" => vec![
+            p(30, 0),
+            p(-30, 0),
+            p(0, 0),
+            Lfe,
+            p(90, 0),
+            p(-90, 0),
+            p(135, 0),
+            p(-135, 0),
+            p(45, 30),
+            p(-45, 30),
+            p(135, 30),
+            p(-135, 30),
+        ],
+        _ => return None,
+    })
+}
+
+fn resolve_rendered_layout(
+    path: &Path,
+    mut buffer: AudioBuffer,
+    provenance: decoder::ChannelLayoutProvenance,
+    layout_name: &str,
+    declared_roles: &[ChannelRole],
+) -> Result<AudioBuffer, String> {
+    if usize::from(buffer.channels) != declared_roles.len() {
+        return Err(format!(
+            "ADM render {} declares layout {layout_name} with {} channels but decoded {}",
+            path.display(),
+            declared_roles.len(),
+            buffer.channels
+        ));
+    }
+    if provenance == decoder::ChannelLayoutProvenance::KnownSpeakers
+        && !decoded_layout_matches_declared(&buffer.channel_roles, declared_roles)
+    {
+        return Err(format!(
+            "ADM render {} decoded speaker layout conflicts with declared BS.2051 layout {layout_name}",
+            path.display()
+        ));
+    }
+    buffer.channel_roles = normalize::resolve_decoded_channel_roles(
+        path,
+        buffer.channels,
+        &buffer.channel_roles,
+        provenance,
+        Some(declared_roles),
+    )?;
+    Ok(buffer)
+}
+
+fn decoded_layout_matches_declared(
+    decoded_roles: &[ChannelRole],
+    declared_roles: &[ChannelRole],
+) -> bool {
+    decoded_roles == declared_roles
+        || (declared_roles.len() > 2
+            && crate::wav::writer::persisted_channel_roles(declared_roles)
+                .is_ok_and(|roles| roles == decoded_roles))
 }
 
 fn render_byte_limit(max_decoded_samples: u64) -> Result<u64, String> {
@@ -1037,6 +1235,7 @@ fn diagnostic(stderr: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wav::{PcmKind, WavWriter};
 
     const AXML: &[u8] = br#"<audioFormatExtended version="ITU-R_BS.2076-3">
   <audioProgramme audioProgrammeID="APR_1002" audioProgrammeName="Second">
@@ -1136,5 +1335,81 @@ mod tests {
         assert!(inventory_from_axml(xml, 16)
             .unwrap_err()
             .contains("belongs to complementary groups"));
+    }
+
+    #[test]
+    fn recognizes_every_fixed_bs2051_renderer_layout() {
+        let expected_channels = [2, 6, 8, 10, 11, 12, 14, 24, 8, 12];
+        for (name, channels) in BS2051_LAYOUT_NAMES.iter().zip(expected_channels) {
+            assert_eq!(bs2051_layout_roles(name).unwrap().len(), channels, "{name}");
+        }
+        assert_eq!(
+            bs2051_layout_roles("0+5+0").unwrap(),
+            named_channel_layout("5.1").unwrap()
+        );
+        assert!(bs2051_layout_roles("custom-speakers").is_none());
+    }
+
+    #[test]
+    fn declared_bs2051_layout_resolves_a_maskless_five_one_render() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("maskless.wav");
+        let source = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 6,
+            frames: 480,
+            data: vec![vec![0.0; 480]; 6],
+            channel_roles: vec![ChannelRole::Main; 6],
+            source_kind: PcmKind::F32,
+        };
+        WavWriter::write(&path, &source, PcmKind::F32, false).unwrap();
+        let (decoded, provenance) = decoder::decode_limited_with_layout(&path, 10_000).unwrap();
+        assert_eq!(provenance, decoder::ChannelLayoutProvenance::Unknown);
+
+        let roles = bs2051_layout_roles("0+5+0").unwrap();
+        let resolved =
+            resolve_rendered_layout(&path, decoded, provenance, "0+5+0", &roles).unwrap();
+        assert_eq!(resolved.channel_roles, named_channel_layout("5.1").unwrap());
+    }
+
+    #[test]
+    fn rejects_bs2051_render_geometry_and_known_layout_conflicts() {
+        let buffer = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 2,
+            frames: 1,
+            data: vec![vec![0.0], vec![0.0]],
+            channel_roles: named_channel_layout("stereo").unwrap(),
+            source_kind: PcmKind::F32,
+        };
+        let roles = bs2051_layout_roles("0+5+0").unwrap();
+        assert!(resolve_rendered_layout(
+            Path::new("render.wav"),
+            buffer,
+            decoder::ChannelLayoutProvenance::KnownSpeakers,
+            "0+5+0",
+            &roles,
+        )
+        .unwrap_err()
+        .contains("6 channels but decoded 2"));
+
+        let roles = bs2051_layout_roles("2+5+0").unwrap();
+        let buffer = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 8,
+            frames: 1,
+            data: vec![vec![0.0]; 8],
+            channel_roles: named_channel_layout("7.1").unwrap(),
+            source_kind: PcmKind::F32,
+        };
+        assert!(resolve_rendered_layout(
+            Path::new("render.wav"),
+            buffer,
+            decoder::ChannelLayoutProvenance::KnownSpeakers,
+            "2+5+0",
+            &roles,
+        )
+        .unwrap_err()
+        .contains("conflicts"));
     }
 }

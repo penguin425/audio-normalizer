@@ -76,7 +76,7 @@ fn sqlite_catalogue_records_normalization_hashes_and_exports_provenance() {
     assert_eq!(row.1.len(), 64);
     assert_eq!(row.2.len(), 64);
     assert_eq!(row.3, "ITU-R BS.1770-5 / EBU R 128");
-    assert_eq!(row.4, "forge-bs1770-5-r2");
+    assert_eq!(row.4, "forge-bs1770-5-r3");
 
     let report_value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
@@ -416,7 +416,7 @@ fn content_addressed_analysis_cache_is_reused_by_real_normalization() {
     assert!(String::from_utf8_lossy(&normalize.stderr).contains("analysis cache hit"));
     assert!(output.is_file());
 
-    let prefix = std::fs::read_dir(cache.join("v1"))
+    let prefix = std::fs::read_dir(cache.join("v2"))
         .unwrap()
         .next()
         .unwrap()
@@ -437,7 +437,7 @@ fn content_addressed_analysis_cache_is_reused_by_real_normalization() {
     let instance: serde_json::Value =
         serde_json::from_slice(&std::fs::read(entry).unwrap()).unwrap();
     let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/analysis-cache-v1.schema.json")).unwrap();
+        serde_json::from_str(include_str!("../schema/analysis-cache-v2.schema.json")).unwrap();
     assert!(jsonschema::validator_for(&schema)
         .unwrap()
         .is_valid(&instance));

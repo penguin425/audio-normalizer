@@ -16,6 +16,10 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -31,6 +35,279 @@ pub const DEFAULT_MAX_DECODED_SAMPLES: u64 = 500_000_000;
 pub const HARD_MAX_DECODED_SAMPLES: u64 = 4_000_000_000;
 pub const DEFAULT_MAX_ALBUM_REFERENCES: u32 = 1_000;
 pub const HARD_MAX_ALBUM_REFERENCES: u32 = 10_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FileIdentity {
+    #[cfg(unix)]
+    Unix { device: u64, inode: u64 },
+    #[cfg(windows)]
+    Windows { volume: u32, index: u64 },
+    #[cfg(not(any(unix, windows)))]
+    Canonical(PathBuf),
+}
+
+struct FileSnapshot {
+    path: PathBuf,
+    canonical: PathBuf,
+    _handle: File,
+    stable: tempfile::NamedTempFile,
+    identity: FileIdentity,
+    len: u64,
+    sha256: String,
+}
+
+impl FileSnapshot {
+    fn capture(path: &Path, max_bytes: u64, description: &str) -> Result<Self, String> {
+        let snapshot =
+            Self::bind(path, max_bytes, description)?.snapshot_contents(max_bytes, description)?;
+        snapshot.verify(
+            max_bytes,
+            &format!("{description} path changed while it was snapshotted"),
+        )?;
+        Ok(snapshot)
+    }
+
+    /// Bind a path, open identity, length, and content hash without copying
+    /// the payload. Album entries that resolve to the already-snapshotted
+    /// selected track use this form so that track bytes are not stored twice.
+    fn bind(path: &Path, max_bytes: u64, description: &str) -> Result<Self, String> {
+        let handle = File::open(path)
+            .map_err(|error| format!("open {description} {}: {error}", path.display()))?;
+        let canonical = fs::canonicalize(path)
+            .map_err(|error| format!("canonicalize {description} {}: {error}", path.display()))?;
+        let metadata = handle
+            .metadata()
+            .map_err(|error| format!("stat {description} {}: {error}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "{description} is not a regular file: {}",
+                path.display()
+            ));
+        }
+        if metadata.len() > max_bytes {
+            return Err(format!(
+                "{description} {} is {} bytes, above the configured byte limit {max_bytes}",
+                path.display(),
+                metadata.len()
+            ));
+        }
+        let identity = file_identity(&handle, &metadata, &canonical)?;
+        let sha256 = sha256_open_file(&handle, &canonical, max_bytes)?;
+        let suffix = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| format!(".{extension}"))
+            .unwrap_or_default();
+        let mut stable = tempfile::Builder::new()
+            .prefix("forge-metadata-input-")
+            .suffix(&suffix)
+            .tempfile()
+            .map_err(|error| format!("create private {description} snapshot: {error}"))?;
+        stable
+            .as_file_mut()
+            .sync_all()
+            .map_err(|error| format!("sync private {description} binding: {error}"))?;
+        let snapshot = Self {
+            path: path.to_owned(),
+            canonical,
+            _handle: handle,
+            stable,
+            identity,
+            len: metadata.len(),
+            sha256,
+        };
+        snapshot.verify(
+            max_bytes,
+            &format!("{description} path changed while it was opened"),
+        )?;
+        Ok(snapshot)
+    }
+
+    fn snapshot_contents(mut self, max_bytes: u64, description: &str) -> Result<Self, String> {
+        let mut input = self
+            ._handle
+            .try_clone()
+            .map_err(|error| format!("clone {description} {}: {error}", self.path.display()))?;
+        input
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| format!("seek {description} {}: {error}", self.path.display()))?;
+        let copied = std::io::copy(
+            &mut input.take(max_bytes.saturating_add(1)),
+            self.stable.as_file_mut(),
+        )
+        .map_err(|error| format!("snapshot {description} {}: {error}", self.path.display()))?;
+        if copied != self.len || copied > max_bytes {
+            return Err(format!(
+                "{description} {} changed size while it was snapshotted",
+                self.path.display()
+            ));
+        }
+        self.stable
+            .as_file_mut()
+            .sync_all()
+            .map_err(|error| format!("sync private {description} snapshot: {error}"))?;
+        let stable_sha256 = sha256_open_file(self.stable.as_file(), self.stable.path(), max_bytes)?;
+        let source_sha256_after = sha256_open_file(&self._handle, &self.canonical, max_bytes)?;
+        if stable_sha256 != self.sha256 || source_sha256_after != self.sha256 {
+            return Err(format!(
+                "{description} changed while it was snapshotted: {}",
+                self.path.display()
+            ));
+        }
+        Ok(self)
+    }
+
+    fn verify(&self, max_bytes: u64, context: &str) -> Result<(), String> {
+        let handle = File::open(&self.path)
+            .map_err(|error| format!("{context}: {}: {error}", self.path.display()))?;
+        let metadata = handle
+            .metadata()
+            .map_err(|error| format!("{context}: {}: {error}", self.path.display()))?;
+        let current_canonical = fs::canonicalize(&self.path)
+            .map_err(|error| format!("{context}: {}: {error}", self.path.display()))?;
+        let identity = file_identity(&handle, &metadata, &current_canonical)?;
+        let sha256 = sha256_open_file(&handle, &current_canonical, max_bytes)?;
+        if identity != self.identity || metadata.len() != self.len || sha256 != self.sha256 {
+            return Err(format!("{context}: {}", self.path.display()));
+        }
+        Ok(())
+    }
+
+    fn stable_path(&self) -> &Path {
+        self.stable.path()
+    }
+}
+
+fn file_identity(
+    file: &File,
+    metadata: &fs::Metadata,
+    canonical: &Path,
+) -> Result<FileIdentity, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = (file, canonical);
+        Ok(FileIdentity::Unix {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        let _ = (metadata, canonical);
+        let (volume, index) = windows_file_identity(file)?;
+        Ok(FileIdentity::Windows { volume, index })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, metadata);
+        Ok(FileIdentity::Canonical(canonical.to_owned()))
+    }
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> Result<(u32, u64), String> {
+    let information = windows_file_information(file)?;
+    Ok((
+        information.dwVolumeSerialNumber,
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    ))
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[allow(non_snake_case)]
+struct WindowsFileTime {
+    dwLowDateTime: u32,
+    dwHighDateTime: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[allow(non_snake_case)]
+struct WindowsByHandleFileInformation {
+    dwFileAttributes: u32,
+    ftCreationTime: WindowsFileTime,
+    ftLastAccessTime: WindowsFileTime,
+    ftLastWriteTime: WindowsFileTime,
+    dwVolumeSerialNumber: u32,
+    nFileSizeHigh: u32,
+    nFileSizeLow: u32,
+    nNumberOfLinks: u32,
+    nFileIndexHigh: u32,
+    nFileIndexLow: u32,
+}
+
+#[cfg(windows)]
+fn windows_file_information(file: &File) -> Result<WindowsByHandleFileInformation, String> {
+    use std::ffi::c_void;
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            handle: *mut c_void,
+            information: *mut WindowsByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let mut information = MaybeUninit::<WindowsByHandleFileInformation>::uninit();
+    let succeeded = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr())
+    };
+    if succeeded == 0 {
+        return Err(format!(
+            "identify open file: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { information.assume_init() })
+}
+
+#[cfg(test)]
+fn open_verified_file_snapshot(
+    path: &Path,
+    expected_identity: &FileIdentity,
+    expected_len: u64,
+) -> Result<File, String> {
+    let file = File::open(path)
+        .map_err(|error| format!("reopen decoded reference {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("restat decoded reference {}: {error}", path.display()))?;
+    let identity = file_identity(&file, &metadata, path)?;
+    if &identity != expected_identity || metadata.len() != expected_len {
+        return Err(format!(
+            "decoded reference changed while preparing album loudness: {}",
+            path.display()
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(test)]
+fn ensure_file_snapshot(
+    path: &Path,
+    expected_identity: &FileIdentity,
+    expected_len: u64,
+) -> Result<(), String> {
+    open_verified_file_snapshot(path, expected_identity, expected_len).map(drop)
+}
+
+#[cfg(test)]
+fn ensure_matching_file_hash(
+    path: &Path,
+    before: &str,
+    after: &str,
+    context: &str,
+) -> Result<(), String> {
+    if before == after {
+        Ok(())
+    } else {
+        Err(format!("{context}: {}", path.display()))
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -291,7 +568,7 @@ struct WaveChunkInfo {
 struct PreparedIsobmffLoudness {
     target: TargetTrack,
     reference: PathBuf,
-    reference_sha256: String,
+    reference_snapshot: FileSnapshot,
     reference_is_source: bool,
     measured: DecodedLoudness,
     encoded: EncodedLoudness,
@@ -303,6 +580,31 @@ struct PreparedIsobmffLoudness {
 struct PreparedAlbumLoudness {
     encoded: EncodedLoudness,
     evidence: IsobmffAlbumLoudnessEvidence,
+    protected_inputs: Vec<FileSnapshot>,
+}
+
+fn protected_inputs<'a>(
+    source: &'a FileSnapshot,
+    prepared: Option<&'a PreparedIsobmffLoudness>,
+) -> Vec<&'a FileSnapshot> {
+    let mut identities = HashSet::new();
+    let mut inputs = Vec::new();
+    if identities.insert(source.identity.clone()) {
+        inputs.push(source);
+    }
+    if let Some(prepared) = prepared {
+        if identities.insert(prepared.reference_snapshot.identity.clone()) {
+            inputs.push(&prepared.reference_snapshot);
+        }
+        if let Some(album) = &prepared.album {
+            for input in &album.protected_inputs {
+                if identities.insert(input.identity.clone()) {
+                    inputs.push(input);
+                }
+            }
+        }
+    }
+    inputs
 }
 
 #[derive(Debug, Clone)]
@@ -446,19 +748,9 @@ fn evaluate_internal(
     let base = request_path.parent().unwrap_or_else(|| Path::new("."));
     let source = resolve(base, &spec.source);
     let destination = resolve(base, &spec.destination);
-    let source_meta = fs::metadata(&source)
-        .map_err(|error| format!("stat metadata source {}: {error}", source.display()))?;
-    let source_bytes = source_meta.len();
-    if source_bytes > spec.max_input_bytes {
-        return Err(format!(
-            "metadata source {} is {source_bytes} bytes, above max_input_bytes {}",
-            source.display(),
-            spec.max_input_bytes
-        ));
-    }
-    if same_path(&source, &destination)? {
-        return Err("metadata repair destination must differ from source".into());
-    }
+    let source_snapshot = FileSnapshot::capture(&source, spec.max_input_bytes, "metadata source")?;
+    let source_bytes = source_snapshot.len;
+    reject_protected_destination(&destination, &[&source_snapshot])?;
     if destination.exists() && !spec.overwrite {
         return Err(format!(
             "metadata repair destination already exists: {} (pass overwrite=true)",
@@ -473,9 +765,21 @@ fn evaluate_internal(
         ));
     }
 
-    let before = container_qc::audit(&source)?;
+    source_snapshot.verify(
+        spec.max_input_bytes,
+        "metadata source changed before initial audit",
+    )?;
+    let before = container_qc::audit(source_snapshot.stable_path())?;
+    source_snapshot.verify(
+        spec.max_input_bytes,
+        "metadata source changed during initial audit",
+    )?;
     let source_format = before.format.clone();
-    let adm_before = read_adm_profile(&source, &source_format)?;
+    let adm_before = read_adm_profile(source_snapshot.stable_path(), &source_format)?;
+    source_snapshot.verify(
+        spec.max_input_bytes,
+        "metadata source changed while reading its ADM profile",
+    )?;
     let has_wave_mutation =
         spec.ensure_bwf_v2 || spec.bwf_loudness.is_some() || spec.adm_version.is_some();
     let has_isobmff_mutation = isobmff_options.is_some();
@@ -503,7 +807,11 @@ fn evaluate_internal(
 
     let prepared_isobmff = if let Some(options) = &isobmff_options {
         Some(prepare_isobmff_loudness(
-            base, &source, &before, &spec, options,
+            base,
+            &source_snapshot,
+            &before,
+            &spec,
+            options,
         )?)
     } else {
         None
@@ -512,80 +820,109 @@ fn evaluate_internal(
     let mut actions = Vec::new();
     let mut warnings = Vec::new();
     let mut isobmff_rewrite = None;
-    let changed = if has_wave_mutation {
-        let result = write_output(
-            &destination,
-            spec.overwrite,
-            spec.atomic_replace,
-            spec.max_output_bytes,
-            |output| rewrite_wave(&source, output, &spec, &mut actions, &mut warnings),
+    let changed = {
+        let protected = protected_inputs(&source_snapshot, prepared_isobmff.as_ref());
+        reject_protected_destination(&destination, &protected)?;
+        verify_protected_inputs(
+            &protected,
+            spec.max_input_bytes,
+            "protected metadata input changed before output",
         )?;
-        let _ = result;
-        actions.iter().any(|action| action.changed)
-    } else if let Some(prepared) = &prepared_isobmff {
-        write_output(
-            &destination,
-            spec.overwrite,
-            spec.atomic_replace,
-            spec.max_output_bytes,
-            |output| {
-                let result = isobmff_loudness_repair::rewrite(
-                    &source,
-                    output,
+        if has_wave_mutation {
+            let result = write_output(
+                &destination,
+                spec.overwrite,
+                spec.atomic_replace,
+                spec.max_output_bytes,
+                &protected,
+                spec.max_input_bytes,
+                |output| {
+                    rewrite_wave(
+                        source_snapshot.stable_path(),
+                        output,
+                        &spec,
+                        &mut actions,
+                        &mut warnings,
+                    )
+                },
+            )?;
+            let _ = result;
+            actions.iter().any(|action| action.changed)
+        } else if let Some(prepared) = &prepared_isobmff {
+            write_output(
+                &destination,
+                spec.overwrite,
+                spec.atomic_replace,
+                spec.max_output_bytes,
+                &protected,
+                spec.max_input_bytes,
+                |output| {
+                    let result = isobmff_loudness_repair::rewrite(
+                        source_snapshot.stable_path(),
+                        output,
+                        prepared.target.track_id,
+                        &prepared.encoded,
+                        prepared.album.as_ref().map(|album| &album.encoded),
+                        isobmff_loudness_repair::RewriteLimits {
+                            max_input_bytes: spec.max_input_bytes,
+                            max_moov_bytes: spec.max_metadata_chunk_bytes,
+                            max_boxes: spec.max_chunks,
+                        },
+                    )?;
+                    let bytes = result.bytes_written;
+                    isobmff_rewrite = Some(result);
+                    Ok(bytes)
+                },
+            )?;
+            let result = isobmff_rewrite
+                .as_ref()
+                .expect("ISO-BMFF write closure records rewrite evidence");
+            actions.push(RepairAction {
+                kind: "isobmff-loudness",
+                changed: result.changed,
+                detail: format!(
+                    "{} ISO-BMFF {} for audio track {}; moov delta {:+} byte(s), adjusted {} chunk offset(s)",
+                    if result.replaced_existing { "replaced" } else { "inserted" },
+                    if prepared.album.is_some() { "ludt/tlou+alou" } else { "ludt/tlou" },
                     prepared.target.track_id,
-                    &prepared.encoded,
-                    prepared.album.as_ref().map(|album| &album.encoded),
-                    isobmff_loudness_repair::RewriteLimits {
-                        max_input_bytes: spec.max_input_bytes,
-                        max_moov_bytes: spec.max_metadata_chunk_bytes,
-                        max_boxes: spec.max_chunks,
-                    },
-                )?;
-                let bytes = result.bytes_written;
-                isobmff_rewrite = Some(result);
-                Ok(bytes)
-            },
-        )?;
-        let result = isobmff_rewrite
-            .as_ref()
-            .expect("ISO-BMFF write closure records rewrite evidence");
-        actions.push(RepairAction {
-            kind: "isobmff-loudness",
-            changed: result.changed,
-            detail: format!(
-                "{} ISO-BMFF {} for audio track {}; moov delta {:+} byte(s), adjusted {} chunk offset(s)",
-                if result.replaced_existing { "replaced" } else { "inserted" },
-                if prepared.album.is_some() { "ludt/tlou+alou" } else { "ludt/tlou" },
-                prepared.target.track_id,
-                result.moov_size_delta,
-                result.adjusted_chunk_offsets
-            ),
-        });
-        result.changed
-    } else {
-        write_output(
-            &destination,
-            spec.overwrite,
-            spec.atomic_replace,
-            spec.max_output_bytes,
-            |output| copy_bounded(&source, output, spec.max_input_bytes),
-        )?;
-        actions.push(RepairAction {
-            kind: if spec.mode == RepairMode::Validate {
-                "validate-and-copy"
-            } else {
-                "copy-without-mutation"
-            },
-            changed: false,
-            detail: "source bytes were copied without metadata mutation".into(),
-        });
-        if source_format == "mxf" {
-            warnings.push(
-                "MXF KLV metadata and partition/index tables are preserved byte-for-byte; mutation is intentionally not attempted".into(),
-            );
+                    result.moov_size_delta,
+                    result.adjusted_chunk_offsets
+                ),
+            });
+            result.changed
+        } else {
+            write_output(
+                &destination,
+                spec.overwrite,
+                spec.atomic_replace,
+                spec.max_output_bytes,
+                &protected,
+                spec.max_input_bytes,
+                |output| copy_bounded(source_snapshot.stable_path(), output, spec.max_input_bytes),
+            )?;
+            actions.push(RepairAction {
+                kind: if spec.mode == RepairMode::Validate {
+                    "validate-and-copy"
+                } else {
+                    "copy-without-mutation"
+                },
+                changed: false,
+                detail: "source bytes were copied without metadata mutation".into(),
+            });
+            if source_format == "mxf" {
+                warnings.push(
+                    "MXF KLV metadata and partition/index tables are preserved byte-for-byte; mutation is intentionally not attempted".into(),
+                );
+            }
+            false
         }
-        false
     };
+
+    verify_protected_inputs(
+        &protected_inputs(&source_snapshot, prepared_isobmff.as_ref()),
+        spec.max_input_bytes,
+        "protected metadata input changed after output commit",
+    )?;
 
     let output_bytes = fs::metadata(&destination)
         .map_err(|error| {
@@ -603,6 +940,11 @@ fn evaluate_internal(
     }
     let after = container_qc::audit(&destination)?;
     let adm_after = read_adm_profile(&destination, &after.format)?;
+    verify_protected_inputs(
+        &protected_inputs(&source_snapshot, prepared_isobmff.as_ref()),
+        spec.max_input_bytes,
+        "protected metadata input changed during output verification",
+    )?;
     let (isobmff_loudness, album_loudness) = if let Some(prepared) = prepared_isobmff {
         let rewrite =
             isobmff_rewrite.expect("prepared ISO-BMFF loudness mutation has rewrite evidence");
@@ -631,11 +973,23 @@ fn evaluate_internal(
                     .into(),
             );
         }
+        prepared.reference_snapshot.verify(
+            spec.max_input_bytes,
+            "decoded reference changed before final evidence",
+        )?;
+        if let Some(album) = &prepared.album {
+            for input in &album.protected_inputs {
+                input.verify(
+                    spec.max_input_bytes,
+                    "album decoded reference changed before final evidence",
+                )?;
+            }
+        }
         let evidence = IsobmffLoudnessEvidence {
             track_id: prepared.target.track_id,
             codecs: prepared.target.codecs,
             decoded_reference: prepared.reference.to_string_lossy().into_owned(),
-            decoded_reference_sha256: prepared.reference_sha256,
+            decoded_reference_sha256: prepared.reference_snapshot.sha256,
             reference_is_source: prepared.reference_is_source,
             sample_rate_hz: prepared.measured.sample_rate_hz,
             channels: prepared.measured.channels,
@@ -687,6 +1041,11 @@ fn evaluate_internal(
             "ISO-BMFF media payloads were hash-verified byte-for-byte; only ludt loudness metadata, ancestor sizes, and required stco/co64 offsets changed".into(),
         );
     }
+    let output_sha256 = sha256_file(&destination, spec.max_output_bytes)?;
+    source_snapshot.verify(
+        spec.max_input_bytes,
+        "metadata source changed before final report",
+    )?;
     let report = MetadataRepairReport {
         schema_version: spec.schema_version,
         validator: if spec.schema_version == SCHEMA_VERSION_V2 {
@@ -700,8 +1059,8 @@ fn evaluate_internal(
         destination: destination.to_string_lossy().into_owned(),
         source_bytes,
         output_bytes,
-        source_sha256: sha256_file(&source, spec.max_input_bytes)?,
-        output_sha256: sha256_file(&destination, spec.max_output_bytes)?,
+        source_sha256: source_snapshot.sha256,
+        output_sha256,
         limits: RepairLimits {
             max_input_bytes: spec.max_input_bytes,
             max_output_bytes: spec.max_output_bytes,
@@ -755,7 +1114,7 @@ fn into_v2_report(report: InternalMetadataRepairReport) -> ExtendedMetadataRepai
 
 fn prepare_isobmff_loudness(
     base: &Path,
-    source: &Path,
+    source: &FileSnapshot,
     before: &ContainerAudit,
     spec: &MetadataRepairSpec,
     options: &IsobmffOptions,
@@ -764,41 +1123,33 @@ fn prepare_isobmff_loudness(
     let reference = options
         .decoded_reference()
         .map(|path| resolve(base, path))
-        .unwrap_or_else(|| source.to_path_buf());
-    let reference_meta = fs::metadata(&reference).map_err(|error| {
-        format!(
-            "stat ISO-BMFF decoded reference {}: {error}",
-            reference.display()
-        )
-    })?;
-    if !reference_meta.is_file() {
-        return Err(format!(
-            "ISO-BMFF decoded reference is not a regular file: {}",
-            reference.display()
-        ));
-    }
-    if reference_meta.len() > spec.max_input_bytes {
-        return Err(format!(
-            "ISO-BMFF decoded reference {} is {} bytes, above max_input_bytes {}",
-            reference.display(),
-            reference_meta.len(),
-            spec.max_input_bytes
-        ));
-    }
-    let reference_is_source = same_path(source, &reference)?;
-    let analyzed =
-        isobmff_loudness_repair::analyze_reference(&reference, options.max_decoded_samples())?;
+        .unwrap_or_else(|| source.path.clone());
+    let reference_snapshot = FileSnapshot::capture(
+        &reference,
+        spec.max_input_bytes,
+        "ISO-BMFF decoded reference",
+    )?;
+    let reference_is_source = reference_snapshot.identity == source.identity;
+    reference_snapshot.verify(
+        spec.max_input_bytes,
+        "decoded reference changed before measurement",
+    )?;
+    let analyzed = isobmff_loudness_repair::analyze_reference(
+        reference_snapshot.stable_path(),
+        options.max_decoded_samples(),
+    )?;
+    reference_snapshot.verify(
+        spec.max_input_bytes,
+        "decoded reference changed while it was measured",
+    )?;
     isobmff_loudness_repair::validate_encodable_measurement(&reference, &analyzed.loudness)?;
     isobmff_loudness_repair::validate_reference_geometry(&target, &analyzed.loudness)?;
     let measured = analyzed.loudness.clone();
     let encoded = isobmff_loudness_repair::encode_measurement(&measured)?;
-    let reference_sha256 = sha256_file(&reference, spec.max_input_bytes)?;
     let album = if let Some(album_references) = options.album_decoded_references() {
         Some(prepare_album_loudness(
             base,
-            &reference,
-            &reference_sha256,
-            reference_meta.len(),
+            &reference_snapshot,
             analyzed,
             album_references,
             options.max_album_references(),
@@ -808,12 +1159,23 @@ fn prepare_isobmff_loudness(
     } else {
         None
     };
-    let source_mdat_sha256 =
-        isobmff_loudness_repair::mdat_sha256(source, spec.max_input_bytes, spec.max_chunks)?;
+    source.verify(
+        spec.max_input_bytes,
+        "metadata source changed before hashing media payloads",
+    )?;
+    let source_mdat_sha256 = isobmff_loudness_repair::mdat_sha256(
+        source.stable_path(),
+        spec.max_input_bytes,
+        spec.max_chunks,
+    )?;
+    source.verify(
+        spec.max_input_bytes,
+        "metadata source changed while hashing media payloads",
+    )?;
     Ok(PreparedIsobmffLoudness {
         target,
         reference,
-        reference_sha256,
+        reference_snapshot,
         reference_is_source,
         measured,
         encoded,
@@ -826,64 +1188,58 @@ fn prepare_isobmff_loudness(
 #[allow(clippy::too_many_arguments)]
 fn prepare_album_loudness(
     base: &Path,
-    track_reference: &Path,
-    track_sha256: &str,
-    track_input_bytes: u64,
+    track_snapshot: &FileSnapshot,
     track_analysis: isobmff_loudness_repair::ReferenceMeasurement,
     album_references: &[PathBuf],
     max_album_references: u32,
     max_decoded_samples: u64,
     max_input_bytes: u64,
 ) -> Result<PreparedAlbumLoudness, String> {
-    let track_canonical = fs::canonicalize(track_reference).map_err(|error| {
-        format!(
-            "canonicalize ISO-BMFF decoded reference {}: {error}",
-            track_reference.display()
-        )
-    })?;
     let mut seen = HashSet::with_capacity(album_references.len());
     let mut resolved = Vec::with_capacity(album_references.len());
     let mut total_reference_bytes = 0_u64;
     let mut track_matches = 0_u32;
     for path in album_references {
         let path = resolve(base, path);
-        let canonical = fs::canonicalize(&path).map_err(|error| {
-            format!(
-                "canonicalize album decoded reference {}: {error}",
-                path.display()
-            )
-        })?;
-        if !seen.insert(canonical.clone()) {
+        // Pass the remaining aggregate budget into capture. Its opened-handle
+        // metadata check runs before creating/copying a private snapshot, so a
+        // long reference list cannot consume references * max_input_bytes of
+        // temporary storage before the aggregate check fires.
+        let remaining_reference_bytes = max_input_bytes
+            .checked_sub(total_reference_bytes)
+            .ok_or("album decoded references exceed aggregate max_input_bytes")?;
+        let snapshot = FileSnapshot::bind(
+            &path,
+            remaining_reference_bytes,
+            "album decoded reference (remaining aggregate budget)",
+        )?;
+        if !seen.insert(snapshot.identity.clone()) {
             return Err(format!(
                 "album_decoded_references contains duplicate file {}",
                 path.display()
             ));
         }
-        let metadata = fs::metadata(&canonical)
-            .map_err(|error| format!("stat album decoded reference {}: {error}", path.display()))?;
-        if !metadata.is_file() {
-            return Err(format!(
-                "album decoded reference is not a regular file: {}",
-                path.display()
-            ));
-        }
         total_reference_bytes = total_reference_bytes
-            .checked_add(metadata.len())
+            .checked_add(snapshot.len)
             .ok_or("album decoded reference byte count overflow")?;
-        let is_track = canonical == track_canonical;
+        let is_track = snapshot.identity == track_snapshot.identity;
+        let snapshot = if is_track {
+            snapshot
+        } else {
+            snapshot.snapshot_contents(
+                remaining_reference_bytes,
+                "album decoded reference (remaining aggregate budget)",
+            )?
+        };
         track_matches += u32::from(is_track);
-        resolved.push((path, canonical, metadata.len(), is_track));
+        resolved.push((path, snapshot, is_track));
     }
     if track_matches != 1 {
         return Err(format!(
             "album_decoded_references must contain the selected track decoded reference exactly once; found {track_matches}"
         ));
     }
-    if total_reference_bytes > max_input_bytes {
-        return Err(format!(
-            "album decoded references total {total_reference_bytes} bytes, above aggregate max_input_bytes {max_input_bytes}"
-        ));
-    }
+    debug_assert!(total_reference_bytes <= max_input_bytes);
 
     let mut total_decoded_samples = track_analysis.loudness.decoded_samples;
     let mut track_analysis = Some(track_analysis);
@@ -891,7 +1247,18 @@ fn prepare_album_loudness(
     let mut sample_peak_dbfs = f64::NEG_INFINITY;
     let mut true_peak_dbtp = f64::NEG_INFINITY;
     let mut evidence = Vec::with_capacity(resolved.len());
-    for (path, _canonical, input_bytes, is_track) in resolved {
+    let mut protected_inputs = Vec::with_capacity(resolved.len());
+    for (path, snapshot, is_track) in resolved {
+        snapshot.verify(
+            max_input_bytes,
+            "album decoded reference changed before measurement",
+        )?;
+        if is_track && snapshot.sha256 != track_snapshot.sha256 {
+            return Err(format!(
+                "selected track decoded reference changed before album measurement: {}",
+                path.display()
+            ));
+        }
         let analysis = if is_track {
             track_analysis
                 .take()
@@ -905,12 +1272,18 @@ fn prepare_album_loudness(
                         "album decoded references exceed aggregate max_decoded_samples ({max_decoded_samples})"
                     )
                 })?;
-            isobmff_loudness_repair::analyze_reference(&path, remaining).map_err(|error| {
-                format!(
-                    "album decoded references exceed aggregate max_decoded_samples ({max_decoded_samples}) or could not be measured: {error}"
-                )
-            })?
+            isobmff_loudness_repair::analyze_reference(snapshot.stable_path(), remaining).map_err(
+                |error| {
+                    format!(
+                        "album decoded references exceed aggregate max_decoded_samples ({max_decoded_samples}) or could not be measured: {error}"
+                    )
+                },
+            )?
         };
+        snapshot.verify(
+            max_input_bytes,
+            "album decoded reference changed while it was measured",
+        )?;
         if !is_track {
             total_decoded_samples = total_decoded_samples
                 .checked_add(analysis.loudness.decoded_samples)
@@ -935,19 +1308,14 @@ fn prepare_album_loudness(
         sample_peak_dbfs = sample_peak_dbfs.max(analysis.loudness.sample_peak_dbfs);
         true_peak_dbtp = true_peak_dbtp.max(analysis.loudness.true_peak_dbtp);
         gating_blocks.extend(analysis.gating_blocks);
-        let sha256 = if is_track {
-            track_sha256.to_owned()
-        } else {
-            sha256_file(&path, max_input_bytes)?
-        };
         evidence.push(IsobmffAlbumReferenceEvidence {
             path: path.to_string_lossy().into_owned(),
-            sha256,
+            sha256: snapshot.sha256.clone(),
             track_reference: is_track,
             input_bytes: if is_track {
-                track_input_bytes
+                track_snapshot.len
             } else {
-                input_bytes
+                snapshot.len
             },
             sample_rate_hz: analysis.loudness.sample_rate_hz,
             channels: analysis.loudness.channels,
@@ -956,6 +1324,7 @@ fn prepare_album_loudness(
             complete_gating_blocks: u64::try_from(block_count)
                 .map_err(|_| "album gating block count exceeds u64")?,
         });
+        protected_inputs.push(snapshot);
     }
     let integrated_lufs = crate::dsp::lufs::gated_lufs(&gating_blocks);
     if !integrated_lufs.is_finite() || !sample_peak_dbfs.is_finite() || !true_peak_dbtp.is_finite()
@@ -991,6 +1360,7 @@ fn prepare_album_loudness(
             true_peak_quantization_error_db: encoded.true_peak_dbtp - true_peak_dbtp,
         },
         encoded,
+        protected_inputs,
     })
 }
 
@@ -1245,23 +1615,159 @@ fn resolve(base: &Path, path: &Path) -> PathBuf {
     }
 }
 
-fn same_path(source: &Path, destination: &Path) -> Result<bool, String> {
-    if source == destination {
-        return Ok(true);
+fn verify_protected_inputs(
+    protected: &[&FileSnapshot],
+    max_input_bytes: u64,
+    context: &str,
+) -> Result<(), String> {
+    for input in protected {
+        input.verify(max_input_bytes, context)?;
     }
-    let source = fs::canonicalize(source)
-        .map_err(|error| format!("canonicalize metadata source {}: {error}", source.display()))?;
-    let destination = if destination.exists() {
-        fs::canonicalize(destination).map_err(|error| {
+    Ok(())
+}
+
+fn opened_file_identity(file: &File, path: &Path) -> Result<FileIdentity, String> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("stat metadata repair path {}: {error}", path.display()))?;
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    file_identity(file, &metadata, &canonical)
+}
+
+fn reject_open_protected_destination(
+    destination: &Path,
+    file: &File,
+    protected: &[&FileSnapshot],
+) -> Result<(), String> {
+    let identity = opened_file_identity(file, destination)?;
+    if protected.iter().any(|input| input.identity == identity) {
+        return Err(format!(
+            "metadata repair destination resolves to a protected source or decoded reference: {}",
+            destination.display()
+        ));
+    }
+    Ok(())
+}
+
+fn reject_protected_destination(
+    destination: &Path,
+    protected: &[&FileSnapshot],
+) -> Result<(), String> {
+    let file = match File::open(destination) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "open metadata repair destination {}: {error}",
+                destination.display()
+            ))
+        }
+    };
+    reject_open_protected_destination(destination, &file, protected)
+}
+
+fn open_non_atomic_destination(destination: &Path, overwrite: bool) -> Result<File, String> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true);
+    if !overwrite {
+        options.create_new(true);
+    }
+    // Opening without truncation lets us bind checks to the actual handle.
+    // O_NOFOLLOW closes the final-component symlink exchange window on Unix.
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    // FILE_FLAG_OPEN_REPARSE_POINT opens the link itself rather than its
+    // target; the opened-handle attribute check below then rejects it.
+    #[cfg(windows)]
+    options.custom_flags(0x0020_0000);
+
+    let output = options.open(destination).map_err(|error| {
+        format!(
+            "create metadata repair output {}: {error}",
+            destination.display()
+        )
+    })?;
+    let metadata = output.metadata().map_err(|error| {
+        format!(
+            "stat opened metadata repair output {}: {error}",
+            destination.display()
+        )
+    })?;
+    #[cfg(windows)]
+    if metadata.file_attributes() & 0x0000_0400 != 0 {
+        return Err(format!(
+            "metadata repair destination must not be a reparse point: {}",
+            destination.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "metadata repair destination is not a regular file: {}",
+            destination.display()
+        ));
+    }
+    Ok(output)
+}
+
+fn reject_multiply_linked_destination(destination: &Path, file: &File) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata().map_err(|error| {
             format!(
-                "canonicalize metadata destination {}: {error}",
+                "stat opened metadata repair output {}: {error}",
                 destination.display()
             )
-        })?
-    } else {
-        destination.to_path_buf()
-    };
-    Ok(source == destination)
+        })?;
+        if metadata.nlink() > 1 {
+            return Err(format!(
+                "non-atomic metadata repair refuses a multiply-linked destination: {}",
+                destination.display()
+            ));
+        }
+    }
+    #[cfg(windows)]
+    if windows_file_information(file)?.nNumberOfLinks > 1 {
+        return Err(format!(
+            "non-atomic metadata repair refuses a multiply-linked destination: {}",
+            destination.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_non_atomic_destination_binding(
+    destination: &Path,
+    output: &File,
+    protected: &[&FileSnapshot],
+) -> Result<(), String> {
+    let opened_identity = opened_file_identity(output, destination)?;
+    let path_metadata = fs::symlink_metadata(destination).map_err(|error| {
+        format!(
+            "restat metadata repair destination {}: {error}",
+            destination.display()
+        )
+    })?;
+    if path_metadata.file_type().is_symlink() {
+        return Err(format!(
+            "metadata repair destination changed to a symbolic link while writing: {}",
+            destination.display()
+        ));
+    }
+    let current = File::open(destination).map_err(|error| {
+        format!(
+            "reopen metadata repair destination {}: {error}",
+            destination.display()
+        )
+    })?;
+    reject_open_protected_destination(destination, &current, protected)?;
+    if opened_file_identity(&current, destination)? != opened_identity {
+        return Err(format!(
+            "metadata repair destination changed while it was being written: {}",
+            destination.display()
+        ));
+    }
+    Ok(())
 }
 
 fn read_adm_profile(path: &Path, format: &str) -> Result<Option<ProductionProfileResult>, String> {
@@ -1276,8 +1782,15 @@ fn write_output(
     overwrite: bool,
     atomic_replace: bool,
     max_output_bytes: u64,
+    protected: &[&FileSnapshot],
+    max_input_bytes: u64,
     mut write: impl FnMut(&mut dyn Write) -> Result<u64, String>,
 ) -> Result<u64, String> {
+    verify_protected_inputs(
+        protected,
+        max_input_bytes,
+        "protected metadata input changed before writing output",
+    )?;
     if atomic_replace {
         let parent = destination.parent().unwrap_or_else(|| Path::new("."));
         let mut temp = tempfile::NamedTempFile::new_in(parent)
@@ -1291,38 +1804,62 @@ fn write_output(
         temp.as_file_mut()
             .sync_all()
             .map_err(|error| format!("sync metadata repair temporary file: {error}"))?;
-        if destination.exists() && !overwrite {
-            return Err(format!(
-                "metadata repair destination already exists: {} (pass overwrite=true)",
-                destination.display()
-            ));
+        verify_protected_inputs(
+            protected,
+            max_input_bytes,
+            "protected metadata input changed while writing output",
+        )?;
+        reject_protected_destination(destination, protected)?;
+        if overwrite {
+            temp.persist(destination).map_err(|error| {
+                format!(
+                    "atomically replace metadata repair destination {}: {}",
+                    destination.display(),
+                    error.error
+                )
+            })?;
+        } else {
+            temp.persist_noclobber(destination).map_err(|error| {
+                format!(
+                    "atomically create metadata repair destination without overwrite {}: {}",
+                    destination.display(),
+                    error.error
+                )
+            })?;
         }
-        temp.persist(destination).map_err(|error| {
-            format!(
-                "atomically replace metadata repair destination {}: {}",
-                destination.display(),
-                error.error
-            )
-        })?;
+        verify_protected_inputs(
+            protected,
+            max_input_bytes,
+            "protected metadata input changed during output commit",
+        )?;
         Ok(bytes)
     } else {
-        let mut options = OpenOptions::new();
-        options.write(true).create(true);
+        let mut output = open_non_atomic_destination(destination, overwrite)?;
+        reject_open_protected_destination(destination, &output, protected)?;
         if overwrite {
-            options.truncate(true);
-        } else {
-            options.create_new(true);
+            reject_multiply_linked_destination(destination, &output)?;
         }
-        let mut output = options.open(destination).map_err(|error| {
-            format!(
-                "create metadata repair output {}: {error}",
-                destination.display()
-            )
-        })?;
+        verify_protected_inputs(
+            protected,
+            max_input_bytes,
+            "protected metadata input changed before truncating output",
+        )?;
+        if overwrite {
+            output.set_len(0).map_err(|error| {
+                format!(
+                    "truncate metadata repair output {}: {error}",
+                    destination.display()
+                )
+            })?;
+            output.seek(SeekFrom::Start(0)).map_err(|error| {
+                format!(
+                    "seek metadata repair output {}: {error}",
+                    destination.display()
+                )
+            })?;
+        }
         let bytes = write(&mut output)?;
         if bytes > max_output_bytes {
-            drop(output);
-            let _ = fs::remove_file(destination);
             return Err(format!(
                 "metadata repair output is {bytes} bytes, above max_output_bytes {max_output_bytes}"
             ));
@@ -1333,6 +1870,12 @@ fn write_output(
                 destination.display()
             )
         })?;
+        verify_protected_inputs(
+            protected,
+            max_input_bytes,
+            "protected metadata input changed while writing output",
+        )?;
+        verify_non_atomic_destination_binding(destination, &output, protected)?;
         Ok(bytes)
     }
 }
@@ -1362,8 +1905,17 @@ fn copy_bounded(source: &Path, output: &mut dyn Write, max_bytes: u64) -> Result
 }
 
 fn sha256_file(path: &Path, max_bytes: u64) -> Result<String, String> {
-    let mut input =
-        File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let input = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    sha256_open_file(&input, path, max_bytes)
+}
+
+fn sha256_open_file(file: &File, path: &Path, max_bytes: u64) -> Result<String, String> {
+    let mut input = file
+        .try_clone()
+        .map_err(|error| format!("clone open file {}: {error}", path.display()))?;
+    input
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("seek {}: {error}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut total = 0_u64;
     let mut buffer = [0_u8; 128 * 1024];
@@ -1560,13 +2112,31 @@ fn scan_riff_chunks(
     if &riff_header[..4] != b"RIFF" || &riff_header[8..] != b"WAVE" {
         return Err("metadata mutation currently supports RIFF/WAVE only; RF64/BW64 is validate-and-copy only".into());
     }
+    let declared_size = u64::from(u32::from_le_bytes(
+        riff_header[4..8].try_into().expect("four-byte RIFF size"),
+    ));
+    if declared_size < 4 {
+        return Err("RIFF size is smaller than the WAVE form type".into());
+    }
+    let scan_end = 8_u64
+        .checked_add(declared_size)
+        .ok_or_else(|| "RIFF size overflows file offset".to_string())?;
+    if scan_end > file_size {
+        return Err("declared RIFF container extends beyond end of file".into());
+    }
+    if scan_end < file_size {
+        // Mutation promises to preserve every unknown source byte. Silently
+        // dropping data outside the declared RIFF form would violate that
+        // contract, so repair is stricter than the decoder (which ignores it).
+        return Err("WAVE contains bytes outside the declared RIFF container".into());
+    }
     let mut position = 12_u64;
     let mut chunks = Vec::new();
-    while position < file_size {
+    while position < scan_end {
         if chunks.len() >= max_chunks as usize {
             return Err(format!("WAVE contains more than max_chunks ({max_chunks})"));
         }
-        if file_size - position < 8 {
+        if scan_end - position < 8 {
             return Err("truncated WAVE chunk header".into());
         }
         input
@@ -1590,8 +2160,8 @@ fn scan_riff_chunks(
             .checked_add(size)
             .and_then(|value| value.checked_add(size & 1))
             .ok_or_else(|| "WAVE chunk offset overflow".to_string())?;
-        if next > file_size {
-            return Err("WAVE chunk extends beyond end of file".into());
+        if next > scan_end {
+            return Err("WAVE chunk or padding extends beyond the declared RIFF container".into());
         }
         chunks.push(WaveChunkInfo {
             id,
@@ -1600,8 +2170,8 @@ fn scan_riff_chunks(
         });
         position = next;
     }
-    if position != file_size {
-        return Err("WAVE contains unaccounted trailing bytes".into());
+    if position != scan_end {
+        return Err("WAVE contains unaccounted bytes inside the declared RIFF container".into());
     }
     Ok((chunks, riff_header))
 }
@@ -1926,6 +2496,30 @@ mod tests {
         fs::write(path, [ftyp, moov, mp4_box(b"mdat", pcm)].concat()).unwrap();
     }
 
+    fn classic_stereo_wave(path: &Path) {
+        classic_stereo_wave_with(path, 48_000, 0.1);
+    }
+
+    fn classic_stereo_wave_with(path: &Path, frames: u32, amplitude: f32) {
+        const SAMPLE_RATE: u32 = 48_000;
+        let frames = usize::try_from(frames).unwrap();
+        let samples = (0..frames)
+            .map(|frame| {
+                let phase = std::f32::consts::TAU * 440.0 * frame as f32 / SAMPLE_RATE as f32;
+                phase.sin() * amplitude
+            })
+            .collect::<Vec<_>>();
+        let audio = AudioBuffer {
+            sample_rate: SAMPLE_RATE,
+            channels: 2,
+            frames,
+            data: vec![samples.clone(), samples],
+            channel_roles: crate::wav::default_channel_roles(2),
+            source_kind: PcmKind::S16,
+        };
+        WavWriter::write(path, &audio, PcmKind::S16, false).unwrap();
+    }
+
     fn fixture(path: &Path, chunks: Vec<WaveChunk>) {
         let audio = AudioBuffer {
             sample_rate: 48_000,
@@ -1967,6 +2561,357 @@ mod tests {
             max_xml_bytes: DEFAULT_MAX_XML_BYTES,
             max_chunks: DEFAULT_MAX_CHUNKS,
         }
+    }
+
+    fn scan_test_wave(path: &Path) -> Result<(Vec<WaveChunkInfo>, [u8; 12]), String> {
+        let mut file = File::open(path).unwrap();
+        let file_size = file.metadata().unwrap().len();
+        scan_riff_chunks(
+            &mut file,
+            file_size,
+            DEFAULT_MAX_METADATA_CHUNK_BYTES,
+            DEFAULT_MAX_CHUNKS,
+        )
+    }
+
+    #[test]
+    fn metadata_mutation_is_bounded_by_the_declared_riff_container() {
+        let directory = tempfile::tempdir().unwrap();
+        let valid_path = directory.path().join("valid.wav");
+        classic_stereo_wave_with(&valid_path, 8, 0.1);
+        let valid = fs::read(&valid_path).unwrap();
+        assert!(scan_test_wave(&valid_path).is_ok());
+
+        let smaller_than_form = directory.path().join("small-riff-size.wav");
+        let mut bytes = valid.clone();
+        bytes[4..8].copy_from_slice(&3_u32.to_le_bytes());
+        fs::write(&smaller_than_form, bytes).unwrap();
+        let error = scan_test_wave(&smaller_than_form).unwrap_err();
+        assert!(error.contains("smaller than the WAVE form type"), "{error}");
+
+        let beyond_eof = directory.path().join("declared-beyond-eof.wav");
+        let mut bytes = valid.clone();
+        let oversized = u32::try_from(bytes.len() - 8 + 1).unwrap();
+        bytes[4..8].copy_from_slice(&oversized.to_le_bytes());
+        fs::write(&beyond_eof, bytes).unwrap();
+        let error = scan_test_wave(&beyond_eof).unwrap_err();
+        assert!(error.contains("extends beyond end of file"), "{error}");
+
+        let chunk_crossing = directory.path().join("chunk-crossing.wav");
+        let mut bytes = valid.clone();
+        bytes.pop();
+        let shortened = u32::try_from(bytes.len() - 8).unwrap();
+        bytes[4..8].copy_from_slice(&shortened.to_le_bytes());
+        fs::write(&chunk_crossing, bytes).unwrap();
+        let error = scan_test_wave(&chunk_crossing).unwrap_err();
+        assert!(
+            error.contains("extends beyond the declared RIFF"),
+            "{error}"
+        );
+
+        let padding_crossing = directory.path().join("padding-crossing.wav");
+        let mut bytes = b"RIFF\0\0\0\0WAVEJUNK\x01\0\0\0x".to_vec();
+        let riff_size = u32::try_from(bytes.len() - 8).unwrap();
+        bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        fs::write(&padding_crossing, bytes).unwrap();
+        let error = scan_test_wave(&padding_crossing).unwrap_err();
+        assert!(error.contains("padding extends beyond"), "{error}");
+
+        let outside = directory.path().join("outside-declaration.wav");
+        let mut bytes = valid;
+        bytes.extend_from_slice(b"JUNK\0\0\0\0");
+        fs::write(&outside, bytes).unwrap();
+        let error = scan_test_wave(&outside).unwrap_err();
+        assert!(error.contains("outside the declared RIFF"), "{error}");
+    }
+
+    #[test]
+    fn content_hash_detects_same_identity_same_length_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reference.bin");
+        fs::write(&path, [0x11; 64]).unwrap();
+        let handle = File::open(&path).unwrap();
+        let metadata = handle.metadata().unwrap();
+        let canonical = fs::canonicalize(&path).unwrap();
+        let identity = file_identity(&handle, &metadata, &canonical).unwrap();
+        let before = sha256_file(&canonical, 64).unwrap();
+
+        fs::write(&canonical, [0x22; 64]).unwrap();
+        ensure_file_snapshot(&canonical, &identity, 64).unwrap();
+        let after = sha256_file(&canonical, 64).unwrap();
+        let error = ensure_matching_file_hash(
+            &path,
+            &before,
+            &after,
+            "decoded reference content changed while it was measured",
+        )
+        .unwrap_err();
+        assert!(error.contains("content changed"), "{error}");
+    }
+
+    #[test]
+    fn file_snapshot_binds_processing_bytes_to_the_opened_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.wav");
+        let original = directory.path().join("original.wav");
+        let replacement = directory.path().join("replacement.wav");
+        fs::write(&source, [0x11; 64]).unwrap();
+        fs::write(&replacement, [0x22; 64]).unwrap();
+        let snapshot = FileSnapshot::capture(&source, 64, "test source").unwrap();
+
+        fs::rename(&source, &original).unwrap();
+        fs::rename(&replacement, &source).unwrap();
+        let error = snapshot
+            .verify(64, "metadata source changed during processing")
+            .unwrap_err();
+        assert!(error.contains("source changed"), "{error}");
+        assert_eq!(fs::read(snapshot.stable_path()).unwrap(), [0x11; 64]);
+        assert_eq!(fs::read(&original).unwrap(), [0x11; 64]);
+        assert_eq!(fs::read(&source).unwrap(), [0x22; 64]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_snapshot_detects_symlink_retargeting() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.wav");
+        let original = directory.path().join("original.wav");
+        let replacement = directory.path().join("replacement.wav");
+        fs::write(&original, [0x11; 64]).unwrap();
+        fs::write(&replacement, [0x22; 64]).unwrap();
+        symlink(&original, &source).unwrap();
+        let snapshot = FileSnapshot::capture(&source, 64, "test source").unwrap();
+
+        fs::remove_file(&source).unwrap();
+        symlink(&replacement, &source).unwrap();
+        let error = snapshot
+            .verify(64, "metadata source changed during processing")
+            .unwrap_err();
+        assert!(error.contains("source changed"), "{error}");
+        assert_eq!(fs::read(snapshot.stable_path()).unwrap(), [0x11; 64]);
+        assert_eq!(fs::read(&original).unwrap(), [0x11; 64]);
+        assert_eq!(fs::read(&replacement).unwrap(), [0x22; 64]);
+    }
+
+    #[test]
+    fn atomic_output_rejects_source_replacement_before_publish() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        let original = directory.path().join("original.bin");
+        let replacement = directory.path().join("replacement.bin");
+        let destination = directory.path().join("destination.bin");
+        fs::write(&source, b"original source").unwrap();
+        fs::write(&replacement, b"replacement src").unwrap();
+        let snapshot = FileSnapshot::capture(&source, 64, "test source").unwrap();
+
+        let error = write_output(&destination, true, true, 64, &[&snapshot], 64, |output| {
+            output.write_all(b"generated").unwrap();
+            fs::rename(&source, &original).unwrap();
+            fs::rename(&replacement, &source).unwrap();
+            Ok(9)
+        })
+        .unwrap_err();
+        assert!(error.contains("changed while writing output"), "{error}");
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&original).unwrap(), b"original source");
+        assert_eq!(fs::read(&source).unwrap(), b"replacement src");
+    }
+
+    #[test]
+    fn atomic_no_overwrite_is_race_free() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        let destination = directory.path().join("destination.bin");
+        fs::write(&source, b"source").unwrap();
+        let snapshot = FileSnapshot::capture(&source, 64, "test source").unwrap();
+
+        let error = write_output(&destination, false, true, 64, &[&snapshot], 64, |output| {
+            output.write_all(b"generated").unwrap();
+            fs::write(&destination, b"competitor").unwrap();
+            Ok(9)
+        })
+        .unwrap_err();
+        assert!(error.contains("without overwrite"), "{error}");
+        assert_eq!(fs::read(&destination).unwrap(), b"competitor");
+        assert_eq!(fs::read(&source).unwrap(), b"source");
+    }
+
+    #[test]
+    fn album_snapshot_budget_is_applied_before_copying_each_reference() {
+        let directory = tempfile::tempdir().unwrap();
+        let track = directory.path().join("track.bin");
+        let other = directory.path().join("other.bin");
+        fs::write(&track, b"123456").unwrap();
+        fs::write(&other, b"abcde").unwrap();
+        let track_snapshot = FileSnapshot::capture(&track, 10, "selected track").unwrap();
+        let track_analysis = isobmff_loudness_repair::ReferenceMeasurement {
+            loudness: DecodedLoudness {
+                sample_rate_hz: 48_000,
+                channels: 1,
+                frames: 1,
+                decoded_samples: 1,
+                integrated_lufs: -23.0,
+                sample_peak_dbfs: -20.0,
+                true_peak_dbtp: -20.0,
+            },
+            gating_blocks: vec![0.01],
+        };
+
+        let error = match prepare_album_loudness(
+            directory.path(),
+            &track_snapshot,
+            track_analysis,
+            &[track.clone(), other],
+            2,
+            16,
+            10,
+        ) {
+            Ok(_) => panic!("aggregate snapshot budget unexpectedly accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("remaining aggregate budget"), "{error}");
+        assert!(error.contains("byte limit 4"), "{error}");
+    }
+
+    #[test]
+    fn non_atomic_overwrite_writes_a_regular_single_link_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        let destination = directory.path().join("destination.bin");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&destination, b"old destination").unwrap();
+        let snapshot = FileSnapshot::capture(&source, 64, "test source").unwrap();
+
+        let bytes = write_output(&destination, true, false, 64, &[&snapshot], 64, |output| {
+            output.write_all(b"new").unwrap();
+            Ok(3)
+        })
+        .unwrap();
+        assert_eq!(bytes, 3);
+        assert_eq!(fs::read(&destination).unwrap(), b"new");
+        assert_eq!(fs::read(&source).unwrap(), b"source");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_atomic_overwrite_never_follows_a_destination_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        let victim = directory.path().join("victim.bin");
+        let destination = directory.path().join("destination.bin");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&victim, b"unrelated victim").unwrap();
+        symlink(&victim, &destination).unwrap();
+        let snapshot = FileSnapshot::capture(&source, 64, "test source").unwrap();
+
+        assert!(
+            write_output(&destination, true, false, 64, &[&snapshot], 64, |output| {
+                output.write_all(b"replacement").unwrap();
+                Ok(11)
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read(&victim).unwrap(), b"unrelated victim");
+        assert!(fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn non_atomic_overwrite_refuses_unprotected_hardlink_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        let destination = directory.path().join("destination.bin");
+        let alias = directory.path().join("alias.bin");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&destination, b"shared destination").unwrap();
+        fs::hard_link(&destination, &alias).unwrap();
+        let snapshot = FileSnapshot::capture(&source, 64, "test source").unwrap();
+
+        let error = write_output(&destination, true, false, 64, &[&snapshot], 64, |output| {
+            output.write_all(b"replacement").unwrap();
+            Ok(11)
+        })
+        .unwrap_err();
+        assert!(error.contains("multiply-linked"), "{error}");
+        assert_eq!(fs::read(&destination).unwrap(), b"shared destination");
+        assert_eq!(fs::read(&alias).unwrap(), b"shared destination");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn non_atomic_overwrite_checks_the_opened_destination_before_truncating() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        let destination = directory.path().join("destination.bin");
+        fs::write(&source, b"protected source bytes").unwrap();
+        let snapshot = FileSnapshot::capture(&source, 64, "test source").unwrap();
+
+        // This simulates the destination being exchanged for a source hardlink
+        // after an earlier path-level check but before the output open.
+        fs::hard_link(&source, &destination).unwrap();
+        let before = fs::read(&source).unwrap();
+        let error = write_output(&destination, true, false, 64, &[&snapshot], 64, |output| {
+            output.write_all(b"replacement").unwrap();
+            Ok(11)
+        })
+        .unwrap_err();
+        assert!(error.contains("protected source"), "{error}");
+        assert_eq!(fs::read(&source).unwrap(), before);
+        assert_eq!(fs::read(&destination).unwrap(), before);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn non_atomic_limit_error_never_unlinks_a_raced_protected_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        let destination = directory.path().join("destination.bin");
+        let displaced_output = directory.path().join("displaced-output.bin");
+        fs::write(&source, b"protected source bytes").unwrap();
+        fs::write(&destination, b"old destination").unwrap();
+        let snapshot = FileSnapshot::capture(&source, 64, "test source").unwrap();
+
+        let error = write_output(&destination, true, false, 4, &[&snapshot], 64, |output| {
+            output.write_all(b"oversized").unwrap();
+            fs::rename(&destination, &displaced_output).unwrap();
+            fs::rename(&source, &destination).unwrap();
+            Ok(9)
+        })
+        .unwrap_err();
+        assert!(error.contains("above max_output_bytes"), "{error}");
+        assert_eq!(fs::read(&destination).unwrap(), b"protected source bytes");
+        assert_eq!(fs::read(&displaced_output).unwrap(), b"oversized");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn non_atomic_success_rejects_a_destination_exchanged_for_protected_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        let destination = directory.path().join("destination.bin");
+        let displaced_output = directory.path().join("displaced-output.bin");
+        fs::write(&source, b"protected source bytes").unwrap();
+        fs::write(&destination, b"old destination").unwrap();
+        let snapshot = FileSnapshot::capture(&source, 64, "test source").unwrap();
+
+        let error = write_output(&destination, true, false, 64, &[&snapshot], 64, |output| {
+            output.write_all(b"generated").unwrap();
+            fs::rename(&destination, &displaced_output).unwrap();
+            fs::hard_link(&source, &destination).unwrap();
+            Ok(9)
+        })
+        .unwrap_err();
+        assert!(error.contains("protected source"), "{error}");
+        assert_eq!(fs::read(&source).unwrap(), b"protected source bytes");
+        assert_eq!(fs::read(&destination).unwrap(), b"protected source bytes");
+        assert_eq!(fs::read(&displaced_output).unwrap(), b"generated");
     }
 
     #[test]
@@ -2039,15 +2984,20 @@ mod tests {
     fn repairs_isobmff_loudness_from_its_decoded_audio() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source.m4a");
+        let reference = directory.path().join("reference.wav");
         let destination = directory.path().join("destination.m4a");
         pcm_mp4(&source);
+        classic_stereo_wave(&reference);
         let before = container_qc::audit(&source).unwrap();
         assert!(before.passed, "{before:#?}");
         let request_json = serde_json::json!({
             "schema_version": 1,
             "source": source,
             "destination": destination,
-            "isobmff_loudness": {"max_decoded_samples": 200_000},
+            "isobmff_loudness": {
+                "decoded_reference": "reference.wav",
+                "max_decoded_samples": 200_000
+            },
             "atomic_replace": true
         });
         let request_schema: serde_json::Value = serde_json::from_str(include_str!(
@@ -2059,7 +3009,12 @@ mod tests {
             .is_valid(&request_json));
         let (_, parsed_options) =
             parse_extended_spec(Path::new("request.json"), &request_json.to_string()).unwrap();
-        assert_eq!(parsed_options.unwrap().max_decoded_samples, 200_000);
+        let parsed_options = parsed_options.unwrap();
+        assert_eq!(
+            parsed_options.decoded_reference.as_deref(),
+            Some(Path::new("reference.wav"))
+        );
+        assert_eq!(parsed_options.max_decoded_samples, 200_000);
         let spec = MetadataRepairSpec {
             schema_version: 1,
             source: source.clone(),
@@ -2080,7 +3035,7 @@ mod tests {
             directory.path().join("request.json").as_path(),
             spec,
             IsobmffLoudnessRepair {
-                decoded_reference: None,
+                decoded_reference: Some(reference),
                 max_decoded_samples: 200_000,
             },
         )
@@ -2106,19 +3061,90 @@ mod tests {
         );
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn destinations_cannot_replace_source_or_decoded_reference_identities() {
+        let directory = tempfile::tempdir().unwrap();
+        let request = directory.path().join("request.json");
+
+        let wave_source = directory.path().join("source.wav");
+        let source_alias = directory.path().join("source-alias.wav");
+        classic_stereo_wave(&wave_source);
+        fs::hard_link(&wave_source, &source_alias).unwrap();
+        let source_before = fs::read(&wave_source).unwrap();
+        let mut source_spec =
+            repair_spec(wave_source.clone(), source_alias.clone(), SCHEMA_VERSION);
+        source_spec.overwrite = true;
+        source_spec.atomic_replace = false;
+        let error = evaluate(&request, source_spec).unwrap_err();
+        assert!(error.contains("protected source"), "{error}");
+        assert_eq!(fs::read(&wave_source).unwrap(), source_before);
+        assert_eq!(fs::read(&source_alias).unwrap(), source_before);
+
+        let source = directory.path().join("source.m4a");
+        let track = directory.path().join("track.wav");
+        pcm_mp4(&source);
+        classic_stereo_wave(&track);
+        let source_before = fs::read(&source).unwrap();
+        let track_before = fs::read(&track).unwrap();
+        let mut track_spec = repair_spec(source.clone(), track.clone(), SCHEMA_VERSION);
+        track_spec.overwrite = true;
+        let error = evaluate_isobmff_loudness(
+            &request,
+            track_spec,
+            IsobmffLoudnessRepair {
+                decoded_reference: Some(track.clone()),
+                max_decoded_samples: 200_000,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("decoded reference"), "{error}");
+        assert_eq!(fs::read(&source).unwrap(), source_before);
+        assert_eq!(fs::read(&track).unwrap(), track_before);
+
+        let companion = directory.path().join("companion.wav");
+        let companion_alias = directory.path().join("companion-alias.wav");
+        classic_stereo_wave_with(&companion, 48_000, 0.2);
+        fs::hard_link(&companion, &companion_alias).unwrap();
+        let companion_before = fs::read(&companion).unwrap();
+        let mut album_spec =
+            repair_spec(source.clone(), companion_alias.clone(), SCHEMA_VERSION_V2);
+        album_spec.overwrite = true;
+        album_spec.atomic_replace = false;
+        let error = evaluate_isobmff_loudness_v2(
+            &request,
+            album_spec,
+            IsobmffLoudnessRepairV2 {
+                decoded_reference: Some(track.clone()),
+                album_decoded_references: Some(vec![track.clone(), companion.clone()]),
+                max_album_references: 2,
+                max_decoded_samples: 300_000,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("decoded reference"), "{error}");
+        assert_eq!(fs::read(&source).unwrap(), source_before);
+        assert_eq!(fs::read(&track).unwrap(), track_before);
+        assert_eq!(fs::read(&companion).unwrap(), companion_before);
+        assert_eq!(fs::read(&companion_alias).unwrap(), companion_before);
+    }
+
     #[test]
     fn schema_v2_repairs_album_loudness_from_combined_complete_blocks() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("quiet.m4a");
-        let loud = directory.path().join("loud.m4a");
+        let quiet_reference = directory.path().join("quiet.wav");
+        let loud_reference = directory.path().join("loud.wav");
         let destination = directory.path().join("destination.m4a");
         let request = directory.path().join("request.json");
         pcm_mp4_with(&source, 192_000, 0.01);
-        pcm_mp4_with(&loud, 48_000, 0.5);
+        classic_stereo_wave_with(&quiet_reference, 192_000, 0.01);
+        classic_stereo_wave_with(&loud_reference, 48_000, 0.5);
 
         let quiet_analysis =
-            isobmff_loudness_repair::analyze_reference(&source, 1_000_000).unwrap();
-        let loud_analysis = isobmff_loudness_repair::analyze_reference(&loud, 1_000_000).unwrap();
+            isobmff_loudness_repair::analyze_reference(&quiet_reference, 1_000_000).unwrap();
+        let loud_analysis =
+            isobmff_loudness_repair::analyze_reference(&loud_reference, 1_000_000).unwrap();
         let mut combined_blocks = quiet_analysis.gating_blocks.clone();
         combined_blocks.extend_from_slice(&loud_analysis.gating_blocks);
         let expected_lufs = crate::dsp::lufs::gated_lufs(&combined_blocks);
@@ -2139,7 +3165,8 @@ mod tests {
             "destination": "destination.m4a",
             "atomic_replace": true,
             "isobmff_loudness": {
-                "album_decoded_references": ["quiet.m4a", "loud.m4a"],
+                "decoded_reference": "quiet.wav",
+                "album_decoded_references": ["quiet.wav", "loud.wav"],
                 "max_album_references": 2,
                 "max_decoded_samples": 600_000
             }
@@ -2241,9 +3268,11 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source.m4a");
-        let companion = directory.path().join("companion.m4a");
+        let source_reference = directory.path().join("source.wav");
+        let companion_reference = directory.path().join("companion.wav");
         pcm_mp4_with(&source, 24_000, 0.1);
-        pcm_mp4_with(&companion, 24_000, 0.2);
+        classic_stereo_wave_with(&source_reference, 24_000, 0.1);
+        classic_stereo_wave_with(&companion_reference, 24_000, 0.2);
         let request_path = directory.path().join("request.json");
 
         let duplicate = evaluate_isobmff_loudness_v2(
@@ -2254,14 +3283,68 @@ mod tests {
                 SCHEMA_VERSION_V2,
             ),
             IsobmffLoudnessRepairV2 {
-                decoded_reference: None,
-                album_decoded_references: Some(vec![source.clone(), source.clone()]),
+                decoded_reference: Some(source_reference.clone()),
+                album_decoded_references: Some(vec![
+                    source_reference.clone(),
+                    source_reference.clone(),
+                ]),
                 max_album_references: 2,
                 max_decoded_samples: 200_000,
             },
         )
         .unwrap_err();
         assert!(duplicate.contains("duplicate file"), "{duplicate}");
+
+        #[cfg(any(unix, windows))]
+        {
+            let hardlink = directory.path().join("source-hardlink.wav");
+            fs::hard_link(&source_reference, &hardlink).unwrap();
+            let duplicate_identity = evaluate_isobmff_loudness_v2(
+                &request_path,
+                repair_spec(
+                    source.clone(),
+                    directory.path().join("duplicate-hardlink.m4a"),
+                    SCHEMA_VERSION_V2,
+                ),
+                IsobmffLoudnessRepairV2 {
+                    decoded_reference: Some(source_reference.clone()),
+                    album_decoded_references: Some(vec![
+                        source_reference.clone(),
+                        hardlink.clone(),
+                    ]),
+                    max_album_references: 2,
+                    max_decoded_samples: 200_000,
+                },
+            )
+            .unwrap_err();
+            assert!(
+                duplicate_identity.contains("duplicate file"),
+                "{duplicate_identity}"
+            );
+
+            let alias_result = evaluate_isobmff_loudness_v2(
+                &request_path,
+                repair_spec(
+                    source.clone(),
+                    directory.path().join("hardlink-track.m4a"),
+                    SCHEMA_VERSION_V2,
+                ),
+                IsobmffLoudnessRepairV2 {
+                    decoded_reference: Some(source_reference.clone()),
+                    album_decoded_references: Some(vec![hardlink, companion_reference.clone()]),
+                    max_album_references: 2,
+                    max_decoded_samples: 200_000,
+                },
+            )
+            .unwrap();
+            let album = alias_result
+                .isobmff_loudness
+                .unwrap()
+                .album_loudness
+                .unwrap();
+            assert!(album.references[0].track_reference);
+            assert!(!album.references[1].track_reference);
+        }
 
         let missing = evaluate_isobmff_loudness_v2(
             &request_path,
@@ -2271,8 +3354,8 @@ mod tests {
                 SCHEMA_VERSION_V2,
             ),
             IsobmffLoudnessRepairV2 {
-                decoded_reference: None,
-                album_decoded_references: Some(vec![companion.clone()]),
+                decoded_reference: Some(source_reference.clone()),
+                album_decoded_references: Some(vec![companion_reference.clone()]),
                 max_album_references: 2,
                 max_decoded_samples: 200_000,
             },
@@ -2287,8 +3370,11 @@ mod tests {
                 SCHEMA_VERSION_V2,
             ),
             Some(&IsobmffOptions::V2(IsobmffLoudnessRepairV2 {
-                decoded_reference: None,
-                album_decoded_references: Some(vec![source.clone(), companion.clone()]),
+                decoded_reference: Some(source_reference.clone()),
+                album_decoded_references: Some(vec![
+                    source_reference.clone(),
+                    companion_reference.clone(),
+                ]),
                 max_album_references: 1,
                 max_decoded_samples: 200_000,
             })),
@@ -2300,26 +3386,39 @@ mod tests {
         );
 
         let source_bytes = fs::metadata(&source).unwrap().len();
-        let companion_bytes = fs::metadata(&companion).unwrap().len();
+        let source_reference_bytes = fs::metadata(&source_reference).unwrap().len();
+        let companion_reference_bytes = fs::metadata(&companion_reference).unwrap().len();
+        let reference_bytes = source_reference_bytes
+            .checked_add(companion_reference_bytes)
+            .unwrap();
+        let largest_input = source_bytes
+            .max(source_reference_bytes)
+            .max(companion_reference_bytes);
+        assert!(largest_input < reference_bytes);
         let mut byte_limited_spec = repair_spec(
             source.clone(),
             directory.path().join("byte-limited.m4a"),
             SCHEMA_VERSION_V2,
         );
-        byte_limited_spec.max_input_bytes = source_bytes + companion_bytes / 2;
+        byte_limited_spec.max_input_bytes = largest_input + (reference_bytes - largest_input) / 2;
+        assert!(byte_limited_spec.max_input_bytes > largest_input);
+        assert!(byte_limited_spec.max_input_bytes < reference_bytes);
         let byte_limit = evaluate_isobmff_loudness_v2(
             &request_path,
             byte_limited_spec,
             IsobmffLoudnessRepairV2 {
-                decoded_reference: None,
-                album_decoded_references: Some(vec![source.clone(), companion.clone()]),
+                decoded_reference: Some(source_reference.clone()),
+                album_decoded_references: Some(vec![
+                    source_reference.clone(),
+                    companion_reference.clone(),
+                ]),
                 max_album_references: 2,
                 max_decoded_samples: 200_000,
             },
         )
         .unwrap_err();
         assert!(
-            byte_limit.contains("aggregate max_input_bytes"),
+            byte_limit.contains("remaining aggregate budget"),
             "{byte_limit}"
         );
 
@@ -2331,8 +3430,8 @@ mod tests {
                 SCHEMA_VERSION_V2,
             ),
             IsobmffLoudnessRepairV2 {
-                decoded_reference: None,
-                album_decoded_references: Some(vec![source, companion]),
+                decoded_reference: Some(source_reference.clone()),
+                album_decoded_references: Some(vec![source_reference, companion_reference]),
                 max_album_references: 2,
                 max_decoded_samples: 60_000,
             },
@@ -2347,10 +3446,29 @@ mod tests {
     #[test]
     fn isobmff_decoded_sample_limit_is_enforced() {
         let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("source.m4a");
-        pcm_mp4(&source);
+        let source = directory.path().join("long.wav");
+        classic_stereo_wave(&source);
         let error = isobmff_loudness_repair::analyze_reference(&source, 100).unwrap_err();
         assert!(error.contains("exceeds max_decoded_samples (100)"));
+    }
+
+    #[test]
+    fn sowt_m4a_without_decoded_reference_rejects_ambiguous_layout() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.m4a");
+        let destination = directory.path().join("destination.m4a");
+        pcm_mp4(&source);
+
+        let error = evaluate_isobmff_loudness(
+            &directory.path().join("request.json"),
+            repair_spec(source, destination, SCHEMA_VERSION),
+            IsobmffLoudnessRepair {
+                decoded_reference: None,
+                max_decoded_samples: 200_000,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("ambiguous 2-channel layout"), "{error}");
     }
 
     #[test]

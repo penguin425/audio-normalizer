@@ -191,8 +191,19 @@ pub unsafe extern "C" fn forge_normalizer_analyze_file_v1(
         }
     };
 
-    let analysis = decoder::decode_limited(Path::new(path), max_decoded_samples)
-        .map(|audio| normalize::analyze(&audio))
+    let input_path = Path::new(path);
+    let analysis = decoder::decode_limited_with_layout(input_path, max_decoded_samples)
+        .and_then(|(mut audio, layout_provenance)| {
+            audio.channel_roles = normalize::resolve_decoded_channel_roles(
+                input_path,
+                audio.channels,
+                &audio.channel_roles,
+                layout_provenance,
+                None,
+            )?;
+            validate_finite_audio(&audio)?;
+            Ok(normalize::analyze(&audio))
+        })
         .and_then(ForgeAnalysisV1::try_from);
     match analysis {
         Ok(analysis) => {
@@ -207,6 +218,26 @@ pub unsafe extern "C" fn forge_normalizer_analyze_file_v1(
             ForgeStatus::AnalysisFailed
         }
     }
+}
+
+fn validate_finite_audio(audio: &crate::wav::AudioBuffer) -> Result<(), String> {
+    let first_non_finite = audio
+        .data
+        .iter()
+        .enumerate()
+        .filter_map(|(channel, samples)| {
+            samples
+                .iter()
+                .position(|sample| !sample.is_finite())
+                .map(|frame| (frame, channel))
+        })
+        .min();
+    if let Some((frame, channel)) = first_non_finite {
+        return Err(format!(
+            "non-finite sample at frame {frame}, channel {channel}"
+        ));
+    }
+    Ok(())
 }
 
 /// Create an opaque real-time processor from a bounded v1 configuration.

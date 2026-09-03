@@ -152,7 +152,7 @@ impl ComplianceProfile {
                 Self::symmetric(name, -23.0, 0.2, -1.0).sourced("EBU R 128 s2", "3.0 (2023)")
             }
             "ebu-r128-s2-streaming-adapted" => {
-                Self::symmetric(name, -18.0, 0.2, -1.0).sourced("EBU R 128 s2", "3.0 (2023)")
+                Self::symmetric(name, -18.0, 2.0, -1.0).sourced("EBU R 128 s2", "3.0 (2023)")
             }
             "ebu-r128-s2-music-low-plr" => Self {
                 max_peak_to_loudness_ratio_lu: Some(15.0),
@@ -212,10 +212,10 @@ impl ComplianceProfile {
                 max_loudness_to_dialogue_ratio_lu: None,
             },
             "aes77-music-track" => {
-                Self::symmetric("aes77-music-track", -16.0, 0.2, -1.0).sourced("AES77", "2023")
+                Self::upper_bounded("aes77-music-track", -16.0, 0.2, -1.0).sourced("AES77", "2023")
             }
             "aes77-interstitial" => {
-                Self::symmetric("aes77-interstitial", -18.0, 0.2, -1.0).sourced("AES77", "2023")
+                Self::upper_bounded("aes77-interstitial", -18.0, 0.2, -1.0).sourced("AES77", "2023")
             }
             _ => return None,
         };
@@ -1401,6 +1401,28 @@ mod tests {
         );
     }
 
+    fn profile_analysis(lufs: f64) -> crate::normalize::Analysis {
+        crate::normalize::Analysis {
+            sample_rate: 48_000,
+            channels: 2,
+            channel_roles: crate::wav::default_channel_roles(2),
+            frames: 48_000,
+            kind: crate::wav::PcmKind::S24,
+            lufs,
+            max_momentary_lufs: lufs,
+            max_short_term_lufs: lufs,
+            loudness_range_lu: 0.0,
+            rms_db: lufs,
+            sample_peak: 0.5,
+            true_peak: 0.5,
+            loudness_blocks: Vec::new(),
+        }
+    }
+
+    fn profile_accepts_loudness(profile: &ComplianceProfile, lufs: f64) -> bool {
+        profile.evaluate(&profile_analysis(lufs)).unwrap().passed
+    }
+
     #[test]
     fn versioned_ebu_distribution_profiles_preserve_their_source() {
         let unchanged = ComplianceProfile::builtin("ebu-r128-s2-streaming").unwrap();
@@ -1410,6 +1432,7 @@ mod tests {
 
         let adapted = ComplianceProfile::builtin("ebu-r128-s2-streaming-adapted").unwrap();
         assert_eq!(adapted.target_lufs, Some(-18.0));
+        assert_eq!(adapted.loudness_tolerance_lu, Some(2.0));
         let music = ComplianceProfile::builtin("ebu-r128-s2-music-low-plr").unwrap();
         assert_eq!(music.target_lufs, Some(-16.0));
         assert_eq!(music.max_peak_to_loudness_ratio_lu, Some(15.0));
@@ -1418,6 +1441,48 @@ mod tests {
         let radio = ComplianceProfile::builtin("ebu-r128-s3-radio").unwrap();
         assert_eq!(radio.target_lufs, Some(-23.0));
         assert_eq!(radio.standard_version.as_deref(), Some("2023"));
+    }
+
+    #[test]
+    fn adapted_ebu_streaming_profile_accepts_only_minus_20_to_minus_16() {
+        let profile = ComplianceProfile::builtin("ebu-r128-s2-streaming-adapted").unwrap();
+        let lower = -20.0_f64;
+        let upper = -16.0_f64;
+
+        assert!(profile_accepts_loudness(&profile, -18.0));
+        assert!(profile_accepts_loudness(&profile, lower));
+        assert!(profile_accepts_loudness(&profile, lower.next_up()));
+        assert!(!profile_accepts_loudness(&profile, lower.next_down()));
+        assert!(profile_accepts_loudness(&profile, upper));
+        assert!(profile_accepts_loudness(&profile, upper.next_down()));
+        assert!(!profile_accepts_loudness(&profile, upper.next_up()));
+    }
+
+    #[test]
+    fn aes77_music_and_interstitial_have_only_an_upper_tolerance() {
+        for name in ["aes77-music-track", "aes77-interstitial"] {
+            let profile = ComplianceProfile::builtin(name).unwrap();
+            assert_eq!(profile.loudness_tolerance_lu, None, "{name}");
+            assert_eq!(profile.lower_tolerance_lu, None, "{name}");
+            assert_eq!(profile.upper_tolerance_lu, Some(0.2), "{name}");
+
+            let target = profile.target_lufs.unwrap();
+            let upper = target + profile.upper_tolerance_lu.unwrap();
+            assert!(profile_accepts_loudness(&profile, target), "{name}");
+            assert!(profile_accepts_loudness(&profile, upper), "{name}");
+            assert!(
+                profile_accepts_loudness(&profile, upper.next_down()),
+                "{name}"
+            );
+            assert!(
+                !profile_accepts_loudness(&profile, upper.next_up()),
+                "{name}"
+            );
+            assert!(
+                profile_accepts_loudness(&profile, target - 20.0),
+                "{name} must not invent a lower loudness bound"
+            );
+        }
     }
 
     #[test]

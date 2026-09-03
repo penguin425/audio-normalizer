@@ -4,11 +4,13 @@ use forge_normalizer::c_api::{
     ForgeAnalysisV1, ForgeLiveConfigV1, ForgeStatus, ANALYSIS_V1_SIZE, C_API_VERSION,
     LIVE_CONFIG_V1_SIZE,
 };
-use forge_normalizer::wav::{default_channel_roles, AudioBuffer, PcmKind, WavWriter};
+use forge_normalizer::wav::{default_channel_roles, AudioBuffer, ChannelRole, PcmKind, WavWriter};
 use std::f32::consts::TAU;
 use std::ffi::{CStr, CString};
+use std::fs;
 use std::mem::MaybeUninit;
 use std::os::raw::c_char;
+use std::path::Path;
 use std::ptr;
 
 fn error_text(buffer: &[c_char]) -> &str {
@@ -16,6 +18,24 @@ fn error_text(buffer: &[c_char]) -> &str {
     unsafe { CStr::from_ptr(buffer.as_ptr()) }
         .to_str()
         .expect("UTF-8 error text")
+}
+
+fn write_f32_wave(path: &Path, sample: f32) {
+    let mut bytes = Vec::with_capacity(48);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&40_u32.to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16_u32.to_le_bytes());
+    bytes.extend_from_slice(&3_u16.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&48_000_u32.to_le_bytes());
+    bytes.extend_from_slice(&192_000_u32.to_le_bytes());
+    bytes.extend_from_slice(&4_u16.to_le_bytes());
+    bytes.extend_from_slice(&32_u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&4_u32.to_le_bytes());
+    bytes.extend_from_slice(&sample.to_le_bytes());
+    fs::write(path, bytes).unwrap();
 }
 
 #[test]
@@ -157,4 +177,75 @@ fn c_api_analyzes_a_bounded_file_into_the_fixed_v1_layout() {
     assert_eq!(status, ForgeStatus::AnalysisFailed);
     assert!(error_text(&error).contains("decoded sample count"));
     assert!(error_text(&error).contains("safety limit"));
+}
+
+#[test]
+fn c_api_rejects_non_finite_ieee_float_wave_samples() {
+    let temporary = tempfile::tempdir().unwrap();
+
+    for (name, sample) in [
+        ("nan", f32::NAN),
+        ("positive-infinity", f32::INFINITY),
+        ("negative-infinity", f32::NEG_INFINITY),
+    ] {
+        let path = temporary.path().join(format!("{name}.wav"));
+        write_f32_wave(&path, sample);
+        let path = CString::new(path.to_str().unwrap()).unwrap();
+        let mut result = MaybeUninit::<ForgeAnalysisV1>::uninit();
+        let mut error = [1_i8; 256];
+
+        // SAFETY: every pointer references live, sufficiently sized,
+        // non-overlapping caller-owned storage.
+        let status = unsafe {
+            forge_normalizer_analyze_file_v1(
+                path.as_ptr(),
+                1,
+                result.as_mut_ptr(),
+                ANALYSIS_V1_SIZE,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+
+        assert_eq!(status, ForgeStatus::AnalysisFailed, "{name}");
+        assert_eq!(
+            error_text(&error),
+            "non-finite sample at frame 0, channel 0",
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn c_api_rejects_maskless_multichannel_without_a_layout_override() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("maskless.wav");
+    let audio = AudioBuffer {
+        sample_rate: 48_000,
+        channels: 6,
+        frames: 8,
+        data: vec![vec![0.0; 8]; 6],
+        channel_roles: vec![ChannelRole::Main; 6],
+        source_kind: PcmKind::F32,
+    };
+    WavWriter::write(&path, &audio, PcmKind::F32, false).unwrap();
+    let path = CString::new(path.to_str().unwrap()).unwrap();
+    let mut result = MaybeUninit::<ForgeAnalysisV1>::uninit();
+    let mut error = [1_i8; 256];
+
+    // SAFETY: every pointer references live, sufficiently sized,
+    // non-overlapping caller-owned storage.
+    let status = unsafe {
+        forge_normalizer_analyze_file_v1(
+            path.as_ptr(),
+            48,
+            result.as_mut_ptr(),
+            ANALYSIS_V1_SIZE,
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+
+    assert_eq!(status, ForgeStatus::AnalysisFailed);
+    assert!(error_text(&error).contains("ambiguous 6-channel layout"));
 }

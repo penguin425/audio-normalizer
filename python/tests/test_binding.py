@@ -44,6 +44,14 @@ def _write_stereo_wave(path: Path, *, seconds: int = 1) -> None:
         output.writeframes(frames)
 
 
+def _write_maskless_multichannel_wave(path: Path) -> None:
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(6)
+        output.setsampwidth(2)
+        output.setframerate(48_000)
+        output.writeframes(bytes(6 * 2 * 8))
+
+
 class BindingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -90,6 +98,13 @@ class BindingTests(unittest.TestCase):
                 analyze_file(path, max_decoded_samples=10, library=self.library)
         self.assertEqual(bounded.exception.status, ForgeStatus.ANALYSIS_FAILED)
         self.assertIn("exceeds safety limit", bounded.exception.message)
+
+    def test_ambiguous_multichannel_layout_fails_without_override(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "maskless.wav"
+            _write_maskless_multichannel_wave(path)
+            with self.assertRaisesRegex(AnalysisError, "ambiguous 6-channel layout"):
+                analyze_file(path, max_decoded_samples=48, library=self.library)
 
     def test_invalid_python_inputs_fail_before_native_code(self) -> None:
         missing_library = Path(tempfile.gettempdir()) / "forge-does-not-exist.so"

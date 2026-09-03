@@ -28,14 +28,17 @@ contains a canonical request descriptor:
 Consequently identical bytes at different paths share an entry, while changed
 bytes or measurement-changing options cannot reuse one. The request hash,
 input hash, canonical result-payload hash, generator version, measurement
-standard, and algorithm revision are retained in the entry. Cache v1 records
+standard, and algorithm revision are retained in the entry. Cache v2 records
 normative ITU-R BS.1770-5 / EBU R 128 measurements; caching does not alter
 gating, channel weighting, units, or normalization targets.
-`forge-bs1770-5-r2` is the current implementation revision and changes
+`forge-bs1770-5-r3` is the current implementation revision and changes
 whenever a result-affecting core algorithm changes.
 
 The JSON compatibility boundary is
-[`analysis-cache-v1`](schema/analysis-cache-v1.schema.json). Decibel silence
+[`analysis-cache-v2`](schema/analysis-cache-v2.schema.json). The immutable
+[`analysis-cache-v1`](schema/analysis-cache-v1.schema.json) remains available
+to validate historical r2 entries, but current runtimes treat them as cache
+misses. Decibel silence
 values that are mathematically negative infinity are represented as JSON
 `"-inf"`; on a validated hit Forge restores negative infinity. Linear peaks
 and gating-block mean squares use finite, non-negative values. Timeline levels
@@ -47,7 +50,7 @@ windows remain distinct from complete silent windows.
 Recognized entries use this fixed-depth layout:
 
 ```text
-DIR/v1/aa/<64-character-input-sha256>/<64-character-request-sha256>.json
+DIR/v2/aa/<64-character-input-sha256>/<64-character-request-sha256>.json
 ```
 
 Forge creates a sibling temporary file, writes and synchronizes the complete
@@ -64,7 +67,7 @@ misses hash again after measurement and fail instead of publishing when the
 ordinary start/end content hashes differ.
 
 The cache never recursively interprets arbitrary files. Capacity accounting
-and eviction recognize only regular JSON files at the exact v1 layout with
+and eviction recognize only regular JSON files at the exact v2 layout with
 lower-case SHA-256 names. Unrecognized files and directories are left alone.
 
 ## Corruption and read-only behavior
@@ -77,7 +80,7 @@ observable miss:
 
 ```text
 analysis cache invalid; repaired: input.wav
-analysis cache warning: cache entry is not valid v1 JSON: ...
+analysis cache warning: cache entry is not valid v2 JSON: ...
 ```
 
 Writable mode recomputes and atomically repairs it. With

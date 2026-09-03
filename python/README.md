@@ -15,7 +15,8 @@ print(analysis.integrated_lufs, analysis.true_peak_dbtp)
 ```
 
 The decoded-sample limit is mandatory and counts frames multiplied by
-channels. See
+channels. File analysis rejects ambiguous or scene-based multichannel layouts
+because C ABI v1 has no speaker-layout override. See
 [`PYTHON-API.md`](https://github.com/penguin425/audio-normalizer/blob/main/PYTHON-API.md)
 for installation, library selection, exceptions, compatibility, and the full
 result schema.

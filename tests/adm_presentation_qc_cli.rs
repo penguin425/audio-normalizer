@@ -45,10 +45,11 @@ fn renders_and_measures_every_complementary_presentation() {
     let report = work.path().join("report.json");
     let retained = work.path().join("renders");
 
-    let audio = sine();
-    WavWriter::write(&template, &audio, PcmKind::F32, false).unwrap();
-    let measured = analysis::analyze(&audio);
-    write_adm(&input, &audio, measured.lufs, measured.true_peak_db());
+    let input_audio = sine();
+    let rendered_audio = stereo_sine();
+    WavWriter::write(&template, &rendered_audio, PcmKind::F32, false).unwrap();
+    let measured = analysis::analyze(&rendered_audio);
+    write_adm(&input, &input_audio, measured.lufs, measured.true_peak_db());
     let script = format!(
         r#"#!/bin/sh
 set -eu
@@ -171,6 +172,19 @@ fn sine() -> AudioBuffer {
         data: vec![samples],
         channel_roles: default_channel_roles(1),
         source_kind: PcmKind::F32,
+    }
+}
+
+#[cfg(unix)]
+fn stereo_sine() -> AudioBuffer {
+    let mono = sine();
+    AudioBuffer {
+        sample_rate: mono.sample_rate,
+        channels: 2,
+        frames: mono.frames,
+        data: vec![mono.data[0].clone(), mono.data[0].clone()],
+        channel_roles: default_channel_roles(2),
+        source_kind: mono.source_kind,
     }
 }
 
