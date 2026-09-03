@@ -89,8 +89,10 @@ jobs:
       - name: Install LAME
         run: sudo apt-get install -y libmp3lame-dev
 
-      - name: Run tests with MP3 encoding
-        run: cargo test --features mp3-encoding
+      - name: Check and test MP3 encoding
+        run: |
+          cargo check --locked --features mp3-encoding --all-targets
+          cargo test --locked --features mp3-encoding --lib --test integration --jobs 1
 
   wasm:
     name: Browser WASM analysis
