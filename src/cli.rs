@@ -7,6 +7,8 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
+const DEFAULT_ANALYSIS_ENGINE: &str = "fast";
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "forge",
@@ -157,14 +159,6 @@ pub struct Cli {
     /// Only measure and print stats; do not write files.
     #[arg(long = "analyze")]
     pub analyze_only: bool,
-
-    /// Measurement engine: fast production path or deterministic reference path.
-    #[arg(
-        long = "analysis-engine",
-        value_parser = ["fast", "reference"],
-        default_value = "fast"
-    )]
-    analysis_engine: String,
 
     /// Print analyze results as a JSON array to stdout.
     #[arg(
@@ -763,14 +757,31 @@ struct OutputConfig {
 }
 
 impl Cli {
-    /// Return the selected loudness-analysis engine name.
-    pub fn analysis_engine(&self) -> &str {
-        &self.analysis_engine
+    /// Build Forge's command with the opt-in loudness-analysis engine selector.
+    ///
+    /// The selector is kept outside [`Cli`] so adding it does not change the
+    /// layout or exhaustive construction of the public configuration struct.
+    pub fn command_with_analysis_engine() -> clap::Command {
+        Self::command().arg(
+            clap::Arg::new("analysis_engine")
+                .long("analysis-engine")
+                .value_name("ENGINE")
+                .value_parser(["fast", "reference"])
+                .default_value(DEFAULT_ANALYSIS_ENGINE)
+                .help("Measurement engine: fast production path or deterministic reference path"),
+        )
     }
 
     pub fn parse_with_config() -> Result<Self, String> {
         let matches = Self::command().get_matches();
         Self::from_matches_with_config(&matches)
+    }
+
+    /// Parse Forge's command line and return both its public configuration and
+    /// the selected loudness-analysis engine.
+    pub fn parse_with_config_and_analysis_engine() -> Result<(Self, String), String> {
+        let matches = Self::command_with_analysis_engine().get_matches();
+        Self::from_matches_with_config_and_analysis_engine(&matches)
     }
 
     /// Build a CLI value from already parsed matches and apply its optional
@@ -781,17 +792,35 @@ impl Cli {
     /// unknown match IDs are ignored while Forge's built-in options retain
     /// their normal explicit-command-line precedence.
     pub fn from_matches_with_config(matches: &clap::ArgMatches) -> Result<Self, String> {
+        Self::from_matches_with_config_and_analysis_engine(matches).map(|(cli, _)| cli)
+    }
+
+    /// Build a CLI value and selected loudness-analysis engine from parsed
+    /// matches, then apply the optional TOML configuration.
+    ///
+    /// `matches` may come from [`Cli::command_with_analysis_engine`] or from a
+    /// caller-augmented [`Cli::command`]. When the added argument is absent,
+    /// the production `fast` engine is selected.
+    pub fn from_matches_with_config_and_analysis_engine(
+        matches: &clap::ArgMatches,
+    ) -> Result<(Self, String), String> {
         let mut cli = Self::from_arg_matches(matches)
             .map_err(|error| format!("parse command line: {error}"))?;
+        let mut analysis_engine = matches
+            .try_get_one::<String>("analysis_engine")
+            .ok()
+            .flatten()
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_ANALYSIS_ENGINE.to_string());
         let Some(path) = cli.config.clone() else {
-            return Ok(cli);
+            return Ok((cli, analysis_engine));
         };
         let text = fs::read_to_string(&path)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
         let config: ForgeConfig =
             toml::from_str(&text).map_err(|error| format!("parse {}: {error}", path.display()))?;
-        cli.apply_config(config, matches, &path)?;
-        Ok(cli)
+        cli.apply_config(config, matches, &path, &mut analysis_engine)?;
+        Ok((cli, analysis_engine))
     }
 
     fn apply_config(
@@ -799,6 +828,7 @@ impl Cli {
         config: ForgeConfig,
         matches: &clap::ArgMatches,
         config_path: &Path,
+        analysis_engine: &mut String,
     ) -> Result<(), String> {
         let normalization = config.normalization;
         let explicit_preset = is_explicit(matches, "preset");
@@ -869,12 +899,11 @@ impl Cli {
             &mut self.analyze_only,
             analysis.enabled,
         );
-        set_if_implicit(
-            matches,
-            "analysis_engine",
-            &mut self.analysis_engine,
-            analysis.engine,
-        );
+        if !is_optional_explicit(matches, "analysis_engine") {
+            if let Some(engine) = analysis.engine {
+                *analysis_engine = engine;
+            }
+        }
         let configured_compliance = analysis.compliance.map(|value| {
             if value.ends_with(".json") || value.ends_with(".toml") {
                 resolve_path(config_path, PathBuf::from(value))
@@ -972,7 +1001,7 @@ impl Cli {
         set_if_implicit(matches, "bwf", &mut self.bwf, output.bwf);
         if !self.analyze_only
             && (self.compliance.is_some()
-                || self.analysis_engine != "fast"
+                || analysis_engine.as_str() != DEFAULT_ANALYSIS_ENGINE
                 || self.dialogue_ranges.is_some()
                 || self.start_seconds.is_some()
                 || self.duration_seconds.is_some()
@@ -1001,16 +1030,12 @@ impl Cli {
                     .into(),
             );
         }
-        self.validate_config_values()
+        self.validate_config_values(analysis_engine)
     }
 
-    fn validate_config_values(&self) -> Result<(), String> {
+    fn validate_config_values(&self, analysis_engine: &str) -> Result<(), String> {
         validate_choice("normalization.mode", &self.mode, &["lufs", "peak", "rms"])?;
-        validate_choice(
-            "analysis.engine",
-            &self.analysis_engine,
-            &["fast", "reference"],
-        )?;
+        validate_choice("analysis.engine", analysis_engine, &["fast", "reference"])?;
         if let Some(preset) = &self.preset {
             validate_choice(
                 "normalization.preset",
@@ -1061,6 +1086,11 @@ impl Cli {
 
 fn is_explicit(matches: &clap::ArgMatches, id: &str) -> bool {
     matches.value_source(id) == Some(ValueSource::CommandLine)
+}
+
+fn is_optional_explicit(matches: &clap::ArgMatches, id: &str) -> bool {
+    matches.try_get_one::<String>(id).is_ok()
+        && matches.value_source(id) == Some(ValueSource::CommandLine)
 }
 
 fn set_if_implicit<T>(

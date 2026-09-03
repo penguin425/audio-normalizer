@@ -529,6 +529,52 @@ fn reference_analysis_reports_engine_identity_and_uses_an_isolated_cache_entry()
 }
 
 #[test]
+fn analysis_engine_config_is_applied_and_an_explicit_cli_value_wins() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("tone.wav");
+    let config = directory.path().join("forge.toml");
+    write_batch_test_wav(&input, 997.0);
+    std::fs::write(
+        &config,
+        r#"
+            [analysis]
+            enabled = true
+            engine = "reference"
+        "#,
+    )
+    .unwrap();
+
+    let configured = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .arg("--config")
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        configured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&configured.stderr)
+    );
+    assert!(String::from_utf8_lossy(&configured.stderr)
+        .contains("analysis engine: forge-reference-bs1770-r1"));
+
+    let overridden = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .arg("--config")
+        .arg(&config)
+        .args(["--analysis-engine", "fast", "--analyze", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        overridden.status.success(),
+        "{}",
+        String::from_utf8_lossy(&overridden.stderr)
+    );
+    let reports: serde_json::Value = serde_json::from_slice(&overridden.stdout).unwrap();
+    assert_eq!(reports[0]["analysis_engine_id"], "forge-fast-bs1770-r4");
+}
+
+#[test]
 fn read_only_analysis_cache_miss_does_not_create_storage() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("tone.wav");

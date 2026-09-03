@@ -1,6 +1,6 @@
 //! Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer.
 
-use clap::{Arg, ArgAction, CommandFactory};
+use clap::{Arg, ArgAction};
 use forge_normalizer::adm::{self, ReferenceRendererOptions};
 use forge_normalizer::analysis::{Analysis, AnalysisEngine};
 use forge_normalizer::analysis_cache::{
@@ -69,6 +69,23 @@ struct CatalogueOptions {
     report: Option<PathBuf>,
 }
 
+#[derive(Debug)]
+struct AnalysisInvocationOptions {
+    engine: AnalysisEngine,
+    anomaly_audits: Vec<PathBuf>,
+    ebu_qc_xml: Option<PathBuf>,
+}
+
+impl AnalysisInvocationOptions {
+    fn engine_only(engine: AnalysisEngine) -> Self {
+        Self {
+            engine,
+            anomaly_audits: Vec::new(),
+            ebu_qc_xml: None,
+        }
+    }
+}
+
 impl CacheOptions {
     fn open(&self) -> Result<Option<AnalysisCache>, String> {
         let Some(directory) = &self.directory else {
@@ -90,7 +107,7 @@ impl CacheOptions {
 }
 
 fn main() -> ExitCode {
-    let matches = cli::Cli::command()
+    let matches = cli::Cli::command_with_analysis_engine()
         .arg(
             Arg::new("true_peak_backend")
                 .long("true-peak-backend")
@@ -298,8 +315,16 @@ fn main() -> ExitCode {
         database: matches.get_one::<PathBuf>("catalogue").cloned(),
         report: matches.get_one::<PathBuf>("catalogue_report").cloned(),
     };
-    let cli = match cli::Cli::from_matches_with_config(&matches) {
-        Ok(cli) => cli,
+    let (cli, analysis_engine) =
+        match cli::Cli::from_matches_with_config_and_analysis_engine(&matches) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                eprintln!("forge: error: {error}");
+                return ExitCode::from(2);
+            }
+        };
+    let analysis_engine = match analysis_engine.parse::<AnalysisEngine>() {
+        Ok(engine) => engine,
         Err(error) => {
             eprintln!("forge: error: {error}");
             return ExitCode::from(2);
@@ -316,8 +341,11 @@ fn main() -> ExitCode {
         cache_options,
         watch_options,
         catalogue_options,
-        anomaly_audits,
-        ebu_qc_xml,
+        AnalysisInvocationOptions {
+            engine: analysis_engine,
+            anomaly_audits,
+            ebu_qc_xml,
+        },
     );
     if backend == forge_normalizer::dsp::lufs::TruePeakBackend::Cuda {
         if let Some(reason) = forge_normalizer::dsp::lufs::cuda_runtime_fallback_reason() {
@@ -366,11 +394,16 @@ fn run(
     cache_options: CacheOptions,
     watch_options: WatchOptions,
     catalogue_options: CatalogueOptions,
-    anomaly_audits: Vec<PathBuf>,
-    ebu_qc_xml: Option<PathBuf>,
+    analysis_options: AnalysisInvocationOptions,
 ) -> Result<(), String> {
     if watch_options.enabled {
-        return run_watch(cli, cache_options, watch_options, anomaly_audits);
+        return run_watch(
+            cli,
+            analysis_options.engine,
+            cache_options,
+            watch_options,
+            analysis_options.anomaly_audits,
+        );
     }
     let pipeline = PipelineFiles::prepare(&mut cli, &batch_options)?;
     run_paths(
@@ -379,14 +412,14 @@ fn run(
         &batch_options,
         &cache_options,
         &catalogue_options,
-        &anomaly_audits,
-        ebu_qc_xml.as_deref(),
+        &analysis_options,
     )?;
     pipeline.emit_stdout()
 }
 
 fn run_watch(
     mut cli: cli::Cli,
+    analysis_engine: AnalysisEngine,
     cache_options: CacheOptions,
     options: WatchOptions,
     anomaly_audits: Vec<PathBuf>,
@@ -441,9 +474,14 @@ fn run_watch(
         let candidates = watch.scan()?;
         let mut failures = Vec::new();
         for candidate in candidates {
-            if let Err(error) =
-                process_watch_candidate(&cli, &cache_options, &mut watch, &candidate, &output_root)
-            {
+            if let Err(error) = process_watch_candidate(
+                &cli,
+                analysis_engine,
+                &cache_options,
+                &mut watch,
+                &candidate,
+                &output_root,
+            ) {
                 watch.mark_failed(&candidate.id, &error)?;
                 eprintln!("watch failed: {}: {error}", candidate.input.display());
                 failures.push(error);
@@ -462,6 +500,7 @@ fn run_watch(
 
 fn process_watch_candidate(
     template: &cli::Cli,
+    analysis_engine: AnalysisEngine,
     cache_options: &CacheOptions,
     watch: &mut WatchFolder,
     candidate: &WatchCandidate,
@@ -491,14 +530,14 @@ fn process_watch_candidate(
     cli.output = Some(output);
     cli.recursive = false;
     cli.overwrite = true;
+    let analysis_options = AnalysisInvocationOptions::engine_only(analysis_engine);
     let result = run_paths(
         cli,
         false,
         &BatchOptions::default(),
         cache_options,
         &CatalogueOptions::default(),
-        &[],
-        None,
+        &analysis_options,
     );
     match result {
         Ok(()) => watch.mark_completed(&candidate.id),
@@ -543,9 +582,11 @@ fn run_paths(
     batch_options: &BatchOptions,
     cache_options: &CacheOptions,
     catalogue_options: &CatalogueOptions,
-    anomaly_audit_paths: &[PathBuf],
-    ebu_qc_xml: Option<&Path>,
+    analysis_options: &AnalysisInvocationOptions,
 ) -> Result<(), String> {
+    let analysis_engine = analysis_options.engine;
+    let anomaly_audit_paths = &analysis_options.anomaly_audits;
+    let ebu_qc_xml = analysis_options.ebu_qc_xml.as_deref();
     if let Some(j) = cli.jobs {
         ThreadPoolBuilder::new()
             .num_threads(j)
@@ -555,7 +596,6 @@ fn run_paths(
 
     let (expanded, relative_paths) = expand_inputs(&cli.inputs, cli.recursive)?;
     cli.inputs = expanded;
-    let analysis_engine = cli.analysis_engine().parse::<AnalysisEngine>()?;
     if analysis_engine == AnalysisEngine::Reference && !cli.analyze_only {
         return Err("--analysis-engine reference requires --analyze".into());
     }
