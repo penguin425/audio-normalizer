@@ -167,9 +167,11 @@ impl AtomicOutput {
         let destination = self.destination;
         let overwrite = matches!(self.expected_destination, DestinationState::Present { .. });
         let persisted = persist_temporary(self.temporary, &destination, overwrite)?;
-        persisted
-            .sync_all()
-            .map_err(|error| format!("sync committed output {}: {error}", destination.display()))?;
+        // The same open inode was synchronized immediately before the rename,
+        // and no file data changes between that sync and publication. Syncing
+        // it a second time here adds a full filesystem round trip without
+        // strengthening durability. The parent-directory sync below makes the
+        // rename durable on Unix; Windows uses MoveFileExW with WRITE_THROUGH.
         sync_parent_directory(&destination)?;
         Ok(persisted)
     }
