@@ -454,13 +454,16 @@ jobs:
           # that one-time integrity migration a measured, bounded allowance;
           # once StableInput is present in the base, the original tight
           # regression limits automatically apply again.
-          # v0.189.5 similarly permits at most 5% for the one-time r3 -> r4
-          # numerically stable accumulation migration. Candidate self-parity
-          # and the exact revision pair are enforced earlier in this job.
+          # v0.189.5 similarly permits at most 5% on aggregate for the one-time
+          # r3 -> r4 numerically stable accumulation migration. Use the same
+          # 8% isolated tripwire as the PCM gate to absorb hosted-runner noise;
+          # the four-value aggregate below still enforces the 5% budget.
+          # Candidate self-parity and the exact revision pair are enforced
+          # earlier in this job.
           analysis_limit = (
               5.0 if stable_input_migration or measurement_migration else 3.0
           )
-          normalization_case_limit = 5.0 if measurement_migration else 3.0
+          normalization_case_limit = 8.0 if measurement_migration else 3.0
           normalization_aggregate_limit = (
               5.0
               if measurement_migration
