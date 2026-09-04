@@ -491,9 +491,10 @@ v0.189.6. Before adding another broad parser surface, Forge will:
   cleanup. A strict broker profile will additionally combine OS filesystem and
   syscall isolation, disable networking and privilege gain, and fail closed
   when the promised sandbox cannot be installed; and
-- pin every GitHub Action and reproducibility-sensitive toolchain to immutable
-  revisions, reject symbolic workflow references in CI, and run scheduled
-  advisory checks.
+- keep every GitHub Action and reproducibility-sensitive toolchain at immutable
+  revisions, reject symbolic workflow references in CI and release readiness,
+  and run scheduled advisory checks. These workflow gates and release-tag
+  update/deletion protection shipped immediately after v0.189.8.
 
 ### Newly identified integrity gates
 
@@ -631,7 +632,7 @@ planned.
 | v0.189.12 | Add explicit metadata-fidelity policies, registry-backed full-container metadata discovery, exact resampling-time conversion, and restartable metadata-only library transactions | Metadata integrity and workflow recovery |
 | v0.189.13 | Add generation-level all-or-nothing album/batch publication, semantic job fingerprints, bounded `--keep-going`, recovery inspection, safe reclamation of orphaned stages, and fully side-effect-free dry runs outside explicit cache warming | Recoverability and operations |
 | v0.189.14 | Prove Linux ABI and wheel-tag compatibility in the oldest supported runtime and ship relocatable CMake/pkg-config metadata before expanding release targets | Distribution compatibility |
-| v0.189.15 | Pin every Action to a full revision, enforce SHA-only workflows, protect release tags with a ruleset, split assemble/attest/publish permissions, decide `latest` before the one-way immutable publication, validate an exact asset manifest, add Linux ARM64 after runtime proof, publish through trusted crates.io/PyPI/npm identities, and extend per-artifact SBOM/provenance; treat Windows ARM64, OCI, notarization, and Authenticode as demand- and credential-gated follow-up | Supply-chain and native trust |
+| v0.189.15 | Split assemble/attest/publish permissions, decide `latest` before the one-way immutable publication, validate an exact asset manifest, add Linux ARM64 after runtime proof, use OIDC trusted publishing for PyPI/npm while isolating a least-privilege crates.io token or credential provider until crates.io offers an equivalent official flow, and extend per-artifact SBOM/provenance; treat Windows ARM64, OCI, notarization, and Authenticode as demand- and credential-gated follow-up | Supply-chain and native trust |
 | v0.190 | Native file-based ADM BS.2168 Level 0/1/2 validation, including declarations, graph constraints, block timing, CHNA/essence reconciliation, and derived limits | Normative |
 | v0.190.1 | Add ITU-R BS.1864-1 international programme-exchange presets for programme- and explicitly ranged dialogue-based −24 LKFS measurement | Normative profile |
 | v0.190.2 | Introduce a common checked AES3 essence layer, then decode and validate uncompressed PCM Wave Audio essence in SMPTE ST 382:2023 MXF, including wrapping, descriptor, quantization, channel-ID, and BWF mapping evidence | Normative subset |
