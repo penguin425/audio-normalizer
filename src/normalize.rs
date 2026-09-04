@@ -1357,7 +1357,7 @@ pub(crate) fn analyze_input_descriptor_for_plan_unbound(
         return analyze_input_descriptor_range_with_engine(descriptor, None, AnalysisEngine::Fast)
             .map(|timed| timed.analysis);
     }
-    Ok(prepare_descriptor_for_plan_sequential(descriptor, plan)?.analysis)
+    Ok(prepare_descriptor_for_plan(descriptor, plan, false)?.analysis)
 }
 
 struct PreparedAnalysis {
@@ -1401,7 +1401,7 @@ fn prepare_file_for_plan(
 ) -> Result<PreparedAnalysis, String> {
     plan.validate()?;
     if analysis_pipeline_enabled(plan) {
-        return prepare_file_for_plan_pipelined(path, channel_roles, plan, capture_spool);
+        return prepare_source_for_plan_pipelined(path, None, channel_roles, plan, capture_spool);
     }
     prepare_file_for_plan_sequential(path, channel_roles, plan, capture_spool)
 }
@@ -1463,14 +1463,16 @@ fn prepare_file_for_plan_sequential(
 fn prepare_descriptor_for_plan_sequential(
     descriptor: &InputDescriptor,
     plan: &Plan,
+    capture_spool: bool,
 ) -> Result<PreparedAnalysis, String> {
     let path = descriptor.stable_input().stable_path();
     let mut analyzer: Option<lufs::StreamingAnalyzer> = None;
     let mut converter: Option<SampleRateConverter> = None;
+    let mut spool: Option<PcmSpool> = None;
     let mut resolved_roles = None;
     let info = decoder::decode_descriptor_stream_with_layout_and_declared_frames(
         descriptor,
-        |info, layout_provenance, _, chunk| {
+        |info, layout_provenance, declared_frames, chunk| {
             if analyzer.is_none() {
                 let roles = resolve_stream_roles(path, info, layout_provenance, None)?;
                 let output_rate = plan.output_sample_rate.unwrap_or(info.sample_rate);
@@ -1484,33 +1486,65 @@ fn prepare_descriptor_for_plan_sequential(
                         plan.resample_quality,
                     )?);
                 }
+                if capture_spool && should_capture_descriptor_pcm(descriptor, converter.is_some()) {
+                    let expected_bytes =
+                        expected_pcm_spool_bytes(path, info, output_rate, declared_frames);
+                    spool = PcmSpool::new(info.channels as usize, expected_bytes).ok();
+                }
             }
             if let Some(converter) = converter.as_mut() {
                 converter.process(chunk, |output| {
-                    analyzer
-                        .as_mut()
-                        .expect("descriptor analyzer was initialized")
-                        .process(output)
+                    analyze_and_capture(
+                        output,
+                        analyzer
+                            .as_mut()
+                            .expect("descriptor analyzer was initialized"),
+                        &mut spool,
+                    )
                 })
             } else {
-                analyzer
-                    .as_mut()
-                    .expect("descriptor analyzer was initialized")
-                    .process(chunk)
+                analyze_and_capture(
+                    chunk,
+                    analyzer
+                        .as_mut()
+                        .expect("descriptor analyzer was initialized"),
+                    &mut spool,
+                )
             }
         },
     )?;
     if let Some(converter) = converter.as_mut() {
         converter.finish(|output| {
-            analyzer
-                .as_mut()
-                .expect("descriptor analyzer was initialized")
-                .process(output)
+            analyze_and_capture(
+                output,
+                analyzer
+                    .as_mut()
+                    .expect("descriptor analyzer was initialized"),
+                &mut spool,
+            )
         })?;
     }
     let analyzer = analyzer.ok_or_else(|| format!("{}: no audio decoded", path.display()))?;
     let roles = resolved_roles.expect("analyzer creation resolves channel roles");
-    finish_prepared_analysis(info, roles, plan, analyzer, None)
+    finish_prepared_analysis(info, roles, plan, analyzer, spool)
+}
+
+fn prepare_descriptor_for_plan(
+    descriptor: &InputDescriptor,
+    plan: &Plan,
+    capture_spool: bool,
+) -> Result<PreparedAnalysis, String> {
+    plan.validate()?;
+    if analysis_pipeline_enabled(plan) {
+        return prepare_source_for_plan_pipelined(
+            descriptor.stable_input().stable_path(),
+            Some(descriptor),
+            None,
+            plan,
+            capture_spool,
+        );
+    }
+    prepare_descriptor_for_plan_sequential(descriptor, plan, capture_spool)
 }
 
 fn analysis_pipeline_enabled(plan: &Plan) -> bool {
@@ -1688,8 +1722,29 @@ fn flush_resampled_analysis_pipeline_chunk(
     Ok(())
 }
 
-fn prepare_file_for_plan_pipelined(
+fn decode_analysis_source_owned<F>(
     path: &Path,
+    descriptor: Option<&InputDescriptor>,
+    consume: F,
+) -> Result<decoder::StreamInfo, String>
+where
+    F: FnMut(
+        &decoder::StreamInfo,
+        decoder::ChannelLayoutProvenance,
+        Option<u64>,
+        Vec<Vec<f32>>,
+    ) -> Result<Vec<Vec<f32>>, String>,
+{
+    if let Some(descriptor) = descriptor {
+        decoder::decode_descriptor_stream_owned_with_layout_and_declared_frames(descriptor, consume)
+    } else {
+        decoder::decode_stream_owned_with_layout_and_declared_frames(path, consume)
+    }
+}
+
+fn prepare_source_for_plan_pipelined(
+    path: &Path,
+    descriptor: Option<&InputDescriptor>,
     channel_roles: Option<&[ChannelRole]>,
     plan: &Plan,
     capture_spool: bool,
@@ -1713,8 +1768,9 @@ fn prepare_file_for_plan_pipelined(
             let _ = result_sender.send(result);
         });
 
-        let decoded = decoder::decode_stream_owned_with_layout_and_declared_frames(
+        let decoded = decode_analysis_source_owned(
             path,
+            descriptor,
             |info, layout_provenance, declared_frames, planar| {
                 if !started {
                     let roles = resolve_stream_roles(path, info, layout_provenance, channel_roles)?;
@@ -1729,9 +1785,13 @@ fn prepare_file_for_plan_pipelined(
                     } else {
                         None
                     };
-                    let spool = if capture_spool
-                        && should_capture_pcm(path, next_converter.is_some())
-                    {
+                    let should_capture = descriptor.map_or_else(
+                        || should_capture_pcm(path, next_converter.is_some()),
+                        |descriptor| {
+                            should_capture_descriptor_pcm(descriptor, next_converter.is_some())
+                        },
+                    );
+                    let spool = if capture_spool && should_capture {
                         let expected_bytes =
                             expected_pcm_spool_bytes(path, info, output_rate, declared_frames);
                         PcmSpool::new_for_top_level_pipeline(info.channels as usize, expected_bytes)
@@ -1953,6 +2013,14 @@ fn should_capture_pcm(path: &Path, resampling: bool) -> bool {
                     "flac" | "dsf" | "dff"
                 )
             })
+}
+
+fn should_capture_descriptor_pcm(descriptor: &InputDescriptor, resampling: bool) -> bool {
+    resampling
+        || matches!(
+            descriptor.codec(),
+            decoder::AudioCodec::Flac | decoder::AudioCodec::Dsd
+        )
 }
 
 fn expected_pcm_spool_bytes(
@@ -2947,6 +3015,25 @@ pub fn normalize_one_bound_audited_with_policy(
     ))
 }
 
+/// Prepare the descriptor's output-domain analysis and retain decoded PCM
+/// whenever replaying it is cheaper than decoding the immutable snapshot again.
+fn prepare_descriptor_analysis_for_render(
+    descriptor: &InputDescriptor,
+    plan: &Plan,
+) -> Result<PreparedAnalysis, String> {
+    let resampling = plan
+        .output_sample_rate
+        .is_some_and(|sample_rate| sample_rate != descriptor.stream_info().sample_rate);
+    if should_capture_descriptor_pcm(descriptor, resampling) {
+        prepare_descriptor_for_plan(descriptor, plan, true)
+    } else {
+        Ok(PreparedAnalysis {
+            analysis: analyze_input_descriptor_for_plan_unbound(descriptor, plan)?,
+            spool: None,
+        })
+    }
+}
+
 /// Analyze, normalize, and publish one descriptor-bound programme as a single
 /// transaction.
 pub fn normalize_one_descriptor_with_policy(
@@ -2981,15 +3068,16 @@ pub fn normalize_one_descriptor_staged_with_policy(
 ) -> Result<StagedNormalization, BoundAnalysisError> {
     plan.validate_for_format(format)
         .map_err(BoundAnalysisError::invalid_request)?;
-    let source = analyze_input_descriptor_for_plan_unbound(descriptor, plan)
+    let prepared = prepare_descriptor_analysis_for_render(descriptor, plan)
         .map_err(BoundAnalysisError::analysis_failed)?;
-    let analysis = BoundAnalysis::for_descriptor(descriptor, source, plan)?;
+    let analysis = BoundAnalysis::for_descriptor(descriptor, prepared.analysis, plan)?;
     normalize_one_descriptor_bound_staged_impl(
         descriptor,
         output,
         plan,
         format,
         &analysis,
+        prepared.spool,
         false,
         output_policy,
     )
@@ -3012,6 +3100,7 @@ pub fn normalize_one_descriptor_bound_staged_with_policy(
         plan,
         format,
         analysis,
+        None,
         false,
         output_policy,
     )
@@ -3032,6 +3121,7 @@ pub fn normalize_one_descriptor_bound_with_policy(
         plan,
         format,
         analysis,
+        None,
         false,
         output_policy,
     )?;
@@ -3054,6 +3144,7 @@ pub fn normalize_one_descriptor_bound_audited_with_policy(
         plan,
         format,
         analysis,
+        None,
         true,
         output_policy,
     )?
@@ -3068,12 +3159,14 @@ pub fn normalize_one_descriptor_bound_audited_with_policy(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn normalize_one_descriptor_bound_staged_impl(
     descriptor: &InputDescriptor,
     output: &Path,
     plan: &Plan,
     format: OutputFormat,
     analysis: &BoundAnalysis,
+    mut source_spool: Option<PcmSpool>,
     capture_statistics: bool,
     output_policy: OutputConflictPolicy,
 ) -> Result<StagedNormalization, BoundAnalysisError> {
@@ -3105,11 +3198,12 @@ fn normalize_one_descriptor_bound_staged_impl(
     let gain = compute_gain(&source, plan);
     let mut staged = AtomicOutput::new_with_overwrite(output, output_policy.allows_overwrite())
         .map_err(BoundAnalysisError::render_failed)?;
+    let replaying_spool = source_spool.is_some();
     let rendered = normalize_stream(
         StreamSource {
             path: input.stable_path(),
-            descriptor: Some(descriptor),
-            spool: None,
+            descriptor: (!replaying_spool).then_some(descriptor),
+            spool: source_spool.as_mut(),
         },
         staged.path(),
         &source,
@@ -8030,7 +8124,7 @@ mod tests {
         let sequential =
             prepare_file_for_plan_sequential(&input, None, &resample_plan, true).unwrap();
         let pipelined =
-            prepare_file_for_plan_pipelined(&input, None, &resample_plan, true).unwrap();
+            prepare_source_for_plan_pipelined(&input, None, None, &resample_plan, true).unwrap();
         let left = &sequential.analysis;
         let right = &pipelined.analysis;
         assert_eq!(left.sample_rate, right.sample_rate);
@@ -8081,6 +8175,34 @@ mod tests {
         let sequential_pcm = collect_spool(sequential.spool.unwrap());
         let pipelined_pcm = collect_spool(pipelined.spool.unwrap());
         assert_eq!(sequential_pcm, pipelined_pcm);
+
+        let stable_options = StableInputOptions::new(u64::MAX).unwrap();
+        let descriptor = InputDescriptor::from_path(
+            &input,
+            &stable_options,
+            InputDescriptorOptions::default()
+                .with_time_range(509.0 / f64::from(sample_rate), Some(1.25)),
+        )
+        .unwrap();
+        let descriptor_sequential =
+            prepare_descriptor_for_plan_sequential(&descriptor, &resample_plan, true).unwrap();
+        let descriptor_pipelined = prepare_source_for_plan_pipelined(
+            descriptor.stable_input().stable_path(),
+            Some(&descriptor),
+            None,
+            &resample_plan,
+            true,
+        )
+        .unwrap();
+        assert_analysis_identical(
+            &descriptor_sequential.analysis,
+            &descriptor_pipelined.analysis,
+            "descriptor analysis pipeline",
+        );
+        assert_eq!(
+            collect_spool(descriptor_sequential.spool.unwrap()),
+            collect_spool(descriptor_pipelined.spool.unwrap())
+        );
     }
 
     #[test]
@@ -8121,6 +8243,23 @@ mod tests {
         assert_eq!(
             std::fs::read(spooled_output).unwrap(),
             std::fs::read(redecode_output).unwrap()
+        );
+
+        let misleading = directory.path().join("lossless-audio.wav");
+        std::fs::copy(&input, &misleading).unwrap();
+        let descriptor = InputDescriptor::from_path(
+            &misleading,
+            &StableInputOptions::new(u64::MAX).unwrap(),
+            InputDescriptorOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(descriptor.codec(), decoder::AudioCodec::Flac);
+        let descriptor_prepared =
+            prepare_descriptor_analysis_for_render(&descriptor, &plan()).unwrap();
+        assert_eq!(
+            descriptor_prepared.spool.as_ref().map(PcmSpool::frames),
+            Some(descriptor_prepared.analysis.frames),
+            "descriptor capture must follow the probed codec, not the suffix"
         );
     }
 
