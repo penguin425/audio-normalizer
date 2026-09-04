@@ -12,7 +12,7 @@
 pub use crate::analysis::{analyze, Analysis, AnalysisEngine};
 use crate::atomic::AtomicOutput;
 use crate::bound_analysis::{BoundAnalysis, BoundAnalysisError};
-use crate::decoder;
+use crate::decoder::{self, InputDescriptor, InputDescriptorOptions};
 use crate::downmix;
 use crate::dsp::limiter::{LimiterConfig, LimiterStatistics, TruePeakLimiter};
 use crate::dsp::resample::{ResampleQuality, SampleRateConverter};
@@ -1320,12 +1320,44 @@ pub fn analyze_stable_input_for_plan(
     BoundAnalysis::for_output_domain(input, analysis, channel_roles, plan)
 }
 
+/// Analyze and bind the exact track, source range, and layout selected by an
+/// input descriptor in the normalization plan's output sample-rate domain.
+pub fn analyze_input_descriptor_for_plan(
+    descriptor: &InputDescriptor,
+    plan: &Plan,
+) -> Result<BoundAnalysis, BoundAnalysisError> {
+    plan.validate()
+        .map_err(BoundAnalysisError::invalid_request)?;
+    let analysis = analyze_input_descriptor_for_plan_unbound(descriptor, plan)
+        .map_err(BoundAnalysisError::analysis_failed)?;
+    descriptor
+        .stable_input()
+        .verify_source()
+        .map_err(|error| BoundAnalysisError::analysis_failed(error.to_string()))?;
+    BoundAnalysis::for_descriptor(descriptor, analysis, plan)
+}
+
 pub(crate) fn analyze_stable_input_for_plan_unbound(
     input: &StableInput,
     channel_roles: Option<&[ChannelRole]>,
     plan: &Plan,
 ) -> Result<Analysis, String> {
     Ok(prepare_file_for_plan(input.stable_path(), channel_roles, plan, false)?.analysis)
+}
+
+pub(crate) fn analyze_input_descriptor_for_plan_unbound(
+    descriptor: &InputDescriptor,
+    plan: &Plan,
+) -> Result<Analysis, String> {
+    plan.validate()?;
+    if plan
+        .output_sample_rate
+        .is_none_or(|sample_rate| sample_rate == descriptor.stream_info().sample_rate)
+    {
+        return analyze_input_descriptor_range_with_engine(descriptor, None, AnalysisEngine::Fast)
+            .map(|timed| timed.analysis);
+    }
+    Ok(prepare_descriptor_for_plan(descriptor, plan, false)?.analysis)
 }
 
 struct PreparedAnalysis {
@@ -1369,7 +1401,7 @@ fn prepare_file_for_plan(
 ) -> Result<PreparedAnalysis, String> {
     plan.validate()?;
     if analysis_pipeline_enabled(plan) {
-        return prepare_file_for_plan_pipelined(path, channel_roles, plan, capture_spool);
+        return prepare_source_for_plan_pipelined(path, None, channel_roles, plan, capture_spool);
     }
     prepare_file_for_plan_sequential(path, channel_roles, plan, capture_spool)
 }
@@ -1426,6 +1458,93 @@ fn prepare_file_for_plan_sequential(
     let analyzer = analyzer.ok_or_else(|| format!("{}: no audio decoded", path.display()))?;
     let roles = resolved_roles.expect("analyzer creation resolves channel roles");
     finish_prepared_analysis(info, roles, plan, analyzer, spool)
+}
+
+fn prepare_descriptor_for_plan_sequential(
+    descriptor: &InputDescriptor,
+    plan: &Plan,
+    capture_spool: bool,
+) -> Result<PreparedAnalysis, String> {
+    let path = descriptor.stable_input().stable_path();
+    let mut analyzer: Option<lufs::StreamingAnalyzer> = None;
+    let mut converter: Option<SampleRateConverter> = None;
+    let mut spool: Option<PcmSpool> = None;
+    let mut resolved_roles = None;
+    let info = decoder::decode_descriptor_stream_with_layout_and_declared_frames(
+        descriptor,
+        |info, layout_provenance, declared_frames, chunk| {
+            if analyzer.is_none() {
+                let roles = resolve_stream_roles(path, info, layout_provenance, None)?;
+                let output_rate = plan.output_sample_rate.unwrap_or(info.sample_rate);
+                analyzer = Some(lufs::StreamingAnalyzer::new(output_rate, roles.clone()));
+                resolved_roles = Some(roles);
+                if output_rate != info.sample_rate {
+                    converter = Some(SampleRateConverter::new_streaming(
+                        info.sample_rate,
+                        output_rate,
+                        usize::from(info.channels),
+                        plan.resample_quality,
+                    )?);
+                }
+                if capture_spool && should_capture_descriptor_pcm(descriptor, converter.is_some()) {
+                    let expected_bytes =
+                        expected_pcm_spool_bytes(path, info, output_rate, declared_frames);
+                    spool = PcmSpool::new(info.channels as usize, expected_bytes).ok();
+                }
+            }
+            if let Some(converter) = converter.as_mut() {
+                converter.process(chunk, |output| {
+                    analyze_and_capture(
+                        output,
+                        analyzer
+                            .as_mut()
+                            .expect("descriptor analyzer was initialized"),
+                        &mut spool,
+                    )
+                })
+            } else {
+                analyze_and_capture(
+                    chunk,
+                    analyzer
+                        .as_mut()
+                        .expect("descriptor analyzer was initialized"),
+                    &mut spool,
+                )
+            }
+        },
+    )?;
+    if let Some(converter) = converter.as_mut() {
+        converter.finish(|output| {
+            analyze_and_capture(
+                output,
+                analyzer
+                    .as_mut()
+                    .expect("descriptor analyzer was initialized"),
+                &mut spool,
+            )
+        })?;
+    }
+    let analyzer = analyzer.ok_or_else(|| format!("{}: no audio decoded", path.display()))?;
+    let roles = resolved_roles.expect("analyzer creation resolves channel roles");
+    finish_prepared_analysis(info, roles, plan, analyzer, spool)
+}
+
+fn prepare_descriptor_for_plan(
+    descriptor: &InputDescriptor,
+    plan: &Plan,
+    capture_spool: bool,
+) -> Result<PreparedAnalysis, String> {
+    plan.validate()?;
+    if analysis_pipeline_enabled(plan) {
+        return prepare_source_for_plan_pipelined(
+            descriptor.stable_input().stable_path(),
+            Some(descriptor),
+            None,
+            plan,
+            capture_spool,
+        );
+    }
+    prepare_descriptor_for_plan_sequential(descriptor, plan, capture_spool)
 }
 
 fn analysis_pipeline_enabled(plan: &Plan) -> bool {
@@ -1603,8 +1722,29 @@ fn flush_resampled_analysis_pipeline_chunk(
     Ok(())
 }
 
-fn prepare_file_for_plan_pipelined(
+fn decode_analysis_source_owned<F>(
     path: &Path,
+    descriptor: Option<&InputDescriptor>,
+    consume: F,
+) -> Result<decoder::StreamInfo, String>
+where
+    F: FnMut(
+        &decoder::StreamInfo,
+        decoder::ChannelLayoutProvenance,
+        Option<u64>,
+        Vec<Vec<f32>>,
+    ) -> Result<Vec<Vec<f32>>, String>,
+{
+    if let Some(descriptor) = descriptor {
+        decoder::decode_descriptor_stream_owned_with_layout_and_declared_frames(descriptor, consume)
+    } else {
+        decoder::decode_stream_owned_with_layout_and_declared_frames(path, consume)
+    }
+}
+
+fn prepare_source_for_plan_pipelined(
+    path: &Path,
+    descriptor: Option<&InputDescriptor>,
     channel_roles: Option<&[ChannelRole]>,
     plan: &Plan,
     capture_spool: bool,
@@ -1628,8 +1768,9 @@ fn prepare_file_for_plan_pipelined(
             let _ = result_sender.send(result);
         });
 
-        let decoded = decoder::decode_stream_owned_with_layout_and_declared_frames(
+        let decoded = decode_analysis_source_owned(
             path,
+            descriptor,
             |info, layout_provenance, declared_frames, planar| {
                 if !started {
                     let roles = resolve_stream_roles(path, info, layout_provenance, channel_roles)?;
@@ -1644,9 +1785,13 @@ fn prepare_file_for_plan_pipelined(
                     } else {
                         None
                     };
-                    let spool = if capture_spool
-                        && should_capture_pcm(path, next_converter.is_some())
-                    {
+                    let should_capture = descriptor.map_or_else(
+                        || should_capture_pcm(path, next_converter.is_some()),
+                        |descriptor| {
+                            should_capture_descriptor_pcm(descriptor, next_converter.is_some())
+                        },
+                    );
+                    let spool = if capture_spool && should_capture {
                         let expected_bytes =
                             expected_pcm_spool_bytes(path, info, output_rate, declared_frames);
                         PcmSpool::new_for_top_level_pipeline(info.channels as usize, expected_bytes)
@@ -1870,6 +2015,14 @@ fn should_capture_pcm(path: &Path, resampling: bool) -> bool {
             })
 }
 
+fn should_capture_descriptor_pcm(descriptor: &InputDescriptor, resampling: bool) -> bool {
+    resampling
+        || matches!(
+            descriptor.codec(),
+            decoder::AudioCodec::Flac | decoder::AudioCodec::Dsd
+        )
+}
+
 fn expected_pcm_spool_bytes(
     path: &Path,
     info: &decoder::StreamInfo,
@@ -1972,14 +2125,25 @@ pub(crate) fn analyze_stable_input_range_with_engine(
     engine: AnalysisEngine,
 ) -> Result<TimedAnalysis, String> {
     validate_analysis_range(start_seconds, duration_seconds, timeline_interval_ms)?;
-    analyze_snapshot_range(
-        input.stable_path(),
-        channel_roles,
-        start_seconds,
-        duration_seconds,
-        timeline_interval_ms,
-        engine,
-    )
+    let mut options =
+        InputDescriptorOptions::default().with_time_range(start_seconds, duration_seconds);
+    if let Some(roles) = channel_roles {
+        options = options.with_channel_roles(roles.to_vec());
+    }
+    let descriptor = InputDescriptor::probe(input.clone(), options)?;
+    analyze_input_descriptor_range_with_engine(&descriptor, timeline_interval_ms, engine)
+}
+
+/// Analyze exactly the programme and source-frame range bound by a descriptor.
+pub fn analyze_input_descriptor_range_with_engine(
+    descriptor: &InputDescriptor,
+    timeline_interval_ms: Option<f64>,
+    engine: AnalysisEngine,
+) -> Result<TimedAnalysis, String> {
+    if timeline_interval_ms.is_some_and(|value| !value.is_finite() || value <= 0.0) {
+        return Err("timeline interval must be a finite positive number".into());
+    }
+    analyze_descriptor_range(descriptor, timeline_interval_ms, engine)
 }
 
 fn validate_analysis_range(
@@ -1999,24 +2163,36 @@ fn validate_analysis_range(
     Ok(())
 }
 
-fn analyze_snapshot_range(
-    path: &Path,
-    channel_roles: Option<&[ChannelRole]>,
-    start_seconds: f64,
-    duration_seconds: Option<f64>,
+fn analyze_descriptor_range(
+    descriptor: &InputDescriptor,
     timeline_interval_ms: Option<f64>,
     engine: AnalysisEngine,
 ) -> Result<TimedAnalysis, String> {
-    const RANGE_COMPLETE: &str = "__forge_analysis_range_complete__";
     enum Analyzer {
         Fast(lufs::StreamingAnalyzer),
         Reference(lufs::ReferenceStreamingAnalyzer),
     }
     impl Analyzer {
-        fn process(&mut self, chunk: &[Vec<f32>]) -> Result<(), String> {
-            match self {
-                Self::Fast(analyzer) => analyzer.process(chunk),
-                Self::Reference(analyzer) => analyzer.process(chunk),
+        fn process(&mut self, chunk: decoder::AnalysisPcmChunk<'_>) -> Result<(), String> {
+            match (self, chunk) {
+                (Self::Fast(analyzer), decoder::AnalysisPcmChunk::F32(planar)) => {
+                    analyzer.process(planar)
+                }
+                (Self::Fast(analyzer), decoder::AnalysisPcmChunk::S32(planar)) => {
+                    analyzer.process_i32(planar)
+                }
+                (Self::Fast(analyzer), decoder::AnalysisPcmChunk::F64(planar)) => {
+                    analyzer.process_f64(planar)
+                }
+                (Self::Reference(analyzer), decoder::AnalysisPcmChunk::F32(planar)) => {
+                    analyzer.process(planar)
+                }
+                (Self::Reference(analyzer), decoder::AnalysisPcmChunk::S32(planar)) => {
+                    analyzer.process_i32(planar)
+                }
+                (Self::Reference(analyzer), decoder::AnalysisPcmChunk::F64(planar)) => {
+                    analyzer.process_f64(planar)
+                }
             }
         }
 
@@ -2028,32 +2204,17 @@ fn analyze_snapshot_range(
         }
     }
     let mut analyzer: Option<Analyzer> = None;
-    let mut captured_info = None;
-    let mut source_frames = 0usize;
-    let decoded = decoder::decode_stream_with_layout(path, |info, layout_provenance, chunk| {
-        captured_info.get_or_insert_with(|| info.clone());
-        let roles = resolve_stream_roles(path, info, layout_provenance, channel_roles)?;
-        let range_start = (start_seconds * info.sample_rate as f64).round() as usize;
-        let range_end = duration_seconds.map(|duration| {
-            range_start.saturating_add((duration * info.sample_rate as f64).round() as usize)
-        });
-        let chunk_start = source_frames;
-        let chunk_end = source_frames + chunk.first().map_or(0, Vec::len);
-        source_frames = chunk_end;
-        if range_end.is_some_and(|end| chunk_start >= end) {
-            return Err(RANGE_COMPLETE.into());
-        }
-        let selected_start = range_start.saturating_sub(chunk_start);
-        let selected_end = range_end
-            .map_or(chunk_end, |end| end.min(chunk_end))
-            .saturating_sub(chunk_start);
-        if selected_start < selected_end {
-            let selected = chunk
-                .iter()
-                .map(|channel| channel[selected_start..selected_end].to_vec())
-                .collect::<Vec<_>>();
+    let info = decoder::decode_descriptor_analysis_stream(
+        descriptor,
+        |info, layout_provenance, chunk| {
+            let roles = resolve_stream_roles(
+                descriptor.stable_input().stable_path(),
+                info,
+                layout_provenance,
+                None,
+            )?;
             let interval_frames = timeline_interval_ms.map(|milliseconds| {
-                ((info.sample_rate as f64 * milliseconds / 1_000.0).round() as usize).max(1)
+                ((f64::from(info.sample_rate) * milliseconds / 1_000.0).round() as usize).max(1)
             });
             if analyzer.is_none() {
                 analyzer = Some(match engine {
@@ -2073,33 +2234,18 @@ fn analyze_snapshot_range(
                     ),
                 });
             }
-            let meter = analyzer.as_mut().expect("range analyzer was initialized");
-            meter.process(&selected)?;
-        }
-        if range_end.is_some_and(|end| chunk_end >= end) {
-            Err(RANGE_COMPLETE.into())
-        } else {
-            Ok(())
-        }
-    });
-    let info = match decoded {
-        Ok(info) => info,
-        Err(error) if error == RANGE_COMPLETE => {
-            captured_info.ok_or_else(|| format!("{}: no audio decoded", path.display()))?
-        }
-        Err(error) => return Err(error),
-    };
+            analyzer
+                .as_mut()
+                .expect("descriptor analyzer was initialized")
+                .process(chunk)
+        },
+    )?;
     let measured = analyzer
-        .ok_or_else(|| {
-            format!(
-                "{}: requested analysis range contains no audio",
-                path.display()
-            )
-        })?
+        .ok_or_else(|| "input descriptor produced no analysis frames".to_string())?
         .finish();
     let mut timeline = measured.timeline;
-    let actual_start_seconds = ((start_seconds * info.sample_rate as f64).round() as usize) as f64
-        / info.sample_rate as f64;
+    let actual_start_seconds =
+        descriptor.source_range().start() as f64 / f64::from(info.sample_rate);
     for point in &mut timeline {
         point.start_seconds += actual_start_seconds;
         point.end_seconds += actual_start_seconds;
@@ -2108,9 +2254,7 @@ fn analyze_snapshot_range(
         analysis: Analysis {
             sample_rate: info.sample_rate,
             channels: info.channels,
-            channel_roles: channel_roles
-                .map(ToOwned::to_owned)
-                .unwrap_or(info.channel_roles),
+            channel_roles: info.channel_roles,
             frames: measured.frames,
             kind: info.source_kind,
             lufs: measured.ebu.integrated_lufs,
@@ -2871,6 +3015,231 @@ pub fn normalize_one_bound_audited_with_policy(
     ))
 }
 
+/// Prepare the descriptor's output-domain analysis and retain decoded PCM
+/// whenever replaying it is cheaper than decoding the immutable snapshot again.
+fn prepare_descriptor_analysis_for_render(
+    descriptor: &InputDescriptor,
+    plan: &Plan,
+) -> Result<PreparedAnalysis, String> {
+    let resampling = plan
+        .output_sample_rate
+        .is_some_and(|sample_rate| sample_rate != descriptor.stream_info().sample_rate);
+    if should_capture_descriptor_pcm(descriptor, resampling) {
+        prepare_descriptor_for_plan(descriptor, plan, true)
+    } else {
+        Ok(PreparedAnalysis {
+            analysis: analyze_input_descriptor_for_plan_unbound(descriptor, plan)?,
+            spool: None,
+        })
+    }
+}
+
+/// Analyze, normalize, and publish one descriptor-bound programme as a single
+/// transaction.
+pub fn normalize_one_descriptor_with_policy(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    output_policy: OutputConflictPolicy,
+) -> Result<(Analysis, f32), BoundAnalysisError> {
+    let staged = normalize_one_descriptor_staged_with_policy(
+        descriptor,
+        output,
+        plan,
+        format,
+        output_policy,
+    )?;
+    let outcome = staged.commit().map_err(BoundAnalysisError::render_failed)?;
+    Ok((outcome.source, outcome.gain))
+}
+
+/// Analyze and stage one descriptor-bound programme as a single transaction.
+///
+/// The immutable snapshot is measured and rendered without rehashing the live
+/// source between those two phases. [`StagedNormalization::commit`] still
+/// verifies the live source immediately before publication.
+pub fn normalize_one_descriptor_staged_with_policy(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedNormalization, BoundAnalysisError> {
+    plan.validate_for_format(format)
+        .map_err(BoundAnalysisError::invalid_request)?;
+    let prepared = prepare_descriptor_analysis_for_render(descriptor, plan)
+        .map_err(BoundAnalysisError::analysis_failed)?;
+    let analysis = BoundAnalysis::for_descriptor(descriptor, prepared.analysis, plan)?;
+    normalize_one_descriptor_bound_staged_impl(
+        descriptor,
+        output,
+        plan,
+        format,
+        &analysis,
+        prepared.spool,
+        false,
+        output_policy,
+    )
+}
+
+/// Stage a normalization render from the exact descriptor used to produce a
+/// bound analysis. This is the track-aware counterpart of
+/// [`normalize_one_bound_staged_with_policy`].
+pub fn normalize_one_descriptor_bound_staged_with_policy(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    analysis: &BoundAnalysis,
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedNormalization, BoundAnalysisError> {
+    normalize_one_descriptor_bound_staged_impl(
+        descriptor,
+        output,
+        plan,
+        format,
+        analysis,
+        None,
+        false,
+        output_policy,
+    )
+}
+
+/// Normalize and publish one descriptor-bound programme.
+pub fn normalize_one_descriptor_bound_with_policy(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    analysis: &BoundAnalysis,
+    output_policy: OutputConflictPolicy,
+) -> Result<(Analysis, f32), BoundAnalysisError> {
+    let staged = normalize_one_descriptor_bound_staged_impl(
+        descriptor,
+        output,
+        plan,
+        format,
+        analysis,
+        None,
+        false,
+        output_policy,
+    )?;
+    let outcome = staged.commit().map_err(BoundAnalysisError::render_failed)?;
+    Ok((outcome.source, outcome.gain))
+}
+
+/// Normalize one descriptor-bound programme and return render statistics.
+pub fn normalize_one_descriptor_bound_audited_with_policy(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    analysis: &BoundAnalysis,
+    output_policy: OutputConflictPolicy,
+) -> Result<(Analysis, f32, RenderStatistics), BoundAnalysisError> {
+    let outcome = normalize_one_descriptor_bound_staged_impl(
+        descriptor,
+        output,
+        plan,
+        format,
+        analysis,
+        None,
+        true,
+        output_policy,
+    )?
+    .commit()
+    .map_err(BoundAnalysisError::render_failed)?;
+    Ok((
+        outcome.source,
+        outcome.gain,
+        outcome
+            .render
+            .expect("audited descriptor render captures statistics"),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_one_descriptor_bound_staged_impl(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    analysis: &BoundAnalysis,
+    mut source_spool: Option<PcmSpool>,
+    capture_statistics: bool,
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedNormalization, BoundAnalysisError> {
+    plan.validate_for_format(format)
+        .map_err(BoundAnalysisError::invalid_request)?;
+    analysis.validate_descriptor_for_plan(descriptor, plan)?;
+    let input = descriptor.stable_input();
+    validate_output_aliases(
+        std::slice::from_ref(input),
+        std::slice::from_ref(&output.to_owned()),
+    )
+    .map_err(BoundAnalysisError::invalid_request)?;
+    let source = analysis.analysis().clone();
+    let layout_alias_policy = if analysis.used_explicit_roles() {
+        LayoutAliasPolicy::ExplicitLegacy
+    } else {
+        LayoutAliasPolicy::ExactOnly
+    };
+    validate_plan_for_signal(
+        plan,
+        format,
+        source.sample_rate,
+        source.channels,
+        &source.channel_roles,
+        source.kind,
+        layout_alias_policy,
+    )
+    .map_err(BoundAnalysisError::invalid_request)?;
+    let gain = compute_gain(&source, plan);
+    let mut staged = AtomicOutput::new_with_overwrite(output, output_policy.allows_overwrite())
+        .map_err(BoundAnalysisError::render_failed)?;
+    let replaying_spool = source_spool.is_some();
+    let rendered = normalize_stream(
+        StreamSource {
+            path: input.stable_path(),
+            descriptor: (!replaying_spool).then_some(descriptor),
+            spool: source_spool.as_mut(),
+        },
+        staged.path(),
+        &source,
+        gain,
+        plan,
+        format,
+        StreamRenderOptions {
+            opus_album_lufs: None,
+            capture_statistics,
+            capture_lossless_verification: false,
+            verification_channel_roles: None,
+            layout_alias_policy,
+        },
+    )
+    .map_err(BoundAnalysisError::render_failed)?;
+    finalize_metadata(
+        input.stable_path(),
+        &mut staged,
+        format,
+        None,
+        source.lufs + gain_db(gain),
+        None,
+        plan,
+    )
+    .map_err(BoundAnalysisError::render_failed)?;
+    Ok(StagedNormalization {
+        output: staged,
+        outcome: NormalizationOutcome {
+            source,
+            gain,
+            render: rendered.statistics,
+        },
+        protected_inputs: vec![input.clone()],
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn normalize_one_with_roles_impl<P: AsRef<Path>>(
     input: P,
@@ -2967,6 +3336,7 @@ fn normalize_one_staged_stable_impl(
     let rendered = normalize_stream(
         StreamSource {
             path: input.stable_path(),
+            descriptor: None,
             spool: source_spool.as_mut(),
         },
         staged.path(),
@@ -3194,6 +3564,127 @@ pub fn normalize_one_bound_corrected_staged_with_policy(
     .map_err(BoundAnalysisError::render_failed)
 }
 
+/// Produce a verified corrected render from the descriptor that was measured.
+#[allow(clippy::too_many_arguments)]
+pub fn normalize_one_descriptor_bound_corrected_staged_with_policy(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    tolerance: f64,
+    max_retries: usize,
+    analysis: &BoundAnalysis,
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedCorrectedNormalization, BoundAnalysisError> {
+    plan.validate_for_format(format)
+        .map_err(BoundAnalysisError::invalid_request)?;
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err(BoundAnalysisError::invalid_request(
+            "verification tolerance must be a finite non-negative number",
+        ));
+    }
+    analysis.validate_descriptor_for_plan(descriptor, plan)?;
+    let input = descriptor.stable_input();
+    validate_output_aliases(
+        std::slice::from_ref(input),
+        std::slice::from_ref(&output.to_owned()),
+    )
+    .map_err(BoundAnalysisError::invalid_request)?;
+    let source = analysis.analysis().clone();
+    let channel_roles = analysis.explicit_roles();
+    let layout_alias_policy = if analysis.used_explicit_roles() {
+        LayoutAliasPolicy::ExplicitLegacy
+    } else {
+        LayoutAliasPolicy::ExactOnly
+    };
+    validate_plan_for_signal(
+        plan,
+        format,
+        source.sample_rate,
+        source.channels,
+        &source.channel_roles,
+        source.kind,
+        layout_alias_policy,
+    )
+    .map_err(BoundAnalysisError::invalid_request)?;
+    let mut gain = compute_gain(&source, plan);
+    let mut intended_level = None;
+    let mut staged = AtomicOutput::new_with_overwrite(output, output_policy.allows_overwrite())
+        .map_err(BoundAnalysisError::render_failed)?;
+
+    for attempt in 0..=max_retries {
+        let rendered = normalize_stream(
+            StreamSource {
+                path: input.stable_path(),
+                descriptor: Some(descriptor),
+                spool: None,
+            },
+            staged.path(),
+            &source,
+            gain,
+            plan,
+            format,
+            StreamRenderOptions {
+                opus_album_lufs: None,
+                capture_statistics: true,
+                capture_lossless_verification: true,
+                verification_channel_roles: channel_roles,
+                layout_alias_policy,
+            },
+        )
+        .map_err(BoundAnalysisError::render_failed)?;
+        let render = rendered
+            .statistics
+            .expect("corrected descriptor normalization captures render statistics");
+        let expected_level =
+            *intended_level.get_or_insert_with(|| analysis_level(&render.intended, plan.mode));
+        let verification = if let Some(output) = rendered.lossless_output {
+            verify_analysis_at_level(&output, expected_level, plan, tolerance)
+        } else {
+            verify_file_at_level_with_roles(
+                staged.path(),
+                expected_level,
+                plan,
+                tolerance,
+                channel_roles,
+            )
+            .map_err(BoundAnalysisError::render_failed)?
+        };
+        if verification.passed() {
+            finalize_metadata(
+                input.stable_path(),
+                &mut staged,
+                format,
+                channel_roles.is_none().then_some(&verification.output),
+                verification.output.lufs,
+                None,
+                plan,
+            )
+            .map_err(BoundAnalysisError::render_failed)?;
+            return Ok(StagedCorrectedNormalization {
+                output: staged,
+                outcome: CorrectedNormalization {
+                    source,
+                    gain,
+                    verification,
+                    render,
+                    attempts: attempt + 1,
+                },
+                protected_inputs: vec![input.clone()],
+            });
+        }
+        if attempt == max_retries {
+            return Err(BoundAnalysisError::render_failed(format!(
+                "post-encode verification failed after {} encoding pass(es)",
+                attempt + 1
+            )));
+        }
+        gain =
+            corrected_gain(gain, &verification, plan).map_err(BoundAnalysisError::render_failed)?;
+    }
+    unreachable!("the inclusive retry loop always returns")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn normalize_one_corrected_with_optional_analysis(
     input: &Path,
@@ -3289,6 +3780,7 @@ fn normalize_one_corrected_stable_impl(
         let rendered = normalize_stream(
             StreamSource {
                 path: input.stable_path(),
+                descriptor: None,
                 spool: source_spool.as_mut(),
             },
             staged.path(),
@@ -3415,6 +3907,7 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
         let rendered = normalize_streams(
             StreamSource {
                 path: input.stable_path(),
+                descriptor: None,
                 spool: source_spool.as_mut(),
             },
             &staged_paths,
@@ -4016,6 +4509,7 @@ fn normalize_album_stable_impl(
             normalize_stream(
                 StreamSource {
                     path: input.stable_path(),
+                    descriptor: None,
                     spool: None,
                 },
                 output,
@@ -4402,6 +4896,7 @@ fn normalize_album_corrected_stable_impl(
                 normalize_stream(
                     StreamSource {
                         path: input.stable_path(),
+                        descriptor: None,
                         spool: None,
                     },
                     output,
@@ -4738,6 +5233,7 @@ struct StreamRenderOptions<'a> {
 
 struct StreamSource<'a> {
     path: &'a Path,
+    descriptor: Option<&'a InputDescriptor>,
     spool: Option<&'a mut PcmSpool>,
 }
 
@@ -5138,8 +5634,9 @@ fn process_normalized_stream_pipelined(
     let producer_failed = Arc::clone(&failed);
     let writer_failed = Arc::clone(&failed);
     let channels = usize::from(analysis.channels);
-    let transfer_owned_chunks =
-        plan.limiter.is_none() && (source.spool.is_some() || plan.output_sample_rate.is_none());
+    let transfer_owned_chunks = source.descriptor.is_none()
+        && plan.limiter.is_none()
+        && (source.spool.is_some() || plan.output_sample_rate.is_none());
 
     let processing = rayon::scope(move |scope| {
         scope.spawn(move |_| {
@@ -5293,8 +5790,12 @@ fn process_normalized_stream_owned(
 ) -> Result<Option<RenderStatistics>, String> {
     let StreamSource {
         path: input,
+        descriptor,
         spool: source_spool,
     } = source;
+    if descriptor.is_some() {
+        return Err("owned render pipeline does not accept descriptor-bound input".into());
+    }
     let mut statistics = capture_statistics.then(|| RenderStatisticsBuilder::new(analysis));
     let mut process = |mut planar: Vec<Vec<f32>>| {
         if statistics.is_none() {
@@ -5486,6 +5987,7 @@ fn process_normalized_stream(
 ) -> Result<Option<RenderStatistics>, String> {
     let StreamSource {
         path: input,
+        descriptor,
         spool: source_spool,
     } = source;
     let limiter_proven_idle = limiter_is_proven_idle(analysis, gain, ceiling, plan);
@@ -5531,7 +6033,7 @@ fn process_normalized_stream(
         })?;
     } else {
         let mut converter: Option<SampleRateConverter> = None;
-        decoder::decode_stream_coalesced(input, |info, planar| {
+        let mut consume = |info: &decoder::StreamInfo, planar: &mut [Vec<f32>]| {
             if info.sample_rate == analysis.sample_rate {
                 return process_normalized_chunk(
                     planar,
@@ -5563,7 +6065,12 @@ fn process_normalized_stream(
                     &mut write,
                 )
             })
-        })?;
+        };
+        if let Some(descriptor) = descriptor {
+            decoder::decode_descriptor_stream_coalesced(descriptor, &mut consume)?;
+        } else {
+            decoder::decode_stream_coalesced(input, &mut consume)?;
+        }
         if let Some(converter) = converter.as_mut() {
             converter.finish(|output| {
                 process_normalized_chunk(
@@ -5687,6 +6194,8 @@ struct LosslessAnalysisBuilder {
     channel_roles: Vec<ChannelRole>,
     kind: PcmKind,
     scratch: Vec<Vec<f32>>,
+    integer_scratch: Vec<Vec<i32>>,
+    f64_scratch: Vec<Vec<f64>>,
 }
 
 impl LosslessAnalysisBuilder {
@@ -5703,13 +6212,45 @@ impl LosslessAnalysisBuilder {
             channel_roles,
             kind,
             scratch: vec![Vec::new(); channels as usize],
+            integer_scratch: vec![Vec::new(); channels as usize],
+            f64_scratch: vec![Vec::new(); channels as usize],
         }
     }
 
     fn observe_wave(&mut self, interleaved: &[u8], kind: PcmKind) -> Result<(), String> {
         debug_assert_eq!(kind, self.kind);
-        convert::decode_planar_into(interleaved, kind, self.channels as usize, &mut self.scratch);
-        self.analyzer.process(&self.scratch)
+        match kind {
+            PcmKind::S32 => {
+                convert::decode_s32_planar_into(
+                    interleaved,
+                    self.channels as usize,
+                    &mut self.integer_scratch,
+                );
+                self.analyzer.process_i32(&self.integer_scratch)
+            }
+            PcmKind::F64 => {
+                convert::decode_f64_planar_into(
+                    interleaved,
+                    self.channels as usize,
+                    &mut self.f64_scratch,
+                );
+                self.analyzer.process_f64(&self.f64_scratch)
+            }
+            // Every signed 24-bit code is exactly representable as f32, and
+            // division by 2^23 is an exact exponent adjustment. Keep generated
+            // S24 output on the paired K-weighting/True Peak fast path without
+            // losing source-sample information; descriptor-based redecoding
+            // uses the same representation and remains bit-identical.
+            PcmKind::U8 | PcmKind::S16 | PcmKind::S24 | PcmKind::F32 => {
+                convert::decode_planar_into(
+                    interleaved,
+                    kind,
+                    self.channels as usize,
+                    &mut self.scratch,
+                );
+                self.analyzer.process(&self.scratch)
+            }
+        }
     }
 
     fn observe_integer(&mut self, interleaved: &[i32], bits: usize) -> Result<(), String> {
@@ -6148,6 +6689,12 @@ pub(crate) fn validate_output_encoder_available(format: OutputFormat) -> Result<
             "AAC/ALAC/Vorbis output is unavailable; rebuild with `--features ffmpeg-encoding`"
                 .into(),
         ),
+        #[cfg(feature = "ffmpeg-encoding")]
+        OutputFormat::M4a => crate::aac::preflight_ffmpeg(crate::aac::FfmpegCodec::Aac),
+        #[cfg(feature = "ffmpeg-encoding")]
+        OutputFormat::Alac => crate::aac::preflight_ffmpeg(crate::aac::FfmpegCodec::Alac),
+        #[cfg(feature = "ffmpeg-encoding")]
+        OutputFormat::Vorbis => crate::aac::preflight_ffmpeg(crate::aac::FfmpegCodec::Vorbis),
         _ => Ok(()),
     }
 }
@@ -6862,12 +7409,92 @@ mod tests {
             &analyses,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("input changed"));
+        assert_eq!(
+            error.kind(),
+            crate::bound_analysis::BoundAnalysisErrorKind::AnalysisRequestMismatch
+        );
+        assert!(error.to_string().contains("changed"), "{error}");
         assert_eq!(std::fs::read(&first_output).unwrap(), b"first destination");
         assert_eq!(
             std::fs::read(&second_output).unwrap(),
             b"second destination"
         );
+    }
+
+    #[test]
+    fn descriptor_bound_render_uses_only_the_selected_frame_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("programme.wav");
+        let output = directory.path().join("selected.wav");
+        let frames = 96_000;
+        let samples = (0..frames)
+            .map(|frame| {
+                let amplitude = if frame < 48_000 { 0.02 } else { 0.2 };
+                amplitude * (std::f32::consts::TAU * 997.0 * frame as f32 / 48_000.0).sin()
+            })
+            .collect::<Vec<_>>();
+        WavWriter::write(
+            &input,
+            &AudioBuffer {
+                sample_rate: 48_000,
+                channels: 1,
+                channel_roles: default_channel_roles(1),
+                frames,
+                data: vec![samples],
+                source_kind: PcmKind::F32,
+            },
+            PcmKind::F32,
+            false,
+        )
+        .unwrap();
+        let stable_options = StableInputOptions::new(u64::MAX).unwrap();
+        let descriptor = InputDescriptor::from_path(
+            &input,
+            &stable_options,
+            InputDescriptorOptions::default().with_time_range(1.0, Some(1.0)),
+        )
+        .unwrap();
+        let render_plan = plan();
+        let bound = analyze_input_descriptor_for_plan(&descriptor, &render_plan).unwrap();
+        let (source, _) = normalize_one_descriptor_bound_with_policy(
+            &descriptor,
+            &output,
+            &render_plan,
+            OutputFormat::Wav,
+            &bound,
+            OutputConflictPolicy::CreateNew,
+        )
+        .unwrap();
+        assert_eq!(source.frames, 48_000);
+        let decoded = decoder::decode(&output).unwrap();
+        assert_eq!(decoded.frames, 48_000);
+        assert_eq!(decoded.sample_rate, 48_000);
+    }
+
+    #[test]
+    fn descriptor_transaction_rejects_a_changed_live_source_at_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("source.wav");
+        let output = directory.path().join("output.wav");
+        write_mono_tone(&input, 0.1);
+        let stable_options = StableInputOptions::new(u64::MAX).unwrap();
+        let descriptor =
+            InputDescriptor::from_path(&input, &stable_options, InputDescriptorOptions::default())
+                .unwrap();
+        let render_plan = plan();
+        let staged = normalize_one_descriptor_staged_with_policy(
+            &descriptor,
+            &output,
+            &render_plan,
+            OutputFormat::Wav,
+            OutputConflictPolicy::CreateNew,
+        )
+        .unwrap();
+
+        std::fs::write(&input, b"changed after the immutable render").unwrap();
+        let error = staged.commit().unwrap_err();
+        assert!(error.contains("input changed before output publication"));
+        assert!(!output.exists());
     }
 
     #[cfg(any(unix, windows))]
@@ -7055,6 +7682,7 @@ mod tests {
         let bypass = normalize_stream(
             StreamSource {
                 path: &input,
+                descriptor: None,
                 spool: None,
             },
             &bypass_output,
@@ -7070,6 +7698,7 @@ mod tests {
         let full = normalize_stream(
             StreamSource {
                 path: &input,
+                descriptor: None,
                 spool: None,
             },
             &full_output,
@@ -7495,7 +8124,7 @@ mod tests {
         let sequential =
             prepare_file_for_plan_sequential(&input, None, &resample_plan, true).unwrap();
         let pipelined =
-            prepare_file_for_plan_pipelined(&input, None, &resample_plan, true).unwrap();
+            prepare_source_for_plan_pipelined(&input, None, None, &resample_plan, true).unwrap();
         let left = &sequential.analysis;
         let right = &pipelined.analysis;
         assert_eq!(left.sample_rate, right.sample_rate);
@@ -7546,6 +8175,34 @@ mod tests {
         let sequential_pcm = collect_spool(sequential.spool.unwrap());
         let pipelined_pcm = collect_spool(pipelined.spool.unwrap());
         assert_eq!(sequential_pcm, pipelined_pcm);
+
+        let stable_options = StableInputOptions::new(u64::MAX).unwrap();
+        let descriptor = InputDescriptor::from_path(
+            &input,
+            &stable_options,
+            InputDescriptorOptions::default()
+                .with_time_range(509.0 / f64::from(sample_rate), Some(1.25)),
+        )
+        .unwrap();
+        let descriptor_sequential =
+            prepare_descriptor_for_plan_sequential(&descriptor, &resample_plan, true).unwrap();
+        let descriptor_pipelined = prepare_source_for_plan_pipelined(
+            descriptor.stable_input().stable_path(),
+            Some(&descriptor),
+            None,
+            &resample_plan,
+            true,
+        )
+        .unwrap();
+        assert_analysis_identical(
+            &descriptor_sequential.analysis,
+            &descriptor_pipelined.analysis,
+            "descriptor analysis pipeline",
+        );
+        assert_eq!(
+            collect_spool(descriptor_sequential.spool.unwrap()),
+            collect_spool(descriptor_pipelined.spool.unwrap())
+        );
     }
 
     #[test]
@@ -7586,6 +8243,23 @@ mod tests {
         assert_eq!(
             std::fs::read(spooled_output).unwrap(),
             std::fs::read(redecode_output).unwrap()
+        );
+
+        let misleading = directory.path().join("lossless-audio.wav");
+        std::fs::copy(&input, &misleading).unwrap();
+        let descriptor = InputDescriptor::from_path(
+            &misleading,
+            &StableInputOptions::new(u64::MAX).unwrap(),
+            InputDescriptorOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(descriptor.codec(), decoder::AudioCodec::Flac);
+        let descriptor_prepared =
+            prepare_descriptor_analysis_for_render(&descriptor, &plan()).unwrap();
+        assert_eq!(
+            descriptor_prepared.spool.as_ref().map(PcmSpool::frames),
+            Some(descriptor_prepared.analysis.frames),
+            "descriptor capture must follow the probed codec, not the suffix"
         );
     }
 
@@ -7646,6 +8320,7 @@ mod tests {
             let rendered = normalize_stream(
                 StreamSource {
                     path: &input,
+                    descriptor: None,
                     spool: None,
                 },
                 &output,
@@ -7718,6 +8393,7 @@ mod tests {
                 normalize_stream(
                     StreamSource {
                         path: &input,
+                        descriptor: None,
                         spool: None,
                     },
                     output,
@@ -7737,6 +8413,7 @@ mod tests {
         let fanout = normalize_streams(
             StreamSource {
                 path: &input,
+                descriptor: None,
                 spool: None,
             },
             &fanout_paths,
@@ -7755,6 +8432,7 @@ mod tests {
         let (pipeline_statistics, pipeline_lossless_outputs) = process_normalized_stream_pipelined(
             StreamSource {
                 path: &input,
+                descriptor: None,
                 spool: None,
             },
             &source,
@@ -7920,6 +8598,7 @@ mod tests {
         process_normalized_stream(
             StreamSource {
                 path: &input,
+                descriptor: None,
                 spool: None,
             },
             &source,
@@ -7935,6 +8614,7 @@ mod tests {
         let (_, outputs) = process_normalized_stream_pipelined(
             StreamSource {
                 path: &input,
+                descriptor: None,
                 spool: None,
             },
             &source,
@@ -8007,6 +8687,7 @@ mod tests {
             let rendered = normalize_stream(
                 StreamSource {
                     path: &input,
+                    descriptor: None,
                     spool: None,
                 },
                 &output,

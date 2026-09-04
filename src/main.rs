@@ -8,9 +8,12 @@ use forge_normalizer::analysis_cache::{
 };
 use forge_normalizer::batch::{BatchAssetSpec, BatchJob, BatchProgressEvent};
 use forge_normalizer::bound_analysis::BoundAnalysis;
-use forge_normalizer::catalogue::{Catalogue, CatalogueAsset, CatalogueRecord};
+use forge_normalizer::catalogue::{Catalogue, CatalogueAsset, CatalogueRecordV2};
 use forge_normalizer::cli;
 use forge_normalizer::codec_qc;
+use forge_normalizer::decoder::{
+    AudioCodec, AudioTrackSelection, InputDescriptor, InputDescriptorOptions,
+};
 use forge_normalizer::discovery::discover_audio_files;
 use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::dsp::resample::ResampleQuality;
@@ -76,6 +79,7 @@ struct CatalogueOptions {
 #[derive(Debug)]
 struct AnalysisInvocationOptions {
     engine: AnalysisEngine,
+    audio_track: Option<u32>,
     anomaly_audits: Vec<PathBuf>,
     ebu_qc_xml: Option<PathBuf>,
 }
@@ -84,6 +88,7 @@ impl AnalysisInvocationOptions {
     fn engine_only(engine: AnalysisEngine) -> Self {
         Self {
             engine,
+            audio_track: None,
             anomaly_audits: Vec::new(),
             ebu_qc_xml: None,
         }
@@ -112,6 +117,13 @@ impl CacheOptions {
 
 fn main() -> ExitCode {
     let matches = cli::Cli::command_with_analysis_engine()
+        .arg(
+            Arg::new("audio_track")
+                .long("audio-track")
+                .value_name("INDEX")
+                .value_parser(clap::value_parser!(u32))
+                .help("Select a zero-based audio-track index after content probing"),
+        )
         .arg(
             Arg::new("true_peak_backend")
                 .long("true-peak-backend")
@@ -349,6 +361,7 @@ fn main() -> ExitCode {
         .map(|values| values.cloned().collect::<Vec<_>>())
         .unwrap_or_default();
     let ebu_qc_xml = matches.get_one::<PathBuf>("ebu_qc_xml").cloned();
+    let audio_track = matches.get_one::<u32>("audio_track").copied();
     let result = run(
         cli,
         batch_options,
@@ -357,6 +370,7 @@ fn main() -> ExitCode {
         catalogue_options,
         AnalysisInvocationOptions {
             engine: analysis_engine,
+            audio_track,
             anomaly_audits,
             ebu_qc_xml,
         },
@@ -411,6 +425,9 @@ fn run(
     analysis_options: AnalysisInvocationOptions,
 ) -> Result<(), String> {
     if watch_options.enabled {
+        if analysis_options.audio_track.is_some() {
+            return Err("--audio-track cannot be used with --watch".into());
+        }
         return run_watch(
             cli,
             analysis_options.engine,
@@ -524,7 +541,7 @@ fn process_watch_candidate(
         .format
         .as_deref()
         .map(parse_format)
-        .unwrap_or_else(|| default_format_for_input(&candidate.input));
+        .map_or_else(|| default_format_for_input(&candidate.input, None), Ok)?;
     let stem = candidate
         .relative
         .file_stem()
@@ -599,6 +616,7 @@ fn run_paths(
     analysis_options: &AnalysisInvocationOptions,
 ) -> Result<(), String> {
     let analysis_engine = analysis_options.engine;
+    let audio_track = analysis_options.audio_track;
     let anomaly_audit_paths = &analysis_options.anomaly_audits;
     let ebu_qc_xml = analysis_options.ebu_qc_xml.as_deref();
     if let Some(j) = cli.jobs {
@@ -618,6 +636,24 @@ fn run_paths(
     {
         return Err(
             "reference analysis cannot be combined with dialogue analysis in this release".into(),
+        );
+    }
+    if audio_track.is_some()
+        && (cli.album
+            || cli.write_tags
+            || cli.auto_dialogue
+            || cli.dialogue_ranges.is_some()
+            || cli.dialogue_stem.is_some()
+            || cli.downmix_qc
+            || cli.codec_metadata.is_some()
+            || cli.codec_qc
+            || cli.adm_presentations.is_some()
+            || cli.adm_render
+            || cli.adm_profile.is_some())
+    {
+        return Err(
+            "--audio-track currently supports independent normalization, gain/dry-run, analysis, and EBU QC only"
+                .into(),
         );
     }
 
@@ -731,7 +767,7 @@ fn run_paths(
         );
     }
 
-    let (outputs, formats) = resolve_outputs_and_formats(&cli, &relative_paths)?;
+    let (outputs, formats) = resolve_outputs_and_formats(&cli, &relative_paths, audio_track)?;
     if !cli.analyze_only && !cli.gain_only {
         for format in &formats {
             if cli.dry_run {
@@ -1012,7 +1048,7 @@ fn run_paths(
             } else {
                 None
             };
-            let timed = analyze_range_cached(
+            let (input_descriptor, timed) = analyze_range_cached(
                 analysis_cache.as_ref(),
                 input,
                 channel_roles_override.as_deref(),
@@ -1020,6 +1056,7 @@ fn run_paths(
                 cli.duration_seconds,
                 analysis_timeline_interval_ms,
                 analysis_engine,
+                audio_track,
             )?;
             let an = timed.analysis;
             let detection = cli
@@ -1142,7 +1179,7 @@ fn run_paths(
             }
             let ebu_qc = ebu_qc_options
                 .as_ref()
-                .map(|options| qc::analyze_file(input, &an, options))
+                .map(|options| qc::analyze_descriptor(&input_descriptor, &an, options))
                 .transpose()?;
             if ebu_qc_xml.is_some() {
                 let results = ebu_qc
@@ -1480,6 +1517,10 @@ fn run_paths(
                     profile: &catalogue_profile(&cli, &plan),
                     provenance: catalogue_provenance(&cli, &plan, "analysis"),
                 },
+                Some(&input_descriptor),
+                catalogue_descriptor_options(&cli, channel_roles_override.as_deref(), audio_track),
+                &plan,
+                &catalogue_analysis_renderer(analysis_engine),
             )?;
             if cli.timeline.is_some() {
                 timeline_reports.extend(TimelineReport::from_points(
@@ -1606,8 +1647,8 @@ fn run_paths(
                     &cli.inputs,
                     channel_roles_override.as_deref(),
                     &plan,
+                    audio_track,
                 )
-                .map_err(|error| error.message)
             })
             .transpose()?;
         if cli.dry_run {
@@ -1713,7 +1754,12 @@ fn run_paths(
             if !album_ok {
                 return Err("post-encode album verification failed".into());
             }
-            for ((input, output), source) in cli.inputs.iter().zip(&outputs).zip(&corrected.sources)
+            for (index, ((input, output), source)) in cli
+                .inputs
+                .iter()
+                .zip(&outputs)
+                .zip(&corrected.sources)
+                .enumerate()
             {
                 record_catalogue_asset(
                     catalogue.as_mut(),
@@ -1729,6 +1775,14 @@ fn run_paths(
                         profile: &catalogue_profile(&cli, &plan),
                         provenance: catalogue_provenance(&cli, &plan, "normalization"),
                     },
+                    None,
+                    catalogue_descriptor_options(
+                        &cli,
+                        channel_roles_override.as_deref(),
+                        audio_track,
+                    ),
+                    &plan,
+                    catalogue_output_renderer(formats[index]),
                 )?;
             }
             if let Some(path) = &cli.difference_report {
@@ -1847,6 +1901,10 @@ fn run_paths(
                     profile: &catalogue_profile(&cli, &plan),
                     provenance: catalogue_provenance(&cli, &plan, "normalization"),
                 },
+                None,
+                catalogue_descriptor_options(&cli, channel_roles_override.as_deref(), audio_track),
+                &plan,
+                catalogue_output_renderer(formats[index]),
             )?;
         }
         if let Some(path) = &cli.difference_report {
@@ -1995,75 +2053,60 @@ fn run_paths(
                 }
             }
 
-            let cached_analyses = if let Some(cache) = analysis_cache.as_ref() {
-                match analyze_many_for_plan_cached(
-                    cache,
-                    &cli.inputs[wave_start..wave_end],
-                    channel_roles_override.as_deref(),
-                    &plan,
-                ) {
-                    Ok(analyses) => Some(analyses),
-                    Err(error) => {
-                        let asset_index = wave_start + error.index;
-                        if let Some(writer) = &mut progress {
-                            writer.emit(
-                                "asset_failed",
-                                batch_job
-                                    .as_ref()
-                                    .map_or(completed_without_job, BatchJob::completed_count),
-                                cli.inputs.len(),
-                                Some((
-                                    asset_index,
-                                    &cli.inputs[asset_index],
-                                    &outputs[asset_index],
-                                )),
-                                Some(&error.message),
-                            )?;
-                        }
-                        return Err(error.message);
-                    }
-                }
-            } else {
-                None
-            };
-
             let staged = (wave_start..wave_end)
                 .into_par_iter()
                 .map(|asset_index| {
                     let output = &outputs[asset_index];
-                    prepare_output_directories(std::slice::from_ref(output))?;
-                    if let Some(analyses) = cached_analyses.as_ref() {
-                        let cached = &analyses[asset_index - wave_start];
-                        normalize::normalize_one_bound_staged_with_policy(
-                            &cached.input,
-                            output,
-                            &plan,
-                            formats[asset_index],
-                            &cached.analysis,
-                            output_conflict_policy,
-                        )
-                        .map_err(|error| error.to_string())
-                    } else {
-                        normalize::normalize_one_staged_with_roles_and_policy(
-                            &cli.inputs[asset_index],
-                            output,
-                            &plan,
-                            formats[asset_index],
-                            channel_roles_override.as_deref(),
-                            output_conflict_policy,
-                        )
+                    if let Err(error) = prepare_output_directories(std::slice::from_ref(output)) {
+                        return (Err(error), None);
                     }
+                    let (analyzed, observation) = if let Some(cache) = analysis_cache.as_ref() {
+                        match analyze_for_plan_cached_unobserved(
+                            cache,
+                            &cli.inputs[asset_index],
+                            channel_roles_override.as_deref(),
+                            &plan,
+                            audio_track,
+                        ) {
+                            Ok((analysis, observation)) => (analysis, Some(observation)),
+                            Err(error) => return (Err(error), None),
+                        }
+                    } else {
+                        match analyze_for_plan_descriptor(
+                            &cli.inputs[asset_index],
+                            channel_roles_override.as_deref(),
+                            &plan,
+                            audio_track,
+                        ) {
+                            Ok(analysis) => (analysis, None),
+                            Err(error) => return (Err(error), None),
+                        }
+                    };
+                    let staged = normalize::normalize_one_descriptor_bound_staged_with_policy(
+                        &analyzed.descriptor,
+                        output,
+                        &plan,
+                        formats[asset_index],
+                        &analyzed.analysis,
+                        output_conflict_policy,
+                    )
+                    .map(|staged| (staged, analyzed.descriptor))
+                    .map_err(|error| error.to_string());
+                    (staged, observation)
                 })
-                .collect::<Vec<Result<_, String>>>();
+                .collect::<Vec<_>>();
 
-            for (asset_index, staged) in (wave_start..wave_end).zip(staged) {
+            for (asset_index, (staged, observation)) in (wave_start..wave_end).zip(staged) {
                 let input = &cli.inputs[asset_index];
                 let output = &outputs[asset_index];
-                let outcome = match staged.and_then(|staged| {
+                if let Some(observation) = observation {
+                    observe_cache_parts(input, observation.disposition, observation.warning);
+                }
+                let outcome = match staged.and_then(|(staged, descriptor)| {
                     if let Some(job) = &mut batch_job {
                         job.mark_ready_to_publish(asset_index, staged.staged_path())?;
                     }
-                    staged.commit()
+                    staged.commit().map(|outcome| (outcome, descriptor))
                 }) {
                     Ok(outcome) => outcome,
                     Err(error) => {
@@ -2081,6 +2124,7 @@ fn run_paths(
                         return Err(error);
                     }
                 };
+                let (outcome, descriptor) = outcome;
                 print_analysis(input, &outcome.source, Some(outcome.gain));
                 record_catalogue_asset(
                     catalogue.as_mut(),
@@ -2096,6 +2140,14 @@ fn run_paths(
                         profile: &catalogue_profile(&cli, &plan),
                         provenance: catalogue_provenance(&cli, &plan, "normalization"),
                     },
+                    Some(&descriptor),
+                    catalogue_descriptor_options(
+                        &cli,
+                        channel_roles_override.as_deref(),
+                        audio_track,
+                    ),
+                    &plan,
+                    catalogue_output_renderer(formats[asset_index]),
                 )?;
                 if let Some(job) = &mut batch_job {
                     job.mark_completed(asset_index)?;
@@ -2172,12 +2224,25 @@ fn run_paths(
         }
         let mut catalogue_measurement = None;
         let result = (|| -> Result<(), String> {
-            let cached_analysis = analysis_cache
-                .as_ref()
-                .map(|cache| {
-                    analyze_for_plan_cached(cache, input, channel_roles_override.as_deref(), &plan)
-                })
-                .transpose()?;
+            let cached_analysis = if let Some(cache) = analysis_cache.as_ref() {
+                Some(analyze_for_plan_cached(
+                    cache,
+                    input,
+                    channel_roles_override.as_deref(),
+                    &plan,
+                    audio_track,
+                )?)
+            } else if cli.gain_only || cli.dry_run || cli.verify || cli.difference_report.is_some()
+            {
+                Some(analyze_for_plan_descriptor(
+                    input,
+                    channel_roles_override.as_deref(),
+                    &plan,
+                    audio_track,
+                )?)
+            } else {
+                None
+            };
             if cli.gain_only || cli.dry_run {
                 let an = if let Some(analysis) = cached_analysis {
                     analysis.analysis.analysis().clone()
@@ -2198,8 +2263,8 @@ fn run_paths(
                 prepare_output_directories(std::slice::from_ref(output))?;
                 if cli.verify {
                     let staged = if let Some(analysis) = cached_analysis.as_ref() {
-                        normalize::normalize_one_bound_corrected_staged_with_policy(
-                            &analysis.input,
+                        normalize::normalize_one_descriptor_bound_corrected_staged_with_policy(
+                            &analysis.descriptor,
                             output,
                             &plan,
                             *fmt,
@@ -2257,8 +2322,8 @@ fn run_paths(
                 } else {
                     if cli.difference_report.is_some() {
                         let (an, gain, render) = if let Some(analysis) = cached_analysis.as_ref() {
-                            normalize::normalize_one_bound_audited_with_policy(
-                                &analysis.input,
+                            normalize::normalize_one_descriptor_bound_audited_with_policy(
+                                &analysis.descriptor,
                                 output,
                                 &plan,
                                 *fmt,
@@ -2296,8 +2361,8 @@ fn run_paths(
                         )?);
                     } else {
                         let (an, gain) = if let Some(analysis) = cached_analysis.as_ref() {
-                            normalize::normalize_one_bound_with_policy(
-                                &analysis.input,
+                            normalize::normalize_one_descriptor_bound_with_policy(
+                                &analysis.descriptor,
                                 output,
                                 &plan,
                                 *fmt,
@@ -2306,14 +2371,19 @@ fn run_paths(
                             )
                             .map_err(|error| error.to_string())?
                         } else {
-                            normalize::normalize_one_with_roles_and_policy(
+                            let descriptor = input_descriptor_for_path(
                                 input,
+                                channel_roles_override.as_deref(),
+                                audio_track,
+                            )?;
+                            normalize::normalize_one_descriptor_with_policy(
+                                &descriptor,
                                 output,
                                 &plan,
                                 *fmt,
-                                channel_roles_override.as_deref(),
                                 output_conflict_policy,
-                            )?
+                            )
+                            .map_err(|error| error.to_string())?
                         };
                         print_analysis(input, &an, Some(gain));
                         catalogue_measurement = Some(an);
@@ -2349,6 +2419,10 @@ fn run_paths(
                     profile: &catalogue_profile(&cli, &plan),
                     provenance: catalogue_provenance(&cli, &plan, "normalization"),
                 },
+                None,
+                catalogue_descriptor_options(&cli, channel_roles_override.as_deref(), audio_track),
+                &plan,
+                catalogue_output_renderer(*fmt),
             )?;
         }
         if let Some(job) = &mut batch_job {
@@ -2706,25 +2780,66 @@ fn validate_catalogue_paths(
 
 fn record_catalogue_asset(
     catalogue: Option<&mut Catalogue>,
-    records: &mut Vec<CatalogueRecord>,
+    records: &mut Vec<CatalogueRecordV2>,
     asset: CatalogueAsset<'_>,
+    descriptor: Option<&InputDescriptor>,
+    descriptor_options: InputDescriptorOptions,
+    plan: &Plan,
+    renderer: &str,
 ) -> Result<(), String> {
     let Some(catalogue) = catalogue else {
         return Ok(());
     };
-    records.push(catalogue.record(asset)?);
+    let record = if let Some(descriptor) = descriptor {
+        catalogue.record_bound(asset, descriptor, plan, renderer)?
+    } else {
+        catalogue.record_bound_path(asset, descriptor_options, plan, renderer)?
+    };
+    records.push(record);
     Ok(())
+}
+
+fn catalogue_descriptor_options(
+    cli: &cli::Cli,
+    channel_roles: Option<&[ChannelRole]>,
+    audio_track: Option<u32>,
+) -> InputDescriptorOptions {
+    let mut options = InputDescriptorOptions::default()
+        .with_time_range(cli.start_seconds.unwrap_or(0.0), cli.duration_seconds);
+    if let Some(index) = audio_track {
+        options = options.with_track(AudioTrackSelection::Index(index));
+    }
+    if let Some(roles) = channel_roles {
+        options = options.with_channel_roles(roles.to_vec());
+    }
+    options
+}
+
+fn catalogue_analysis_renderer(engine: AnalysisEngine) -> String {
+    format!("forge-analysis:{}", engine.id())
+}
+
+const fn catalogue_output_renderer(format: OutputFormat) -> &'static str {
+    match format {
+        OutputFormat::Wav => "forge-native:wav",
+        OutputFormat::Flac => "forge-native:flac",
+        OutputFormat::Mp3 => "lame:mp3",
+        OutputFormat::Opus => "libopus:ogg",
+        OutputFormat::M4a => "ffmpeg:aac:ipod",
+        OutputFormat::Alac => "ffmpeg:alac:ipod",
+        OutputFormat::Vorbis => "ffmpeg:libvorbis:ogg",
+    }
 }
 
 fn write_catalogue_report(
     catalogue: Option<&Catalogue>,
     report: Option<&Path>,
-    records: Vec<CatalogueRecord>,
+    records: Vec<CatalogueRecordV2>,
     overwrite: bool,
 ) -> Result<(), String> {
     match (catalogue, report) {
         (Some(catalogue), Some(report)) => {
-            catalogue.write_report_with_overwrite(report, records, overwrite)
+            catalogue.write_report_v2_with_overwrite(report, records, overwrite)
         }
         _ => Ok(()),
     }
@@ -2871,6 +2986,7 @@ fn print_verification(input: &Path, verification: &normalize::Verification, plan
     verification.passed()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn analyze_range_cached(
     cache: Option<&AnalysisCache>,
     input: &Path,
@@ -2879,38 +2995,43 @@ fn analyze_range_cached(
     duration_seconds: Option<f64>,
     timeline_interval_ms: Option<f64>,
     engine: AnalysisEngine,
-) -> Result<normalize::TimedAnalysis, String> {
-    if let Some(cache) = cache {
-        return cache
-            .analyze_range_with_engine(
-                input,
-                channel_roles,
-                start_seconds,
-                duration_seconds,
-                timeline_interval_ms,
-                engine,
-            )
-            .map(|cached| observe_cache(input, cached));
+    audio_track: Option<u32>,
+) -> Result<(InputDescriptor, normalize::TimedAnalysis), String> {
+    let stable_options = StableInputOptions::new(u64::MAX).map_err(|error| error.to_string())?;
+    let stable =
+        StableInput::from_path(input, &stable_options).map_err(|error| error.to_string())?;
+    let mut descriptor_options =
+        InputDescriptorOptions::default().with_time_range(start_seconds, duration_seconds);
+    if let Some(index) = audio_track {
+        descriptor_options = descriptor_options.with_track(AudioTrackSelection::Index(index));
     }
-    normalize::analyze_file_range_with_roles_and_engine(
-        input,
-        channel_roles,
-        start_seconds,
-        duration_seconds,
+    if let Some(roles) = channel_roles {
+        descriptor_options = descriptor_options.with_channel_roles(roles.to_vec());
+    }
+    let descriptor = InputDescriptor::probe(stable, descriptor_options)?;
+    if let Some(cache) = cache {
+        let timed = cache
+            .analyze_descriptor_range_with_engine(&descriptor, timeline_interval_ms, engine)
+            .map(|cached| observe_cache(input, cached))?;
+        return Ok((descriptor, timed));
+    }
+    let timed = normalize::analyze_input_descriptor_range_with_engine(
+        &descriptor,
         timeline_interval_ms,
         engine,
-    )
-}
-
-#[derive(Debug)]
-struct IndexedAnalysisError {
-    index: usize,
-    message: String,
+    )?;
+    Ok((descriptor, timed))
 }
 
 struct CachedPlanAnalysis {
     input: StableInput,
+    descriptor: InputDescriptor,
     analysis: BoundAnalysis,
+}
+
+struct CacheObservation {
+    disposition: CacheDisposition,
+    warning: Option<String>,
 }
 
 fn analyze_many_for_plan_cached(
@@ -2918,25 +3039,28 @@ fn analyze_many_for_plan_cached(
     inputs: &[PathBuf],
     channel_roles: Option<&[ChannelRole]>,
     plan: &Plan,
-) -> Result<Vec<CachedPlanAnalysis>, IndexedAnalysisError> {
+    audio_track: Option<u32>,
+) -> Result<Vec<CachedPlanAnalysis>, String> {
     let cached = inputs
         .par_iter()
         .map(|path| {
             let options = StableInputOptions::new(u64::MAX).map_err(|error| error.to_string())?;
             let input =
                 StableInput::from_path(path, &options).map_err(|error| error.to_string())?;
-            let cached = cache.analyze_stable_for_plan(&input, channel_roles, plan)?;
-            Ok((input, cached))
+            let descriptor = input_descriptor_for_plan(input.clone(), channel_roles, audio_track)?;
+            let cached = cache.analyze_descriptor_for_plan(&descriptor, plan)?;
+            Ok((input, descriptor, cached))
         })
         .collect::<Vec<_>>();
     let mut analyses = Vec::with_capacity(inputs.len());
-    for (index, (input, result)) in inputs.iter().zip(cached).enumerate() {
+    for (input, result) in inputs.iter().zip(cached) {
         match result {
-            Ok((stable, cached)) => analyses.push(CachedPlanAnalysis {
+            Ok((stable, descriptor, cached)) => analyses.push(CachedPlanAnalysis {
                 input: stable,
+                descriptor,
                 analysis: observe_cache(input, cached),
             }),
-            Err(message) => return Err(IndexedAnalysisError { index, message }),
+            Err(message) => return Err(message),
         }
     }
     Ok(analyses)
@@ -2947,16 +3071,82 @@ fn analyze_for_plan_cached(
     input: &Path,
     channel_roles: Option<&[ChannelRole]>,
     plan: &Plan,
+    audio_track: Option<u32>,
 ) -> Result<CachedPlanAnalysis, String> {
+    let (analysis, observation) =
+        analyze_for_plan_cached_unobserved(cache, input, channel_roles, plan, audio_track)?;
+    observe_cache_parts(input, observation.disposition, observation.warning);
+    Ok(analysis)
+}
+
+fn analyze_for_plan_cached_unobserved(
+    cache: &AnalysisCache,
+    input: &Path,
+    channel_roles: Option<&[ChannelRole]>,
+    plan: &Plan,
+    audio_track: Option<u32>,
+) -> Result<(CachedPlanAnalysis, CacheObservation), String> {
     let options = StableInputOptions::new(u64::MAX).map_err(|error| error.to_string())?;
     let stable = StableInput::from_path(input, &options).map_err(|error| error.to_string())?;
-    let analysis = cache
-        .analyze_stable_for_plan(&stable, channel_roles, plan)
-        .map(|cached| observe_cache(input, cached))?;
+    let descriptor = input_descriptor_for_plan(stable.clone(), channel_roles, audio_track)?;
+    let Cached {
+        value: analysis,
+        disposition,
+        warning,
+    } = cache.analyze_descriptor_for_plan(&descriptor, plan)?;
+    Ok((
+        CachedPlanAnalysis {
+            input: stable,
+            descriptor,
+            analysis,
+        },
+        CacheObservation {
+            disposition,
+            warning,
+        },
+    ))
+}
+
+fn analyze_for_plan_descriptor(
+    input: &Path,
+    channel_roles: Option<&[ChannelRole]>,
+    plan: &Plan,
+    audio_track: Option<u32>,
+) -> Result<CachedPlanAnalysis, String> {
+    let descriptor = input_descriptor_for_path(input, channel_roles, audio_track)?;
+    let stable = descriptor.stable_input().clone();
+    let analysis = normalize::analyze_input_descriptor_for_plan(&descriptor, plan)
+        .map_err(|error| error.to_string())?;
     Ok(CachedPlanAnalysis {
         input: stable,
+        descriptor,
         analysis,
     })
+}
+
+fn input_descriptor_for_path(
+    input: &Path,
+    channel_roles: Option<&[ChannelRole]>,
+    audio_track: Option<u32>,
+) -> Result<InputDescriptor, String> {
+    let options = StableInputOptions::new(u64::MAX).map_err(|error| error.to_string())?;
+    let stable = StableInput::from_path(input, &options).map_err(|error| error.to_string())?;
+    input_descriptor_for_plan(stable, channel_roles, audio_track)
+}
+
+fn input_descriptor_for_plan(
+    input: StableInput,
+    channel_roles: Option<&[ChannelRole]>,
+    audio_track: Option<u32>,
+) -> Result<InputDescriptor, String> {
+    let mut options = InputDescriptorOptions::default();
+    if let Some(roles) = channel_roles {
+        options = options.with_channel_roles(roles.to_vec());
+    }
+    if let Some(index) = audio_track {
+        options = options.with_track(AudioTrackSelection::Index(index));
+    }
+    InputDescriptor::probe(input, options)
 }
 
 fn analyze_file_cached(
@@ -2973,7 +3163,12 @@ fn analyze_file_cached(
 }
 
 fn observe_cache<T>(input: &Path, cached: Cached<T>) -> T {
-    let action = match cached.disposition {
+    observe_cache_parts(input, cached.disposition, cached.warning);
+    cached.value
+}
+
+fn observe_cache_parts(input: &Path, disposition: CacheDisposition, warning: Option<String>) {
+    let action = match disposition {
         CacheDisposition::Hit => "hit",
         CacheDisposition::Stored => "miss; stored",
         CacheDisposition::Repaired => "invalid; repaired",
@@ -2982,10 +3177,9 @@ fn observe_cache<T>(input: &Path, cached: Cached<T>) -> T {
         CacheDisposition::TooLarge => "miss; entry too large to store",
     };
     eprintln!("analysis cache {action}: {}", input.display());
-    if let Some(warning) = cached.warning {
+    if let Some(warning) = warning {
         eprintln!("analysis cache warning: {warning}");
     }
-    cached.value
 }
 
 fn write_loudness_tags(
@@ -3268,6 +3462,7 @@ fn prepare_output_directories(outputs: &[PathBuf]) -> Result<(), String> {
 fn resolve_outputs_and_formats(
     cli: &cli::Cli,
     relative_paths: &[PathBuf],
+    audio_track: Option<u32>,
 ) -> Result<(Vec<PathBuf>, Vec<OutputFormat>), String> {
     let explicit = cli.format.as_deref().map(parse_format);
     let mut outputs = Vec::with_capacity(cli.inputs.len());
@@ -3276,7 +3471,10 @@ fn resolve_outputs_and_formats(
     if let Some(out) = &cli.output {
         if out.is_dir() || (!out.exists() && (cli.inputs.len() > 1 || cli.recursive)) {
             for (index, inp) in cli.inputs.iter().enumerate() {
-                let fmt = explicit.unwrap_or_else(|| default_format_for_input(inp));
+                let fmt = match explicit {
+                    Some(format) => format,
+                    None => default_format_for_input(inp, audio_track)?,
+                };
                 let relative = relative_paths.get(index).unwrap_or(inp);
                 let stem = relative
                     .file_stem()
@@ -3295,7 +3493,7 @@ fn resolve_outputs_and_formats(
             // Single explicit output file: infer its format from the extension.
             let fmt = explicit
                 .or_else(|| infer_format(out))
-                .unwrap_or_else(|| default_format_for_input(&cli.inputs[0]));
+                .map_or_else(|| default_format_for_input(&cli.inputs[0], audio_track), Ok)?;
             outputs.push(out.clone());
             formats.push(fmt);
             return Ok((outputs, formats));
@@ -3310,7 +3508,10 @@ fn resolve_outputs_and_formats(
     // follows the chosen format, which defaults to the input's container when
     // supported (mp3 -> mp3) and otherwise wav.
     for inp in &cli.inputs {
-        let fmt = explicit.unwrap_or_else(|| default_format_for_input(inp));
+        let fmt = match explicit {
+            Some(format) => format,
+            None => default_format_for_input(inp, audio_track)?,
+        };
         let stem = inp.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
         let dir = inp.parent().unwrap_or_else(|| Path::new(""));
         outputs.push(dir.join(format!("{stem}_normalized.{}", fmt_ext(fmt))));
@@ -3362,19 +3563,43 @@ fn infer_format(path: &Path) -> Option<OutputFormat> {
     }
 }
 
-/// Keep lossless FLAC and MP3 inputs in their original containers; other
-/// decoded formats fall back to lossless WAV.
-fn default_format_for_input(path: &Path) -> OutputFormat {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("flac") => OutputFormat::Flac,
-        Some("mp3") => OutputFormat::Mp3,
-        Some("opus") => OutputFormat::Opus,
-        Some("ogg") | Some("oga") => {
+/// Select a default from the content-probed codec. A lossless input never
+/// silently falls through to a lossy encoder merely because of its suffix.
+fn default_format_for_input(path: &Path, audio_track: Option<u32>) -> Result<OutputFormat, String> {
+    let selection = audio_track.map_or(AudioTrackSelection::Default, AudioTrackSelection::Index);
+    // Output planning happens before a resumable batch starts processing its
+    // assets. An unreadable asset must therefore not prevent earlier valid
+    // assets from reaching their durable checkpoints. WAV is the conservative
+    // lossless fallback whenever the selected programme cannot be identified;
+    // descriptor construction will still report the original probe error when
+    // that asset is processed.
+    let identity = match forge_normalizer::decoder::probe_audio_program(path, selection) {
+        Ok(identity) => identity,
+        Err(_) => return Ok(OutputFormat::Wav),
+    };
+    let format = match identity.codec {
+        AudioCodec::Flac => OutputFormat::Flac,
+        AudioCodec::Mp3 => {
+            #[cfg(feature = "mp3-encoding")]
+            {
+                OutputFormat::Mp3
+            }
+            #[cfg(not(feature = "mp3-encoding"))]
+            {
+                OutputFormat::Wav
+            }
+        }
+        AudioCodec::Opus => {
+            #[cfg(feature = "opus-encoding")]
+            {
+                OutputFormat::Opus
+            }
+            #[cfg(not(feature = "opus-encoding"))]
+            {
+                OutputFormat::Wav
+            }
+        }
+        AudioCodec::Vorbis => {
             #[cfg(feature = "ffmpeg-encoding")]
             {
                 OutputFormat::Vorbis
@@ -3384,18 +3609,32 @@ fn default_format_for_input(path: &Path) -> OutputFormat {
                 OutputFormat::Wav
             }
         }
-        Some("m4a") | Some("mp4") => {
-            #[cfg(feature = "aac-encoding")]
+        AudioCodec::Aac => {
+            #[cfg(feature = "ffmpeg-encoding")]
             {
                 OutputFormat::M4a
             }
-            #[cfg(not(feature = "aac-encoding"))]
+            #[cfg(not(feature = "ffmpeg-encoding"))]
             {
                 OutputFormat::Wav
             }
         }
+        AudioCodec::Alac => {
+            #[cfg(feature = "ffmpeg-encoding")]
+            {
+                OutputFormat::Alac
+            }
+            #[cfg(not(feature = "ffmpeg-encoding"))]
+            {
+                OutputFormat::Wav
+            }
+        }
+        AudioCodec::Pcm(_) | AudioCodec::Dsd | AudioCodec::Mp1 | AudioCodec::Mp2 => {
+            OutputFormat::Wav
+        }
         _ => OutputFormat::Wav,
-    }
+    };
+    Ok(format)
 }
 
 fn fmt_kind(k: PcmKind) -> &'static str {

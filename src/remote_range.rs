@@ -10,13 +10,18 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
+
+use crate::stable_input::{StableInput, StableInputOptions};
 
 pub const REMOTE_QC_SCHEMA: &str =
     "https://penguin425.github.io/audio-normalizer/schema/remote-qc-v1";
 pub const REMOTE_RANGE_SCHEMA: &str =
     "https://penguin425.github.io/audio-normalizer/schema/remote-range-v1";
+pub const REMOTE_MATERIALIZATION_SCHEMA: &str =
+    "https://penguin425.github.io/audio-normalizer/schema/remote-materialization-v1";
 
 const MAX_TIMEOUT_MILLISECONDS: u64 = 60_000;
 const MAX_RANGE_BYTES: u64 = 16 * 1024 * 1024;
@@ -95,6 +100,24 @@ pub struct RemoteFetchReport {
     pub error: Option<String>,
 }
 
+/// Evidence for one bounded, whole-object response captured as an immutable
+/// [`StableInput`]. No validator is required because bytes from separate
+/// representation responses are never combined.
+#[non_exhaustive]
+#[derive(Clone, Debug, Serialize)]
+pub struct RemoteMaterializationReport {
+    pub schema: &'static str,
+    pub requested_uri: String,
+    pub allowed_origins: Vec<String>,
+    pub final_uri: String,
+    pub redirect_chain: Vec<String>,
+    pub status: u16,
+    pub object_size_bytes: u64,
+    pub sha256: String,
+    pub response_headers: BTreeMap<String, String>,
+    pub passed: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AllowedOrigin {
     display: String,
@@ -161,6 +184,8 @@ pub struct RemoteRangeReader {
     object_size: Option<u64>,
     cache_start: u64,
     cache: Vec<u8>,
+    strong_etag: Option<String>,
+    representation_url: Option<Url>,
     report: RemoteFetchReport,
 }
 
@@ -203,6 +228,8 @@ impl RemoteRangeReader {
             object_size: None,
             cache_start: 0,
             cache: Vec::new(),
+            strong_etag: None,
+            representation_url: None,
             report: RemoteFetchReport {
                 schema: REMOTE_RANGE_SCHEMA,
                 requested_uri: target.redacted_uri(),
@@ -231,6 +258,13 @@ impl RemoteRangeReader {
         self.report.clone()
     }
 
+    /// Strong entity tag binding every successful range in this session.
+    /// A single range may be read without one; a second network response may
+    /// not be combined unless this value is present.
+    pub fn strong_etag(&self) -> Option<&str> {
+        self.strong_etag.as_deref()
+    }
+
     /// Fetch one bounded range without changing the reader cursor.
     pub fn read_range_at(&mut self, start: u64, length: u64) -> Result<Vec<u8>, String> {
         if length == 0 {
@@ -249,6 +283,12 @@ impl RemoteRangeReader {
     }
 
     fn fetch_range(&mut self, start: u64, requested_end: u64) -> Result<Vec<u8>, String> {
+        if self.report.range_count > 0 && self.strong_etag.is_none() {
+            return self.fail(
+                "remote object has no strong ETag; refusing to combine multiple range responses; materialize one bounded snapshot instead"
+                    .into(),
+            );
+        }
         if self.report.request_count >= self.options.max_requests {
             return self.fail(format!(
                 "remote request limit {} exhausted",
@@ -277,13 +317,15 @@ impl RemoteRangeReader {
             }
             self.report.request_count += 1;
             let range_header = format!("bytes={start}-{requested_end}");
-            let mut response = match self
+            let mut request = self
                 .agent
                 .get(current.as_str())
                 .header("Range", &range_header)
-                .header("Accept-Encoding", "identity")
-                .call()
-            {
+                .header("Accept-Encoding", "identity");
+            if let Some(etag) = self.strong_etag.as_deref() {
+                request = request.header("If-Range", etag);
+            }
+            let mut response = match request.call() {
                 Ok(response) => response,
                 Err(error) => {
                     return self.fail(format!("request {}: {error}", redacted_uri(&current)));
@@ -342,8 +384,13 @@ impl RemoteRangeReader {
             };
             if status != 206 {
                 let error = if status == 200 {
-                    "origin did not honor Range (HTTP 200 would require an unbounded full download)"
-                        .to_string()
+                    if self.strong_etag.is_some() {
+                        "remote representation changed or origin did not honor If-Range; refusing to combine responses"
+                            .to_string()
+                    } else {
+                        "origin did not honor Range (HTTP 200 would require an unbounded full download)"
+                            .to_string()
+                    }
                 } else {
                     format!("HTTP status {status}; expected 206 Partial Content")
                 };
@@ -351,12 +398,42 @@ impl RemoteRangeReader {
                 self.report.ranges.push(entry);
                 return self.fail(error);
             }
+            if response
+                .headers()
+                .get("content-encoding")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| !value.eq_ignore_ascii_case("identity"))
+            {
+                return self.fail(
+                    "range response used a non-identity Content-Encoding; byte offsets are not safe to combine"
+                        .into(),
+                );
+            }
             let content_range = response
                 .headers()
                 .get("content-range")
                 .and_then(|value| value.to_str().ok())
                 .ok_or_else(|| "206 response has no valid Content-Range header".to_string())?;
             let (returned_start, returned_end, object_size) = parse_content_range(content_range)?;
+            let response_etag = strong_etag(response.headers()).map(ToOwned::to_owned);
+            if let Some(expected_etag) = self.strong_etag.as_deref() {
+                if response_etag.as_deref() != Some(expected_etag) {
+                    return self.fail(
+                        "remote strong ETag changed or was omitted; refusing to combine range responses"
+                            .into(),
+                    );
+                }
+            }
+            if self
+                .representation_url
+                .as_ref()
+                .is_some_and(|previous| previous != &current)
+            {
+                return self.fail(
+                    "remote redirect resolved to a different representation URI; refusing to combine range responses"
+                        .into(),
+                );
+            }
             if returned_start != start
                 || returned_end < returned_start
                 || returned_end > requested_end
@@ -451,6 +528,12 @@ impl RemoteRangeReader {
             self.report.range_count += 1;
             self.object_size = Some(object_size);
             self.report.object_size_bytes = Some(object_size);
+            if self.strong_etag.is_none() {
+                self.strong_etag = response_etag;
+            }
+            if self.representation_url.is_none() {
+                self.representation_url = Some(current);
+            }
             entry.passed = true;
             self.report.ranges.push(entry);
             self.report.passed = true;
@@ -549,6 +632,158 @@ pub fn fetch_range(
     let mut reader = RemoteRangeReader::open(uri, options)?;
     let bytes = reader.read_range_at(start, length)?;
     Ok((bytes, reader.report()))
+}
+
+/// Capture a whole remote object from one bounded representation response.
+///
+/// This is the safe fallback for origins that do not provide a strong ETag for
+/// range requests. Redirects are re-authorized, compression is rejected, and
+/// the body is capped by both `max_total_bytes` and `max_object_bytes` before it
+/// becomes an immutable [`StableInput`].
+pub fn materialize(
+    uri: &str,
+    options: RemoteRangeOptions,
+) -> Result<(StableInput, RemoteMaterializationReport), String> {
+    let session = RemoteRangeReader::open(uri, options)?;
+    let byte_limit = session
+        .options
+        .max_total_bytes
+        .min(session.options.max_object_bytes);
+    let mut current = session.target.request.clone();
+    let mut redirects = 0_u32;
+    let mut request_count = 0_usize;
+    let mut redirect_chain = Vec::new();
+
+    loop {
+        if !origin_allowed(&current, &session.allowed) {
+            return Err(format!(
+                "redirect target origin is not explicitly allowed: {}",
+                redacted_uri(&current)
+            ));
+        }
+        if request_count >= session.options.max_requests {
+            return Err(format!(
+                "remote request limit {} exhausted",
+                session.options.max_requests
+            ));
+        }
+        request_count += 1;
+        let mut response = session
+            .agent
+            .get(current.as_str())
+            .header("Accept-Encoding", "identity")
+            .call()
+            .map_err(|error| format!("request {}: {error}", redacted_uri(&current)))?;
+        let status = response.status().as_u16();
+        if (300..400).contains(&status) {
+            if redirects >= session.options.max_redirects {
+                return Err(format!(
+                    "redirect limit {} exceeded at {}",
+                    session.options.max_redirects,
+                    redacted_uri(&current)
+                ));
+            }
+            let location = response
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| format!("redirect {status} has no valid Location header"))?;
+            if location.len() > MAX_HEADER_VALUE_BYTES {
+                return Err("redirect Location header is too large".into());
+            }
+            let next = current
+                .join(location)
+                .map_err(|error| format!("invalid redirect Location header: {error}"))?;
+            validate_http_url(&next, session.options.allow_insecure_http)?;
+            if !origin_allowed(&next, &session.allowed) {
+                return Err(format!(
+                    "redirect target origin is not explicitly allowed: {}",
+                    redacted_uri(&next)
+                ));
+            }
+            redirect_chain.push(redacted_uri(&next));
+            current = next;
+            redirects += 1;
+            continue;
+        }
+        if status != 200 {
+            return Err(format!(
+                "HTTP status {status}; expected 200 OK for snapshot materialization"
+            ));
+        }
+        if response
+            .headers()
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| !value.eq_ignore_ascii_case("identity"))
+        {
+            return Err("snapshot response used a non-identity Content-Encoding".into());
+        }
+        let advertised_length = response
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| "200 response has an invalid Content-Length".to_string())
+            })
+            .transpose()?;
+        if advertised_length.is_some_and(|length| length > byte_limit) {
+            return Err(format!(
+                "remote object size {} exceeds snapshot limit {byte_limit} bytes",
+                advertised_length.unwrap()
+            ));
+        }
+        let response_headers = selected_headers(response.headers());
+        let read_limit = byte_limit
+            .checked_add(1)
+            .ok_or_else(|| "snapshot read limit overflows u64".to_string())?;
+        let mut bytes = Vec::new();
+        response
+            .body_mut()
+            .as_reader()
+            .take(read_limit)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("read remote snapshot response: {error}"))?;
+        let object_size_bytes = u64::try_from(bytes.len())
+            .map_err(|_| "remote snapshot length exceeds u64".to_string())?;
+        if object_size_bytes > byte_limit {
+            return Err(format!(
+                "remote snapshot exceeded {byte_limit} bytes while reading"
+            ));
+        }
+        if let Some(advertised) = advertised_length {
+            if advertised != object_size_bytes {
+                return Err(format!(
+                    "remote snapshot contains {object_size_bytes} bytes, expected {advertised}"
+                ));
+            }
+        }
+        let source_name = current
+            .path_segments()
+            .and_then(|mut segments| segments.rfind(|value| !value.is_empty()))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("remote.bin"));
+        let stable_options = StableInputOptions::new(byte_limit)
+            .map_err(|error| error.to_string())?
+            .with_source_name_hint(source_name);
+        let snapshot =
+            StableInput::from_bytes(&bytes, &stable_options).map_err(|error| error.to_string())?;
+        let report = RemoteMaterializationReport {
+            schema: REMOTE_MATERIALIZATION_SCHEMA,
+            requested_uri: session.target.redacted_uri(),
+            allowed_origins: session.report.allowed_origins.clone(),
+            final_uri: redacted_uri(&current),
+            redirect_chain,
+            status,
+            object_size_bytes,
+            sha256: hex_digest(snapshot.sha256()),
+            response_headers,
+            passed: true,
+        };
+        return Ok((snapshot, report));
+    }
 }
 
 /// A bounded prefix/header probe suitable for remote QC.
@@ -827,6 +1062,7 @@ fn selected_headers(headers: &ureq::http::HeaderMap) -> BTreeMap<String, String>
     const NAMES: &[&str] = &[
         "accept-ranges",
         "cache-control",
+        "content-encoding",
         "content-length",
         "content-range",
         "content-type",
@@ -845,6 +1081,23 @@ fn selected_headers(headers: &ureq::http::HeaderMap) -> BTreeMap<String, String>
         }
     }
     selected
+}
+
+/// Return an entity tag only when it is syntactically suitable for `If-Range`.
+/// Weak validators cannot prove that byte ranges belong to one representation.
+fn strong_etag(headers: &ureq::http::HeaderMap) -> Option<&str> {
+    let value = headers.get("etag")?.to_str().ok()?.trim();
+    if value.starts_with("W/")
+        || value.len() < 2
+        || !value.starts_with('"')
+        || !value.ends_with('"')
+        || value[1..value.len() - 1]
+            .bytes()
+            .any(|byte| byte == b'"' || byte < 0x21 || byte == 0x7f)
+    {
+        return None;
+    }
+    Some(value)
 }
 
 fn detect_format(bytes: &[u8]) -> &'static str {
@@ -961,7 +1214,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
-            for (start, body) in [(0_u64, b"abcd".as_slice()), (4, b"efgh"), (2, b"cdef")] {
+            for (index, (start, body)) in [(0_u64, b"abcd".as_slice()), (4, b"efgh"), (2, b"cdef")]
+                .into_iter()
+                .enumerate()
+            {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 1024];
@@ -972,10 +1228,17 @@ mod tests {
                     }
                     request.extend_from_slice(&buffer[..read]);
                 }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                if index == 0 {
+                    assert!(!request.contains("if-range:"));
+                } else {
+                    assert!(request.contains("if-range: \"stable\""));
+                }
                 let end = start + body.len() as u64 - 1;
                 let header = format!(
                     "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\
-                     Content-Range: bytes {start}-{end}/8\r\nConnection: close\r\n\r\n",
+                     Content-Range: bytes {start}-{end}/8\r\nETag: \"stable\"\r\n\
+                     Connection: close\r\n\r\n",
                     body.len()
                 );
                 stream.write_all(header.as_bytes()).unwrap();
@@ -1063,12 +1326,167 @@ mod tests {
         reader.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"efgh");
         assert_eq!(reader.object_size(), Some(8));
+        assert_eq!(reader.strong_etag(), Some("\"stable\""));
         reader.seek(SeekFrom::Start(2)).unwrap();
         let mut excerpt = [0_u8; 2];
         reader.read_exact(&mut excerpt).unwrap();
         assert_eq!(&excerpt, b"cd");
         assert_eq!(reader.report().request_count, 3);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn reader_refuses_to_mix_unvalidated_range_responses() {
+        let (origin, server) = serve(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\
+             Content-Range: bytes 0-3/8\r\nConnection: close\r\n\r\nabcd"
+                .into(),
+        );
+        let mut reader = RemoteRangeReader::open(
+            &format!("{origin}/audio.wav"),
+            RemoteRangeOptions {
+                allowed_origins: vec![origin],
+                allow_insecure_http: true,
+                max_range_bytes: 4,
+                ..RemoteRangeOptions::default()
+            },
+        )
+        .unwrap();
+        let mut bytes = [0_u8; 4];
+        reader.read_exact(&mut bytes).unwrap();
+        reader.seek(SeekFrom::Start(4)).unwrap();
+        let error = reader.read_exact(&mut bytes).unwrap_err().to_string();
+        assert!(
+            error.contains("materialize one bounded snapshot"),
+            "{error}"
+        );
+        assert_eq!(reader.report().request_count, 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn reader_rejects_encoded_range_representations() {
+        let (origin, server) = serve(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\
+             Content-Range: bytes 0-3/8\r\nContent-Encoding: gzip\r\n\
+             ETag: \"stable\"\r\nConnection: close\r\n\r\nabcd"
+                .into(),
+        );
+        let mut reader = RemoteRangeReader::open(
+            &format!("{origin}/audio.wav"),
+            RemoteRangeOptions {
+                allowed_origins: vec![origin],
+                allow_insecure_http: true,
+                max_range_bytes: 4,
+                ..RemoteRangeOptions::default()
+            },
+        )
+        .unwrap();
+        let error = reader.read_range_at(0, 4).unwrap_err();
+        assert!(error.contains("non-identity Content-Encoding"), "{error}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn reader_rejects_a_changed_strong_validator() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for (index, (body, etag)) in [(b"abcd".as_slice(), "first"), (b"efgh", "second")]
+                .into_iter()
+                .enumerate()
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                if index == 1 {
+                    assert!(request.contains("if-range: \"first\""));
+                }
+                let start = (index * 4) as u64;
+                let end = start + 3;
+                let header = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\
+                     Content-Range: bytes {start}-{end}/8\r\nETag: \"{etag}\"\r\n\
+                     Connection: close\r\n\r\n"
+                );
+                stream.write_all(header.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+        let origin = format!("http://{address}");
+        let mut reader = RemoteRangeReader::open(
+            &format!("{origin}/audio.wav"),
+            RemoteRangeOptions {
+                allowed_origins: vec![origin],
+                allow_insecure_http: true,
+                max_range_bytes: 4,
+                ..RemoteRangeOptions::default()
+            },
+        )
+        .unwrap();
+        let mut bytes = [0_u8; 4];
+        reader.read_exact(&mut bytes).unwrap();
+        let error = reader.read_exact(&mut bytes).unwrap_err().to_string();
+        assert!(error.contains("strong ETag changed"), "{error}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn materializes_one_unvalidated_response_as_a_stable_snapshot() {
+        let (origin, server) = serve(
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nContent-Type: audio/flac\r\n\
+             Connection: close\r\n\r\nabcdefgh"
+                .into(),
+        );
+        let (snapshot, report) = materialize(
+            &format!("{origin}/audio.flac?token=secret"),
+            options(&origin),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(snapshot.byte_len(), 8);
+        assert_eq!(
+            snapshot.source_name_hint(),
+            Some(std::path::Path::new("audio.flac"))
+        );
+        assert_eq!(report.object_size_bytes, 8);
+        assert_eq!(report.sha256, hex_digest(snapshot.sha256()));
+        assert!(!report.requested_uri.contains("secret"));
+        assert!(!report.final_uri.contains("secret"));
+        let instance = serde_json::to_value(&report).unwrap();
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../schema/remote-materialization-v1.schema.json"
+        ))
+        .unwrap();
+        assert!(jsonschema::validator_for(&schema)
+            .unwrap()
+            .is_valid(&instance));
+    }
+
+    #[test]
+    fn materialization_rejects_an_advertised_oversized_object() {
+        let (origin, server) =
+            serve("HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\n".into());
+        let result = materialize(
+            &format!("{origin}/audio.wav"),
+            RemoteRangeOptions {
+                allowed_origins: vec![origin],
+                allow_insecure_http: true,
+                max_range_bytes: 8,
+                max_total_bytes: 8,
+                ..RemoteRangeOptions::default()
+            },
+        );
+        server.join().unwrap();
+        assert!(result.unwrap_err().contains("snapshot limit 8 bytes"));
     }
 
     #[test]

@@ -45,6 +45,11 @@ on:
       - "schema/analysis-cache-v1.schema.json"
       - "schema/analysis-cache-v2.schema.json"
       - "schema/analysis-cache-v3.schema.json"
+      - "schema/analysis-cache-v4.schema.json"
+      - "src/catalogue.rs"
+      - "CATALOGUE.md"
+      - "schema/catalogue-report-v1.schema.json"
+      - "schema/catalogue-report-v2.schema.json"
       - "schema/batch-job-v1.schema.json"
       - "schema/batch-job-v2.schema.json"
       - "schema/batch-progress-v1.schema.json"
@@ -154,6 +159,7 @@ on:
       - "schema/onnx-anomaly-model-v1.schema.json"
       - "schema/onnx-feature-frames-v1.schema.json"
       - "schema/remote-range-v1.schema.json"
+      - "schema/remote-materialization-v1.schema.json"
       - "schema/remote-qc-v1.schema.json"
       - "schema/service-analysis-v1.schema.json"
       - "schema/service-analysis-v2.schema.json"
@@ -458,7 +464,10 @@ jobs:
           cp schema/doctor-report-v1.schema.json "$staging/schema/"
           cp schema/analysis-cache-v1.schema.json \
              schema/analysis-cache-v2.schema.json \
-             schema/analysis-cache-v3.schema.json "$staging/schema/"
+             schema/analysis-cache-v3.schema.json \
+             schema/analysis-cache-v4.schema.json \
+             schema/catalogue-report-v1.schema.json \
+             schema/catalogue-report-v2.schema.json "$staging/schema/"
           cp schema/batch-job-v1.schema.json \
              schema/batch-job-v2.schema.json \
              schema/batch-progress-v1.schema.json \
@@ -502,6 +511,7 @@ jobs:
              schema/onnx-anomaly-model-v1.schema.json \
              schema/onnx-feature-frames-v1.schema.json \
              schema/remote-range-v1.schema.json \
+             schema/remote-materialization-v1.schema.json \
              schema/remote-qc-v1.schema.json \
              schema/service-analysis-v1.schema.json \
              schema/service-analysis-v2.schema.json \
@@ -541,7 +551,7 @@ jobs:
           Copy-Item @("tools/benchmark.py","tools/test-vst3-adapter.sh","tools/test-au-adapter.sh") "$staging/tools/"
           Copy-Item schema/performance-benchmark-v1.schema.json "$staging/schema/"
           Copy-Item schema/doctor-report-v1.schema.json "$staging/schema/"
-          Copy-Item "schema/analysis-cache-v1.schema.json","schema/analysis-cache-v2.schema.json","schema/analysis-cache-v3.schema.json" "$staging/schema/"
+          Copy-Item "schema/analysis-cache-v1.schema.json","schema/analysis-cache-v2.schema.json","schema/analysis-cache-v3.schema.json","schema/analysis-cache-v4.schema.json","schema/catalogue-report-v1.schema.json","schema/catalogue-report-v2.schema.json" "$staging/schema/"
           Copy-Item "schema/batch-job-v1.schema.json","schema/batch-job-v2.schema.json","schema/batch-progress-v1.schema.json","schema/watch-folder-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/delivery-manifest-v1.schema.json","schema/delivery-manifest-v2.schema.json","schema/delivery-manifest-v3.schema.json","schema/delivery-manifest-v4.schema.json" "$staging/schema/"
           Copy-Item "schema/multi-delivery-request-v1.schema.json","schema/multi-delivery-report-v1.schema.json" "$staging/schema/"
@@ -554,7 +564,7 @@ jobs:
           Copy-Item "schema/binaural-qc-request-v1.schema.json","schema/binaural-qc-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/remediation-request-v1.schema.json","schema/remediation-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/metadata-repair-request-v1.schema.json","schema/metadata-repair-report-v1.schema.json","schema/metadata-repair-request-v2.schema.json","schema/metadata-repair-report-v2.schema.json" "$staging/schema/"
-          Copy-Item "schema/audio-anomaly-provider-v1.schema.json","schema/anomaly-provider-audit-v1.schema.json","schema/model-qc-v1.schema.json","schema/onnx-anomaly-model-v1.schema.json","schema/onnx-feature-frames-v1.schema.json","schema/remote-range-v1.schema.json","schema/remote-qc-v1.schema.json","schema/service-analysis-v1.schema.json","schema/service-analysis-v2.schema.json","schema/service-error-v1.schema.json","schema/service-health-v1.schema.json" "$staging/schema/"
+          Copy-Item "schema/audio-anomaly-provider-v1.schema.json","schema/anomaly-provider-audit-v1.schema.json","schema/model-qc-v1.schema.json","schema/onnx-anomaly-model-v1.schema.json","schema/onnx-feature-frames-v1.schema.json","schema/remote-range-v1.schema.json","schema/remote-materialization-v1.schema.json","schema/remote-qc-v1.schema.json","schema/service-analysis-v1.schema.json","schema/service-analysis-v2.schema.json","schema/service-error-v1.schema.json","schema/service-health-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/ebu-qc-results-v2.schema.json","schema/ebu-qc-catalogue-v2-pins.json" "$staging/schema/"
           Copy-Item schema/ebu-qc-2026-04 "$staging/schema/" -Recurse
           Copy-Item "README.md","CHANGELOG.md","COMPATIBILITY.md","CONTRIBUTING.md","SECURITY.md","DOCUMENTATION.md","PERFORMANCE.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","MULTI-DELIVERY.md","SEGMENT-NORMALIZATION.md","AC4-ADAPTER.md","MPEGH-ADAPTER.md","DTS-ADAPTER.md","ADM-PRESENTATION-QC.md","ADM-INTERACTIVITY-QC.md","ADM-SEMANTICS-QC.md","ANOMALY-ADAPTER.md","SERVICE-METRICS.md","C-API.md","HOST-ADAPTERS.md","VST3-ADAPTER.md","AU-ADAPTER.md","IMMERSIVE-DOWNMIX.md","BINAURAL-QC.md","REMEDIATION.md","METADATA-REPAIR.md","EBU-QC-SCENARIO1.md","NEXT-GENERATION-PLAN.md","ROADMAP.md","LICENSE" $staging

@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::OnceLock;
 
 use crate::wav::{MAX_DECODE_SAMPLE_RATE_HZ, MIN_DECODE_SAMPLE_RATE_HZ};
 
@@ -29,6 +30,101 @@ impl FfmpegCodec {
             Self::Vorbis => "Vorbis",
         }
     }
+
+    const fn encoder(self) -> &'static str {
+        match self {
+            Self::Aac => "aac",
+            Self::Alac => "alac",
+            Self::Vorbis => "libvorbis",
+        }
+    }
+
+    const fn muxer(self) -> &'static str {
+        match self {
+            Self::Aac | Self::Alac => "ipod",
+            Self::Vorbis => "ogg",
+        }
+    }
+}
+
+static AAC_PREFLIGHT: OnceLock<Result<(), String>> = OnceLock::new();
+static ALAC_PREFLIGHT: OnceLock<Result<(), String>> = OnceLock::new();
+static VORBIS_PREFLIGHT: OnceLock<Result<(), String>> = OnceLock::new();
+
+/// Verify the exact encoder and muxer required by one FFmpeg-backed format.
+/// Results are cached per process after the first successful or failed probe.
+pub fn preflight_ffmpeg(codec: FfmpegCodec) -> Result<(), String> {
+    let slot = match codec {
+        FfmpegCodec::Aac => &AAC_PREFLIGHT,
+        FfmpegCodec::Alac => &ALAC_PREFLIGHT,
+        FfmpegCodec::Vorbis => &VORBIS_PREFLIGHT,
+    };
+    slot.get_or_init(|| run_ffmpeg_preflight(codec)).clone()
+}
+
+fn run_ffmpeg_preflight(codec: FfmpegCodec) -> Result<(), String> {
+    let encoders = ffmpeg_capability_output("-encoders", codec)?;
+    if !listed_ffmpeg_component(&encoders, codec.encoder(), CapabilityKind::Encoder) {
+        return Err(format!(
+            "FFmpeg {} output requires the exact `{}` encoder, but this runtime does not provide it",
+            codec.name(),
+            codec.encoder()
+        ));
+    }
+    let muxers = ffmpeg_capability_output("-muxers", codec)?;
+    if !listed_ffmpeg_component(&muxers, codec.muxer(), CapabilityKind::Muxer) {
+        return Err(format!(
+            "FFmpeg {} output requires the exact `{}` muxer, but this runtime does not provide it",
+            codec.name(),
+            codec.muxer()
+        ));
+    }
+    Ok(())
+}
+
+fn ffmpeg_capability_output(argument: &str, codec: FfmpegCodec) -> Result<String, String> {
+    let output = Command::new("ffmpeg")
+        .args(["-hide_banner", argument])
+        .output()
+        .map_err(|error| {
+            format!(
+                "inspect FFmpeg {} capabilities: {error}; install `ffmpeg` or choose another format",
+                codec.name()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "inspect FFmpeg {} capabilities failed with {}: {}",
+            codec.name(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| "FFmpeg capability output is not valid UTF-8".to_string())
+}
+
+#[derive(Clone, Copy)]
+enum CapabilityKind {
+    Encoder,
+    Muxer,
+}
+
+fn listed_ffmpeg_component(output: &str, required: &str, kind: CapabilityKind) -> bool {
+    output.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let Some(flags) = fields.next() else {
+            return false;
+        };
+        let valid_flags = match kind {
+            CapabilityKind::Encoder => flags.len() == 6 && flags.starts_with('A'),
+            CapabilityKind::Muxer => flags.len() <= 2 && flags.contains('E'),
+        };
+        valid_flags
+            && fields
+                .next()
+                .is_some_and(|names| names.split(',').any(|name| name == required))
+    })
 }
 
 impl AacStreamWriter {
@@ -51,6 +147,7 @@ impl AacStreamWriter {
         validate_ffmpeg_sample_rate(codec, sample_rate)?;
         let channel_layout = ffmpeg_channel_layout(codec, channels)?;
         validate_ffmpeg_bitrate(codec, sample_rate, channels, bitrate_kbps)?;
+        preflight_ffmpeg(codec)?;
         let mut command = Command::new("ffmpeg");
         command.args([
             "-hide_banner",
@@ -330,6 +427,62 @@ impl Drop for AacStreamWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capability_parser_requires_exact_audio_encoder_and_muxer_names() {
+        let encoders = "\
+Encoders:\n\
+ V..... aac_video not audio\n\
+ A....D aac AAC encoder\n\
+ A..... libvorbis Vorbis encoder\n";
+        assert!(listed_ffmpeg_component(
+            encoders,
+            "aac",
+            CapabilityKind::Encoder
+        ));
+        assert!(listed_ffmpeg_component(
+            encoders,
+            "libvorbis",
+            CapabilityKind::Encoder
+        ));
+        assert!(!listed_ffmpeg_component(
+            encoders,
+            "vorbis",
+            CapabilityKind::Encoder
+        ));
+        assert!(!listed_ffmpeg_component(
+            encoders,
+            "aac_video",
+            CapabilityKind::Encoder
+        ));
+
+        let muxers = "\
+File formats:\n\
+ D  ipod            demux-only decoy\n\
+  E mov,mp4,m4a     QuickTime family\n\
+  E ipod            iPod H.264 MP4\n\
+ DE ogg             Ogg\n";
+        assert!(listed_ffmpeg_component(
+            muxers,
+            "ipod",
+            CapabilityKind::Muxer
+        ));
+        assert!(listed_ffmpeg_component(
+            muxers,
+            "m4a",
+            CapabilityKind::Muxer
+        ));
+        assert!(listed_ffmpeg_component(
+            muxers,
+            "ogg",
+            CapabilityKind::Muxer
+        ));
+        assert!(!listed_ffmpeg_component(
+            muxers,
+            "ipo",
+            CapabilityKind::Muxer
+        ));
+    }
 
     #[test]
     fn unsafe_m4a_layouts_are_rejected_before_creating_output() {

@@ -48,6 +48,9 @@ forge --analyze input.wav --json
 
 # Use the fixed-order reference meter and record its engine ID
 forge --analyze input.wav --analysis-engine reference --json
+
+# Select the second audio track in a multi-track container
+forge --analyze programme.m4a --audio-track 1 --json
 ```
 
 Run `forge --help` for the complete option list.
@@ -80,7 +83,9 @@ Run `forge --help` for the complete option list.
 
 Release archives include Opus support and the FFmpeg adapter. AAC-LC, ALAC,
 and Vorbis output still require `ffmpeg` on `PATH`. Output otherwise follows
-the input format when an encoder is available, or falls back to WAV.
+the content-probed input codec when a compatible encoder is available, or
+falls back to WAV. Forge checks the exact FFmpeg encoder and muxer before it
+creates an output; lossless ALAC input therefore never defaults to lossy AAC.
 
 ## Optional source features
 

@@ -6,6 +6,9 @@
 //! measurement-domain request produced those values.
 
 use crate::analysis::Analysis;
+use crate::decoder::{
+    ChannelLayoutProvenance, InputDescriptor, InputDescriptorOptions, SourceFrameRange,
+};
 use crate::dsp::resample::ResampleQuality;
 use crate::normalize::Plan;
 use crate::stable_input::{InputContentBinding, StableInput};
@@ -15,7 +18,7 @@ use std::error::Error;
 use std::fmt;
 
 /// Version of the in-process bound-analysis contract.
-pub const BOUND_ANALYSIS_VERSION: u32 = 1;
+pub const BOUND_ANALYSIS_VERSION: u32 = 2;
 
 /// Revision of the measurement implementation represented by bound results.
 pub const MEASUREMENT_ALGORITHM_REVISION: &str = "forge-bs1770-5-r4";
@@ -82,6 +85,8 @@ impl Error for BoundAnalysisError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OutputDomainRequest {
     decoder_route: String,
+    source_range: SourceFrameRange,
+    declared_layout_provenance: ChannelLayoutProvenance,
     effective_roles: Vec<ChannelRole>,
     explicit_roles: bool,
     output_sample_rate: Option<u32>,
@@ -108,6 +113,20 @@ impl BoundAnalysis {
         requested_roles: Option<&[ChannelRole]>,
         plan: &Plan,
     ) -> Result<Self, BoundAnalysisError> {
+        let mut options = InputDescriptorOptions::default();
+        if let Some(roles) = requested_roles {
+            options = options.with_channel_roles(roles.to_vec());
+        }
+        let descriptor = InputDescriptor::probe(input.clone(), options)
+            .map_err(BoundAnalysisError::analysis_failed)?;
+        Self::for_descriptor(&descriptor, analysis, plan)
+    }
+
+    pub(crate) fn for_descriptor(
+        descriptor: &InputDescriptor,
+        analysis: Analysis,
+        plan: &Plan,
+    ) -> Result<Self, BoundAnalysisError> {
         plan.validate()
             .map_err(BoundAnalysisError::invalid_request)?;
         if analysis.channel_roles.len() != usize::from(analysis.channels) {
@@ -115,30 +134,47 @@ impl BoundAnalysis {
                 "analysis channel-role count does not match its channel count",
             ));
         }
-        if requested_roles.is_some_and(|roles| roles != analysis.channel_roles) {
+        if descriptor.stream_info().channel_roles != analysis.channel_roles {
             return Err(BoundAnalysisError::analysis_failed(
-                "effective analysis roles do not match the requested channel roles",
+                "effective analysis roles do not match the input descriptor",
             ));
         }
-        if plan
+        let expected_sample_rate = plan
             .output_sample_rate
-            .is_some_and(|sample_rate| sample_rate != analysis.sample_rate)
-        {
+            .unwrap_or(descriptor.stream_info().sample_rate);
+        if analysis.sample_rate != expected_sample_rate {
             return Err(BoundAnalysisError::analysis_failed(
                 "analysis sample rate does not match the requested output domain",
             ));
         }
+        if analysis.channels != descriptor.stream_info().channels {
+            return Err(BoundAnalysisError::analysis_failed(
+                "analysis channel count does not match the input descriptor",
+            ));
+        }
+        if analysis.kind != descriptor.stream_info().source_kind {
+            return Err(BoundAnalysisError::analysis_failed(
+                "analysis PCM kind does not match the input descriptor",
+            ));
+        }
+        if analysis.frames == 0 {
+            return Err(BoundAnalysisError::analysis_failed(
+                "bound analysis must contain at least one decoded frame",
+            ));
+        }
         let request = OutputDomainRequest {
-            decoder_route: decoder_route_descriptor(input),
+            decoder_route: descriptor.decoder_route_id(),
+            source_range: descriptor.source_range(),
+            declared_layout_provenance: descriptor.declared_layout_provenance(),
             effective_roles: analysis.channel_roles.clone(),
-            explicit_roles: requested_roles.is_some(),
+            explicit_roles: descriptor.uses_explicit_channel_roles(),
             output_sample_rate: plan.output_sample_rate,
             resample_quality: plan.resample_quality,
         };
         let request_sha256 = request_digest(&request);
         Ok(Self {
             analysis,
-            input_binding: input.binding().clone(),
+            input_binding: descriptor.stable_input().binding().clone(),
             request,
             request_sha256,
             algorithm_revision: MEASUREMENT_ALGORITHM_REVISION,
@@ -181,6 +217,27 @@ impl BoundAnalysis {
         input: &StableInput,
         plan: &Plan,
     ) -> Result<(), BoundAnalysisError> {
+        input.verify_source().map_err(|error| {
+            BoundAnalysisError::new(
+                BoundAnalysisErrorKind::AnalysisRequestMismatch,
+                error.to_string(),
+            )
+        })?;
+        let mut options = InputDescriptorOptions::default();
+        if self.request.explicit_roles {
+            options = options.with_channel_roles(self.request.effective_roles.clone());
+        }
+        let descriptor = InputDescriptor::probe(input.clone(), options).map_err(|error| {
+            BoundAnalysisError::new(BoundAnalysisErrorKind::AnalysisRequestMismatch, error)
+        })?;
+        self.validate_descriptor_for_plan(&descriptor, plan)
+    }
+
+    pub(crate) fn validate_descriptor_for_plan(
+        &self,
+        descriptor: &InputDescriptor,
+        plan: &Plan,
+    ) -> Result<(), BoundAnalysisError> {
         plan.validate()
             .map_err(BoundAnalysisError::invalid_request)?;
         if self.algorithm_revision != MEASUREMENT_ALGORITHM_REVISION {
@@ -189,16 +246,18 @@ impl BoundAnalysis {
                 "bound analysis measurement revision is unsupported",
             ));
         }
-        if self.input_binding != *input.binding() {
+        if self.input_binding != *descriptor.stable_input().binding() {
             return Err(BoundAnalysisError::new(
                 BoundAnalysisErrorKind::InputContentMismatch,
                 "bound analysis does not describe the supplied input bytes",
             ));
         }
         let expected = OutputDomainRequest {
-            decoder_route: decoder_route_descriptor(input),
+            decoder_route: descriptor.decoder_route_id(),
+            source_range: descriptor.source_range(),
+            declared_layout_provenance: descriptor.declared_layout_provenance(),
             effective_roles: self.request.effective_roles.clone(),
-            explicit_roles: self.request.explicit_roles,
+            explicit_roles: descriptor.uses_explicit_channel_roles(),
             output_sample_rate: plan.output_sample_rate,
             resample_quality: plan.resample_quality,
         };
@@ -228,20 +287,23 @@ impl BoundAnalysis {
     }
 }
 
-pub(crate) fn decoder_route_descriptor(input: &StableInput) -> String {
-    let extension = input
-        .source_name_hint()
-        .and_then(|path| path.extension())
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    format!("forge-decoder-v1:first-audio-track:{extension}")
-}
-
 fn request_digest(request: &OutputDomainRequest) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"forge-bound-analysis-request-v1\0output-domain\0");
+    digest.update(b"forge-bound-analysis-request-v2\0output-domain\0");
     update_len_prefixed(&mut digest, request.decoder_route.as_bytes());
+    digest.update(request.source_range.start().to_le_bytes());
+    match request.source_range.frames() {
+        Some(frames) => {
+            digest.update([1]);
+            digest.update(frames.to_le_bytes());
+        }
+        None => digest.update([0]),
+    }
+    digest.update([match request.declared_layout_provenance {
+        ChannelLayoutProvenance::KnownSpeakers => 0,
+        ChannelLayoutProvenance::Unknown => 1,
+        ChannelLayoutProvenance::SceneBased => 2,
+    }]);
     digest.update([u8::from(request.explicit_roles)]);
     digest.update((request.effective_roles.len() as u64).to_le_bytes());
     for role in &request.effective_roles {
@@ -297,7 +359,7 @@ mod tests {
     use crate::dsp::limiter::LimiterConfig;
     use crate::normalize::Mode;
     use crate::stable_input::StableInputOptions;
-    use crate::wav::{PcmKind, WavContainer};
+    use crate::wav::{AudioBuffer, PcmKind, WavContainer, WavWriter};
 
     fn plan() -> Plan {
         Plan {
@@ -337,16 +399,33 @@ mod tests {
         }
     }
 
-    fn input(bytes: &[u8], hint: &str) -> StableInput {
-        let options = StableInputOptions::new(1024)
+    fn input(amplitude: f32, hint: &str) -> StableInput {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fixture.wav");
+        WavWriter::write(
+            &path,
+            &AudioBuffer {
+                sample_rate: 48_000,
+                channels: 1,
+                channel_roles: vec![ChannelRole::Main],
+                frames: 48_000,
+                data: vec![vec![amplitude; 48_000]],
+                source_kind: PcmKind::F32,
+            },
+            PcmKind::F32,
+            false,
+        )
+        .unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let options = StableInputOptions::new(bytes.len() as u64)
             .unwrap()
             .with_source_name_hint(hint);
-        StableInput::from_bytes(bytes, &options).unwrap()
+        StableInput::from_bytes(&bytes, &options).unwrap()
     }
 
     #[test]
     fn validates_matching_content_and_measurement_request() {
-        let input = input(b"one", "track.wav");
+        let input = input(0.1, "track.wav");
         let roles = vec![ChannelRole::Main];
         let bound = BoundAnalysis::for_output_domain(
             &input,
@@ -363,7 +442,7 @@ mod tests {
 
     #[test]
     fn rejects_content_route_rate_and_quality_mismatches() {
-        let original_input = input(b"one", "track.wav");
+        let original_input = input(0.1, "track.wav");
         let roles = vec![ChannelRole::Main];
         let bound = BoundAnalysis::for_output_domain(
             &original_input,
@@ -373,7 +452,7 @@ mod tests {
         )
         .unwrap();
 
-        let changed = input(b"two", "track.wav");
+        let changed = input(0.2, "track.wav");
         assert_eq!(
             bound
                 .validate_for_plan(&changed, &plan())
@@ -381,14 +460,10 @@ mod tests {
                 .kind(),
             BoundAnalysisErrorKind::InputContentMismatch
         );
-        let rerouted = input(b"one", "track.flac");
-        assert_eq!(
-            bound
-                .validate_for_plan(&rerouted, &plan())
-                .unwrap_err()
-                .kind(),
-            BoundAnalysisErrorKind::AnalysisRequestMismatch
-        );
+        let misleading_suffix = input(0.1, "track.flac");
+        bound
+            .validate_for_plan(&misleading_suffix, &plan())
+            .unwrap();
         let mut changed_plan = plan();
         changed_plan.output_sample_rate = Some(48_000);
         assert_eq!(

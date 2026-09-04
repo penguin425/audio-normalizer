@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/remote-materialization-v1",
+  "title": "Forge remote snapshot materialization evidence",
+  "type": "object",
+  "required": [
+    "schema",
+    "requested_uri",
+    "allowed_origins",
+    "final_uri",
+    "redirect_chain",
+    "status",
+    "object_size_bytes",
+    "sha256",
+    "response_headers",
+    "passed"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/remote-materialization-v1"
+    },
+    "requested_uri": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(https://|http://)"
+    },
+    "allowed_origins": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "maxItems": 1024
+    },
+    "final_uri": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(https://|http://)"
+    },
+    "redirect_chain": {
+      "type": "array",
+      "maxItems": 8,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "status": { "const": 200 },
+    "object_size_bytes": { "type": "integer", "minimum": 0 },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "response_headers": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "maxProperties": 16
+    },
+    "passed": { "const": true }
+  },
+  "additionalProperties": false
+}

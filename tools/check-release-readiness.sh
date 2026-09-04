@@ -91,7 +91,12 @@ for file in README.md LICENSE CHANGELOG.md COMPATIBILITY.md SECURITY.md CONTRIBU
   fi
 done
 for file in \
+  ANALYSIS-CACHE.md \
+  CATALOGUE.md \
   EBU-QC-SCENARIO1.md \
+  schema/analysis-cache-v4.schema.json \
+  schema/catalogue-report-v2.schema.json \
+  schema/remote-materialization-v1.schema.json \
   schema/ebu-qc-results-v2.schema.json \
   schema/ebu-qc-catalogue-v2-pins.json \
   schema/ebu-qc-2026-04/README.md \
