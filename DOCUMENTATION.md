@@ -74,6 +74,10 @@ The release contains the main `forge` normalizer plus focused binaries:
 
 Some binaries require the Cargo features listed in [`Cargo.toml`](Cargo.toml).
 Use `<command> --help` for its inputs, limits, output schemas, and exit codes.
+`forge-report ebu-qc-validate` validates EBU QC 2026-04 report structure and
+cross-element semantics; it uses Scenario 1 constraints by default and accepts
+`--profile data-model` for the general rules. The release also contains the
+hash-pinned official XSDs for independent schema validation.
 `forge-sadm-qc` accepts S-ADM XML frame documents in transport order; divided
 chunks with a shared base `frameFormatID` must be adjacent and ordered by chunk
 index. It validates the normative frame paths and version declaration, then

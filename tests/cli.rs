@@ -1,3 +1,4 @@
+use forge_normalizer::ebu_qc_validation::{validate_xml, EbuQcValidationProfile};
 use forge_normalizer::wav::{
     default_channel_roles, AudioBuffer, PcmKind, WavContainer, WavWriter, WaveChunk,
 };
@@ -2130,7 +2131,7 @@ fn ebu_qc_writes_scenario1_2026_04_catalogue_xml() {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    let xml = std::fs::read_to_string(report).unwrap();
+    let xml = std::fs::read_to_string(&report).unwrap();
     assert!(xml.contains("<Report xmlns=\"tag:qc.ebu.ch,2026-04\">"));
     assert!(xml.contains("<EditRate>48000/1</EditRate>"));
     assert!(xml.contains("<EBUQCID>0010B</EBUQCID>"));
@@ -2138,7 +2139,56 @@ fn ebu_qc_writes_scenario1_2026_04_catalogue_xml() {
     assert!(xml.contains("<Name>SilenceThresholdLevel</Name>"));
     assert!(xml.contains("<Name>LoudnessMomentaryOverTime</Name>"));
     assert!(!xml.contains("<Name>Event</Name>"));
+    assert!(!xml.contains("<Name>CheckResult</Name>"));
     assert!(!xml.contains("FORGE-DC-OFFSET"));
+    let summary = validate_xml(xml.as_bytes(), EbuQcValidationProfile::Scenario1).unwrap();
+    assert!(summary.check_item_count > 0);
+    assert!(summary.report_item_count > 0);
+
+    let validation = Command::new(env!("CARGO_BIN_EXE_forge-report"))
+        .args(["ebu-qc-validate", report.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        validation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&validation.stderr)
+    );
+    assert!(String::from_utf8_lossy(&validation.stderr).contains("valid EBU QC 2026-04"));
+
+    let invalid_report = directory.path().join("invalid-ebu-qc.xml");
+    std::fs::write(
+        &invalid_report,
+        xml.replacen(
+            "<Name>LoudnessMomentaryOverTime</Name>",
+            "<Name>CheckResult</Name>",
+            1,
+        ),
+    )
+    .unwrap();
+    let rejected = Command::new(env!("CARGO_BIN_EXE_forge-report"))
+        .args(["ebu-qc-validate", invalid_report.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("prohibits Output/Name=CheckResult"));
+
+    if Command::new("xmllint").arg("--version").output().is_ok() {
+        let schema = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("schema/ebu-qc-2026-04/forge-validation.xsd");
+        let xsd = Command::new("xmllint")
+            .arg("--noout")
+            .arg("--schema")
+            .arg(schema)
+            .arg(&report)
+            .output()
+            .unwrap();
+        assert!(
+            xsd.status.success(),
+            "{}",
+            String::from_utf8_lossy(&xsd.stderr)
+        );
+    }
 }
 
 #[test]

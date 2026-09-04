@@ -63,6 +63,7 @@ pub mod dsp;
 pub mod dts_adapter;
 pub mod ebu_qc_report;
 pub mod ebu_qc_scenario1;
+pub mod ebu_qc_validation;
 mod flac_qc;
 pub mod flacenc;
 pub mod hls_qc;

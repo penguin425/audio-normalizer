@@ -10,6 +10,8 @@ on:
       - "src/anomaly_provider.rs"
       - "src/onnx_provider.rs"
       - "src/remote_range.rs"
+      - "src/ebu_qc_validation.rs"
+      - "schema/ebu-qc-2026-04/**"
       - "src/compare.rs"
       - "src/container_qc.rs"
       - "src/decoder.rs"
@@ -32,6 +34,8 @@ on:
       - "src/anomaly_provider.rs"
       - "src/onnx_provider.rs"
       - "src/remote_range.rs"
+      - "src/ebu_qc_validation.rs"
+      - "schema/ebu-qc-2026-04/**"
       - "src/compare.rs"
       - "src/container_qc.rs"
       - "src/decoder.rs"
@@ -74,6 +78,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for target in wave_reader container_qc adm_profile manifest_compare audio_compare dsd hls_qc dash_qc imf_qc rtp_qc nmos_qc anomaly_provider anomaly_audit onnx_provider remote_range; do
+          mkdir -p fuzz/corpus/ebu_qc_validation
+          cp schema/ebu-qc-2026-04/qc-reports/qc-report-generic-sample.xml \
+            fuzz/corpus/ebu_qc_validation/official-transition.xml
+          for target in wave_reader container_qc adm_profile manifest_compare audio_compare dsd hls_qc dash_qc imf_qc rtp_qc nmos_qc anomaly_provider anomaly_audit onnx_provider remote_range ebu_qc_validation; do
             cargo fuzz run "$target" -- -runs=1000
           done

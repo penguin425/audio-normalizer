@@ -1,5 +1,9 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use forge_normalizer::{output::write_file_atomically, report_tools};
+use forge_normalizer::{
+    ebu_qc_validation::{self, EbuQcValidationProfile},
+    output::write_file_atomically,
+    report_tools,
+};
 use serde_json::Value;
 use std::fs;
 use std::io::{self, Write};
@@ -10,7 +14,7 @@ use std::process::ExitCode;
 #[command(
     name = "forge-report",
     version,
-    about = "Migrate Forge reports and explain failed compliance/QC rules"
+    about = "Migrate and explain Forge reports, or validate EBU QC XML"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -46,6 +50,13 @@ enum Command {
         #[arg(long)]
         overwrite: bool,
     },
+    /// Validate an EBU QC 2026-04 XML report and its cross-element semantics.
+    EbuQcValidate {
+        input: PathBuf,
+        /// Apply the general data-model rules or the stricter Scenario 1 rules.
+        #[arg(long, value_enum, default_value = "scenario-1")]
+        profile: EbuQcProfile,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -58,6 +69,14 @@ enum ExplainFormat {
 enum ExplainScope {
     All,
     Compliance,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum EbuQcProfile {
+    #[value(name = "data-model")]
+    DataModel,
+    #[value(name = "scenario-1")]
+    Scenario1,
 }
 
 fn main() -> ExitCode {
@@ -86,7 +105,29 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             scope,
             overwrite,
         } => explain(&input, output.as_deref(), format, scope, overwrite),
+        Command::EbuQcValidate { input, profile } => validate_ebu_qc(&input, profile),
     }
+}
+
+fn validate_ebu_qc(input: &Path, profile: EbuQcProfile) -> Result<ExitCode, String> {
+    let bytes = read_report(input)?;
+    let profile = match profile {
+        EbuQcProfile::DataModel => EbuQcValidationProfile::DataModel2026_04,
+        EbuQcProfile::Scenario1 => EbuQcValidationProfile::Scenario1,
+    };
+    let summary = ebu_qc_validation::validate_xml(&bytes, profile)?;
+    let edit_rate = summary
+        .timing_edit_rate
+        .map_or_else(|| "none".to_string(), |(n, d)| format!("{n}/{d}"));
+    eprintln!(
+        "forge-report: valid EBU QC 2026-04 report {} ({} items: {} check, {} report; timing {})",
+        summary.report_id,
+        summary.item_count,
+        summary.check_item_count,
+        summary.report_item_count,
+        edit_rate
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn migrate(

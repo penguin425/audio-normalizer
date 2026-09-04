@@ -8,6 +8,28 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.189.7 - 2026-09-04
+
+### Added
+
+- Add bounded EBU QC Data Model 2026-04 semantic validation with optional
+  Scenario 1 constraints, exposed through the Rust API and
+  `forge-report ebu-qc-validate`. Generated generic and Scenario 1 reports are
+  validated before publication.
+- Ship the hash-pinned EBU 2026-04 core, timing-extension, and Catalogue API
+  schemas with their CC BY 4.0 attribution and a combined XSD validation
+  wrapper. Publish and package the EBU report schemas, v2 catalogue pins, and
+  Scenario 1 documentation on every supported platform.
+
+### Fixed
+
+- Stop emitting the obsolete `Output/Name=CheckResult` representation. Keep
+  `CheckResult` only on check-mode ItemResults and omit report/profile results
+  when a generic report contains no checks, matching the 2026-04 data-model
+  semantics.
+- Publish non-JSON schema assets through GitHub Pages so the catalogue pin URL
+  embedded in Scenario 1 reports resolves instead of returning 404.
+
 ## 0.189.6 - 2026-09-04
 
 ### Added

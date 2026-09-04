@@ -7,7 +7,10 @@
 //! replace Forge's generic `Event` vocabulary.
 
 use crate::dsp::lufs::LoudnessTimelinePoint;
-use crate::ebu_qc_report::{EbuQcReportMetadata, EBU_QC_REPORT_NAMESPACE, EBU_QC_TIMING_NAMESPACE};
+use crate::ebu_qc_report::{
+    BoundedXmlBuffer, EbuQcReportMetadata, EBU_QC_REPORT_NAMESPACE, EBU_QC_TIMING_NAMESPACE,
+};
+use crate::ebu_qc_validation::{validate_xml, EbuQcValidationProfile};
 use crate::normalize::Analysis;
 use crate::qc::{QcOptions, QcResult, EBU_QC_CATALOGUE};
 use crate::wav::ChannelRole;
@@ -217,6 +220,33 @@ struct Locator {
 /// interval. The CLI captures a timeline automatically whenever this writer is
 /// requested.
 pub fn write_xml<W: Write>(
+    mut output: W,
+    metadata: &EbuQcReportMetadata,
+    analysis: &Analysis,
+    options: &QcOptions,
+    results: &[QcResult],
+    timeline: &[LoudnessTimelinePoint],
+    timeline_interval_ms: f64,
+) -> Result<(), String> {
+    let mut encoded = BoundedXmlBuffer::new();
+    encode_xml(
+        &mut encoded,
+        metadata,
+        analysis,
+        options,
+        results,
+        timeline,
+        timeline_interval_ms,
+    )?;
+    let encoded = encoded.into_bytes();
+    validate_xml(&encoded, EbuQcValidationProfile::Scenario1)
+        .map_err(|error| format!("validate generated EBU QC Scenario 1 report: {error}"))?;
+    output
+        .write_all(&encoded)
+        .map_err(|error| format!("write EBU QC Scenario 1 XML: {error}"))
+}
+
+fn encode_xml<W: Write>(
     output: W,
     metadata: &EbuQcReportMetadata,
     analysis: &Analysis,
@@ -709,7 +739,7 @@ fn item_outputs(
     let duration = analysis.duration_secs();
     let outputs = match id {
         "0078B" => {
-            let mut values = vec![io("CheckResult", bool_text(result.passed))];
+            let mut values = Vec::new();
             for event in &result.events {
                 values.push(event_io("Channel", event, event.channel.to_string()));
                 if let Some(measured) = event.measured {
@@ -814,7 +844,7 @@ fn item_outputs(
             values
         }
         "0170B" => {
-            let mut values = vec![io("CheckResult", bool_text(result.passed))];
+            let mut values = Vec::new();
             for event in &result.events {
                 values.push(event_io(
                     "CrossTalkLocation",
@@ -825,7 +855,7 @@ fn item_outputs(
             values
         }
         "0230B" => {
-            let mut values = vec![io("CheckResult", bool_text(result.passed))];
+            let mut values = Vec::new();
             for event in &result.events {
                 values.push(event_io("AudioPanningError", event, "true"));
             }
@@ -964,7 +994,7 @@ fn required_output_names(id: &str, used_as: UsedAs) -> Result<&'static [&'static
             "LoudnessShortTermOverTime",
         ],
         ("0084B", UsedAs::Report) => &["AudioPeaksMeasured"],
-        ("0078B", UsedAs::Check) => &["CheckResult"],
+        ("0078B", UsedAs::Check) => &[],
         ("0005B", UsedAs::Check) => &[
             "AudioDigitalClippingDetected",
             "AudioDigitalClippingChannel",
@@ -984,7 +1014,7 @@ fn required_output_names(id: &str, used_as: UsedAs) -> Result<&'static [&'static
         ("0077B", UsedAs::Check) => &["AverageMinimumAudioLevelThresholdReported"],
         ("0088B", UsedAs::Check) => &["AudioHumDetected"],
         ("0086B", UsedAs::Check) => &["AudioNoiseDetected"],
-        ("0170B", UsedAs::Check) | ("0230B", UsedAs::Check) => &["CheckResult"],
+        ("0170B", UsedAs::Check) | ("0230B", UsedAs::Check) => &[],
         ("0095B", UsedAs::Check) => &[
             "LfeAudioChannelAssignment",
             "LfeChannelFrequencyHighReported",

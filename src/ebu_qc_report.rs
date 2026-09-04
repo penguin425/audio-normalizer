@@ -6,7 +6,9 @@
 //! checks are intentionally omitted because they do not resolve to definitions
 //! in the EBU-hosted catalogue. The generic output is not a claim of complete
 //! Scenario 1 Catalogue-vocabulary conformance: item-specific Inputs and
-//! Outputs remain available in Forge's JSON evidence instead.
+//! Outputs remain available in Forge's JSON evidence instead. Event details
+//! carried here use the data model's vendor-specific `-PRIVATE-...` naming
+//! convention and never duplicate the model-level `CheckResult` property.
 
 use crate::normalization_diff;
 use crate::normalize::Analysis;
@@ -15,13 +17,52 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const EBU_QC_REPORT_NAMESPACE: &str = "tag:qc.ebu.ch,2026-04";
 pub const EBU_QC_REPORT_SCHEMA: &str = "https://ebu.github.io/qc/qc-data-model/qc.xsd";
 pub const EBU_QC_TIMING_NAMESPACE: &str = "tag:qc.ebu.ch,2026-04:extensions:timing";
+
+pub(crate) struct BoundedXmlBuffer {
+    bytes: Vec<u8>,
+}
+
+impl BoundedXmlBuffer {
+    pub(crate) fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(64 * 1024),
+        }
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for BoundedXmlBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let total = self.bytes.len().checked_add(bytes.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "EBU QC XML size overflow")
+        })?;
+        if total > crate::ebu_qc_validation::MAX_EBU_QC_XML_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "EBU QC XML exceeds {} bytes",
+                    crate::ebu_qc_validation::MAX_EBU_QC_XML_BYTES
+                ),
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EbuQcReportMetadata {
@@ -63,6 +104,24 @@ impl EbuQcReportMetadata {
 }
 
 pub fn write_xml<W: Write>(
+    mut output: W,
+    metadata: &EbuQcReportMetadata,
+    results: &[QcResult],
+) -> Result<(), String> {
+    let mut encoded = BoundedXmlBuffer::new();
+    encode_xml(&mut encoded, metadata, results)?;
+    let encoded = encoded.into_bytes();
+    crate::ebu_qc_validation::validate_xml(
+        &encoded,
+        crate::ebu_qc_validation::EbuQcValidationProfile::DataModel2026_04,
+    )
+    .map_err(|error| format!("validate generated EBU QC report: {error}"))?;
+    output
+        .write_all(&encoded)
+        .map_err(|error| format!("write EBU QC XML: {error}"))
+}
+
+fn encode_xml<W: Write>(
     output: W,
     metadata: &EbuQcReportMetadata,
     results: &[QcResult],
@@ -79,10 +138,11 @@ pub fn write_xml<W: Write>(
     if items.is_empty() {
         return Err("EBU QC XML requires at least one calculated published EBU QC Item".into());
     }
-    let overall = items
+    let check_items = items
         .iter()
-        .filter(|result| !result.events.is_empty() || !measurement_only(result))
-        .all(|result| result.passed);
+        .filter(|result| !measurement_only(result))
+        .collect::<Vec<_>>();
+    let overall = check_items.iter().all(|result| result.passed);
     let identity_fingerprint = item_identity_fingerprint(&items);
     let result_fingerprint = results_fingerprint(&items);
     let report_id = deterministic_uuid(
@@ -106,7 +166,9 @@ pub fn write_xml<W: Write>(
     xml_event(&mut writer, Event::Start(root))?;
     text_element(&mut writer, "ReportId", &report_id)?;
     text_element(&mut writer, "ExecutionStatus", "complete")?;
-    text_element(&mut writer, "CheckResult", bool_text(overall))?;
+    if !check_items.is_empty() {
+        text_element(&mut writer, "CheckResult", bool_text(overall))?;
+    }
     content_id(&mut writer, &metadata.content_identifier)?;
     text_element(
         &mut writer,
@@ -124,7 +186,9 @@ pub fn write_xml<W: Write>(
     text_element(&mut writer, "ID", &profile_id)?;
     text_element(&mut writer, "Name", "Forge EBU audio QC generic envelope")?;
     content_id(&mut writer, &metadata.content_identifier)?;
-    text_element(&mut writer, "CheckResultRule", "AND")?;
+    if !check_items.is_empty() {
+        text_element(&mut writer, "CheckResultRule", "AND")?;
+    }
     text_element(
         &mut writer,
         "Description",
@@ -158,16 +222,24 @@ pub fn write_xml<W: Write>(
         write_item_identity(&mut writer, result, index, &profile_id)?;
         text_element(&mut writer, "AnalysisMethodUsed", "measurement")?;
         text_element(&mut writer, "ExecutionStatus", "complete")?;
-        text_element(&mut writer, "CheckResult", bool_text(result.passed))?;
+        if !measurement_only(result) {
+            text_element(&mut writer, "CheckResult", bool_text(result.passed))?;
+        }
         text_element(&mut writer, "DetectionMethod", "automatic")?;
         start(&mut writer, "Outputs")?;
-        start(&mut writer, "Output")?;
-        text_element(&mut writer, "Name", "CheckResult")?;
-        text_element(&mut writer, "Value", bool_text(result.passed))?;
-        end(&mut writer, "Output")?;
+        if measurement_only(result) && result.events.is_empty() {
+            start(&mut writer, "Output")?;
+            text_element(
+                &mut writer,
+                "Name",
+                "-PRIVATE-penguin425-Forge-ResultAvailableInJSON",
+            )?;
+            text_element(&mut writer, "Value", "true")?;
+            end(&mut writer, "Output")?;
+        }
         for event in &result.events {
             start(&mut writer, "Output")?;
-            text_element(&mut writer, "Name", "Event")?;
+            text_element(&mut writer, "Name", "-PRIVATE-penguin425-Forge-Event")?;
             start(&mut writer, "Locator")?;
             text_element(
                 &mut writer,
@@ -477,6 +549,7 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ebu_qc_validation::{validate_xml, EbuQcValidationProfile};
     use crate::qc::QcOptions;
     use crate::wav::{AudioBuffer, ChannelRole, PcmKind};
     use quick_xml::events::Event;
@@ -514,6 +587,8 @@ mod tests {
         assert!(text.contains("<TimingExtensionMediaPlaybackEditUnits xmlns=\"tag:qc.ebu.ch,2026-04:extensions:timing\">"));
         assert!(text.contains("<EditRate>48000/1</EditRate>"));
         assert!(!text.contains("FORGE-DC-OFFSET"));
+        assert!(!text.contains("<Name>CheckResult</Name>"));
+        validate_xml(&xml, EbuQcValidationProfile::DataModel2026_04).unwrap();
 
         let mut reader = Reader::from_reader(xml.as_slice());
         let mut item_count = 0;
@@ -551,6 +626,26 @@ mod tests {
             identifier.split('-').nth(2).unwrap().starts_with('8'),
             "custom SHA-256 identifiers use UUIDv8: {identifier}"
         );
+    }
+
+    #[test]
+    fn buffers_are_bounded_and_invalid_reports_are_not_published() {
+        let mut full = BoundedXmlBuffer {
+            bytes: vec![0; crate::ebu_qc_validation::MAX_EBU_QC_XML_BYTES],
+        };
+        assert!(full.write_all(b"x").is_err());
+
+        let (metadata, mut results) = fixture();
+        results
+            .iter_mut()
+            .find(|result| result.calculated && result.source_url.starts_with(EBU_QC_CATALOGUE))
+            .unwrap()
+            .version = "invalid".into();
+        let mut output = Vec::new();
+        assert!(write_xml(&mut output, &metadata, &results)
+            .unwrap_err()
+            .contains("validate generated EBU QC report"));
+        assert!(output.is_empty());
     }
 
     #[test]

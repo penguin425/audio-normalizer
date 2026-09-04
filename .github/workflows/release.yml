@@ -30,6 +30,15 @@ on:
       - "wasm/**"
       - "src/c_api.rs"
       - "src/lib.rs"
+      - "src/ebu_qc_report.rs"
+      - "src/ebu_qc_scenario1.rs"
+      - "src/ebu_qc_validation.rs"
+      - "EBU-QC-SCENARIO1.md"
+      - "schema/ebu-qc-results-v2.schema.json"
+      - "schema/ebu-qc-catalogue-v2-pins.json"
+      - "schema/ebu-qc-2026-04/**"
+      - "tests/cli.rs"
+      - "fuzz/fuzz_targets/ebu_qc_validation.rs"
       - "src/bin/forge-doctor.rs"
       - "tests/doctor_cli.rs"
       - "schema/doctor-report-v1.schema.json"
@@ -498,7 +507,10 @@ jobs:
              schema/service-analysis-v2.schema.json \
              schema/service-error-v1.schema.json \
              schema/service-health-v1.schema.json "$staging/schema/"
-          cp README.md CHANGELOG.md COMPATIBILITY.md CONTRIBUTING.md SECURITY.md DOCUMENTATION.md PERFORMANCE.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md MPEGH-ADAPTER.md DTS-ADAPTER.md ADM-PRESENTATION-QC.md ADM-INTERACTIVITY-QC.md ADM-SEMANTICS-QC.md ANOMALY-ADAPTER.md SERVICE-METRICS.md C-API.md HOST-ADAPTERS.md VST3-ADAPTER.md AU-ADAPTER.md IMMERSIVE-DOWNMIX.md BINAURAL-QC.md REMEDIATION.md METADATA-REPAIR.md NEXT-GENERATION-PLAN.md ROADMAP.md LICENSE "$staging/"
+          cp schema/ebu-qc-results-v2.schema.json \
+             schema/ebu-qc-catalogue-v2-pins.json "$staging/schema/"
+          cp -R schema/ebu-qc-2026-04 "$staging/schema/"
+          cp README.md CHANGELOG.md COMPATIBILITY.md CONTRIBUTING.md SECURITY.md DOCUMENTATION.md PERFORMANCE.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md MPEGH-ADAPTER.md DTS-ADAPTER.md ADM-PRESENTATION-QC.md ADM-INTERACTIVITY-QC.md ADM-SEMANTICS-QC.md ANOMALY-ADAPTER.md SERVICE-METRICS.md C-API.md HOST-ADAPTERS.md VST3-ADAPTER.md AU-ADAPTER.md IMMERSIVE-DOWNMIX.md BINAURAL-QC.md REMEDIATION.md METADATA-REPAIR.md EBU-QC-SCENARIO1.md NEXT-GENERATION-PLAN.md ROADMAP.md LICENSE "$staging/"
           tar -czf "${staging}.tar.gz" "$staging"
 
       - name: Package Windows binary
@@ -543,7 +555,9 @@ jobs:
           Copy-Item "schema/remediation-request-v1.schema.json","schema/remediation-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/metadata-repair-request-v1.schema.json","schema/metadata-repair-report-v1.schema.json","schema/metadata-repair-request-v2.schema.json","schema/metadata-repair-report-v2.schema.json" "$staging/schema/"
           Copy-Item "schema/audio-anomaly-provider-v1.schema.json","schema/anomaly-provider-audit-v1.schema.json","schema/model-qc-v1.schema.json","schema/onnx-anomaly-model-v1.schema.json","schema/onnx-feature-frames-v1.schema.json","schema/remote-range-v1.schema.json","schema/remote-qc-v1.schema.json","schema/service-analysis-v1.schema.json","schema/service-analysis-v2.schema.json","schema/service-error-v1.schema.json","schema/service-health-v1.schema.json" "$staging/schema/"
-          Copy-Item "README.md","CHANGELOG.md","COMPATIBILITY.md","CONTRIBUTING.md","SECURITY.md","DOCUMENTATION.md","PERFORMANCE.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","MULTI-DELIVERY.md","SEGMENT-NORMALIZATION.md","AC4-ADAPTER.md","MPEGH-ADAPTER.md","DTS-ADAPTER.md","ADM-PRESENTATION-QC.md","ADM-INTERACTIVITY-QC.md","ADM-SEMANTICS-QC.md","ANOMALY-ADAPTER.md","SERVICE-METRICS.md","C-API.md","HOST-ADAPTERS.md","VST3-ADAPTER.md","AU-ADAPTER.md","IMMERSIVE-DOWNMIX.md","BINAURAL-QC.md","REMEDIATION.md","METADATA-REPAIR.md","NEXT-GENERATION-PLAN.md","ROADMAP.md","LICENSE" $staging
+          Copy-Item "schema/ebu-qc-results-v2.schema.json","schema/ebu-qc-catalogue-v2-pins.json" "$staging/schema/"
+          Copy-Item schema/ebu-qc-2026-04 "$staging/schema/" -Recurse
+          Copy-Item "README.md","CHANGELOG.md","COMPATIBILITY.md","CONTRIBUTING.md","SECURITY.md","DOCUMENTATION.md","PERFORMANCE.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","MULTI-DELIVERY.md","SEGMENT-NORMALIZATION.md","AC4-ADAPTER.md","MPEGH-ADAPTER.md","DTS-ADAPTER.md","ADM-PRESENTATION-QC.md","ADM-INTERACTIVITY-QC.md","ADM-SEMANTICS-QC.md","ANOMALY-ADAPTER.md","SERVICE-METRICS.md","C-API.md","HOST-ADAPTERS.md","VST3-ADAPTER.md","AU-ADAPTER.md","IMMERSIVE-DOWNMIX.md","BINAURAL-QC.md","REMEDIATION.md","METADATA-REPAIR.md","EBU-QC-SCENARIO1.md","NEXT-GENERATION-PLAN.md","ROADMAP.md","LICENSE" $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
 
       - name: Upload packaged binary
