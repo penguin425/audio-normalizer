@@ -62,8 +62,8 @@ pub(crate) fn decode_planar_into(
 
 /// Decode signed 24-bit little-endian PCM into exact `i32` sample codes.
 ///
-/// This lane is reserved for measurement paths that must not round source
-/// values through normalized `f32` before applying the K-weighting filters.
+/// This test oracle verifies that the production f32 decoder preserves every
+/// inspected integer code across its exact power-of-two normalization.
 #[cfg(test)]
 pub(crate) fn decode_s24_planar_into(bytes: &[u8], channels: usize, output: &mut Vec<Vec<i32>>) {
     decode_i32_codes_planar_into(bytes, PcmKind::S24, channels, output);

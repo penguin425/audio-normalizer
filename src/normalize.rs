@@ -6097,8 +6097,8 @@ impl LosslessAnalysisBuilder {
             // Every signed 24-bit code is exactly representable as f32, and
             // division by 2^23 is an exact exponent adjustment. Keep generated
             // S24 output on the paired K-weighting/True Peak fast path without
-            // losing any source-sample information. Native S24 input analysis
-            // remains on the descriptor's high-precision typed ingress.
+            // losing source-sample information; descriptor-based redecoding
+            // uses the same representation and remains bit-identical.
             PcmKind::U8 | PcmKind::S16 | PcmKind::S24 | PcmKind::F32 => {
                 convert::decode_planar_into(
                     interleaved,
