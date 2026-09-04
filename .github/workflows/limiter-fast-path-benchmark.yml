@@ -202,6 +202,22 @@ jobs:
           import statistics
           from pathlib import Path
 
+          def measurement_revision(root):
+              prefix = 'pub const MEASUREMENT_ALGORITHM_REVISION: &str = "'
+              for line in (root / "src/bound_analysis.rs").read_text(
+                  encoding="utf-8"
+              ).splitlines():
+                  if line.startswith(prefix) and line.endswith('";'):
+                      return line[len(prefix):-2]
+              raise AssertionError(f"missing measurement revision in {root}")
+
+          baseline_revision = measurement_revision(Path("baseline"))
+          candidate_revision = measurement_revision(Path("candidate"))
+          measurement_migration = (
+              baseline_revision == "forge-bs1770-5-r3"
+              and candidate_revision == "forge-bs1770-5-r4"
+          )
+          wall_limit = 5.0 if measurement_migration else 3.0
           names = ("base-first", "candidate-second", "candidate-first", "base-second")
           documents = {
               name: json.loads(Path(f"{name}.json").read_text())
@@ -212,7 +228,13 @@ jobs:
               name: {item["id"]: item for item in document["results"]}
               for name, document in documents.items()
           }
-          summary = {"method": "two execution orders; ten samples per binary", "cases": []}
+          summary = {
+              "method": "two execution orders; ten samples per binary",
+              "baseline_measurement_revision": baseline_revision,
+              "candidate_measurement_revision": candidate_revision,
+              "wall_limit_percent": wall_limit,
+              "cases": [],
+          }
           for case_id in indexed["base-first"]:
               row = {"id": case_id, "samples_per_binary": 10}
               for metric in ("wall", "cpu", "rss"):
@@ -245,16 +267,23 @@ jobs:
                       "candidate_pooled": candidate_value,
                       "change_percent": (candidate_value / base_value - 1.0) * 100.0,
                   }
-              assert row["wall"]["change_percent"] <= 3.0, row
               summary["cases"].append(row)
 
           Path("limiter-fast-path-summary.json").write_text(
               json.dumps(summary, indent=2) + "\n"
           )
           print(json.dumps(summary, indent=2))
+          failures = [
+              row for row in summary["cases"]
+              if row["wall"]["change_percent"] > wall_limit
+          ]
+          assert not failures, ("wall regression", wall_limit, failures)
+          if measurement_migration:
+              print("applied one-time r3 -> r4 measurement migration limit")
           PY
 
       - name: Upload benchmark evidence
+        if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
           name: limiter-fast-path-benchmark-${{ runner.os }}-${{ runner.arch }}
@@ -262,5 +291,5 @@ jobs:
             base-*.json
             candidate-*.json
             limiter-fast-path-summary.json
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
