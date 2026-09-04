@@ -87,7 +87,10 @@ cp schema/performance-benchmark-v1.schema.json "$staging/schema/"
 cp schema/doctor-report-v1.schema.json "$staging/schema/"
 cp schema/analysis-cache-v1.schema.json \
    schema/analysis-cache-v2.schema.json \
-   schema/analysis-cache-v3.schema.json "$staging/schema/"
+   schema/analysis-cache-v3.schema.json \
+   schema/analysis-cache-v4.schema.json \
+   schema/catalogue-report-v1.schema.json \
+   schema/catalogue-report-v2.schema.json "$staging/schema/"
 cp schema/batch-job-v1.schema.json \
    schema/batch-job-v2.schema.json \
    schema/batch-progress-v1.schema.json \
@@ -131,6 +134,7 @@ cp schema/audio-anomaly-provider-v1.schema.json \
    schema/onnx-anomaly-model-v1.schema.json \
    schema/onnx-feature-frames-v1.schema.json \
    schema/remote-range-v1.schema.json \
+   schema/remote-materialization-v1.schema.json \
    schema/remote-qc-v1.schema.json \
    schema/service-analysis-v1.schema.json \
    schema/service-analysis-v2.schema.json \

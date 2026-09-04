@@ -8,11 +8,12 @@
 //! have. All paths produce the same planar-f32 [`AudioBuffer`] the DSP engine
 //! consumes.
 
+use crate::stable_input::{StableInput, StableInputOptions};
 pub use crate::wav::ChannelLayoutProvenance;
 use crate::wav::{default_channel_roles, AudioBuffer, ChannelRole, PcmKind, WavReader};
 pub(crate) use crate::wav::{MAX_DECODE_SAMPLE_RATE_HZ, MIN_DECODE_SAMPLE_RATE_HZ};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 const MONO_WAV_STREAM_CHUNK_BYTES: usize = 64 * 1024;
@@ -190,6 +191,625 @@ pub struct StreamInfo {
     pub channels: u16,
     pub channel_roles: Vec<ChannelRole>,
     pub source_kind: PcmKind,
+}
+
+/// Version of the content-, track-, range-, and layout-bound input contract.
+pub const INPUT_DESCRIPTOR_VERSION: u32 = 1;
+
+/// Container identified from the retained bytes, never just a file suffix.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioContainer {
+    Wave,
+    Flac,
+    Ogg,
+    IsoBmff,
+    Matroska,
+    MpegAudio,
+    Adts,
+    Dsf,
+    Dsdiff,
+}
+
+impl AudioContainer {
+    /// Stable lower-case identity used by cache and catalogue bindings.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Wave => "wave",
+            Self::Flac => "flac",
+            Self::Ogg => "ogg",
+            Self::IsoBmff => "isobmff",
+            Self::Matroska => "matroska",
+            Self::MpegAudio => "mpeg-audio",
+            Self::Adts => "adts",
+            Self::Dsf => "dsf",
+            Self::Dsdiff => "dsdiff",
+        }
+    }
+}
+
+/// Codec selected from the actual container track.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioCodec {
+    Pcm(PcmKind),
+    Dsd,
+    Flac,
+    Mp1,
+    Mp2,
+    Mp3,
+    Aac,
+    Alac,
+    Vorbis,
+    Opus,
+}
+
+impl AudioCodec {
+    /// Stable lower-case identity used by cache and catalogue bindings.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Pcm(PcmKind::U8) => "pcm-u8",
+            Self::Pcm(PcmKind::S16) => "pcm-s16le",
+            Self::Pcm(PcmKind::S24) => "pcm-s24le",
+            Self::Pcm(PcmKind::S32) => "pcm-s32le",
+            Self::Pcm(PcmKind::F32) => "pcm-f32le",
+            Self::Pcm(PcmKind::F64) => "pcm-f64le",
+            Self::Dsd => "dsd",
+            Self::Flac => "flac",
+            Self::Mp1 => "mp1",
+            Self::Mp2 => "mp2",
+            Self::Mp3 => "mp3",
+            Self::Aac => "aac",
+            Self::Alac => "alac",
+            Self::Vorbis => "vorbis",
+            Self::Opus => "opus",
+        }
+    }
+
+    /// Whether the codec carries lossless or uncompressed source essence.
+    pub const fn is_lossless(self) -> bool {
+        matches!(self, Self::Pcm(_) | Self::Dsd | Self::Flac | Self::Alac)
+    }
+}
+
+/// Deterministic audio-track selection within a probed container.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AudioTrackSelection {
+    /// Select the container's declared default audio track.
+    #[default]
+    Default,
+    /// Select the zero-based index among audio tracks only.
+    Index(u32),
+    /// Select the container's exact track identifier.
+    Id(u32),
+}
+
+/// Lightweight content-probed identity used for safe output defaults before
+/// an immutable [`InputDescriptor`] is captured for processing.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioProgramIdentity {
+    pub container: AudioContainer,
+    pub codec: AudioCodec,
+    pub track_index: u32,
+    pub track_id: u32,
+}
+
+/// Identify a selected audio programme from container bytes, treating the file
+/// name only as a non-binding probe hint.
+pub fn probe_audio_program(
+    path: &Path,
+    selection: AudioTrackSelection,
+) -> Result<AudioProgramIdentity, String> {
+    let route = sniff_decoder_route(path)?;
+    let (container, codec, track_index, track_id) = registry_identity_at(
+        path,
+        Some(path),
+        &path.display().to_string(),
+        route,
+        selection,
+    )?;
+    Ok(AudioProgramIdentity {
+        container,
+        codec,
+        track_index,
+        track_id,
+    })
+}
+
+/// Requested decoded-frame interval selected for analysis and QC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceFrameRange {
+    start: u64,
+    frames: Option<u64>,
+}
+
+impl SourceFrameRange {
+    pub const fn start(self) -> u64 {
+        self.start
+    }
+
+    pub const fn frames(self) -> Option<u64> {
+        self.frames
+    }
+
+    pub const fn is_complete(self) -> bool {
+        self.start == 0 && self.frames.is_none()
+    }
+}
+
+/// Options whose complete effective value becomes part of an [`InputDescriptor`].
+#[derive(Debug, Clone)]
+pub struct InputDescriptorOptions {
+    track: AudioTrackSelection,
+    start_seconds: f64,
+    duration_seconds: Option<f64>,
+    channel_roles: Option<Vec<ChannelRole>>,
+}
+
+impl Default for InputDescriptorOptions {
+    fn default() -> Self {
+        Self {
+            track: AudioTrackSelection::Default,
+            start_seconds: 0.0,
+            duration_seconds: None,
+            channel_roles: None,
+        }
+    }
+}
+
+impl InputDescriptorOptions {
+    pub fn with_track(mut self, track: AudioTrackSelection) -> Self {
+        self.track = track;
+        self
+    }
+
+    pub fn with_time_range(mut self, start_seconds: f64, duration_seconds: Option<f64>) -> Self {
+        self.start_seconds = start_seconds;
+        self.duration_seconds = duration_seconds;
+        self
+    }
+
+    pub fn with_channel_roles(mut self, channel_roles: Vec<ChannelRole>) -> Self {
+        self.channel_roles = Some(channel_roles);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecoderRoute {
+    Wave,
+    Dsf,
+    Dsdiff,
+    Opus,
+    Symphonia,
+}
+
+/// Immutable input bytes plus their selected codec, track, range, and layout.
+///
+/// A descriptor is probed from a [`StableInput`], so every later decode pass
+/// reopens only the private immutable snapshot. Its file-name suffix is a probe
+/// hint and never part of the selected route or cache identity.
+#[derive(Clone)]
+pub struct InputDescriptor {
+    input: StableInput,
+    route: DecoderRoute,
+    container: AudioContainer,
+    codec: AudioCodec,
+    track_selection: AudioTrackSelection,
+    track_index: u32,
+    track_id: u32,
+    info: StreamInfo,
+    declared_frames: Option<u64>,
+    declared_layout_provenance: ChannelLayoutProvenance,
+    explicit_channel_roles: bool,
+    range: SourceFrameRange,
+}
+
+impl std::fmt::Debug for InputDescriptor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InputDescriptor")
+            .field("binding", self.input.binding())
+            .field("container", &self.container)
+            .field("codec", &self.codec)
+            .field("track_selection", &self.track_selection)
+            .field("track_index", &self.track_index)
+            .field("track_id", &self.track_id)
+            .field("info", &self.info)
+            .field("declared_frames", &self.declared_frames)
+            .field(
+                "declared_layout_provenance",
+                &self.declared_layout_provenance,
+            )
+            .field("explicit_channel_roles", &self.explicit_channel_roles)
+            .field("range", &self.range)
+            .finish()
+    }
+}
+
+impl InputDescriptor {
+    /// Probe one immutable input and bind the exact selected programme.
+    pub fn probe(input: StableInput, options: InputDescriptorOptions) -> Result<Self, String> {
+        validate_descriptor_options(&options)?;
+        let probed = probe_registry(&input, options.track)?;
+        if let Some(roles) = options.channel_roles.as_ref() {
+            if roles.len() != usize::from(probed.info.channels) {
+                return Err(format!(
+                    "explicit channel layout has {} channels but selected track has {}",
+                    roles.len(),
+                    probed.info.channels
+                ));
+            }
+        }
+        let range = source_frame_range(
+            probed.info.sample_rate,
+            options.start_seconds,
+            options.duration_seconds,
+        )?;
+        let explicit_channel_roles = options.channel_roles.is_some();
+        let mut info = probed.info;
+        if let Some(roles) = options.channel_roles {
+            info.channel_roles = roles;
+        }
+        input.verify_source().map_err(|error| error.to_string())?;
+        Ok(Self {
+            input,
+            route: probed.route,
+            container: probed.container,
+            codec: probed.codec,
+            track_selection: options.track,
+            track_index: probed.track_index,
+            track_id: probed.track_id,
+            info,
+            declared_frames: probed.declared_frames,
+            declared_layout_provenance: probed.layout_provenance,
+            explicit_channel_roles,
+            range,
+        })
+    }
+
+    /// Capture and probe a path using one bounded private snapshot.
+    pub fn from_path(
+        path: &Path,
+        stable_options: &StableInputOptions,
+        descriptor_options: InputDescriptorOptions,
+    ) -> Result<Self, String> {
+        let input =
+            StableInput::from_path(path, stable_options).map_err(|error| error.to_string())?;
+        Self::probe(input, descriptor_options)
+    }
+
+    pub const fn version(&self) -> u32 {
+        INPUT_DESCRIPTOR_VERSION
+    }
+
+    pub fn stable_input(&self) -> &StableInput {
+        &self.input
+    }
+
+    pub const fn container(&self) -> AudioContainer {
+        self.container
+    }
+
+    pub const fn codec(&self) -> AudioCodec {
+        self.codec
+    }
+
+    pub const fn track_index(&self) -> u32 {
+        self.track_index
+    }
+
+    pub const fn track_id(&self) -> u32 {
+        self.track_id
+    }
+
+    pub fn stream_info(&self) -> &StreamInfo {
+        &self.info
+    }
+
+    pub const fn declared_frames(&self) -> Option<u64> {
+        self.declared_frames
+    }
+
+    pub const fn declared_layout_provenance(&self) -> ChannelLayoutProvenance {
+        self.declared_layout_provenance
+    }
+
+    pub const fn uses_explicit_channel_roles(&self) -> bool {
+        self.explicit_channel_roles
+    }
+
+    pub const fn source_range(&self) -> SourceFrameRange {
+        self.range
+    }
+
+    pub fn decoder_route_id(&self) -> String {
+        format!(
+            "forge-input-descriptor-v1:{}:{}:audio-index={}:track-id={}",
+            self.container.id(),
+            self.codec.id(),
+            self.track_index,
+            self.track_id
+        )
+    }
+}
+
+struct RegistryProbe {
+    route: DecoderRoute,
+    container: AudioContainer,
+    codec: AudioCodec,
+    track_index: u32,
+    track_id: u32,
+    info: StreamInfo,
+    declared_frames: Option<u64>,
+    layout_provenance: ChannelLayoutProvenance,
+}
+
+fn validate_descriptor_options(options: &InputDescriptorOptions) -> Result<(), String> {
+    if !options.start_seconds.is_finite() || options.start_seconds < 0.0 {
+        return Err("input descriptor start must be finite and non-negative".into());
+    }
+    if options
+        .duration_seconds
+        .is_some_and(|duration| !duration.is_finite() || duration <= 0.0)
+    {
+        return Err("input descriptor duration must be finite and positive".into());
+    }
+    if options
+        .channel_roles
+        .as_ref()
+        .is_some_and(|roles| roles.is_empty() || roles.len() > usize::from(u16::MAX))
+    {
+        return Err("input descriptor channel layout must contain 1..=65535 roles".into());
+    }
+    Ok(())
+}
+
+fn source_frame_range(
+    sample_rate: u32,
+    start_seconds: f64,
+    duration_seconds: Option<f64>,
+) -> Result<SourceFrameRange, String> {
+    let frames = |name: &str, seconds: f64| {
+        let value = seconds * f64::from(sample_rate);
+        if !value.is_finite() || value.round() > u64::MAX as f64 {
+            return Err(format!(
+                "input descriptor {name} exceeds the decoded-frame domain"
+            ));
+        }
+        Ok(value.round() as u64)
+    };
+    let start = frames("start", start_seconds)?;
+    let frames = duration_seconds
+        .map(|duration| frames("duration", duration))
+        .transpose()?;
+    if duration_seconds.is_some() && frames == Some(0) {
+        return Err("input descriptor duration rounds to zero decoded frames".into());
+    }
+    if let Some(length) = frames {
+        start
+            .checked_add(length)
+            .ok_or_else(|| "input descriptor frame range overflows u64".to_string())?;
+    }
+    Ok(SourceFrameRange { start, frames })
+}
+
+fn probe_registry(
+    input: &StableInput,
+    selection: AudioTrackSelection,
+) -> Result<RegistryProbe, String> {
+    let path = input.stable_path();
+    let route = sniff_decoder_route(path)?;
+    let display = display_input(input);
+    let (container, codec, track_index, track_id) =
+        registry_identity_at(path, input.source_name_hint(), &display, route, selection)?;
+
+    const PROBE_COMPLETE: &str = "__forge_input_descriptor_probe_complete__";
+    let mut captured = None;
+    let decoded = decode_stream_raw_with_selection(
+        path,
+        route,
+        selection,
+        None,
+        |info, provenance, declared_frames, _| {
+            captured = Some((info.clone(), provenance, declared_frames));
+            Err(PROBE_COMPLETE.into())
+        },
+    );
+    match decoded {
+        Err(error) if error == PROBE_COMPLETE => {}
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
+    let (info, layout_provenance, declared_frames) = captured.ok_or_else(|| {
+        format!(
+            "{}: selected audio track decoded no frames",
+            display_input(input)
+        )
+    })?;
+    Ok(RegistryProbe {
+        route,
+        container,
+        codec,
+        track_index,
+        track_id,
+        info,
+        declared_frames,
+        layout_provenance,
+    })
+}
+
+fn registry_identity_at(
+    path: &Path,
+    hint_path: Option<&Path>,
+    display: &str,
+    route: DecoderRoute,
+    selection: AudioTrackSelection,
+) -> Result<(AudioContainer, AudioCodec, u32, u32), String> {
+    match route {
+        DecoderRoute::Wave => {
+            require_single_track(selection)?;
+            let wav = WavReader::probe_with_layout(path)
+                .map_err(|error| format!("{display}: {error}"))?
+                .0;
+            Ok((AudioContainer::Wave, AudioCodec::Pcm(wav.kind), 0, 0))
+        }
+        DecoderRoute::Dsf => {
+            require_single_track(selection)?;
+            Ok((AudioContainer::Dsf, AudioCodec::Dsd, 0, 0))
+        }
+        DecoderRoute::Dsdiff => {
+            require_single_track(selection)?;
+            Ok((AudioContainer::Dsdiff, AudioCodec::Dsd, 0, 0))
+        }
+        DecoderRoute::Opus => {
+            require_single_track(selection)?;
+            Ok((AudioContainer::Ogg, AudioCodec::Opus, 0, 0))
+        }
+        DecoderRoute::Symphonia => probe_symphonia_identity_at(path, hint_path, display, selection),
+    }
+}
+
+fn display_input(input: &StableInput) -> String {
+    input
+        .source_name_hint()
+        .unwrap_or_else(|| input.stable_path())
+        .display()
+        .to_string()
+}
+
+fn require_single_track(selection: AudioTrackSelection) -> Result<(), String> {
+    match selection {
+        AudioTrackSelection::Default
+        | AudioTrackSelection::Index(0)
+        | AudioTrackSelection::Id(0) => Ok(()),
+        AudioTrackSelection::Index(index) => Err(format!(
+            "audio track index {index} is unavailable; this container has one audio track"
+        )),
+        AudioTrackSelection::Id(id) => Err(format!(
+            "audio track ID {id} is unavailable; this container uses track ID 0"
+        )),
+    }
+}
+
+fn sniff_decoder_route(path: &Path) -> Result<DecoderRoute, String> {
+    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut prefix = [0_u8; 16];
+    let length = file
+        .read(&mut prefix)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let prefix = &prefix[..length];
+    if prefix.len() >= 12
+        && matches!(&prefix[..4], b"RIFF" | b"RF64" | b"BW64")
+        && &prefix[8..12] == b"WAVE"
+    {
+        return Ok(DecoderRoute::Wave);
+    }
+    if prefix.starts_with(b"DSD ") {
+        return Ok(DecoderRoute::Dsf);
+    }
+    if prefix.len() >= 16 && &prefix[..4] == b"FRM8" && &prefix[12..16] == b"DSD " {
+        return Ok(DecoderRoute::Dsdiff);
+    }
+    if prefix.starts_with(b"OggS") {
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let mut packets = ogg::PacketReader::new(BufReader::new(file));
+        if packets
+            .read_packet()
+            .ok()
+            .flatten()
+            .is_some_and(|packet| packet.data.starts_with(b"OpusHead"))
+        {
+            return Ok(DecoderRoute::Opus);
+        }
+    }
+    Ok(DecoderRoute::Symphonia)
+}
+
+fn probe_symphonia_identity_at(
+    path: &Path,
+    hint_path: Option<&Path>,
+    display: &str,
+    selection: AudioTrackSelection,
+) -> Result<(AudioContainer, AudioCodec, u32, u32), String> {
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::default::get_probe;
+
+    let file = File::open(path).map_err(|error| format!("{display}: {error}"))?;
+    let stream = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
+    let mut hint = Hint::new();
+    if let Some(extension) = hint_path
+        .and_then(Path::extension)
+        .and_then(|extension| extension.to_str())
+    {
+        hint.with_extension(extension);
+    }
+    let format = get_probe()
+        .probe(
+            &hint,
+            stream,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|error| format!("{display}: probe failed: {error}"))?;
+    let container =
+        audio_container_from_symphonia(format.format_info().format).ok_or_else(|| {
+            format!(
+                "{}: container {} is not registered for normalization",
+                display,
+                format.format_info().short_name
+            )
+        })?;
+    let (track, track_index) =
+        select_symphonia_audio_track_with_selection(path, format.as_ref(), selection)?;
+    let codec = audio_codec_from_symphonia(track.codec_params.codec)
+        .ok_or_else(|| format!("{}: selected audio codec is not registered", display))?;
+    Ok((container, codec, track_index, track.id))
+}
+
+fn audio_container_from_symphonia(
+    format: symphonia::core::formats::FormatId,
+) -> Option<AudioContainer> {
+    use symphonia::core::formats::well_known::*;
+    Some(match format {
+        FORMAT_ID_FLAC => AudioContainer::Flac,
+        FORMAT_ID_OGG => AudioContainer::Ogg,
+        FORMAT_ID_ISOMP4 => AudioContainer::IsoBmff,
+        FORMAT_ID_MKV => AudioContainer::Matroska,
+        FORMAT_ID_MP1 | FORMAT_ID_MP2 | FORMAT_ID_MP3 => AudioContainer::MpegAudio,
+        FORMAT_ID_ADTS => AudioContainer::Adts,
+        FORMAT_ID_WAVE => AudioContainer::Wave,
+        _ => return None,
+    })
+}
+
+fn audio_codec_from_symphonia(
+    codec: symphonia::core::codecs::audio::AudioCodecId,
+) -> Option<AudioCodec> {
+    use symphonia::core::codecs::audio::well_known::*;
+    Some(match codec {
+        CODEC_ID_FLAC => AudioCodec::Flac,
+        CODEC_ID_MP1 => AudioCodec::Mp1,
+        CODEC_ID_MP2 => AudioCodec::Mp2,
+        CODEC_ID_MP3 => AudioCodec::Mp3,
+        CODEC_ID_AAC => AudioCodec::Aac,
+        CODEC_ID_ALAC => AudioCodec::Alac,
+        CODEC_ID_VORBIS => AudioCodec::Vorbis,
+        CODEC_ID_OPUS => AudioCodec::Opus,
+        CODEC_ID_PCM_U8 | CODEC_ID_PCM_U8_PLANAR => AudioCodec::Pcm(PcmKind::U8),
+        CODEC_ID_PCM_S16LE | CODEC_ID_PCM_S16LE_PLANAR => AudioCodec::Pcm(PcmKind::S16),
+        CODEC_ID_PCM_S24LE | CODEC_ID_PCM_S24LE_PLANAR => AudioCodec::Pcm(PcmKind::S24),
+        CODEC_ID_PCM_S32LE | CODEC_ID_PCM_S32LE_PLANAR => AudioCodec::Pcm(PcmKind::S32),
+        CODEC_ID_PCM_F32LE | CODEC_ID_PCM_F32LE_PLANAR => AudioCodec::Pcm(PcmKind::F32),
+        CODEC_ID_PCM_F64LE | CODEC_ID_PCM_F64LE_PLANAR => AudioCodec::Pcm(PcmKind::F64),
+        _ => return None,
+    })
 }
 
 /// RFC 9639 section 8.6.2 channel-mask metadata observed for one FLAC stream.
@@ -729,22 +1349,77 @@ fn select_symphonia_audio_track(
     path: &Path,
     format: &dyn symphonia::core::formats::FormatReader,
 ) -> Result<SymphoniaAudioTrack, String> {
+    select_symphonia_audio_track_with_selection(path, format, AudioTrackSelection::Default)
+        .map(|(track, _)| track)
+}
+
+fn select_symphonia_audio_track_with_selection(
+    path: &Path,
+    format: &dyn symphonia::core::formats::FormatReader,
+    selection: AudioTrackSelection,
+) -> Result<(SymphoniaAudioTrack, u32), String> {
     use symphonia::core::formats::TrackType;
 
-    let track = format
-        .default_track(TrackType::Audio)
-        .ok_or_else(|| format!("{}: no audio track", path.display()))?;
+    let audio_tracks = format
+        .tracks()
+        .iter()
+        .filter(|track| track.track_type() == Some(TrackType::Audio))
+        .collect::<Vec<_>>();
+    let (track, index) = match selection {
+        AudioTrackSelection::Default => {
+            let selected = format
+                .default_track(TrackType::Audio)
+                .ok_or_else(|| format!("{}: no audio track", path.display()))?;
+            let index = audio_tracks
+                .iter()
+                .position(|track| track.id == selected.id)
+                .ok_or_else(|| {
+                    format!(
+                        "{}: default audio track is not in the track list",
+                        path.display()
+                    )
+                })?;
+            (selected, index)
+        }
+        AudioTrackSelection::Index(index) => {
+            let index = usize::try_from(index).map_err(|_| {
+                format!(
+                    "{}: audio track index does not fit this platform",
+                    path.display()
+                )
+            })?;
+            let selected = audio_tracks.get(index).copied().ok_or_else(|| {
+                format!(
+                    "{}: audio track index {index} is unavailable; found {} audio track(s)",
+                    path.display(),
+                    audio_tracks.len()
+                )
+            })?;
+            (selected, index)
+        }
+        AudioTrackSelection::Id(id) => {
+            let index = audio_tracks
+                .iter()
+                .position(|track| track.id == id)
+                .ok_or_else(|| format!("{}: audio track ID {id} is unavailable", path.display()))?;
+            (audio_tracks[index], index)
+        }
+    };
     let codec_params = track
         .codec_params
         .as_ref()
         .and_then(|params| params.audio())
         .ok_or_else(|| format!("{}: audio codec parameters are missing", path.display()))?
         .clone();
-    Ok(SymphoniaAudioTrack {
-        id: track.id,
-        num_frames: track.num_frames,
-        codec_params,
-    })
+    Ok((
+        SymphoniaAudioTrack {
+            id: track.id,
+            num_frames: track.num_frames,
+            codec_params,
+        },
+        u32::try_from(index)
+            .map_err(|_| format!("{}: audio track index exceeds u32", path.display()))?,
+    ))
 }
 
 fn symphonia_decoder_options() -> symphonia::core::codecs::audio::AudioDecoderOptions {
@@ -1362,6 +2037,325 @@ where
     decode_stream_with_flac_workers(path, None, consume)
 }
 
+/// Decode exactly the track, frame range, and layout bound by a descriptor.
+pub fn decode_descriptor_stream_with_layout<F>(
+    descriptor: &InputDescriptor,
+    mut consume: F,
+) -> Result<StreamInfo, String>
+where
+    F: FnMut(&StreamInfo, ChannelLayoutProvenance, &mut [Vec<f32>]) -> Result<(), String>,
+{
+    decode_descriptor_stream_with_layout_and_declared_frames(
+        descriptor,
+        |info, provenance, _, planar| consume(info, provenance, planar),
+    )
+}
+
+pub(crate) fn decode_descriptor_stream_with_layout_and_declared_frames<F>(
+    descriptor: &InputDescriptor,
+    mut consume: F,
+) -> Result<StreamInfo, String>
+where
+    F: FnMut(
+        &StreamInfo,
+        ChannelLayoutProvenance,
+        Option<u64>,
+        &mut [Vec<f32>],
+    ) -> Result<(), String>,
+{
+    const RANGE_COMPLETE: &str = "__forge_input_descriptor_range_complete__";
+    descriptor
+        .input
+        .verify_source()
+        .map_err(|error| error.to_string())?;
+    let selection = descriptor.track_selection;
+    let range = descriptor.range;
+    let range_end = range.frames.map(|frames| {
+        range
+            .start
+            .checked_add(frames)
+            .expect("validated descriptor range")
+    });
+    let declared_frames = descriptor.declared_frames.map(|declared| {
+        let available = declared.saturating_sub(range.start);
+        range
+            .frames
+            .map_or(available, |frames| available.min(frames))
+    });
+    let effective_provenance = if descriptor.explicit_channel_roles {
+        ChannelLayoutProvenance::KnownSpeakers
+    } else {
+        descriptor.declared_layout_provenance
+    };
+    let mut source_frame = 0_u64;
+    let mut delivered = 0_u64;
+    let result = decode_stream_raw_with_selection(
+        descriptor.input.stable_path(),
+        descriptor.route,
+        selection,
+        None,
+        |info, provenance, _, planar| {
+            validate_descriptor_decode(descriptor, info, provenance)?;
+            let chunk_frames = planar.first().map_or(0, Vec::len);
+            if planar.iter().any(|channel| channel.len() != chunk_frames) {
+                return Err("decoded descriptor stream has unequal channel lengths".into());
+            }
+            let chunk_frames = u64::try_from(chunk_frames)
+                .map_err(|_| "decoded chunk frame count exceeds u64".to_string())?;
+            let chunk_start = source_frame;
+            let chunk_end = chunk_start
+                .checked_add(chunk_frames)
+                .ok_or_else(|| "decoded descriptor frame count overflow".to_string())?;
+            source_frame = chunk_end;
+            if range_end.is_some_and(|end| chunk_start >= end) {
+                return Err(RANGE_COMPLETE.into());
+            }
+            let overlap_start = chunk_start.max(range.start);
+            let overlap_end = range_end.map_or(chunk_end, |end| chunk_end.min(end));
+            if overlap_start < overlap_end {
+                let start = usize::try_from(overlap_start - chunk_start)
+                    .map_err(|_| "descriptor range start exceeds usize".to_string())?;
+                let end = usize::try_from(overlap_end - chunk_start)
+                    .map_err(|_| "descriptor range end exceeds usize".to_string())?;
+                if start != 0 || end != usize::try_from(chunk_frames).unwrap_or(usize::MAX) {
+                    for channel in planar.iter_mut() {
+                        channel.copy_within(start..end, 0);
+                        channel.truncate(end - start);
+                    }
+                }
+                delivered = delivered
+                    .checked_add(overlap_end - overlap_start)
+                    .ok_or_else(|| "descriptor delivered frame count overflow".to_string())?;
+                consume(
+                    &descriptor.info,
+                    effective_provenance,
+                    declared_frames,
+                    planar,
+                )?;
+            }
+            if range_end.is_some_and(|end| chunk_end >= end) {
+                Err(RANGE_COMPLETE.into())
+            } else {
+                Ok(())
+            }
+        },
+    );
+    match result {
+        Ok(_) => {}
+        Err(error) if error == RANGE_COMPLETE => {}
+        Err(error) => return Err(error),
+    }
+    if delivered == 0 {
+        return Err(format!(
+            "{}: selected input range contains no audio",
+            display_input(&descriptor.input)
+        ));
+    }
+    descriptor
+        .input
+        .verify_source()
+        .map_err(|error| error.to_string())?;
+    Ok(descriptor.info.clone())
+}
+
+/// One bounded PCM chunk in the narrowest exact representation needed by the
+/// loudness analyzer. Common and compressed formats retain the optimized f32
+/// lane; high-resolution WAVE samples avoid an irreversible f32 conversion.
+pub(crate) enum AnalysisPcmChunk<'a> {
+    F32(&'a [Vec<f32>]),
+    S24(&'a [Vec<i32>]),
+    S32(&'a [Vec<i32>]),
+    F64(&'a [Vec<f64>]),
+}
+
+/// Decode the descriptor's exact programme for loudness measurement.
+///
+/// Native S24/S32/F64 WAVE streams are read directly from their immutable
+/// snapshot. Other inputs share the regular bounded decoder stream.
+pub(crate) fn decode_descriptor_analysis_stream<F>(
+    descriptor: &InputDescriptor,
+    mut consume: F,
+) -> Result<StreamInfo, String>
+where
+    F: FnMut(&StreamInfo, ChannelLayoutProvenance, AnalysisPcmChunk<'_>) -> Result<(), String>,
+{
+    if descriptor.route != DecoderRoute::Wave
+        || !matches!(
+            descriptor.info.source_kind,
+            PcmKind::S24 | PcmKind::S32 | PcmKind::F64
+        )
+    {
+        return decode_descriptor_stream_with_layout(descriptor, |info, provenance, planar| {
+            consume(info, provenance, AnalysisPcmChunk::F32(planar))
+        });
+    }
+
+    descriptor
+        .input
+        .verify_source()
+        .map_err(|error| error.to_string())?;
+    let path = descriptor.input.stable_path();
+    let (wav, provenance) = WavReader::probe_with_layout(path)
+        .map_err(|error| format!("{}: {error}", display_input(&descriptor.input)))?;
+    let decoded_info = StreamInfo {
+        sample_rate: wav.sample_rate,
+        channels: wav.channels,
+        channel_roles: wav.channel_roles,
+        source_kind: wav.kind,
+    };
+    validate_descriptor_decode(descriptor, &decoded_info, provenance)?;
+    let effective_provenance = if descriptor.explicit_channel_roles {
+        ChannelLayoutProvenance::KnownSpeakers
+    } else {
+        provenance
+    };
+    let channels = usize::from(wav.channels);
+    let frame_bytes = channels
+        .checked_mul(wav.kind.bytes_per_sample())
+        .ok_or_else(|| "WAVE frame size overflow".to_string())?;
+    let frame_bytes_u64 =
+        u64::try_from(frame_bytes).map_err(|_| "WAVE frame size exceeds u64".to_string())?;
+    let total_frames = wav.data_size / frame_bytes_u64;
+    let start = descriptor.range.start.min(total_frames);
+    let available = total_frames.saturating_sub(start);
+    let selected_frames = descriptor
+        .range
+        .frames
+        .map_or(available, |frames| frames.min(available));
+    if selected_frames == 0 {
+        return Err(format!(
+            "{}: selected input range contains no audio",
+            display_input(&descriptor.input)
+        ));
+    }
+    let byte_offset = start
+        .checked_mul(frame_bytes_u64)
+        .and_then(|offset| wav.data_offset.checked_add(offset))
+        .ok_or_else(|| "selected WAVE byte range overflows u64".to_string())?;
+    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    file.seek(SeekFrom::Start(byte_offset))
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let chunk_bytes = wav_stream_chunk_bytes(wav.channels, wav.kind);
+    let chunk_frames = chunk_bytes / frame_bytes;
+    let mut bytes = vec![0_u8; chunk_bytes];
+    let mut integer_planar = Vec::new();
+    let mut f64_planar = Vec::new();
+    let mut remaining_frames = selected_frames;
+    while remaining_frames != 0 {
+        let frames = remaining_frames.min(chunk_frames as u64) as usize;
+        let bytes_to_read = frames
+            .checked_mul(frame_bytes)
+            .ok_or_else(|| "selected WAVE chunk size overflow".to_string())?;
+        file.read_exact(&mut bytes[..bytes_to_read])
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        match wav.kind {
+            PcmKind::S24 => {
+                crate::dsp::convert::decode_s24_planar_into(
+                    &bytes[..bytes_to_read],
+                    channels,
+                    &mut integer_planar,
+                );
+                consume(
+                    &descriptor.info,
+                    effective_provenance,
+                    AnalysisPcmChunk::S24(&integer_planar),
+                )?;
+            }
+            PcmKind::S32 => {
+                crate::dsp::convert::decode_s32_planar_into(
+                    &bytes[..bytes_to_read],
+                    channels,
+                    &mut integer_planar,
+                );
+                consume(
+                    &descriptor.info,
+                    effective_provenance,
+                    AnalysisPcmChunk::S32(&integer_planar),
+                )?;
+            }
+            PcmKind::F64 => {
+                crate::dsp::convert::decode_f64_planar_into(
+                    &bytes[..bytes_to_read],
+                    channels,
+                    &mut f64_planar,
+                );
+                consume(
+                    &descriptor.info,
+                    effective_provenance,
+                    AnalysisPcmChunk::F64(&f64_planar),
+                )?;
+            }
+            _ => unreachable!("high-precision WAVE kind was selected above"),
+        }
+        remaining_frames -= frames as u64;
+    }
+    descriptor
+        .input
+        .verify_source()
+        .map_err(|error| error.to_string())?;
+    Ok(descriptor.info.clone())
+}
+
+/// Bounded full-buffer decode of the programme selected by a descriptor.
+pub fn decode_descriptor_limited_with_layout(
+    descriptor: &InputDescriptor,
+    max_decoded_samples: u64,
+) -> Result<(AudioBuffer, ChannelLayoutProvenance), String> {
+    if max_decoded_samples == 0 {
+        return Err("decoded sample limit must be greater than zero".into());
+    }
+    let mut data = vec![Vec::new(); usize::from(descriptor.info.channels)];
+    let mut layout = None;
+    let info = decode_descriptor_stream_with_layout(descriptor, |info, provenance, planar| {
+        let packet_frames = planar.first().map_or(0, Vec::len) as u64;
+        let accumulated = data.first().map_or(0, Vec::len) as u64;
+        enforce_decoded_sample_limit(
+            descriptor.input.stable_path(),
+            accumulated.saturating_add(packet_frames),
+            u64::from(info.channels),
+            max_decoded_samples,
+        )?;
+        if layout
+            .replace(provenance)
+            .is_some_and(|previous| previous != provenance)
+        {
+            return Err("descriptor layout provenance changed during decode".into());
+        }
+        for (destination, source) in data.iter_mut().zip(planar) {
+            destination.extend_from_slice(source);
+        }
+        Ok(())
+    })?;
+    let frames = data.first().map_or(0, Vec::len);
+    Ok((
+        AudioBuffer {
+            sample_rate: info.sample_rate,
+            channels: info.channels,
+            channel_roles: info.channel_roles,
+            frames,
+            data,
+            source_kind: info.source_kind,
+        },
+        layout.expect("descriptor decoding delivers at least one chunk"),
+    ))
+}
+
+fn validate_descriptor_decode(
+    descriptor: &InputDescriptor,
+    info: &StreamInfo,
+    provenance: ChannelLayoutProvenance,
+) -> Result<(), String> {
+    if info.sample_rate != descriptor.info.sample_rate
+        || info.channels != descriptor.info.channels
+        || info.source_kind != descriptor.info.source_kind
+        || info.channel_roles != descriptor.info.channel_roles && !descriptor.explicit_channel_roles
+        || provenance != descriptor.declared_layout_provenance
+    {
+        return Err("decoded stream no longer matches its input descriptor".into());
+    }
+    Ok(())
+}
+
 /// Decode with small planar-f32 packets coalesced for the normalization render
 /// pass. Analysis deliberately keeps codec packet boundaries: larger chunks
 /// can reduce True Peak pruning efficiency on some architectures.
@@ -1390,8 +2384,65 @@ where
     Ok(info)
 }
 
+/// Descriptor-bound counterpart of [`decode_stream_coalesced`].
+pub(crate) fn decode_descriptor_stream_coalesced<F>(
+    descriptor: &InputDescriptor,
+    consume: F,
+) -> Result<StreamInfo, String>
+where
+    F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
+{
+    let mut consume = consume;
+    if !matches!(
+        descriptor.codec,
+        AudioCodec::Mp1
+            | AudioCodec::Mp2
+            | AudioCodec::Mp3
+            | AudioCodec::Aac
+            | AudioCodec::Alac
+            | AudioCodec::Vorbis
+            | AudioCodec::Opus
+    ) {
+        return decode_descriptor_stream_with_layout(descriptor, |info, _, planar| {
+            consume(info, planar)
+        });
+    }
+
+    let mut pending = Vec::new();
+    let info = decode_descriptor_stream_with_layout(descriptor, |info, _, planar| {
+        append_symphonia_stream_chunk(info, planar, &mut pending, &mut consume)
+    })?;
+    flush_symphonia_stream_chunk(&info, &mut pending, &mut consume)?;
+    Ok(info)
+}
+
 fn decode_stream_with_flac_workers<F>(
     path: &Path,
+    forced_flac_workers: Option<usize>,
+    consume: F,
+) -> Result<StreamInfo, String>
+where
+    F: FnMut(
+        &StreamInfo,
+        ChannelLayoutProvenance,
+        Option<u64>,
+        &mut [Vec<f32>],
+    ) -> Result<(), String>,
+{
+    let route = sniff_decoder_route(path)?;
+    decode_stream_raw_with_selection(
+        path,
+        route,
+        AudioTrackSelection::Default,
+        forced_flac_workers,
+        consume,
+    )
+}
+
+fn decode_stream_raw_with_selection<F>(
+    path: &Path,
+    route: DecoderRoute,
+    selection: AudioTrackSelection,
     forced_flac_workers: Option<usize>,
     mut consume: F,
 ) -> Result<StreamInfo, String>
@@ -1415,13 +2466,16 @@ where
         .and_then(|value| value.to_str())
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
-    if is_wave_extension(&extension) || has_wave_signature(path) {
+    if route == DecoderRoute::Wave {
+        require_single_track(selection)?;
         return decode_wav_stream(path, consume);
     }
-    if matches!(extension.as_str(), "dsf" | "dff") {
+    if matches!(route, DecoderRoute::Dsf | DecoderRoute::Dsdiff) {
+        require_single_track(selection)?;
         return crate::dsd::decode_stream_with_layout_and_declared_frames(path, consume);
     }
-    if extension == "opus" {
+    if route == DecoderRoute::Opus {
+        require_single_track(selection)?;
         #[cfg(feature = "opus-encoding")]
         {
             return crate::opus::decode_stream(path, |info, planar| {
@@ -1452,12 +2506,15 @@ where
         )
         .map_err(|error| format!("{}: probe failed: {error}", path.display()))?;
     let container_format = format.format_info().format;
-    let mut track = select_symphonia_audio_track(path, format.as_ref())?;
+    let mut track =
+        select_symphonia_audio_track_with_selection(path, format.as_ref(), selection)?.0;
     require_symphonia_sample_rate(path, &track.codec_params)?;
     let mut flac_metadata = FlacMetadataTracker::default();
     let mut flac_channel_mask = flac_metadata.scan(format.as_mut(), &track);
     let decoder_options = symphonia_decoder_options();
-    let file_bytes = if extension == "flac" && track.num_frames.is_none() {
+    let native_flac = container_format == symphonia::core::formats::well_known::FORMAT_ID_FLAC
+        && track.codec_params.codec == symphonia::core::codecs::audio::well_known::CODEC_ID_FLAC;
+    let file_bytes = if native_flac && track.num_frames.is_none() {
         std::fs::metadata(path)
             .map_err(|error| format!("{}: {error}", path.display()))?
             .len()
@@ -1465,9 +2522,7 @@ where
         0
     };
     let flac_worker_cap = parallel_flac_worker_cap(&track, file_bytes);
-    let parallel_flac = extension == "flac"
-        && flac_worker_cap >= MIN_PARALLEL_FLAC_DECODERS
-        && track.codec_params.codec == symphonia::core::codecs::audio::well_known::CODEC_ID_FLAC;
+    let parallel_flac = native_flac && flac_worker_cap >= MIN_PARALLEL_FLAC_DECODERS;
     let flac_workers = if parallel_flac {
         forced_flac_workers
             .unwrap_or_else(|| {
@@ -1489,6 +2544,7 @@ where
             decoder_options,
             flac_workers,
             flac_metadata,
+            selection,
             consume,
         );
     }
@@ -1506,11 +2562,12 @@ where
             Ok(Some(packet)) => packet,
             Ok(None) => break,
             Err(Error::ResetRequired) => {
-                let next_track = select_symphonia_audio_track(path, format.as_ref())?;
+                let next_track =
+                    select_symphonia_audio_track_with_selection(path, format.as_ref(), selection)?
+                        .0;
                 require_symphonia_sample_rate(path, &next_track.codec_params)?;
                 let next_flac_channel_mask = flac_metadata.scan(format.as_mut(), &next_track);
-                let next_source_kind =
-                    source_kind(&extension, next_track.codec_params.bits_per_sample);
+                let next_source_kind = PcmKind::F32;
                 if let Some(output) = output_format.as_ref() {
                     validate_symphonia_track_compatibility(
                         path,
@@ -1546,7 +2603,10 @@ where
         if decoded_channels == 0 {
             continue;
         }
-        let current_source_kind = source_kind(&extension, track.codec_params.bits_per_sample);
+        // Every Symphonia codec is handed to this render path as normalized
+        // planar f32. The source-name suffix is only a probe hint and must not
+        // change the PCM contract or cache result for identical bytes.
+        let current_source_kind = PcmKind::F32;
         if let Some(output) = output_format.as_ref() {
             validate_symphonia_decoded_compatibility(path, output, spec, current_source_kind)?;
         } else {
@@ -1792,6 +2852,7 @@ fn decode_parallel_flac_batch(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_native_flac_stream_parallel<F>(
     path: &Path,
     format: &mut dyn symphonia::core::formats::FormatReader,
@@ -1799,6 +2860,7 @@ fn decode_native_flac_stream_parallel<F>(
     decoder_options: symphonia::core::codecs::audio::AudioDecoderOptions,
     worker_count: usize,
     mut flac_metadata: FlacMetadataTracker,
+    selection: AudioTrackSelection,
     mut consume: F,
 ) -> Result<StreamInfo, String>
 where
@@ -1927,7 +2989,8 @@ where
                 return Err(format!("{}: read packet: {error}", path.display()));
             }
             FlacDemuxBoundary::Reset => {
-                let next_track = select_symphonia_audio_track(path, format)?;
+                let next_track =
+                    select_symphonia_audio_track_with_selection(path, format, selection)?.0;
                 require_symphonia_sample_rate(path, &next_track.codec_params)?;
                 let next_flac_channel_mask = flac_metadata.scan(format, &next_track);
                 if next_track.codec_params.codec != CODEC_ID_FLAC {
@@ -2116,21 +3179,6 @@ fn wav_stream_chunk_bytes(channels: u16, kind: PcmKind) -> usize {
         MULTICHANNEL_WAV_STREAM_CHUNK_BYTES
     };
     (target / frame_bytes).max(1) * frame_bytes
-}
-
-fn source_kind(extension: &str, bits: Option<u32>) -> PcmKind {
-    if is_wave_extension(extension) {
-        match bits {
-            Some(8) => PcmKind::U8,
-            Some(16) => PcmKind::S16,
-            Some(24) => PcmKind::S24,
-            Some(32) => PcmKind::S32,
-            Some(64) => PcmKind::F64,
-            _ => PcmKind::F32,
-        }
-    } else {
-        PcmKind::F32
-    }
 }
 
 #[cfg(test)]
@@ -3138,6 +4186,89 @@ mod tests {
         wave
     }
 
+    fn exact_pcm_wave(kind: PcmKind, channels: u16, data: Vec<u8>) -> Vec<u8> {
+        let format_tag = if kind.is_float() { 3_u16 } else { 1_u16 };
+        let sample_rate = 48_000_u32;
+        let frame_bytes = channels * kind.bytes_per_sample() as u16;
+        let mut format = Vec::new();
+        format.extend_from_slice(&format_tag.to_le_bytes());
+        format.extend_from_slice(&channels.to_le_bytes());
+        format.extend_from_slice(&sample_rate.to_le_bytes());
+        format.extend_from_slice(&(sample_rate * u32::from(frame_bytes)).to_le_bytes());
+        format.extend_from_slice(&frame_bytes.to_le_bytes());
+        format.extend_from_slice(&kind.bits_per_sample().to_le_bytes());
+        riff_wave([(*b"fmt ", format), (*b"data", data)])
+    }
+
+    #[test]
+    fn descriptor_analysis_stream_preserves_exact_wave_values_and_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let stable_options = StableInputOptions::new(1024 * 1024).unwrap();
+
+        let s32_path = directory.path().join("exact-s32.wav");
+        let s32_source = [
+            1_073_741_823_i32,
+            1_073_741_824,
+            1_073_741_825,
+            1_073_741_826,
+        ];
+        let s32_bytes = s32_source
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect::<Vec<_>>();
+        std::fs::write(&s32_path, exact_pcm_wave(PcmKind::S32, 1, s32_bytes)).unwrap();
+        let descriptor = InputDescriptor::from_path(
+            &s32_path,
+            &stable_options,
+            InputDescriptorOptions::default().with_time_range(1.0 / 48_000.0, Some(2.0 / 48_000.0)),
+        )
+        .unwrap();
+        let mut decoded_s32 = Vec::new();
+        decode_descriptor_analysis_stream(&descriptor, |_, _, chunk| {
+            let AnalysisPcmChunk::S32(planar) = chunk else {
+                panic!("S32 WAVE must use the exact analysis lane");
+            };
+            decoded_s32.extend_from_slice(&planar[0]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(decoded_s32, s32_source[1..3]);
+        assert_eq!(
+            decoded_s32[0] as f32, decoded_s32[1] as f32,
+            "the exact lane must retain codes that normalized f32 cannot distinguish"
+        );
+
+        let f64_path = directory.path().join("exact-f64.wav");
+        let f64_source = [0.5_f64, f64::from_bits(0x3fe0_0000_0000_0001), -0.0];
+        let f64_bytes = f64_source
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect::<Vec<_>>();
+        std::fs::write(&f64_path, exact_pcm_wave(PcmKind::F64, 1, f64_bytes)).unwrap();
+        let descriptor = InputDescriptor::from_path(
+            &f64_path,
+            &stable_options,
+            InputDescriptorOptions::default(),
+        )
+        .unwrap();
+        let mut decoded_f64 = Vec::new();
+        decode_descriptor_analysis_stream(&descriptor, |_, _, chunk| {
+            let AnalysisPcmChunk::F64(planar) = chunk else {
+                panic!("F64 WAVE must use the exact analysis lane");
+            };
+            decoded_f64.extend(planar[0].iter().map(|sample| sample.to_bits()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            decoded_f64,
+            f64_source
+                .iter()
+                .map(|sample| sample.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
     fn pcm16_fmt_body(sample_rate: u32, channels: u16, channel_mask: Option<u32>) -> Vec<u8> {
         let format_tag = if channel_mask.is_some() {
             0xfffe_u16
@@ -3823,6 +4954,31 @@ mod tests {
             .write_chunk(&vec![vec![0.0; frames]; usize::from(channels)])
             .unwrap();
         writer.finish().unwrap();
+    }
+
+    #[test]
+    fn descriptor_pcm_contract_is_independent_of_a_misleading_suffix() {
+        let directory = tempfile::tempdir().unwrap();
+        let regular = directory.path().join("programme.flac");
+        let misleading = directory.path().join("programme.wav");
+        write_silent_test_flac(&regular, 2, 48_000);
+        std::fs::copy(&regular, &misleading).unwrap();
+        let options = StableInputOptions::new(u64::MAX).unwrap();
+        let regular =
+            InputDescriptor::from_path(&regular, &options, InputDescriptorOptions::default())
+                .unwrap();
+        let misleading =
+            InputDescriptor::from_path(&misleading, &options, InputDescriptorOptions::default())
+                .unwrap();
+
+        assert_eq!(regular.container(), AudioContainer::Flac);
+        assert_eq!(regular.codec(), AudioCodec::Flac);
+        assert_eq!(regular.decoder_route_id(), misleading.decoder_route_id());
+        assert_eq!(regular.stream_info().source_kind, PcmKind::F32);
+        assert_eq!(
+            regular.stream_info().source_kind,
+            misleading.stream_info().source_kind
+        );
     }
 
     fn inject_flac_comments(path: &Path, comments: &[&str]) {

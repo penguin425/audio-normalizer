@@ -1,7 +1,9 @@
 //! EBU QC baseband checks over decoded PCM.
 
 use crate::decoder;
+use crate::decoder::{InputDescriptor, InputDescriptorOptions};
 use crate::normalize::Analysis;
+use crate::stable_input::{StableInput, StableInputOptions};
 use crate::wav::{AudioBuffer, ChannelRole, PcmKind};
 use serde::{Deserialize, Serialize};
 use std::f64::consts::TAU;
@@ -210,15 +212,32 @@ pub fn analyze_file(
     analysis: &Analysis,
     options: &QcOptions,
 ) -> Result<Vec<QcResult>, String> {
-    options.validate()?;
-    let (mut audio, layout_provenance) = decoder::decode_with_layout(path)?;
-    audio.channel_roles = crate::normalize::resolve_decoded_channel_roles(
-        path,
-        audio.channels,
-        &audio.channel_roles,
-        layout_provenance,
-        Some(&analysis.channel_roles),
+    let stable_options = StableInputOptions::new(u64::MAX).map_err(|error| error.to_string())?;
+    let input = StableInput::from_path(path, &stable_options).map_err(|error| error.to_string())?;
+    let descriptor = InputDescriptor::probe(
+        input,
+        InputDescriptorOptions::default().with_channel_roles(analysis.channel_roles.clone()),
     )?;
+    analyze_descriptor(&descriptor, analysis, options)
+}
+
+/// Run baseband QC over exactly the same immutable track, frame range, and
+/// channel layout that produced `analysis`.
+pub fn analyze_descriptor(
+    descriptor: &InputDescriptor,
+    analysis: &Analysis,
+    options: &QcOptions,
+) -> Result<Vec<QcResult>, String> {
+    options.validate()?;
+    let (audio, _) = decoder::decode_descriptor_limited_with_layout(descriptor, u64::MAX)?;
+    if audio.sample_rate != analysis.sample_rate
+        || audio.channels != analysis.channels
+        || audio.frames != analysis.frames
+        || audio.channel_roles != analysis.channel_roles
+        || audio.source_kind != analysis.kind
+    {
+        return Err("EBU QC descriptor does not match the supplied loudness analysis".into());
+    }
     Ok(analyze(&audio, analysis, options))
 }
 
@@ -1459,8 +1478,9 @@ fn seconds_to_frames(audio: &AudioBuffer, seconds: f64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::AnalysisEngine;
     use crate::normalize;
-    use crate::wav::default_channel_roles;
+    use crate::wav::{default_channel_roles, WavWriter};
 
     fn buffer(samples: Vec<f32>) -> AudioBuffer {
         AudioBuffer {
@@ -1490,6 +1510,41 @@ mod tests {
             .iter()
             .find(|result| result.ebu_qc_id == id)
             .unwrap_or_else(|| panic!("missing QC result {id}"))
+    }
+
+    #[test]
+    fn descriptor_qc_uses_the_exact_measured_frame_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("programme.wav");
+        let audio = buffer(
+            (0..96_000)
+                .map(|frame| 0.1 * (TAU * 440.0 * frame as f64 / 48_000.0).sin() as f32)
+                .collect(),
+        );
+        WavWriter::write(&path, &audio, PcmKind::S16, false).unwrap();
+        let stable_options = StableInputOptions::new(u64::MAX).unwrap();
+        let descriptor = InputDescriptor::from_path(
+            &path,
+            &stable_options,
+            InputDescriptorOptions::default().with_time_range(1.0, Some(0.5)),
+        )
+        .unwrap();
+        let timed = normalize::analyze_input_descriptor_range_with_engine(
+            &descriptor,
+            None,
+            AnalysisEngine::Fast,
+        )
+        .unwrap();
+        assert_eq!(timed.analysis.frames, 24_000);
+        let options = QcOptions {
+            expected_duration_seconds: Some(0.5),
+            ..QcOptions::default()
+        };
+        let results = analyze_descriptor(&descriptor, &timed.analysis, &options).unwrap();
+        assert!(result_by_id(&results, "0009F").passed);
+
+        let error = analyze_file(&path, &timed.analysis, &options).unwrap_err();
+        assert!(error.contains("does not match"), "{error}");
     }
 
     #[test]

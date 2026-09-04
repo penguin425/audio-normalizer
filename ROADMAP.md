@@ -612,7 +612,7 @@ unchanged controls from paths whose normative work factor changed.
 The order below is an implementation plan, not a standards requirement. Each
 normative item must name the exact supported clauses and must not imply
 certification or coverage beyond its fixtures.
-v0.189.1 through v0.189.7 are the completed baseline; later entries are
+v0.189.1 through v0.189.8 are the completed baseline; later entries are
 planned.
 
 | Release | Scope | Classification |
@@ -762,6 +762,8 @@ Primary sources for this sequence are
 [OCI build attestations](https://docs.docker.com/build/metadata/attestations/),
 [OpenAPI 3.2](https://spec.openapis.org/oas/v3.2.0.html),
 [RFC 9457 Problem Details](https://www.rfc-editor.org/rfc/rfc9457.html),
+[gRPC cancellation](https://grpc.io/docs/guides/cancellation/),
+[gRPC flow control](https://grpc.io/docs/guides/flow-control/),
 [gRPC health checking](https://grpc.io/docs/guides/health-checking/),
 [gRPC reflection](https://grpc.io/docs/guides/reflection/),
 [RFC 8785 JSON Canonicalization](https://www.rfc-editor.org/rfc/rfc8785.html),

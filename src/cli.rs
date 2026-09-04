@@ -105,8 +105,8 @@ pub struct Cli {
     pub max_gain_db: Option<f64>,
 
     /// Output container format: `wav`, `flac`, `mp3`, `opus`, `m4a`, `alac`, or `vorbis`. If omitted, inferred from the
-    /// `-o` extension, else defaults to the input's format when supported
-    /// (FLAC/MP3 are kept) and otherwise wav.
+    /// `-o` extension; otherwise selected from the content-probed codec when a
+    /// compatible encoder is compiled, with WAV as the safe fallback.
     #[arg(
         long = "format",
         value_parser = ["wav", "flac", "mp3", "opus", "m4a", "alac", "vorbis"]

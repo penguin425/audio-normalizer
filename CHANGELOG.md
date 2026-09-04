@@ -8,6 +8,41 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.189.8 - 2026-09-05
+
+### Added
+
+- Add a content-probed codec/container/track registry and immutable
+  `InputDescriptor`, plus `--audio-track` for independent normalization,
+  analysis, and EBU QC of a selected programme.
+- Publish analysis-cache schema v4 and catalogue report/database v2. Their
+  identities now include source bytes, decoder route, track, exact frame
+  range, channel layout, renderer, and effective processing plan; v1
+  catalogues migrate transactionally without losing rows.
+- Add a bounded one-response remote snapshot API and evidence schema for
+  origins that cannot provide a strong range validator.
+
+### Changed
+
+- Make normalization and QC consume the same descriptor-bound stream, time
+  range, selected track, and layout evidence. Native 24/32-bit integer and
+  64-bit floating-point WAVE analysis now retains source precision through the
+  loudness analyzer instead of first narrowing to `f32`.
+- Bind multi-request remote range sessions to one final representation URI and
+  strong ETag, send `If-Range`, and reject encoded or changed responses.
+- Choose implicit output formats from the detected codec, preserve lossless
+  defaults, and verify the exact FFmpeg encoder and muxer before decoding or
+  creating output.
+- Keep the existing Rust catalogue record/report API on schema v1 while the
+  descriptor-bound API and CLI emit the new request-bound v2 evidence.
+
+### Fixed
+
+- Keep descriptor-bound parallel batches independently restartable when a
+  later asset fails, while preserving input-ordered cache and progress output.
+- Make decoder selection and PCM contracts independent of misleading file-name
+  suffixes.
+
 ## 0.189.7 - 2026-09-04
 
 ### Added

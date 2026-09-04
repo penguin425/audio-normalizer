@@ -6,8 +6,9 @@
 
 use crate::analysis::{Analysis, AnalysisEngine};
 use crate::atomic::AtomicOutput;
-use crate::bound_analysis::{
-    decoder_route_descriptor, BoundAnalysis, MEASUREMENT_ALGORITHM_REVISION,
+use crate::bound_analysis::{BoundAnalysis, MEASUREMENT_ALGORITHM_REVISION};
+use crate::decoder::{
+    ChannelLayoutProvenance, InputDescriptor, InputDescriptorOptions, INPUT_DESCRIPTOR_VERSION,
 };
 use crate::dsp::lufs::LoudnessTimelinePoint;
 use crate::dsp::resample::ResampleQuality;
@@ -28,10 +29,12 @@ pub const ANALYSIS_CACHE_SCHEMA_V2: &str =
     "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v2";
 pub const ANALYSIS_CACHE_SCHEMA_V3: &str =
     "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v3";
+pub const ANALYSIS_CACHE_SCHEMA_V4: &str =
+    "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v4";
 pub const MEASUREMENT_STANDARD: &str = "ITU-R BS.1770-5 / EBU R 128";
 pub const ALGORITHM_REVISION: &str = MEASUREMENT_ALGORITHM_REVISION;
 
-const LAYOUT_VERSION: &str = "v3";
+const LAYOUT_VERSION: &str = "v4";
 const MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CHANNELS: usize = 1024;
 const MAX_SCAN_ENTRIES: usize = 100_000;
@@ -199,20 +202,32 @@ impl AnalysisCache {
         timeline_interval_ms: Option<f64>,
         engine: AnalysisEngine,
     ) -> Result<Cached<TimedAnalysis>, String> {
+        let mut options =
+            InputDescriptorOptions::default().with_time_range(start_seconds, duration_seconds);
+        if let Some(roles) = channel_roles {
+            options = options.with_channel_roles(roles.to_vec());
+        }
+        let descriptor = InputDescriptor::probe(input.clone(), options)?;
+        self.analyze_descriptor_range_with_engine(&descriptor, timeline_interval_ms, engine)
+    }
+
+    /// Analyze exactly the track, source range, and layout selected by a
+    /// descriptor using a cache address bound to that complete selection.
+    pub fn analyze_descriptor_range_with_engine(
+        &self,
+        descriptor: &InputDescriptor,
+        timeline_interval_ms: Option<f64>,
+        engine: AnalysisEngine,
+    ) -> Result<Cached<TimedAnalysis>, String> {
         let request = RequestRecord::Range {
             engine_id: engine.id().to_owned(),
-            channel_roles: channel_roles.map(roles_to_records),
-            start_seconds,
-            duration_seconds,
+            input_descriptor: InputDescriptorRecord::from_descriptor(descriptor),
             timeline_interval_ms,
         };
         validate_request(&request)?;
-        self.lookup_or_compute(input, request, || {
-            normalize::analyze_stable_input_range_with_engine(
-                input,
-                channel_roles,
-                start_seconds,
-                duration_seconds,
+        self.lookup_or_compute(descriptor, request, || {
+            normalize::analyze_input_descriptor_range_with_engine(
+                descriptor,
                 timeline_interval_ms,
                 engine,
             )
@@ -245,23 +260,39 @@ impl AnalysisCache {
         plan: &Plan,
     ) -> Result<Cached<BoundAnalysis>, String> {
         plan.validate()?;
+        let mut options = InputDescriptorOptions::default();
+        if let Some(roles) = channel_roles {
+            options = options.with_channel_roles(roles.to_vec());
+        }
+        let descriptor = InputDescriptor::probe(input.clone(), options)?;
+        self.analyze_descriptor_for_plan(&descriptor, plan)
+    }
+
+    /// Analyze, cache, and bind the descriptor's exact programme in the
+    /// normalization plan's output sample-rate domain.
+    pub fn analyze_descriptor_for_plan(
+        &self,
+        descriptor: &InputDescriptor,
+        plan: &Plan,
+    ) -> Result<Cached<BoundAnalysis>, String> {
+        plan.validate()?;
         let request = RequestRecord::OutputDomain {
             engine_id: AnalysisEngine::Fast.id().to_owned(),
-            channel_roles: channel_roles.map(roles_to_records),
+            input_descriptor: InputDescriptorRecord::from_descriptor(descriptor),
             output_sample_rate_hz: plan.output_sample_rate,
             resample_quality: plan.resample_quality,
         };
         validate_request(&request)?;
-        self.lookup_or_compute(input, request, || {
-            normalize::analyze_stable_input_for_plan_unbound(input, channel_roles, plan).map(
-                |analysis| TimedAnalysis {
+        self.lookup_or_compute(descriptor, request, || {
+            normalize::analyze_input_descriptor_for_plan_unbound(descriptor, plan).map(|analysis| {
+                TimedAnalysis {
                     analysis,
                     timeline: Vec::new(),
-                },
-            )
+                }
+            })
         })
         .and_then(|cached| {
-            BoundAnalysis::for_output_domain(input, cached.value.analysis, channel_roles, plan)
+            BoundAnalysis::for_descriptor(descriptor, cached.value.analysis, plan)
                 .map(|value| Cached {
                     value,
                     disposition: cached.disposition,
@@ -273,10 +304,11 @@ impl AnalysisCache {
 
     fn lookup_or_compute(
         &self,
-        input: &StableInput,
+        descriptor: &InputDescriptor,
         request: RequestRecord,
         compute: impl FnOnce() -> Result<TimedAnalysis, String>,
     ) -> Result<Cached<TimedAnalysis>, String> {
+        let input = descriptor.stable_input();
         let input_sha256 = input.binding().sha256_hex();
         let request_bytes = serde_json::to_vec(&request)
             .map_err(|error| format!("encode analysis cache request: {error}"))?;
@@ -284,12 +316,18 @@ impl AnalysisCache {
         let path = self.entry_path(&input_sha256, &request_sha256);
         let invalid = match self.load(&path, &input_sha256, &request_sha256, &request)? {
             LoadResult::Hit(value) => {
-                input.verify_source().map_err(|error| error.to_string())?;
-                return Ok(Cached {
-                    value,
-                    disposition: CacheDisposition::Hit,
-                    warning: None,
-                });
+                if let Err(reason) =
+                    validate_timed_analysis_for_descriptor(&value, descriptor, &request)
+                {
+                    Some(reason)
+                } else {
+                    input.verify_source().map_err(|error| error.to_string())?;
+                    return Ok(Cached {
+                        value,
+                        disposition: CacheDisposition::Hit,
+                        warning: None,
+                    });
+                }
             }
             LoadResult::Missing => None,
             LoadResult::Invalid(reason) => Some(reason),
@@ -297,6 +335,7 @@ impl AnalysisCache {
 
         let value = compute()?;
         validate_timed_analysis(&value)?;
+        validate_timed_analysis_for_descriptor(&value, descriptor, &request)?;
         input.verify_source().map_err(|error| error.to_string())?;
         if self.policy.read_only {
             return Ok(Cached {
@@ -316,7 +355,7 @@ impl AnalysisCache {
                 .map_err(|error| format!("encode analysis cache result: {error}"))?,
         );
         let document = CacheDocument {
-            schema: ANALYSIS_CACHE_SCHEMA_V3.to_owned(),
+            schema: ANALYSIS_CACHE_SCHEMA_V4.to_owned(),
             generator: format!("forge-normalizer/{}", env!("CARGO_PKG_VERSION")),
             measurement_standard: MEASUREMENT_STANDARD.to_owned(),
             algorithm_revision: ALGORITHM_REVISION.to_owned(),
@@ -416,7 +455,7 @@ impl AnalysisCache {
             Ok(document) => document,
             Err(error) => {
                 return Ok(LoadResult::Invalid(format!(
-                    "cache entry is not valid v3 JSON: {error}"
+                    "cache entry is not valid v4 JSON: {error}"
                 )));
             }
         };
@@ -575,18 +614,73 @@ enum RequestRecord {
     Range {
         #[serde(default = "default_fast_engine_id")]
         engine_id: String,
-        channel_roles: Option<Vec<ChannelRoleRecord>>,
-        start_seconds: f64,
-        duration_seconds: Option<f64>,
+        input_descriptor: InputDescriptorRecord,
         timeline_interval_ms: Option<f64>,
     },
     OutputDomain {
         #[serde(default = "default_fast_engine_id")]
         engine_id: String,
-        channel_roles: Option<Vec<ChannelRoleRecord>>,
+        input_descriptor: InputDescriptorRecord,
         output_sample_rate_hz: Option<u32>,
         resample_quality: ResampleQuality,
     },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct InputDescriptorRecord {
+    version: u32,
+    decoder_route: String,
+    container: String,
+    codec: String,
+    audio_track_index: u32,
+    audio_track_id: u32,
+    source_start_frame: u64,
+    source_frames: Option<u64>,
+    sample_rate_hz: u32,
+    channels: u16,
+    channel_roles: Vec<ChannelRoleRecord>,
+    declared_layout_provenance: LayoutProvenanceRecord,
+    explicit_channel_roles: bool,
+}
+
+impl InputDescriptorRecord {
+    fn from_descriptor(descriptor: &InputDescriptor) -> Self {
+        let info = descriptor.stream_info();
+        Self {
+            version: descriptor.version(),
+            decoder_route: descriptor.decoder_route_id(),
+            container: descriptor.container().id().to_owned(),
+            codec: descriptor.codec().id().to_owned(),
+            audio_track_index: descriptor.track_index(),
+            audio_track_id: descriptor.track_id(),
+            source_start_frame: descriptor.source_range().start(),
+            source_frames: descriptor.source_range().frames(),
+            sample_rate_hz: info.sample_rate,
+            channels: info.channels,
+            channel_roles: roles_to_records(&info.channel_roles),
+            declared_layout_provenance: descriptor.declared_layout_provenance().into(),
+            explicit_channel_roles: descriptor.uses_explicit_channel_roles(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LayoutProvenanceRecord {
+    KnownSpeakers,
+    Unknown,
+    SceneBased,
+}
+
+impl From<ChannelLayoutProvenance> for LayoutProvenanceRecord {
+    fn from(value: ChannelLayoutProvenance) -> Self {
+        match value {
+            ChannelLayoutProvenance::KnownSpeakers => Self::KnownSpeakers,
+            ChannelLayoutProvenance::Unknown => Self::Unknown,
+            ChannelLayoutProvenance::SceneBased => Self::SceneBased,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -782,7 +876,7 @@ fn validate_document(
     request_hash: &str,
     request: &RequestRecord,
 ) -> Result<(), String> {
-    if document.schema != ANALYSIS_CACHE_SCHEMA_V3 {
+    if document.schema != ANALYSIS_CACHE_SCHEMA_V4 {
         return Err("cache entry has an unsupported schema".into());
     }
     if document.generator.is_empty() || document.generator.len() > 256 {
@@ -809,29 +903,21 @@ fn validate_document(
 }
 
 fn validate_request(request: &RequestRecord) -> Result<(), String> {
-    let roles = match request {
+    let descriptor = match request {
         RequestRecord::Range {
             engine_id,
-            channel_roles,
-            start_seconds,
-            duration_seconds,
+            input_descriptor,
             timeline_interval_ms,
         } => {
             validate_engine_id(engine_id)?;
-            if !start_seconds.is_finite() || *start_seconds < 0.0 {
-                return Err("analysis cache start must be finite and non-negative".into());
-            }
-            if duration_seconds.is_some_and(|value| !value.is_finite() || value <= 0.0) {
-                return Err("analysis cache duration must be finite and positive".into());
-            }
             if timeline_interval_ms.is_some_and(|value| !value.is_finite() || value <= 0.0) {
                 return Err("analysis cache timeline interval must be finite and positive".into());
             }
-            channel_roles
+            input_descriptor
         }
         RequestRecord::OutputDomain {
             engine_id,
-            channel_roles,
+            input_descriptor,
             output_sample_rate_hz,
             ..
         } => {
@@ -841,13 +927,47 @@ fn validate_request(request: &RequestRecord) -> Result<(), String> {
             if output_sample_rate_hz == &Some(0) {
                 return Err("analysis cache output sample rate must be positive".into());
             }
-            channel_roles
+            input_descriptor
         }
     };
-    if roles
-        .as_ref()
-        .is_some_and(|roles| roles.is_empty() || roles.len() > MAX_CHANNELS)
+    validate_input_descriptor_record(descriptor)
+}
+
+fn validate_input_descriptor_record(descriptor: &InputDescriptorRecord) -> Result<(), String> {
+    if descriptor.version != INPUT_DESCRIPTOR_VERSION {
+        return Err("analysis cache input descriptor version is unsupported".into());
+    }
+    if descriptor.decoder_route.is_empty() || descriptor.decoder_route.len() > 512 {
+        return Err("analysis cache decoder route must contain 1..=512 bytes".into());
+    }
+    if descriptor.container.is_empty()
+        || descriptor.container.len() > 64
+        || descriptor.codec.is_empty()
+        || descriptor.codec.len() > 64
     {
+        return Err("analysis cache container and codec IDs must contain 1..=64 bytes".into());
+    }
+    if descriptor.sample_rate_hz == 0 {
+        return Err("analysis cache descriptor sample rate must be positive".into());
+    }
+    if descriptor.channels == 0 || usize::from(descriptor.channels) > MAX_CHANNELS {
+        return Err(format!(
+            "analysis cache descriptor channels must be within 1..={MAX_CHANNELS}"
+        ));
+    }
+    if descriptor.channel_roles.len() != usize::from(descriptor.channels) {
+        return Err("analysis cache descriptor channel-role count does not match channels".into());
+    }
+    if descriptor.source_frames == Some(0) {
+        return Err("analysis cache descriptor source range must not be empty".into());
+    }
+    if descriptor
+        .source_frames
+        .is_some_and(|frames| descriptor.source_start_frame.checked_add(frames).is_none())
+    {
+        return Err("analysis cache descriptor source range overflows u64".into());
+    }
+    if descriptor.channel_roles.is_empty() || descriptor.channel_roles.len() > MAX_CHANNELS {
         return Err(format!(
             "analysis cache channel roles must contain 1..={MAX_CHANNELS} entries"
         ));
@@ -873,6 +993,40 @@ fn validate_timed_analysis(value: &TimedAnalysis) -> Result<(), String> {
     TimedAnalysisRecord::from_analysis(value)
         .into_analysis()
         .map(|_| ())
+}
+
+fn validate_timed_analysis_for_descriptor(
+    value: &TimedAnalysis,
+    descriptor: &InputDescriptor,
+    request: &RequestRecord,
+) -> Result<(), String> {
+    let analysis = &value.analysis;
+    let source = descriptor.stream_info();
+    let expected_sample_rate = match request {
+        RequestRecord::Range { .. } => source.sample_rate,
+        RequestRecord::OutputDomain {
+            output_sample_rate_hz,
+            ..
+        } => output_sample_rate_hz.unwrap_or(source.sample_rate),
+    };
+    if analysis.sample_rate != expected_sample_rate
+        || analysis.channels != source.channels
+        || analysis.channel_roles != source.channel_roles
+        || analysis.kind != source.source_kind
+    {
+        return Err("analysis cache result does not match its input descriptor".into());
+    }
+    if analysis.frames == 0 {
+        return Err("analysis cache result contains no decoded frames".into());
+    }
+    if matches!(request, RequestRecord::Range { .. })
+        && descriptor.source_range().frames().is_some_and(|limit| {
+            u64::try_from(analysis.frames).map_or(true, |frames| frames > limit)
+        })
+    {
+        return Err("analysis cache result exceeds its selected source range".into());
+    }
+    Ok(())
 }
 
 fn roles_to_records(roles: &[ChannelRole]) -> Vec<ChannelRoleRecord> {
@@ -951,12 +1105,9 @@ fn capture_stable_input(path: &Path) -> Result<StableInput, String> {
 }
 
 fn hash_bound_request(input: &StableInput, request_bytes: &[u8]) -> String {
-    let route = decoder_route_descriptor(input);
     let mut digest = Sha256::new();
-    digest.update(b"forge-analysis-cache-request-binding-v1\0");
+    digest.update(b"forge-analysis-cache-request-binding-v2\0");
     digest.update(input.binding().version().to_le_bytes());
-    digest.update((route.len() as u64).to_le_bytes());
-    digest.update(route.as_bytes());
     digest.update((MEASUREMENT_ALGORITHM_REVISION.len() as u64).to_le_bytes());
     digest.update(MEASUREMENT_ALGORITHM_REVISION.as_bytes());
     digest.update((request_bytes.len() as u64).to_le_bytes());
@@ -1193,27 +1344,44 @@ mod tests {
     }
 
     #[test]
-    fn decoder_route_is_part_of_the_cache_address_without_changing_v3_schema() {
-        let wav_options = StableInputOptions::new(64)
+    fn descriptor_identity_is_content_probed_and_suffix_independent() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.wav");
+        wav(&source, 0.1);
+        let source_bytes = fs::read(source).unwrap();
+        let max_bytes = source_bytes.len() as u64;
+        let wav_options = StableInputOptions::new(max_bytes)
             .unwrap()
             .with_source_name_hint("same.wav");
-        let flac_options = StableInputOptions::new(64)
+        let flac_options = StableInputOptions::new(max_bytes)
             .unwrap()
             .with_source_name_hint("same.flac");
-        let wav_input = StableInput::from_bytes(b"identical", &wav_options).unwrap();
-        let flac_input = StableInput::from_bytes(b"identical", &flac_options).unwrap();
-        let request = RequestRecord::OutputDomain {
+        let wav_input = StableInput::from_bytes(&source_bytes, &wav_options).unwrap();
+        let flac_input = StableInput::from_bytes(&source_bytes, &flac_options).unwrap();
+        let wav_descriptor =
+            InputDescriptor::probe(wav_input.clone(), InputDescriptorOptions::default()).unwrap();
+        let flac_descriptor =
+            InputDescriptor::probe(flac_input.clone(), InputDescriptorOptions::default()).unwrap();
+        let wav_request = RequestRecord::OutputDomain {
             engine_id: AnalysisEngine::Fast.id().to_owned(),
-            channel_roles: None,
+            input_descriptor: InputDescriptorRecord::from_descriptor(&wav_descriptor),
             output_sample_rate_hz: None,
             resample_quality: ResampleQuality::Balanced,
         };
-        let bytes = serde_json::to_vec(&request).unwrap();
+        let flac_request = RequestRecord::OutputDomain {
+            engine_id: AnalysisEngine::Fast.id().to_owned(),
+            input_descriptor: InputDescriptorRecord::from_descriptor(&flac_descriptor),
+            output_sample_rate_hz: None,
+            resample_quality: ResampleQuality::Balanced,
+        };
+        let wav_request = serde_json::to_vec(&wav_request).unwrap();
+        let flac_request = serde_json::to_vec(&flac_request).unwrap();
 
         assert_eq!(wav_input.binding(), flac_input.binding());
-        assert_ne!(
-            hash_bound_request(&wav_input, &bytes),
-            hash_bound_request(&flac_input, &bytes)
+        assert_eq!(wav_descriptor.container(), flac_descriptor.container());
+        assert_eq!(
+            hash_bound_request(&wav_input, &wav_request),
+            hash_bound_request(&flac_input, &flac_request)
         );
     }
 
@@ -1254,6 +1422,25 @@ mod tests {
             .warning
             .as_deref()
             .is_some_and(|warning| warning.contains("result SHA-256")));
+
+        let mut self_consistent_but_mismatched: serde_json::Value =
+            serde_json::from_slice(&fs::read(&entry).unwrap()).unwrap();
+        self_consistent_but_mismatched["result"]["sample_rate_hz"] = serde_json::json!(44_100);
+        let mismatched_result: TimedAnalysisRecord =
+            serde_json::from_value(self_consistent_but_mismatched["result"].clone()).unwrap();
+        let result_sha256 = hash_bytes(&serde_json::to_vec(&mismatched_result).unwrap());
+        self_consistent_but_mismatched["result_sha256"] = serde_json::json!(result_sha256);
+        fs::write(
+            &entry,
+            serde_json::to_vec_pretty(&self_consistent_but_mismatched).unwrap(),
+        )
+        .unwrap();
+        let descriptor_repaired = cache.analyze_file(&input, None).unwrap();
+        assert_eq!(descriptor_repaired.disposition, CacheDisposition::Repaired);
+        assert!(descriptor_repaired
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("does not match its input descriptor")));
     }
 
     #[test]
@@ -1382,21 +1569,12 @@ mod tests {
         let instance: serde_json::Value =
             serde_json::from_slice(&fs::read(entry).unwrap()).unwrap();
         let schema: serde_json::Value =
-            serde_json::from_str(include_str!("../schema/analysis-cache-v3.schema.json")).unwrap();
+            serde_json::from_str(include_str!("../schema/analysis-cache-v4.schema.json")).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         assert!(validator.validate(&instance).is_ok());
 
-        let legacy_schema: serde_json::Value =
-            serde_json::from_str(include_str!("../schema/analysis-cache-v1.schema.json")).unwrap();
-        let legacy_validator = jsonschema::validator_for(&legacy_schema).unwrap();
         let mut legacy = instance.clone();
-        legacy["schema"] = serde_json::json!(ANALYSIS_CACHE_SCHEMA_V1);
-        legacy["algorithm_revision"] = serde_json::json!("forge-bs1770-5-r2");
-        legacy["request"]
-            .as_object_mut()
-            .unwrap()
-            .remove("engine_id");
-        assert!(legacy_validator.validate(&legacy).is_ok());
+        legacy["schema"] = serde_json::json!(ANALYSIS_CACHE_SCHEMA_V3);
         let legacy: CacheDocument = serde_json::from_value(legacy).unwrap();
         assert!(validate_document(
             &legacy,
@@ -1462,16 +1640,16 @@ mod tests {
             AnalysisCachePolicy::default(),
         )
         .unwrap();
+        let stable = capture_stable_input(&input).unwrap();
+        let descriptor =
+            InputDescriptor::probe(stable.clone(), InputDescriptorOptions::default()).unwrap();
         let request = RequestRecord::Range {
             engine_id: AnalysisEngine::Fast.id().to_owned(),
-            channel_roles: None,
-            start_seconds: 0.0,
-            duration_seconds: None,
+            input_descriptor: InputDescriptorRecord::from_descriptor(&descriptor),
             timeline_interval_ms: None,
         };
-        let stable = capture_stable_input(&input).unwrap();
         let error = cache
-            .lookup_or_compute(&stable, request, || {
+            .lookup_or_compute(&descriptor, request, || {
                 let measured =
                     normalize::analyze_stable_input_range(&stable, None, 0.0, None, None)?;
                 fs::write(&input, b"changed during analysis").unwrap();

@@ -56,10 +56,11 @@ fn sqlite_catalogue_records_normalization_hashes_and_exports_provenance() {
     );
 
     let connection = rusqlite::Connection::open(&database).unwrap();
-    let row: (String, String, String, String, String) = connection
+    let row: (String, String, String, String, String, String, String) = connection
         .query_row(
             "SELECT operation, source_sha256, output_sha256,
-                    measurement_standard, measurement_version
+                    measurement_standard, measurement_version,
+                    request_sha256, request_json
              FROM catalogue_entries",
             [],
             |row| {
@@ -69,6 +70,8 @@ fn sqlite_catalogue_records_normalization_hashes_and_exports_provenance() {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )
@@ -78,11 +81,15 @@ fn sqlite_catalogue_records_normalization_hashes_and_exports_provenance() {
     assert_eq!(row.2.len(), 64);
     assert_eq!(row.3, "ITU-R BS.1770-5 / EBU R 128");
     assert_eq!(row.4, "forge-bs1770-5-r4");
+    assert_eq!(row.5.len(), 64);
+    let request: serde_json::Value = serde_json::from_str(&row.6).unwrap();
+    assert_eq!(request["renderer"], "forge-native:wav");
+    assert_eq!(request["input_descriptor"]["audio_track_index"], 0);
 
     let report_value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
     let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/catalogue-report-v1.schema.json")).unwrap();
+        serde_json::from_str(include_str!("../schema/catalogue-report-v2.schema.json")).unwrap();
     assert!(jsonschema::validator_for(&schema)
         .unwrap()
         .is_valid(&report_value));
@@ -118,6 +125,20 @@ fn sqlite_catalogue_analysis_is_content_addressed_and_deduplicated() {
         "{}",
         String::from_utf8_lossy(&second.stderr)
     );
+    let ranged = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .arg("--analyze")
+        .arg("--duration")
+        .arg("0.25")
+        .arg("--catalogue")
+        .arg(&database)
+        .output()
+        .unwrap();
+    assert!(
+        ranged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ranged.stderr)
+    );
     let connection = rusqlite::Connection::open(database).unwrap();
     let count: i64 = connection
         .query_row("SELECT COUNT(*) FROM catalogue_entries", [], |row| {
@@ -131,7 +152,7 @@ fn sqlite_catalogue_analysis_is_content_addressed_and_deduplicated() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(count, 2);
     assert_eq!(output_count, 0);
 }
 
@@ -444,7 +465,7 @@ fn content_addressed_analysis_cache_is_reused_by_real_normalization() {
     assert!(String::from_utf8_lossy(&normalize.stderr).contains("analysis cache hit"));
     assert!(output.is_file());
 
-    let prefix = std::fs::read_dir(cache.join("v3"))
+    let prefix = std::fs::read_dir(cache.join("v4"))
         .unwrap()
         .next()
         .unwrap()
@@ -465,7 +486,7 @@ fn content_addressed_analysis_cache_is_reused_by_real_normalization() {
     let instance: serde_json::Value =
         serde_json::from_slice(&std::fs::read(entry).unwrap()).unwrap();
     let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/analysis-cache-v3.schema.json")).unwrap();
+        serde_json::from_str(include_str!("../schema/analysis-cache-v4.schema.json")).unwrap();
     assert!(jsonschema::validator_for(&schema)
         .unwrap()
         .is_valid(&instance));
@@ -491,7 +512,7 @@ fn dry_run_does_not_populate_analysis_cache_without_warm_cache() {
         String::from_utf8_lossy(&dry_run.stderr)
     );
     assert!(String::from_utf8_lossy(&dry_run.stderr).contains("miss; read-only"));
-    assert!(!cache.join("v3").exists());
+    assert!(!cache.join("v4").exists());
 
     let tag_dry_run = Command::new(env!("CARGO_BIN_EXE_forge"))
         .arg(&input)
@@ -507,7 +528,7 @@ fn dry_run_does_not_populate_analysis_cache_without_warm_cache() {
         String::from_utf8_lossy(&tag_dry_run.stderr)
     );
     assert!(String::from_utf8_lossy(&tag_dry_run.stderr).contains("miss; read-only"));
-    assert!(!cache.join("v3").exists());
+    assert!(!cache.join("v4").exists());
 }
 
 #[test]
@@ -549,7 +570,7 @@ fn reference_analysis_reports_engine_identity_and_uses_an_isolated_cache_entry()
         .unwrap();
     assert!(fast.status.success());
     let mut entry_count = 0;
-    for prefix in std::fs::read_dir(cache.join("v3")).unwrap() {
+    for prefix in std::fs::read_dir(cache.join("v4")).unwrap() {
         for content in std::fs::read_dir(prefix.unwrap().path()).unwrap() {
             entry_count += std::fs::read_dir(content.unwrap().path())
                 .unwrap()
@@ -1582,6 +1603,126 @@ fn m4a_output_format_is_exposed() {
         let cli = Cli::try_parse_from(["forge", "track.wav", "--format", format]).unwrap();
         assert_eq!(cli.format.as_deref(), Some(format));
     }
+}
+
+#[test]
+fn input_track_selection_and_content_probed_defaults_are_exposed() {
+    let help = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--audio-track <INDEX>"));
+
+    let directory = tempfile::tempdir().unwrap();
+    let misleading = directory.path().join("misleading.flac");
+    write_batch_test_wav(&misleading, 440.0);
+    let normalized = directory.path().join("misleading_normalized.wav");
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&misleading)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(normalized.is_file());
+    assert!(!directory.path().join("misleading_normalized.flac").exists());
+
+    let unavailable_track = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&misleading)
+        .arg("--analyze")
+        .arg("--audio-track")
+        .arg("1")
+        .output()
+        .unwrap();
+    assert!(!unavailable_track.status.success());
+    assert!(
+        String::from_utf8_lossy(&unavailable_track.stderr)
+            .contains("audio track index 1 is unavailable"),
+        "{}",
+        String::from_utf8_lossy(&unavailable_track.stderr)
+    );
+}
+
+#[test]
+fn selected_audio_track_drives_the_measured_programme() {
+    if !Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("two-audio-tracks.m4a");
+    let cache = directory.path().join("analysis-cache");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=880:sample_rate=48000:duration=2",
+            "-filter_complex",
+            "[0:a]volume=0.02[quiet];[1:a]volume=0.4[loud]",
+            "-map",
+            "[quiet]",
+            "-map",
+            "[loud]",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            input.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(generated.success());
+
+    let measure = |track: &str| {
+        let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+            .arg(&input)
+            .args(["--analyze", "--json", "--audio-track", track])
+            .arg("--analysis-cache")
+            .arg(&cache)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        report[0]["integrated_lufs"].as_f64().unwrap()
+    };
+    let quiet_lufs = measure("0");
+    let loud_lufs = measure("1");
+    assert!(
+        loud_lufs - quiet_lufs > 20.0,
+        "track selection was not reflected in loudness: quiet={quiet_lufs}, loud={loud_lufs}"
+    );
+    let mut entry_count = 0;
+    for prefix in std::fs::read_dir(cache.join("v4")).unwrap() {
+        for content in std::fs::read_dir(prefix.unwrap().path()).unwrap() {
+            entry_count += std::fs::read_dir(content.unwrap().path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                .count();
+        }
+    }
+    assert_eq!(entry_count, 2, "audio tracks must have distinct cache keys");
 }
 
 #[test]

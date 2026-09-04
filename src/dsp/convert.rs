@@ -60,6 +60,97 @@ pub(crate) fn decode_planar_into(
         });
 }
 
+/// Decode signed 24-bit little-endian PCM into exact `i32` sample codes.
+///
+/// This lane is reserved for measurement paths that must not round source
+/// values through normalized `f32` before applying the K-weighting filters.
+pub(crate) fn decode_s24_planar_into(bytes: &[u8], channels: usize, output: &mut Vec<Vec<i32>>) {
+    decode_i32_codes_planar_into(bytes, PcmKind::S24, channels, output);
+}
+
+/// Decode signed 32-bit little-endian PCM into exact `i32` sample codes.
+pub(crate) fn decode_s32_planar_into(bytes: &[u8], channels: usize, output: &mut Vec<Vec<i32>>) {
+    decode_i32_codes_planar_into(bytes, PcmKind::S32, channels, output);
+}
+
+fn decode_i32_codes_planar_into(
+    bytes: &[u8],
+    kind: PcmKind,
+    channels: usize,
+    output: &mut Vec<Vec<i32>>,
+) {
+    assert!(matches!(kind, PcmKind::S24 | PcmKind::S32));
+    assert!(channels >= 1);
+    let bytes_per_sample = kind.bytes_per_sample();
+    let frame_bytes = bytes_per_sample * channels;
+    assert_eq!(bytes.len() % frame_bytes, 0, "partial PCM frame");
+    let frames = bytes.len() / frame_bytes;
+    if output.len() != channels {
+        output.clear();
+        output.resize_with(channels, Vec::new);
+    }
+    output
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(channel, decoded)| {
+            decoded.clear();
+            decoded.reserve(frames);
+            let mut offset = channel * bytes_per_sample;
+            for _ in 0..frames {
+                let sample = match kind {
+                    PcmKind::S24 => {
+                        let unsigned = i32::from(bytes[offset])
+                            | (i32::from(bytes[offset + 1]) << 8)
+                            | (i32::from(bytes[offset + 2]) << 16);
+                        if unsigned & 0x80_0000 == 0 {
+                            unsigned
+                        } else {
+                            unsigned | !0xFF_FFFF
+                        }
+                    }
+                    PcmKind::S32 => i32::from_le_bytes([
+                        bytes[offset],
+                        bytes[offset + 1],
+                        bytes[offset + 2],
+                        bytes[offset + 3],
+                    ]),
+                    _ => unreachable!("validated exact integer PCM kind"),
+                };
+                decoded.push(sample);
+                offset += frame_bytes;
+            }
+        });
+}
+
+/// Decode IEEE-754 binary64 little-endian PCM without narrowing to `f32`.
+pub(crate) fn decode_f64_planar_into(bytes: &[u8], channels: usize, output: &mut Vec<Vec<f64>>) {
+    assert!(channels >= 1);
+    let bytes_per_sample = PcmKind::F64.bytes_per_sample();
+    let frame_bytes = bytes_per_sample * channels;
+    assert_eq!(bytes.len() % frame_bytes, 0, "partial PCM frame");
+    let frames = bytes.len() / frame_bytes;
+    if output.len() != channels {
+        output.clear();
+        output.resize_with(channels, Vec::new);
+    }
+    output
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(channel, decoded)| {
+            decoded.clear();
+            decoded.reserve(frames);
+            let mut offset = channel * bytes_per_sample;
+            for _ in 0..frames {
+                decoded.push(f64::from_le_bytes(
+                    bytes[offset..offset + bytes_per_sample]
+                        .try_into()
+                        .expect("eight-byte f64 sample"),
+                ));
+                offset += frame_bytes;
+            }
+        });
+}
+
 #[inline]
 fn decode_channel(
     bytes: &[u8],
@@ -1459,6 +1550,78 @@ fn next_uniform(rng: &mut u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_measurement_decoders_preserve_source_codes_and_binary64_bits() {
+        let s24_frames = [
+            [-8_388_608_i32, 8_388_607_i32],
+            [-1_i32, 0_i32],
+            [1_i32, 0x12_3456_i32],
+        ];
+        let mut s24_bytes = Vec::new();
+        for frame in s24_frames {
+            for sample in frame {
+                s24_bytes.extend_from_slice(&sample.to_le_bytes()[..3]);
+            }
+        }
+        let mut s24 = Vec::new();
+        decode_s24_planar_into(&s24_bytes, 2, &mut s24);
+        assert_eq!(
+            s24,
+            vec![vec![-8_388_608, -1, 1], vec![8_388_607, 0, 0x12_3456]]
+        );
+
+        let s32_frames = [
+            [i32::MIN, i32::MAX],
+            [1_073_741_824, 1_073_741_825],
+            [-1_073_741_824, -1_073_741_823],
+        ];
+        let mut s32_bytes = Vec::new();
+        for frame in s32_frames {
+            for sample in frame {
+                s32_bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+        let mut s32 = Vec::new();
+        decode_s32_planar_into(&s32_bytes, 2, &mut s32);
+        assert_eq!(
+            s32,
+            vec![
+                vec![i32::MIN, 1_073_741_824, -1_073_741_824],
+                vec![i32::MAX, 1_073_741_825, -1_073_741_823],
+            ]
+        );
+        assert_eq!(
+            1_073_741_824_i32 as f32, 1_073_741_825_i32 as f32,
+            "test values must demonstrate the old f32 collapse"
+        );
+
+        let f64_frames = [
+            [0.5_f64, f64::from_bits(0x3fe0_0000_0000_0001)],
+            [-0.0_f64, f64::MIN_POSITIVE],
+        ];
+        let mut f64_bytes = Vec::new();
+        for frame in f64_frames {
+            for sample in frame {
+                f64_bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+        let mut binary64 = Vec::new();
+        decode_f64_planar_into(&f64_bytes, 2, &mut binary64);
+        assert_eq!(
+            binary64
+                .iter()
+                .map(|channel| channel
+                    .iter()
+                    .map(|sample| sample.to_bits())
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![0.5_f64.to_bits(), (-0.0_f64).to_bits()],
+                vec![0x3fe0_0000_0000_0001, f64::MIN_POSITIVE.to_bits(),],
+            ]
+        );
+    }
 
     #[test]
     fn dither_changes_quantized_silence_for_every_integer_kind() {

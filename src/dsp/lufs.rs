@@ -1681,6 +1681,21 @@ impl ReferenceStreamingAnalyzer {
         self.inner.process_scalar_typed(planar, frames, f64::from)
     }
 
+    /// Process signed 24-bit PCM without an intermediate normalized `f32`.
+    pub fn process_s24(&mut self, planar: &[Vec<i32>]) -> Result<(), String> {
+        self.inner.process_s24(planar)
+    }
+
+    /// Process signed 32-bit PCM without an intermediate normalized `f32`.
+    pub fn process_i32(&mut self, planar: &[Vec<i32>]) -> Result<(), String> {
+        self.inner.process_i32(planar)
+    }
+
+    /// Process normalized binary64 PCM without narrowing it to `f32`.
+    pub fn process_f64(&mut self, planar: &[Vec<f64>]) -> Result<(), String> {
+        self.inner.process_f64(planar)
+    }
+
     pub fn finish(self) -> StreamingMeasurements {
         let mut measured = self.inner.finish();
         canonicalize_reference_measurements(&mut measured);

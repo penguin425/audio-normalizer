@@ -206,21 +206,22 @@ fn linear_db(value: f32) -> f64 {
 /// Remapping discards only fields that the destination tag format cannot
 /// represent.
 pub fn copy_metadata(input: &Path, output: &Path) -> Result<(), String> {
-    if matches!(
-        input
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("dsf" | "dff")
-    ) {
+    if crate::decoder::probe_audio_program(input, crate::decoder::AudioTrackSelection::Default)
+        .is_ok_and(|identity| identity.codec == crate::decoder::AudioCodec::Dsd)
+    {
         // DSF ID3 and DSDIFF DIIN/COMT metadata have no lossless, standardized
         // mapping to Forge's PCM output containers. Keep DSD handling
         // read-only instead of silently translating or dropping fields into a
         // partially equivalent tag model.
         return Ok(());
     }
-    let source = lofty::read_from_path(input)
+    let probe = lofty::probe::Probe::open(input)
+        .map_err(|error| format!("open metadata {}: {error}", input.display()))?;
+    let probe = probe
+        .guess_file_type()
+        .map_err(|error| format!("probe metadata {}: {error}", input.display()))?;
+    let source = probe
+        .read()
         .map_err(|error| format!("read metadata {}: {error}", input.display()))?;
     let Some(mut tag) = source.primary_tag().or_else(|| source.first_tag()).cloned() else {
         return Ok(());
