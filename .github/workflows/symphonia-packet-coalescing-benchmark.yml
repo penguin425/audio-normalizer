@@ -83,10 +83,31 @@ jobs:
             cargo build --locked --release --manifest-path candidate/Cargo.toml \
               --no-default-features --bin forge --bin forge-container-qc
 
-      - name: Verify exact MP3, AAC, and Vorbis results
+      - name: Verify revision-aware exact MP3, AAC, and Vorbis results
         shell: bash
         run: |
           set -euo pipefail
+          baseline_revision="$(
+            sed -n 's/^pub const MEASUREMENT_ALGORITHM_REVISION: &str = "\(.*\)";$/\1/p' \
+              baseline/src/bound_analysis.rs
+          )"
+          candidate_revision="$(
+            sed -n 's/^pub const MEASUREMENT_ALGORITHM_REVISION: &str = "\(.*\)";$/\1/p' \
+              candidate/src/bound_analysis.rs
+          )"
+          test -n "${baseline_revision}"
+          test -n "${candidate_revision}"
+          require_baseline_identity=true
+          if [[ "${baseline_revision}" != "${candidate_revision}" ]]; then
+            if [[ "${baseline_revision}" != "forge-bs1770-5-r3" || \
+                  "${candidate_revision}" != "forge-bs1770-5-r4" ]]; then
+              echo "Unapproved measurement migration: ${baseline_revision} -> ${candidate_revision}" >&2
+              exit 1
+            fi
+            require_baseline_identity=false
+            echo "Using approved r3 -> r4 fixed-oracle migration fixture"
+          fi
+
           exact_dir="${RUNNER_TEMP}/exact-output"
           mkdir "${exact_dir}"
           EXACT_DIR="${exact_dir}" python3 - <<'PY'
@@ -147,10 +168,12 @@ jobs:
               > "${exact_dir}/candidate-${extension}.json"
             "${candidate}" "${input}" --jobs 1 --analyze --json \
               > "${exact_dir}/candidate-${extension}-one.json"
-            cmp "${exact_dir}/base-${extension}.json" \
-              "${exact_dir}/candidate-${extension}.json"
             cmp "${exact_dir}/candidate-${extension}.json" \
               "${exact_dir}/candidate-${extension}-one.json"
+            if [[ "${require_baseline_identity}" == true ]]; then
+              cmp "${exact_dir}/base-${extension}.json" \
+                "${exact_dir}/candidate-${extension}.json"
+            fi
 
             "${baseline}" "${input}" --overwrite \
               -o "${exact_dir}/base-${extension}.wav"
@@ -158,10 +181,12 @@ jobs:
               -o "${exact_dir}/candidate-${extension}.wav"
             "${candidate}" "${input}" --jobs 1 --overwrite \
               -o "${exact_dir}/candidate-${extension}-one.wav"
-            cmp "${exact_dir}/base-${extension}.wav" \
-              "${exact_dir}/candidate-${extension}.wav"
             cmp "${exact_dir}/candidate-${extension}.wav" \
               "${exact_dir}/candidate-${extension}-one.wav"
+            if [[ "${require_baseline_identity}" == true ]]; then
+              cmp "${exact_dir}/base-${extension}.wav" \
+                "${exact_dir}/candidate-${extension}.wav"
+            fi
           done
 
       - name: Run thermally balanced interleaved MP3 benchmarks
@@ -409,13 +434,41 @@ jobs:
               not Path("baseline/src/stable_input.rs").is_file()
               and Path("candidate/src/stable_input.rs").is_file()
           )
+          def measurement_revision(root):
+              prefix = 'pub const MEASUREMENT_ALGORITHM_REVISION: &str = "'
+              for line in (root / "src/bound_analysis.rs").read_text(
+                  encoding="utf-8"
+              ).splitlines():
+                  if line.startswith(prefix) and line.endswith('";'):
+                      return line[len(prefix):-2]
+              raise AssertionError(f"missing measurement revision in {root}")
+
+          baseline_revision = measurement_revision(Path("baseline"))
+          candidate_revision = measurement_revision(Path("candidate"))
+          measurement_migration = (
+              baseline_revision == "forge-bs1770-5-r3"
+              and candidate_revision == "forge-bs1770-5-r4"
+          )
           # v0.189.3 deliberately adds a private copy plus content hashes and
           # live-source revalidation around the pre-existing decode work. Give
           # that one-time integrity migration a measured, bounded allowance;
           # once StableInput is present in the base, the original tight
           # regression limits automatically apply again.
-          analysis_limit = 5.0 if stable_input_migration else 3.0
-          normalization_aggregate_limit = 3.0 if stable_input_migration else 1.0
+          # v0.189.5 similarly permits at most 5% on aggregate for the one-time
+          # r3 -> r4 numerically stable accumulation migration. Use the same
+          # 8% isolated tripwire as the PCM gate to absorb hosted-runner noise;
+          # the four-value aggregate below still enforces the 5% budget.
+          # Candidate self-parity and the exact revision pair are enforced
+          # earlier in this job.
+          analysis_limit = (
+              5.0 if stable_input_migration or measurement_migration else 3.0
+          )
+          normalization_case_limit = 8.0 if measurement_migration else 3.0
+          normalization_aggregate_limit = (
+              5.0
+              if measurement_migration
+              else 3.0 if stable_input_migration else 1.0
+          )
           normalization_pooled = []
           normalization_paired = []
           for mode in ("default", "jobs_1"):
@@ -426,7 +479,11 @@ jobs:
                       values = summary[metric]
                       pooled = values["pooled_change_percent"]
                       paired = values["median_paired_round_change_percent"]
-                      limit = analysis_limit if case == "analyze" else 3.0
+                      limit = (
+                          analysis_limit
+                          if case == "analyze"
+                          else normalization_case_limit
+                      )
                       assert pooled <= limit, (mode, case, metric, "pooled", pooled)
                       assert paired <= limit, (mode, case, metric, "paired", paired)
                       if case == "normalize":
@@ -460,6 +517,8 @@ jobs:
           )
           if stable_input_migration:
               print("applied one-time StableInput integrity migration limits")
+          if measurement_migration:
+              print("applied one-time r3 -> r4 measurement migration limits")
           print(f"pooled normalization change: {pooled_aggregate:+.3f}%")
           print(f"paired normalization change: {paired_aggregate:+.3f}%")
           PY

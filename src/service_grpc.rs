@@ -538,6 +538,11 @@ fn analyze_audio(job: AnalyzeJob) -> Result<AnalyzeResponse, Status> {
     );
     report.path = filename.clone();
     check_cancelled(&cancelled)?;
+    if !report.integrated_lufs.is_finite() || !report.true_peak_dbtp.is_finite() {
+        return Err(Status::invalid_argument(
+            "the v1 response contract cannot represent a non-finite measurement",
+        ));
+    }
     let report_json = serde_json::to_string(&report)
         .map_err(|_| Status::invalid_argument("measurement contains a non-finite value"))?;
     check_cancelled(&cancelled)?;

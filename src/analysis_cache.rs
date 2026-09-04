@@ -4,7 +4,7 @@
 //! option that changes the measured signal. Entries are versioned JSON
 //! evidence documents and are committed atomically.
 
-use crate::analysis::Analysis;
+use crate::analysis::{Analysis, AnalysisEngine};
 use crate::atomic::AtomicOutput;
 use crate::bound_analysis::{
     decoder_route_descriptor, BoundAnalysis, MEASUREMENT_ALGORITHM_REVISION,
@@ -26,10 +26,12 @@ pub const ANALYSIS_CACHE_SCHEMA_V1: &str =
     "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v1";
 pub const ANALYSIS_CACHE_SCHEMA_V2: &str =
     "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v2";
+pub const ANALYSIS_CACHE_SCHEMA_V3: &str =
+    "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v3";
 pub const MEASUREMENT_STANDARD: &str = "ITU-R BS.1770-5 / EBU R 128";
 pub const ALGORITHM_REVISION: &str = MEASUREMENT_ALGORITHM_REVISION;
 
-const LAYOUT_VERSION: &str = "v2";
+const LAYOUT_VERSION: &str = "v3";
 const MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CHANNELS: usize = 1024;
 const MAX_SCAN_ENTRIES: usize = 100_000;
@@ -109,8 +111,18 @@ impl AnalysisCache {
         path: &Path,
         channel_roles: Option<&[ChannelRole]>,
     ) -> Result<Cached<Analysis>, String> {
+        self.analyze_file_with_engine(path, channel_roles, AnalysisEngine::Fast)
+    }
+
+    /// Analyze a complete source stream with an isolated engine identity.
+    pub fn analyze_file_with_engine(
+        &self,
+        path: &Path,
+        channel_roles: Option<&[ChannelRole]>,
+        engine: AnalysisEngine,
+    ) -> Result<Cached<Analysis>, String> {
         let input = capture_stable_input(path)?;
-        self.analyze_stable_range(&input, channel_roles, 0.0, None, None)
+        self.analyze_stable_range_with_engine(&input, channel_roles, 0.0, None, None, engine)
             .map(|cached| Cached {
                 value: cached.value.analysis,
                 disposition: cached.disposition,
@@ -127,20 +139,34 @@ impl AnalysisCache {
         duration_seconds: Option<f64>,
         timeline_interval_ms: Option<f64>,
     ) -> Result<Cached<TimedAnalysis>, String> {
-        let request = RequestRecord::Range {
-            channel_roles: channel_roles.map(roles_to_records),
+        self.analyze_range_with_engine(
+            path,
+            channel_roles,
             start_seconds,
             duration_seconds,
             timeline_interval_ms,
-        };
-        validate_request(&request)?;
+            AnalysisEngine::Fast,
+        )
+    }
+
+    /// Analyze a range using a cache key isolated by measurement engine.
+    pub fn analyze_range_with_engine(
+        &self,
+        path: &Path,
+        channel_roles: Option<&[ChannelRole]>,
+        start_seconds: f64,
+        duration_seconds: Option<f64>,
+        timeline_interval_ms: Option<f64>,
+        engine: AnalysisEngine,
+    ) -> Result<Cached<TimedAnalysis>, String> {
         let input = capture_stable_input(path)?;
-        self.analyze_stable_range(
+        self.analyze_stable_range_with_engine(
             &input,
             channel_roles,
             start_seconds,
             duration_seconds,
             timeline_interval_ms,
+            engine,
         )
     }
 
@@ -153,7 +179,28 @@ impl AnalysisCache {
         duration_seconds: Option<f64>,
         timeline_interval_ms: Option<f64>,
     ) -> Result<Cached<TimedAnalysis>, String> {
+        self.analyze_stable_range_with_engine(
+            input,
+            channel_roles,
+            start_seconds,
+            duration_seconds,
+            timeline_interval_ms,
+            AnalysisEngine::Fast,
+        )
+    }
+
+    /// Analyze an immutable input with an engine-isolated cache identity.
+    pub fn analyze_stable_range_with_engine(
+        &self,
+        input: &StableInput,
+        channel_roles: Option<&[ChannelRole]>,
+        start_seconds: f64,
+        duration_seconds: Option<f64>,
+        timeline_interval_ms: Option<f64>,
+        engine: AnalysisEngine,
+    ) -> Result<Cached<TimedAnalysis>, String> {
         let request = RequestRecord::Range {
+            engine_id: engine.id().to_owned(),
             channel_roles: channel_roles.map(roles_to_records),
             start_seconds,
             duration_seconds,
@@ -161,12 +208,13 @@ impl AnalysisCache {
         };
         validate_request(&request)?;
         self.lookup_or_compute(input, request, || {
-            normalize::analyze_stable_input_range(
+            normalize::analyze_stable_input_range_with_engine(
                 input,
                 channel_roles,
                 start_seconds,
                 duration_seconds,
                 timeline_interval_ms,
+                engine,
             )
         })
     }
@@ -198,6 +246,7 @@ impl AnalysisCache {
     ) -> Result<Cached<BoundAnalysis>, String> {
         plan.validate()?;
         let request = RequestRecord::OutputDomain {
+            engine_id: AnalysisEngine::Fast.id().to_owned(),
             channel_roles: channel_roles.map(roles_to_records),
             output_sample_rate_hz: plan.output_sample_rate,
             resample_quality: plan.resample_quality,
@@ -267,7 +316,7 @@ impl AnalysisCache {
                 .map_err(|error| format!("encode analysis cache result: {error}"))?,
         );
         let document = CacheDocument {
-            schema: ANALYSIS_CACHE_SCHEMA_V2.to_owned(),
+            schema: ANALYSIS_CACHE_SCHEMA_V3.to_owned(),
             generator: format!("forge-normalizer/{}", env!("CARGO_PKG_VERSION")),
             measurement_standard: MEASUREMENT_STANDARD.to_owned(),
             algorithm_revision: ALGORITHM_REVISION.to_owned(),
@@ -367,7 +416,7 @@ impl AnalysisCache {
             Ok(document) => document,
             Err(error) => {
                 return Ok(LoadResult::Invalid(format!(
-                    "cache entry is not valid v2 JSON: {error}"
+                    "cache entry is not valid v3 JSON: {error}"
                 )));
             }
         };
@@ -524,12 +573,16 @@ struct CacheDocument {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum RequestRecord {
     Range {
+        #[serde(default = "default_fast_engine_id")]
+        engine_id: String,
         channel_roles: Option<Vec<ChannelRoleRecord>>,
         start_seconds: f64,
         duration_seconds: Option<f64>,
         timeline_interval_ms: Option<f64>,
     },
     OutputDomain {
+        #[serde(default = "default_fast_engine_id")]
+        engine_id: String,
         channel_roles: Option<Vec<ChannelRoleRecord>>,
         output_sample_rate_hz: Option<u32>,
         resample_quality: ResampleQuality,
@@ -729,7 +782,7 @@ fn validate_document(
     request_hash: &str,
     request: &RequestRecord,
 ) -> Result<(), String> {
-    if document.schema != ANALYSIS_CACHE_SCHEMA_V2 {
+    if document.schema != ANALYSIS_CACHE_SCHEMA_V3 {
         return Err("cache entry has an unsupported schema".into());
     }
     if document.generator.is_empty() || document.generator.len() > 256 {
@@ -758,11 +811,13 @@ fn validate_document(
 fn validate_request(request: &RequestRecord) -> Result<(), String> {
     let roles = match request {
         RequestRecord::Range {
+            engine_id,
             channel_roles,
             start_seconds,
             duration_seconds,
             timeline_interval_ms,
         } => {
+            validate_engine_id(engine_id)?;
             if !start_seconds.is_finite() || *start_seconds < 0.0 {
                 return Err("analysis cache start must be finite and non-negative".into());
             }
@@ -775,10 +830,14 @@ fn validate_request(request: &RequestRecord) -> Result<(), String> {
             channel_roles
         }
         RequestRecord::OutputDomain {
+            engine_id,
             channel_roles,
             output_sample_rate_hz,
             ..
         } => {
+            if engine_id != AnalysisEngine::Fast.id() {
+                return Err("output-domain cache entries require the fast engine".into());
+            }
             if output_sample_rate_hz == &Some(0) {
                 return Err("analysis cache output sample rate must be positive".into());
             }
@@ -794,6 +853,20 @@ fn validate_request(request: &RequestRecord) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn validate_engine_id(engine_id: &str) -> Result<(), String> {
+    if [AnalysisEngine::Fast.id(), AnalysisEngine::Reference.id()].contains(&engine_id) {
+        Ok(())
+    } else {
+        Err(format!(
+            "analysis cache uses an unsupported engine ID: {engine_id}"
+        ))
+    }
+}
+
+fn default_fast_engine_id() -> String {
+    AnalysisEngine::Fast.id().to_owned()
 }
 
 fn validate_timed_analysis(value: &TimedAnalysis) -> Result<(), String> {
@@ -1120,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn decoder_route_is_part_of_the_cache_address_without_changing_v2_schema() {
+    fn decoder_route_is_part_of_the_cache_address_without_changing_v3_schema() {
         let wav_options = StableInputOptions::new(64)
             .unwrap()
             .with_source_name_hint("same.wav");
@@ -1130,6 +1203,7 @@ mod tests {
         let wav_input = StableInput::from_bytes(b"identical", &wav_options).unwrap();
         let flac_input = StableInput::from_bytes(b"identical", &flac_options).unwrap();
         let request = RequestRecord::OutputDomain {
+            engine_id: AnalysisEngine::Fast.id().to_owned(),
             channel_roles: None,
             output_sample_rate_hz: None,
             resample_quality: ResampleQuality::Balanced,
@@ -1308,7 +1382,7 @@ mod tests {
         let instance: serde_json::Value =
             serde_json::from_slice(&fs::read(entry).unwrap()).unwrap();
         let schema: serde_json::Value =
-            serde_json::from_str(include_str!("../schema/analysis-cache-v2.schema.json")).unwrap();
+            serde_json::from_str(include_str!("../schema/analysis-cache-v3.schema.json")).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         assert!(validator.validate(&instance).is_ok());
 
@@ -1318,6 +1392,10 @@ mod tests {
         let mut legacy = instance.clone();
         legacy["schema"] = serde_json::json!(ANALYSIS_CACHE_SCHEMA_V1);
         legacy["algorithm_revision"] = serde_json::json!("forge-bs1770-5-r2");
+        legacy["request"]
+            .as_object_mut()
+            .unwrap()
+            .remove("engine_id");
         assert!(legacy_validator.validate(&legacy).is_ok());
         let legacy: CacheDocument = serde_json::from_value(legacy).unwrap();
         assert!(validate_document(
@@ -1335,6 +1413,46 @@ mod tests {
     }
 
     #[test]
+    fn reference_and_fast_engines_use_distinct_cache_addresses() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("tone.wav");
+        wav(&input, 0.1);
+        let cache = AnalysisCache::new(
+            directory.path().join("cache"),
+            AnalysisCachePolicy::default(),
+        )
+        .unwrap();
+
+        cache
+            .analyze_file_with_engine(&input, None, AnalysisEngine::Fast)
+            .unwrap();
+        cache
+            .analyze_file_with_engine(&input, None, AnalysisEngine::Reference)
+            .unwrap();
+        let mut entries = cache.recognized_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        let mut engine_ids = entries
+            .drain(..)
+            .map(|entry| {
+                let document: CacheDocument =
+                    serde_json::from_slice(&fs::read(entry.path).unwrap()).unwrap();
+                match document.request {
+                    RequestRecord::Range { engine_id, .. } => engine_id,
+                    RequestRecord::OutputDomain { .. } => panic!("expected range request"),
+                }
+            })
+            .collect::<Vec<_>>();
+        engine_ids.sort();
+        assert_eq!(
+            engine_ids,
+            [
+                AnalysisEngine::Fast.id().to_owned(),
+                AnalysisEngine::Reference.id().to_owned(),
+            ]
+        );
+    }
+
+    #[test]
     fn input_changed_during_measurement_is_not_cached() {
         let directory = tempfile::tempdir().unwrap();
         let input = directory.path().join("tone.wav");
@@ -1345,6 +1463,7 @@ mod tests {
         )
         .unwrap();
         let request = RequestRecord::Range {
+            engine_id: AnalysisEngine::Fast.id().to_owned(),
             channel_roles: None,
             start_seconds: 0.0,
             duration_seconds: None,

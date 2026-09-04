@@ -6,6 +6,8 @@
 
 use crate::dsp::kwfilter::KWeight;
 use crate::dsp::lufs::channel_weight;
+use crate::dsp::pcm::{self, PlanarChunkMessages};
+use crate::dsp::sum::CompensatedSum;
 use crate::dsp::truepeak::TruePeakMeter;
 use crate::wav::ChannelRole;
 
@@ -31,8 +33,8 @@ pub struct RealtimeMeter {
     position: usize,
     filled: usize,
     momentary_window: usize,
-    momentary_sum: f64,
-    short_term_sum: f64,
+    momentary_sum: CompensatedSum,
+    short_term_sum: CompensatedSum,
     frames: u64,
     sample_peak: f32,
 }
@@ -46,8 +48,8 @@ impl RealtimeMeter {
             return Err("real-time meter requires at least one channel".into());
         }
         let channels = roles.len();
-        let momentary_window = ((sample_rate as usize * 4) / 10).max(1);
-        let short_term_window = (sample_rate as usize * 3).max(1);
+        let momentary_window = crate::dsp::lufs::rounded_tenth_frames(sample_rate, 4)?.max(1);
+        let short_term_window = crate::dsp::lufs::rounded_tenth_frames(sample_rate, 30)?.max(1);
         Ok(Self {
             sample_rate,
             roles,
@@ -61,8 +63,8 @@ impl RealtimeMeter {
             position: 0,
             filled: 0,
             momentary_window,
-            momentary_sum: 0.0,
-            short_term_sum: 0.0,
+            momentary_sum: CompensatedSum::new(),
+            short_term_sum: CompensatedSum::new(),
             frames: 0,
             sample_peak: 0.0,
         })
@@ -78,57 +80,57 @@ impl RealtimeMeter {
 
     #[allow(clippy::needless_range_loop)] // frame-major traversal without iterator allocation
     pub fn process_planar(&mut self, planar: &[&[f32]]) -> Result<(), String> {
-        if planar.len() != self.channels() {
-            return Err("real-time meter channel count changed".into());
-        }
-        let chunk_frames = planar.first().map_or(0, |channel| channel.len());
-        if planar.iter().any(|channel| channel.len() != chunk_frames) {
-            return Err("real-time meter channel length mismatch".into());
-        }
+        let consumed_frames = usize::try_from(self.frames)
+            .map_err(|_| "real-time meter frame count exceeds this platform".to_string())?;
+        let chunk_frames = pcm::validate_planar_chunk(
+            planar,
+            self.channels(),
+            consumed_frames,
+            |sample| !sample.is_finite(),
+            "non-finite sample",
+            PlanarChunkMessages {
+                channel_count: "real-time meter channel count changed",
+                channel_length: "real-time meter channel length mismatch",
+                frame_overflow: "real-time meter frame count overflow",
+            },
+        )?;
         for (meter, channel) in self.true_peak.iter_mut().zip(planar) {
             meter.process(channel);
         }
         for frame in 0..chunk_frames {
-            let mut weighted = 0.0;
+            let mut weighted = CompensatedSum::new();
             for channel in 0..self.channels() {
                 let sample = planar[channel][frame];
                 self.sample_peak = self.sample_peak.max(sample.abs());
                 let filtered = self.filters[channel].process(sample) as f64;
-                weighted += channel_weight(self.roles[channel]) * filtered * filtered;
+                weighted.add(channel_weight(self.roles[channel]) * filtered * filtered);
             }
-
-            if self.filled >= self.momentary_window {
-                let index =
-                    (self.position + self.energy.len() - self.momentary_window) % self.energy.len();
-                self.momentary_sum -= self.energy[index];
-            }
-            if self.filled == self.energy.len() {
-                self.short_term_sum -= self.energy[self.position];
-            }
-            self.energy[self.position] = weighted;
-            self.momentary_sum += weighted;
-            self.short_term_sum += weighted;
-            self.position = (self.position + 1) % self.energy.len();
-            self.filled = (self.filled + 1).min(self.energy.len());
-            self.frames += 1;
+            self.push_energy(weighted.total());
         }
         Ok(())
     }
 
     /// Process frame-major interleaved samples without allocating.
     pub fn process_interleaved(&mut self, samples: &[f32]) -> Result<(), String> {
-        if !samples.len().is_multiple_of(self.channels()) {
-            return Err("real-time meter interleaved buffer is not frame-aligned".into());
-        }
+        let consumed_frames = usize::try_from(self.frames)
+            .map_err(|_| "real-time meter frame count exceeds this platform".to_string())?;
+        pcm::validate_interleaved_chunk(
+            samples,
+            self.channels(),
+            consumed_frames,
+            |sample| !sample.is_finite(),
+            "non-finite sample",
+            "real-time meter interleaved buffer is not frame-aligned",
+        )?;
         for frame in samples.chunks_exact(self.channels()) {
-            let mut weighted = 0.0;
+            let mut weighted = CompensatedSum::new();
             for (channel, sample) in frame.iter().copied().enumerate() {
                 self.sample_peak = self.sample_peak.max(sample.abs());
                 self.true_peak[channel].process_sample(sample);
                 let filtered = self.filters[channel].process(sample) as f64;
-                weighted += channel_weight(self.roles[channel]) * filtered * filtered;
+                weighted.add(channel_weight(self.roles[channel]) * filtered * filtered);
             }
-            self.push_energy(weighted);
+            self.push_energy(weighted.total());
         }
         Ok(())
     }
@@ -137,14 +139,14 @@ impl RealtimeMeter {
         if self.filled >= self.momentary_window {
             let index =
                 (self.position + self.energy.len() - self.momentary_window) % self.energy.len();
-            self.momentary_sum -= self.energy[index];
+            self.momentary_sum.subtract(self.energy[index]);
         }
         if self.filled == self.energy.len() {
-            self.short_term_sum -= self.energy[self.position];
+            self.short_term_sum.subtract(self.energy[self.position]);
         }
         self.energy[self.position] = weighted;
-        self.momentary_sum += weighted;
-        self.short_term_sum += weighted;
+        self.momentary_sum.add(weighted);
+        self.short_term_sum.add(weighted);
         self.position = (self.position + 1) % self.energy.len();
         self.filled = (self.filled + 1).min(self.energy.len());
         self.frames += 1;
@@ -154,11 +156,15 @@ impl RealtimeMeter {
         RealtimeMeasurement {
             frames: self.frames,
             momentary_lufs: window_loudness(
-                self.momentary_sum,
+                self.momentary_sum.total(),
                 self.filled.min(self.momentary_window),
                 self.momentary_window,
             ),
-            short_term_lufs: window_loudness(self.short_term_sum, self.filled, self.energy.len()),
+            short_term_lufs: window_loudness(
+                self.short_term_sum.total(),
+                self.filled,
+                self.energy.len(),
+            ),
             sample_peak_dbfs: amplitude_db(self.sample_peak),
             true_peak_dbtp: amplitude_db(
                 self.true_peak
@@ -179,8 +185,8 @@ impl RealtimeMeter {
         self.energy.fill(0.0);
         self.position = 0;
         self.filled = 0;
-        self.momentary_sum = 0.0;
-        self.short_term_sum = 0.0;
+        self.momentary_sum = CompensatedSum::new();
+        self.short_term_sum = CompensatedSum::new();
         self.frames = 0;
         self.sample_peak = 0.0;
     }
@@ -228,6 +234,7 @@ pub struct RealtimeGainProcessor {
     limiter_envelope: f32,
     limiter_hold_frames: usize,
     max_reduction_db: f64,
+    frames: usize,
 }
 
 impl RealtimeGainProcessor {
@@ -272,6 +279,7 @@ impl RealtimeGainProcessor {
             limiter_envelope: 1.0,
             limiter_hold_frames: 0,
             max_reduction_db: 0.0,
+            frames: 0,
         })
     }
 
@@ -319,9 +327,14 @@ impl RealtimeGainProcessor {
     }
 
     pub fn process_interleaved(&mut self, samples: &mut [f32]) -> Result<(), String> {
-        if !samples.len().is_multiple_of(self.channels) {
-            return Err("interleaved buffer is not frame-aligned".into());
-        }
+        let chunk_frames = pcm::validate_interleaved_chunk(
+            samples,
+            self.channels,
+            self.frames,
+            |sample| !sample.is_finite(),
+            "non-finite sample",
+            "interleaved buffer is not frame-aligned",
+        )?;
         for frame in samples.chunks_exact_mut(self.channels) {
             let coefficient = if self.target_gain < self.current_gain {
                 self.attack_coefficient
@@ -342,6 +355,7 @@ impl RealtimeGainProcessor {
             }
             self.delay_frame = (self.delay_frame + 1) % self.lookahead_frames;
         }
+        self.frames += chunk_frames;
         Ok(())
     }
 
@@ -438,6 +452,56 @@ mod tests {
         assert!((a.momentary_lufs - b.momentary_lufs).abs() < 1e-10);
         assert!((a.short_term_lufs - b.short_term_lufs).abs() < 1e-10);
         assert!((a.true_peak_dbtp - b.true_peak_dbtp).abs() < 1e-10);
+    }
+
+    #[test]
+    fn meter_rejects_non_finite_chunks_without_advancing() {
+        let prefix = vec![0.1_f32; 257];
+        let suffix = vec![-0.2_f32; 509];
+        let mut candidate = RealtimeMeter::new(48_000, vec![ChannelRole::Main]).unwrap();
+        candidate.process_planar(&[&prefix]).unwrap();
+        let rejected = [0.3, f32::NAN, 0.4];
+        assert_eq!(
+            candidate.process_planar(&[&rejected]).unwrap_err(),
+            "non-finite sample at frame 258, channel 0"
+        );
+        candidate.process_planar(&[&suffix]).unwrap();
+
+        let mut expected = RealtimeMeter::new(48_000, vec![ChannelRole::Main]).unwrap();
+        expected.process_planar(&[&prefix]).unwrap();
+        expected.process_planar(&[&suffix]).unwrap();
+        assert_eq!(candidate.measurement(), expected.measurement());
+    }
+
+    #[test]
+    fn gain_processor_rejects_the_whole_chunk_before_mutating_samples_or_state() {
+        let config = RealtimeGainConfig::default();
+        let mut candidate = RealtimeGainProcessor::new(48_000, 2, config).unwrap();
+        let mut rejected = [0.1, 0.2, 0.3, f32::INFINITY, 0.4, 0.5];
+        let before = rejected.map(f32::to_bits);
+        assert_eq!(
+            candidate.process_interleaved(&mut rejected).unwrap_err(),
+            "non-finite sample at frame 1, channel 1"
+        );
+        assert_eq!(rejected.map(f32::to_bits), before);
+
+        let mut candidate_audio = vec![0.2_f32; 1_024];
+        let mut expected_audio = candidate_audio.clone();
+        candidate.process_interleaved(&mut candidate_audio).unwrap();
+        let mut expected = RealtimeGainProcessor::new(48_000, 2, config).unwrap();
+        expected.process_interleaved(&mut expected_audio).unwrap();
+        assert_eq!(
+            candidate_audio
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected_audio
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(candidate.current_gain_db(), expected.current_gain_db());
+        assert_eq!(candidate.max_reduction_db(), expected.max_reduction_db());
     }
 
     #[test]

@@ -6,6 +6,37 @@
 use crate::dsp::{lufs, truepeak};
 use crate::wav::{AudioBuffer, ChannelRole, PcmKind};
 
+/// Measurement implementation selected for analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisEngine {
+    /// SIMD/parallel production engine.
+    Fast,
+    /// CPU-only scalar engine with committed coefficient bits and fixed order.
+    Reference,
+}
+
+impl AnalysisEngine {
+    /// Stable identifier recorded in reports and cache identities.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Fast => "forge-fast-bs1770-r4",
+            Self::Reference => "forge-reference-bs1770-r1",
+        }
+    }
+}
+
+impl std::str::FromStr for AnalysisEngine {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "fast" => Ok(Self::Fast),
+            "reference" => Ok(Self::Reference),
+            _ => Err(format!("unsupported analysis engine: {value}")),
+        }
+    }
+}
+
 /// Loudness/peak analysis of a single audio stream.
 #[derive(Debug, Clone)]
 pub struct Analysis {
@@ -81,4 +112,30 @@ pub fn analyze(buf: &AudioBuffer) -> Analysis {
         true_peak,
         loudness_blocks: ebu.gating_blocks,
     }
+}
+
+/// Analyze a decoded buffer with an explicitly identified engine.
+pub fn analyze_with_engine(buf: &AudioBuffer, engine: AnalysisEngine) -> Result<Analysis, String> {
+    if engine == AnalysisEngine::Fast {
+        return Ok(analyze(buf));
+    }
+    let mut analyzer =
+        lufs::ReferenceStreamingAnalyzer::new(buf.sample_rate, buf.channel_roles.clone())?;
+    analyzer.process(&buf.data)?;
+    let measured = analyzer.finish();
+    Ok(Analysis {
+        sample_rate: buf.sample_rate,
+        channels: buf.channels,
+        channel_roles: buf.channel_roles.clone(),
+        frames: measured.frames,
+        kind: buf.source_kind,
+        lufs: measured.ebu.integrated_lufs,
+        max_momentary_lufs: measured.ebu.max_momentary_lufs,
+        max_short_term_lufs: measured.ebu.max_short_term_lufs,
+        loudness_range_lu: measured.ebu.loudness_range_lu,
+        rms_db: measured.rms_db,
+        sample_peak: measured.sample_peak,
+        true_peak: measured.true_peak,
+        loudness_blocks: measured.ebu.gating_blocks,
+    })
 }

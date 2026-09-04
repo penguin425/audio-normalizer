@@ -1,8 +1,8 @@
 //! Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer.
 
-use clap::{Arg, ArgAction, CommandFactory};
+use clap::{Arg, ArgAction};
 use forge_normalizer::adm::{self, ReferenceRendererOptions};
-use forge_normalizer::analysis::Analysis;
+use forge_normalizer::analysis::{Analysis, AnalysisEngine};
 use forge_normalizer::analysis_cache::{
     AnalysisCache, AnalysisCachePolicy, CacheDisposition, Cached,
 };
@@ -69,6 +69,23 @@ struct CatalogueOptions {
     report: Option<PathBuf>,
 }
 
+#[derive(Debug)]
+struct AnalysisInvocationOptions {
+    engine: AnalysisEngine,
+    anomaly_audits: Vec<PathBuf>,
+    ebu_qc_xml: Option<PathBuf>,
+}
+
+impl AnalysisInvocationOptions {
+    fn engine_only(engine: AnalysisEngine) -> Self {
+        Self {
+            engine,
+            anomaly_audits: Vec::new(),
+            ebu_qc_xml: None,
+        }
+    }
+}
+
 impl CacheOptions {
     fn open(&self) -> Result<Option<AnalysisCache>, String> {
         let Some(directory) = &self.directory else {
@@ -90,7 +107,7 @@ impl CacheOptions {
 }
 
 fn main() -> ExitCode {
-    let matches = cli::Cli::command()
+    let matches = cli::Cli::command_with_analysis_engine()
         .arg(
             Arg::new("true_peak_backend")
                 .long("true-peak-backend")
@@ -298,8 +315,16 @@ fn main() -> ExitCode {
         database: matches.get_one::<PathBuf>("catalogue").cloned(),
         report: matches.get_one::<PathBuf>("catalogue_report").cloned(),
     };
-    let cli = match cli::Cli::from_matches_with_config(&matches) {
-        Ok(cli) => cli,
+    let (cli, analysis_engine) =
+        match cli::Cli::from_matches_with_config_and_analysis_engine(&matches) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                eprintln!("forge: error: {error}");
+                return ExitCode::from(2);
+            }
+        };
+    let analysis_engine = match analysis_engine.parse::<AnalysisEngine>() {
+        Ok(engine) => engine,
         Err(error) => {
             eprintln!("forge: error: {error}");
             return ExitCode::from(2);
@@ -316,8 +341,11 @@ fn main() -> ExitCode {
         cache_options,
         watch_options,
         catalogue_options,
-        anomaly_audits,
-        ebu_qc_xml,
+        AnalysisInvocationOptions {
+            engine: analysis_engine,
+            anomaly_audits,
+            ebu_qc_xml,
+        },
     );
     if backend == forge_normalizer::dsp::lufs::TruePeakBackend::Cuda {
         if let Some(reason) = forge_normalizer::dsp::lufs::cuda_runtime_fallback_reason() {
@@ -366,11 +394,16 @@ fn run(
     cache_options: CacheOptions,
     watch_options: WatchOptions,
     catalogue_options: CatalogueOptions,
-    anomaly_audits: Vec<PathBuf>,
-    ebu_qc_xml: Option<PathBuf>,
+    analysis_options: AnalysisInvocationOptions,
 ) -> Result<(), String> {
     if watch_options.enabled {
-        return run_watch(cli, cache_options, watch_options, anomaly_audits);
+        return run_watch(
+            cli,
+            analysis_options.engine,
+            cache_options,
+            watch_options,
+            analysis_options.anomaly_audits,
+        );
     }
     let pipeline = PipelineFiles::prepare(&mut cli, &batch_options)?;
     run_paths(
@@ -379,14 +412,14 @@ fn run(
         &batch_options,
         &cache_options,
         &catalogue_options,
-        &anomaly_audits,
-        ebu_qc_xml.as_deref(),
+        &analysis_options,
     )?;
     pipeline.emit_stdout()
 }
 
 fn run_watch(
     mut cli: cli::Cli,
+    analysis_engine: AnalysisEngine,
     cache_options: CacheOptions,
     options: WatchOptions,
     anomaly_audits: Vec<PathBuf>,
@@ -441,9 +474,14 @@ fn run_watch(
         let candidates = watch.scan()?;
         let mut failures = Vec::new();
         for candidate in candidates {
-            if let Err(error) =
-                process_watch_candidate(&cli, &cache_options, &mut watch, &candidate, &output_root)
-            {
+            if let Err(error) = process_watch_candidate(
+                &cli,
+                analysis_engine,
+                &cache_options,
+                &mut watch,
+                &candidate,
+                &output_root,
+            ) {
                 watch.mark_failed(&candidate.id, &error)?;
                 eprintln!("watch failed: {}: {error}", candidate.input.display());
                 failures.push(error);
@@ -462,6 +500,7 @@ fn run_watch(
 
 fn process_watch_candidate(
     template: &cli::Cli,
+    analysis_engine: AnalysisEngine,
     cache_options: &CacheOptions,
     watch: &mut WatchFolder,
     candidate: &WatchCandidate,
@@ -491,14 +530,14 @@ fn process_watch_candidate(
     cli.output = Some(output);
     cli.recursive = false;
     cli.overwrite = true;
+    let analysis_options = AnalysisInvocationOptions::engine_only(analysis_engine);
     let result = run_paths(
         cli,
         false,
         &BatchOptions::default(),
         cache_options,
         &CatalogueOptions::default(),
-        &[],
-        None,
+        &analysis_options,
     );
     match result {
         Ok(()) => watch.mark_completed(&candidate.id),
@@ -543,9 +582,11 @@ fn run_paths(
     batch_options: &BatchOptions,
     cache_options: &CacheOptions,
     catalogue_options: &CatalogueOptions,
-    anomaly_audit_paths: &[PathBuf],
-    ebu_qc_xml: Option<&Path>,
+    analysis_options: &AnalysisInvocationOptions,
 ) -> Result<(), String> {
+    let analysis_engine = analysis_options.engine;
+    let anomaly_audit_paths = &analysis_options.anomaly_audits;
+    let ebu_qc_xml = analysis_options.ebu_qc_xml.as_deref();
     if let Some(j) = cli.jobs {
         ThreadPoolBuilder::new()
             .num_threads(j)
@@ -555,6 +596,16 @@ fn run_paths(
 
     let (expanded, relative_paths) = expand_inputs(&cli.inputs, cli.recursive)?;
     cli.inputs = expanded;
+    if analysis_engine == AnalysisEngine::Reference && !cli.analyze_only {
+        return Err("--analysis-engine reference requires --analyze".into());
+    }
+    if analysis_engine == AnalysisEngine::Reference
+        && (cli.auto_dialogue || cli.dialogue_ranges.is_some() || cli.dialogue_stem.is_some())
+    {
+        return Err(
+            "reference analysis cannot be combined with dialogue analysis in this release".into(),
+        );
+    }
 
     let anomaly_audits = if anomaly_audit_paths.is_empty() {
         Vec::new()
@@ -940,6 +991,7 @@ fn run_paths(
                 start_seconds,
                 cli.duration_seconds,
                 analysis_timeline_interval_ms,
+                analysis_engine,
             )?;
             let an = timed.analysis;
             let detection = cli
@@ -1237,6 +1289,9 @@ fn run_paths(
                 reports.push(report);
             } else {
                 print_analysis(input, &an, None);
+                if analysis_engine == AnalysisEngine::Reference {
+                    eprintln!("  analysis engine: {}", analysis_engine.id());
+                }
                 if let Some(dialogue) = &dialogue {
                     eprintln!(
                         "  dialogue: {:.2} LUFS across {} range(s), {:.3} s\n    source: {:?}\n    standard: {}\n    method: {}\n    LDR: {:.2} LU",
@@ -1413,37 +1468,43 @@ fn run_paths(
         if cli.json {
             let stdout = io::stdout();
             let mut output = stdout.lock();
-            report::write_json(&mut output, &reports)?;
+            report::write_json_with_engine(&mut output, &reports, analysis_engine)?;
             writeln!(output).map_err(|error| format!("write stdout: {error}"))?;
         } else if cli.ndjson {
             let stdout = io::stdout();
-            report::write_ndjson(stdout.lock(), &reports)?;
+            report::write_ndjson_with_engine(stdout.lock(), &reports, analysis_engine)?;
         } else if let Some(path) = &cli.csv {
             if path.as_os_str() == "-" {
                 let stdout = io::stdout();
-                report::write_csv(stdout.lock(), &reports)?;
+                report::write_csv_with_engine(stdout.lock(), &reports, analysis_engine)?;
             } else {
                 let file = File::create(path)
                     .map_err(|error| format!("create {}: {error}", path.display()))?;
-                report::write_csv(file, &reports)?;
+                report::write_csv_with_engine(file, &reports, analysis_engine)?;
             }
         }
         if let Some(path) = &cli.timeline {
-            write_timeline(path, &timeline_reports)?;
+            write_timeline(path, &timeline_reports, analysis_engine)?;
         }
         if let Some(path) = &cli.manifest {
             if path.as_os_str() == "-" {
                 let stdout = io::stdout();
-                report::write_manifest_with_anomaly_audits(
+                report::write_manifest_with_engine_and_anomaly_audits(
                     stdout.lock(),
                     &reports,
                     &anomaly_audits,
+                    analysis_engine,
                 )?;
                 println!();
             } else {
                 let file = File::create(path)
                     .map_err(|error| format!("create {}: {error}", path.display()))?;
-                report::write_manifest_with_anomaly_audits(file, &reports, &anomaly_audits)?;
+                report::write_manifest_with_engine_and_anomaly_audits(
+                    file,
+                    &reports,
+                    &anomaly_audits,
+                    analysis_engine,
+                )?;
             }
         }
         if let Some(path) = &cli.dialogue_detection_report {
@@ -2284,16 +2345,20 @@ fn write_difference_report(
     normalization_diff::write_report(path, &NormalizationDifferenceReport::new(assets))
 }
 
-fn write_timeline(path: &Path, reports: &[TimelineReport]) -> Result<(), String> {
+fn write_timeline(
+    path: &Path,
+    reports: &[TimelineReport],
+    engine: AnalysisEngine,
+) -> Result<(), String> {
     let format = path
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or("ndjson")
         .to_ascii_lowercase();
     let write = |writer: &mut dyn Write| match format.as_str() {
-        "json" => report::write_timeline_json(writer, reports),
-        "csv" => report::write_timeline_csv(writer, reports),
-        "ndjson" | "jsonl" => report::write_timeline_ndjson(writer, reports),
+        "json" => report::write_timeline_json_with_engine(writer, reports, engine),
+        "csv" => report::write_timeline_csv_with_engine(writer, reports, engine),
+        "ndjson" | "jsonl" => report::write_timeline_ndjson_with_engine(writer, reports, engine),
         _ => Err("--timeline path must end in .json, .ndjson, .jsonl, or .csv".into()),
     };
     if path.as_os_str() == "-" {
@@ -2765,24 +2830,27 @@ fn analyze_range_cached(
     start_seconds: f64,
     duration_seconds: Option<f64>,
     timeline_interval_ms: Option<f64>,
+    engine: AnalysisEngine,
 ) -> Result<normalize::TimedAnalysis, String> {
     if let Some(cache) = cache {
         return cache
-            .analyze_range(
+            .analyze_range_with_engine(
                 input,
                 channel_roles,
                 start_seconds,
                 duration_seconds,
                 timeline_interval_ms,
+                engine,
             )
             .map(|cached| observe_cache(input, cached));
     }
-    normalize::analyze_file_range_with_roles(
+    normalize::analyze_file_range_with_roles_and_engine(
         input,
         channel_roles,
         start_seconds,
         duration_seconds,
         timeline_interval_ms,
+        engine,
     )
 }
 

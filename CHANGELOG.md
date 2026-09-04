@@ -8,6 +8,33 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.189.5 - 2026-09-04
+
+### Added
+
+- Add an opt-in `--analysis-engine reference` path with committed K-weighting
+  and True Peak coefficient bits, scalar fixed-order processing, canonical
+  nanodecibel reports, explicit engine IDs, and engine-isolated cache entries.
+- Add transactional U8, S16, S24, S32, and F64 streaming-analysis ingress and
+  shared non-finite PCM preflight for offline and real-time processors.
+- Publish analysis-cache schema v3, delivery-manifest schema v4, and bounded
+  service-analysis response v2. Core JSON measurement contracts now
+  distinguish finite numbers, measured digital silence (`"-inf"`), and
+  undefined values (`null`).
+
+### Changed
+
+- Derive all 100 ms loudness-grid boundaries from exact rational indices and
+  use fixed-order numerically stable sums across window, channel, gate, RMS,
+  album, dialogue, and real-time energy reductions. The common `f32` path uses
+  chunk-independent partials with compensated aggregation and periodic
+  rolling-window rebasing; the reference path remains strictly compensated
+  per value. The measurement revision is now `forge-bs1770-5-r4`.
+- Keep the reproducible stereo fast path within its performance budget by
+  sharing the absolute frame ordinal across paired energy reductions and
+  amortizing compensated rolling-window rebases over `2^24` frames. A full
+  interval remains within one nanoloudness unit of a compensated rebase.
+
 ## 0.189.4 - 2026-09-03
 
 ### Added

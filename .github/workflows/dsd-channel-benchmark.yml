@@ -85,10 +85,31 @@ jobs:
             cargo build --locked --release --manifest-path candidate/Cargo.toml \
               --no-default-features --bin forge --bin forge-container-qc
 
-      - name: Verify exact analysis and one-worker fallback
+      - name: Verify revision-aware exact analysis and one-worker fallback
         shell: bash
         run: |
           set -euo pipefail
+          baseline_revision="$(
+            sed -n 's/^pub const MEASUREMENT_ALGORITHM_REVISION: &str = "\(.*\)";$/\1/p' \
+              baseline/src/bound_analysis.rs
+          )"
+          candidate_revision="$(
+            sed -n 's/^pub const MEASUREMENT_ALGORITHM_REVISION: &str = "\(.*\)";$/\1/p' \
+              candidate/src/bound_analysis.rs
+          )"
+          test -n "${baseline_revision}"
+          test -n "${candidate_revision}"
+          require_baseline_identity=true
+          if [[ "${baseline_revision}" != "${candidate_revision}" ]]; then
+            if [[ "${baseline_revision}" != "forge-bs1770-5-r3" || \
+                  "${candidate_revision}" != "forge-bs1770-5-r4" ]]; then
+              echo "Unapproved measurement migration: ${baseline_revision} -> ${candidate_revision}" >&2
+              exit 1
+            fi
+            require_baseline_identity=false
+            echo "Using approved r3 -> r4 fixed-oracle migration fixture"
+          fi
+
           exact_dir="${RUNNER_TEMP}/exact-output"
           mkdir "${exact_dir}"
           EXACT_DIR="${exact_dir}" python3 - <<'PY'
@@ -113,10 +134,12 @@ jobs:
               > "${exact_dir}/candidate-${extension}.json"
             "${candidate}" "${exact_dir}/stereo.${extension}" --jobs 1 --analyze --json \
               > "${exact_dir}/candidate-one-${extension}.json"
-            cmp "${exact_dir}/base-${extension}.json" \
-              "${exact_dir}/candidate-${extension}.json"
             cmp "${exact_dir}/candidate-${extension}.json" \
               "${exact_dir}/candidate-one-${extension}.json"
+            if [[ "${require_baseline_identity}" == true ]]; then
+              cmp "${exact_dir}/base-${extension}.json" \
+                "${exact_dir}/candidate-${extension}.json"
+            fi
           done
 
       - name: Run default-worker benchmarks in both orders

@@ -4,6 +4,22 @@
 explicitly enabled. The registry contains no paths, filenames, request IDs,
 model payloads, or user-controlled labels.
 
+## Analysis response versions
+
+Send an audio file as the request body to `POST /v2/analyze`, with its basename
+in `X-Forge-Filename`. The current v2 response records the measurement engine
+and algorithm revision. Decibel-domain fields use a finite JSON number,
+`"-inf"` for measured digital silence, and `null` when a measurement is
+undefined. The legacy `/v1/analyze` endpoint remains available, but returns
+HTTP 422 when its older finite-number-only contract cannot represent a result.
+
+```bash
+curl --fail --data-binary @programme.wav \
+  -H 'Content-Type: audio/wav' \
+  -H 'X-Forge-Filename: programme.wav' \
+  http://127.0.0.1:8080/v2/analyze
+```
+
 ## Prometheus
 
 Start REST mode with `--metrics`:

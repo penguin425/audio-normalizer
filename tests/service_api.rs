@@ -155,6 +155,32 @@ fn health_and_upload_analysis_are_schema_shaped() {
     let validator = jsonschema::validator_for(&schema).unwrap();
     assert!(validator.is_valid(&value));
 
+    let head = format!(
+        "POST /v2/analyze HTTP/1.1\r\nHost: forge\r\nContent-Type: audio/wav\r\nX-Forge-Filename: sample.wav\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut upload = head.into_bytes();
+    upload.extend_from_slice(&body);
+    let response = request(&address, &upload);
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+    let json_start = response.iter().position(|byte| *byte == b'{').unwrap();
+    let value: Value = serde_json::from_slice(&response[json_start..]).unwrap();
+    assert_eq!(
+        value["schema"],
+        "https://penguin425.github.io/audio-normalizer/schema/service-analysis-v2"
+    );
+    assert_eq!(
+        value["report"]["analysis_engine_id"],
+        "forge-fast-bs1770-r4"
+    );
+    assert_eq!(
+        value["report"]["measurement_algorithm_revision"],
+        "forge-bs1770-5-r4"
+    );
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/service-analysis-v2.schema.json")).unwrap();
+    assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&value));
+
     child.kill().unwrap();
     let _ = child.wait();
 }

@@ -1,0 +1,259 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v4",
+  "title": "Forge delivery manifest v4",
+  "description": "Versioned loudness, ADM, codec, EBU, container, and optional non-normative model-QC evidence emitted by forge --manifest.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generator",
+    "asset_count",
+    "passed_count",
+    "failed_count",
+    "assets"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v4"
+    },
+    "generator": {
+      "type": "string",
+      "pattern": "^forge-normalizer/[0-9]+\\.[0-9]+\\.[0-9]+"
+    },
+    "asset_count": {"type": "integer", "minimum": 0},
+    "passed_count": {"type": "integer", "minimum": 0},
+    "failed_count": {"type": "integer", "minimum": 0},
+    "assets": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/asset"}
+    }
+  },
+  "$defs": {
+    "nullableString": {"type": ["string", "null"]},
+    "nullableBoolean": {"type": ["boolean", "null"]},
+    "dbValue": {"oneOf": [{"type": "number"}, {"const": "-inf"}, {"type": "null"}]},
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channel", "start_seconds", "end_seconds"],
+      "properties": {
+        "channel": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "related_channel": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "start_seconds": {"type": "number", "minimum": 0},
+        "end_seconds": {"type": "number", "minimum": 0},
+        "measured": {"type": "number"},
+        "unit": {"type": "string", "minLength": 1}
+      }
+    },
+    "qcResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "ebu_qc_id",
+        "version",
+        "name",
+        "layer",
+        "passed",
+        "calculated",
+        "source_url",
+        "method",
+        "events"
+      ],
+      "properties": {
+        "rule_id": {"type": "string", "minLength": 1},
+        "ebu_qc_id": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+        "name": {"type": "string", "minLength": 1},
+        "layer": {"enum": ["baseband", "bitstream"]},
+        "passed": {"type": "boolean"},
+        "calculated": {"type": "boolean"},
+        "source_url": {"type": "string", "format": "uri"},
+        "method": {"type": "string", "minLength": 1},
+        "events_truncated": {"type": "boolean"},
+        "events": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": {"$ref": "#/$defs/event"}
+        }
+      }
+    },
+    "qc": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "results"],
+      "properties": {
+        "schema": {
+          "const": "https://penguin425.github.io/audio-normalizer/schema/ebu-qc-results-v2"
+        },
+        "results": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/qcResult"}
+        }
+      }
+    },
+    "containerCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rule_id", "passed", "message"],
+      "properties": {
+        "rule_id": {"type": "string", "pattern": "^FORGE-"},
+        "passed": {"type": "boolean"},
+        "message": {"type": "string"},
+        "observed": {}
+      }
+    },
+    "containerLayer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["layer", "passed", "checks"],
+      "properties": {
+        "layer": {"enum": ["wrapper", "bitstream", "x-check"]},
+        "passed": {"type": "boolean"},
+        "checks": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/containerCheck"}
+        }
+      }
+    },
+    "containerQc": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "generator",
+        "path",
+        "format",
+        "passed",
+        "layers",
+        "properties"
+      ],
+      "properties": {
+        "schema": {
+          "const": "https://penguin425.github.io/audio-normalizer/schema/container-qc-v1"
+        },
+        "generator": {"type": "string"},
+        "path": {"type": "string"},
+        "format": {"enum": ["wave", "aiff", "aifc", "caf", "au", "dsd", "dsf", "dsdiff", "wavpack", "monkeys-audio", "flac", "mp3", "aac-adts", "aac-loas", "ac3", "eac3", "iamf", "mpegts", "m2ts", "mxf", "mxf-opatom", "ogg", "ogg-opus", "ogg-vorbis", "matroska", "webm", "isobmff"]},
+        "passed": {"type": "boolean"},
+        "layers": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {"$ref": "#/$defs/containerLayer"}
+        },
+        "properties": {"type": "object"}
+      }
+    },
+    "asset": {
+      "type": "object",
+      "required": [
+        "analysis_engine_id",
+        "measurement_algorithm_revision",
+        "path",
+        "duration_seconds",
+        "source_start_seconds",
+        "sample_rate_hz",
+        "channels",
+        "sample_format",
+        "integrated_lufs",
+        "max_momentary_lufs",
+        "max_short_term_lufs",
+        "loudness_range_lu",
+        "rms_dbfs",
+        "sample_peak_dbfs",
+        "true_peak_dbtp",
+        "peak_to_loudness_ratio_lu"
+      ],
+      "properties": {
+        "analysis_engine_id": {"enum": ["forge-fast-bs1770-r4", "forge-reference-bs1770-r1", "legacy-unknown"]},
+        "measurement_algorithm_revision": {"enum": ["forge-bs1770-5-r4", "legacy-unknown"]},
+        "path": {"type": "string"},
+        "duration_seconds": {"type": "number", "minimum": 0},
+        "source_start_seconds": {"type": "number", "minimum": 0},
+        "sample_rate_hz": {"type": "integer", "minimum": 1},
+        "channels": {"type": "integer", "minimum": 1},
+        "sample_format": {"type": "string"},
+        "integrated_lufs": {"$ref": "#/$defs/dbValue"},
+        "max_momentary_lufs": {"$ref": "#/$defs/dbValue"},
+        "max_short_term_lufs": {"$ref": "#/$defs/dbValue"},
+        "loudness_range_lu": {"type": "number", "minimum": 0},
+        "rms_dbfs": {"$ref": "#/$defs/dbValue"},
+        "sample_peak_dbfs": {"$ref": "#/$defs/dbValue"},
+        "true_peak_dbtp": {"$ref": "#/$defs/dbValue"},
+        "peak_to_loudness_ratio_lu": {"$ref": "#/$defs/dbValue"},
+        "ebu_qc_results_json": {"$ref": "#/$defs/nullableString"},
+        "ebu_qc_passed": {"$ref": "#/$defs/nullableBoolean"},
+        "qc": {"$ref": "#/$defs/qc"},
+        "container_qc": {"$ref": "#/$defs/containerQc"},
+        "model_qc": {"$ref": "#/$defs/modelQc"}
+      }
+    },
+    "modelQc": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "layer", "classification", "passed", "audit"],
+      "properties": {
+        "schema": {
+          "const": "https://penguin425.github.io/audio-normalizer/schema/model-qc-v1"
+        },
+        "layer": {"const": "model-qc"},
+        "classification": {"const": "non-normative-model-evidence"},
+        "passed": {"type": "boolean"},
+        "audit": {"$ref": "#/$defs/anomalyAudit"}
+      }
+    },
+    "anomalyAudit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "schema_version", "adapter", "source_path", "source_sha256",
+        "provider", "provider_version", "model", "model_version", "model_sha256",
+        "source_duration_seconds", "confidence_threshold",
+        "severity_threshold", "input_event_count", "selected_event_count",
+        "selected_event_duration_seconds", "selected_by_kind", "passed", "events"
+      ],
+      "properties": {
+        "schema": {"const": "https://penguin425.github.io/audio-normalizer/schema/anomaly-provider-audit-v1"},
+        "schema_version": {"const": 1},
+        "adapter": {"const": "forge-anomaly-provider-1"},
+        "source_path": {"type": "string", "minLength": 1},
+        "source_sha256": {"$ref": "#/$defs/sha256"},
+        "provider": {"type": "string", "minLength": 1},
+        "provider_version": {"type": "string", "minLength": 1},
+        "model": {"type": "string", "minLength": 1},
+        "model_version": {"type": "string", "minLength": 1},
+        "model_sha256": {"$ref": "#/$defs/sha256"},
+        "source_duration_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 604800},
+        "sample_rate_hz": {"type": ["integer", "null"], "minimum": 1},
+        "confidence_threshold": {"type": "number", "minimum": 0, "maximum": 1},
+        "severity_threshold": {"type": "number", "minimum": 0, "maximum": 1},
+        "input_event_count": {"type": "integer", "minimum": 0, "maximum": 100000},
+        "selected_event_count": {"type": "integer", "minimum": 0, "maximum": 100000},
+        "selected_event_duration_seconds": {"type": "number", "minimum": 0},
+        "selected_by_kind": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}},
+        "passed": {"type": "boolean"},
+        "events": {"type": "array", "maxItems": 100000, "items": {"$ref": "#/$defs/anomalyEvent"}}
+      }
+    },
+    "sha256": {"type": "string", "pattern": "^[A-Fa-f0-9]{64}$"},
+    "anomalyEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "kind", "start_seconds", "end_seconds", "confidence", "severity", "selected"],
+      "properties": {
+        "index": {"type": "integer", "minimum": 1, "maximum": 100000},
+        "kind": {"enum": ["noise", "pop", "dropout", "lip-noise", "phase-cancellation", "clipping", "other"]},
+        "start_seconds": {"type": "number", "minimum": 0},
+        "end_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "severity": {"type": "number", "minimum": 0, "maximum": 1},
+        "channel": {"type": ["integer", "null"], "minimum": 1, "maximum": 65535},
+        "related_channel": {"type": ["integer", "null"], "minimum": 1, "maximum": 65535},
+        "evidence_label": {"type": ["string", "null"], "minLength": 1, "maxLength": 128},
+        "selected": {"type": "boolean"}
+      }
+    }
+  }
+}

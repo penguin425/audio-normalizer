@@ -9,13 +9,14 @@
 //! *inter-sample* true peak does not exceed the ceiling, which is how
 //! professional loudness normalizers avoid clipping without a dynamic limiter.
 
-pub use crate::analysis::{analyze, Analysis};
+pub use crate::analysis::{analyze, Analysis, AnalysisEngine};
 use crate::atomic::AtomicOutput;
 use crate::bound_analysis::{BoundAnalysis, BoundAnalysisError};
 use crate::decoder;
 use crate::downmix;
 use crate::dsp::limiter::{LimiterConfig, LimiterStatistics, TruePeakLimiter};
 use crate::dsp::resample::{ResampleQuality, SampleRateConverter};
+use crate::dsp::sum::CompensatedSum;
 use crate::dsp::{convert, lufs, simd};
 use crate::flacenc::FlacStreamWriter;
 use crate::metadata;
@@ -596,11 +597,7 @@ pub fn detect_dialogue_ranges(
             continue;
         }
         let (focus_signal, focus_score) = dialogue_focus(&source.data, start, end);
-        let energy = focus_signal
-            .iter()
-            .map(|sample| *sample as f64 * *sample as f64)
-            .sum::<f64>()
-            / focus_signal.len() as f64;
+        let energy = mean_square(&focus_signal);
         let rms_dbfs = if energy > 0.0 {
             10.0 * energy.log10()
         } else {
@@ -733,17 +730,17 @@ fn speech_band_energy_ratio(samples: &[f32], sample_rate: u32) -> f64 {
     let mut previous_input = 0.0;
     let mut high_pass = 0.0;
     let mut speech_band = 0.0;
-    let mut band_energy = 0.0;
-    let mut total_energy = 0.0;
+    let mut band_energy = CompensatedSum::new();
+    let mut total_energy = CompensatedSum::new();
     for sample in samples {
         let input = f64::from(*sample);
         high_pass = high_pass_alpha * (high_pass + input - previous_input);
         speech_band += low_pass_alpha * (high_pass - speech_band);
         previous_input = input;
-        band_energy += speech_band * speech_band;
-        total_energy += input * input;
+        band_energy.add(speech_band * speech_band);
+        total_energy.add(input * input);
     }
-    (band_energy / (total_energy + f64::EPSILON)).clamp(0.0, 1.0)
+    (band_energy.total() / (total_energy.total() + f64::EPSILON)).clamp(0.0, 1.0)
 }
 
 fn amplitude_modulation_db(samples: &[f32], sample_rate: u32) -> f64 {
@@ -759,11 +756,12 @@ fn amplitude_modulation_db(samples: &[f32], sample_rate: u32) -> f64 {
     if levels.len() < 2 {
         return 0.0;
     }
-    let mean = levels.iter().sum::<f64>() / levels.len() as f64;
+    let mean = levels.iter().copied().collect::<CompensatedSum>().total() / levels.len() as f64;
     (levels
         .iter()
         .map(|level| (level - mean).powi(2))
-        .sum::<f64>()
+        .collect::<CompensatedSum>()
+        .total()
         / levels.len() as f64)
         .sqrt()
 }
@@ -774,7 +772,8 @@ fn speech_periodicity(samples: &[f32], sample_rate: u32) -> f64 {
         .iter()
         .step_by(4)
         .map(|sample| f64::from(*sample).powi(2))
-        .sum::<f64>();
+        .collect::<CompensatedSum>()
+        .total();
     if energy <= f64::EPSILON {
         return 0.0;
     }
@@ -783,15 +782,16 @@ fn speech_periodicity(samples: &[f32], sample_rate: u32) -> f64 {
         .filter_map(|frequency| {
             let lag = (sample_rate / frequency) as usize;
             (lag < samples.len()).then(|| {
-                let mut correlation = 0.0;
-                let mut delayed_energy = 0.0;
+                let mut correlation = CompensatedSum::new();
+                let mut delayed_energy = CompensatedSum::new();
                 for index in (lag..samples.len()).step_by(4) {
                     let current = f64::from(samples[index]);
                     let delayed = f64::from(samples[index - lag]);
-                    correlation += current * delayed;
-                    delayed_energy += delayed * delayed;
+                    correlation.add(current * delayed);
+                    delayed_energy.add(delayed * delayed);
                 }
-                (correlation / (energy * delayed_energy).sqrt().max(f64::EPSILON)).max(0.0)
+                (correlation.total() / (energy * delayed_energy.total()).sqrt().max(f64::EPSILON))
+                    .max(0.0)
             })
         })
         .fold(0.0, f64::max)
@@ -808,7 +808,12 @@ fn dialogue_focus(channels: &[Vec<f32>], start: usize, end: usize) -> (Vec<f32>,
             .filter(|(index, _)| *index != 2 && !(channels.len() >= 6 && *index == 3))
             .map(|(_, channel)| mean_square(&channel[start..end]))
             .collect::<Vec<_>>();
-        let other_energy = other_channels.iter().sum::<f64>() / other_channels.len().max(1) as f64;
+        let other_energy = other_channels
+            .iter()
+            .copied()
+            .collect::<CompensatedSum>()
+            .total()
+            / other_channels.len().max(1) as f64;
         let focus = center_energy / (center_energy + other_energy + f64::EPSILON);
         (center, focus)
     } else if channels.len() == 2 {
@@ -837,7 +842,8 @@ fn mean_square(samples: &[f32]) -> f64 {
     samples
         .iter()
         .map(|sample| *sample as f64 * *sample as f64)
-        .sum::<f64>()
+        .collect::<CompensatedSum>()
+        .total()
         / samples.len().max(1) as f64
 }
 
@@ -1185,12 +1191,32 @@ pub fn analyze_file<P: AsRef<Path>>(path: P) -> Result<Analysis, String> {
     analyze_file_with_roles(path, None)
 }
 
+/// Analyze a complete file with an explicitly selected measurement engine.
+pub fn analyze_file_with_engine<P: AsRef<Path>>(
+    path: P,
+    engine: AnalysisEngine,
+) -> Result<Analysis, String> {
+    analyze_file_with_roles_and_engine(path, None, engine)
+}
+
 /// Analyze a file with an optional explicit channel layout.
 pub fn analyze_file_with_roles<P: AsRef<Path>>(
     path: P,
     channel_roles: Option<&[ChannelRole]>,
 ) -> Result<Analysis, String> {
     Ok(analyze_file_range_with_roles(path, channel_roles, 0.0, None, None)?.analysis)
+}
+
+/// Analyze a complete file with channel roles and an explicit engine.
+pub fn analyze_file_with_roles_and_engine<P: AsRef<Path>>(
+    path: P,
+    channel_roles: Option<&[ChannelRole]>,
+    engine: AnalysisEngine,
+) -> Result<Analysis, String> {
+    Ok(
+        analyze_file_range_with_roles_and_engine(path, channel_roles, 0.0, None, None, engine)?
+            .analysis,
+    )
 }
 
 /// Analyze the exact output-domain signal when a plan requests sample-rate
@@ -1817,14 +1843,34 @@ pub fn analyze_file_range_with_roles<P: AsRef<Path>>(
     duration_seconds: Option<f64>,
     timeline_interval_ms: Option<f64>,
 ) -> Result<TimedAnalysis, String> {
+    analyze_file_range_with_roles_and_engine(
+        path,
+        channel_roles,
+        start_seconds,
+        duration_seconds,
+        timeline_interval_ms,
+        AnalysisEngine::Fast,
+    )
+}
+
+/// Analyze a source-time range with an explicitly selected measurement engine.
+pub fn analyze_file_range_with_roles_and_engine<P: AsRef<Path>>(
+    path: P,
+    channel_roles: Option<&[ChannelRole]>,
+    start_seconds: f64,
+    duration_seconds: Option<f64>,
+    timeline_interval_ms: Option<f64>,
+    engine: AnalysisEngine,
+) -> Result<TimedAnalysis, String> {
     validate_analysis_range(start_seconds, duration_seconds, timeline_interval_ms)?;
     let input = capture_stable_input(path.as_ref())?;
-    let result = analyze_stable_input_range(
+    let result = analyze_stable_input_range_with_engine(
         &input,
         channel_roles,
         start_seconds,
         duration_seconds,
         timeline_interval_ms,
+        engine,
     )?;
     verify_stable_inputs(
         std::slice::from_ref(&input),
@@ -1833,12 +1879,31 @@ pub fn analyze_file_range_with_roles<P: AsRef<Path>>(
     Ok(result)
 }
 
+#[cfg(test)]
 pub(crate) fn analyze_stable_input_range(
     input: &StableInput,
     channel_roles: Option<&[ChannelRole]>,
     start_seconds: f64,
     duration_seconds: Option<f64>,
     timeline_interval_ms: Option<f64>,
+) -> Result<TimedAnalysis, String> {
+    analyze_stable_input_range_with_engine(
+        input,
+        channel_roles,
+        start_seconds,
+        duration_seconds,
+        timeline_interval_ms,
+        AnalysisEngine::Fast,
+    )
+}
+
+pub(crate) fn analyze_stable_input_range_with_engine(
+    input: &StableInput,
+    channel_roles: Option<&[ChannelRole]>,
+    start_seconds: f64,
+    duration_seconds: Option<f64>,
+    timeline_interval_ms: Option<f64>,
+    engine: AnalysisEngine,
 ) -> Result<TimedAnalysis, String> {
     validate_analysis_range(start_seconds, duration_seconds, timeline_interval_ms)?;
     analyze_snapshot_range(
@@ -1847,6 +1912,7 @@ pub(crate) fn analyze_stable_input_range(
         start_seconds,
         duration_seconds,
         timeline_interval_ms,
+        engine,
     )
 }
 
@@ -1873,9 +1939,29 @@ fn analyze_snapshot_range(
     start_seconds: f64,
     duration_seconds: Option<f64>,
     timeline_interval_ms: Option<f64>,
+    engine: AnalysisEngine,
 ) -> Result<TimedAnalysis, String> {
     const RANGE_COMPLETE: &str = "__forge_analysis_range_complete__";
-    let mut analyzer: Option<lufs::StreamingAnalyzer> = None;
+    enum Analyzer {
+        Fast(lufs::StreamingAnalyzer),
+        Reference(lufs::ReferenceStreamingAnalyzer),
+    }
+    impl Analyzer {
+        fn process(&mut self, chunk: &[Vec<f32>]) -> Result<(), String> {
+            match self {
+                Self::Fast(analyzer) => analyzer.process(chunk),
+                Self::Reference(analyzer) => analyzer.process(chunk),
+            }
+        }
+
+        fn finish(self) -> lufs::StreamingMeasurements {
+            match self {
+                Self::Fast(analyzer) => analyzer.finish(),
+                Self::Reference(analyzer) => analyzer.finish(),
+            }
+        }
+    }
+    let mut analyzer: Option<Analyzer> = None;
     let mut captured_info = None;
     let mut source_frames = 0usize;
     let decoded = decoder::decode_stream_with_layout(path, |info, layout_provenance, chunk| {
@@ -1903,13 +1989,25 @@ fn analyze_snapshot_range(
             let interval_frames = timeline_interval_ms.map(|milliseconds| {
                 ((info.sample_rate as f64 * milliseconds / 1_000.0).round() as usize).max(1)
             });
-            let meter = analyzer.get_or_insert_with(|| {
-                lufs::StreamingAnalyzer::with_timeline_interval(
-                    info.sample_rate,
-                    roles,
-                    interval_frames,
-                )
-            });
+            if analyzer.is_none() {
+                analyzer = Some(match engine {
+                    AnalysisEngine::Fast => {
+                        Analyzer::Fast(lufs::StreamingAnalyzer::with_timeline_interval(
+                            info.sample_rate,
+                            roles,
+                            interval_frames,
+                        ))
+                    }
+                    AnalysisEngine::Reference => Analyzer::Reference(
+                        lufs::ReferenceStreamingAnalyzer::with_timeline_interval(
+                            info.sample_rate,
+                            roles,
+                            interval_frames,
+                        )?,
+                    ),
+                });
+            }
+            let meter = analyzer.as_mut().expect("range analyzer was initialized");
             meter.process(&selected)?;
         }
         if range_end.is_some_and(|end| chunk_end >= end) {
@@ -2082,7 +2180,7 @@ pub fn analyze_dialogue_ranges_for_standard_with_roles<P: AsRef<Path>>(
             }
             Ok(())
         })?;
-    let mut weighted_energy = 0.0;
+    let mut weighted_energy = CompensatedSum::new();
     let mut gating_blocks = Vec::new();
     let mut frames = 0usize;
     for (index, analyzer) in analyzers.into_iter().enumerate() {
@@ -2095,7 +2193,7 @@ pub fn analyze_dialogue_ranges_for_standard_with_roles<P: AsRef<Path>>(
                 )
             })?
             .finish_without_lra_tail();
-        weighted_energy += measured.weighted_mean_square * measured.frames as f64;
+        weighted_energy.add(measured.weighted_mean_square * measured.frames as f64);
         gating_blocks.extend(measured.ebu.gating_blocks);
         frames += measured.frames;
     }
@@ -2104,7 +2202,7 @@ pub fn analyze_dialogue_ranges_for_standard_with_roles<P: AsRef<Path>>(
     }
     let (loudness, standard_name, method) = match standard {
         DialogueStandard::AtscA85 => (
-            lufs::ungated_lufs(weighted_energy / frames as f64),
+            lufs::ungated_lufs(weighted_energy.total() / frames as f64),
             "ATSC A/85:2026-07",
             "BS.1770-1 K-weighting + explicit dialogue gate; no relative-level gate",
         ),

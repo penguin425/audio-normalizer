@@ -11,6 +11,8 @@ pub const DELIVERY_MANIFEST_V2: &str =
     "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v2";
 pub const DELIVERY_MANIFEST_V3: &str =
     "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v3";
+pub const DELIVERY_MANIFEST_V4: &str =
+    "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v4";
 pub const EXPLANATION_SCHEMA: &str =
     "https://penguin425.github.io/audio-normalizer/schema/rule-explanations-v1";
 pub const EXPLANATION_SCHEMA_V2: &str =
@@ -25,6 +27,8 @@ const DELIVERY_MANIFEST_V2_SCHEMA: &str =
     include_str!("../schema/delivery-manifest-v2.schema.json");
 const DELIVERY_MANIFEST_V3_SCHEMA: &str =
     include_str!("../schema/delivery-manifest-v3.schema.json");
+const DELIVERY_MANIFEST_V4_SCHEMA: &str =
+    include_str!("../schema/delivery-manifest-v4.schema.json");
 const EXPLANATION_V1_SCHEMA: &str = include_str!("../schema/rule-explanations-v1.schema.json");
 const EXPLANATION_V2_SCHEMA: &str = include_str!("../schema/rule-explanations-v2.schema.json");
 pub const MAX_REPORT_BYTES: usize = 64 * 1024 * 1024;
@@ -59,7 +63,7 @@ pub fn migrate_delivery_manifest(bytes: &[u8]) -> Result<(Value, MigrationSummar
         .to_owned();
     if !matches!(
         source_schema.as_str(),
-        DELIVERY_MANIFEST_V1 | DELIVERY_MANIFEST_V2 | DELIVERY_MANIFEST_V3
+        DELIVERY_MANIFEST_V1 | DELIVERY_MANIFEST_V2 | DELIVERY_MANIFEST_V3 | DELIVERY_MANIFEST_V4
     ) {
         return Err(format!(
             "unsupported delivery manifest schema {source_schema}"
@@ -81,6 +85,7 @@ pub fn migrate_delivery_manifest(bytes: &[u8]) -> Result<(Value, MigrationSummar
         .expect("validated assets array");
 
     let mut migrated_qc_envelopes = 0;
+    let mut added_measurement_provenance = false;
     for (index, asset) in assets.iter_mut().enumerate() {
         let object = asset
             .as_object_mut()
@@ -88,17 +93,33 @@ pub fn migrate_delivery_manifest(bytes: &[u8]) -> Result<(Value, MigrationSummar
         if !object.get("path").is_some_and(Value::is_string) {
             return Err(format!("asset {} requires a string path", index + 1));
         }
+        if !object.contains_key("analysis_engine_id") {
+            object.insert(
+                "analysis_engine_id".into(),
+                Value::String("legacy-unknown".into()),
+            );
+            added_measurement_provenance = true;
+        }
+        if !object.contains_key("measurement_algorithm_revision") {
+            object.insert(
+                "measurement_algorithm_revision".into(),
+                Value::String("legacy-unknown".into()),
+            );
+            added_measurement_provenance = true;
+        }
         if migrate_qc_envelope(object, index)? {
             migrated_qc_envelopes += 1;
         }
     }
-    root.insert("schema".into(), Value::String(DELIVERY_MANIFEST_V3.into()));
-    let changed = source_schema != DELIVERY_MANIFEST_V3 || migrated_qc_envelopes > 0;
+    root.insert("schema".into(), Value::String(DELIVERY_MANIFEST_V4.into()));
+    let changed = source_schema != DELIVERY_MANIFEST_V4
+        || migrated_qc_envelopes > 0
+        || added_measurement_provenance;
     Ok((
         manifest,
         MigrationSummary {
             source_schema,
-            target_schema: DELIVERY_MANIFEST_V3,
+            target_schema: DELIVERY_MANIFEST_V4,
             asset_count,
             migrated_qc_envelopes,
             changed,
@@ -111,6 +132,7 @@ pub fn delivery_manifest_schema(schema_id: &str) -> Option<&'static str> {
         DELIVERY_MANIFEST_V1 => DELIVERY_MANIFEST_V1_SCHEMA,
         DELIVERY_MANIFEST_V2 => DELIVERY_MANIFEST_V2_SCHEMA,
         DELIVERY_MANIFEST_V3 => DELIVERY_MANIFEST_V3_SCHEMA,
+        DELIVERY_MANIFEST_V4 => DELIVERY_MANIFEST_V4_SCHEMA,
         _ => return None,
     })
 }
@@ -310,6 +332,7 @@ fn upgrade_legacy_qc_results(results: &mut [Value], asset_index: usize) -> Resul
 #[derive(Debug, Clone, Deserialize)]
 struct RuleInput {
     metric: String,
+    #[serde(deserialize_with = "crate::db_value::deserialize_db")]
     measured: f64,
     minimum: Option<f64>,
     maximum: Option<f64>,
@@ -397,6 +420,12 @@ pub fn explain_failed_rules(bytes: &[u8]) -> Result<ExplanationReport, String> {
             ));
         }
         for rule in rules.into_iter().filter(|rule| !rule.passed) {
+            if !rule.measured.is_finite() {
+                return Err(
+                    "the v1 compliance-explanation contract requires a finite measured value; use the v2 all-findings contract"
+                        .into(),
+                );
+            }
             explanations.push(explain_rule(
                 path,
                 profile,
@@ -1127,7 +1156,7 @@ fn explain_compliance_rule_v2(
         },
         observation: json!({
             "metric": rule.metric,
-            "measured": rule.measured,
+            "measured": crate::db_value::DecibelValue::from_db(rule.measured),
             "unit": unit,
             "minimum": rule.minimum,
             "maximum": rule.maximum,
@@ -2398,7 +2427,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v2_flat_qc_to_v3_envelope() {
+    fn migrates_v2_flat_qc_to_v4_envelope() {
         let legacy_result = json!({
             "ebu_qc_id": "0005B",
             "version": "1.0",
@@ -2416,7 +2445,8 @@ mod tests {
             }),
         );
         let (value, summary) = migrate_delivery_manifest(&input).unwrap();
-        assert_eq!(value["schema"], DELIVERY_MANIFEST_V3);
+        assert_eq!(value["schema"], DELIVERY_MANIFEST_V4);
+        assert_eq!(value["assets"][0]["analysis_engine_id"], "legacy-unknown");
         assert_eq!(value["assets"][0]["qc"]["schema"], QC_SCHEMA);
         assert_eq!(value["assets"][0]["qc"]["results"][0]["rule_id"], "0005B");
         assert_eq!(
@@ -2432,7 +2462,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v1_measurements_to_v3_without_data_loss() {
+    fn migrates_v1_measurements_to_v4_without_data_loss() {
         let input = manifest(
             DELIVERY_MANIFEST_V1,
             json!({
@@ -2441,7 +2471,7 @@ mod tests {
             }),
         );
         let (value, summary) = migrate_delivery_manifest(&input).unwrap();
-        assert_eq!(value["schema"], DELIVERY_MANIFEST_V3);
+        assert_eq!(value["schema"], DELIVERY_MANIFEST_V4);
         assert_eq!(value["assets"][0]["adm_qc_passed"], true);
         assert_eq!(summary.source_schema, DELIVERY_MANIFEST_V1);
         assert_eq!(summary.migrated_qc_envelopes, 0);
@@ -2450,9 +2480,11 @@ mod tests {
     #[test]
     fn migration_is_idempotent_and_preserves_extension_evidence() {
         let input = manifest(
-            DELIVERY_MANIFEST_V3,
+            DELIVERY_MANIFEST_V4,
             json!({
                 "path": "programme.wav",
+                "analysis_engine_id": "forge-fast-bs1770-r4",
+                "measurement_algorithm_revision": "forge-bs1770-5-r4",
                 "future_evidence": {"kept": true}
             }),
         );
@@ -2582,5 +2614,34 @@ mod tests {
             Some("https://tech.ebu.ch/publications/r128")
         );
         assert!(explanation.remediation.contains("true-peak"));
+    }
+
+    #[test]
+    fn v2_explanations_preserve_negative_infinity_and_v1_fails_closed() {
+        let rules = serde_json::to_string(&json!([{
+            "metric": "integrated_lufs",
+            "measured": "-inf",
+            "minimum": -23.2,
+            "maximum": -22.8,
+            "minimum_inclusive": true,
+            "maximum_inclusive": true,
+            "passed": false
+        }]))
+        .unwrap();
+        let input = manifest(
+            DELIVERY_MANIFEST_V4,
+            json!({
+                "analysis_engine_id": "forge-fast-bs1770-r4",
+                "measurement_algorithm_revision": "forge-bs1770-5-r4",
+                "compliance_rules_json": rules
+            }),
+        );
+
+        let report = explain_failed_findings(&input).unwrap();
+        assert_eq!(report.explanations.len(), 1);
+        assert_eq!(report.explanations[0].observation["measured"], "-inf");
+        assert!(explain_failed_rules(&input)
+            .unwrap_err()
+            .contains("requires a finite measured value"));
     }
 }

@@ -54,6 +54,15 @@ impl Biquad {
         self.z2 = self.b2 * x - self.a2 * y;
         y as f32
     }
+
+    /// Process one sample without the compatibility `f32` stage rounding.
+    #[inline]
+    fn process_f64(&mut self, x: f64) -> f64 {
+        let y = self.b0 * x + self.z1;
+        self.z1 = self.b1 * x - self.a1 * y + self.z2;
+        self.z2 = self.b2 * x - self.a2 * y;
+        y
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +81,134 @@ impl KWeight {
         Self { stage1, stage2 }
     }
 
+    /// Build the reference engine from committed coefficient bits.
+    ///
+    /// The deliberately finite rate set covers the common music and
+    /// production families while avoiding platform `libm` variation in the
+    /// analytic coefficient design.
+    pub(crate) fn for_reference_sample_rate(fs: u32) -> Result<Self, String> {
+        let coefficients = match fs {
+            44_100 => [
+                0x3ff87e535fa6f506,
+                0xc0053534ffec5184,
+                0x3ff2b48c43eb3692,
+                0xbffa9e54d2f41fe2,
+                0x3fe6cd94ed5b50e2,
+                0x3ff0000000000000,
+                0xc000000000000000,
+                0x3ff0000000000000,
+                0xbfffd3a39466f5a0,
+                0x3fefa784bc7e1508,
+            ],
+            44_101 => [
+                0x3ff87e549fcbb80c,
+                0xc005353af0337901,
+                0x3ff2b494bd645125,
+                0xbffa9e5cb71b2867,
+                0x3fe6cda067c87f2e,
+                0x3ff0000000000000,
+                0xc000000000000000,
+                0x3ff0000000000000,
+                0xbfffd3a3d6258aee,
+                0x3fefa7853f44bbbf,
+            ],
+            48_000 => [
+                0x3ff88fdf15b33e98,
+                0xc005889803022554,
+                0x3ff32c9df0a5fd59,
+                0xbffb0cf0c24e59d1,
+                0x3fe7707b85469636,
+                0x3ff0000000000000,
+                0xc000000000000000,
+                0x3ff0000000000000,
+                0xbfffd73bffffffeb,
+                0x3fefaeabfffffff7,
+            ],
+            88_200 => [
+                0x3ff8eb953e121c19,
+                0xc0073eb969153ebb,
+                0x3ff5c8062302d39d,
+                0xbffd4b72c1de4140,
+                0x3feb0336a19166fb,
+                0x3ff0000000000000,
+                0xc000000000000000,
+                0x3ff0000000000000,
+                0xbfffe9ca1ce3237d,
+                0x3fefd3a3a95fc246,
+            ],
+            96_000 => [
+                0x3ff8f496e848e968,
+                0xc00769f77d137460,
+                0x3ff60d5b9e54ac07,
+                0xbffd838538311e5d,
+                0x3feb6311894f9616,
+                0x3ff0000000000000,
+                0xc000000000000000,
+                0x3ff0000000000000,
+                0xbfffeb9784589f37,
+                0x3fefd73c10fa5c29,
+            ],
+            176_400 => [
+                0x3ff92349d0bf2281,
+                0xc0084ad7d81569a1,
+                0x3ff7807f84f84cf1,
+                0xbffea5305a8de33e,
+                0x3fed66940034fedd,
+                0x3ff0000000000000,
+                0xc000000000000000,
+                0x3ff0000000000000,
+                0xbffff4e321c89ecd,
+                0x3fefe9ca20ce90ee,
+            ],
+            192_000 => [
+                0x3ff927d7b96b2c02,
+                0xc00860d5efc0e542,
+                0x3ff7a5c546deec1b,
+                0xbffec157204c1e5e,
+                0x3fed9a908228d7ed,
+                0x3ff0000000000000,
+                0xc000000000000000,
+                0x3ff0000000000000,
+                0xbffff5ca2239fe53,
+                0x3fefeb9787905080,
+            ],
+            352_800 => [
+                0x3ff93f6091b92569,
+                0xc008d2a9c00148ac,
+                0x3ff8698c3ee9438d,
+                0xbfff5285d63b4ce5,
+                0x3feeac3e4db6490a,
+                0x3ff0000000000000,
+                0xc000000000000000,
+                0x3ff0000000000000,
+                0xbffffa71158f56ba,
+                0x3feff4e32298f554,
+            ],
+            384_000 => [
+                0x3ff941aa70dd2dbc,
+                0xc008ddbf9607b10b,
+                0x3ff87cdfbc6207c6,
+                0xbfff609d4444f3f3,
+                0x3feec7508ae98ec1,
+                0x3ff0000000000000,
+                0xc000000000000000,
+                0x3ff0000000000000,
+                0xbffffae4a8ff44ae,
+                0x3feff5ca22e6ee77,
+            ],
+            _ => {
+                return Err(format!(
+                    "reference analysis supports sample rates 44100, 44101, 48000, 88200, 96000, 176400, 192000, 352800, and 384000 Hz; got {fs} Hz"
+                ));
+            }
+        };
+        let value = |index| f64::from_bits(coefficients[index]);
+        Ok(Self {
+            stage1: Biquad::new(value(0), value(1), value(2), value(3), value(4)),
+            stage2: Biquad::new(value(5), value(6), value(7), value(8), value(9)),
+        })
+    }
+
     #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.stage1.reset();
@@ -81,6 +218,13 @@ impl KWeight {
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
         self.stage2.process(self.stage1.process(x))
+    }
+
+    /// Scalar high-precision lane for integer and `f64` analysis ingress.
+    #[inline]
+    pub(crate) fn process_f64(&mut self, x: f64) -> f64 {
+        let stage1 = self.stage1.process_f64(x);
+        self.stage2.process_f64(stage1)
     }
 
     /// Filter a whole channel into `out` (length must equal `inp.len()`).
@@ -435,6 +579,21 @@ mod tests {
             last = kw.process(0.5);
         }
         assert!(last.abs() < 1e-3, "DC not removed: {last}");
+    }
+
+    #[test]
+    fn reference_kweight_uses_the_committed_48k_vector_and_rejects_other_rates() {
+        let kw = KWeight::for_reference_sample_rate(48_000).unwrap();
+        assert_eq!(kw.stage1.b0.to_bits(), 0x3ff8_8fdf_15b3_3e98);
+        assert_eq!(kw.stage1.b1.to_bits(), 0xc005_8898_0302_2554);
+        assert_eq!(kw.stage1.b2.to_bits(), 0x3ff3_2c9d_f0a5_fd59);
+        assert_eq!(kw.stage1.a1.to_bits(), 0xbffb_0cf0_c24e_59d1);
+        assert_eq!(kw.stage1.a2.to_bits(), 0x3fe7_707b_8546_9636);
+        assert_eq!(kw.stage2.a1.to_bits(), 0xbfff_d73b_ffff_ffeb);
+        assert_eq!(kw.stage2.a2.to_bits(), 0x3fef_aeab_ffff_fff7);
+        assert!(KWeight::for_reference_sample_rate(32_000)
+            .unwrap_err()
+            .contains("supports sample rates"));
     }
 
     #[cfg(target_arch = "x86_64")]
