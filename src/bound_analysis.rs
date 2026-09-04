@@ -217,6 +217,12 @@ impl BoundAnalysis {
         input: &StableInput,
         plan: &Plan,
     ) -> Result<(), BoundAnalysisError> {
+        input.verify_source().map_err(|error| {
+            BoundAnalysisError::new(
+                BoundAnalysisErrorKind::AnalysisRequestMismatch,
+                error.to_string(),
+            )
+        })?;
         let mut options = InputDescriptorOptions::default();
         if self.request.explicit_roles {
             options = options.with_channel_roles(self.request.effective_roles.clone());

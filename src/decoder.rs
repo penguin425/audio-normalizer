@@ -453,7 +453,6 @@ impl InputDescriptor {
         if let Some(roles) = options.channel_roles {
             info.channel_roles = roles;
         }
-        input.verify_source().map_err(|error| error.to_string())?;
         Ok(Self {
             input,
             route: probed.route,
@@ -2064,10 +2063,6 @@ where
     ) -> Result<(), String>,
 {
     const RANGE_COMPLETE: &str = "__forge_input_descriptor_range_complete__";
-    descriptor
-        .input
-        .verify_source()
-        .map_err(|error| error.to_string())?;
     let selection = descriptor.track_selection;
     let range = descriptor.range;
     let range_end = range.frames.map(|frames| {
@@ -2151,10 +2146,6 @@ where
             display_input(&descriptor.input)
         ));
     }
-    descriptor
-        .input
-        .verify_source()
-        .map_err(|error| error.to_string())?;
     Ok(descriptor.info.clone())
 }
 
@@ -2188,10 +2179,6 @@ where
         });
     }
 
-    descriptor
-        .input
-        .verify_source()
-        .map_err(|error| error.to_string())?;
     let path = descriptor.input.stable_path();
     let (wav, provenance) = WavReader::probe_with_layout(path)
         .map_err(|error| format!("{}: {error}", display_input(&descriptor.input)))?;
@@ -2275,10 +2262,6 @@ where
         }
         remaining_frames -= frames as u64;
     }
-    descriptor
-        .input
-        .verify_source()
-        .map_err(|error| error.to_string())?;
     Ok(descriptor.info.clone())
 }
 

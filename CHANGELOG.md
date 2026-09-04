@@ -42,6 +42,8 @@ tags and keeps public compatibility commitments in
   later asset fails, while preserving input-ordered cache and progress output.
 - Make decoder selection and PCM contracts independent of misleading file-name
   suffixes.
+- Preserve descriptor-bound normalization throughput by hashing the live input
+  at transaction boundaries instead of around every immutable-snapshot decode.
 
 ## 0.189.7 - 2026-09-04
 

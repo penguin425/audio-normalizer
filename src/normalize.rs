@@ -7329,6 +7329,34 @@ mod tests {
         assert_eq!(decoded.sample_rate, 48_000);
     }
 
+    #[test]
+    fn descriptor_bound_commit_rejects_a_changed_live_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("source.wav");
+        let output = directory.path().join("output.wav");
+        write_mono_tone(&input, 0.1);
+        let stable_options = StableInputOptions::new(u64::MAX).unwrap();
+        let descriptor =
+            InputDescriptor::from_path(&input, &stable_options, InputDescriptorOptions::default())
+                .unwrap();
+        let render_plan = plan();
+        let bound = analyze_input_descriptor_for_plan(&descriptor, &render_plan).unwrap();
+        let staged = normalize_one_descriptor_bound_staged_with_policy(
+            &descriptor,
+            &output,
+            &render_plan,
+            OutputFormat::Wav,
+            &bound,
+            OutputConflictPolicy::CreateNew,
+        )
+        .unwrap();
+
+        std::fs::write(&input, b"changed after the immutable render").unwrap();
+        let error = staged.commit().unwrap_err();
+        assert!(error.contains("input changed before output publication"));
+        assert!(!output.exists());
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn album_rejects_input_output_and_output_output_hardlink_aliases() {
