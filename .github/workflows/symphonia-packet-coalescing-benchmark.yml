@@ -423,6 +423,7 @@ jobs:
           python3 - <<'PY'
           import json
           import statistics
+          import tomllib
           from pathlib import Path
 
           evidence = json.loads(
@@ -449,6 +450,14 @@ jobs:
               baseline_revision == "forge-bs1770-5-r3"
               and candidate_revision == "forge-bs1770-5-r4"
           )
+          def package_version(root):
+              with (root / "Cargo.toml").open("rb") as source:
+                  return tomllib.load(source)["package"]["version"]
+
+          durability_migration = (
+              package_version(Path("baseline")) == "0.189.5"
+              and package_version(Path("candidate")) == "0.189.6"
+          )
           # v0.189.3 deliberately adds a private copy plus content hashes and
           # live-source revalidation around the pre-existing decode work. Give
           # that one-time integrity migration a measured, bounded allowance;
@@ -458,16 +467,25 @@ jobs:
           # r3 -> r4 numerically stable accumulation migration. Use the same
           # 8% isolated tripwire as the PCM gate to absorb hosted-runner noise;
           # the four-value aggregate below still enforces the 5% budget.
-          # Candidate self-parity and the exact revision pair are enforced
-          # earlier in this job.
+          # v0.189.6 adds durable output and directory publication. Its fixed
+          # sync cost is bounded per normalization case and to 2% across the
+          # four normalization wall/CPU values; later comparisons return to
+          # the original 3%/1% limits. Candidate self-parity and the exact
+          # revision/version pairs are enforced earlier in this job.
           analysis_limit = (
               5.0 if stable_input_migration or measurement_migration else 3.0
           )
-          normalization_case_limit = 8.0 if measurement_migration else 3.0
+          normalization_case_limit = (
+              8.0
+              if measurement_migration
+              else 8.0 if durability_migration else 3.0
+          )
           normalization_aggregate_limit = (
               5.0
               if measurement_migration
-              else 3.0 if stable_input_migration else 1.0
+              else 3.0
+              if stable_input_migration
+              else 2.0 if durability_migration else 1.0
           )
           normalization_pooled = []
           normalization_paired = []
@@ -519,6 +537,8 @@ jobs:
               print("applied one-time StableInput integrity migration limits")
           if measurement_migration:
               print("applied one-time r3 -> r4 measurement migration limits")
+          if durability_migration:
+              print("applied one-time v0.189.5 -> v0.189.6 durability limits")
           print(f"pooled normalization change: {pooled_aggregate:+.3f}%")
           print(f"paired normalization change: {paired_aggregate:+.3f}%")
           PY

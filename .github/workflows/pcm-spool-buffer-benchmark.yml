@@ -480,6 +480,7 @@ jobs:
           import json
           import statistics
           import sys
+          import tomllib
           from pathlib import Path
 
           sys.path.insert(0, "candidate/tools")
@@ -498,7 +499,20 @@ jobs:
               measurement_revision(Path("baseline")) == "forge-bs1770-5-r3"
               and measurement_revision(Path("candidate")) == "forge-bs1770-5-r4"
           )
-          isolated_limit = 8.0 if measurement_migration else 5.0
+          def package_version(root):
+              with (root / "Cargo.toml").open("rb") as source:
+                  return tomllib.load(source)["package"]["version"]
+
+          durability_migration = (
+              package_version(Path("baseline")) == "0.189.5"
+              and package_version(Path("candidate")) == "0.189.6"
+          )
+          # Durable publication adds an output-file sync and a parent-directory
+          # sync. Those fixed-cost operations are visible in an isolated wall
+          # sample, while the eight-value aggregate remains tightly bounded.
+          isolated_limit = (
+              8.0 if measurement_migration or durability_migration else 5.0
+          )
           average_limit = 5.0 if measurement_migration else 3.0
           pooled_limit = 20.0 if measurement_migration else 15.0
           changes = []
@@ -561,5 +575,7 @@ jobs:
           assert average <= average_limit, ("over-budget average regression", average)
           if measurement_migration:
               print("applied one-time r3 -> r4 measurement migration limits")
+          if durability_migration:
+              print("applied one-time v0.189.5 -> v0.189.6 durability limits")
           print(f"over-budget wall/CPU average change: {average:+.3f}%")
           PY
