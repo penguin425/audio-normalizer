@@ -2110,9 +2110,6 @@ fn analyze_descriptor_range(
                 (Self::Fast(analyzer), decoder::AnalysisPcmChunk::F32(planar)) => {
                     analyzer.process(planar)
                 }
-                (Self::Fast(analyzer), decoder::AnalysisPcmChunk::S24(planar)) => {
-                    analyzer.process_s24(planar)
-                }
                 (Self::Fast(analyzer), decoder::AnalysisPcmChunk::S32(planar)) => {
                     analyzer.process_i32(planar)
                 }
@@ -2121,9 +2118,6 @@ fn analyze_descriptor_range(
                 }
                 (Self::Reference(analyzer), decoder::AnalysisPcmChunk::F32(planar)) => {
                     analyzer.process(planar)
-                }
-                (Self::Reference(analyzer), decoder::AnalysisPcmChunk::S24(planar)) => {
-                    analyzer.process_s24(planar)
                 }
                 (Self::Reference(analyzer), decoder::AnalysisPcmChunk::S32(planar)) => {
                     analyzer.process_i32(planar)
@@ -6084,14 +6078,6 @@ impl LosslessAnalysisBuilder {
     fn observe_wave(&mut self, interleaved: &[u8], kind: PcmKind) -> Result<(), String> {
         debug_assert_eq!(kind, self.kind);
         match kind {
-            PcmKind::S24 => {
-                convert::decode_s24_planar_into(
-                    interleaved,
-                    self.channels as usize,
-                    &mut self.integer_scratch,
-                );
-                self.analyzer.process_s24(&self.integer_scratch)
-            }
             PcmKind::S32 => {
                 convert::decode_s32_planar_into(
                     interleaved,
@@ -6108,7 +6094,12 @@ impl LosslessAnalysisBuilder {
                 );
                 self.analyzer.process_f64(&self.f64_scratch)
             }
-            PcmKind::U8 | PcmKind::S16 | PcmKind::F32 => {
+            // Every signed 24-bit code is exactly representable as f32, and
+            // division by 2^23 is an exact exponent adjustment. Keep generated
+            // S24 output on the paired K-weighting/True Peak fast path without
+            // losing any source-sample information. Native S24 input analysis
+            // remains on the descriptor's high-precision typed ingress.
+            PcmKind::U8 | PcmKind::S16 | PcmKind::S24 | PcmKind::F32 => {
                 convert::decode_planar_into(
                     interleaved,
                     kind,

@@ -25,9 +25,9 @@ tags and keeps public compatibility commitments in
 ### Changed
 
 - Make normalization and QC consume the same descriptor-bound stream, time
-  range, selected track, and layout evidence. Native 24/32-bit integer and
-  64-bit floating-point WAVE analysis now retains source precision through the
-  loudness analyzer instead of first narrowing to `f32`.
+  range, selected track, and layout evidence. Native 32-bit integer and 64-bit
+  floating-point WAVE analysis now avoids narrowing to `f32`; normalized S24
+  remains exact on the existing SIMD analyzer path.
 - Bind multi-request remote range sessions to one final representation URI and
   strong ETag, send `If-Range`, and reject encoded or changed responses.
 - Choose implicit output formats from the detected codec, preserve lossless

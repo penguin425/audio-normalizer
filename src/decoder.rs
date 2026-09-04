@@ -2159,19 +2159,20 @@ where
 }
 
 /// One bounded PCM chunk in the narrowest exact representation needed by the
-/// loudness analyzer. Common and compressed formats retain the optimized f32
-/// lane; high-resolution WAVE samples avoid an irreversible f32 conversion.
+/// loudness analyzer. Common, compressed, and S24 formats retain the optimized
+/// f32 lane; every S24 code is exactly representable after power-of-two
+/// normalization. S32 and F64 WAVE samples avoid an irreversible conversion.
 pub(crate) enum AnalysisPcmChunk<'a> {
     F32(&'a [Vec<f32>]),
-    S24(&'a [Vec<i32>]),
     S32(&'a [Vec<i32>]),
     F64(&'a [Vec<f64>]),
 }
 
 /// Decode the descriptor's exact programme for loudness measurement.
 ///
-/// Native S24/S32/F64 WAVE streams are read directly from their immutable
-/// snapshot. Other inputs share the regular bounded decoder stream.
+/// Native S32/F64 WAVE streams are read directly from their immutable
+/// snapshot. Other inputs share the regular bounded decoder stream; its S24
+/// normalization is exact and retains the optimized f32 analyzer lane.
 pub(crate) fn decode_descriptor_analysis_stream<F>(
     descriptor: &InputDescriptor,
     mut consume: F,
@@ -2180,10 +2181,7 @@ where
     F: FnMut(&StreamInfo, ChannelLayoutProvenance, AnalysisPcmChunk<'_>) -> Result<(), String>,
 {
     if descriptor.route != DecoderRoute::Wave
-        || !matches!(
-            descriptor.info.source_kind,
-            PcmKind::S24 | PcmKind::S32 | PcmKind::F64
-        )
+        || !matches!(descriptor.info.source_kind, PcmKind::S32 | PcmKind::F64)
     {
         return decode_descriptor_stream_with_layout(descriptor, |info, provenance, planar| {
             consume(info, provenance, AnalysisPcmChunk::F32(planar))
@@ -2249,18 +2247,6 @@ where
         file.read_exact(&mut bytes[..bytes_to_read])
             .map_err(|error| format!("{}: {error}", path.display()))?;
         match wav.kind {
-            PcmKind::S24 => {
-                crate::dsp::convert::decode_s24_planar_into(
-                    &bytes[..bytes_to_read],
-                    channels,
-                    &mut integer_planar,
-                );
-                consume(
-                    &descriptor.info,
-                    effective_provenance,
-                    AnalysisPcmChunk::S24(&integer_planar),
-                )?;
-            }
             PcmKind::S32 => {
                 crate::dsp::convert::decode_s32_planar_into(
                     &bytes[..bytes_to_read],

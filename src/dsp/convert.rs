@@ -64,6 +64,7 @@ pub(crate) fn decode_planar_into(
 ///
 /// This lane is reserved for measurement paths that must not round source
 /// values through normalized `f32` before applying the K-weighting filters.
+#[cfg(test)]
 pub(crate) fn decode_s24_planar_into(bytes: &[u8], channels: usize, output: &mut Vec<Vec<i32>>) {
     decode_i32_codes_planar_into(bytes, PcmKind::S24, channels, output);
 }
@@ -1570,6 +1571,18 @@ mod tests {
             s24,
             vec![vec![-8_388_608, -1, 1], vec![8_388_607, 0, 0x12_3456]]
         );
+        let mut normalized_s24 = Vec::new();
+        decode_planar_into(&s24_bytes, PcmKind::S24, 2, &mut normalized_s24);
+        let reconstructed_s24 = normalized_s24
+            .iter()
+            .map(|channel| {
+                channel
+                    .iter()
+                    .map(|sample| (*sample * 8_388_608.0) as i32)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reconstructed_s24, s24);
 
         let s32_frames = [
             [i32::MIN, i32::MAX],
