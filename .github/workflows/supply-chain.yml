@@ -3,12 +3,16 @@ name: Supply chain
 on:
   push:
     branches: [main]
+  schedule:
+    - cron: "41 4 * * 1"
   pull_request:
     paths:
-      - ".github/workflows/supply-chain.yml"
+      - ".github/actions/**"
+      - ".github/workflows/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "deny.toml"
+      - "tools/check-workflow-pins.py"
   workflow_dispatch:
 
 permissions:
@@ -19,6 +23,14 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  workflow-integrity:
+    name: Immutable workflow dependencies
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+      - name: Reject mutable external Action references
+        run: python3 tools/check-workflow-pins.py
+
   dependency-policy:
     name: Dependency policy
     runs-on: ubuntu-24.04
@@ -37,6 +49,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
       - name: Install Rust 1.89.0
-        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.89.0
+        uses: dtolnay/rust-toolchain@b4f984c1e7daae8e175614de3e73a8411a20333c # 1.89.0
       - name: Check minimum-supported Rust
         run: cargo check --locked --no-default-features --all-targets

@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 expected_version="${1:-}"
+python3 tools/check-workflow-pins.py
 IFS=$'\t' read -r version target_dir < <(
   python3 - "$expected_version" <<'PY'
 import json
