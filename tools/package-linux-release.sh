@@ -136,12 +136,15 @@ cp schema/audio-anomaly-provider-v1.schema.json \
    schema/service-analysis-v2.schema.json \
    schema/service-error-v1.schema.json \
    schema/service-health-v1.schema.json "$staging/schema/"
+cp schema/ebu-qc-results-v2.schema.json \
+   schema/ebu-qc-catalogue-v2-pins.json "$staging/schema/"
+cp -R schema/ebu-qc-2026-04 "$staging/schema/"
 cp README.md CHANGELOG.md COMPATIBILITY.md CONTRIBUTING.md SECURITY.md DOCUMENTATION.md \
    PERFORMANCE.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md \
    BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md \
    MPEGH-ADAPTER.md DTS-ADAPTER.md ADM-PRESENTATION-QC.md ADM-INTERACTIVITY-QC.md ADM-SEMANTICS-QC.md ANOMALY-ADAPTER.md \
    SERVICE-METRICS.md C-API.md HOST-ADAPTERS.md NEXT-GENERATION-PLAN.md \
-   VST3-ADAPTER.md AU-ADAPTER.md IMMERSIVE-DOWNMIX.md BINAURAL-QC.md REMEDIATION.md METADATA-REPAIR.md ROADMAP.md LICENSE "$staging/"
+   VST3-ADAPTER.md AU-ADAPTER.md IMMERSIVE-DOWNMIX.md BINAURAL-QC.md REMEDIATION.md METADATA-REPAIR.md EBU-QC-SCENARIO1.md ROADMAP.md LICENSE "$staging/"
 
 find "$staging" -exec touch -h -d "@${source_date_epoch}" {} +
 tar \

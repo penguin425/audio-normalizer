@@ -67,6 +67,7 @@ package_args=(--locked --no-verify)
 if [[ "${FORGE_ALLOW_DIRTY_PACKAGE:-0}" == "1" ]]; then
   package_args+=(--allow-dirty)
 fi
+(cd schema/ebu-qc-2026-04 && sha256sum --check SHA256SUMS)
 cargo package "${package_args[@]}"
 
 crate="$target_dir/package/forge-normalizer-${version}.crate"
@@ -84,6 +85,24 @@ fi
 
 prefix="forge-normalizer-${version}"
 for file in README.md LICENSE CHANGELOG.md COMPATIBILITY.md SECURITY.md CONTRIBUTING.md; do
+  if ! tar -tzf "$crate" "$prefix/$file" >/dev/null; then
+    echo "crate is missing $file" >&2
+    exit 1
+  fi
+done
+for file in \
+  EBU-QC-SCENARIO1.md \
+  schema/ebu-qc-results-v2.schema.json \
+  schema/ebu-qc-catalogue-v2-pins.json \
+  schema/ebu-qc-2026-04/README.md \
+  schema/ebu-qc-2026-04/LICENSE.md \
+  schema/ebu-qc-2026-04/SHA256SUMS \
+  schema/ebu-qc-2026-04/forge-validation.xsd \
+  schema/ebu-qc-2026-04/qc-data-model/qc.xsd \
+  schema/ebu-qc-2026-04/qc-data-model/TimingExtensionMediaPlaybackEditUnits.xsd \
+  schema/ebu-qc-2026-04/qc-catalogue-api/qc-catalogue-api-schema.xsd \
+  schema/ebu-qc-2026-04/qc-reports/qc-report-generic-sample.xml
+do
   if ! tar -tzf "$crate" "$prefix/$file" >/dev/null; then
     echo "crate is missing $file" >&2
     exit 1

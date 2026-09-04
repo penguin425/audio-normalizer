@@ -1,5 +1,9 @@
 use forge_normalizer::analysis_cache::{AnalysisCache, AnalysisCachePolicy, CacheDisposition};
 use forge_normalizer::decoder;
+use forge_normalizer::ebu_qc_validation::{
+    validate_xml, EbuQcValidationProfile, EBU_QC_2026_04_SCHEMA_SHA256,
+    EBU_QC_2026_04_SOURCE_COMMIT,
+};
 use forge_normalizer::normalize::{
     analyze, apply_gain_and_protect, compute_gain, Mode, OutputFormat, Plan,
 };
@@ -16,6 +20,11 @@ use std::time::Duration;
 
 #[test]
 fn documented_public_api_works_from_a_downstream_crate() {
+    let validation_profile = EbuQcValidationProfile::Scenario1;
+    assert!(validate_xml(b"<Report/>", validation_profile).is_err());
+    assert_eq!(EBU_QC_2026_04_SOURCE_COMMIT.len(), 40);
+    assert_eq!(EBU_QC_2026_04_SCHEMA_SHA256.len(), 64);
+
     let sample_rate = 48_000;
     let frames = sample_rate as usize;
     let left: Vec<f32> = (0..frames)

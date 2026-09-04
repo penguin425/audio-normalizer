@@ -14,6 +14,25 @@ timing, a one-to-one `Item`/`ItemResult` mapping, and no embedded
 Input and Output names. Forge-only signal-health rules remain in the JSON
 analysis output and are not presented as EBU catalogue Items.
 
+Every generated report is checked before publication with Forge's bounded
+2026-04 semantic validator. To validate an existing report:
+
+```sh
+forge-report ebu-qc-validate programme.qc.xml
+forge-report ebu-qc-validate --profile data-model another-report.xml
+```
+
+The default applies the additional Scenario 1 rules. `--profile data-model`
+checks the general cross-element rules only. Both modes reject DTDs, excessive
+resource use, mismatched Item identities, inconsistent overall results,
+report-mode `CheckResult`, invalid timing locators, and the obsolete
+`Output/Name=CheckResult` representation.
+
+Formal XSD validation is separate. The release ships the core, timing, and
+Catalogue API schemas fixed to EBU tag `2026-04` commit
+`c9b04821831a38b91f650449b09a17a8e6092757`, their SHA-256 manifest, and a
+combined validation wrapper under `schema/ebu-qc-2026-04/`.
+
 ## Catalogue pinning
 
 Report generation is offline and deterministic. It does not query the live EBU
@@ -23,6 +42,13 @@ for every supported definition in
 The pins use Catalogue API v2 (`tag:qc.ebu.ch,2026-01`), which is the API used
 by the current EBU report implementation resources, while reports use the
 2026-04 data-model namespace.
+
+The EBU 2026-04 release specifies Catalogue API v3, but the production
+`/api/v3` endpoint was still unavailable on 2026-09-04 and the EBU tracks its
+rollout in issue #7. Forge therefore does not claim production Catalogue API
+v3 conformance and will not fabricate v3 Item definitions or hashes. A later
+release will replace the v2 snapshot after the published/withdrawn v3
+definitions are available and verified.
 
 Catalogue identity drift is a hard error. Updating an Item version therefore
 requires an explicit code and pin-manifest change rather than silently changing
@@ -48,6 +74,8 @@ channel is declared.
 ## References
 
 - [EBU QC Data Model 2026-04](https://tech.ebu.ch/publications/ebu_qc_dm)
-- [Scenario 1 best-practice guidance](https://github.com/ebu/qc/blob/main/qc-reports/qc-reports-best-practice-guidance-1.md)
-- [EBU QC report compliance checklist](https://github.com/ebu/qc/blob/main/qc-reports/qc-reports-compliance-checklist.md)
+- [EBU QC 2026-04 release](https://github.com/ebu/qc/releases/tag/2026-04)
+- [Scenario 1 best-practice guidance](https://github.com/ebu/qc/blob/2026-04/qc-reports/qc-reports-best-practice-guidance-1.md)
+- [EBU QC report compliance checklist](https://github.com/ebu/qc/blob/2026-04/qc-reports/qc-reports-compliance-checklist.md)
+- [Catalogue API v3 rollout issue](https://github.com/ebu/qc/issues/7)
 - [EBU QC Catalogue API](https://qc.ebu.io/help/api)

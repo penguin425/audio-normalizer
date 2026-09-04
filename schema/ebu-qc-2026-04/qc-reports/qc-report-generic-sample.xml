@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Report xmlns="tag:qc.ebu.ch,2026-04">
+	<ReportId>urn:uuid:8ac88441-34d4-495d-b960-38f6f22e0893</ReportId>
+	<ReportCreator>
+		<Name>John Doe</Name>
+		<ID>AGENT007</ID>
+		<Role>Smooth Operator</Role>
+	</ReportCreator>
+	<ExecutionStatus>complete</ExecutionStatus>
+	<CheckResult>false</CheckResult>
+	<ContentId>
+		<ContentIdentifier>
+			<ID>urn:uuid:57f5a1e3-54df-4a0b-be44-7ac3167d9eda</ID>
+		</ContentIdentifier>
+	</ContentId>
+	<LastModifiedDateTime>2026-07-06T17:00:00+00:00</LastModifiedDateTime>
+	<OverallAnalysisDuration>P1M</OverallAnalysisDuration>
+	<ToolInformation>
+		<ToolID>QCReportCreator_ID</ToolID>
+		<ToolName>QC Report Creator</ToolName>
+		<Vendor>The Company</Vendor>
+		<URL>https://www.qctool.org</URL>
+		<Version>v2026.3.2.0</Version>
+	</ToolInformation>
+	<Profile>
+		<ID>urn:uuid:10c833e5-4289-4bfb-b5c2-2cd2ceedd76e</ID>
+		<Name>EBU QC testing</Name>
+		<ContentId>
+			<ContentIdentifier>
+				<ID>urn:uuid:57f5a1e3-54df-4a0b-be44-7ac3167d9eda</ID>
+			</ContentIdentifier>
+		</ContentId>
+		<CheckResultRule>AND</CheckResultRule>
+		<Description>An example EBU QC Profile</Description>
+		<Scopes>
+			<Scope>
+				<Start>86000</Start>
+				<End>255786</End>
+			</Scope>
+		</Scopes>
+		<Requestor>
+			<Name>John Doe</Name>
+			<ID>AGENT007</ID>
+			<Role>Smooth Operator</Role>
+		</Requestor>
+		<DueDate>2026-08-01T00:00:00+00:00</DueDate>
+		<Items>
+			<Item>
+				<EBUQCID>0039B</EBUQCID>
+				<EBUQCName>Digital Tape Dropouts</EBUQCName>
+				<EBUQCVersion>3.0</EBUQCVersion>
+				<InstanceId>urn:uuid:ddd54536-bddb-4139-8ba9-eec8c83ed8f4</InstanceId>
+				<UsedAs>check</UsedAs>
+				<Scopes/>
+				<Inputs>
+					<Input>
+						<Name>MinimumArea</Name>
+						<Value>80.00%</Value>
+					</Input>
+					<Input>
+						<Name>MinimumDuration</Name>
+						<Value>20</Value>
+					</Input>
+				</Inputs>
+			</Item>
+			<Item>
+				<EBUQCID>0272B</EBUQCID>
+				<EBUQCName>Black Frames Report</EBUQCName>
+				<EBUQCVersion>1.0</EBUQCVersion>
+				<InstanceId>urn:uuid:adc2a9c2-adc6-4d64-a84b-4c96fb4698b3</InstanceId>
+				<UsedAs>report</UsedAs>
+				<Scopes/>
+				<Inputs/>
+			</Item>
+		</Items>
+		<ItemDefinitions/>
+	</Profile>
+	<ItemResults>
+		<ItemResult>
+			<EBUQCID>0039B</EBUQCID>
+			<EBUQCName>Digital Tape Dropouts</EBUQCName>
+			<EBUQCVersion>3.0</EBUQCVersion>
+			<InstanceId>urn:uuid:ddd54536-bddb-4139-8ba9-eec8c83ed8f4</InstanceId>
+			<AnalysisMethodUsed>measurement</AnalysisMethodUsed>
+			<ExecutionStatus>complete</ExecutionStatus>
+			<CheckResult>false</CheckResult>
+			<ToolInformation>
+				<ToolID>QCToolA_ID</ToolID>
+				<ToolName>QC Tool A</ToolName>
+				<Vendor>The Company</Vendor>
+				<URL>https://www.qctool.org</URL>
+				<Version>v2024.6.7.0</Version>
+			</ToolInformation>
+			<DetectionMethod>automatic</DetectionMethod>
+			<CreationDateTime>2026-07-06T17:00:00+00:00</CreationDateTime>
+			<Operator>
+				<Name>John Doe</Name>
+				<ID>AGENT007</ID>
+				<Role>Smooth Operator</Role>
+			</Operator>
+			<Outputs>
+				<Output>
+					<Name>CheckResult</Name>
+					<Value>false</Value>
+				</Output>
+				<Output>
+					<Name>DropoutAreaSegment</Name>
+					<Locator>
+						<Start>86602</Start>
+						<End>86718</End>
+					</Locator>
+					<Value>92.00%</Value>
+					<Annotation>
+						<Text>Manually verified</Text>
+						<Editor>
+							<Name>John Doe</Name>
+							<ID>AGENT007</ID>
+							<Role>Smooth Operator</Role>
+						</Editor>
+						<Timestamp>2026-07-06T17:00:00+00:00</Timestamp>
+					</Annotation>
+				</Output>
+			</Outputs>
+		</ItemResult>
+		<ItemResult>
+			<EBUQCID>0272B</EBUQCID>
+			<EBUQCName>Black Frames Report</EBUQCName>
+			<EBUQCVersion>1.0</EBUQCVersion>
+			<InstanceId>urn:uuid:adc2a9c2-adc6-4d64-a84b-4c96fb4698b3</InstanceId>
+			<AnalysisMethodUsed>measurement</AnalysisMethodUsed>
+			<ExecutionStatus>complete</ExecutionStatus>
+			<ToolInformation>
+				<ToolID>QCToolB_ID</ToolID>
+				<ToolName>QC Tool B</ToolName>
+				<Vendor>The Company</Vendor>
+				<URL>https://www.qctool.org</URL>
+				<Version>v2025.19.16.0</Version>
+			</ToolInformation>
+			<DetectionMethod>automatic</DetectionMethod>
+			<CreationDateTime>2026-07-06T17:00:00+00:00</CreationDateTime>
+			<Operator>
+				<Name>John Doe</Name>
+				<ID>AGENT007</ID>
+				<Role>Smooth Operator</Role>
+			</Operator>
+			<Outputs>
+				<Output>
+					<Name>BlackFramesSegment</Name>
+					<Locator>
+						<Start>86874</Start>
+						<End>87005</End>
+					</Locator>
+				</Output>
+				<Output>
+					<Name>BlackFramesSegment</Name>
+					<Locator>
+						<Start>87118</Start>
+						<End>87262</End>
+					</Locator>
+				</Output>
+			</Outputs>
+		</ItemResult>
+	</ItemResults>
+	<ExtensionProperties>
+		<TimingExtensionMediaPlaybackEditUnits xmlns="tag:qc.ebu.ch,2026-04:extensions:timing">
+			<EditRate>25/1</EditRate>
+		</TimingExtensionMediaPlaybackEditUnits>
+	</ExtensionProperties>
+</Report>

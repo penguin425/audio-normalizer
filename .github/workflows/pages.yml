@@ -31,10 +31,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p _site/schema
+          cp -R schema/. _site/schema/
           for schema in schema/*.schema.json; do
             name="$(basename "$schema" .schema.json)"
             cp "$schema" "_site/schema/$name"
-            cp "$schema" "_site/schema/$name.schema.json"
           done
 
       - uses: actions/configure-pages@v6

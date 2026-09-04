@@ -42,6 +42,27 @@ jobs:
       - name: Run the official ITU-R BS.2217-2 conformance tests
         run: ./tools/test-itu-conformance.sh
 
+  ebu-qc-report-2026-04:
+    name: EBU QC report 2026-04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install XML Schema validator
+        run: sudo apt-get update && sudo apt-get install --yes libxml2-utils
+
+      - name: Verify pinned schemas and generated Scenario 1 report
+        run: |
+          (cd schema/ebu-qc-2026-04 && sha256sum --check SHA256SUMS)
+          xmllint --noout --schema schema/ebu-qc-2026-04/forge-validation.xsd \
+            schema/ebu-qc-2026-04/qc-reports/qc-report-generic-sample.xml
+          cargo test --locked --test cli ebu_qc_writes_scenario1_2026_04_catalogue_xml
+
   iamf-interoperability:
     name: AOMedia OAR/IAMF interoperability matrix
     runs-on: ubuntu-24.04

@@ -118,3 +118,10 @@ path = "fuzz_targets/remote_range.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ebu_qc_validation"
+path = "fuzz_targets/ebu_qc_validation.rs"
+test = false
+doc = false
+bench = false

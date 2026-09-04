@@ -168,7 +168,11 @@ Forge already provides:
 - April 2026 EBU QC Scenario 1 XML reports with deterministic identifiers,
   sample edit units, pinned Catalogue API v2 definition hashes, exact
   catalogue-specific input/output vocabularies, one-to-one Item results, and
-  correct check-versus-report semantics.
+  correct check-versus-report semantics. Reports are checked by a bounded
+  semantic validator, obsolete `Output/Name=CheckResult` values are rejected,
+  and the official core/timing/Catalogue XSDs are shipped with fixed hashes.
+  Production Catalogue API v3 pinning remains gated on the EBU endpoint
+  tracked by upstream issue #7.
 - September 2025 EBU Tech 3393 reading/writing structural audits covering the
   profile declaration, bounded core ADM graph/cardinalities, identifiers,
   references, labels, object nesting, tag groups, and `chna` reconciliation.
@@ -608,7 +612,7 @@ unchanged controls from paths whose normative work factor changed.
 The order below is an implementation plan, not a standards requirement. Each
 normative item must name the exact supported clauses and must not imply
 certification or coverage beyond its fixtures.
-v0.189.1 through v0.189.6 are the completed baseline; later entries are
+v0.189.1 through v0.189.7 are the completed baseline; later entries are
 planned.
 
 | Release | Scope | Classification |
@@ -619,14 +623,15 @@ planned.
 | v0.189.4 | Bind atomic publication to the staged inode produced by trusted path-based metadata writers; reject metadata-report aliases observed at preflight and immediately before atomic publication; and retain gRPC worker permits and cancellation registrations until blocking work actually exits | Filesystem and service safety |
 | v0.189.5 | Use an exact rational block clock, carry compensated or fixed-order accumulation through every energy reduction, reject typed non-finite chunks atomically, distinguish finite/negative-infinity/undefined dB values in every JSON contract, and add a deterministic cross-platform reference-analysis mode | Measurement correctness and reproducibility |
 | v0.189.6 | Add a whole-invocation filesystem/output plan and one transaction layer for the normalizer's final audio, report, and state writers, with commit-time no-clobber/CAS checks, parent-directory durability, state-file process locks, crash recovery, and bounded symlink-safe discovery shared by CLI, batch, and watch modes | Filesystem safety and recoverability |
-| v0.189.7 | Introduce one codec/container/track registry and `InputDescriptor`; make normalization and QC share its bounded decode stream, time range, selected track, and layout evidence; bind remote range reads with a strong validator or one materialized snapshot; preserve integer/`f64` source precision; key catalogue v2 by bytes, track, range, layout, renderer, and effective plan; add lossless-safe defaults and exact encoder/muxer preflight | Codec interoperability and product contract |
-| v0.189.8 | Carry one exact channel-layout descriptor through decode, analysis, rendering, and re-verification; complete BS.1770-5 Annex 3 positional weighting and Annex 4 renderer-bound measurement; round-trip non-default RFC 9639 masks through FLAC/WAVE and ISO-BMFF `chnl`/CICP layout plus `dmix` evidence; and expose additive layout override/provenance parity in Rust, C, Python, Wasm, REST, and gRPC | Measurement and API consistency |
-| v0.189.9 | Make REST/gRPC request limits effective during decode with streaming upload or bounded replay spooling, global memory/temp quotas, and cooperative cancellation throughout bounded decode and analysis | Product safety and resource control |
-| v0.189.10 | Require a secure non-loopback service boundary and centralize external codec/renderer execution behind bounded, cancellable process-tree supervision; keep full mTLS/OIDC and multi-OS sandbox policy as separately gated follow-up | Service and subprocess security |
-| v0.189.11 | Add explicit metadata-fidelity policies, registry-backed full-container metadata discovery, exact resampling-time conversion, and restartable metadata-only library transactions | Metadata integrity and workflow recovery |
-| v0.189.12 | Add generation-level all-or-nothing album/batch publication, semantic job fingerprints, bounded `--keep-going`, recovery inspection, safe reclamation of orphaned stages, and fully side-effect-free dry runs outside explicit cache warming | Recoverability and operations |
-| v0.189.13 | Prove Linux ABI and wheel-tag compatibility in the oldest supported runtime and ship relocatable CMake/pkg-config metadata before expanding release targets | Distribution compatibility |
-| v0.189.14 | Pin every Action to a full revision, enforce SHA-only workflows, protect release tags with a ruleset, split assemble/attest/publish permissions, decide `latest` before the one-way immutable publication, validate an exact asset manifest, add Linux ARM64 after runtime proof, publish through trusted crates.io/PyPI/npm identities, and extend per-artifact SBOM/provenance; treat Windows ARM64, OCI, notarization, and Authenticode as demand- and credential-gated follow-up | Supply-chain and native trust |
+| v0.189.7 | Correct EBU QC 2026-04 check/report result semantics, reject the obsolete `Output/Name=CheckResult` encoding, add bounded general and Scenario 1 semantic validation, pin the official core/timing/Catalogue XSDs, and distribute the report documentation, schemas, and v2 provenance pins consistently | Normative report interoperability and distribution correctness |
+| v0.189.8 | Introduce one codec/container/track registry and `InputDescriptor`; make normalization and QC share its bounded decode stream, time range, selected track, and layout evidence; bind remote range reads with a strong validator or one materialized snapshot; preserve integer/`f64` source precision; key catalogue v2 by bytes, track, range, layout, renderer, and effective plan; add lossless-safe defaults and exact encoder/muxer preflight | Codec interoperability and product contract |
+| v0.189.9 | Carry one exact channel-layout descriptor through decode, analysis, rendering, and re-verification; complete BS.1770-5 Annex 3 positional weighting and Annex 4 renderer-bound measurement; round-trip non-default RFC 9639 masks through FLAC/WAVE and ISO-BMFF `chnl`/CICP layout plus `dmix` evidence; and expose additive layout override/provenance parity in Rust, C, Python, Wasm, REST, and gRPC | Measurement and API consistency |
+| v0.189.10 | Make REST/gRPC request limits effective during decode with streaming upload or bounded replay spooling, global memory/temp quotas, and cooperative cancellation throughout bounded decode and analysis | Product safety and resource control |
+| v0.189.11 | Require a secure non-loopback service boundary and centralize external codec/renderer execution behind bounded, cancellable process-tree supervision; keep full mTLS/OIDC and multi-OS sandbox policy as separately gated follow-up | Service and subprocess security |
+| v0.189.12 | Add explicit metadata-fidelity policies, registry-backed full-container metadata discovery, exact resampling-time conversion, and restartable metadata-only library transactions | Metadata integrity and workflow recovery |
+| v0.189.13 | Add generation-level all-or-nothing album/batch publication, semantic job fingerprints, bounded `--keep-going`, recovery inspection, safe reclamation of orphaned stages, and fully side-effect-free dry runs outside explicit cache warming | Recoverability and operations |
+| v0.189.14 | Prove Linux ABI and wheel-tag compatibility in the oldest supported runtime and ship relocatable CMake/pkg-config metadata before expanding release targets | Distribution compatibility |
+| v0.189.15 | Pin every Action to a full revision, enforce SHA-only workflows, protect release tags with a ruleset, split assemble/attest/publish permissions, decide `latest` before the one-way immutable publication, validate an exact asset manifest, add Linux ARM64 after runtime proof, publish through trusted crates.io/PyPI/npm identities, and extend per-artifact SBOM/provenance; treat Windows ARM64, OCI, notarization, and Authenticode as demand- and credential-gated follow-up | Supply-chain and native trust |
 | v0.190 | Native file-based ADM BS.2168 Level 0/1/2 validation, including declarations, graph constraints, block timing, CHNA/essence reconciliation, and derived limits | Normative |
 | v0.190.1 | Add ITU-R BS.1864-1 international programme-exchange presets for programme- and explicitly ranged dialogue-based −24 LKFS measurement | Normative profile |
 | v0.190.2 | Introduce a common checked AES3 essence layer, then decode and validate uncompressed PCM Wave Audio essence in SMPTE ST 382:2023 MXF, including wrapping, descriptor, quantization, channel-ID, and BWF mapping evidence | Normative subset |
@@ -685,7 +690,7 @@ planned.
 | v0.236 | Implement separate `EbuMode` and `ItuBs1771` live meters: preserve Tech 3341 rectangular M/S/I/LRA semantics and add the distinct BS.1771 first-order-IIR indication, with mode-labelled results, atomic start/pause/continue/reset state, exact update cadence, and separate conformance fixtures | Measurement workflow |
 | v0.237 | Publish measurable sample-rate-conversion and dither quality contracts, asset-bound reproducible seeds, and optional high-pass/noise-shaped modes | DSP quality and reproducibility |
 | v0.238 | Benchmark-gate AVX-512 true-peak/K-weighting dispatch, true-peak tile pruning, AArch64/Wasm multichannel lanes, and persistent GPU batch scheduling; retain the scalar oracle, every-factor conformance corpus, CPU-frequency evidence, and deterministic fallback after each optimization | Performance engineering |
-| v0.239 | Import, validate, and round-trip EBU QC Data Model/XSD 2026-04 reports, including the semantic checklist and optional Scenario 1 constraints; retire the obsolete generic `Output/Name=CheckResult` encoding | Normative report interoperability |
+| v0.239 | Add lossless bounded import and canonical round-trip for EBU QC 2026-04, preserve unknown extensions, validate complete Annex C definition contracts, and pin production Catalogue API v3 published/withdrawn definitions once the upstream endpoint is available | Normative report interoperability |
 | v0.240 | Receive bounded live ST 2110-30:2025/AES67 L16/L24 PCM from SDP/RTP, with reorder/loss evidence and explicit `not_run` when PTP conformance cannot be observed | Normative transport subset plus operational receiver policy |
 | v0.241 | Add an optional MXL v1.0.2 same-host Float32 audio adapter with bounded continuous-flow reads, wrap handling, cancellation, and no mandatory native build dependency | Open SDK interoperability; non-normative |
 | v0.242 | Validate and activate AMWA BCP-007-03 NMOS/MXL resources over the MXL adapter without implementing an unrestricted NMOS controller | Normative control-plane subset |

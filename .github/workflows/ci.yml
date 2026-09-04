@@ -355,6 +355,16 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install XML Schema validator
+        run: sudo apt-get update && sudo apt-get install --yes libxml2-utils
+
+      - name: Verify and test EBU QC 2026-04 report schemas
+        run: |
+          (cd schema/ebu-qc-2026-04 && sha256sum --check SHA256SUMS)
+          xmllint --noout --schema schema/ebu-qc-2026-04/forge-validation.xsd \
+            schema/ebu-qc-2026-04/qc-reports/qc-report-generic-sample.xml
+          cargo test --locked --test cli ebu_qc_writes_scenario1_2026_04_catalogue_xml
+
       - name: Cache official EBU v5 test set
         uses: actions/cache@v6
         with:
