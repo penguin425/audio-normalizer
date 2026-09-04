@@ -2947,6 +2947,54 @@ pub fn normalize_one_bound_audited_with_policy(
     ))
 }
 
+/// Analyze, normalize, and publish one descriptor-bound programme as a single
+/// transaction.
+pub fn normalize_one_descriptor_with_policy(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    output_policy: OutputConflictPolicy,
+) -> Result<(Analysis, f32), BoundAnalysisError> {
+    let staged = normalize_one_descriptor_staged_with_policy(
+        descriptor,
+        output,
+        plan,
+        format,
+        output_policy,
+    )?;
+    let outcome = staged.commit().map_err(BoundAnalysisError::render_failed)?;
+    Ok((outcome.source, outcome.gain))
+}
+
+/// Analyze and stage one descriptor-bound programme as a single transaction.
+///
+/// The immutable snapshot is measured and rendered without rehashing the live
+/// source between those two phases. [`StagedNormalization::commit`] still
+/// verifies the live source immediately before publication.
+pub fn normalize_one_descriptor_staged_with_policy(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedNormalization, BoundAnalysisError> {
+    plan.validate_for_format(format)
+        .map_err(BoundAnalysisError::invalid_request)?;
+    let source = analyze_input_descriptor_for_plan_unbound(descriptor, plan)
+        .map_err(BoundAnalysisError::analysis_failed)?;
+    let analysis = BoundAnalysis::for_descriptor(descriptor, source, plan)?;
+    normalize_one_descriptor_bound_staged_impl(
+        descriptor,
+        output,
+        plan,
+        format,
+        &analysis,
+        false,
+        output_policy,
+    )
+}
+
 /// Stage a normalization render from the exact descriptor used to produce a
 /// bound analysis. This is the track-aware counterpart of
 /// [`normalize_one_bound_staged_with_policy`].
@@ -7330,7 +7378,7 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_bound_commit_rejects_a_changed_live_source() {
+    fn descriptor_transaction_rejects_a_changed_live_source_at_commit() {
         let directory = tempfile::tempdir().unwrap();
         let input = directory.path().join("source.wav");
         let output = directory.path().join("output.wav");
@@ -7340,13 +7388,11 @@ mod tests {
             InputDescriptor::from_path(&input, &stable_options, InputDescriptorOptions::default())
                 .unwrap();
         let render_plan = plan();
-        let bound = analyze_input_descriptor_for_plan(&descriptor, &render_plan).unwrap();
-        let staged = normalize_one_descriptor_bound_staged_with_policy(
+        let staged = normalize_one_descriptor_staged_with_policy(
             &descriptor,
             &output,
             &render_plan,
             OutputFormat::Wav,
-            &bound,
             OutputConflictPolicy::CreateNew,
         )
         .unwrap();

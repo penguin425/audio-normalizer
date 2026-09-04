@@ -2232,13 +2232,16 @@ fn run_paths(
                     &plan,
                     audio_track,
                 )?)
-            } else {
+            } else if cli.gain_only || cli.dry_run || cli.verify || cli.difference_report.is_some()
+            {
                 Some(analyze_for_plan_descriptor(
                     input,
                     channel_roles_override.as_deref(),
                     &plan,
                     audio_track,
                 )?)
+            } else {
+                None
             };
             if cli.gain_only || cli.dry_run {
                 let an = if let Some(analysis) = cached_analysis {
@@ -2368,14 +2371,19 @@ fn run_paths(
                             )
                             .map_err(|error| error.to_string())?
                         } else {
-                            normalize::normalize_one_with_roles_and_policy(
+                            let descriptor = input_descriptor_for_path(
                                 input,
+                                channel_roles_override.as_deref(),
+                                audio_track,
+                            )?;
+                            normalize::normalize_one_descriptor_with_policy(
+                                &descriptor,
                                 output,
                                 &plan,
                                 *fmt,
-                                channel_roles_override.as_deref(),
                                 output_conflict_policy,
-                            )?
+                            )
+                            .map_err(|error| error.to_string())?
                         };
                         print_analysis(input, &an, Some(gain));
                         catalogue_measurement = Some(an);
@@ -3105,9 +3113,8 @@ fn analyze_for_plan_descriptor(
     plan: &Plan,
     audio_track: Option<u32>,
 ) -> Result<CachedPlanAnalysis, String> {
-    let options = StableInputOptions::new(u64::MAX).map_err(|error| error.to_string())?;
-    let stable = StableInput::from_path(input, &options).map_err(|error| error.to_string())?;
-    let descriptor = input_descriptor_for_plan(stable.clone(), channel_roles, audio_track)?;
+    let descriptor = input_descriptor_for_path(input, channel_roles, audio_track)?;
+    let stable = descriptor.stable_input().clone();
     let analysis = normalize::analyze_input_descriptor_for_plan(&descriptor, plan)
         .map_err(|error| error.to_string())?;
     Ok(CachedPlanAnalysis {
@@ -3115,6 +3122,16 @@ fn analyze_for_plan_descriptor(
         descriptor,
         analysis,
     })
+}
+
+fn input_descriptor_for_path(
+    input: &Path,
+    channel_roles: Option<&[ChannelRole]>,
+    audio_track: Option<u32>,
+) -> Result<InputDescriptor, String> {
+    let options = StableInputOptions::new(u64::MAX).map_err(|error| error.to_string())?;
+    let stable = StableInput::from_path(input, &options).map_err(|error| error.to_string())?;
+    input_descriptor_for_plan(stable, channel_roles, audio_track)
 }
 
 fn input_descriptor_for_plan(
