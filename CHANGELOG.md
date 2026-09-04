@@ -8,6 +8,36 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.189.6 - 2026-09-04
+
+### Added
+
+- Add whole-invocation output planning for the main normalizer, rejecting
+  duplicate routes and path, symlink/reparse-point, hard-link, protected-file,
+  and conservative platform case aliases before decode. Recursive discovery
+  is now deterministic, shared by CLI and watch workflows, and bounded by
+  file, entry, and depth limits.
+- Add explicit `CreateNew` and `ReplaceUnchanged` publication policies to the
+  Rust normalization API, including staged corrected-normalization entry
+  points for durable coordinators.
+- Publish batch-job schema v2 with a hash-bound `ready_to_publish` checkpoint,
+  automatic v1 migration, and process-lifetime sibling locks for batch and
+  watch state. A restart can recognize an output committed immediately before
+  interruption without re-encoding it.
+- Add `--warm-cache` as the explicit opt-in for populating the analysis cache
+  during `--dry-run`.
+
+### Fixed
+
+- Publish final normalization audio, reports, and state documents with atomic
+  no-clobber semantics for new destinations or identity/length/SHA-256
+  compare-and-swap checks for requested replacement. Synchronize the committed
+  file and containing directory on Unix, and use write-through moves on
+  Windows.
+- Keep ordinary dry runs from creating, repairing, or evicting analysis-cache
+  entries. Harden state reads and recursive traversal against final-component
+  links, Windows reparse points, non-regular files, and unbounded allocation.
+
 ## 0.189.5 - 2026-09-04
 
 ### Added

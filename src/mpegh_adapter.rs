@@ -522,7 +522,7 @@ pub fn write_report(
     }
     .map_err(|error| format!("serialize MPEG-H adapter report: {error}"))?;
     bytes.push(b'\n');
-    let mut output = crate::atomic::AtomicOutput::new(path)?;
+    let mut output = crate::atomic::AtomicOutput::new_with_overwrite(path, overwrite)?;
     output.write_all(&bytes)?;
     output.commit()
 }

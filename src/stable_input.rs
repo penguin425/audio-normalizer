@@ -776,7 +776,9 @@ fn file_identity(
     }
 }
 
-fn path_identity_if_exists(path: &Path) -> Result<Option<StableFileIdentity>, StableInputError> {
+pub(crate) fn path_identity_if_exists(
+    path: &Path,
+) -> Result<Option<StableFileIdentity>, StableInputError> {
     let opened = match open_source_target(path) {
         Ok(opened) => opened,
         Err(error) if error.is_not_found() => return Ok(None),

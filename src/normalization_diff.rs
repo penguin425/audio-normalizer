@@ -152,6 +152,15 @@ impl NormalizationDifferenceReport {
 }
 
 pub fn write_report(path: &Path, report: &NormalizationDifferenceReport) -> Result<(), String> {
+    write_report_with_overwrite(path, report, true)
+}
+
+/// Atomically write a difference report with an explicit replacement policy.
+pub fn write_report_with_overwrite(
+    path: &Path,
+    report: &NormalizationDifferenceReport,
+    overwrite: bool,
+) -> Result<(), String> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -159,7 +168,7 @@ pub fn write_report(path: &Path, report: &NormalizationDifferenceReport) -> Resu
         fs::create_dir_all(parent)
             .map_err(|error| format!("create {}: {error}", parent.display()))?;
     }
-    let staged = AtomicOutput::new(path)?;
+    let staged = AtomicOutput::new_with_overwrite(path, overwrite)?;
     let mut file = File::create(staged.path())
         .map_err(|error| format!("create {}: {error}", staged.path().display()))?;
     serde_json::to_writer_pretty(&mut file, report)

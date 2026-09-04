@@ -416,7 +416,7 @@ pub fn create_plan(
         fs::create_dir_all(parent)
             .map_err(|error| format!("create {}: {error}", parent.display()))?;
     }
-    write_json_atomic(&manifest_path, &plan)?;
+    write_json_atomic(&manifest_path, &plan, overwrite)?;
     Ok(plan)
 }
 
@@ -492,6 +492,7 @@ pub fn render_plan(
             &roles,
             &render_plan,
             format,
+            overwrite,
         )?);
     }
     let published_segments = rendered.iter().filter(|segment| segment.published).count();
@@ -522,7 +523,7 @@ pub fn render_plan(
     request_input
         .verify_source()
         .map_err(|error| format!("segment request changed before report publication: {error}"))?;
-    write_json_atomic(&report_path, &report)?;
+    write_json_atomic(&report_path, &report, overwrite)?;
     Ok(report)
 }
 
@@ -533,6 +534,7 @@ fn render_segment(
     roles: &[ChannelRole],
     plan: &Plan,
     format: OutputFormat,
+    overwrite: bool,
 ) -> Result<RenderedSegment, String> {
     let input_path = Path::new(&segment.input.path);
     let output_path = Path::new(&segment.output_path);
@@ -561,7 +563,7 @@ fn render_segment(
         )
     })?;
 
-    let mut staged = AtomicOutput::new(output_path)?;
+    let mut staged = AtomicOutput::new_with_overwrite(output_path, overwrite)?;
     normalize::write(&buffer, staged.path(), plan, format)?;
     staged.adopt_path_writer_output()?;
     let padding = u64::from(intended.sample_rate)
@@ -1411,8 +1413,8 @@ fn load_bounded<T: for<'de> Deserialize<'de>>(path: &Path, limit: u64) -> Result
     }
 }
 
-fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> {
-    let staged = AtomicOutput::new(path)?;
+fn write_json_atomic(path: &Path, value: &impl Serialize, overwrite: bool) -> Result<(), String> {
+    let staged = AtomicOutput::new_with_overwrite(path, overwrite)?;
     let mut file = File::create(staged.path())
         .map_err(|error| format!("create {}: {error}", staged.path().display()))?;
     serde_json::to_writer_pretty(&mut file, value)

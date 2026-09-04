@@ -11,6 +11,7 @@ use forge_normalizer::bound_analysis::BoundAnalysis;
 use forge_normalizer::catalogue::{Catalogue, CatalogueAsset, CatalogueRecord};
 use forge_normalizer::cli;
 use forge_normalizer::codec_qc;
+use forge_normalizer::discovery::discover_audio_files;
 use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::dsp::resample::ResampleQuality;
 use forge_normalizer::ebu_qc_report;
@@ -21,6 +22,8 @@ use forge_normalizer::normalization_diff::{
 use forge_normalizer::normalize::{
     self, DialogueSource, DialogueStandard, Mode, OutputFormat, Plan,
 };
+use forge_normalizer::output::{create_live_file_atomically, write_file_atomically};
+use forge_normalizer::output_plan::{OutputPlan, PlannedOutput, ProtectedPath};
 use forge_normalizer::preset::Preset;
 use forge_normalizer::qc::{self, QcOptions};
 use forge_normalizer::report::{
@@ -50,6 +53,7 @@ struct BatchOptions {
 struct CacheOptions {
     directory: Option<PathBuf>,
     read_only: bool,
+    warm_cache: bool,
     max_mib: Option<u64>,
 }
 
@@ -87,7 +91,7 @@ impl AnalysisInvocationOptions {
 }
 
 impl CacheOptions {
-    fn open(&self) -> Result<Option<AnalysisCache>, String> {
+    fn open(&self, force_read_only: bool) -> Result<Option<AnalysisCache>, String> {
         let Some(directory) = &self.directory else {
             return Ok(None);
         };
@@ -98,7 +102,7 @@ impl CacheOptions {
         AnalysisCache::new(
             directory,
             AnalysisCachePolicy {
-                read_only: self.read_only,
+                read_only: self.read_only || force_read_only,
                 max_bytes,
             },
         )
@@ -162,6 +166,15 @@ fn main() -> ExitCode {
                 .action(ArgAction::SetTrue)
                 .requires("analysis_cache")
                 .help("Read cache hits but never create, repair, or evict entries"),
+        )
+        .arg(
+            Arg::new("warm_cache")
+                .long("warm-cache")
+                .action(ArgAction::SetTrue)
+                .requires("analysis_cache")
+                .requires("dry_run")
+                .conflicts_with("analysis_cache_read_only")
+                .help("Allow --dry-run to populate and evict entries in the analysis cache"),
         )
         .arg(
             Arg::new("analysis_cache_max_mib")
@@ -301,6 +314,7 @@ fn main() -> ExitCode {
     let cache_options = CacheOptions {
         directory: matches.get_one::<PathBuf>("analysis_cache").cloned(),
         read_only: matches.get_flag("analysis_cache_read_only"),
+        warm_cache: matches.get_flag("warm_cache"),
         max_mib: matches.get_one::<u64>("analysis_cache_max_mib").copied(),
     };
     let watch_options = WatchOptions {
@@ -524,12 +538,12 @@ fn process_watch_candidate(
         std::fs::create_dir_all(directory)
             .map_err(|error| format!("create {}: {error}", directory.display()))?;
     }
-    let output = watch.mark_processing(&candidate.id, &output)?;
+    let output = watch.mark_processing_output(&candidate.id, &output)?;
     let mut cli = template.clone();
     cli.inputs = vec![candidate.input.clone()];
-    cli.output = Some(output);
+    cli.output = Some(output.path().to_owned());
     cli.recursive = false;
-    cli.overwrite = true;
+    cli.overwrite = output.replace_existing();
     let analysis_options = AnalysisInvocationOptions::engine_only(analysis_engine);
     let result = run_paths(
         cli,
@@ -663,6 +677,11 @@ fn run_paths(
         output_sample_rate: cli.sample_rate_hz,
         resample_quality: ResampleQuality::parse(&cli.resample_quality),
     };
+    let output_conflict_policy = if cli.overwrite {
+        normalize::OutputConflictPolicy::ReplaceUnchanged
+    } else {
+        normalize::OutputConflictPolicy::CreateNew
+    };
     if let Some(preset) = preset {
         eprintln!(
             "preset {}: {:.1} LUFS, {:.1} dBTP ({})",
@@ -703,9 +722,8 @@ fn run_paths(
         );
     }
     plan.validate()?;
-    let analysis_cache = cache_options.open()?;
-
     if cli.write_tags {
+        let analysis_cache = cache_options.open(cli.dry_run && !cache_options.warm_cache)?;
         return write_loudness_tags(
             &cli,
             channel_roles_override.as_deref(),
@@ -723,6 +741,16 @@ fn run_paths(
             }
         }
     }
+    validate_control_paths(&cli, batch_options, &outputs)?;
+    let _output_plan = build_output_plan(
+        &cli,
+        batch_options,
+        catalogue_options,
+        anomaly_audit_paths,
+        ebu_qc_xml,
+        &outputs,
+    )?;
+    let analysis_cache = cache_options.open(cli.dry_run && !cache_options.warm_cache)?;
     validate_catalogue_paths(&cli, catalogue_options, &outputs, stdin_requested)?;
     let mut catalogue = catalogue_options
         .database
@@ -1478,13 +1506,13 @@ fn run_paths(
                 let stdout = io::stdout();
                 report::write_csv_with_engine(stdout.lock(), &reports, analysis_engine)?;
             } else {
-                let file = File::create(path)
-                    .map_err(|error| format!("create {}: {error}", path.display()))?;
-                report::write_csv_with_engine(file, &reports, analysis_engine)?;
+                write_file_atomically(path, cli.overwrite, |file| {
+                    report::write_csv_with_engine(file, &reports, analysis_engine)
+                })?;
             }
         }
         if let Some(path) = &cli.timeline {
-            write_timeline(path, &timeline_reports, analysis_engine)?;
+            write_timeline(path, &timeline_reports, analysis_engine, cli.overwrite)?;
         }
         if let Some(path) = &cli.manifest {
             if path.as_os_str() == "-" {
@@ -1497,62 +1525,56 @@ fn run_paths(
                 )?;
                 println!();
             } else {
-                let file = File::create(path)
-                    .map_err(|error| format!("create {}: {error}", path.display()))?;
-                report::write_manifest_with_engine_and_anomaly_audits(
-                    file,
-                    &reports,
-                    &anomaly_audits,
-                    analysis_engine,
-                )?;
+                write_file_atomically(path, cli.overwrite, |file| {
+                    report::write_manifest_with_engine_and_anomaly_audits(
+                        file,
+                        &reports,
+                        &anomaly_audits,
+                        analysis_engine,
+                    )
+                })?;
             }
         }
         if let Some(path) = &cli.dialogue_detection_report {
             let detection = dialogue_detection_output
                 .as_ref()
                 .expect("auto dialogue always produces a detection result");
-            let file = File::create(path)
-                .map_err(|error| format!("create {}: {error}", path.display()))?;
-            serde_json::to_writer_pretty(file, detection)
-                .map_err(|error| format!("write dialogue detection report: {error}"))?;
+            write_file_atomically(path, cli.overwrite, |file| {
+                serde_json::to_writer_pretty(file, detection)
+                    .map_err(|error| format!("write dialogue detection report: {error}"))
+            })?;
         }
         if let Some(path) = &cli.adm_profile_report {
             let audit = adm_profile_audit_output
                 .as_ref()
                 .expect("ADM profile validation always produces an audit");
-            let file = File::create(path)
-                .map_err(|error| format!("create {}: {error}", path.display()))?;
-            serde_json::to_writer_pretty(file, audit)
-                .map_err(|error| format!("write ADM profile report: {error}"))?;
+            write_file_atomically(path, cli.overwrite, |file| {
+                serde_json::to_writer_pretty(file, audit)
+                    .map_err(|error| format!("write ADM profile report: {error}"))
+            })?;
         }
         if let Some(path) = ebu_qc_xml {
-            if let Some(parent) = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-            {
-                std::fs::create_dir_all(parent)
-                    .map_err(|error| format!("create {}: {error}", parent.display()))?;
-            }
             let (metadata, analysis, options, results, timeline, timeline_interval_ms) =
                 ebu_qc_xml_output
                     .as_ref()
                     .expect("EBU QC XML analysis always produces report data");
-            let file = File::create(path)
-                .map_err(|error| format!("create {}: {error}", path.display()))?;
-            ebu_qc_scenario1::write_xml(
-                file,
-                metadata,
-                analysis,
-                options,
-                results,
-                timeline,
-                *timeline_interval_ms,
-            )?;
+            write_file_atomically(path, cli.overwrite, |file| {
+                ebu_qc_scenario1::write_xml(
+                    file,
+                    metadata,
+                    analysis,
+                    options,
+                    results,
+                    timeline,
+                    *timeline_interval_ms,
+                )
+            })?;
         }
         write_catalogue_report(
             catalogue.as_ref(),
             catalogue_options.report.as_deref(),
             std::mem::take(&mut catalogue_records),
+            cli.overwrite,
         )?;
         if qc_failed {
             return Err("one or more inputs failed the requested compliance/QC checks".into());
@@ -1569,7 +1591,6 @@ fn run_paths(
         {
             return Err("--job-state and --progress cannot be used with stdin".into());
         }
-        validate_control_paths(&cli, batch_options, &outputs)?;
         if cli.album {
             validate_outputs(&cli.inputs, &outputs, cli.overwrite)?;
         }
@@ -1627,7 +1648,7 @@ fn run_paths(
                     .iter()
                     .map(|cached| cached.analysis.clone())
                     .collect::<Vec<_>>();
-                normalize::normalize_album_bound_corrected(
+                normalize::normalize_album_bound_corrected_with_policy(
                     &stable_inputs,
                     &outputs,
                     &plan,
@@ -1635,10 +1656,11 @@ fn run_paths(
                     cli.verify_tolerance,
                     cli.verify_retries as usize,
                     &bound_analyses,
+                    output_conflict_policy,
                 )
                 .map_err(|error| error.to_string())?
             } else {
-                normalize::normalize_album_corrected_with_roles(
+                normalize::normalize_album_corrected_with_roles_and_policy(
                     &cli.inputs,
                     &outputs,
                     &plan,
@@ -1646,6 +1668,7 @@ fn run_paths(
                     cli.verify_tolerance,
                     cli.verify_retries as usize,
                     channel_roles_override.as_deref(),
+                    output_conflict_policy,
                 )?
             };
             for (input, source) in cli.inputs.iter().zip(&corrected.sources) {
@@ -1723,12 +1746,13 @@ fn run_paths(
                         },
                     )?);
                 }
-                write_difference_report(path, difference_assets)?;
+                write_difference_report(path, difference_assets, cli.overwrite)?;
             }
             write_catalogue_report(
                 catalogue.as_ref(),
                 catalogue_options.report.as_deref(),
                 std::mem::take(&mut catalogue_records),
+                cli.overwrite,
             )?;
             return Ok(());
         }
@@ -1742,21 +1766,23 @@ fn run_paths(
                     .iter()
                     .map(|cached| cached.analysis.clone())
                     .collect::<Vec<_>>();
-                normalize::normalize_album_bound_audited(
+                normalize::normalize_album_bound_audited_with_policy(
                     &stable_inputs,
                     &outputs,
                     &plan,
                     &formats,
                     &bound_analyses,
+                    output_conflict_policy,
                 )
                 .map_err(|error| error.to_string())?
             } else {
-                normalize::normalize_album_audited_with_roles(
+                normalize::normalize_album_audited_with_roles_and_policy(
                     &cli.inputs,
                     &outputs,
                     &plan,
                     &formats,
                     channel_roles_override.as_deref(),
+                    output_conflict_policy,
                 )?
             }
             .into_iter()
@@ -1772,21 +1798,23 @@ fn run_paths(
                     .iter()
                     .map(|cached| cached.analysis.clone())
                     .collect::<Vec<_>>();
-                normalize::normalize_album_bound(
+                normalize::normalize_album_bound_with_policy(
                     &stable_inputs,
                     &outputs,
                     &plan,
                     &formats,
                     &bound_analyses,
+                    output_conflict_policy,
                 )
                 .map_err(|error| error.to_string())?
             } else {
-                normalize::normalize_album_with_roles(
+                normalize::normalize_album_with_roles_and_policy(
                     &cli.inputs,
                     &outputs,
                     &plan,
                     &formats,
                     channel_roles_override.as_deref(),
+                    output_conflict_policy,
                 )?
             }
             .into_iter()
@@ -1842,12 +1870,13 @@ fn run_paths(
                     },
                 )?);
             }
-            write_difference_report(path, difference_assets)?;
+            write_difference_report(path, difference_assets, cli.overwrite)?;
         }
         write_catalogue_report(
             catalogue.as_ref(),
             catalogue_options.report.as_deref(),
             std::mem::take(&mut catalogue_records),
+            cli.overwrite,
         )?;
         return Ok(());
     }
@@ -1890,7 +1919,10 @@ fn run_paths(
     let mut progress = batch_options
         .progress
         .as_deref()
-        .map(ProgressWriter::open)
+        // A progress path denotes a per-invocation live stream. Preserve its
+        // historical replace-on-open behavior independently of audio output
+        // overwrite policy; aliases were rejected by the output plan above.
+        .map(|path| ProgressWriter::open(path, true))
         .transpose()?;
     let initial_completed = batch_job.as_ref().map_or(0, BatchJob::completed_count);
     if let Some(writer) = &mut progress {
@@ -2002,21 +2034,23 @@ fn run_paths(
                     prepare_output_directories(std::slice::from_ref(output))?;
                     if let Some(analyses) = cached_analyses.as_ref() {
                         let cached = &analyses[asset_index - wave_start];
-                        normalize::normalize_one_bound_staged(
+                        normalize::normalize_one_bound_staged_with_policy(
                             &cached.input,
                             output,
                             &plan,
                             formats[asset_index],
                             &cached.analysis,
+                            output_conflict_policy,
                         )
                         .map_err(|error| error.to_string())
                     } else {
-                        normalize::normalize_one_staged_with_roles(
+                        normalize::normalize_one_staged_with_roles_and_policy(
                             &cli.inputs[asset_index],
                             output,
                             &plan,
                             formats[asset_index],
                             channel_roles_override.as_deref(),
+                            output_conflict_policy,
                         )
                     }
                 })
@@ -2025,7 +2059,12 @@ fn run_paths(
             for (asset_index, staged) in (wave_start..wave_end).zip(staged) {
                 let input = &cli.inputs[asset_index];
                 let output = &outputs[asset_index];
-                let outcome = match staged.and_then(normalize::StagedNormalization::commit) {
+                let outcome = match staged.and_then(|staged| {
+                    if let Some(job) = &mut batch_job {
+                        job.mark_ready_to_publish(asset_index, staged.staged_path())?;
+                    }
+                    staged.commit()
+                }) {
                     Ok(outcome) => outcome,
                     Err(error) => {
                         if let Some(writer) = &mut progress {
@@ -2092,6 +2131,7 @@ fn run_paths(
             catalogue.as_ref(),
             catalogue_options.report.as_deref(),
             catalogue_records,
+            cli.overwrite,
         )?;
         return Ok(());
     }
@@ -2157,8 +2197,8 @@ fn run_paths(
             } else {
                 prepare_output_directories(std::slice::from_ref(output))?;
                 if cli.verify {
-                    let corrected = if let Some(analysis) = cached_analysis.as_ref() {
-                        normalize::normalize_one_bound_corrected(
+                    let staged = if let Some(analysis) = cached_analysis.as_ref() {
+                        normalize::normalize_one_bound_corrected_staged_with_policy(
                             &analysis.input,
                             output,
                             &plan,
@@ -2166,10 +2206,11 @@ fn run_paths(
                             cli.verify_tolerance,
                             cli.verify_retries as usize,
                             &analysis.analysis,
+                            output_conflict_policy,
                         )
                         .map_err(|error| error.to_string())?
                     } else {
-                        normalize::normalize_one_corrected_with_roles(
+                        normalize::normalize_one_corrected_staged_with_roles_and_policy(
                             input,
                             output,
                             &plan,
@@ -2177,8 +2218,13 @@ fn run_paths(
                             cli.verify_tolerance,
                             cli.verify_retries as usize,
                             channel_roles_override.as_deref(),
+                            output_conflict_policy,
                         )?
                     };
+                    if let Some(job) = &mut batch_job {
+                        job.mark_ready_to_publish(index, staged.staged_path())?;
+                    }
+                    let corrected = staged.commit()?;
                     print_analysis(input, &corrected.source, Some(corrected.gain));
                     catalogue_measurement = Some(corrected.source.clone());
                     if !print_verification(input, &corrected.verification, &plan) {
@@ -2211,21 +2257,23 @@ fn run_paths(
                 } else {
                     if cli.difference_report.is_some() {
                         let (an, gain, render) = if let Some(analysis) = cached_analysis.as_ref() {
-                            normalize::normalize_one_bound_audited(
+                            normalize::normalize_one_bound_audited_with_policy(
                                 &analysis.input,
                                 output,
                                 &plan,
                                 *fmt,
                                 &analysis.analysis,
+                                output_conflict_policy,
                             )
                             .map_err(|error| error.to_string())?
                         } else {
-                            normalize::normalize_one_audited_with_roles(
+                            normalize::normalize_one_audited_with_roles_and_policy(
                                 input,
                                 output,
                                 &plan,
                                 *fmt,
                                 channel_roles_override.as_deref(),
+                                output_conflict_policy,
                             )?
                         };
                         print_analysis(input, &an, Some(gain));
@@ -2248,21 +2296,23 @@ fn run_paths(
                         )?);
                     } else {
                         let (an, gain) = if let Some(analysis) = cached_analysis.as_ref() {
-                            normalize::normalize_one_bound(
+                            normalize::normalize_one_bound_with_policy(
                                 &analysis.input,
                                 output,
                                 &plan,
                                 *fmt,
                                 &analysis.analysis,
+                                output_conflict_policy,
                             )
                             .map_err(|error| error.to_string())?
                         } else {
-                            normalize::normalize_one_with_roles(
+                            normalize::normalize_one_with_roles_and_policy(
                                 input,
                                 output,
                                 &plan,
                                 *fmt,
                                 channel_roles_override.as_deref(),
+                                output_conflict_policy,
                             )?
                         };
                         print_analysis(input, &an, Some(gain));
@@ -2328,12 +2378,13 @@ fn run_paths(
         )?;
     }
     if let Some(path) = &cli.difference_report {
-        write_difference_report(path, difference_assets)?;
+        write_difference_report(path, difference_assets, cli.overwrite)?;
     }
     write_catalogue_report(
         catalogue.as_ref(),
         catalogue_options.report.as_deref(),
         catalogue_records,
+        cli.overwrite,
     )?;
     Ok(())
 }
@@ -2341,14 +2392,20 @@ fn run_paths(
 fn write_difference_report(
     path: &Path,
     assets: Vec<NormalizationDifferenceAsset>,
+    overwrite: bool,
 ) -> Result<(), String> {
-    normalization_diff::write_report(path, &NormalizationDifferenceReport::new(assets))
+    normalization_diff::write_report_with_overwrite(
+        path,
+        &NormalizationDifferenceReport::new(assets),
+        overwrite,
+    )
 }
 
 fn write_timeline(
     path: &Path,
     reports: &[TimelineReport],
     engine: AnalysisEngine,
+    overwrite: bool,
 ) -> Result<(), String> {
     let format = path
         .extension()
@@ -2366,16 +2423,7 @@ fn write_timeline(
         let mut output = stdout.lock();
         write(&mut output)
     } else {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("create {}: {error}", parent.display()))?;
-        }
-        let mut file =
-            File::create(path).map_err(|error| format!("create {}: {error}", path.display()))?;
-        write(&mut file)
+        write_file_atomically(path, overwrite, |file| write(file))
     }
 }
 
@@ -2492,7 +2540,7 @@ struct ProgressWriter {
 }
 
 impl ProgressWriter {
-    fn open(path: &Path) -> Result<Self, String> {
+    fn open(path: &Path, overwrite: bool) -> Result<Self, String> {
         let output: Box<dyn Write> = if path == Path::new("-") {
             Box::new(io::stdout())
         } else {
@@ -2503,10 +2551,7 @@ impl ProgressWriter {
                 std::fs::create_dir_all(parent)
                     .map_err(|error| format!("create {}: {error}", parent.display()))?;
             }
-            Box::new(
-                File::create(path)
-                    .map_err(|error| format!("create {}: {error}", path.display()))?,
-            )
+            Box::new(create_live_file_atomically(path, overwrite)?)
         };
         Ok(Self {
             output,
@@ -2675,9 +2720,12 @@ fn write_catalogue_report(
     catalogue: Option<&Catalogue>,
     report: Option<&Path>,
     records: Vec<CatalogueRecord>,
+    overwrite: bool,
 ) -> Result<(), String> {
     match (catalogue, report) {
-        (Some(catalogue), Some(report)) => catalogue.write_report(report, records),
+        (Some(catalogue), Some(report)) => {
+            catalogue.write_report_with_overwrite(report, records, overwrite)
+        }
         _ => Ok(()),
     }
 }
@@ -3058,7 +3106,14 @@ fn expand_inputs(
                     input.display()
                 ));
             }
-            collect_audio_files(input, input, &mut expanded, &mut relative)?;
+            let root = std::fs::canonicalize(input)
+                .map_err(|error| format!("canonicalize {}: {error}", input.display()))?;
+            for path in discover_audio_files(&root, true)? {
+                relative.push(path.strip_prefix(&root).map(PathBuf::from).map_err(|_| {
+                    format!("discovered input escaped its root: {}", path.display())
+                })?);
+                expanded.push(path);
+            }
         } else {
             return Err(format!("input does not exist: {}", input.display()));
         }
@@ -3067,58 +3122,6 @@ fn expand_inputs(
         return Err("no supported audio files found".into());
     }
     Ok((expanded, relative))
-}
-
-fn collect_audio_files(
-    root: &Path,
-    directory: &Path,
-    expanded: &mut Vec<PathBuf>,
-    relative: &mut Vec<PathBuf>,
-) -> Result<(), String> {
-    let mut entries: Vec<_> = std::fs::read_dir(directory)
-        .map_err(|error| format!("read {}: {error}", directory.display()))?
-        .collect::<Result<_, _>>()
-        .map_err(|error| format!("read {}: {error}", directory.display()))?;
-    entries.sort_by_key(|entry| entry.path());
-    for entry in entries {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_audio_files(root, &path, expanded, relative)?;
-        } else if path.is_file() && is_supported_input(&path) {
-            relative.push(
-                path.strip_prefix(root)
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| path.clone()),
-            );
-            expanded.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn is_supported_input(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some(
-            "wav"
-                | "wave"
-                | "bwf"
-                | "bw64"
-                | "rf64"
-                | "dsf"
-                | "dff"
-                | "mp3"
-                | "flac"
-                | "aac"
-                | "m4a"
-                | "mp4"
-                | "ogg"
-                | "opus",
-        )
-    )
 }
 
 fn validate_outputs(
@@ -3138,6 +3141,115 @@ fn validate_outputs(
         }
     }
     Ok(())
+}
+
+fn build_output_plan(
+    cli: &cli::Cli,
+    batch_options: &BatchOptions,
+    catalogue_options: &CatalogueOptions,
+    anomaly_audits: &[PathBuf],
+    ebu_qc_xml: Option<&Path>,
+    audio_outputs: &[PathBuf],
+) -> Result<OutputPlan, String> {
+    let mut protected = Vec::new();
+    for (index, path) in cli.inputs.iter().enumerate() {
+        if path != Path::new("-") {
+            protected.push(ProtectedPath::new(format!("input {index}"), path));
+        }
+    }
+    for (label, path) in [
+        ("configuration", cli.config.as_deref()),
+        ("dialogue ranges", cli.dialogue_ranges.as_deref()),
+        ("dialogue stem", cli.dialogue_stem.as_deref()),
+        ("codec metadata", cli.codec_metadata.as_deref()),
+        ("codec reference", cli.codec_reference.as_deref()),
+        ("codec prober", cli.codec_prober.as_deref()),
+        ("ADM presentation map", cli.adm_presentations.as_deref()),
+        ("ADM renderer", cli.adm_renderer.as_deref()),
+    ] {
+        if let Some(path) = path {
+            protected.push(ProtectedPath::new(label, path));
+        }
+    }
+    protected.extend(
+        anomaly_audits
+            .iter()
+            .enumerate()
+            .map(|(index, path)| ProtectedPath::new(format!("anomaly audit {index}"), path)),
+    );
+
+    let mut outputs = Vec::new();
+    if !cli.analyze_only && !cli.gain_only && !cli.write_tags {
+        outputs.extend(audio_outputs.iter().enumerate().map(|(index, path)| {
+            // A resumable job may legitimately begin with hash-verified
+            // completed outputs. BatchJob validates those hashes before the
+            // pending subset applies the caller's actual overwrite policy.
+            PlannedOutput::new(
+                format!("audio output {index}"),
+                path,
+                cli.overwrite || batch_options.job_state.is_some(),
+            )
+        }));
+    }
+    if cli.analyze_only {
+        for (label, path) in [
+            ("CSV report", cli.csv.as_deref()),
+            ("timeline report", cli.timeline.as_deref()),
+            ("delivery manifest", cli.manifest.as_deref()),
+            (
+                "dialogue detection report",
+                cli.dialogue_detection_report.as_deref(),
+            ),
+            ("ADM profile report", cli.adm_profile_report.as_deref()),
+            ("EBU QC XML report", ebu_qc_xml),
+            ("ADM rendered output", cli.adm_rendered_output.as_deref()),
+        ] {
+            if let Some(path) = path.filter(|path| *path != Path::new("-")) {
+                outputs.push(PlannedOutput::new(label, path, cli.overwrite));
+            }
+        }
+    }
+    if let Some(path) = &cli.difference_report {
+        outputs.push(PlannedOutput::new(
+            "normalization difference report",
+            path,
+            cli.overwrite,
+        ));
+    }
+    if let Some(path) = &batch_options.job_state {
+        outputs.push(PlannedOutput::new("batch state", path, true));
+        outputs.push(PlannedOutput::new(
+            "batch state lock",
+            state_lock_path(path)?,
+            true,
+        ));
+    }
+    if let Some(path) = batch_options
+        .progress
+        .as_deref()
+        .filter(|path| *path != Path::new("-"))
+    {
+        outputs.push(PlannedOutput::new("batch progress report", path, true));
+    }
+    if let Some(path) = &catalogue_options.database {
+        outputs.push(PlannedOutput::new("catalogue database", path, true));
+    }
+    if let Some(path) = &catalogue_options.report {
+        outputs.push(PlannedOutput::new("catalogue report", path, cli.overwrite));
+    }
+    OutputPlan::new(protected, outputs)
+}
+
+fn state_lock_path(state: &Path) -> Result<PathBuf, String> {
+    let name = state.file_name().ok_or_else(|| {
+        format!(
+            "state path has no final component for locking: {}",
+            state.display()
+        )
+    })?;
+    let mut lock_name = name.to_os_string();
+    lock_name.push(".lock");
+    Ok(state.with_file_name(lock_name))
 }
 
 fn prepare_output_directories(outputs: &[PathBuf]) -> Result<(), String> {

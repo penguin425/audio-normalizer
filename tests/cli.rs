@@ -413,6 +413,7 @@ fn content_addressed_analysis_cache_is_reused_by_real_normalization() {
         .arg("--dry-run")
         .arg("--analysis-cache")
         .arg(&cache)
+        .arg("--warm-cache")
         .arg("--sample-rate")
         .arg("44100")
         .output()
@@ -467,6 +468,45 @@ fn content_addressed_analysis_cache_is_reused_by_real_normalization() {
     assert!(jsonschema::validator_for(&schema)
         .unwrap()
         .is_valid(&instance));
+}
+
+#[test]
+fn dry_run_does_not_populate_analysis_cache_without_warm_cache() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("tone.wav");
+    let cache = directory.path().join("analysis-cache");
+    write_batch_test_wav(&input, 440.0);
+
+    let dry_run = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .arg("--dry-run")
+        .arg("--analysis-cache")
+        .arg(&cache)
+        .output()
+        .unwrap();
+    assert!(
+        dry_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&dry_run.stderr).contains("miss; read-only"));
+    assert!(!cache.join("v3").exists());
+
+    let tag_dry_run = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .arg("--write-tags")
+        .arg("--dry-run")
+        .arg("--analysis-cache")
+        .arg(&cache)
+        .output()
+        .unwrap();
+    assert!(
+        tag_dry_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tag_dry_run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&tag_dry_run.stderr).contains("miss; read-only"));
+    assert!(!cache.join("v3").exists());
 }
 
 #[test]
@@ -661,6 +701,7 @@ fn album_verification_consumes_cached_source_analyses() {
         .arg(&output)
         .arg("--analysis-cache")
         .arg(&cache)
+        .arg("--warm-cache")
         .output()
         .unwrap();
     assert!(
@@ -757,7 +798,7 @@ fn resumable_batch_skips_verified_outputs_and_recovers_only_missing_or_changed_a
         String::from_utf8_lossy(&first_run.stderr)
     );
     let state_schema: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/batch-job-v1.schema.json")).unwrap();
+        serde_json::from_str(include_str!("../schema/batch-job-v2.schema.json")).unwrap();
     let state: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
     assert!(jsonschema::validator_for(&state_schema)
@@ -1059,6 +1100,7 @@ fn parallel_cached_batch_matches_serial_bytes_and_reports_hits_in_input_order() 
         .arg("--dry-run")
         .arg("--analysis-cache")
         .arg(&cache)
+        .arg("--warm-cache")
         .arg("-o")
         .arg(&warm_outputs)
         .output()

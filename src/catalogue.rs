@@ -254,6 +254,16 @@ impl Catalogue {
 
     /// Export records committed by the caller as an atomic JSON report.
     pub fn write_report(&self, path: &Path, records: Vec<CatalogueRecord>) -> Result<(), String> {
+        self.write_report_with_overwrite(path, records, true)
+    }
+
+    /// Atomically export invocation records with an explicit replacement policy.
+    pub fn write_report_with_overwrite(
+        &self,
+        path: &Path,
+        records: Vec<CatalogueRecord>,
+        overwrite: bool,
+    ) -> Result<(), String> {
         if records.len() > MAX_REPORT_RECORDS {
             return Err(format!(
                 "catalogue report contains {} records; limit is {MAX_REPORT_RECORDS}",
@@ -279,7 +289,7 @@ impl Catalogue {
         let mut bytes = serde_json::to_vec_pretty(&report)
             .map_err(|error| format!("encode catalogue report: {error}"))?;
         bytes.push(b'\n');
-        let mut output = AtomicOutput::new(path)?;
+        let mut output = AtomicOutput::new_with_overwrite(path, overwrite)?;
         output.write_all(&bytes)?;
         output.commit()
     }

@@ -505,7 +505,7 @@ pub fn write_report(
     }
     .map_err(|error| format!("serialize ADM presentation report: {error}"))?;
     bytes.push(b'\n');
-    let mut output = crate::atomic::AtomicOutput::new(path)?;
+    let mut output = crate::atomic::AtomicOutput::new_with_overwrite(path, overwrite)?;
     output.write_all(&bytes)?;
     output.commit()
 }
@@ -1076,7 +1076,7 @@ fn retain_render(
             destination.display()
         ));
     }
-    let mut output = crate::atomic::AtomicOutput::new(&destination)?;
+    let mut output = crate::atomic::AtomicOutput::new_with_overwrite(&destination, overwrite)?;
     output.copy_from_path(source)?;
     output.commit()?;
     Ok(destination)

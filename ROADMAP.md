@@ -265,15 +265,23 @@ Forge already provides:
   envelope, limiter amount, clipping/ceiling counts, decoded-output endpoints,
   SHA-256 provenance, and codec loudness/peak/duration drift.
 - Resumable independent-track batch jobs with atomic per-output checkpoints,
-  input/settings/output SHA-256 binding, missing-output recovery,
-  changed-output rejection, and schema-validated lifecycle NDJSON.
+  input/settings/output SHA-256 binding, a crash-recoverable
+  `ready_to_publish` state, process locking, missing-output recovery,
+  changed-output rejection, v1-to-v2 migration, and schema-validated lifecycle
+  NDJSON.
 - Opt-in content-addressed core analysis cache with streaming input SHA-256,
   request and algorithm revision binding, atomic schema-validated entries,
   corruption recovery, read-only operation, bounded FIFO eviction, and
   ordered file-level parallel hit/miss integration for album and batch jobs.
+  Dry runs are read-only unless cache warming is explicitly requested.
 - Stable-file watch folders with symlink-safe bounded discovery, durable
-  atomic processing state, settings and input/output SHA-256 binding,
-  restart recovery, explicit failed-item retry, and one-shot scheduling.
+  atomic processing state, process locking, settings and input/output SHA-256
+  binding, restart recovery, explicit failed-item retry, and one-shot
+  scheduling.
+- Whole-invocation output planning for the normalizer rejects protected-file,
+  duplicate-route, symlink/reparse-point, hard-link, and platform case aliases
+  before decode. Final audio, reports, and state use atomic no-clobber or
+  unchanged-destination compare-and-swap publication with directory durability.
 - Versioned SQLite catalogue with source/output SHA-256, BS.1770-5/EBU R 128
   measurement and algorithm revisions, selected profile, Forge version,
   bounded structured provenance, transactional deduplication, and atomic
@@ -465,15 +473,9 @@ core:
 ### Immediate operational gates
 
 New standards coverage must not outrun the safety of the ordinary file and
-service workflows. Before adding another broad parser surface, Forge will:
+service workflows. The filesystem and state-coordination gates shipped in
+v0.189.6. Before adding another broad parser surface, Forge will:
 
-- build one deterministic `OutputPlan` before decoding, covering audio,
-  reports, timelines, manifests, and state files; reject path, symlink,
-  hard-link, case-folding, and duplicate-output collisions; and publish every
-  file with atomic replace or atomic no-clobber semantics as requested;
-- hold a sibling process lock for each batch/watch state file and share a
-  bounded, symlink-safe discovery policy across the normal CLI, batch, and
-  watch workflows;
 - make metadata handling explicit through `preserve`, `strict`, and `strip`
   policies, report every preserved/mapped/recomputed/dropped field, adjust
   sample-indexed BWF/DAW timing with exact rational arithmetic after
@@ -491,18 +493,9 @@ service workflows. Before adding another broad parser surface, Forge will:
 
 ### Newly identified integrity gates
 
-The following gaps were found by tracing the current decode, render, batch,
-and configuration paths rather than by adding another format checklist:
+The following remaining gaps were found by tracing the current decode, render,
+batch, and configuration paths rather than by adding another format checklist:
 
-- bind every two-pass analysis to the exact bytes later rendered. Carry an
-  `AnalyzedInput` identity (content hash plus platform file identity where
-  available), verify it before publication, and fail without touching an
-  existing output when a path is replaced, overwritten, or changed through a
-  hard link between analysis and render;
-- centralize finite/range validation in `Plan::validate()` and
-  `validate_for(format)` and call it from the CLI, configuration loader, and
-  every public normalize/write entry point before decoding or creating an
-  output;
 - replace extension-only dispatch with one codec/container registry and an
   `InputDescriptor` that records container, codec, and selected audio-track
   identity. Preserve the source codec by default where possible and require an
@@ -519,13 +512,12 @@ and configuration paths rather than by adding another format checklist:
 - probe the exact encoder and muxer capability before decoding, rather than
   treating a successful `ffmpeg -version` as proof that AAC, ALAC, or Vorbis
   output is available;
-- make batch publication crash-recoverable with a hash-bound
-  `ReadyToPublish` checkpoint, a semantic operation fingerprint containing the
-  analysis revision, codec, and encoder identity, and an opt-in bounded
-  `--keep-going` failure report;
-- sync the parent directory after atomic publication, make `--dry-run`
-  read-only unless `--warm-cache` is explicit, and treat a closed output pipe
-  as a normal CLI termination; and
+- extend the crash-recoverable batch checkpoint with a semantic operation
+  fingerprint containing the analysis revision, codec, and encoder identity,
+  plus an opt-in bounded `--keep-going` failure report;
+- make dry-run behavior side-effect-free across file reports and external
+  renderer outputs, retaining `--warm-cache` as the only explicit mutation;
+- treat a closed output pipe as a normal CLI termination; and
 - require release tags to resolve to protected `main`, recheck the remote tag
   immediately before publication, and generate every platform archive from a
   single manifest whose contract test proves that each bundled executable has
@@ -616,7 +608,7 @@ unchanged controls from paths whose normative work factor changed.
 The order below is an implementation plan, not a standards requirement. Each
 normative item must name the exact supported clauses and must not imply
 certification or coverage beyond its fixtures.
-v0.189.1 through v0.189.5 are the completed baseline; later entries are
+v0.189.1 through v0.189.6 are the completed baseline; later entries are
 planned.
 
 | Release | Scope | Classification |
@@ -626,13 +618,13 @@ planned.
 | v0.189.3 | Bind every two-pass analysis, cache hit, metadata read, and final render to one stable byte source through additive `StableInput`/`BoundAnalysis` APIs, and centralize validation of every public `Plan` and format-specific numeric setting before decode or output creation | Input integrity and API safety |
 | v0.189.4 | Bind atomic publication to the staged inode produced by trusted path-based metadata writers; reject metadata-report aliases observed at preflight and immediately before atomic publication; and retain gRPC worker permits and cancellation registrations until blocking work actually exits | Filesystem and service safety |
 | v0.189.5 | Use an exact rational block clock, carry compensated or fixed-order accumulation through every energy reduction, reject typed non-finite chunks atomically, distinguish finite/negative-infinity/undefined dB values in every JSON contract, and add a deterministic cross-platform reference-analysis mode | Measurement correctness and reproducibility |
-| v0.189.6 | Add a whole-invocation filesystem/output plan and one transaction layer for every audio and report writer, with commit-time no-clobber/CAS checks, parent-directory durability, state-file process locks, crash recovery, and bounded symlink-safe discovery shared by CLI, batch, and watch modes | Filesystem safety and recoverability |
+| v0.189.6 | Add a whole-invocation filesystem/output plan and one transaction layer for the normalizer's final audio, report, and state writers, with commit-time no-clobber/CAS checks, parent-directory durability, state-file process locks, crash recovery, and bounded symlink-safe discovery shared by CLI, batch, and watch modes | Filesystem safety and recoverability |
 | v0.189.7 | Introduce one codec/container/track registry and `InputDescriptor`; make normalization and QC share its bounded decode stream, time range, selected track, and layout evidence; bind remote range reads with a strong validator or one materialized snapshot; preserve integer/`f64` source precision; key catalogue v2 by bytes, track, range, layout, renderer, and effective plan; add lossless-safe defaults and exact encoder/muxer preflight | Codec interoperability and product contract |
 | v0.189.8 | Carry one exact channel-layout descriptor through decode, analysis, rendering, and re-verification; complete BS.1770-5 Annex 3 positional weighting and Annex 4 renderer-bound measurement; round-trip non-default RFC 9639 masks through FLAC/WAVE and ISO-BMFF `chnl`/CICP layout plus `dmix` evidence; and expose additive layout override/provenance parity in Rust, C, Python, Wasm, REST, and gRPC | Measurement and API consistency |
 | v0.189.9 | Make REST/gRPC request limits effective during decode with streaming upload or bounded replay spooling, global memory/temp quotas, and cooperative cancellation throughout bounded decode and analysis | Product safety and resource control |
 | v0.189.10 | Require a secure non-loopback service boundary and centralize external codec/renderer execution behind bounded, cancellable process-tree supervision; keep full mTLS/OIDC and multi-OS sandbox policy as separately gated follow-up | Service and subprocess security |
 | v0.189.11 | Add explicit metadata-fidelity policies, registry-backed full-container metadata discovery, exact resampling-time conversion, and restartable metadata-only library transactions | Metadata integrity and workflow recovery |
-| v0.189.12 | Add crash-consistent batch publication, semantic job fingerprints, bounded `--keep-going`, parent-directory durability, and side-effect-free dry runs | Recoverability and operations |
+| v0.189.12 | Add generation-level all-or-nothing album/batch publication, semantic job fingerprints, bounded `--keep-going`, recovery inspection, safe reclamation of orphaned stages, and fully side-effect-free dry runs outside explicit cache warming | Recoverability and operations |
 | v0.189.13 | Prove Linux ABI and wheel-tag compatibility in the oldest supported runtime and ship relocatable CMake/pkg-config metadata before expanding release targets | Distribution compatibility |
 | v0.189.14 | Pin every Action to a full revision, enforce SHA-only workflows, protect release tags with a ruleset, split assemble/attest/publish permissions, decide `latest` before the one-way immutable publication, validate an exact asset manifest, add Linux ARM64 after runtime proof, publish through trusted crates.io/PyPI/npm identities, and extend per-artifact SBOM/provenance; treat Windows ARM64, OCI, notarization, and Authenticode as demand- and credential-gated follow-up | Supply-chain and native trust |
 | v0.190 | Native file-based ADM BS.2168 Level 0/1/2 validation, including declarations, graph constraints, block timing, CHNA/essence reconciliation, and derived limits | Normative |

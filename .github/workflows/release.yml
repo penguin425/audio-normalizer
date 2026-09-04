@@ -36,6 +36,12 @@ on:
       - "schema/analysis-cache-v1.schema.json"
       - "schema/analysis-cache-v2.schema.json"
       - "schema/analysis-cache-v3.schema.json"
+      - "schema/batch-job-v1.schema.json"
+      - "schema/batch-job-v2.schema.json"
+      - "schema/batch-progress-v1.schema.json"
+      - "schema/watch-folder-v1.schema.json"
+      - "BATCH-JOBS.md"
+      - "WATCH-FOLDERS.md"
       - "PYTHON-API.md"
       - "BENCHMARKS.md"
       - "MULTI-DELIVERY.md"
@@ -444,6 +450,10 @@ jobs:
           cp schema/analysis-cache-v1.schema.json \
              schema/analysis-cache-v2.schema.json \
              schema/analysis-cache-v3.schema.json "$staging/schema/"
+          cp schema/batch-job-v1.schema.json \
+             schema/batch-job-v2.schema.json \
+             schema/batch-progress-v1.schema.json \
+             schema/watch-folder-v1.schema.json "$staging/schema/"
           cp schema/delivery-manifest-v1.schema.json \
              schema/delivery-manifest-v2.schema.json \
              schema/delivery-manifest-v3.schema.json \
@@ -520,6 +530,7 @@ jobs:
           Copy-Item schema/performance-benchmark-v1.schema.json "$staging/schema/"
           Copy-Item schema/doctor-report-v1.schema.json "$staging/schema/"
           Copy-Item "schema/analysis-cache-v1.schema.json","schema/analysis-cache-v2.schema.json","schema/analysis-cache-v3.schema.json" "$staging/schema/"
+          Copy-Item "schema/batch-job-v1.schema.json","schema/batch-job-v2.schema.json","schema/batch-progress-v1.schema.json","schema/watch-folder-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/delivery-manifest-v1.schema.json","schema/delivery-manifest-v2.schema.json","schema/delivery-manifest-v3.schema.json","schema/delivery-manifest-v4.schema.json" "$staging/schema/"
           Copy-Item "schema/multi-delivery-request-v1.schema.json","schema/multi-delivery-report-v1.schema.json" "$staging/schema/"
           Copy-Item "schema/segment-normalization-request-v1.schema.json","schema/segment-normalization-plan-v1.schema.json","schema/segment-normalization-report-v1.schema.json","schema/segment-normalization-plan-v2.schema.json","schema/segment-normalization-report-v2.schema.json" "$staging/schema/"

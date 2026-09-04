@@ -240,6 +240,11 @@ pub fn run(
         request.verify_tolerance_lu_db,
         request.verify_retries,
         channel_roles,
+        if overwrite {
+            normalize::OutputConflictPolicy::ReplaceUnchanged
+        } else {
+            normalize::OutputConflictPolicy::CreateNew
+        },
     )?;
     if !result.source.lufs.is_finite()
         || !result.expected_level.is_finite()
@@ -315,7 +320,7 @@ pub fn run(
         passed: deliveries.iter().all(|delivery| delivery.passed),
         deliveries,
     };
-    write_report(report_path, &report)?;
+    write_report(report_path, &report, overwrite)?;
     Ok(report)
 }
 
@@ -570,8 +575,8 @@ fn profile_bounds_passed(
         && normalize::true_peak_within_ceiling(true_peak_dbtp, ceiling_dbtp)
 }
 
-fn write_report(path: &Path, report: &MultiDeliveryReport) -> Result<(), String> {
-    let staged = AtomicOutput::new(path)?;
+fn write_report(path: &Path, report: &MultiDeliveryReport, overwrite: bool) -> Result<(), String> {
+    let staged = AtomicOutput::new_with_overwrite(path, overwrite)?;
     let mut file = File::create(staged.path())
         .map_err(|error| format!("create {}: {error}", staged.path().display()))?;
     serde_json::to_writer_pretty(&mut file, report)

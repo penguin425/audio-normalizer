@@ -94,6 +94,11 @@ current invocation but leaves a missing or invalid entry untouched. An absent
 read-only cache directory is not created. Filesystem access or commit failures
 are errors rather than silent cache bypasses.
 
+`--dry-run` also opens the cache read-only by default, so inspecting a command
+does not create, repair, or evict cache entries. Add `--warm-cache` alongside
+`--dry-run --analysis-cache DIR` only when populating the cache is an intended
+side effect.
+
 ## Resource limits and eviction
 
 - One entry is limited to 64 MiB.
