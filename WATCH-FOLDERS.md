@@ -27,7 +27,8 @@ The first scan records each supported regular file's byte length,
 nanosecond-resolution modification time, and observation time. A file is
 eligible only when both properties remain unchanged for the full
 `--watch-stable-seconds` interval. Any observed change restarts the interval.
-Forge never follows symbolic links.
+Forge never follows symbolic links or Windows reparse points below the
+explicit input root.
 
 Immediately before processing, Forge checks the fingerprint again, computes
 the complete input SHA-256, and checks the fingerprint after hashing. A writer
@@ -48,12 +49,21 @@ itself is excluded from discovery even if it has an audio-like extension:
 3. `completed` records input and output SHA-256.
 4. `failed` records a bounded diagnostic and is not retried in a tight loop.
 
+One process owns the state through a persistent sibling
+`<state-name>.lock`. The lock file is intentionally not deleted between runs;
+this prevents another process from locking a new inode while an earlier owner
+still holds the old one. State and lock paths are protected from output-path,
+hard-link, reparse-point, and platform case aliases.
+
 On restart, a `processing` entry with no newly committed output is safely
 requeued. If the transactional output was committed before the state update,
 Forge hashes and adopts it as completed. Missing completed outputs are
 requeued. Modified completed outputs are rejected rather than overwritten.
 When a completed input changes, its previously recorded output must still
-match its SHA-256 before Forge will replace it.
+match its SHA-256 before Forge will replace it. A first-time output is
+published with atomic no-clobber semantics; replacement is allowed only for
+the exact previously verified output and is rejected if its identity or bytes
+change while normalization is running.
 
 Failed inputs remain suppressed until their size or modification time changes.
 `--watch-retry-failed` explicitly requeues all unchanged failures once at

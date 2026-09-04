@@ -59,7 +59,9 @@ Run `forge --help` for the complete option list.
 - Track and duration-weighted album normalization.
 - Configurable true-peak ceiling, optional look-ahead limiter, resampling, and
   integer PCM dither.
-- Recursive and resumable batch processing with JSON, CSV, and NDJSON reports.
+- Bounded recursive discovery and lock-protected, crash-resumable batch/watch
+  processing with JSON, CSV, and NDJSON reports.
+- Atomic output publication with no-clobber or unchanged-destination checks.
 - Output re-verification, ReplayGain, native M4A/ALAC `tlou`/`alou`, BWF
   metadata, and delivery compliance profiles.
 - Bounded parsers and companion QC tools for broadcast, streaming, immersive,

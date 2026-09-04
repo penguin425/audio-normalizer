@@ -88,6 +88,10 @@ cp schema/doctor-report-v1.schema.json "$staging/schema/"
 cp schema/analysis-cache-v1.schema.json \
    schema/analysis-cache-v2.schema.json \
    schema/analysis-cache-v3.schema.json "$staging/schema/"
+cp schema/batch-job-v1.schema.json \
+   schema/batch-job-v2.schema.json \
+   schema/batch-progress-v1.schema.json \
+   schema/watch-folder-v1.schema.json "$staging/schema/"
 cp schema/delivery-manifest-v1.schema.json \
    schema/delivery-manifest-v2.schema.json \
    schema/delivery-manifest-v3.schema.json \

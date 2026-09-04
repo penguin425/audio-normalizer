@@ -1,8 +1,10 @@
 //! Transactional output files staged beside their final destination.
 
 use crate::stable_input::identity_from_open_file;
+use crate::stable_input::StableFileIdentity;
+use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(windows)]
@@ -20,11 +22,33 @@ use tempfile::{Builder, NamedTempFile};
 /// primitive that could close that last pathname lookup window.
 pub(crate) struct AtomicOutput {
     destination: PathBuf,
+    expected_destination: DestinationState,
     temporary: NamedTempFile,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DestinationState {
+    Missing,
+    Present {
+        identity: StableFileIdentity,
+        byte_len: u64,
+        sha256: [u8; 32],
+    },
 }
 
 impl AtomicOutput {
     pub(crate) fn new(destination: &Path) -> Result<Self, String> {
+        Self::new_with_overwrite(destination, true)
+    }
+
+    pub(crate) fn new_with_overwrite(destination: &Path, overwrite: bool) -> Result<Self, String> {
+        let expected_destination = DestinationState::capture(destination)?;
+        if !overwrite && expected_destination != DestinationState::Missing {
+            return Err(format!(
+                "output already exists: {} (enable overwrite to replace it)",
+                destination.display()
+            ));
+        }
         let parent = destination
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
@@ -45,6 +69,7 @@ impl AtomicOutput {
             })?;
         Ok(Self {
             destination: destination.to_owned(),
+            expected_destination,
             temporary,
         })
     }
@@ -124,6 +149,10 @@ impl AtomicOutput {
     }
 
     pub(crate) fn commit(self) -> Result<(), String> {
+        self.commit_open().map(drop)
+    }
+
+    pub(crate) fn commit_open(self) -> Result<File, String> {
         // Sync the owned inode first, then minimize (but cannot portably
         // eliminate) the pathname race by binding immediately before persist.
         // An intentional path-replacing rewrite must first be adopted.
@@ -132,14 +161,19 @@ impl AtomicOutput {
             .sync_all()
             .map_err(|error| format!("sync {}: {error}", self.temporary.path().display()))?;
         let _bound_path_handle = self.bound_stage_file()?;
-        self.temporary.persist(&self.destination).map_err(|error| {
-            format!(
-                "commit output {}: {}",
-                self.destination.display(),
-                error.error
-            )
-        })?;
-        Ok(())
+        let _bound_destination_handles = self
+            .expected_destination
+            .verify_immediately_before_commit(&self.destination)?;
+        let destination = self.destination;
+        let overwrite = matches!(self.expected_destination, DestinationState::Present { .. });
+        let persisted = persist_temporary(self.temporary, &destination, overwrite)?;
+        // The same open inode was synchronized immediately before the rename,
+        // and no file data changes between that sync and publication. Syncing
+        // it a second time here adds a full filesystem round trip without
+        // strengthening durability. The parent-directory sync below makes the
+        // rename durable on Unix; Windows uses MoveFileExW with WRITE_THROUGH.
+        sync_parent_directory(&destination)?;
+        Ok(persisted)
     }
 
     #[cfg(unix)]
@@ -224,6 +258,269 @@ impl AtomicOutput {
         }
         Ok(current)
     }
+}
+
+#[cfg(not(windows))]
+fn persist_temporary(
+    temporary: NamedTempFile,
+    destination: &Path,
+    overwrite: bool,
+) -> Result<File, String> {
+    if overwrite {
+        temporary
+            .persist(destination)
+            .map_err(|error| format!("commit output {}: {}", destination.display(), error.error))
+    } else {
+        temporary.persist_noclobber(destination).map_err(|error| {
+            format!(
+                "commit output without overwrite {}: {}",
+                destination.display(),
+                error.error
+            )
+        })
+    }
+}
+
+#[cfg(windows)]
+fn persist_temporary(
+    temporary: NamedTempFile,
+    destination: &Path,
+    overwrite: bool,
+) -> Result<File, String> {
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+    const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x0000_0100;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+        fn SetFileAttributesW(path: *const u16, attributes: u32) -> i32;
+    }
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(iter::once(0))
+            .collect()
+    }
+
+    let source = temporary.path().to_owned();
+    let source_wide = wide(&source);
+    let destination_wide = wide(destination);
+    // NamedTempFile marks named files as temporary on Windows. Clear that
+    // attribute before publication, then request write-through rename
+    // semantics so the directory update is not merely queued in memory.
+    let normalized = unsafe { SetFileAttributesW(source_wide.as_ptr(), FILE_ATTRIBUTE_NORMAL) };
+    if normalized == 0 {
+        return Err(format!(
+            "prepare Windows output {} for commit: {}",
+            destination.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let flags = MOVEFILE_WRITE_THROUGH
+        | if overwrite {
+            MOVEFILE_REPLACE_EXISTING
+        } else {
+            0
+        };
+    let moved = unsafe { MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), flags) };
+    if moved == 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = unsafe { SetFileAttributesW(source_wide.as_ptr(), FILE_ATTRIBUTE_TEMPORARY) };
+        let action = if overwrite {
+            "commit output"
+        } else {
+            "commit output without overwrite"
+        };
+        return Err(format!("{action} {}: {error}", destination.display()));
+    }
+
+    let (file, old_path) = temporary.into_parts();
+    drop(old_path);
+    Ok(file)
+}
+
+impl DestinationState {
+    fn capture(path: &Path) -> Result<Self, String> {
+        let file = match open_regular_destination(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::Missing),
+            Err(error) => {
+                return Err(format!(
+                    "inspect output destination {}: {error}",
+                    path.display()
+                ))
+            }
+        };
+        let snapshot = snapshot_open_destination(&file, path)?;
+        let confirmation = open_regular_destination(path).map_err(|error| {
+            format!(
+                "reopen output destination {} after hashing: {error}",
+                path.display()
+            )
+        })?;
+        let confirmation_identity = identity_from_open_file(&confirmation, path)
+            .map_err(|error| format!("identify output destination {}: {error}", path.display()))?;
+        if snapshot.identity() != &confirmation_identity {
+            return Err(format!(
+                "output destination changed while its initial state was captured: {}",
+                path.display()
+            ));
+        }
+        Ok(snapshot)
+    }
+
+    fn identity(&self) -> &StableFileIdentity {
+        match self {
+            Self::Present { identity, .. } => identity,
+            Self::Missing => unreachable!("missing destinations have no file identity"),
+        }
+    }
+
+    fn verify_immediately_before_commit(&self, path: &Path) -> Result<Vec<File>, String> {
+        let Self::Present { .. } = self else {
+            // persist_noclobber performs the missing-state comparison and the
+            // publication as one filesystem operation.
+            return Ok(Vec::new());
+        };
+        let current = open_regular_destination(path).map_err(|error| {
+            format!(
+                "output destination changed before commit {}: {error}",
+                path.display()
+            )
+        })?;
+        let observed = snapshot_open_destination(&current, path)?;
+        if &observed != self {
+            return Err(format!(
+                "output destination changed after processing began; refusing to replace {}",
+                path.display()
+            ));
+        }
+        let confirmation = open_regular_destination(path).map_err(|error| {
+            format!(
+                "confirm output destination immediately before commit {}: {error}",
+                path.display()
+            )
+        })?;
+        let confirmation_identity = identity_from_open_file(&confirmation, path)
+            .map_err(|error| format!("identify output destination {}: {error}", path.display()))?;
+        if observed.identity() != &confirmation_identity {
+            return Err(format!(
+                "output destination changed immediately before commit: {}",
+                path.display()
+            ));
+        }
+        Ok(vec![current, confirmation])
+    }
+}
+
+fn snapshot_open_destination(file: &File, path: &Path) -> Result<DestinationState, String> {
+    let before = file.metadata().map_err(|error| {
+        format!(
+            "inspect opened output destination {}: {error}",
+            path.display()
+        )
+    })?;
+    if !before.is_file() {
+        return Err(format!(
+            "output destination is not a regular file: {}",
+            path.display()
+        ));
+    }
+    let identity = identity_from_open_file(file, path)
+        .map_err(|error| format!("identify output destination {}: {error}", path.display()))?;
+    let mut reader = file
+        .try_clone()
+        .map_err(|error| format!("clone output destination {}: {error}", path.display()))?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("seek output destination {}: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("hash output destination {}: {error}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let after = file.metadata().map_err(|error| {
+        format!(
+            "reinspect opened output destination {}: {error}",
+            path.display()
+        )
+    })?;
+    if before.len() != after.len() {
+        return Err(format!(
+            "output destination length changed while it was hashed: {}",
+            path.display()
+        ));
+    }
+    Ok(DestinationState::Present {
+        identity,
+        byte_len: after.len(),
+        sha256: hasher.finalize().into(),
+    })
+}
+
+fn open_regular_destination(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(windows)]
+    options
+        .share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004)
+        .custom_flags(0x0020_0000);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    if metadata.file_attributes() & 0x0000_0400 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination is a reparse point",
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(destination: &Path) -> Result<(), String> {
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            format!(
+                "sync output directory {} after committing {}: {error}",
+                parent.display(),
+                destination.display()
+            )
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_destination: &Path) -> Result<(), String> {
+    // Windows exposes durable move semantics through MoveFileEx rather than a
+    // portable directory-fsync equivalent. The persisted file handle itself
+    // is synchronized above; the publication primitive is strengthened on
+    // Windows separately from this Unix directory step.
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -324,6 +621,50 @@ mod tests {
         output.temporary.write_all(b"complete").unwrap();
         output.commit().unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"complete");
+    }
+
+    #[test]
+    fn commit_never_clobbers_a_destination_created_during_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("result.wav");
+        let mut output = AtomicOutput::new(&destination).unwrap();
+        output.write_all(b"generated").unwrap();
+        std::fs::write(&destination, b"competitor").unwrap();
+
+        let error = output.commit().unwrap_err();
+        assert!(error.contains("without overwrite"), "{error}");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"competitor");
+    }
+
+    #[test]
+    fn commit_rejects_same_inode_same_length_destination_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("result.wav");
+        std::fs::write(&destination, b"original").unwrap();
+        let mut output = AtomicOutput::new(&destination).unwrap();
+        output.write_all(b"generated").unwrap();
+        std::fs::write(&destination, b"tampered").unwrap();
+
+        let error = output.commit().unwrap_err();
+        assert!(error.contains("changed after processing began"), "{error}");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"tampered");
+    }
+
+    #[test]
+    fn commit_rejects_destination_inode_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("result.wav");
+        let displaced = directory.path().join("displaced.wav");
+        std::fs::write(&destination, b"original").unwrap();
+        let mut output = AtomicOutput::new(&destination).unwrap();
+        output.write_all(b"generated").unwrap();
+        std::fs::rename(&destination, &displaced).unwrap();
+        std::fs::write(&destination, b"competitor").unwrap();
+
+        let error = output.commit().unwrap_err();
+        assert!(error.contains("changed after processing began"), "{error}");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"competitor");
+        assert_eq!(std::fs::read(&displaced).unwrap(), b"original");
     }
 
     #[test]

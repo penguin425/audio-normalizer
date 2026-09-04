@@ -6,16 +6,24 @@
 //! settings.
 
 use crate::atomic::AtomicOutput;
+use crate::stable_input::identity_from_open_file;
+use crate::state_lock::{read_regular_state_file, StateFileLock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 pub const BATCH_JOB_SCHEMA_V1: &str =
     "https://penguin425.github.io/audio-normalizer/schema/batch-job-v1";
+pub const BATCH_JOB_SCHEMA_V2: &str =
+    "https://penguin425.github.io/audio-normalizer/schema/batch-job-v2";
 pub const BATCH_PROGRESS_SCHEMA_V1: &str =
     "https://penguin425.github.io/audio-normalizer/schema/batch-progress-v1";
 const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
@@ -42,6 +50,7 @@ impl BatchAssetSpec {
 #[serde(rename_all = "snake_case")]
 enum AssetStatus {
     Pending,
+    ReadyToPublish,
     Completed,
 }
 
@@ -73,6 +82,7 @@ struct JobDocument {
 pub struct BatchJob {
     path: PathBuf,
     document: JobDocument,
+    _state_lock: StateFileLock,
 }
 
 impl BatchJob {
@@ -96,23 +106,14 @@ impl BatchJob {
             ));
         }
         let path = absolute_path(&path.into())?;
+        let state_lock = StateFileLock::acquire(&path, "batch state")?;
         let expected_assets = build_assets(assets)?;
         reject_duplicate_paths(&expected_assets)?;
         let specification_sha256 = specification_hash(operation, &expected_assets)?;
         let generator = format!("forge-normalizer/{}", env!("CARGO_PKG_VERSION"));
 
-        let mut job = if path.exists() {
-            let metadata = std::fs::metadata(&path)
-                .map_err(|error| format!("inspect {}: {error}", path.display()))?;
-            if metadata.len() > MAX_STATE_BYTES {
-                return Err(format!(
-                    "{} exceeds the {}-byte batch state limit",
-                    path.display(),
-                    MAX_STATE_BYTES
-                ));
-            }
-            let bytes = std::fs::read(&path)
-                .map_err(|error| format!("read {}: {error}", path.display()))?;
+        let existing = read_regular_state_file(&path, "batch state", MAX_STATE_BYTES)?;
+        let mut job = if let Some(bytes) = existing {
             let document: JobDocument = serde_json::from_slice(&bytes)
                 .map_err(|error| format!("decode {}: {error}", path.display()))?;
             validate_document(
@@ -121,10 +122,14 @@ impl BatchJob {
                 &specification_sha256,
                 &expected_assets,
             )?;
-            Self { path, document }
+            Self {
+                path,
+                document,
+                _state_lock: state_lock,
+            }
         } else {
             let document = JobDocument {
-                schema: BATCH_JOB_SCHEMA_V1.into(),
+                schema: BATCH_JOB_SCHEMA_V2.into(),
                 generator,
                 operation: operation.clone(),
                 specification_sha256,
@@ -132,14 +137,22 @@ impl BatchJob {
                 completed_count: 0,
                 assets: expected_assets,
             };
-            let job = Self { path, document };
+            let job = Self {
+                path,
+                document,
+                _state_lock: state_lock,
+            };
             job.save()?;
             job
         };
 
         let mut changed = false;
+        if job.document.schema == BATCH_JOB_SCHEMA_V1 {
+            job.document.schema = BATCH_JOB_SCHEMA_V2.into();
+            changed = true;
+        }
         for asset in &mut job.document.assets {
-            if asset.status != AssetStatus::Completed {
+            if asset.status == AssetStatus::Pending {
                 continue;
             }
             let output = Path::new(&asset.output);
@@ -159,6 +172,11 @@ impl BatchJob {
                 }
                 asset.status = AssetStatus::Pending;
                 asset.output_sha256 = None;
+                changed = true;
+            } else if asset.status == AssetStatus::ReadyToPublish {
+                // Publication completed but the process exited before it
+                // could commit the final Completed checkpoint.
+                asset.status = AssetStatus::Completed;
                 changed = true;
             }
         }
@@ -182,6 +200,24 @@ impl BatchJob {
             .assets
             .get(index)
             .is_some_and(|asset| asset.status == AssetStatus::Completed)
+    }
+
+    /// Hash a fully rendered sibling stage and durably record that the next
+    /// operation is publication of those exact bytes.
+    pub fn mark_ready_to_publish(&mut self, index: usize, staged: &Path) -> Result<(), String> {
+        let staged_sha256 = hash_file(staged)?;
+        let asset = self
+            .document
+            .assets
+            .get_mut(index)
+            .ok_or_else(|| format!("batch asset index {index} is out of range"))?;
+        if asset.status == AssetStatus::Completed {
+            return Err(format!("batch asset {index} is already completed"));
+        }
+        asset.output_sha256 = Some(staged_sha256);
+        asset.status = AssetStatus::ReadyToPublish;
+        self.recount();
+        self.save()
     }
 
     /// Hash the completed output and atomically commit the updated checkpoint.
@@ -304,11 +340,19 @@ fn validate_document(
     specification_sha256: &str,
     expected_assets: &[JobAsset],
 ) -> Result<(), String> {
-    if document.schema != BATCH_JOB_SCHEMA_V1 {
+    if document.schema != BATCH_JOB_SCHEMA_V1 && document.schema != BATCH_JOB_SCHEMA_V2 {
         return Err(format!(
             "unsupported batch state schema {}",
             document.schema
         ));
+    }
+    if document.schema == BATCH_JOB_SCHEMA_V1
+        && document
+            .assets
+            .iter()
+            .any(|asset| asset.status == AssetStatus::ReadyToPublish)
+    {
+        return Err("batch-job-v1 cannot contain a ready-to-publish asset".into());
     }
     if !document.generator.starts_with("forge-normalizer/") {
         return Err("batch state contains an invalid generator".into());
@@ -350,7 +394,7 @@ fn validate_document(
                 .output_sha256
                 .as_deref()
                 .is_some_and(|value| !is_sha256(value))
-            || (stored.status == AssetStatus::Completed && stored.output_sha256.is_none())
+            || (stored.status != AssetStatus::Pending && stored.output_sha256.is_none())
             || (stored.status == AssetStatus::Pending && stored.output_sha256.is_some())
         {
             return Err("batch state contains invalid hash or status evidence".into());
@@ -370,7 +414,45 @@ fn path_text(path: &Path) -> Result<String, String> {
 }
 
 fn hash_file(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect {}: {error}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refuse to hash a non-regular or symlink batch file: {}",
+            path.display()
+        ));
+    }
+    #[cfg(windows)]
+    if metadata.file_attributes() & 0x0000_0400 != 0 {
+        return Err(format!(
+            "refuse to hash a reparse-point batch file: {}",
+            path.display()
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(windows)]
+    options.custom_flags(0x0020_0000);
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("open {}: {error}", path.display()))?;
+    let before = file
+        .metadata()
+        .map_err(|error| format!("inspect opened {}: {error}", path.display()))?;
+    #[cfg(windows)]
+    if before.file_attributes() & 0x0000_0400 != 0 {
+        return Err(format!(
+            "refuse to hash a reparse-point batch file: {}",
+            path.display()
+        ));
+    }
+    if !before.is_file() {
+        return Err(format!("batch file is not regular: {}", path.display()));
+    }
+    let identity = identity_from_open_file(&file, path)
+        .map_err(|error| format!("identify {}: {error}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0; HASH_BUFFER_BYTES];
     loop {
@@ -381,6 +463,26 @@ fn hash_file(path: &Path) -> Result<String, String> {
             break;
         }
         hasher.update(&buffer[..read]);
+    }
+    let after = file
+        .metadata()
+        .map_err(|error| format!("reinspect opened {}: {error}", path.display()))?;
+    if before.len() != after.len() {
+        return Err(format!(
+            "batch file changed while hashing: {}",
+            path.display()
+        ));
+    }
+    let confirmation = options
+        .open(path)
+        .map_err(|error| format!("reopen {} after hashing: {error}", path.display()))?;
+    let confirmation_identity = identity_from_open_file(&confirmation, path)
+        .map_err(|error| format!("identify {} after hashing: {error}", path.display()))?;
+    if confirmation_identity != identity {
+        return Err(format!(
+            "batch file changed while hashing: {}",
+            path.display()
+        ));
     }
     Ok(hex_digest(hasher.finalize().as_slice()))
 }
@@ -500,5 +602,88 @@ mod tests {
                 .unwrap_err()
                 .contains("does not match")
         );
+    }
+
+    #[test]
+    fn a_batch_state_cannot_be_opened_twice() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.wav");
+        let output = directory.path().join("output.wav");
+        let state = directory.path().join("job.json");
+        std::fs::write(&input, b"input").unwrap();
+        let assets = [BatchAssetSpec::new(&input, &output)];
+        let operation = json!({"target": -16});
+
+        let job = BatchJob::open(&state, &assets, &operation, false).unwrap();
+        let error = BatchJob::open(&state, &assets, &operation, false).unwrap_err();
+        assert!(error.contains("already open"), "{error}");
+        drop(job);
+        BatchJob::open(&state, &assets, &operation, false).unwrap();
+    }
+
+    #[test]
+    fn valid_v1_state_is_migrated_to_v2() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.wav");
+        let output = directory.path().join("output.wav");
+        let state = directory.path().join("job.json");
+        std::fs::write(&input, b"input").unwrap();
+        let assets = [BatchAssetSpec::new(&input, &output)];
+        let operation = json!({"target": -16});
+
+        drop(BatchJob::open(&state, &assets, &operation, false).unwrap());
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+        document["schema"] = BATCH_JOB_SCHEMA_V1.into();
+        std::fs::write(&state, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        drop(BatchJob::open(&state, &assets, &operation, false).unwrap());
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+        assert_eq!(migrated["schema"], BATCH_JOB_SCHEMA_V2);
+    }
+
+    #[test]
+    fn ready_checkpoint_recovers_a_published_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.wav");
+        let output = directory.path().join("output.wav");
+        let staged = directory.path().join("staged.wav");
+        let state = directory.path().join("job.json");
+        std::fs::write(&input, b"input").unwrap();
+        std::fs::write(&staged, b"normalized").unwrap();
+        let assets = [BatchAssetSpec::new(&input, &output)];
+        let operation = json!({"target": -16});
+
+        let mut job = BatchJob::open(&state, &assets, &operation, false).unwrap();
+        job.mark_ready_to_publish(0, &staged).unwrap();
+        std::fs::rename(&staged, &output).unwrap();
+        drop(job);
+
+        let job = BatchJob::open(&state, &assets, &operation, false).unwrap();
+        assert!(job.is_completed(0));
+        assert_eq!(job.completed_count(), 1);
+    }
+
+    #[test]
+    fn ready_checkpoint_without_publication_is_requeued() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.wav");
+        let output = directory.path().join("output.wav");
+        let staged = directory.path().join("staged.wav");
+        let state = directory.path().join("job.json");
+        std::fs::write(&input, b"input").unwrap();
+        std::fs::write(&staged, b"normalized").unwrap();
+        let assets = [BatchAssetSpec::new(&input, &output)];
+        let operation = json!({"target": -16});
+
+        let mut job = BatchJob::open(&state, &assets, &operation, false).unwrap();
+        job.mark_ready_to_publish(0, &staged).unwrap();
+        drop(job);
+        std::fs::remove_file(&staged).unwrap();
+
+        let job = BatchJob::open(&state, &assets, &operation, false).unwrap();
+        assert!(!job.is_completed(0));
+        assert_eq!(job.completed_count(), 0);
     }
 }

@@ -5,22 +5,29 @@
 //! atomically so a process restart cannot silently lose completed work.
 
 use crate::atomic::AtomicOutput;
+#[cfg(test)]
+use crate::discovery::MAX_DIRECTORY_DEPTH;
+use crate::discovery::{discover_audio_files_excluding, MAX_FILES};
+use crate::output_plan::{OutputPlan, PlannedOutput, ProtectedPath};
+use crate::stable_input::identity_from_open_file;
+use crate::state_lock::{read_regular_state_file, StateFileLock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const WATCH_FOLDER_SCHEMA_V1: &str =
     "https://penguin425.github.io/audio-normalizer/schema/watch-folder-v1";
 const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_FILES: usize = 100_000;
-const MAX_DIRECTORY_ENTRIES: usize = 1_000_000;
-const MAX_DIRECTORY_DEPTH: usize = 64;
 const MAX_ERROR_BYTES: usize = 4096;
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
@@ -30,6 +37,25 @@ pub struct WatchCandidate {
     pub id: String,
     pub input: PathBuf,
     pub relative: PathBuf,
+}
+
+/// Publication decision captured while a watched output is checkpointed.
+#[derive(Debug, Clone)]
+pub struct WatchProcessingOutput {
+    path: PathBuf,
+    replace_existing: bool,
+}
+
+impl WatchProcessingOutput {
+    /// Absolute path reserved for the watched output.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Whether publication may replace the output captured by the checkpoint.
+    pub fn replace_existing(&self) -> bool {
+        self.replace_existing
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -88,6 +114,7 @@ pub struct WatchFolder {
     input_root: PathBuf,
     output_root: PathBuf,
     document: WatchDocument,
+    _state_lock: StateFileLock,
 }
 
 impl WatchFolder {
@@ -101,6 +128,7 @@ impl WatchFolder {
         operation: Value,
     ) -> Result<Self, String> {
         let state_path = absolute_path(&state_path.into())?;
+        let state_lock = StateFileLock::acquire(&state_path, "watch state")?;
         let input_root = std::fs::canonicalize(input_root.into())
             .map_err(|error| format!("canonicalize watch input: {error}"))?;
         if !input_root.is_dir() {
@@ -126,23 +154,8 @@ impl WatchFolder {
         let input_text = path_text(&input_root)?;
         let output_text = path_text(&output_root)?;
 
-        let document = if state_path.exists() {
-            let metadata = std::fs::symlink_metadata(&state_path)
-                .map_err(|error| format!("inspect {}: {error}", state_path.display()))?;
-            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-                return Err(format!(
-                    "watch state is not a regular non-symlink file: {}",
-                    state_path.display()
-                ));
-            }
-            if metadata.len() > MAX_STATE_BYTES {
-                return Err(format!(
-                    "{} exceeds the {MAX_STATE_BYTES}-byte watch state limit",
-                    state_path.display()
-                ));
-            }
-            let bytes = std::fs::read(&state_path)
-                .map_err(|error| format!("read {}: {error}", state_path.display()))?;
+        let existing = read_regular_state_file(&state_path, "watch state", MAX_STATE_BYTES)?;
+        let document = if let Some(bytes) = existing {
             let document: WatchDocument = serde_json::from_slice(&bytes)
                 .map_err(|error| format!("decode {}: {error}", state_path.display()))?;
             validate_document(
@@ -173,6 +186,7 @@ impl WatchFolder {
             input_root,
             output_root,
             document,
+            _state_lock: state_lock,
         };
         folder.save()?;
         Ok(folder)
@@ -203,21 +217,12 @@ impl WatchFolder {
 
     fn scan_at(&mut self, now: SystemTime) -> Result<Vec<WatchCandidate>, String> {
         let now_ms = unix_millis(now)?;
-        let mut discovered = Vec::new();
-        let mut visited = 0;
-        WatchScanner {
-            root: &self.input_root,
-            output_root: &self.output_root,
-            state_path: &self.state_path,
-            recursive: self.document.recursive,
-            visited: &mut visited,
-            files: &mut discovered,
-        }
-        .collect(&self.input_root, 0)?;
-        if discovered.len() > MAX_FILES {
-            return Err(format!("watch folder exceeds the {MAX_FILES}-file limit"));
-        }
-        discovered.sort();
+        let discovered = discover_audio_files_excluding(
+            &self.input_root,
+            self.document.recursive,
+            Some(&self.state_path),
+            Some(&self.output_root),
+        )?;
         let mut seen = BTreeSet::new();
         let mut candidates = Vec::new();
 
@@ -310,6 +315,17 @@ impl WatchFolder {
         id: &str,
         output: impl Into<PathBuf>,
     ) -> Result<PathBuf, String> {
+        self.mark_processing_output(id, output)
+            .map(|planned| planned.path)
+    }
+
+    /// Persist intent and return whether a hash-verified prior output may be
+    /// replaced. A previously missing output must use no-clobber publication.
+    pub fn mark_processing_output(
+        &mut self,
+        id: &str,
+        output: impl Into<PathBuf>,
+    ) -> Result<WatchProcessingOutput, String> {
         let input = self.input_root.join(id);
         let output = absolute_path(&output.into())?;
         let output_name = output
@@ -327,6 +343,13 @@ impl WatchFolder {
             ));
         }
         let output = parent.join(output_name);
+        OutputPlan::new(
+            vec![
+                ProtectedPath::new("watch state", &self.state_path),
+                ProtectedPath::new("watch state lock", sibling_lock_path(&self.state_path)?),
+            ],
+            vec![PlannedOutput::new("watch output", &output, true)],
+        )?;
         let entry = self.entry_mut(id)?;
         if entry.status != WatchStatus::Observing {
             return Err(format!("watch entry is not ready for processing: {id}"));
@@ -347,6 +370,7 @@ impl WatchFolder {
         } else {
             None
         };
+        let replace_existing = prior_output_sha256.is_some();
         entry.input_sha256 = Some(hash_stable_input(&input, &entry.fingerprint)?);
         entry.output = Some(path_text(&output)?);
         entry.output_sha256 = None;
@@ -354,7 +378,10 @@ impl WatchFolder {
         entry.error = None;
         entry.status = WatchStatus::Processing;
         self.save()?;
-        Ok(output)
+        Ok(WatchProcessingOutput {
+            path: output,
+            replace_existing,
+        })
     }
 
     /// Verify and atomically checkpoint a successfully committed output.
@@ -435,6 +462,18 @@ impl WatchFolder {
         output.write_all(&bytes)?;
         output.commit()
     }
+}
+
+fn sibling_lock_path(state: &Path) -> Result<PathBuf, String> {
+    let name = state.file_name().ok_or_else(|| {
+        format!(
+            "state path has no final component for locking: {}",
+            state.display()
+        )
+    })?;
+    let mut lock_name = name.to_os_string();
+    lock_name.push(".lock");
+    Ok(state.with_file_name(lock_name))
 }
 
 fn reset_entry(entry: &mut WatchEntry, fingerprint: Fingerprint, now_ms: u64) {
@@ -538,90 +577,12 @@ fn verify_output(entry: &WatchEntry) -> Result<(), String> {
     Ok(())
 }
 
-struct WatchScanner<'a> {
-    root: &'a Path,
-    output_root: &'a Path,
-    state_path: &'a Path,
-    recursive: bool,
-    visited: &'a mut usize,
-    files: &'a mut Vec<PathBuf>,
-}
-
-impl WatchScanner<'_> {
-    fn collect(&mut self, directory: &Path, depth: usize) -> Result<(), String> {
-        if depth > MAX_DIRECTORY_DEPTH {
-            return Err(format!(
-                "watch folder exceeds the {MAX_DIRECTORY_DEPTH}-directory-depth limit"
-            ));
-        }
-        let mut entries = std::fs::read_dir(directory)
-            .map_err(|error| format!("read {}: {error}", directory.display()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("read {}: {error}", directory.display()))?;
-        entries.sort_by_key(|entry| entry.path());
-        for entry in entries {
-            *self.visited = self
-                .visited
-                .checked_add(1)
-                .ok_or_else(|| "watch directory-entry count overflow".to_string())?;
-            if *self.visited > MAX_DIRECTORY_ENTRIES {
-                return Err(format!(
-                    "watch folder exceeds the {MAX_DIRECTORY_ENTRIES}-directory-entry limit"
-                ));
-            }
-            let file_type = entry
-                .file_type()
-                .map_err(|error| format!("inspect {}: {error}", entry.path().display()))?;
-            if file_type.is_symlink() {
-                continue;
-            }
-            let path = entry.path();
-            if path == self.state_path {
-                continue;
-            }
-            if file_type.is_dir() {
-                if self.recursive && path != self.output_root && path.starts_with(self.root) {
-                    self.collect(&path, depth + 1)?;
-                }
-            } else if file_type.is_file() && supported_audio(&path) {
-                self.files.push(path);
-            }
-        }
-        Ok(())
-    }
-}
-
-fn supported_audio(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some(
-            "wav"
-                | "wave"
-                | "bwf"
-                | "bw64"
-                | "rf64"
-                | "dsf"
-                | "dff"
-                | "mp3"
-                | "flac"
-                | "aac"
-                | "m4a"
-                | "mp4"
-                | "ogg"
-                | "opus"
-        )
-    )
-}
-
 fn fingerprint(path: &Path) -> Result<Fingerprint, String> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| format!("inspect {}: {error}", path.display()))?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+    if !metadata.file_type().is_file() || metadata_is_link(&metadata) {
         return Err(format!(
-            "watch input is not a regular non-symlink file: {}",
+            "watch input is not a regular non-symlink/reparse-point file: {}",
             path.display()
         ));
     }
@@ -760,15 +721,27 @@ fn hash_json(value: &Value) -> Result<String, String> {
 }
 
 fn hash_file(path: &Path) -> Result<String, String> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| format!("inspect {}: {error}", path.display()))?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+    let before = fingerprint(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(windows)]
+    options.custom_flags(0x0020_0000);
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("open {} without following links: {error}", path.display()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("inspect opened {}: {error}", path.display()))?;
+    if !opened.is_file() || metadata_is_link(&opened) {
         return Err(format!(
-            "refusing to hash a non-regular or symlink file: {}",
+            "refusing to hash a non-regular or linked file: {}",
             path.display()
         ));
     }
-    let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let identity = identity_from_open_file(&file, path)
+        .map_err(|error| format!("identify {}: {error}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; HASH_BUFFER_BYTES];
     loop {
@@ -780,7 +753,28 @@ fn hash_file(path: &Path) -> Result<String, String> {
         }
         hasher.update(&buffer[..count]);
     }
+    if fingerprint(path)? != before {
+        return Err(format!("file changed while hashing: {}", path.display()));
+    }
+    let confirmation = options
+        .open(path)
+        .map_err(|error| format!("reopen {} after hashing: {error}", path.display()))?;
+    let confirmation_identity = identity_from_open_file(&confirmation, path)
+        .map_err(|error| format!("identify {} after hashing: {error}", path.display()))?;
+    if confirmation_identity != identity {
+        return Err(format!("file changed while hashing: {}", path.display()));
+    }
     Ok(hex_digest(hasher.finalize()))
+}
+
+#[cfg(windows)]
+fn metadata_is_link(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink() || metadata.file_attributes() & 0x0000_0400 != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_link(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn hash_stable_input(path: &Path, expected: &Fingerprint) -> Result<String, String> {
@@ -1103,6 +1097,44 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("does not match"));
+    }
+
+    #[test]
+    fn a_watch_state_cannot_be_opened_twice() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input");
+        let output = directory.path().join("output");
+        let state = directory.path().join("watch.json");
+        std::fs::create_dir(&input).unwrap();
+        let folder = WatchFolder::open(
+            &state,
+            &input,
+            &output,
+            true,
+            Duration::from_secs(1),
+            json!({}),
+        )
+        .unwrap();
+        let error = WatchFolder::open(
+            &state,
+            &input,
+            &output,
+            true,
+            Duration::from_secs(1),
+            json!({}),
+        )
+        .unwrap_err();
+        assert!(error.contains("already open"), "{error}");
+        drop(folder);
+        WatchFolder::open(
+            state,
+            input,
+            output,
+            true,
+            Duration::from_secs(1),
+            json!({}),
+        )
+        .unwrap();
     }
 
     #[test]

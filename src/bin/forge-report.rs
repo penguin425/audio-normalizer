@@ -1,11 +1,10 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use forge_normalizer::report_tools;
+use forge_normalizer::{output::write_file_atomically, report_tools};
 use serde_json::Value;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use tempfile::Builder;
 
 #[derive(Parser)]
 #[command(
@@ -275,36 +274,11 @@ fn format_text_v2(report: &report_tools::ExplanationReportV2) -> String {
 }
 
 fn write_atomic(destination: &Path, bytes: &[u8], replace: bool) -> Result<(), String> {
-    if destination.exists() && !replace {
-        return Err(format!(
-            "{} already exists (use --overwrite to replace it)",
-            destination.display()
-        ));
-    }
-    let parent = destination
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut temporary = Builder::new()
-        .prefix(".forge-report-")
-        .tempfile_in(parent)
-        .map_err(|error| {
-            format!(
-                "create temporary output beside {}: {error}",
-                destination.display()
-            )
-        })?;
-    temporary
-        .write_all(bytes)
-        .map_err(|error| format!("write temporary output: {error}"))?;
-    temporary
-        .as_file_mut()
-        .sync_all()
-        .map_err(|error| format!("sync temporary output: {error}"))?;
-    temporary
-        .persist(destination)
-        .map_err(|error| format!("commit {}: {}", destination.display(), error.error))?;
-    Ok(())
+    write_file_atomically(destination, replace, |output| {
+        output
+            .write_all(bytes)
+            .map_err(|error| format!("write {}: {error}", destination.display()))
+    })
 }
 
 fn read_report(path: &Path) -> Result<Vec<u8>, String> {

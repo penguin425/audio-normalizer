@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/batch-job-v2",
+  "title": "Forge resumable batch job v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generator",
+    "operation",
+    "specification_sha256",
+    "asset_count",
+    "completed_count",
+    "assets"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/batch-job-v2"
+    },
+    "generator": {
+      "type": "string",
+      "pattern": "^forge-normalizer/[0-9]+\\.[0-9]+\\.[0-9]+"
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "mode",
+        "target_lufs",
+        "target_peak_dbfs",
+        "target_rms_dbfs",
+        "ceiling_dbtp",
+        "max_gain_db",
+        "dither",
+        "output_bits",
+        "bitrate_kbps",
+        "encoder_quality",
+        "limiter",
+        "wav_container",
+        "bwf",
+        "output_sample_rate_hz",
+        "resample_quality",
+        "verify",
+        "verify_tolerance",
+        "verify_retries",
+        "channel_layout",
+        "dual_mono",
+        "formats"
+      ],
+      "properties": {
+        "schema": {"const": "forge-normalization-operation-v1"},
+        "mode": {"enum": ["lufs", "peak", "rms"]},
+        "target_lufs": {"type": "number"},
+        "target_peak_dbfs": {"type": "number"},
+        "target_rms_dbfs": {"type": "number"},
+        "ceiling_dbtp": {"type": "number"},
+        "max_gain_db": {"type": ["number", "null"]},
+        "dither": {"type": "boolean"},
+        "output_bits": {
+          "type": ["string", "null"],
+          "enum": ["8", "16", "24", "32", "32f", "64f", null]
+        },
+        "bitrate_kbps": {"type": "integer"},
+        "encoder_quality": {"type": "integer", "minimum": 0, "maximum": 9},
+        "limiter": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["lookahead_ms", "release_ms"],
+              "properties": {
+                "lookahead_ms": {"type": "number", "exclusiveMinimum": 0},
+                "release_ms": {"type": "number", "exclusiveMinimum": 0}
+              }
+            }
+          ]
+        },
+        "wav_container": {"enum": ["auto", "riff", "rf64", "bw64"]},
+        "bwf": {"type": "boolean"},
+        "output_sample_rate_hz": {
+          "type": ["integer", "null"],
+          "minimum": 8000,
+          "maximum": 384000
+        },
+        "resample_quality": {"enum": ["fast", "balanced", "best"]},
+        "verify": {"type": "boolean"},
+        "verify_tolerance": {"type": "number", "exclusiveMinimum": 0},
+        "verify_retries": {"type": "integer", "minimum": 0},
+        "channel_layout": {"type": ["string", "null"]},
+        "dual_mono": {"type": "boolean"},
+        "formats": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100000,
+          "items": {
+            "enum": ["wav", "flac", "mp3", "opus", "m4a", "alac", "vorbis"]
+          }
+        }
+      }
+    },
+    "specification_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "asset_count": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100000
+    },
+    "completed_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100000
+    },
+    "assets": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["input", "output", "input_sha256", "status"],
+        "properties": {
+          "input": {"type": "string", "minLength": 1},
+          "output": {"type": "string", "minLength": 1},
+          "input_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "status": {"enum": ["pending", "ready_to_publish", "completed"]},
+          "output_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"status": {"const": "pending"}}},
+            "then": {"not": {"required": ["output_sha256"]}},
+            "else": {"required": ["output_sha256"]}
+          }
+        ]
+      }
+    }
+  }
+}
