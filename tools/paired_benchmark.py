@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import benchmark
 
@@ -110,6 +110,56 @@ def paired_median_change_percent(
     return statistics.median(changes)
 
 
+def paired_round_differences(
+    rounds: Iterable[dict[str, Any]],
+    value: Callable[[dict[str, Any]], float],
+    *,
+    reducer: Callable[[list[float]], float] = statistics.median,
+) -> list[float]:
+    """Return candidate-minus-baseline values for balanced round records.
+
+    Unlike :func:`paired_round_changes`, this helper operates on the nested
+    ``rounds`` representation used by the Symphonia benchmark and returns an
+    absolute difference. This is appropriate for byte-valued metrics such as
+    process peak RSS, including a zero-byte baseline.
+    """
+
+    differences = []
+    for round_result in rounds:
+        order = round_result["order"]
+        if (
+            len(order) != 4
+            or order.count(BASELINE) != 2
+            or order.count(CANDIDATE) != 2
+        ):
+            raise ValueError("paired benchmark round is not balanced")
+        samples = round_result["samples"]
+        baseline_values = [value(sample) for sample in samples[BASELINE]]
+        candidate_values = [value(sample) for sample in samples[CANDIDATE]]
+        if len(baseline_values) != 2 or len(candidate_values) != 2:
+            raise ValueError(
+                "paired benchmark round does not contain two samples per binary"
+            )
+        differences.append(reducer(candidate_values) - reducer(baseline_values))
+    return differences
+
+
+def isolated_regression_reproduced(
+    initial_change: float,
+    confirmation_change: float,
+    limit: float,
+) -> bool:
+    """Return whether an isolated regression exceeds its limit twice."""
+
+    return initial_change > limit and confirmation_change > limit
+
+
+def selected_cases(requested: Iterable[str] | None) -> list[str]:
+    """Return requested benchmark cases once each, or the full default set."""
+
+    return list(dict.fromkeys(requested)) if requested else list(CASES)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-forge", type=Path, required=True)
@@ -121,6 +171,13 @@ def parse_args() -> argparse.Namespace:
         "--duration-seconds", type=benchmark.positive_int, required=True
     )
     parser.add_argument("--rounds", type=benchmark.positive_int, default=8)
+    parser.add_argument(
+        "--case",
+        action="append",
+        choices=CASES,
+        dest="cases",
+        help="benchmark only this case; may be supplied more than once",
+    )
     parser.add_argument(
         "--timeout-seconds", type=benchmark.positive_int, default=7_200
     )
@@ -238,6 +295,7 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
 
 def main() -> int:
     args = parse_args()
+    cases = selected_cases(args.cases)
     if args.duration_seconds > benchmark.MAX_DURATION_SECONDS:
         raise ValueError(
             f"duration must not exceed {benchmark.MAX_DURATION_SECONDS} seconds"
@@ -273,7 +331,7 @@ def main() -> int:
             "duration_seconds": args.duration_seconds,
             "rounds": args.rounds,
             "samples_per_binary": args.rounds * 2,
-            "cases": list(CASES),
+            "cases": cases,
         },
         "versions": {
             label: benchmark.command_version(path)
@@ -296,15 +354,19 @@ def main() -> int:
             benchmark.write_pcm16_wave(
                 wave_path, args.duration_seconds, 48_000, 2
             )
-            benchmark.encode_fixture(
-                ffmpeg, wave_path, flac_path, ["-map_metadata", "-1", "-c:a", "flac"],
-                args.timeout_seconds,
-            )
-            for case_index, case_id in enumerate(CASES):
+            if "flac-stereo-normalize" in cases:
+                benchmark.encode_fixture(
+                    ffmpeg,
+                    wave_path,
+                    flac_path,
+                    ["-map_metadata", "-1", "-c:a", "flac"],
+                    args.timeout_seconds,
+                )
+            for case_id in cases:
                 report["results"].append(
                     run_case(
                         case_id,
-                        case_index,
+                        CASES.index(case_id),
                         workspace,
                         binaries,
                         wave_path,

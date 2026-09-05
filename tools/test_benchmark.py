@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import statistics
 import struct
 import sys
 import tempfile
@@ -150,6 +151,81 @@ class BenchmarkTests(unittest.TestCase):
             paired_benchmark.paired_round_changes(
                 result, lambda sample: sample["value"]
             )
+
+    def test_paired_round_max_differences_isolate_one_gross_rss_outlier(self):
+        orders = (
+            paired_benchmark.alternating_schedule(1),
+            paired_benchmark.alternating_schedule(1, inverted=True),
+            paired_benchmark.alternating_schedule(1),
+        )
+        rss_pairs = (
+            ((100, 100), (101, 101)),
+            ((100, 100), (101, 501)),
+            ((100, 100), (101, 101)),
+        )
+        rounds = []
+        for order, (baseline, candidate) in zip(orders, rss_pairs):
+            rounds.append(
+                {
+                    "order": order,
+                    "samples": {
+                        paired_benchmark.BASELINE: [
+                            {"peak_rss_bytes": value} for value in baseline
+                        ],
+                        paired_benchmark.CANDIDATE: [
+                            {"peak_rss_bytes": value} for value in candidate
+                        ],
+                    },
+                }
+            )
+        differences = paired_benchmark.paired_round_differences(
+            rounds,
+            lambda sample: sample["peak_rss_bytes"],
+            reducer=max,
+        )
+        self.assertEqual(differences, [1, 401, 1])
+        self.assertEqual(statistics.median(differences), 1.0)
+
+    def test_isolated_regression_must_exceed_the_same_limit_twice(self):
+        reproduced = paired_benchmark.isolated_regression_reproduced
+        self.assertTrue(reproduced(4.1, 4.2, 4.0))
+        self.assertFalse(reproduced(4.1, 3.9, 4.0))
+        self.assertFalse(reproduced(3.9, 4.2, 4.0))
+        self.assertFalse(reproduced(4.0, 4.1, 4.0))
+
+    def test_selected_cases_default_and_deduplication(self):
+        self.assertEqual(
+            paired_benchmark.selected_cases(None), list(paired_benchmark.CASES)
+        )
+        self.assertEqual(
+            paired_benchmark.selected_cases(
+                [
+                    "wav-stereo-resample-normalize",
+                    "wav-stereo-resample-normalize",
+                ]
+            ),
+            ["wav-stereo-resample-normalize"],
+        )
+
+    def test_paired_cli_accepts_a_single_confirmation_case(self):
+        arguments = [
+            "paired_benchmark.py",
+            "--baseline-forge",
+            "/baseline-forge",
+            "--candidate-forge",
+            "/candidate-forge",
+            "--ffmpeg",
+            "/ffmpeg",
+            "--output",
+            "/report.json",
+            "--duration-seconds",
+            "300",
+            "--case",
+            "flac-stereo-normalize",
+        ]
+        with mock.patch.object(sys, "argv", arguments):
+            parsed = paired_benchmark.parse_args()
+        self.assertEqual(parsed.cases, ["flac-stereo-normalize"])
 
     def test_repeated_measurements_use_medians_and_maximum_rss(self):
         summary = benchmark.aggregate_measurements([

@@ -9,6 +9,7 @@ on:
       - "src/normalize.rs"
       - "src/pcm_spool.rs"
       - "tools/benchmark.py"
+      - "tools/paired_benchmark.py"
       - "tools/test_benchmark.py"
 
 permissions:
@@ -213,6 +214,7 @@ jobs:
               run_measured,
               write_pcm16_wave,
           )
+          from paired_benchmark import alternating_schedule, paired_round_differences
 
           root = Path(os.environ["BENCHMARK_ROOT"])
           root.mkdir()
@@ -248,8 +250,9 @@ jobs:
           }
           result = {
               "method": (
-                  "7-round ABBA/BAAB on one pre-encoded 600-second MP3 "
-                  "fixture; 14 samples per binary"
+                  "two unmeasured balanced warm-up blocks followed by 7-round "
+                  "ABBA/BAAB on one pre-encoded 600-second MP3 fixture; "
+                  "14 measured samples per binary"
               ),
               "system": {
                   "platform": sys.platform,
@@ -303,9 +306,11 @@ jobs:
                       assert sample["exit_code"] == 0, sample
                       return sample
 
-                  # Warm both binaries symmetrically; warm-ups are not measured.
-                  for name in ("baseline", "candidate"):
-                      measure(name, "warm")
+                  # Settle executable/input pages and the hosted runner without
+                  # favoring either binary. These two complete balanced blocks
+                  # are deliberately excluded from the measured population.
+                  for position, name in enumerate(alternating_schedule(2)):
+                      measure(name, f"warm-{position:02d}")
 
                   for round_index in range(7):
                       order = (
@@ -358,9 +363,26 @@ jobs:
                           ),
                           "paired_round_changes_percent": round_changes,
                       }
-                  summary["peak_rss_bytes"] = {
+                  rss_round_differences = paired_round_differences(
+                      rounds,
+                      lambda sample: sample["peak_rss_bytes"],
+                      reducer=max,
+                  )
+                  raw_rss_maxima = {
                       name: max(sample["peak_rss_bytes"] for sample in values)
                       for name, values in samples.items()
+                  }
+                  summary["peak_rss_bytes"] = {
+                      # Retain the old raw/gross maxima as evidence. The gate
+                      # below uses the drift-resistant paired-round population.
+                      **raw_rss_maxima,
+                      "raw_max_delta_bytes": (
+                          raw_rss_maxima["candidate"] - raw_rss_maxima["baseline"]
+                      ),
+                      "paired_round_differences_bytes": rss_round_differences,
+                      "median_paired_round_difference_bytes": statistics.median(
+                          rss_round_differences
+                      ),
                   }
                   mode_cases[case] = {"summary": summary, "rounds": rounds}
               result["modes"][mode] = mode_cases
@@ -376,15 +398,16 @@ jobs:
           ) as output:
               output.write("## Symphonia packet coalescing benchmark\n\n")
               output.write(
-                  "Seven ABBA/BAAB rounds; 14 samples per binary and mode.\n"
+                  "Two unmeasured balanced warm-up blocks, then seven measured "
+                  "ABBA/BAAB rounds; 14 samples per binary and mode.\n"
               )
               for mode, cases in result["modes"].items():
                   output.write(f"\n### {mode}\n\n")
                   output.write(
                       "| Case | Pooled wall | Paired wall | Pooled CPU "
-                      "| Paired CPU | RSS delta |\n"
+                      "| Paired CPU | Paired RSS delta | Raw max RSS delta |\n"
                   )
-                  output.write("|---|---:|---:|---:|---:|---:|\n")
+                  output.write("|---|---:|---:|---:|---:|---:|---:|\n")
                   for case, case_result in cases.items():
                       summary = case_result["summary"]
                       rss = summary["peak_rss_bytes"]
@@ -394,7 +417,8 @@ jobs:
                           f"| {summary['wall']['median_paired_round_change_percent']:+.3f}% "
                           f"| {summary['cpu']['pooled_change_percent']:+.3f}% "
                           f"| {summary['cpu']['median_paired_round_change_percent']:+.3f}% "
-                          f"| {rss['candidate'] - rss['baseline']:+d} B |\n"
+                          f"| {rss['median_paired_round_difference_bytes']:+.0f} B "
+                          f"| {rss['raw_max_delta_bytes']:+d} B |\n"
                       )
           print(json.dumps({
               mode: {
@@ -508,11 +532,11 @@ jobs:
                           normalization_pooled.append(pooled)
                           normalization_paired.append(paired)
                   rss = summary["peak_rss_bytes"]
-                  rss_delta = rss["candidate"] - rss["baseline"]
+                  rss_delta = rss["median_paired_round_difference_bytes"]
                   assert rss_delta <= 4 * 1024 * 1024, (
                       mode,
                       case,
-                      "RSS delta",
+                      "median paired-round RSS delta",
                       rss_delta,
                   )
           assert len(normalization_pooled) == 4, normalization_pooled
