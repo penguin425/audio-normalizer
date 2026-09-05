@@ -28,6 +28,7 @@ CASES = ("flac-stereo-normalize", "wav-stereo-resample-normalize")
 BASELINE = "baseline"
 CANDIDATE = "candidate"
 MAX_ROUNDS = 32
+WARMUP_ROUNDS = 2
 
 
 def alternating_schedule(rounds: int, *, inverted: bool = False) -> list[str]:
@@ -184,13 +185,12 @@ def run_case(
         for label, forge in binaries.items()
     }
 
-    # Prime both executable and input pages without measuring them. Reverse the
-    # order for the second case so warm-up order cannot favor one binary across
-    # the complete report.
-    warmup = (
-        (BASELINE, CANDIDATE)
-        if case_index % 2 == 0
-        else (CANDIDATE, BASELINE)
+    # Prime both executable and input pages with the same balanced ordering used
+    # for measured samples. Two complete, unmeasured blocks let hosted runners
+    # settle without favoring either binary; invert the first block for the
+    # second case so starting order is balanced across the complete report.
+    warmup = alternating_schedule(
+        WARMUP_ROUNDS, inverted=case_index % 2 == 1
     )
     for label in warmup:
         run_warmup(commands[label], output_path, timeout_seconds)

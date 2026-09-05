@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).with_name("benchmark.py")
@@ -51,6 +52,65 @@ class BenchmarkTests(unittest.TestCase):
             paired_benchmark.alternating_schedule(1, inverted=True),
             schedule[4:8],
         )
+
+    def test_paired_case_uses_two_balanced_unmeasured_warmup_blocks(self):
+        binaries = {
+            paired_benchmark.BASELINE: Path("/baseline-forge"),
+            paired_benchmark.CANDIDATE: Path("/candidate-forge"),
+        }
+        labels_by_binary = {str(path): label for label, path in binaries.items()}
+        self.assertEqual(paired_benchmark.WARMUP_ROUNDS, 2)
+
+        for case_index, case_id in enumerate(paired_benchmark.CASES):
+            with self.subTest(case_id=case_id):
+                inverted = case_index % 2 == 1
+                expected_warmup = paired_benchmark.alternating_schedule(
+                    2, inverted=inverted
+                )
+                expected_measured = paired_benchmark.alternating_schedule(
+                    1, inverted=inverted
+                )
+                warmup_labels = []
+                measured_labels = []
+
+                def record_warmup(command, _output_path, _timeout_seconds):
+                    warmup_labels.append(command[0])
+
+                def record_measurement(
+                    command, _timeout_seconds, _stdout_path, _stderr_path
+                ):
+                    measured_labels.append(command[0])
+                    return {"exit_code": 0}
+
+                with tempfile.TemporaryDirectory() as directory:
+                    with mock.patch.object(
+                        paired_benchmark, "run_warmup", side_effect=record_warmup
+                    ), mock.patch.object(
+                        paired_benchmark.benchmark,
+                        "run_measured",
+                        side_effect=record_measurement,
+                    ):
+                        result = paired_benchmark.run_case(
+                            case_id,
+                            case_index,
+                            Path(directory),
+                            binaries,
+                            Path(directory) / "input.wav",
+                            Path(directory) / "input.flac",
+                            1,
+                            60,
+                        )
+
+                self.assertEqual(len(warmup_labels), 8)
+                self.assertEqual(
+                    [labels_by_binary[path] for path in warmup_labels], expected_warmup
+                )
+                self.assertEqual(
+                    [labels_by_binary[path] for path in measured_labels], expected_measured
+                )
+                self.assertEqual(result["schedule"], expected_measured)
+                self.assertEqual(len(result["baseline_samples"]), 2)
+                self.assertEqual(len(result["candidate_samples"]), 2)
 
     def test_paired_change_reduces_each_balanced_block_before_comparing(self):
         result = {
