@@ -116,6 +116,7 @@ pub mod service;
 #[cfg(feature = "grpc-service")]
 pub mod service_grpc;
 pub mod service_metrics;
+mod service_runtime;
 pub mod stable_input;
 mod state_lock;
 pub mod watch;

@@ -18,6 +18,7 @@ use std::num::NonZeroU64;
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::{Builder, NamedTempFile};
@@ -285,8 +286,46 @@ impl BoundInput {
                 max_input_bytes: self.max_input_bytes,
                 source_name_hint: Some(self.source.path.clone()),
                 live_source: Some(self.source),
+                _retention: None,
             }),
         })
+    }
+}
+
+/// One ownership transfer from a completed private spool into [`StableInput`].
+///
+/// Keeping all evidence and the resource-retention guard in one value prevents
+/// callers from accidentally pairing a snapshot with another upload's length,
+/// digest, options, or quota lease. The snapshot is deliberately declared
+/// before `retention`: Rust drops fields in declaration order, so Windows gets
+/// a chance to close and unlink the file before its temporary-storage quota is
+/// returned.
+pub(crate) struct StableInputTransfer {
+    snapshot: NamedTempFile,
+    byte_len: u64,
+    sha256: [u8; 32],
+    options: StableInputOptions,
+    retention: Box<dyn Send + Sync + UnwindSafe + RefUnwindSafe + 'static>,
+}
+
+impl StableInputTransfer {
+    pub(crate) fn new<R>(
+        snapshot: NamedTempFile,
+        byte_len: u64,
+        sha256: [u8; 32],
+        options: StableInputOptions,
+        retention: R,
+    ) -> Self
+    where
+        R: Send + Sync + UnwindSafe + RefUnwindSafe + 'static,
+    {
+        Self {
+            snapshot,
+            byte_len,
+            sha256,
+            options,
+            retention: Box::new(retention),
+        }
     }
 }
 
@@ -297,6 +336,9 @@ struct StableInputInner {
     max_input_bytes: NonZeroU64,
     source_name_hint: Option<PathBuf>,
     live_source: Option<LiveSource>,
+    // Keep this last. In particular, a quota lease must outlive the snapshot's
+    // close-and-unlink operation on Windows.
+    _retention: Option<Box<dyn Send + Sync + UnwindSafe + RefUnwindSafe + 'static>>,
 }
 
 /// An immutable, privately stored input snapshot shared through an [`Arc`].
@@ -375,6 +417,7 @@ impl StableInput {
                 max_input_bytes: options.max_input_bytes,
                 source_name_hint: options.source_name_hint.clone(),
                 live_source: None,
+                _retention: None,
             }),
         })
     }
@@ -415,6 +458,60 @@ impl StableInput {
                 max_input_bytes: options.max_input_bytes,
                 source_name_hint: Some(path.to_owned()),
                 live_source: Some(source),
+                _retention: None,
+            }),
+        })
+    }
+
+    /// Adopt a completed private spool without copying or reopening it.
+    ///
+    /// The transfer is crate-private because its digest is trusted. Producers
+    /// must hash every successfully written byte and must not expose a writable
+    /// handle after constructing the transfer.
+    pub(crate) fn from_owned_snapshot(
+        mut transfer: StableInputTransfer,
+    ) -> Result<Self, StableInputError> {
+        ensure_within_limit(
+            transfer.byte_len,
+            transfer.options.max_input_bytes.get(),
+            "owned input snapshot",
+        )?;
+        let actual_len = transfer
+            .snapshot
+            .as_file()
+            .metadata()
+            .map_err(|error| StableInputError::io("inspect owned input snapshot", error))?
+            .len();
+        if actual_len != transfer.byte_len {
+            return Err(StableInputError::source_changed(format!(
+                "owned input snapshot is {actual_len} bytes, expected {}",
+                transfer.byte_len
+            )));
+        }
+        transfer
+            .snapshot
+            .as_file_mut()
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| StableInputError::io("rewind owned input snapshot", error))?;
+        let snapshot_identity =
+            identity_from_open_file(transfer.snapshot.as_file(), transfer.snapshot.path())?;
+
+        let StableInputTransfer {
+            snapshot,
+            byte_len,
+            sha256,
+            options,
+            retention,
+        } = transfer;
+        Ok(Self {
+            inner: Arc::new(StableInputInner {
+                snapshot,
+                snapshot_identity,
+                binding: InputContentBinding::new(byte_len, sha256),
+                max_input_bytes: options.max_input_bytes,
+                source_name_hint: options.source_name_hint,
+                live_source: None,
+                _retention: Some(retention),
             }),
         })
     }
@@ -645,7 +742,9 @@ fn ensure_within_limit(
     Ok(())
 }
 
-fn create_snapshot(source_name_hint: Option<&Path>) -> Result<NamedTempFile, StableInputError> {
+pub(crate) fn create_snapshot(
+    source_name_hint: Option<&Path>,
+) -> Result<NamedTempFile, StableInputError> {
     // The snapshot is process-local scratch state, not a restartable artifact.
     // Completed writes are immediately visible to its open file descriptor;
     // durability flushes belong only to final output publication.
@@ -1043,11 +1142,78 @@ mod tests {
 
     #[test]
     fn clones_share_one_snapshot() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<StableInput>();
+        fn assert_stable_traits<T: Send + Sync + UnwindSafe + RefUnwindSafe>() {}
+        assert_stable_traits::<StableInput>();
+        assert_stable_traits::<StableInputTransfer>();
 
         let input = StableInput::from_bytes(b"shared", &options(64)).unwrap();
         let cloned = input.clone();
         assert_eq!(input.stable_path(), cloned.stable_path());
+    }
+
+    #[test]
+    fn owned_transfer_drops_snapshot_before_last_clone_releases_retention() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropOrderProbe {
+            snapshot_path: PathBuf,
+            observed_snapshot_absent: Arc<AtomicBool>,
+        }
+
+        impl Drop for DropOrderProbe {
+            fn drop(&mut self) {
+                self.observed_snapshot_absent
+                    .store(!self.snapshot_path.exists(), Ordering::SeqCst);
+            }
+        }
+
+        let mut snapshot = create_snapshot(Some(Path::new("upload.wav"))).unwrap();
+        snapshot.as_file_mut().write_all(b"owned").unwrap();
+        snapshot.as_file_mut().flush().unwrap();
+        let snapshot_path = snapshot.path().to_owned();
+        let observed_snapshot_absent = Arc::new(AtomicBool::new(false));
+        let transfer = StableInputTransfer::new(
+            snapshot,
+            5,
+            Sha256::digest(b"owned").into(),
+            options(5).with_source_name_hint("upload.wav"),
+            DropOrderProbe {
+                snapshot_path: snapshot_path.clone(),
+                observed_snapshot_absent: Arc::clone(&observed_snapshot_absent),
+            },
+        );
+        let input = StableInput::from_owned_snapshot(transfer).unwrap();
+        assert_eq!(input.stable_path(), snapshot_path);
+        let clone = input.clone();
+        drop(input);
+        assert!(snapshot_path.exists());
+        assert!(!observed_snapshot_absent.load(Ordering::SeqCst));
+        drop(clone);
+        assert!(!snapshot_path.exists());
+        assert!(observed_snapshot_absent.load(Ordering::SeqCst));
+
+        let mut rejected_snapshot = create_snapshot(Some(Path::new("rejected.wav"))).unwrap();
+        rejected_snapshot.as_file_mut().write_all(b"short").unwrap();
+        rejected_snapshot.as_file_mut().flush().unwrap();
+        let rejected_path = rejected_snapshot.path().to_owned();
+        let rejected_drop_order = Arc::new(AtomicBool::new(false));
+        let rejected = StableInputTransfer::new(
+            rejected_snapshot,
+            6,
+            Sha256::digest(b"short").into(),
+            options(6).with_source_name_hint("rejected.wav"),
+            DropOrderProbe {
+                snapshot_path: rejected_path.clone(),
+                observed_snapshot_absent: Arc::clone(&rejected_drop_order),
+            },
+        );
+        assert_eq!(
+            StableInput::from_owned_snapshot(rejected)
+                .unwrap_err()
+                .kind(),
+            StableInputErrorKind::SourceChanged
+        );
+        assert!(!rejected_path.exists());
+        assert!(rejected_drop_order.load(Ordering::SeqCst));
     }
 }
