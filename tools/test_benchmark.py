@@ -1,10 +1,12 @@
 import importlib.util
 import json
+import statistics
 import struct
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).with_name("benchmark.py")
@@ -52,6 +54,65 @@ class BenchmarkTests(unittest.TestCase):
             schedule[4:8],
         )
 
+    def test_paired_case_uses_two_balanced_unmeasured_warmup_blocks(self):
+        binaries = {
+            paired_benchmark.BASELINE: Path("/baseline-forge"),
+            paired_benchmark.CANDIDATE: Path("/candidate-forge"),
+        }
+        labels_by_binary = {str(path): label for label, path in binaries.items()}
+        self.assertEqual(paired_benchmark.WARMUP_ROUNDS, 2)
+
+        for case_index, case_id in enumerate(paired_benchmark.CASES):
+            with self.subTest(case_id=case_id):
+                inverted = case_index % 2 == 1
+                expected_warmup = paired_benchmark.alternating_schedule(
+                    2, inverted=inverted
+                )
+                expected_measured = paired_benchmark.alternating_schedule(
+                    1, inverted=inverted
+                )
+                warmup_labels = []
+                measured_labels = []
+
+                def record_warmup(command, _output_path, _timeout_seconds):
+                    warmup_labels.append(command[0])
+
+                def record_measurement(
+                    command, _timeout_seconds, _stdout_path, _stderr_path
+                ):
+                    measured_labels.append(command[0])
+                    return {"exit_code": 0}
+
+                with tempfile.TemporaryDirectory() as directory:
+                    with mock.patch.object(
+                        paired_benchmark, "run_warmup", side_effect=record_warmup
+                    ), mock.patch.object(
+                        paired_benchmark.benchmark,
+                        "run_measured",
+                        side_effect=record_measurement,
+                    ):
+                        result = paired_benchmark.run_case(
+                            case_id,
+                            case_index,
+                            Path(directory),
+                            binaries,
+                            Path(directory) / "input.wav",
+                            Path(directory) / "input.flac",
+                            1,
+                            60,
+                        )
+
+                self.assertEqual(len(warmup_labels), 8)
+                self.assertEqual(
+                    [labels_by_binary[path] for path in warmup_labels], expected_warmup
+                )
+                self.assertEqual(
+                    [labels_by_binary[path] for path in measured_labels], expected_measured
+                )
+                self.assertEqual(result["schedule"], expected_measured)
+                self.assertEqual(len(result["baseline_samples"]), 2)
+                self.assertEqual(len(result["candidate_samples"]), 2)
+
     def test_paired_change_reduces_each_balanced_block_before_comparing(self):
         result = {
             "schedule": paired_benchmark.alternating_schedule(2),
@@ -90,6 +151,249 @@ class BenchmarkTests(unittest.TestCase):
             paired_benchmark.paired_round_changes(
                 result, lambda sample: sample["value"]
             )
+
+    def test_five_round_limiter_schedule_is_balanced_and_inverts_by_case(self):
+        baseline_first = paired_benchmark.alternating_schedule(5)
+        candidate_first = paired_benchmark.alternating_schedule(5, inverted=True)
+        for schedule in (baseline_first, candidate_first):
+            self.assertEqual(len(schedule), 20)
+            self.assertEqual(schedule.count(paired_benchmark.BASELINE), 10)
+            self.assertEqual(schedule.count(paired_benchmark.CANDIDATE), 10)
+            for start in range(0, len(schedule), 4):
+                block = schedule[start : start + 4]
+                self.assertEqual(block.count(paired_benchmark.BASELINE), 2)
+                self.assertEqual(block.count(paired_benchmark.CANDIDATE), 2)
+        self.assertEqual(baseline_first[0], paired_benchmark.BASELINE)
+        self.assertEqual(candidate_first[0], paired_benchmark.CANDIDATE)
+
+    @staticmethod
+    def _chronological_paired_result(schedule, candidate_factor=1.0):
+        samples = {
+            paired_benchmark.BASELINE: [],
+            paired_benchmark.CANDIDATE: [],
+        }
+        for position, label in enumerate(schedule):
+            value = 100.0 + position
+            if label == paired_benchmark.CANDIDATE:
+                value *= candidate_factor
+            samples[label].append({"value": value})
+        return {
+            "schedule": schedule,
+            "baseline_samples": samples[paired_benchmark.BASELINE],
+            "candidate_samples": samples[paired_benchmark.CANDIDATE],
+        }
+
+    def test_small_balanced_blocks_cancel_linear_runner_drift(self):
+        result = self._chronological_paired_result(
+            paired_benchmark.alternating_schedule(5)
+        )
+        changes = paired_benchmark.paired_round_changes(
+            result, lambda sample: sample["value"]
+        )
+        self.assertEqual(len(changes), 5)
+        for change in changes:
+            self.assertAlmostEqual(change, 0.0)
+        self.assertAlmostEqual(
+            paired_benchmark.pooled_median_change_percent(
+                result, lambda sample: sample["value"]
+            ),
+            0.0,
+        )
+
+    def test_paired_statistics_preserve_a_real_regression_during_drift(self):
+        result = self._chronological_paired_result(
+            paired_benchmark.alternating_schedule(5), candidate_factor=1.05
+        )
+        self.assertAlmostEqual(
+            paired_benchmark.paired_median_change_percent(
+                result, lambda sample: sample["value"]
+            ),
+            5.0,
+        )
+        self.assertGreater(
+            paired_benchmark.pooled_median_change_percent(
+                result, lambda sample: sample["value"]
+            ),
+            4.9,
+        )
+
+    def test_paired_statistics_reject_incomplete_populations(self):
+        result = self._chronological_paired_result(
+            paired_benchmark.alternating_schedule(1)
+        )
+        result["candidate_samples"].pop()
+        with self.assertRaisesRegex(ValueError, "missing a candidate sample"):
+            paired_benchmark.paired_round_changes(
+                result, lambda sample: sample["value"]
+            )
+        with self.assertRaisesRegex(ValueError, "incomplete or unbalanced"):
+            paired_benchmark.pooled_median_change_percent(
+                result, lambda sample: sample["value"]
+            )
+
+    def test_paired_statistics_reject_raw_nonfinite_values_before_reduction(self):
+        result = self._chronological_paired_result(
+            paired_benchmark.alternating_schedule(5)
+        )
+        result["baseline_samples"][0]["value"] = float("inf")
+        with self.assertRaisesRegex(ValueError, "baseline sample is non-finite"):
+            paired_benchmark.paired_round_changes(
+                result, lambda sample: sample["value"]
+            )
+        with self.assertRaisesRegex(ValueError, "population is non-finite"):
+            paired_benchmark.pooled_median_change_percent(
+                result, lambda sample: sample["value"]
+            )
+
+        rounds = [
+            {
+                "order": paired_benchmark.alternating_schedule(1),
+                "samples": {
+                    paired_benchmark.BASELINE: [
+                        {"value": 1.0},
+                        {"value": 1.0},
+                    ],
+                    paired_benchmark.CANDIDATE: [
+                        {"value": float("nan")},
+                        {"value": 1.0},
+                    ],
+                },
+            }
+        ]
+        with self.assertRaisesRegex(ValueError, "candidate round is non-finite"):
+            paired_benchmark.paired_round_differences(
+                rounds, lambda sample: sample["value"]
+            )
+
+    def test_paired_and_pooled_gate_uses_exact_fail_closed_thresholds(self):
+        gate = paired_benchmark.paired_and_pooled_gate_passes
+        self.assertTrue(gate(3.0, 3.0, 3.0))
+        self.assertFalse(gate(3.000_001, 3.0, 3.0))
+        self.assertFalse(gate(3.0, 3.000_001, 3.0))
+        self.assertFalse(gate(float("nan"), 0.0, 3.0))
+
+    def test_paired_round_max_differences_isolate_one_gross_rss_outlier(self):
+        orders = (
+            paired_benchmark.alternating_schedule(1),
+            paired_benchmark.alternating_schedule(1, inverted=True),
+            paired_benchmark.alternating_schedule(1),
+        )
+        rss_pairs = (
+            ((100, 100), (101, 101)),
+            ((100, 100), (101, 501)),
+            ((100, 100), (101, 101)),
+        )
+        rounds = []
+        for order, (baseline, candidate) in zip(orders, rss_pairs):
+            rounds.append(
+                {
+                    "order": order,
+                    "samples": {
+                        paired_benchmark.BASELINE: [
+                            {"peak_rss_bytes": value} for value in baseline
+                        ],
+                        paired_benchmark.CANDIDATE: [
+                            {"peak_rss_bytes": value} for value in candidate
+                        ],
+                    },
+                }
+            )
+        differences = paired_benchmark.paired_round_differences(
+            rounds,
+            lambda sample: sample["peak_rss_bytes"],
+            reducer=max,
+        )
+        self.assertEqual(differences, [1, 401, 1])
+        self.assertEqual(statistics.median(differences), 1.0)
+
+    def test_paired_rss_ratchet_rejects_two_of_seven_over_limit_rounds(self):
+        limit = 4 * 1024 * 1024
+        differences = [limit + 1, 0, 0, limit + 1, 0, 0, 0]
+        self.assertFalse(
+            paired_benchmark.paired_round_single_outlier_ratchet_passes(
+                differences, limit
+            )
+        )
+        self.assertEqual(
+            paired_benchmark.paired_round_limit_exceedances(differences, limit),
+            [0, 3],
+        )
+
+    def test_paired_rss_ratchet_allows_one_of_seven_over_limit_rounds(self):
+        limit = 4 * 1024 * 1024
+        differences = [0, 0, limit + 1, 0, 0, 0, 0]
+        self.assertTrue(
+            paired_benchmark.paired_round_single_outlier_ratchet_passes(
+                differences, limit
+            )
+        )
+
+    def test_paired_rss_ratchet_treats_exact_limit_as_passing(self):
+        limit = 4 * 1024 * 1024
+        differences = [limit] * 7
+        self.assertTrue(
+            paired_benchmark.paired_round_single_outlier_ratchet_passes(
+                differences, limit
+            )
+        )
+        self.assertEqual(
+            paired_benchmark.paired_round_limit_exceedances(differences, limit),
+            [],
+        )
+
+    def test_isolated_regression_must_exceed_the_same_limit_twice(self):
+        reproduced = paired_benchmark.isolated_regression_reproduced
+        self.assertTrue(reproduced(4.1, 4.2, 4.0))
+        self.assertFalse(reproduced(4.1, 3.9, 4.0))
+        self.assertFalse(reproduced(3.9, 4.2, 4.0))
+        self.assertFalse(reproduced(4.0, 4.1, 4.0))
+
+    def test_wall_and_cpu_aggregate_regressions_require_reproduction(self):
+        for metric in ("wall", "cpu"):
+            with self.subTest(metric=metric):
+                self.assertFalse(
+                    paired_benchmark.regression_reproduced(1.2, 0.9, 1.0)
+                )
+                self.assertTrue(
+                    paired_benchmark.regression_reproduced(1.2, 1.1, 1.0)
+                )
+        for nonfinite in (float("nan"), float("inf"), float("-inf")):
+            with self.assertRaisesRegex(ValueError, "non-finite"):
+                paired_benchmark.regression_reproduced(1.2, nonfinite, 1.0)
+
+    def test_selected_cases_default_and_deduplication(self):
+        self.assertEqual(
+            paired_benchmark.selected_cases(None), list(paired_benchmark.CASES)
+        )
+        self.assertEqual(
+            paired_benchmark.selected_cases(
+                [
+                    "wav-stereo-resample-normalize",
+                    "wav-stereo-resample-normalize",
+                ]
+            ),
+            ["wav-stereo-resample-normalize"],
+        )
+
+    def test_paired_cli_accepts_a_single_confirmation_case(self):
+        arguments = [
+            "paired_benchmark.py",
+            "--baseline-forge",
+            "/baseline-forge",
+            "--candidate-forge",
+            "/candidate-forge",
+            "--ffmpeg",
+            "/ffmpeg",
+            "--output",
+            "/report.json",
+            "--duration-seconds",
+            "300",
+            "--case",
+            "flac-stereo-normalize",
+        ]
+        with mock.patch.object(sys, "argv", arguments):
+            parsed = paired_benchmark.parse_args()
+        self.assertEqual(parsed.cases, ["flac-stereo-normalize"])
 
     def test_repeated_measurements_use_medians_and_maximum_rss(self):
         summary = benchmark.aggregate_measurements([

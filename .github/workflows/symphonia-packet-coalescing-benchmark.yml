@@ -9,6 +9,7 @@ on:
       - "src/normalize.rs"
       - "src/pcm_spool.rs"
       - "tools/benchmark.py"
+      - "tools/paired_benchmark.py"
       - "tools/test_benchmark.py"
 
 permissions:
@@ -200,10 +201,13 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import json
+          import math
           import os
           import shutil
           import statistics
+          import subprocess
           import sys
+          import tomllib
           from pathlib import Path
 
           sys.path.insert(0, "candidate/tools")
@@ -213,6 +217,25 @@ jobs:
               run_measured,
               write_pcm16_wave,
           )
+          from paired_benchmark import (
+              alternating_schedule,
+              isolated_regression_reproduced,
+              paired_round_differences,
+              paired_round_limit_exceedances,
+              regression_reproduced,
+          )
+
+          DURATION_SECONDS = 600
+          TIMEOUT_SECONDS = 1_800
+          WARMUP_ROUNDS = 2
+          MEASURED_ROUNDS = 7
+          SAMPLES_PER_BINARY = MEASURED_ROUNDS * 2
+          RSS_ROUND_LIMIT_BYTES = 4 * 1024 * 1024
+          MODES = (
+              ("default", []),
+              ("jobs_1", ["--jobs", "1"]),
+          )
+          CASES = ("analyze", "normalize")
 
           root = Path(os.environ["BENCHMARK_ROOT"])
           root.mkdir()
@@ -228,7 +251,7 @@ jobs:
           logs.mkdir()
           source = root / "source.wav"
           input_path = root / "input.mp3"
-          write_pcm16_wave(source, 600, 48_000, 2)
+          write_pcm16_wave(source, DURATION_SECONDS, 48_000, 2)
           encode_fixture(
               Path(shutil.which("ffmpeg")),
               source,
@@ -238,7 +261,7 @@ jobs:
                   "-c:a", "libmp3lame",
                   "-b:a", "320k",
               ],
-              1_800,
+              TIMEOUT_SECONDS,
           )
           source.unlink()
 
@@ -246,11 +269,397 @@ jobs:
               "baseline": Path(os.environ["BASELINE_FORGE"]),
               "candidate": Path(os.environ["CANDIDATE_FORGE"]),
           }
-          result = {
-              "method": (
-                  "7-round ABBA/BAAB on one pre-encoded 600-second MP3 "
-                  "fixture; 14 samples per binary"
+          def measurement_revision(repository):
+              prefix = 'pub const MEASUREMENT_ALGORITHM_REVISION: &str = "'
+              for line in (repository / "src/bound_analysis.rs").read_text(
+                  encoding="utf-8"
+              ).splitlines():
+                  if line.startswith(prefix) and line.endswith('";'):
+                      return line[len(prefix):-2]
+              raise AssertionError(f"missing measurement revision in {repository}")
+
+          def package_version(repository):
+              with (repository / "Cargo.toml").open("rb") as source_file:
+                  return tomllib.load(source_file)["package"]["version"]
+
+          def git_revision(repository):
+              return subprocess.run(
+                  ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  text=True,
+              ).stdout.strip()
+
+          baseline_repository = Path("baseline")
+          candidate_repository = Path("candidate")
+          versions = {
+              "baseline": package_version(baseline_repository),
+              "candidate": package_version(candidate_repository),
+          }
+          revisions = {
+              "baseline": {
+                  "git": git_revision(baseline_repository),
+                  "measurement": measurement_revision(baseline_repository),
+              },
+              "candidate": {
+                  "git": git_revision(candidate_repository),
+                  "measurement": measurement_revision(candidate_repository),
+              },
+          }
+          migrations = {
+              "stable_input": (
+                  not (baseline_repository / "src/stable_input.rs").is_file()
+                  and (candidate_repository / "src/stable_input.rs").is_file()
               ),
+              "measurement_r3_to_r4": (
+                  revisions["baseline"]["measurement"] == "forge-bs1770-5-r3"
+                  and revisions["candidate"]["measurement"]
+                  == "forge-bs1770-5-r4"
+              ),
+              "durability_0_189_5_to_0_189_6": (
+                  versions["baseline"] == "0.189.5"
+                  and versions["candidate"] == "0.189.6"
+              ),
+          }
+          normalization_aggregate_limit = (
+              5.0
+              if migrations["measurement_r3_to_r4"]
+              else 3.0
+              if migrations["stable_input"]
+              else 2.0
+              if migrations["durability_0_189_5_to_0_189_6"]
+              else 1.0
+          )
+          analysis_limit = (
+              5.0
+              if migrations["stable_input"]
+              or migrations["measurement_r3_to_r4"]
+              else 3.0
+          )
+          normalization_case_limit = (
+              8.0
+              if migrations["measurement_r3_to_r4"]
+              or migrations["durability_0_189_5_to_0_189_6"]
+              else 3.0
+          )
+          configuration = {
+              "fixture": {
+                  "duration_seconds": DURATION_SECONDS,
+                  "sample_rate_hz": 48_000,
+                  "channels": 2,
+                  "codec": "libmp3lame",
+                  "bitrate": "320k",
+              },
+              "modes": {name: arguments for name, arguments in MODES},
+              "cases": list(CASES),
+              "warmup_rounds": WARMUP_ROUNDS,
+              "measured_rounds": MEASURED_ROUNDS,
+              "samples_per_binary_per_case": SAMPLES_PER_BINARY,
+              "timeout_seconds": TIMEOUT_SECONDS,
+              "rss_round_limit_bytes": RSS_ROUND_LIMIT_BYTES,
+          }
+
+          def validate_sample(sample):
+              assert set(sample) == {
+                  "exit_code",
+                  "wall_seconds",
+                  "user_cpu_seconds",
+                  "system_cpu_seconds",
+                  "cpu_percent",
+                  "peak_rss_bytes",
+              }, sample
+              assert (
+                  isinstance(sample["exit_code"], int)
+                  and not isinstance(sample["exit_code"], bool)
+                  and sample["exit_code"] == 0
+              ), sample
+              for key in (
+                  "wall_seconds",
+                  "user_cpu_seconds",
+                  "system_cpu_seconds",
+                  "cpu_percent",
+                  "peak_rss_bytes",
+              ):
+                  value = sample[key]
+                  assert (
+                      isinstance(value, (int, float))
+                      and not isinstance(value, bool)
+                      and math.isfinite(value)
+                  ), (key, value, sample)
+              assert sample["wall_seconds"] > 0.0, sample
+              assert sample["user_cpu_seconds"] >= 0.0, sample
+              assert sample["system_cpu_seconds"] >= 0.0, sample
+              assert sample["cpu_percent"] >= 0.0, sample
+              assert (
+                  isinstance(sample["peak_rss_bytes"], int)
+                  and sample["peak_rss_bytes"] >= 0
+              ), sample
+
+          def summarize_case(samples, rounds):
+              summary = {"samples_per_binary": len(samples["baseline"])}
+              for label, getter in (
+                  ("wall", lambda sample: sample["wall_seconds"]),
+                  (
+                      "cpu",
+                      lambda sample: sample["user_cpu_seconds"]
+                      + sample["system_cpu_seconds"],
+                  ),
+              ):
+                  baseline = [getter(sample) for sample in samples["baseline"]]
+                  candidate = [getter(sample) for sample in samples["candidate"]]
+                  round_changes = []
+                  for round_result in rounds:
+                      baseline_round = statistics.median(
+                          getter(sample)
+                          for sample in round_result["samples"]["baseline"]
+                      )
+                      candidate_round = statistics.median(
+                          getter(sample)
+                          for sample in round_result["samples"]["candidate"]
+                      )
+                      round_changes.append(
+                          (candidate_round / baseline_round - 1.0) * 100.0
+                      )
+                  baseline_median = statistics.median(baseline)
+                  candidate_median = statistics.median(candidate)
+                  summary[label] = {
+                      "baseline_median": baseline_median,
+                      "candidate_median": candidate_median,
+                      "pooled_change_percent": (
+                          candidate_median / baseline_median - 1.0
+                      )
+                      * 100.0,
+                      "median_paired_round_change_percent": statistics.median(
+                          round_changes
+                      ),
+                      "paired_round_changes_percent": round_changes,
+                  }
+              rss_round_differences = paired_round_differences(
+                  rounds,
+                  lambda sample: sample["peak_rss_bytes"],
+                  reducer=max,
+              )
+              rss_exceeding_rounds = paired_round_limit_exceedances(
+                  rss_round_differences, RSS_ROUND_LIMIT_BYTES
+              )
+              raw_rss_maxima = {
+                  name: max(sample["peak_rss_bytes"] for sample in values)
+                  for name, values in samples.items()
+              }
+              summary["peak_rss_bytes"] = {
+                  # Retain raw/gross maxima as evidence. The memory gate uses
+                  # the drift-resistant paired-round population below.
+                  **raw_rss_maxima,
+                  "raw_max_delta_bytes": (
+                      raw_rss_maxima["candidate"] - raw_rss_maxima["baseline"]
+                  ),
+                  "paired_round_differences_bytes": rss_round_differences,
+                  "paired_round_limit_bytes": RSS_ROUND_LIMIT_BYTES,
+                  "paired_round_exceeding_indices": rss_exceeding_rounds,
+                  "median_paired_round_difference_bytes": statistics.median(
+                      rss_round_differences
+                  ),
+              }
+              return summary
+
+          def run_population(population):
+              population_logs = logs / population
+              population_logs.mkdir()
+              population_modes = {}
+              for mode, extra_args in MODES:
+                  mode_cases = {}
+                  for case in CASES:
+                      samples = {"baseline": [], "candidate": []}
+                      warmup_rounds = []
+                      rounds = []
+                      output_path = (
+                          output_root / f"{population}-{mode}-{case}-output.wav"
+                      )
+
+                      def command(name):
+                          if case == "analyze":
+                              return [
+                                  str(binaries[name]),
+                                  str(input_path),
+                                  *extra_args,
+                                  "--analyze",
+                                  "--json",
+                              ]
+                          output_path.unlink(missing_ok=True)
+                          return [
+                              str(binaries[name]),
+                              str(input_path),
+                              *extra_args,
+                              "--overwrite",
+                              "-o",
+                              str(output_path),
+                          ]
+
+                      def measure(name, label):
+                          sample = run_measured(
+                              command(name),
+                              TIMEOUT_SECONDS,
+                              population_logs
+                              / f"{mode}-{case}-{label}-{name}.out",
+                              population_logs
+                              / f"{mode}-{case}-{label}-{name}.err",
+                          )
+                          output_path.unlink(missing_ok=True)
+                          validate_sample(sample)
+                          return sample
+
+                      # Each population settles executable/input pages and the
+                      # hosted runner independently. Warm-up samples remain as
+                      # raw evidence but are excluded from every statistic.
+                      warmup_schedule = alternating_schedule(WARMUP_ROUNDS)
+                      for warmup_index in range(WARMUP_ROUNDS):
+                          order = warmup_schedule[
+                              warmup_index * 4 : (warmup_index + 1) * 4
+                          ]
+                          round_samples = {"baseline": [], "candidate": []}
+                          for position, name in enumerate(order):
+                              sample = measure(
+                                  name,
+                                  f"warm-{warmup_index:02d}-{position}",
+                              )
+                              round_samples[name].append(sample)
+                          warmup_rounds.append(
+                              {"order": order, "samples": round_samples}
+                          )
+
+                      measured_schedule = alternating_schedule(MEASURED_ROUNDS)
+                      for round_index in range(MEASURED_ROUNDS):
+                          order = measured_schedule[
+                              round_index * 4 : (round_index + 1) * 4
+                          ]
+                          round_samples = {"baseline": [], "candidate": []}
+                          for position, name in enumerate(order):
+                              sample = measure(name, f"{round_index:02d}-{position}")
+                              samples[name].append(sample)
+                              round_samples[name].append(sample)
+                          rounds.append({"order": order, "samples": round_samples})
+
+                      mode_cases[case] = {
+                          "summary": summarize_case(samples, rounds),
+                          "samples": samples,
+                          "warmup_rounds": warmup_rounds,
+                          "rounds": rounds,
+                      }
+                  population_modes[mode] = mode_cases
+              return population_modes
+
+          def normalization_aggregates(modes):
+              pooled = []
+              paired = []
+              for mode, _extra_args in MODES:
+                  summary = modes[mode]["normalize"]["summary"]
+                  for metric in ("wall", "cpu"):
+                      pooled.append(summary[metric]["pooled_change_percent"])
+                      paired.append(
+                          summary[metric][
+                              "median_paired_round_change_percent"
+                          ]
+                      )
+              assert len(pooled) == 4, pooled
+              assert len(paired) == 4, paired
+              assert all(math.isfinite(value) for value in pooled), pooled
+              assert all(math.isfinite(value) for value in paired), paired
+              return {
+                  "pooled": statistics.fmean(pooled),
+                  "paired": statistics.fmean(paired),
+              }
+
+          def isolated_timing_requests(modes):
+              requests = []
+              for mode, _extra_args in MODES:
+                  for case in CASES:
+                      limit = (
+                          analysis_limit
+                          if case == "analyze"
+                          else normalization_case_limit
+                      )
+                      summary = modes[mode][case]["summary"]
+                      for metric in ("wall", "cpu"):
+                          for statistic, key in (
+                              ("pooled", "pooled_change_percent"),
+                              (
+                                  "paired",
+                                  "median_paired_round_change_percent",
+                              ),
+                          ):
+                              change = summary[metric][key]
+                              if change > limit:
+                                  requests.append(
+                                      {
+                                          "mode": mode,
+                                          "case": case,
+                                          "metric": metric,
+                                          "statistic": statistic,
+                                          "limit_percent": limit,
+                                          "initial_change_percent": change,
+                                      }
+                                  )
+              return requests
+
+          initial_modes = run_population("initial")
+          initial_aggregates = normalization_aggregates(initial_modes)
+          requested_statistics = [
+              statistic
+              for statistic, change in initial_aggregates.items()
+              if change > normalization_aggregate_limit
+          ]
+          isolated_requests = isolated_timing_requests(initial_modes)
+          confirmation_modes = None
+          confirmation_aggregates = None
+          if requested_statistics or isolated_requests:
+              confirmation_modes = run_population("confirmation")
+              confirmation_aggregates = normalization_aggregates(
+                  confirmation_modes
+              )
+          reproduced = {
+              statistic: (
+                  confirmation_aggregates is not None
+                  and regression_reproduced(
+                      initial_aggregates[statistic],
+                      confirmation_aggregates[statistic],
+                      normalization_aggregate_limit,
+                  )
+              )
+              for statistic in ("pooled", "paired")
+          }
+          isolated_confirmations = []
+          for request in isolated_requests:
+              key = (
+                  "pooled_change_percent"
+                  if request["statistic"] == "pooled"
+                  else "median_paired_round_change_percent"
+              )
+              confirmation_change = confirmation_modes[
+                  request["mode"]
+              ][request["case"]]["summary"][request["metric"]][key]
+              isolated_confirmations.append(
+                  {
+                      **request,
+                      "confirmation_change_percent": confirmation_change,
+                      "reproduced": isolated_regression_reproduced(
+                          request["initial_change_percent"],
+                          confirmation_change,
+                          request["limit_percent"],
+                      ),
+                  }
+              )
+          result = {
+              "schema_version": 3,
+              "method": (
+                  "each independent population uses two unmeasured balanced "
+                  "warm-up blocks followed by 7-round ABBA/BAAB on one "
+                  "pre-encoded 600-second MP3 fixture; 14 measured samples "
+                  "per binary, mode, and case"
+              ),
+              "configuration": configuration,
+              "versions": versions,
+              "revisions": revisions,
+              "migrations": migrations,
               "system": {
                   "platform": sys.platform,
                   "cpu_model": cpu_model(),
@@ -260,110 +669,17 @@ jobs:
                       else "runner-temp"
                   ),
               },
-              "modes": {},
+              "modes": initial_modes,
+              "confirmation_modes": confirmation_modes,
+              "isolated_timing_confirmations": isolated_confirmations,
+              "normalization_aggregate_confirmation": {
+                  "limit_percent": normalization_aggregate_limit,
+                  "requested_statistics": requested_statistics,
+                  "initial": initial_aggregates,
+                  "confirmation": confirmation_aggregates,
+                  "reproduced": reproduced,
+              },
           }
-
-          for mode, extra_args in (
-              ("default", []),
-              ("jobs_1", ["--jobs", "1"]),
-          ):
-              mode_cases = {}
-              for case in ("analyze", "normalize"):
-                  samples = {"baseline": [], "candidate": []}
-                  rounds = []
-                  output_path = output_root / f"{mode}-{case}-output.wav"
-
-                  def command(name):
-                      if case == "analyze":
-                          return [
-                              str(binaries[name]),
-                              str(input_path),
-                              *extra_args,
-                              "--analyze",
-                              "--json",
-                          ]
-                      output_path.unlink(missing_ok=True)
-                      return [
-                          str(binaries[name]),
-                          str(input_path),
-                          *extra_args,
-                          "--overwrite",
-                          "-o",
-                          str(output_path),
-                      ]
-
-                  def measure(name, label):
-                      sample = run_measured(
-                          command(name),
-                          1_800,
-                          logs / f"{mode}-{case}-{label}-{name}.out",
-                          logs / f"{mode}-{case}-{label}-{name}.err",
-                      )
-                      output_path.unlink(missing_ok=True)
-                      assert sample["exit_code"] == 0, sample
-                      return sample
-
-                  # Warm both binaries symmetrically; warm-ups are not measured.
-                  for name in ("baseline", "candidate"):
-                      measure(name, "warm")
-
-                  for round_index in range(7):
-                      order = (
-                          ("baseline", "candidate", "candidate", "baseline")
-                          if round_index % 2 == 0
-                          else ("candidate", "baseline", "baseline", "candidate")
-                      )
-                      round_samples = {"baseline": [], "candidate": []}
-                      for position, name in enumerate(order):
-                          sample = measure(name, f"{round_index:02d}-{position}")
-                          samples[name].append(sample)
-                          round_samples[name].append(sample)
-                      rounds.append({"order": order, "samples": round_samples})
-
-                  summary = {"samples_per_binary": len(samples["baseline"])}
-                  for label, getter in (
-                      ("wall", lambda sample: sample["wall_seconds"]),
-                      (
-                          "cpu",
-                          lambda sample: sample["user_cpu_seconds"]
-                          + sample["system_cpu_seconds"],
-                      ),
-                  ):
-                      baseline = [getter(sample) for sample in samples["baseline"]]
-                      candidate = [getter(sample) for sample in samples["candidate"]]
-                      round_changes = []
-                      for round_result in rounds:
-                          base_round = statistics.median(
-                              getter(sample)
-                              for sample in round_result["samples"]["baseline"]
-                          )
-                          candidate_round = statistics.median(
-                              getter(sample)
-                              for sample in round_result["samples"]["candidate"]
-                          )
-                          round_changes.append(
-                              (candidate_round / base_round - 1.0) * 100.0
-                          )
-                      baseline_median = statistics.median(baseline)
-                      candidate_median = statistics.median(candidate)
-                      summary[label] = {
-                          "baseline_median": baseline_median,
-                          "candidate_median": candidate_median,
-                          "pooled_change_percent": (
-                              candidate_median / baseline_median - 1.0
-                          )
-                          * 100.0,
-                          "median_paired_round_change_percent": statistics.median(
-                              round_changes
-                          ),
-                          "paired_round_changes_percent": round_changes,
-                      }
-                  summary["peak_rss_bytes"] = {
-                      name: max(sample["peak_rss_bytes"] for sample in values)
-                      for name, values in samples.items()
-                  }
-                  mode_cases[case] = {"summary": summary, "rounds": rounds}
-              result["modes"][mode] = mode_cases
 
           output_root.rmdir()
 
@@ -376,32 +692,87 @@ jobs:
           ) as output:
               output.write("## Symphonia packet coalescing benchmark\n\n")
               output.write(
-                  "Seven ABBA/BAAB rounds; 14 samples per binary and mode.\n"
+                  "Each independent population uses two unmeasured balanced "
+                  "warm-up blocks, then seven measured ABBA/BAAB rounds; "
+                  "14 samples per binary, mode, and case.\n"
               )
-              for mode, cases in result["modes"].items():
-                  output.write(f"\n### {mode}\n\n")
-                  output.write(
-                      "| Case | Pooled wall | Paired wall | Pooled CPU "
-                      "| Paired CPU | RSS delta |\n"
-                  )
-                  output.write("|---|---:|---:|---:|---:|---:|\n")
-                  for case, case_result in cases.items():
-                      summary = case_result["summary"]
-                      rss = summary["peak_rss_bytes"]
+
+              def write_population(title, modes):
+                  output.write(f"\n### {title} population\n")
+                  for mode, cases in modes.items():
+                      output.write(f"\n#### {mode}\n\n")
                       output.write(
-                          f"| {case} "
-                          f"| {summary['wall']['pooled_change_percent']:+.3f}% "
-                          f"| {summary['wall']['median_paired_round_change_percent']:+.3f}% "
-                          f"| {summary['cpu']['pooled_change_percent']:+.3f}% "
-                          f"| {summary['cpu']['median_paired_round_change_percent']:+.3f}% "
-                          f"| {rss['candidate'] - rss['baseline']:+d} B |\n"
+                          "| Case | Pooled wall | Paired wall | Pooled CPU "
+                          "| Paired CPU | Paired RSS delta | RSS rounds >4 MiB "
+                          "| Raw max RSS delta |\n"
                       )
+                      output.write(
+                          "|---|---:|---:|---:|---:|---:|---:|---:|\n"
+                      )
+                      for case, case_result in cases.items():
+                          summary = case_result["summary"]
+                          rss = summary["peak_rss_bytes"]
+                          output.write(
+                              f"| {case} "
+                              f"| {summary['wall']['pooled_change_percent']:+.3f}% "
+                              f"| {summary['wall']['median_paired_round_change_percent']:+.3f}% "
+                              f"| {summary['cpu']['pooled_change_percent']:+.3f}% "
+                              f"| {summary['cpu']['median_paired_round_change_percent']:+.3f}% "
+                              f"| {rss['median_paired_round_difference_bytes']:+.0f} B "
+                              f"| {len(rss['paired_round_exceeding_indices'])}/7 "
+                              f"| {rss['raw_max_delta_bytes']:+d} B |\n"
+                          )
+
+              write_population("Initial", result["modes"])
+              if result["confirmation_modes"] is not None:
+                  write_population(
+                      "Independent confirmation", result["confirmation_modes"]
+                  )
+
+              output.write("\n### Isolated timing confirmations\n\n")
+              output.write(
+                  "| Mode | Case | Metric | Statistic | Initial | "
+                  "Confirmation | Limit | Reproduced |\n"
+              )
+              output.write("|---|---|---|---|---:|---:|---:|:---:|\n")
+              for confirmation in result["isolated_timing_confirmations"]:
+                  output.write(
+                      f"| {confirmation['mode']} "
+                      f"| {confirmation['case']} "
+                      f"| {confirmation['metric']} "
+                      f"| {confirmation['statistic']} "
+                      f"| {confirmation['initial_change_percent']:+.3f}% "
+                      f"| {confirmation['confirmation_change_percent']:+.3f}% "
+                      f"| {confirmation['limit_percent']:.3f}% "
+                      f"| {confirmation['reproduced']} |\n"
+                  )
+
+              confirmation = result["normalization_aggregate_confirmation"]
+              output.write("\n### Normalization aggregate confirmation\n\n")
+              output.write(
+                  "| Statistic | Initial | Confirmation | Limit | Reproduced |\n"
+              )
+              output.write("|---|---:|---:|---:|:---:|\n")
+              for statistic in ("pooled", "paired"):
+                  confirmation_value = (
+                      "n/a"
+                      if confirmation["confirmation"] is None
+                      else f"{confirmation['confirmation'][statistic]:+.3f}%"
+                  )
+                  output.write(
+                      f"| {statistic} "
+                      f"| {confirmation['initial'][statistic]:+.3f}% "
+                      f"| {confirmation_value} "
+                      f"| {confirmation['limit_percent']:.3f}% "
+                      f"| {confirmation['reproduced'][statistic]} |\n"
+                  )
           print(json.dumps({
-              mode: {
-                  case: case_result["summary"]
-                  for case, case_result in cases.items()
-              }
-              for mode, cases in result["modes"].items()
+              "initial": result["normalization_aggregate_confirmation"]["initial"],
+              "confirmation": result["normalization_aggregate_confirmation"][
+                  "confirmation"
+              ],
+              "limit_percent": normalization_aggregate_limit,
+              "reproduced": reproduced,
           }, indent=2))
           PY
           cat symphonia-packet-coalescing-summary.md >> "${GITHUB_STEP_SUMMARY}"
@@ -420,21 +791,64 @@ jobs:
       - name: Enforce performance and memory gates
         shell: bash
         run: |
+          set -euo pipefail
           python3 - <<'PY'
           import json
+          import math
           import statistics
+          import subprocess
+          import sys
           import tomllib
           from pathlib import Path
+
+          sys.path.insert(0, "candidate/tools")
+          from paired_benchmark import (
+              alternating_schedule,
+              isolated_regression_reproduced,
+              paired_round_differences,
+              paired_round_limit_exceedances,
+              paired_round_single_outlier_ratchet_passes,
+              regression_reproduced,
+          )
 
           evidence = json.loads(
               Path("symphonia-packet-coalescing-interleaved.json").read_text(
                   encoding="utf-8"
               )
           )
+          DURATION_SECONDS = 600
+          TIMEOUT_SECONDS = 1_800
+          WARMUP_ROUNDS = 2
+          MEASURED_ROUNDS = 7
+          SAMPLES_PER_BINARY = 14
+          RSS_ROUND_LIMIT_BYTES = 4 * 1024 * 1024
+          MODES = {
+              "default": [],
+              "jobs_1": ["--jobs", "1"],
+          }
+          CASES = ("analyze", "normalize")
+          expected_configuration = {
+              "fixture": {
+                  "duration_seconds": DURATION_SECONDS,
+                  "sample_rate_hz": 48_000,
+                  "channels": 2,
+                  "codec": "libmp3lame",
+                  "bitrate": "320k",
+              },
+              "modes": MODES,
+              "cases": list(CASES),
+              "warmup_rounds": WARMUP_ROUNDS,
+              "measured_rounds": MEASURED_ROUNDS,
+              "samples_per_binary_per_case": SAMPLES_PER_BINARY,
+              "timeout_seconds": TIMEOUT_SECONDS,
+              "rss_round_limit_bytes": RSS_ROUND_LIMIT_BYTES,
+          }
+
           stable_input_migration = (
               not Path("baseline/src/stable_input.rs").is_file()
               and Path("candidate/src/stable_input.rs").is_file()
           )
+
           def measurement_revision(root):
               prefix = 'pub const MEASUREMENT_ALGORITHM_REVISION: &str = "'
               for line in (root / "src/bound_analysis.rs").read_text(
@@ -444,20 +858,78 @@ jobs:
                       return line[len(prefix):-2]
               raise AssertionError(f"missing measurement revision in {root}")
 
-          baseline_revision = measurement_revision(Path("baseline"))
-          candidate_revision = measurement_revision(Path("candidate"))
-          measurement_migration = (
-              baseline_revision == "forge-bs1770-5-r3"
-              and candidate_revision == "forge-bs1770-5-r4"
-          )
           def package_version(root):
               with (root / "Cargo.toml").open("rb") as source:
                   return tomllib.load(source)["package"]["version"]
 
-          durability_migration = (
-              package_version(Path("baseline")) == "0.189.5"
-              and package_version(Path("candidate")) == "0.189.6"
+          def git_revision(root):
+              return subprocess.run(
+                  ["git", "-C", str(root), "rev-parse", "HEAD"],
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  text=True,
+              ).stdout.strip()
+
+          baseline_root = Path("baseline")
+          candidate_root = Path("candidate")
+          baseline_revision = measurement_revision(baseline_root)
+          candidate_revision = measurement_revision(candidate_root)
+          versions = {
+              "baseline": package_version(baseline_root),
+              "candidate": package_version(candidate_root),
+          }
+          revisions = {
+              "baseline": {
+                  "git": git_revision(baseline_root),
+                  "measurement": baseline_revision,
+              },
+              "candidate": {
+                  "git": git_revision(candidate_root),
+                  "measurement": candidate_revision,
+              },
+          }
+          measurement_migration = (
+              baseline_revision == "forge-bs1770-5-r3"
+              and candidate_revision == "forge-bs1770-5-r4"
           )
+          durability_migration = (
+              versions["baseline"] == "0.189.5"
+              and versions["candidate"] == "0.189.6"
+          )
+          migrations = {
+              "stable_input": stable_input_migration,
+              "measurement_r3_to_r4": measurement_migration,
+              "durability_0_189_5_to_0_189_6": durability_migration,
+          }
+
+          assert set(evidence) == {
+              "schema_version",
+              "method",
+              "configuration",
+              "versions",
+              "revisions",
+              "migrations",
+              "system",
+              "modes",
+              "confirmation_modes",
+              "isolated_timing_confirmations",
+              "normalization_aggregate_confirmation",
+          }, evidence.keys()
+          assert evidence["schema_version"] == 3, evidence.get("schema_version")
+          assert evidence["configuration"] == expected_configuration, (
+              evidence.get("configuration"),
+              expected_configuration,
+          )
+          assert evidence["versions"] == versions, (evidence.get("versions"), versions)
+          assert evidence["revisions"] == revisions, (
+              evidence.get("revisions"),
+              revisions,
+          )
+          assert evidence["migrations"] == migrations, (
+              evidence.get("migrations"),
+              migrations,
+          )
+
           # v0.189.3 deliberately adds a private copy plus content hashes and
           # live-source revalidation around the pre-existing decode work. Give
           # that one-time integrity migration a measured, bounded allowance;
@@ -487,58 +959,505 @@ jobs:
               if stable_input_migration
               else 2.0 if durability_migration else 1.0
           )
-          normalization_pooled = []
-          normalization_paired = []
-          for mode in ("default", "jobs_1"):
-              for case, case_result in evidence["modes"][mode].items():
-                  summary = case_result["summary"]
-                  assert summary["samples_per_binary"] == 14, (mode, case, summary)
+
+          def require_finite(value, label):
+              assert (
+                  isinstance(value, (int, float))
+                  and not isinstance(value, bool)
+                  and math.isfinite(value)
+              ), (label, value)
+              return value
+
+          def validate_sample(sample, label):
+              assert set(sample) == {
+                  "exit_code",
+                  "wall_seconds",
+                  "user_cpu_seconds",
+                  "system_cpu_seconds",
+                  "cpu_percent",
+                  "peak_rss_bytes",
+              }, (label, sample)
+              assert (
+                  isinstance(sample["exit_code"], int)
+                  and not isinstance(sample["exit_code"], bool)
+                  and sample["exit_code"] == 0
+              ), (label, sample)
+              wall = require_finite(sample["wall_seconds"], (label, "wall"))
+              user = require_finite(
+                  sample["user_cpu_seconds"], (label, "user CPU")
+              )
+              system = require_finite(
+                  sample["system_cpu_seconds"], (label, "system CPU")
+              )
+              cpu_percent = require_finite(
+                  sample["cpu_percent"], (label, "CPU percent")
+              )
+              rss = require_finite(
+                  sample["peak_rss_bytes"], (label, "peak RSS")
+              )
+              assert wall > 0.0, (label, wall)
+              assert user >= 0.0 and system >= 0.0, (label, user, system)
+              assert cpu_percent >= 0.0, (label, cpu_percent)
+              assert isinstance(rss, int) and rss >= 0, (label, rss)
+
+          def validate_rounds(rounds, count, label):
+              assert isinstance(rounds, list) and len(rounds) == count, (
+                  label,
+                  len(rounds) if isinstance(rounds, list) else rounds,
+              )
+              expected_schedule = alternating_schedule(count)
+              flattened = {"baseline": [], "candidate": []}
+              for round_index, round_result in enumerate(rounds):
+                  assert set(round_result) == {"order", "samples"}, (
+                      label,
+                      round_index,
+                      round_result,
+                  )
+                  expected_order = expected_schedule[
+                      round_index * 4 : (round_index + 1) * 4
+                  ]
+                  assert round_result["order"] == expected_order, (
+                      label,
+                      round_index,
+                      round_result["order"],
+                      expected_order,
+                  )
+                  round_samples = round_result["samples"]
+                  assert set(round_samples) == {"baseline", "candidate"}, (
+                      label,
+                      round_index,
+                      round_samples,
+                  )
+                  for binary in ("baseline", "candidate"):
+                      values = round_samples[binary]
+                      assert isinstance(values, list) and len(values) == 2, (
+                          label,
+                          round_index,
+                          binary,
+                          values,
+                      )
+                      for sample_index, sample in enumerate(values):
+                          validate_sample(
+                              sample,
+                              (label, round_index, binary, sample_index),
+                          )
+                      flattened[binary].extend(values)
+              return flattened
+
+          def recompute_summary(samples, rounds, label):
+              summary = {"samples_per_binary": SAMPLES_PER_BINARY}
+              for metric, getter in (
+                  ("wall", lambda sample: sample["wall_seconds"]),
+                  (
+                      "cpu",
+                      lambda sample: sample["user_cpu_seconds"]
+                      + sample["system_cpu_seconds"],
+                  ),
+              ):
+                  baseline = [getter(sample) for sample in samples["baseline"]]
+                  candidate = [getter(sample) for sample in samples["candidate"]]
+                  assert len(baseline) == SAMPLES_PER_BINARY, (label, metric)
+                  assert len(candidate) == SAMPLES_PER_BINARY, (label, metric)
+                  for binary, values in (
+                      ("baseline", baseline),
+                      ("candidate", candidate),
+                  ):
+                      for sample_index, value in enumerate(values):
+                          require_finite(
+                              value,
+                              (label, metric, binary, sample_index),
+                          )
+                  round_changes = []
+                  for round_index, round_result in enumerate(rounds):
+                      baseline_round = statistics.median(
+                          getter(sample)
+                          for sample in round_result["samples"]["baseline"]
+                      )
+                      candidate_round = statistics.median(
+                          getter(sample)
+                          for sample in round_result["samples"]["candidate"]
+                      )
+                      assert baseline_round > 0.0, (
+                          label,
+                          metric,
+                          round_index,
+                          baseline_round,
+                      )
+                      round_changes.append(
+                          (candidate_round / baseline_round - 1.0) * 100.0
+                      )
+                  baseline_median = statistics.median(baseline)
+                  candidate_median = statistics.median(candidate)
+                  assert baseline_median > 0.0, (label, metric, baseline_median)
+                  summary[metric] = {
+                      "baseline_median": baseline_median,
+                      "candidate_median": candidate_median,
+                      "pooled_change_percent": (
+                          candidate_median / baseline_median - 1.0
+                      )
+                      * 100.0,
+                      "median_paired_round_change_percent": statistics.median(
+                          round_changes
+                      ),
+                      "paired_round_changes_percent": round_changes,
+                  }
+              rss_round_differences = paired_round_differences(
+                  rounds,
+                  lambda sample: sample["peak_rss_bytes"],
+                  reducer=max,
+              )
+              for round_index, difference in enumerate(rss_round_differences):
+                  require_finite(difference, (label, "RSS difference", round_index))
+              rss_exceeding_rounds = paired_round_limit_exceedances(
+                  rss_round_differences, RSS_ROUND_LIMIT_BYTES
+              )
+              raw_rss_maxima = {
+                  binary: max(
+                      sample["peak_rss_bytes"] for sample in binary_samples
+                  )
+                  for binary, binary_samples in samples.items()
+              }
+              summary["peak_rss_bytes"] = {
+                  **raw_rss_maxima,
+                  "raw_max_delta_bytes": (
+                      raw_rss_maxima["candidate"] - raw_rss_maxima["baseline"]
+                  ),
+                  "paired_round_differences_bytes": rss_round_differences,
+                  "paired_round_limit_bytes": RSS_ROUND_LIMIT_BYTES,
+                  "paired_round_exceeding_indices": rss_exceeding_rounds,
+                  "median_paired_round_difference_bytes": statistics.median(
+                      rss_round_differences
+                  ),
+              }
+              return summary
+
+          def validate_population(modes, population):
+              assert isinstance(modes, dict), (population, modes)
+              assert set(modes) == set(MODES), (population, modes.keys())
+              for mode in MODES:
+                  cases = modes[mode]
+                  assert set(cases) == set(CASES), (
+                      population,
+                      mode,
+                      cases.keys(),
+                  )
+                  for case in CASES:
+                      case_result = cases[case]
+                      label = (population, mode, case)
+                      assert set(case_result) == {
+                          "summary",
+                          "samples",
+                          "warmup_rounds",
+                          "rounds",
+                      }, (label, case_result.keys())
+                      warmup_samples = validate_rounds(
+                          case_result["warmup_rounds"],
+                          WARMUP_ROUNDS,
+                          (*label, "warmup"),
+                      )
+                      assert all(
+                          len(warmup_samples[binary]) == WARMUP_ROUNDS * 2
+                          for binary in ("baseline", "candidate")
+                      ), (label, warmup_samples)
+                      measured_samples = validate_rounds(
+                          case_result["rounds"],
+                          MEASURED_ROUNDS,
+                          (*label, "measured"),
+                      )
+                      assert case_result["samples"] == measured_samples, (
+                          label,
+                          case_result["samples"],
+                          measured_samples,
+                      )
+                      computed_summary = recompute_summary(
+                          measured_samples,
+                          case_result["rounds"],
+                          label,
+                      )
+                      assert case_result["summary"] == computed_summary, (
+                          label,
+                          case_result["summary"],
+                          computed_summary,
+                      )
+
+          def normalization_aggregates(modes):
+              pooled = []
+              paired = []
+              for mode in MODES:
+                  summary = modes[mode]["normalize"]["summary"]
                   for metric in ("wall", "cpu"):
-                      values = summary[metric]
-                      pooled = values["pooled_change_percent"]
-                      paired = values["median_paired_round_change_percent"]
+                      pooled.append(summary[metric]["pooled_change_percent"])
+                      paired.append(
+                          summary[metric][
+                              "median_paired_round_change_percent"
+                          ]
+                      )
+              assert len(pooled) == 4, pooled
+              assert len(paired) == 4, paired
+              for statistic, values in (("pooled", pooled), ("paired", paired)):
+                  for index, value in enumerate(values):
+                      require_finite(value, ("aggregate", statistic, index))
+              aggregates = {
+                  "pooled": statistics.fmean(pooled),
+                  "paired": statistics.fmean(paired),
+              }
+              for statistic, value in aggregates.items():
+                  require_finite(value, ("aggregate", statistic))
+              return aggregates
+
+          def isolated_timing_requests(modes):
+              requests = []
+              for mode in MODES:
+                  for case in CASES:
                       limit = (
                           analysis_limit
                           if case == "analyze"
                           else normalization_case_limit
                       )
-                      assert pooled <= limit, (mode, case, metric, "pooled", pooled)
-                      assert paired <= limit, (mode, case, metric, "paired", paired)
+                      summary = modes[mode][case]["summary"]
+                      for metric in ("wall", "cpu"):
+                          for statistic, key in (
+                              ("pooled", "pooled_change_percent"),
+                              (
+                                  "paired",
+                                  "median_paired_round_change_percent",
+                              ),
+                          ):
+                              change = require_finite(
+                                  summary[metric][key],
+                                  (mode, case, metric, statistic),
+                              )
+                              if change > limit:
+                                  requests.append(
+                                      {
+                                          "mode": mode,
+                                          "case": case,
+                                          "metric": metric,
+                                          "statistic": statistic,
+                                          "limit_percent": limit,
+                                          "initial_change_percent": change,
+                                      }
+                                  )
+              return requests
+
+          validate_population(evidence["modes"], "initial")
+          normalization_pooled = []
+          normalization_paired = []
+          for mode in MODES:
+              for case in CASES:
+                  summary = evidence["modes"][mode][case]["summary"]
+                  for metric in ("wall", "cpu"):
+                      values = summary[metric]
+                      pooled = values["pooled_change_percent"]
+                      paired = values["median_paired_round_change_percent"]
                       if case == "normalize":
                           normalization_pooled.append(pooled)
                           normalization_paired.append(paired)
                   rss = summary["peak_rss_bytes"]
-                  rss_delta = rss["candidate"] - rss["baseline"]
-                  assert rss_delta <= 4 * 1024 * 1024, (
+                  rss_limit = RSS_ROUND_LIMIT_BYTES
+                  rss_delta = rss["median_paired_round_difference_bytes"]
+                  assert rss_delta <= rss_limit, (
                       mode,
                       case,
-                      "RSS delta",
+                      "median paired-round RSS delta",
                       rss_delta,
                   )
-          assert len(normalization_pooled) == 4, normalization_pooled
-          assert len(normalization_paired) == 4, normalization_paired
-          pooled_aggregate = statistics.fmean(normalization_pooled)
-          paired_aggregate = statistics.fmean(normalization_paired)
+                  rss_round_differences = rss["paired_round_differences_bytes"]
+                  assert len(rss_round_differences) == 7, (
+                      mode,
+                      case,
+                      "paired RSS round count",
+                      len(rss_round_differences),
+                  )
+                  assert rss["paired_round_limit_bytes"] == rss_limit, (
+                      mode,
+                      case,
+                      "paired RSS round limit",
+                      rss["paired_round_limit_bytes"],
+                  )
+                  rss_exceeding_rounds = paired_round_limit_exceedances(
+                      rss_round_differences, rss_limit
+                  )
+                  assert (
+                      rss["paired_round_exceeding_indices"] == rss_exceeding_rounds
+                  ), (
+                      mode,
+                      case,
+                      "paired RSS exceedance evidence",
+                      rss["paired_round_exceeding_indices"],
+                      rss_exceeding_rounds,
+                  )
+                  assert paired_round_single_outlier_ratchet_passes(
+                      rss_round_differences, rss_limit
+                  ), (
+                      mode,
+                      case,
+                      "repeated paired-round RSS regression",
+                      rss_exceeding_rounds,
+                      rss_round_differences,
+                  )
+          initial_aggregates = normalization_aggregates(evidence["modes"])
+          isolated_requests = isolated_timing_requests(evidence["modes"])
+          assert initial_aggregates == {
+              "pooled": statistics.fmean(normalization_pooled),
+              "paired": statistics.fmean(normalization_paired),
+          }, (initial_aggregates, normalization_pooled, normalization_paired)
+          confirmation_record = evidence["normalization_aggregate_confirmation"]
+          assert set(confirmation_record) == {
+              "limit_percent",
+              "requested_statistics",
+              "initial",
+              "confirmation",
+              "reproduced",
+          }, confirmation_record
+          assert (
+              confirmation_record["limit_percent"]
+              == normalization_aggregate_limit
+          ), (
+              confirmation_record["limit_percent"],
+              normalization_aggregate_limit,
+          )
+          assert confirmation_record["initial"] == initial_aggregates, (
+              confirmation_record["initial"],
+              initial_aggregates,
+          )
+          requested_statistics = [
+              statistic
+              for statistic in ("pooled", "paired")
+              if initial_aggregates[statistic] > normalization_aggregate_limit
+          ]
+          assert (
+              confirmation_record["requested_statistics"]
+              == requested_statistics
+          ), (
+              confirmation_record["requested_statistics"],
+              requested_statistics,
+          )
+          confirmation_needed = bool(requested_statistics or isolated_requests)
+          if confirmation_needed:
+              confirmation_modes = evidence["confirmation_modes"]
+              validate_population(confirmation_modes, "confirmation")
+              confirmation_aggregates = normalization_aggregates(
+                  confirmation_modes
+              )
+              assert (
+                  confirmation_record["confirmation"]
+                  == confirmation_aggregates
+              ), (
+                  confirmation_record["confirmation"],
+                  confirmation_aggregates,
+              )
+          else:
+              assert evidence["confirmation_modes"] is None, (
+                  "unexpected confirmation population",
+                  evidence["confirmation_modes"],
+              )
+              assert confirmation_record["confirmation"] is None, (
+                  "unexpected aggregate confirmation statistics",
+                  confirmation_record["confirmation"],
+              )
+              confirmation_aggregates = None
+
+          expected_isolated_confirmations = []
+          for request in isolated_requests:
+              key = (
+                  "pooled_change_percent"
+                  if request["statistic"] == "pooled"
+                  else "median_paired_round_change_percent"
+              )
+              confirmation_change = require_finite(
+                  confirmation_modes[request["mode"]][request["case"]][
+                      "summary"
+                  ][request["metric"]][key],
+                  (
+                      "confirmation",
+                      request["mode"],
+                      request["case"],
+                      request["metric"],
+                      request["statistic"],
+                  ),
+              )
+              expected_isolated_confirmations.append(
+                  {
+                      **request,
+                      "confirmation_change_percent": confirmation_change,
+                      "reproduced": isolated_regression_reproduced(
+                          request["initial_change_percent"],
+                          confirmation_change,
+                          request["limit_percent"],
+                      ),
+                  }
+              )
+          assert (
+              evidence["isolated_timing_confirmations"]
+              == expected_isolated_confirmations
+          ), (
+              evidence["isolated_timing_confirmations"],
+              expected_isolated_confirmations,
+          )
+          for confirmation in expected_isolated_confirmations:
+              assert not confirmation["reproduced"], (
+                  "isolated timing regression reproduced",
+                  confirmation,
+              )
+
+          expected_reproduced = {
+              statistic: (
+                  confirmation_aggregates is not None
+                  and regression_reproduced(
+                      initial_aggregates[statistic],
+                      confirmation_aggregates[statistic],
+                      normalization_aggregate_limit,
+                  )
+              )
+              for statistic in ("pooled", "paired")
+          }
+          assert confirmation_record["reproduced"] == expected_reproduced, (
+              confirmation_record["reproduced"],
+              expected_reproduced,
+          )
           # The packet-coalescing speedup landed in v0.167.0, so both sides of
           # later pull-request comparisons already contain it. Keep this as a
-          # tight end-to-end regression sentinel instead of requiring every
-          # unrelated hot-path change to reproduce the original speedup.
-          assert pooled_aggregate <= normalization_aggregate_limit, (
-              "pooled normalization aggregate regressed",
-              pooled_aggregate,
-              normalization_pooled,
-          )
-          assert paired_aggregate <= normalization_aggregate_limit, (
-              "paired normalization aggregate regressed",
-              paired_aggregate,
-              normalization_paired,
-          )
+          # tight end-to-end regression sentinel. An independent population
+          # may clear runner noise, but the same statistic crossing the same
+          # unchanged limit twice remains a regression.
+          for statistic in requested_statistics:
+              assert not expected_reproduced[statistic], (
+                  f"{statistic} normalization aggregate regression reproduced",
+                  initial_aggregates[statistic],
+                  confirmation_aggregates[statistic],
+                  normalization_aggregate_limit,
+              )
           if stable_input_migration:
               print("applied one-time StableInput integrity migration limits")
           if measurement_migration:
               print("applied one-time r3 -> r4 measurement migration limits")
           if durability_migration:
               print("applied one-time v0.189.5 -> v0.189.6 durability limits")
-          print(f"pooled normalization change: {pooled_aggregate:+.3f}%")
-          print(f"paired normalization change: {paired_aggregate:+.3f}%")
+          print(
+              "initial pooled normalization change: "
+              f"{initial_aggregates['pooled']:+.3f}%"
+          )
+          print(
+              "initial paired normalization change: "
+              f"{initial_aggregates['paired']:+.3f}%"
+          )
+          if confirmation_aggregates is not None:
+              print(
+                  "confirmation pooled normalization change: "
+                  f"{confirmation_aggregates['pooled']:+.3f}%"
+              )
+              print(
+                  "confirmation paired normalization change: "
+                  f"{confirmation_aggregates['paired']:+.3f}%"
+              )
+          for confirmation in expected_isolated_confirmations:
+              print(
+                  "isolated timing confirmation: "
+                  f"{confirmation['mode']}/{confirmation['case']} "
+                  f"{confirmation['metric']}/{confirmation['statistic']} "
+                  f"initial={confirmation['initial_change_percent']:+.3f}% "
+                  "confirmation="
+                  f"{confirmation['confirmation_change_percent']:+.3f}%"
+              )
           PY

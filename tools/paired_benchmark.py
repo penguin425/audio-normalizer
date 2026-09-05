@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import statistics
@@ -19,7 +20,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import benchmark
 
@@ -28,6 +29,7 @@ CASES = ("flac-stereo-normalize", "wav-stereo-resample-normalize")
 BASELINE = "baseline"
 CANDIDATE = "candidate"
 MAX_ROUNDS = 32
+WARMUP_ROUNDS = 2
 
 
 def alternating_schedule(rounds: int, *, inverted: bool = False) -> list[str]:
@@ -75,12 +77,18 @@ def paired_round_changes(
             if label == BASELINE:
                 if baseline_index >= len(baseline_samples):
                     raise ValueError("paired benchmark is missing a baseline sample")
-                baseline_values.append(value(baseline_samples[baseline_index]))
+                sample_value = value(baseline_samples[baseline_index])
+                if not math.isfinite(sample_value):
+                    raise ValueError("paired benchmark baseline sample is non-finite")
+                baseline_values.append(sample_value)
                 baseline_index += 1
             elif label == CANDIDATE:
                 if candidate_index >= len(candidate_samples):
                     raise ValueError("paired benchmark is missing a candidate sample")
-                candidate_values.append(value(candidate_samples[candidate_index]))
+                sample_value = value(candidate_samples[candidate_index])
+                if not math.isfinite(sample_value):
+                    raise ValueError("paired benchmark candidate sample is non-finite")
+                candidate_values.append(sample_value)
                 candidate_index += 1
             else:
                 raise ValueError(f"unknown paired benchmark schedule label: {label}")
@@ -109,6 +117,134 @@ def paired_median_change_percent(
     return statistics.median(changes)
 
 
+def pooled_median_change_percent(
+    result: dict[str, Any],
+    value: Callable[[dict[str, Any]], float],
+) -> float:
+    """Return the candidate/baseline change across both complete populations."""
+
+    baseline_samples = result["baseline_samples"]
+    candidate_samples = result["candidate_samples"]
+    if not baseline_samples or len(baseline_samples) != len(candidate_samples):
+        raise ValueError("paired benchmark populations are incomplete or unbalanced")
+    baseline_values = [value(sample) for sample in baseline_samples]
+    candidate_values = [value(sample) for sample in candidate_samples]
+    if not all(math.isfinite(sample) for sample in baseline_values):
+        raise ValueError("paired benchmark baseline population is non-finite")
+    if not all(math.isfinite(sample) for sample in candidate_values):
+        raise ValueError("paired benchmark candidate population is non-finite")
+    baseline_value = statistics.median(baseline_values)
+    candidate_value = statistics.median(candidate_values)
+    if baseline_value <= 0.0:
+        raise ValueError("paired benchmark baseline value must be positive")
+    return (candidate_value / baseline_value - 1.0) * 100.0
+
+
+def paired_and_pooled_gate_passes(
+    paired_change: float,
+    pooled_change: float,
+    limit: float,
+) -> bool:
+    """Require both independent change statistics to stay within one limit."""
+
+    return (
+        math.isfinite(paired_change)
+        and math.isfinite(pooled_change)
+        and math.isfinite(limit)
+        and paired_change <= limit
+        and pooled_change <= limit
+    )
+
+
+def paired_round_differences(
+    rounds: Iterable[dict[str, Any]],
+    value: Callable[[dict[str, Any]], float],
+    *,
+    reducer: Callable[[list[float]], float] = statistics.median,
+) -> list[float]:
+    """Return candidate-minus-baseline values for balanced round records.
+
+    Unlike :func:`paired_round_changes`, this helper operates on the nested
+    ``rounds`` representation used by the Symphonia benchmark and returns an
+    absolute difference. This is appropriate for byte-valued metrics such as
+    process peak RSS, including a zero-byte baseline.
+    """
+
+    differences = []
+    for round_result in rounds:
+        order = round_result["order"]
+        if (
+            len(order) != 4
+            or order.count(BASELINE) != 2
+            or order.count(CANDIDATE) != 2
+        ):
+            raise ValueError("paired benchmark round is not balanced")
+        samples = round_result["samples"]
+        baseline_values = [value(sample) for sample in samples[BASELINE]]
+        candidate_values = [value(sample) for sample in samples[CANDIDATE]]
+        if len(baseline_values) != 2 or len(candidate_values) != 2:
+            raise ValueError(
+                "paired benchmark round does not contain two samples per binary"
+            )
+        if not all(math.isfinite(sample) for sample in baseline_values):
+            raise ValueError("paired benchmark baseline round is non-finite")
+        if not all(math.isfinite(sample) for sample in candidate_values):
+            raise ValueError("paired benchmark candidate round is non-finite")
+        differences.append(reducer(candidate_values) - reducer(baseline_values))
+    return differences
+
+
+def paired_round_limit_exceedances(
+    differences: Iterable[float], limit: float
+) -> list[int]:
+    """Return round indexes whose candidate-minus-baseline value exceeds a limit."""
+
+    return [
+        round_index
+        for round_index, difference in enumerate(differences)
+        if difference > limit
+    ]
+
+
+def paired_round_single_outlier_ratchet_passes(
+    differences: Iterable[float], limit: float
+) -> bool:
+    """Allow one isolated over-limit round, but reject two or more."""
+
+    return len(paired_round_limit_exceedances(differences, limit)) <= 1
+
+
+def regression_reproduced(
+    initial_change: float,
+    confirmation_change: float,
+    limit: float,
+) -> bool:
+    """Return whether independent populations both exceed the same limit."""
+
+    if not all(
+        math.isfinite(value)
+        for value in (initial_change, confirmation_change, limit)
+    ):
+        raise ValueError("regression comparison contains a non-finite value")
+    return initial_change > limit and confirmation_change > limit
+
+
+def isolated_regression_reproduced(
+    initial_change: float,
+    confirmation_change: float,
+    limit: float,
+) -> bool:
+    """Return whether an isolated regression exceeds its limit twice."""
+
+    return regression_reproduced(initial_change, confirmation_change, limit)
+
+
+def selected_cases(requested: Iterable[str] | None) -> list[str]:
+    """Return requested benchmark cases once each, or the full default set."""
+
+    return list(dict.fromkeys(requested)) if requested else list(CASES)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-forge", type=Path, required=True)
@@ -120,6 +256,13 @@ def parse_args() -> argparse.Namespace:
         "--duration-seconds", type=benchmark.positive_int, required=True
     )
     parser.add_argument("--rounds", type=benchmark.positive_int, default=8)
+    parser.add_argument(
+        "--case",
+        action="append",
+        choices=CASES,
+        dest="cases",
+        help="benchmark only this case; may be supplied more than once",
+    )
     parser.add_argument(
         "--timeout-seconds", type=benchmark.positive_int, default=7_200
     )
@@ -184,13 +327,12 @@ def run_case(
         for label, forge in binaries.items()
     }
 
-    # Prime both executable and input pages without measuring them. Reverse the
-    # order for the second case so warm-up order cannot favor one binary across
-    # the complete report.
-    warmup = (
-        (BASELINE, CANDIDATE)
-        if case_index % 2 == 0
-        else (CANDIDATE, BASELINE)
+    # Prime both executable and input pages with the same balanced ordering used
+    # for measured samples. Two complete, unmeasured blocks let hosted runners
+    # settle without favoring either binary; invert the first block for the
+    # second case so starting order is balanced across the complete report.
+    warmup = alternating_schedule(
+        WARMUP_ROUNDS, inverted=case_index % 2 == 1
     )
     for label in warmup:
         run_warmup(commands[label], output_path, timeout_seconds)
@@ -238,6 +380,7 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
 
 def main() -> int:
     args = parse_args()
+    cases = selected_cases(args.cases)
     if args.duration_seconds > benchmark.MAX_DURATION_SECONDS:
         raise ValueError(
             f"duration must not exceed {benchmark.MAX_DURATION_SECONDS} seconds"
@@ -273,7 +416,7 @@ def main() -> int:
             "duration_seconds": args.duration_seconds,
             "rounds": args.rounds,
             "samples_per_binary": args.rounds * 2,
-            "cases": list(CASES),
+            "cases": cases,
         },
         "versions": {
             label: benchmark.command_version(path)
@@ -296,15 +439,19 @@ def main() -> int:
             benchmark.write_pcm16_wave(
                 wave_path, args.duration_seconds, 48_000, 2
             )
-            benchmark.encode_fixture(
-                ffmpeg, wave_path, flac_path, ["-map_metadata", "-1", "-c:a", "flac"],
-                args.timeout_seconds,
-            )
-            for case_index, case_id in enumerate(CASES):
+            if "flac-stereo-normalize" in cases:
+                benchmark.encode_fixture(
+                    ffmpeg,
+                    wave_path,
+                    flac_path,
+                    ["-map_metadata", "-1", "-c:a", "flac"],
+                    args.timeout_seconds,
+                )
+            for case_id in cases:
                 report["results"].append(
                     run_case(
                         case_id,
-                        case_index,
+                        CASES.index(case_id),
                         workspace,
                         binaries,
                         wave_path,

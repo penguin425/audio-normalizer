@@ -1,0 +1,2122 @@
+{
+  "$schema": "https://penguin425.github.io/audio-normalizer/schema/schema-registry-v1",
+  "registry_id": "https://penguin425.github.io/audio-normalizer/schema/schema-registry-v1.json",
+  "registry_version": 1,
+  "entries": [
+    {
+      "path": "schema/ac4-adapter-report-v1.schema.json",
+      "family": "ac4-adapter-report",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/ac4-adapter-report-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "supported-legacy",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/ac4-adapter-report-v1"
+      },
+      "producers": [
+        "repo:src/ac4_adapter.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/ac4_adapter_cli.rs"
+      ],
+      "successor_path": "schema/ac4-adapter-report-v2.schema.json"
+    },
+    {
+      "path": "schema/ac4-adapter-report-v2.schema.json",
+      "family": "ac4-adapter-report",
+      "version": 2,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/ac4-adapter-report-v2",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/ac4-adapter-report-v2"
+      },
+      "producers": [
+        "repo:src/ac4_adapter.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/ac4_adapter_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/ac4-adapter-request-v1.schema.json",
+      "family": "ac4-adapter-request",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/ac4-adapter-request-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/ac4-adapter-request-v1"
+      },
+      "producers": [
+        "external:api-client"
+      ],
+      "consumers": [
+        "repo:src/ac4_adapter.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/ac4_adapter_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/ac4-adapter-response-v1.schema.json",
+      "family": "ac4-adapter-response",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/ac4-adapter-response-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/ac4-adapter-response-v1"
+      },
+      "producers": [
+        "repo:src/ac4_adapter.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/ac4_adapter_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/adm-interactivity-report-v1.schema.json",
+      "family": "adm-interactivity-report",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/adm-interactivity-report-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/adm-interactivity-report-v1"
+      },
+      "producers": [
+        "repo:src/adm_interactivity_qc.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/adm_interactivity_qc_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/adm-presentation-report-v1.schema.json",
+      "family": "adm-presentation-report",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/adm-presentation-report-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/adm-presentation-report-v1"
+      },
+      "producers": [
+        "repo:src/adm_presentation_qc.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/adm_presentation_qc_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/adm-semantics-report-v1.schema.json",
+      "family": "adm-semantics-report",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/adm-semantics-report-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/adm-semantics-report-v1"
+      },
+      "producers": [
+        "repo:src/adm_semantics_qc.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/adm_semantics_qc_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/aes31-qc-v1.schema.json",
+      "family": "aes31-qc",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/aes31-qc-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/aes31-qc-v1"
+      },
+      "producers": [
+        "repo:src/aes31_qc.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/aes31_qc_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/analysis-cache-v1.schema.json",
+      "family": "analysis-cache",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "cache",
+      "lifecycle": "retired",
+      "change_policy": "invalidate",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v1"
+      },
+      "producers": [
+        "repo:src/analysis_cache.rs"
+      ],
+      "consumers": [
+        "repo:src/analysis_cache.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
+      ],
+      "successor_path": "schema/analysis-cache-v2.schema.json"
+    },
+    {
+      "path": "schema/analysis-cache-v2.schema.json",
+      "family": "analysis-cache",
+      "version": 2,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v2",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "cache",
+      "lifecycle": "retired",
+      "change_policy": "invalidate",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v2"
+      },
+      "producers": [
+        "repo:src/analysis_cache.rs"
+      ],
+      "consumers": [
+        "repo:src/analysis_cache.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
+      ],
+      "successor_path": "schema/analysis-cache-v3.schema.json"
+    },
+    {
+      "path": "schema/analysis-cache-v3.schema.json",
+      "family": "analysis-cache",
+      "version": 3,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v3",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "cache",
+      "lifecycle": "retired",
+      "change_policy": "invalidate",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v3"
+      },
+      "producers": [
+        "repo:src/analysis_cache.rs"
+      ],
+      "consumers": [
+        "repo:src/analysis_cache.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
+      ],
+      "successor_path": "schema/analysis-cache-v4.schema.json"
+    },
+    {
+      "path": "schema/analysis-cache-v4.schema.json",
+      "family": "analysis-cache",
+      "version": 4,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v4",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "cache",
+      "lifecycle": "retired",
+      "change_policy": "invalidate",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v4"
+      },
+      "producers": [
+        "repo:src/analysis_cache.rs"
+      ],
+      "consumers": [
+        "repo:src/analysis_cache.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
+      ],
+      "successor_path": "schema/analysis-cache-v5.schema.json"
+    },
+    {
+      "path": "schema/analysis-cache-v5.schema.json",
+      "family": "analysis-cache",
+      "version": 5,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v5",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "cache",
+      "lifecycle": "current",
+      "change_policy": "invalidate",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v5"
+      },
+      "producers": [
+        "repo:src/analysis_cache.rs"
+      ],
+      "consumers": [
+        "repo:src/analysis_cache.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
+      ]
+    },
+    {
+      "path": "schema/anomaly-provider-audit-v1.schema.json",
+      "family": "anomaly-provider-audit",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/anomaly-provider-audit-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/anomaly-provider-audit-v1"
+      },
+      "producers": [
+        "repo:src/anomaly_provider.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/anomaly_provider_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/atsc-a85-service-report-v1.schema.json",
+      "family": "atsc-a85-service-report",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/atsc-a85-service-report-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/atsc-a85-service-report-v1"
+      },
+      "producers": [
+        "repo:src/atsc_a85_service.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/atsc_a85_service_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/atsc-a85-service-request-v1.schema.json",
+      "family": "atsc-a85-service-request",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/atsc-a85-service-request-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/atsc-a85-service-request-v1"
+      },
+      "producers": [
+        "external:api-client"
+      ],
+      "consumers": [
+        "repo:src/atsc_a85_service.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/atsc_a85_service_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/audio-anomaly-provider-v1.schema.json",
+      "family": "audio-anomaly-provider",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/audio-anomaly-provider-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema_version",
+        "value": 1
+      },
+      "producers": [
+        "repo:src/anomaly_provider.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/anomaly_provider_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/audio-comparison-v1.schema.json",
+      "family": "audio-comparison",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/audio-comparison-v1.schema.json",
+      "id_policy": "legacy-preserved",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/audio-comparison-v1"
+      },
+      "producers": [
+        "repo:src/audio_compare.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/manifest_schema.rs"
+      ]
+    },
+    {
+      "path": "schema/batch-job-v1.schema.json",
+      "family": "batch-job",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/batch-job-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "durable",
+      "lifecycle": "supported-legacy",
+      "change_policy": "migrate",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/batch-job-v1"
+      },
+      "producers": [
+        "repo:src/batch.rs"
+      ],
+      "consumers": [
+        "repo:src/batch.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
+      ],
+      "successor_path": "schema/batch-job-v2.schema.json"
+    },
+    {
+      "path": "schema/batch-job-v2.schema.json",
+      "family": "batch-job",
+      "version": 2,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/batch-job-v2",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "durable",
+      "lifecycle": "current",
+      "change_policy": "migrate",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/batch-job-v2"
+      },
+      "producers": [
+        "repo:src/batch.rs"
+      ],
+      "consumers": [
+        "repo:src/batch.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
+      ]
+    },
+    {
+      "path": "schema/batch-progress-v1.schema.json",
+      "family": "batch-progress",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/batch-progress-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "durable",
+      "lifecycle": "current",
+      "change_policy": "migrate",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/batch-progress-v1"
+      },
+      "producers": [
+        "repo:src/batch.rs"
+      ],
+      "consumers": [
+        "repo:src/batch.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
+      ]
+    },
+    {
+      "path": "schema/binaural-qc-report-v1.schema.json",
+      "family": "binaural-qc-report",
+      "version": 1,
+      "document_id": "https://github.com/penguin425/audio-normalizer/schema/binaural-qc-report-v1.schema.json",
+      "id_policy": "legacy-preserved",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema_version",
+        "value": 1
+      },
+      "producers": [
+        "repo:src/binaural_qc.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/binaural_qc_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/binaural-qc-request-v1.schema.json",
+      "family": "binaural-qc-request",
+      "version": 1,
+      "document_id": "https://github.com/penguin425/audio-normalizer/schema/binaural-qc-request-v1.schema.json",
+      "id_policy": "legacy-preserved",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema_version",
+        "value": 1
+      },
+      "producers": [
+        "external:api-client"
+      ],
+      "consumers": [
+        "repo:src/binaural_qc.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/binaural_qc_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/catalogue-report-v1.schema.json",
+      "family": "catalogue-report",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/catalogue-report-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "supported-legacy",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/catalogue-report-v1"
+      },
+      "producers": [
+        "repo:src/catalogue.rs"
+      ],
+      "consumers": [
+        "repo:src/catalogue.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
+      ],
+      "successor_path": "schema/catalogue-report-v2.schema.json"
+    },
+    {
+      "path": "schema/catalogue-report-v2.schema.json",
+      "family": "catalogue-report",
+      "version": 2,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/catalogue-report-v2",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "supported-legacy",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/catalogue-report-v2"
+      },
+      "producers": [
+        "repo:src/catalogue.rs"
+      ],
+      "consumers": [
+        "repo:src/catalogue.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
+      ],
+      "successor_path": "schema/catalogue-report-v3.schema.json"
+    },
+    {
+      "path": "schema/catalogue-report-v3.schema.json",
+      "family": "catalogue-report",
+      "version": 3,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/catalogue-report-v3",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/catalogue-report-v3"
+      },
+      "producers": [
+        "repo:src/catalogue.rs"
+      ],
+      "consumers": [
+        "repo:src/catalogue.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
+      ]
+    },
+    {
+      "path": "schema/channel-layout-v1.schema.json",
+      "family": "channel-layout",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/channel-layout-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "version",
+        "value": 1
+      },
+      "producers": [
+        "repo:src/channel_layout.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:src/channel_layout.rs"
+      ]
+    },
+    {
+      "path": "schema/container-qc-v1.schema.json",
+      "family": "container-qc",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/container-qc-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/container-qc-v1"
+      },
+      "producers": [
+        "repo:src/container_qc.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/container_qc_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/dash-qc-v1.schema.json",
+      "family": "dash-qc",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/dash-qc-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/dash-qc-v1"
+      },
+      "producers": [
+        "repo:src/dash_qc.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/manifest_schema.rs"
+      ]
+    },
+    {
+      "path": "schema/delivery-manifest-v1.schema.json",
+      "family": "delivery-manifest",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "durable",
+      "lifecycle": "supported-legacy",
+      "change_policy": "migrate",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v1"
+      },
+      "producers": [
+        "repo:src/report.rs"
+      ],
+      "consumers": [
+        "repo:src/report.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/manifest_schema.rs"
+      ],
+      "successor_path": "schema/delivery-manifest-v2.schema.json"
+    },
+    {
+      "path": "schema/delivery-manifest-v2.schema.json",
+      "family": "delivery-manifest",
+      "version": 2,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v2",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "durable",
+      "lifecycle": "supported-legacy",
+      "change_policy": "migrate",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v2"
+      },
+      "producers": [
+        "repo:src/report.rs"
+      ],
+      "consumers": [
+        "repo:src/report.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/manifest_schema.rs"
+      ],
+      "successor_path": "schema/delivery-manifest-v3.schema.json"
+    },
+    {
+      "path": "schema/delivery-manifest-v3.schema.json",
+      "family": "delivery-manifest",
+      "version": 3,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v3",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "durable",
+      "lifecycle": "supported-legacy",
+      "change_policy": "migrate",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v3"
+      },
+      "producers": [
+        "repo:src/report.rs"
+      ],
+      "consumers": [
+        "repo:src/report.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/manifest_schema.rs"
+      ],
+      "successor_path": "schema/delivery-manifest-v4.schema.json"
+    },
+    {
+      "path": "schema/delivery-manifest-v4.schema.json",
+      "family": "delivery-manifest",
+      "version": 4,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v4",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "durable",
+      "lifecycle": "current",
+      "change_policy": "migrate",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/delivery-manifest-v4"
+      },
+      "producers": [
+        "repo:src/report.rs"
+      ],
+      "consumers": [
+        "repo:src/report.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/manifest_schema.rs"
+      ]
+    },
+    {
+      "path": "schema/doctor-report-v1.schema.json",
+      "family": "doctor-report",
+      "version": 1,
+      "document_id": "https://github.com/penguin425/audio-normalizer/schema/doctor-report-v1.schema.json",
+      "id_policy": "legacy-preserved",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema_version",
+        "value": "forge-doctor-v1"
+      },
+      "producers": [
+        "repo:src/bin/forge-doctor.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/doctor_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/downmix-qc-report-v1.schema.json",
+      "family": "downmix-qc-report",
+      "version": 1,
+      "document_id": "https://github.com/penguin425/audio-normalizer/schema/downmix-qc-report-v1.schema.json",
+      "id_policy": "legacy-preserved",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema_version",
+        "value": 1
+      },
+      "producers": [
+        "repo:src/downmix_qc.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/downmix_qc_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/downmix-qc-request-v1.schema.json",
+      "family": "downmix-qc-request",
+      "version": 1,
+      "document_id": "https://github.com/penguin425/audio-normalizer/schema/downmix-qc-request-v1.schema.json",
+      "id_policy": "legacy-preserved",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema_version",
+        "value": 1
+      },
+      "producers": [
+        "external:api-client"
+      ],
+      "consumers": [
+        "repo:src/downmix_qc.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/downmix_qc_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/dts-adapter-report-v1.schema.json",
+      "family": "dts-adapter-report",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/dts-adapter-report-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "supported-legacy",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/dts-adapter-report-v1"
+      },
+      "producers": [
+        "repo:src/dts_adapter.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/dts_adapter_cli.rs"
+      ],
+      "successor_path": "schema/dts-adapter-report-v2.schema.json"
+    },
+    {
+      "path": "schema/dts-adapter-report-v2.schema.json",
+      "family": "dts-adapter-report",
+      "version": 2,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/dts-adapter-report-v2",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/dts-adapter-report-v2"
+      },
+      "producers": [
+        "repo:src/dts_adapter.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/dts_adapter_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/dts-adapter-request-v1.schema.json",
+      "family": "dts-adapter-request",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/dts-adapter-request-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/dts-adapter-request-v1"
+      },
+      "producers": [
+        "external:api-client"
+      ],
+      "consumers": [
+        "repo:src/dts_adapter.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/dts_adapter_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/dts-adapter-response-v1.schema.json",
+      "family": "dts-adapter-response",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/dts-adapter-response-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/dts-adapter-response-v1"
+      },
+      "producers": [
+        "repo:src/dts_adapter.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/dts_adapter_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/ebu-qc-catalogue-v2-pins.json",
+      "family": "ebu-qc-catalogue-pins",
+      "version": 2,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/ebu-qc-catalogue-v2-pins.json",
+      "id_policy": "canonical",
+      "document_kind": "data",
+      "artifact_class": "evidence",
+      "lifecycle": "current",
+      "change_policy": "external-pin",
+      "producers": [
+        "external:ebu-qc-catalogue-api"
+      ],
+      "consumers": [
+        "repo:src/ebu_qc_scenario1.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/manifest_schema.rs"
+      ]
+    },
+    {
+      "path": "schema/ebu-qc-results-v2.schema.json",
+      "family": "ebu-qc-results",
+      "version": 2,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/ebu-qc-results-v2",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/ebu-qc-results-v2"
+      },
+      "producers": [
+        "repo:src/ebu_qc_report.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/manifest_schema.rs"
+      ]
+    },
+    {
+      "path": "schema/hls-qc-v1.schema.json",
+      "family": "hls-qc",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/hls-qc-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/hls-qc-v1"
+      },
+      "producers": [
+        "repo:src/hls_qc.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/manifest_schema.rs"
+      ]
+    },
+    {
+      "path": "schema/imf-qc-v1.schema.json",
+      "family": "imf-qc",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/imf-qc-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/imf-qc-v1"
+      },
+      "producers": [
+        "repo:src/imf_qc.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/imf_qc_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/manifest-comparison-v1.schema.json",
+      "family": "manifest-comparison",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/manifest-comparison-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/manifest-comparison-v1"
+      },
+      "producers": [
+        "repo:src/compare.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/manifest_schema.rs"
+      ]
+    },
+    {
+      "path": "schema/metadata-repair-report-v1.schema.json",
+      "family": "metadata-repair-report",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/metadata-repair-report-v1.schema.json",
+      "id_policy": "legacy-preserved",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "supported-legacy",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema_version",
+        "value": 1
+      },
+      "producers": [
+        "repo:src/metadata_repair.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/metadata_repair_cli.rs"
+      ],
+      "successor_path": "schema/metadata-repair-report-v2.schema.json"
+    },
+    {
+      "path": "schema/metadata-repair-report-v2.schema.json",
+      "family": "metadata-repair-report",
+      "version": 2,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/metadata-repair-report-v2.schema.json",
+      "id_policy": "legacy-preserved",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema_version",
+        "value": 2
+      },
+      "producers": [
+        "repo:src/metadata_repair.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/metadata_repair_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/metadata-repair-request-v1.schema.json",
+      "family": "metadata-repair-request",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/metadata-repair-request-v1.schema.json",
+      "id_policy": "legacy-preserved",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "supported-legacy",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema_version",
+        "value": 1
+      },
+      "producers": [
+        "external:api-client"
+      ],
+      "consumers": [
+        "repo:src/metadata_repair.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/metadata_repair_cli.rs"
+      ],
+      "successor_path": "schema/metadata-repair-request-v2.schema.json"
+    },
+    {
+      "path": "schema/metadata-repair-request-v2.schema.json",
+      "family": "metadata-repair-request",
+      "version": 2,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/metadata-repair-request-v2.schema.json",
+      "id_policy": "legacy-preserved",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema_version",
+        "value": 2
+      },
+      "producers": [
+        "external:api-client"
+      ],
+      "consumers": [
+        "repo:src/metadata_repair.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/metadata_repair_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/model-qc-v1.schema.json",
+      "family": "model-qc",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/model-qc-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/model-qc-v1"
+      },
+      "producers": [
+        "repo:src/report.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/manifest_schema.rs"
+      ]
+    },
+    {
+      "path": "schema/mpegh-adapter-report-v1.schema.json",
+      "family": "mpegh-adapter-report",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/mpegh-adapter-report-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "supported-legacy",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/mpegh-adapter-report-v1"
+      },
+      "producers": [
+        "repo:src/mpegh_adapter.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/mpegh_adapter_cli.rs"
+      ],
+      "successor_path": "schema/mpegh-adapter-report-v2.schema.json"
+    },
+    {
+      "path": "schema/mpegh-adapter-report-v2.schema.json",
+      "family": "mpegh-adapter-report",
+      "version": 2,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/mpegh-adapter-report-v2",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/mpegh-adapter-report-v2"
+      },
+      "producers": [
+        "repo:src/mpegh_adapter.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/mpegh_adapter_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/mpegh-adapter-request-v1.schema.json",
+      "family": "mpegh-adapter-request",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/mpegh-adapter-request-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/mpegh-adapter-request-v1"
+      },
+      "producers": [
+        "external:api-client"
+      ],
+      "consumers": [
+        "repo:src/mpegh_adapter.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/mpegh_adapter_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/mpegh-adapter-response-v1.schema.json",
+      "family": "mpegh-adapter-response",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/mpegh-adapter-response-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/mpegh-adapter-response-v1"
+      },
+      "producers": [
+        "repo:src/mpegh_adapter.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/mpegh_adapter_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/multi-delivery-report-v1.schema.json",
+      "family": "multi-delivery-report",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/multi-delivery-report-v1.schema.json",
+      "id_policy": "legacy-preserved",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/multi-delivery-report-v1"
+      },
+      "producers": [
+        "repo:src/multi_delivery.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/multi_delivery_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/multi-delivery-request-v1.schema.json",
+      "family": "multi-delivery-request",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/multi-delivery-request-v1.schema.json",
+      "id_policy": "legacy-preserved",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/multi-delivery-request-v1"
+      },
+      "producers": [
+        "external:api-client"
+      ],
+      "consumers": [
+        "repo:src/multi_delivery.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/multi_delivery_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/nmos-qc-v1.schema.json",
+      "family": "nmos-qc",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/nmos-qc-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/nmos-qc-v1"
+      },
+      "producers": [
+        "repo:src/nmos_qc.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/nmos_qc_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/normalization-difference-v1.schema.json",
+      "family": "normalization-difference",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/normalization-difference-v1.schema.json",
+      "id_policy": "legacy-preserved",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/normalization-difference-v1"
+      },
+      "producers": [
+        "repo:src/normalization_diff.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
+      ]
+    },
+    {
+      "path": "schema/onnx-anomaly-model-v1.schema.json",
+      "family": "onnx-anomaly-model",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/onnx-anomaly-model-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/onnx-anomaly-model-v1"
+      },
+      "producers": [
+        "external:api-client"
+      ],
+      "consumers": [
+        "repo:src/onnx_provider.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/onnx_provider.rs"
+      ]
+    },
+    {
+      "path": "schema/onnx-feature-frames-v1.schema.json",
+      "family": "onnx-feature-frames",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/onnx-feature-frames-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/onnx-feature-frames-v1"
+      },
+      "producers": [
+        "repo:src/onnx_provider.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/onnx_provider.rs"
+      ]
+    },
+    {
+      "path": "schema/performance-benchmark-v1.schema.json",
+      "family": "performance-benchmark",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/performance-benchmark-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "evidence",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "$schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/performance-benchmark-v1"
+      },
+      "producers": [
+        "repo:tools/benchmark.py"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/performance_benchmark_schema.rs"
+      ]
+    },
+    {
+      "path": "schema/provenance-qc-v1.schema.json",
+      "family": "provenance-qc",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/provenance-qc-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/provenance-qc-v1"
+      },
+      "producers": [
+        "repo:src/provenance.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/provenance_qc_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/remediation-report-v1.schema.json",
+      "family": "remediation-report",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/remediation-report-v1.schema.json",
+      "id_policy": "legacy-preserved",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema_version",
+        "value": 1
+      },
+      "producers": [
+        "repo:src/remediation.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/remediation_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/remediation-request-v1.schema.json",
+      "family": "remediation-request",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/remediation-request-v1.schema.json",
+      "id_policy": "legacy-preserved",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema_version",
+        "value": 1
+      },
+      "producers": [
+        "external:api-client"
+      ],
+      "consumers": [
+        "repo:src/remediation.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/remediation_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/remote-materialization-v1.schema.json",
+      "family": "remote-materialization",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/remote-materialization-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "durable",
+      "lifecycle": "current",
+      "change_policy": "migrate",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/remote-materialization-v1"
+      },
+      "producers": [
+        "repo:src/remote_range.rs"
+      ],
+      "consumers": [
+        "repo:src/remote_range.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/remote_qc_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/remote-qc-v1.schema.json",
+      "family": "remote-qc",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/remote-qc-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/remote-qc-v1"
+      },
+      "producers": [
+        "repo:src/remote_range.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/remote_qc_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/remote-range-v1.schema.json",
+      "family": "remote-range",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/remote-range-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/remote-range-v1"
+      },
+      "producers": [
+        "repo:src/remote_range.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/remote_qc_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/rtp-audio-qc-v1.schema.json",
+      "family": "rtp-audio-qc",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/rtp-audio-qc-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/rtp-audio-qc-v1"
+      },
+      "producers": [
+        "repo:src/rtp_qc.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/rtp_qc_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/rule-explanations-v1.schema.json",
+      "family": "rule-explanations",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/rule-explanations-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "supported-legacy",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/rule-explanations-v1"
+      },
+      "producers": [
+        "repo:src/report_tools.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/manifest_schema.rs"
+      ],
+      "successor_path": "schema/rule-explanations-v2.schema.json"
+    },
+    {
+      "path": "schema/rule-explanations-v2.schema.json",
+      "family": "rule-explanations",
+      "version": 2,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/rule-explanations-v2",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/rule-explanations-v2"
+      },
+      "producers": [
+        "repo:src/report_tools.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/manifest_schema.rs"
+      ]
+    },
+    {
+      "path": "schema/schema-registry-v1.json",
+      "family": "schema-registry",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/schema-registry-v1.json",
+      "id_policy": "canonical",
+      "document_kind": "registry",
+      "artifact_class": "registry",
+      "lifecycle": "current",
+      "change_policy": "registry-bootstrap",
+      "producers": [
+        "repo:tools/check-schema-registry.py"
+      ],
+      "consumers": [
+        "repo:tools/check-schema-registry.py",
+        "repo:tests/schema_registry.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs"
+      ]
+    },
+    {
+      "path": "schema/schema-registry-v1.schema.json",
+      "family": "schema-registry",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/schema-registry-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "registry",
+      "lifecycle": "current",
+      "change_policy": "registry-bootstrap",
+      "instance_discriminator": {
+        "field": "$schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/schema-registry-v1"
+      },
+      "producers": [
+        "repo:tools/check-schema-registry.py"
+      ],
+      "consumers": [
+        "repo:tools/check-schema-registry.py",
+        "repo:tests/schema_registry.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs"
+      ],
+      "samples": [
+        "repo:schema/schema-registry-v1.json"
+      ]
+    },
+    {
+      "path": "schema/segment-normalization-plan-v1.schema.json",
+      "family": "segment-normalization-plan",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/segment-normalization-plan-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "supported-legacy",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/segment-normalization-plan-v1"
+      },
+      "producers": [
+        "repo:src/segment_normalize.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/segment_normalize_cli.rs"
+      ],
+      "successor_path": "schema/segment-normalization-plan-v2.schema.json"
+    },
+    {
+      "path": "schema/segment-normalization-plan-v2.schema.json",
+      "family": "segment-normalization-plan",
+      "version": 2,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/segment-normalization-plan-v2",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/segment-normalization-plan-v2"
+      },
+      "producers": [
+        "repo:src/segment_normalize.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/segment_normalize_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/segment-normalization-report-v1.schema.json",
+      "family": "segment-normalization-report",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/segment-normalization-report-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "supported-legacy",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/segment-normalization-report-v1"
+      },
+      "producers": [
+        "repo:src/segment_normalize.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/segment_normalize_cli.rs"
+      ],
+      "successor_path": "schema/segment-normalization-report-v2.schema.json"
+    },
+    {
+      "path": "schema/segment-normalization-report-v2.schema.json",
+      "family": "segment-normalization-report",
+      "version": 2,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/segment-normalization-report-v2",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/segment-normalization-report-v2"
+      },
+      "producers": [
+        "repo:src/segment_normalize.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/segment_normalize_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/segment-normalization-request-v1.schema.json",
+      "family": "segment-normalization-request",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/segment-normalization-request-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/segment-normalization-request-v1"
+      },
+      "producers": [
+        "external:api-client"
+      ],
+      "consumers": [
+        "repo:src/segment_normalize.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/segment_normalize_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/service-analysis-v1.schema.json",
+      "family": "service-analysis",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/service-analysis-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "supported-legacy",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/service-analysis-v1"
+      },
+      "producers": [
+        "repo:src/service.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/service_api.rs"
+      ],
+      "successor_path": "schema/service-analysis-v2.schema.json"
+    },
+    {
+      "path": "schema/service-analysis-v2.schema.json",
+      "family": "service-analysis",
+      "version": 2,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/service-analysis-v2",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "supported-legacy",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/service-analysis-v2"
+      },
+      "producers": [
+        "repo:src/service.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/service_api.rs"
+      ],
+      "successor_path": "schema/service-analysis-v3.schema.json"
+    },
+    {
+      "path": "schema/service-analysis-v3.schema.json",
+      "family": "service-analysis",
+      "version": 3,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/service-analysis-v3",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/service-analysis-v3"
+      },
+      "producers": [
+        "repo:src/service.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/service_api.rs"
+      ]
+    },
+    {
+      "path": "schema/service-error-v1.schema.json",
+      "family": "service-error",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/service-error-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/service-error-v1"
+      },
+      "producers": [
+        "repo:src/service.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/service_api.rs"
+      ]
+    },
+    {
+      "path": "schema/service-health-v1.schema.json",
+      "family": "service-health",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/service-health-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/service-health-v1"
+      },
+      "producers": [
+        "repo:src/service.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/service_api.rs"
+      ]
+    },
+    {
+      "path": "schema/st2022-7-qc-v1.schema.json",
+      "family": "st2022-7-qc",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/st2022-7-qc-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/st2022-7-qc-v1"
+      },
+      "producers": [
+        "repo:src/rtp_qc.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/st2022_7_qc_cli.rs"
+      ]
+    },
+    {
+      "path": "schema/watch-folder-v1.schema.json",
+      "family": "watch-folder",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/watch-folder-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "durable",
+      "lifecycle": "current",
+      "change_policy": "migrate",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/watch-folder-v1"
+      },
+      "producers": [
+        "repo:src/watch.rs"
+      ],
+      "consumers": [
+        "repo:src/watch.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
+      ]
+    }
+  ]
+}

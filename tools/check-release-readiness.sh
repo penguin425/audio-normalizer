@@ -6,6 +6,8 @@ cd "$repo_root"
 
 expected_version="${1:-}"
 python3 tools/check-workflow-pins.py
+python3 tools/check-schema-registry.py
+python3 -m unittest tools/test_schema_registry.py
 IFS=$'\t' read -r version target_dir < <(
   python3 - "$expected_version" <<'PY'
 import json
@@ -97,6 +99,8 @@ for file in \
   EBU-QC-SCENARIO1.md \
   schema/analysis-cache-v4.schema.json \
   schema/analysis-cache-v5.schema.json \
+  schema/schema-registry-v1.schema.json \
+  schema/schema-registry-v1.json \
   schema/channel-layout-v1.schema.json \
   schema/catalogue-report-v2.schema.json \
   schema/catalogue-report-v3.schema.json \

@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/schema-registry-v1",
+  "title": "Forge JSON contract registry v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["$schema", "registry_id", "registry_version", "entries"],
+  "properties": {
+    "$schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/schema-registry-v1"
+    },
+    "registry_id": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/schema-registry-v1.json"
+    },
+    "registry_version": {
+      "const": 1
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/entry" }
+    }
+  },
+  "$defs": {
+    "repoOwner": {
+      "type": "string",
+      "pattern": "^(repo:[A-Za-z0-9][A-Za-z0-9._/-]*|external:[A-Za-z0-9][A-Za-z0-9._/-]*)$"
+    },
+    "repoValidator": {
+      "type": "string",
+      "pattern": "^repo:[A-Za-z0-9][A-Za-z0-9._/-]*$"
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "family",
+        "version",
+        "document_id",
+        "id_policy",
+        "document_kind",
+        "artifact_class",
+        "lifecycle",
+        "change_policy",
+        "producers",
+        "consumers",
+        "validators"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^schema/[A-Za-z0-9][A-Za-z0-9._-]*\\.json$"
+        },
+        "family": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "document_id": {
+          "type": "string",
+          "pattern": "^https://[^\\u0000-\\u0020]+$"
+        },
+        "id_policy": {
+          "enum": ["canonical", "legacy-preserved"]
+        },
+        "instance_discriminator": {
+          "$ref": "#/$defs/instanceDiscriminator"
+        },
+        "document_kind": {
+          "enum": ["json-schema", "data", "registry"]
+        },
+        "artifact_class": {
+          "enum": ["wire", "durable", "cache", "report", "evidence", "registry"]
+        },
+        "lifecycle": {
+          "enum": ["current", "supported-legacy", "retired"]
+        },
+        "change_policy": {
+          "enum": [
+            "immutable-version",
+            "migrate",
+            "invalidate",
+            "external-pin",
+            "registry-bootstrap"
+          ]
+        },
+        "successor_path": {
+          "type": "string",
+          "pattern": "^schema/[A-Za-z0-9][A-Za-z0-9._-]*\\.json$"
+        },
+        "producers": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/repoOwner" }
+        },
+        "consumers": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/repoOwner" }
+        },
+        "validators": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/repoValidator" }
+        },
+        "samples": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/repoValidator" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "document_kind": { "const": "json-schema" } },
+            "required": ["document_kind"]
+          },
+          "then": { "required": ["instance_discriminator"] },
+          "else": { "not": { "required": ["instance_discriminator"] } }
+        },
+        {
+          "if": {
+            "properties": { "lifecycle": { "const": "supported-legacy" } },
+            "required": ["lifecycle"]
+          },
+          "then": { "required": ["successor_path"] }
+        },
+        {
+          "if": {
+            "properties": { "lifecycle": { "const": "current" } },
+            "required": ["lifecycle"]
+          },
+          "then": { "not": { "required": ["successor_path"] } }
+        }
+      ]
+    },
+    "instanceDiscriminator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "value"],
+      "properties": {
+        "field": {
+          "enum": ["$schema", "schema", "schema_version", "version"]
+        },
+        "value": {
+          "type": ["string", "integer"]
+        }
+      }
+    }
+  }
+}

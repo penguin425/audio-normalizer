@@ -8,6 +8,27 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.189.10 - 2026-09-05
+
+### Added
+
+- Add a self-registering JSON contract catalogue covering all 82 shipped JSON
+  Schemas and two governed data documents. Every entry records its family,
+  integer version, exact document ID, instance discriminator, lifecycle,
+  evolution policy, producers, consumers, and validators.
+- Add dependency-free registry checks and negative tests for missing, stale,
+  duplicate, non-local, path-traversing, and broken-successor contracts, plus
+  meta-schema compilation and registered-sample validation in Rust.
+
+### Changed
+
+- Validate the complete offline schema closure before crates, GitHub Pages, or
+  release archives are produced, and derive the archive's governed JSON file
+  set from the registry.
+- Preserve the exact 15 historical schema IDs through a closed allowlist, and
+  distinguish supported older wire/report contracts from retired,
+  invalidatable analysis-cache formats.
+
 ## 0.189.9 - 2026-09-05
 
 ### Added
