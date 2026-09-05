@@ -7,6 +7,7 @@ on:
       - "Cargo.lock"
       - "Cargo.toml"
       - "src/decoder.rs"
+      - "src/bound_analysis.rs"
       - "src/dsd.rs"
       - "src/dsp/kwfilter.rs"
       - "src/dsp/lufs.rs"
@@ -17,7 +18,9 @@ on:
       - "src/pcm_spool.rs"
       - "tools/benchmark.py"
       - "tools/paired_benchmark.py"
+      - "tools/pcm_benchmark_gate.py"
       - "tools/test_benchmark.py"
+      - "tools/test_pcm_benchmark_gate.py"
 
 permissions:
   contents: read
@@ -27,12 +30,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  benchmark:
-    name: benchmark (${{ matrix.os }})
+  initial:
+    name: initial benchmark (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest]
+        include:
+          - os: ubuntu-24.04
+            arch: X64
+          - os: macos-latest
+            arch: ARM64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 150
 
@@ -72,6 +79,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 candidate/tools/test_benchmark.py
+          python3 candidate/tools/test_pcm_benchmark_gate.py
           cargo test --locked --manifest-path candidate/Cargo.toml \
             --no-default-features --lib pcm_spool::tests -- --nocapture
           cargo test --locked --manifest-path candidate/Cargo.toml \
@@ -217,1166 +225,220 @@ jobs:
             run_benchmark "${mode}"
           done
 
-      - name: Confirm aggregate and isolated timing tripwires
+
+      - name: Plan fresh-runner timing confirmations
         shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import math
-          import os
-          import shutil
-          import statistics
-          import subprocess
-          import sys
-          import tomllib
-          from pathlib import Path
-
-          sys.path.insert(0, "candidate/tools")
-          import paired_benchmark
-
-          MODES = ("default", "one")
-          CASES = paired_benchmark.CASES
-
-          def measurement_revision(root):
-              prefix = 'pub const MEASUREMENT_ALGORITHM_REVISION: &str = "'
-              for line in (root / "src/bound_analysis.rs").read_text(
-                  encoding="utf-8"
-              ).splitlines():
-                  if line.startswith(prefix) and line.endswith('";'):
-                      return line[len(prefix):-2]
-              raise AssertionError(f"missing measurement revision in {root}")
-
-          def package_version(root):
-              with (root / "Cargo.toml").open("rb") as source:
-                  return tomllib.load(source)["package"]["version"]
-
-          measurement_migration = (
-              measurement_revision(Path("baseline")) == "forge-bs1770-5-r3"
-              and measurement_revision(Path("candidate")) == "forge-bs1770-5-r4"
-          )
-          durability_migration = (
-              package_version(Path("baseline")) == "0.189.5"
-              and package_version(Path("candidate")) == "0.189.6"
-          )
-          short_control_cpu_limit = (
-              8.0 if measurement_migration else 5.0 if durability_migration else 4.0
-          )
-          short_resample_wall_limit = (
-              8.0 if measurement_migration else 5.0 if durability_migration else 4.0
-          )
-          short_resample_cpu_limit = (
-              8.0 if measurement_migration else 4.0 if durability_migration else 3.0
-          )
-          short_average_limit = (
-              5.0 if measurement_migration else 2.0 if durability_migration else 1.0
-          )
-          long_isolated_limit = (
-              8.0 if measurement_migration or durability_migration else 5.0
-          )
-          long_average_limit = 5.0 if measurement_migration else 3.0
-
-          def total_cpu(sample):
-              return sample["user_cpu_seconds"] + sample["system_cpu_seconds"]
-
-          GETTERS = {
-              "wall": lambda sample: sample["wall_seconds"],
-              "cpu": total_cpu,
-          }
-
-          def read_results(prefix, expected_duration):
-              results = {}
-              for mode in MODES:
-                  path = Path(f"{prefix}-{mode}.json")
-                  document = json.loads(path.read_text(encoding="utf-8"))
-                  assert document["passed"], (path, document["error"])
-                  assert document["configuration"] == {
-                      "duration_seconds": expected_duration,
-                      "rounds": 8,
-                      "samples_per_binary": 16,
-                      "cases": list(CASES),
-                  }, (path, document["configuration"])
-                  assert [result["id"] for result in document["results"]] == list(
-                      CASES
-                  ), (path, document["results"])
-                  for result in document["results"]:
-                      case_id = result["id"]
-                      assert result["samples_per_binary"] == 16, (path, case_id)
-                      assert len(result["baseline_samples"]) == 16, (path, case_id)
-                      assert len(result["candidate_samples"]) == 16, (path, case_id)
-                      for population in (
-                          result["baseline_samples"],
-                          result["candidate_samples"],
-                      ):
-                          for sample in population:
-                              raw_values = (
-                                  sample["wall_seconds"],
-                                  sample["user_cpu_seconds"],
-                                  sample["system_cpu_seconds"],
-                                  sample["peak_rss_bytes"],
-                              )
-                              assert all(
-                                  math.isfinite(value) for value in raw_values
-                              ), (path, case_id, "non-finite raw sample", sample)
-                      assert result["schedule"] == (
-                          paired_benchmark.alternating_schedule(
-                              8,
-                              inverted=CASES.index(case_id) % 2 == 1,
-                          )
-                      ), (path, case_id, "unexpected initial schedule")
-                      results[(mode, case_id)] = result
-              assert len(results) == len(MODES) * len(CASES), results.keys()
-              return results
-
-          def paired_changes(results):
-              return {
-                  (mode, case, metric): paired_benchmark.paired_median_change_percent(
-                      result, getter
-                  )
-                  for (mode, case), result in results.items()
-                  for metric, getter in GETTERS.items()
-              }
-
-          short_changes = paired_changes(read_results("short", 300))
-          assert all(math.isfinite(value) for value in short_changes.values()), (
-              short_changes
-          )
-          short_wall_average = statistics.fmean(
-              value
-              for (mode, case, metric), value in short_changes.items()
-              if metric == "wall"
-          )
-          short_cpu_average = statistics.fmean(
-              value
-              for (mode, case, metric), value in short_changes.items()
-              if metric == "cpu"
-          )
-          short_aggregate_passed = (
-              short_wall_average <= short_average_limit
-              and short_cpu_average <= short_average_limit
-          )
-
-          short_limits = {
-              (mode, case, "wall"): 10.0
-              for mode in MODES
-              for case in CASES
-          }
-          short_limits.update({
-              (mode, case, "cpu"): 8.0
-              for mode in MODES
-              for case in CASES
-          })
-          for mode in MODES:
-              key = (mode, "flac-stereo-normalize", "cpu")
-              short_limits[key] = min(short_limits[key], short_control_cpu_limit)
-          for metric, limit in (
-              ("wall", short_resample_wall_limit),
-              ("cpu", short_resample_cpu_limit),
-          ):
-              key = ("one", "wav-stereo-resample-normalize", metric)
-              short_limits[key] = min(short_limits[key], limit)
-
-          long_changes = paired_changes(read_results("long", 600))
-          assert all(math.isfinite(value) for value in long_changes.values()), (
-              long_changes
-          )
-          long_average = statistics.fmean(long_changes.values())
-          long_aggregate_passed = long_average <= long_average_limit
-
-          plan = {
-              "method": (
-                  "Aggregate and isolated timing regressions are rejected only "
-                  "when an independent balanced confirmation population exceeds "
-                  "the same unchanged limit. A full aggregate confirmation is "
-                  "also reused for any initial isolated tripwire."
-              ),
-              "aggregates": {
-                  "short": {
-                      "wall_change_percent": short_wall_average,
-                      "cpu_change_percent": short_cpu_average,
-                      "limit_percent": short_average_limit,
-                      "passed": short_aggregate_passed,
-                  },
-                  "long": {
-                      "wall_cpu_change_percent": long_average,
-                      "limit_percent": long_average_limit,
-                      "passed": long_aggregate_passed,
-                  },
-              },
-              "full_populations": {},
-              "populations": [],
-          }
-          populations = {}
-
-          def triggered_isolated_tripwires(length, changes, limits):
-              tripwires = []
-              for (mode, case, metric), limit in limits.items():
-                  initial = changes[(mode, case, metric)]
-                  if initial > limit:
-                      tripwires.append({
-                          "length": length,
-                          "mode": mode,
-                          "case": case,
-                          "metric": metric,
-                          "initial_change_percent": initial,
-                          "limit_percent": limit,
-                          "reused_full_population": True,
-                      })
-              return tripwires
-
-          def add_population(length, duration, mode, case, metric, initial, limit):
-              key = (length, mode, case)
-              entry = populations.setdefault(key, {
-                  "length": length,
-                  "duration_seconds": duration,
-                  "mode": mode,
-                  "case": case,
-                  "rounds": 8,
-                  "output": f"confirmation-{length}-{mode}-{case}.json",
-                  "metrics": {},
-              })
-              entry["metrics"][metric] = {
-                  "initial_change_percent": initial,
-                  "limit_percent": limit,
-              }
-
-          if short_aggregate_passed:
-              for key, limit in short_limits.items():
-                  initial = short_changes[key]
-                  if initial > limit:
-                      mode, case, metric = key
-                      add_population("short", 300, mode, case, metric, initial, limit)
-          else:
-              metrics = {}
-              for metric, initial in (
-                  ("wall", short_wall_average),
-                  ("cpu", short_cpu_average),
-              ):
-                  if initial > short_average_limit:
-                      metrics[metric] = {
-                          "initial_change_percent": initial,
-                          "limit_percent": short_average_limit,
-                      }
-              plan["full_populations"]["short"] = {
-                  "length": "short",
-                  "duration_seconds": 300,
-                  "modes": list(MODES),
-                  "cases": list(CASES),
-                  "rounds": 8,
-                  "outputs": {
-                      mode: f"confirmation-full-short-{mode}.json"
-                      for mode in MODES
-                  },
-                  "metrics": metrics,
-                  "reused_isolated_tripwires": triggered_isolated_tripwires(
-                      "short", short_changes, short_limits
-                  ),
-              }
-          if long_aggregate_passed:
-              for (mode, case, metric), initial in long_changes.items():
-                  if initial > long_isolated_limit:
-                      add_population(
-                          "long",
-                          600,
-                          mode,
-                          case,
-                          metric,
-                          initial,
-                          long_isolated_limit,
-                      )
-          else:
-              long_limits = {
-                  key: long_isolated_limit for key in long_changes
-              }
-              plan["full_populations"]["long"] = {
-                  "length": "long",
-                  "duration_seconds": 600,
-                  "modes": list(MODES),
-                  "cases": list(CASES),
-                  "rounds": 8,
-                  "outputs": {
-                      mode: f"confirmation-full-long-{mode}.json"
-                      for mode in MODES
-                  },
-                  "metrics": {
-                      "wall_cpu": {
-                          "initial_change_percent": long_average,
-                          "limit_percent": long_average_limit,
-                      },
-                  },
-                  "reused_isolated_tripwires": triggered_isolated_tripwires(
-                      "long", long_changes, long_limits
-                  ),
-              }
-
-          plan["populations"] = list(populations.values())
-          plan_path = Path("pcm-spool-buffer-confirmations.json")
-
-          def write_plan():
-              plan_path.write_text(
-                  json.dumps(plan, indent=2, sort_keys=True) + "\n",
-                  encoding="utf-8",
-              )
-
-          ffmpeg = shutil.which("ffmpeg")
-          assert ffmpeg is not None, "ffmpeg is unavailable"
-
-          def run_confirmation(length, duration, mode, output, case=None):
-              expected_cases = [case] if case is not None else list(CASES)
-              command = [
-                  sys.executable,
-                  "candidate/tools/paired_benchmark.py",
-                  "--baseline-forge", str(
-                      Path(os.environ["RUNNER_TEMP"])
-                      / "target-baseline/release/forge"
-                  ),
-                  "--candidate-forge", str(
-                      Path(os.environ["RUNNER_TEMP"])
-                      / "target-candidate/release/forge"
-                  ),
-                  "--ffmpeg", ffmpeg,
-                  "--duration-seconds", str(duration),
-                  "--rounds", "8",
-                  "--work-dir", str(
-                      Path(os.environ["RUNNER_TEMP"])
-                      / f"paired-confirmation-{length}-{mode}"
-                      / (case or "full")
-                  ),
-                  "--output", str(output),
-              ]
-              if case is not None:
-                  command += ["--case", case]
-              environment = os.environ.copy()
-              if mode == "one":
-                  environment["RAYON_NUM_THREADS"] = "1"
-              else:
-                  environment.pop("RAYON_NUM_THREADS", None)
-              subprocess.run(command, check=True, env=environment)
-              document = json.loads(output.read_text(encoding="utf-8"))
-              assert document["passed"], (output, document["error"])
-              assert document["configuration"] == {
-                  "duration_seconds": duration,
-                  "rounds": 8,
-                  "samples_per_binary": 16,
-                  "cases": expected_cases,
-              }, (output, document["configuration"])
-              assert [result["id"] for result in document["results"]] == (
-                  expected_cases
-              ), (output, document["results"])
-              results = {}
-              for result in document["results"]:
-                  case_id = result["id"]
-                  assert result["samples_per_binary"] == 16, (output, case_id)
-                  assert len(result["baseline_samples"]) == 16, (output, case_id)
-                  assert len(result["candidate_samples"]) == 16, (output, case_id)
-                  assert result["schedule"] == paired_benchmark.alternating_schedule(
-                      8,
-                      inverted=paired_benchmark.CASES.index(case_id) % 2 == 1,
-                  ), (output, case_id, "unbalanced confirmation schedule")
-                  results[(mode, case_id)] = result
-              return results
-
-          write_plan()
-          for length, entry in plan["full_populations"].items():
-              try:
-                  full_results = {}
-                  for mode, output_name in entry["outputs"].items():
-                      full_results.update(
-                          run_confirmation(
-                              length,
-                              entry["duration_seconds"],
-                              mode,
-                              Path(output_name),
-                          )
-                      )
-                  confirmation_changes = paired_changes(full_results)
-                  assert all(
-                      math.isfinite(value) for value in confirmation_changes.values()
-                  ), confirmation_changes
-                  entry["case_metric_changes_percent"] = {
-                      mode: {
-                          case: {
-                              metric: confirmation_changes[(mode, case, metric)]
-                              for metric in GETTERS
-                          }
-                          for case in CASES
-                      }
-                      for mode in MODES
-                  }
-                  if length == "short":
-                      confirmation_aggregates = {
-                          metric: statistics.fmean(
-                              value
-                              for (mode, case, candidate_metric), value
-                              in confirmation_changes.items()
-                              if candidate_metric == metric
-                          )
-                          for metric in GETTERS
-                      }
-                  else:
-                      confirmation_aggregates = {
-                          "wall_cpu": statistics.fmean(
-                              confirmation_changes.values()
-                          )
-                      }
-                  entry["confirmation_aggregate_changes_percent"] = (
-                      confirmation_aggregates
-                  )
-                  for metric, evidence in entry["metrics"].items():
-                      confirmation = confirmation_aggregates[metric]
-                      evidence["confirmation_change_percent"] = confirmation
-                      evidence["reproduced"] = (
-                          paired_benchmark.regression_reproduced(
-                              evidence["initial_change_percent"],
-                              confirmation,
-                              evidence["limit_percent"],
-                          )
-                      )
-                  for evidence in entry["reused_isolated_tripwires"]:
-                      confirmation = confirmation_changes[
-                          (evidence["mode"], evidence["case"], evidence["metric"])
-                      ]
-                      evidence["confirmation_change_percent"] = confirmation
-                      evidence["reproduced"] = (
-                          paired_benchmark.isolated_regression_reproduced(
-                              evidence["initial_change_percent"],
-                              confirmation,
-                              evidence["limit_percent"],
-                          )
-                      )
-              except Exception as error:
-                  entry["error"] = str(error)
-                  write_plan()
-                  raise
-              write_plan()
-
-          for entry in plan["populations"]:
-              output = Path(entry["output"])
-              try:
-                  results = run_confirmation(
-                      entry["length"],
-                      entry["duration_seconds"],
-                      entry["mode"],
-                      output,
-                      entry["case"],
-                  )
-                  result = results[(entry["mode"], entry["case"])]
-                  for metric, evidence in entry["metrics"].items():
-                      confirmation = paired_benchmark.paired_median_change_percent(
-                          result, GETTERS[metric]
-                      )
-                      evidence["confirmation_change_percent"] = confirmation
-                      evidence["reproduced"] = (
-                          paired_benchmark.isolated_regression_reproduced(
-                              evidence["initial_change_percent"],
-                              confirmation,
-                              evidence["limit_percent"],
-                          )
-                      )
-              except Exception as error:
-                  entry["error"] = str(error)
-                  write_plan()
-                  raise
-              write_plan()
-
-          print(json.dumps(plan, indent=2, sort_keys=True))
-          PY
-
-      - name: Summarize paired comparisons
-        if: always()
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import json
-          import statistics
-          import sys
-          from pathlib import Path
-
-          sys.path.insert(0, "candidate/tools")
-          import paired_benchmark
-
-          summary = {"system": {}, "modes": {}, "complete": True}
-          for mode in ("default", "one"):
-              path = Path(f"short-{mode}.json")
-              if not path.is_file():
-                  summary["complete"] = False
-                  summary["modes"][mode] = {
-                      "missing": [str(path)]
-                  }
-                  continue
-              document = json.loads(path.read_text(encoding="utf-8"))
-              if not document["passed"]:
-                  summary["complete"] = False
-              if not summary["system"]:
-                  summary["system"] = document["system"]
-              rows = {}
-              for result in document["results"]:
-                  case_id = result["id"]
-                  baseline = result["baseline_samples"]
-                  candidate = result["candidate_samples"]
-                  row = {"samples_per_binary": len(baseline), "metrics": {}}
-                  for metric in ("wall_seconds", "peak_rss_bytes"):
-                      # Each sample already records its process peak. Use the
-                      # median across repeated processes so one hosted-runner
-                      # accounting spike cannot masquerade as a persistent
-                      # allocation regression.
-                      reducer = statistics.median
-                      base_value = reducer(sample[metric] for sample in baseline)
-                      candidate_value = reducer(sample[metric] for sample in candidate)
-                      row["metrics"][metric] = {
-                          "baseline": base_value,
-                          "candidate": candidate_value,
-                          "change_percent": (candidate_value / base_value - 1.0) * 100.0,
-                      }
-                  row["metrics"]["wall_seconds"]["pooled_change_percent"] = row[
-                      "metrics"
-                  ]["wall_seconds"]["change_percent"]
-                  row["metrics"]["wall_seconds"]["change_percent"] = (
-                      paired_benchmark.paired_median_change_percent(
-                          result, lambda sample: sample["wall_seconds"]
-                      )
-                  )
-                  base_cpu = statistics.median(
-                      sample["user_cpu_seconds"] + sample["system_cpu_seconds"]
-                      for sample in baseline
-                  )
-                  candidate_cpu = statistics.median(
-                      sample["user_cpu_seconds"] + sample["system_cpu_seconds"]
-                      for sample in candidate
-                  )
-                  row["metrics"]["total_cpu_seconds"] = {
-                      "baseline": base_cpu,
-                      "candidate": candidate_cpu,
-                      "change_percent": (candidate_cpu / base_cpu - 1.0) * 100.0,
-                  }
-                  row["metrics"]["total_cpu_seconds"]["pooled_change_percent"] = row[
-                      "metrics"
-                  ]["total_cpu_seconds"]["change_percent"]
-                  row["metrics"]["total_cpu_seconds"]["change_percent"] = (
-                      paired_benchmark.paired_median_change_percent(
-                          result,
-                          lambda sample: sample["user_cpu_seconds"]
-                          + sample["system_cpu_seconds"],
-                      )
-                  )
-                  rows[case_id] = row
-              summary["modes"][mode] = rows
-
-          confirmation_path = Path("pcm-spool-buffer-confirmations.json")
-          if confirmation_path.is_file():
-              summary["confirmations"] = json.loads(
-                  confirmation_path.read_text(encoding="utf-8")
-              )
-
-          Path("pcm-spool-buffer-summary.json").write_text(
-              json.dumps(summary, indent=2) + "\n",
-              encoding="utf-8",
-          )
-          print(json.dumps(summary, indent=2))
-          with Path("pcm-spool-buffer-summary.md").open("w", encoding="utf-8") as output:
-              output.write("## PCM spool and analysis pipeline benchmark\n\n")
-              if not summary["complete"]:
-                  output.write("Benchmark evidence is incomplete.\n")
-              for mode, cases in summary["modes"].items():
-                  if "missing" in cases:
-                      output.write(f"\n`{mode}` missing: {', '.join(cases['missing'])}\n")
-                      continue
-                  output.write(f"\n### {mode}\n\n")
-                  output.write("| Case | Samples | Wall | CPU | RSS |\n")
-                  output.write("|---|---:|---:|---:|---:|\n")
-                  for case_id, row in cases.items():
-                      metrics = row["metrics"]
-                      output.write(
-                          f"| {case_id} | {row['samples_per_binary']} "
-                          f"| {metrics['wall_seconds']['change_percent']:+.3f}% "
-                          f"| {metrics['total_cpu_seconds']['change_percent']:+.3f}% "
-                          f"| {metrics['peak_rss_bytes']['change_percent']:+.3f}% |\n"
-                      )
-              confirmations = summary.get("confirmations", {}).get("populations", [])
-              full_confirmations = summary.get("confirmations", {}).get(
-                  "full_populations", {}
-              )
-              reused_confirmations = [
-                  evidence
-                  for population in full_confirmations.values()
-                  for evidence in population.get("reused_isolated_tripwires", [])
-              ]
-              output.write("\n### Independent aggregate confirmations\n\n")
-              if not full_confirmations:
-                  output.write("No full confirmation population was required.\n")
-              else:
-                  output.write(
-                      "| Length | Metric | Initial | Confirmation | Limit |\n"
-                  )
-                  output.write("|---|---|---:|---:|---:|\n")
-                  for length, population in full_confirmations.items():
-                      for metric, evidence in population["metrics"].items():
-                          confirmation = evidence.get("confirmation_change_percent")
-                          confirmation_text = (
-                              f"{confirmation:+.3f}%"
-                              if confirmation is not None
-                              else "missing"
-                          )
-                          output.write(
-                              f"| {length} | {metric} "
-                              f"| {evidence['initial_change_percent']:+.3f}% "
-                              f"| {confirmation_text} "
-                              f"| {evidence['limit_percent']:.3f}% |\n"
-                          )
-              output.write("\n### Independent isolated-tripwire confirmations\n\n")
-              if not confirmations and not reused_confirmations:
-                  output.write("No confirmation population was required.\n")
-              else:
-                  output.write(
-                      "| Length | Mode | Case | Metric | Population | Initial "
-                      "| Confirmation | Limit |\n"
-                  )
-                  output.write("|---|---|---|---|---|---:|---:|---:|\n")
-                  for population in confirmations:
-                      for metric, evidence in population["metrics"].items():
-                          confirmation = evidence.get("confirmation_change_percent")
-                          confirmation_text = (
-                              f"{confirmation:+.3f}%"
-                              if confirmation is not None
-                              else "missing"
-                          )
-                          output.write(
-                              f"| {population['length']} | {population['mode']} "
-                              f"| {population['case']} | {metric} "
-                              "| case-only "
-                              f"| {evidence['initial_change_percent']:+.3f}% "
-                              f"| {confirmation_text} "
-                              f"| {evidence['limit_percent']:.3f}% |\n"
-                          )
-                  for evidence in reused_confirmations:
-                      confirmation = evidence.get("confirmation_change_percent")
-                      confirmation_text = (
-                          f"{confirmation:+.3f}%"
-                          if confirmation is not None
-                          else "missing"
-                      )
-                      output.write(
-                          f"| {evidence['length']} | {evidence['mode']} "
-                          f"| {evidence['case']} | {evidence['metric']} "
-                          "| full aggregate reuse "
-                          f"| {evidence['initial_change_percent']:+.3f}% "
-                          f"| {confirmation_text} "
-                          f"| {evidence['limit_percent']:.3f}% |\n"
-                      )
-          PY
+          test "$(git -C baseline rev-parse HEAD)" = "${BASE_SHA}"
+          test "$(git -C candidate rev-parse HEAD)" = "${HEAD_SHA}"
+          test "${RUNNER_ARCH}" = "${{ matrix.arch }}"
+          python3 candidate/tools/pcm_benchmark_gate.py plan \
+            --initial-dir . \
+            --baseline-root baseline \
+            --candidate-root candidate \
+            --base-sha "${BASE_SHA}" \
+            --head-sha "${HEAD_SHA}" \
+            --runner-os "${RUNNER_OS}" \
+            --runner-arch "${RUNNER_ARCH}" \
+            --output pcm-spool-buffer-fresh-plan.json \
+            --summary-json pcm-spool-buffer-summary.json \
+            --summary-markdown pcm-spool-buffer-summary.md
           cat pcm-spool-buffer-summary.md >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Upload benchmark evidence
+      - name: Upload initial benchmark evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
-          name: pcm-spool-buffer-${{ matrix.os }}-${{ runner.arch }}
+          name: pcm-spool-buffer-initial-${{ matrix.os }}-${{ matrix.arch }}
           path: |
             short-*.json
             long-*.json
-            confirmation-*.json
-            pcm-spool-buffer-confirmations.json
+            pcm-spool-buffer-fresh-plan.json
             pcm-spool-buffer-summary.json
             pcm-spool-buffer-summary.md
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Enforce performance and memory gates
+      - name: Enforce initial-runner memory gates
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 candidate/tools/pcm_benchmark_gate.py enforce-initial \
+            --plan pcm-spool-buffer-fresh-plan.json \
+            --initial-dir . \
+            --baseline-root baseline \
+            --candidate-root candidate \
+            --base-sha "${BASE_SHA}" \
+            --head-sha "${HEAD_SHA}" \
+            --runner-os "${RUNNER_OS}" \
+            --runner-arch "${RUNNER_ARCH}"
+
+  fresh:
+    # Use a workflow-specific final check name so it cannot be confused with
+    # another benchmark workflow if branch protection is expanded later. The
+    # initial job remains an immediate, non-confirmed RSS gate and a producer
+    # of SHA-bound raw evidence.
+    name: PCM spool benchmark (${{ matrix.os }})
+    needs: initial
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: X64
+          - os: macos-latest
+            arch: ARM64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+
+      - name: Check out exact pull-request base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: baseline
+
+      - name: Download initial benchmark evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: pcm-spool-buffer-initial-${{ matrix.os }}-${{ matrix.arch }}
+          path: initial-evidence
+
+      - name: Validate bound confirmation plan
+        id: plan
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C baseline rev-parse HEAD)" = "${BASE_SHA}"
+          test "$(git -C candidate rev-parse HEAD)" = "${HEAD_SHA}"
+          test "${RUNNER_ARCH}" = "${{ matrix.arch }}"
+          python3 candidate/tools/pcm_benchmark_gate.py validate-plan \
+            --plan initial-evidence/pcm-spool-buffer-fresh-plan.json \
+            --initial-dir initial-evidence \
+            --baseline-root baseline \
+            --candidate-root candidate \
+            --base-sha "${BASE_SHA}" \
+            --head-sha "${HEAD_SHA}" \
+            --runner-os "${RUNNER_OS}" \
+            --runner-arch "${RUNNER_ARCH}" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Install Rust 1.97.0 for requested confirmation
+        if: steps.plan.outputs.required == 'true'
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+
+      - name: Install ffmpeg for requested confirmation
+        if: steps.plan.outputs.required == 'true'
         shell: bash
         run: |
-          python3 - <<'PY'
-          import json
-          import math
-          import statistics
-          import sys
-          import tomllib
-          from pathlib import Path
+          set -euo pipefail
+          if [[ "${RUNNER_OS}" == "Linux" ]]; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends ffmpeg
+          elif ! command -v ffmpeg >/dev/null; then
+            brew install ffmpeg
+          fi
+          ffmpeg -version | head -n 1
 
-          sys.path.insert(0, "candidate/tools")
-          import paired_benchmark
+      - name: Build exact baseline and candidate for requested confirmation
+        if: steps.plan.outputs.required == 'true'
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "0"
+          RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-Ctarget-feature=+neon,+aes,+sha2' || '-Ctarget-cpu=native' }}
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/target-baseline" \
+            cargo build --locked --release --manifest-path baseline/Cargo.toml \
+              --no-default-features --bin forge --bin forge-container-qc
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/target-candidate" \
+            cargo build --locked --release --manifest-path candidate/Cargo.toml \
+              --no-default-features --bin forge --bin forge-container-qc
 
-          summary = json.loads(
-              Path("pcm-spool-buffer-summary.json").read_text(encoding="utf-8")
-          )
-          assert summary["complete"], summary
-          def measurement_revision(root):
-              prefix = 'pub const MEASUREMENT_ALGORITHM_REVISION: &str = "'
-              for line in (root / "src/bound_analysis.rs").read_text(
-                  encoding="utf-8"
-              ).splitlines():
-                  if line.startswith(prefix) and line.endswith('";'):
-                      return line[len(prefix):-2]
-              raise AssertionError(f"missing measurement revision in {root}")
+      - name: Run requested fresh-runner confirmations
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          ffmpeg_path="$(command -v ffmpeg || command -v false)"
+          python3 candidate/tools/pcm_benchmark_gate.py run-confirmations \
+            --plan initial-evidence/pcm-spool-buffer-fresh-plan.json \
+            --initial-dir initial-evidence \
+            --baseline-root baseline \
+            --candidate-root candidate \
+            --base-sha "${BASE_SHA}" \
+            --head-sha "${HEAD_SHA}" \
+            --runner-os "${RUNNER_OS}" \
+            --runner-arch "${RUNNER_ARCH}" \
+            --paired-script candidate/tools/paired_benchmark.py \
+            --baseline-forge "${RUNNER_TEMP}/target-baseline/release/forge" \
+            --candidate-forge "${RUNNER_TEMP}/target-candidate/release/forge" \
+            --ffmpeg "${ffmpeg_path}" \
+            --work-dir "${RUNNER_TEMP}/pcm-fresh-confirmation" \
+            --confirmation-dir fresh-evidence \
+            --evidence-output fresh-evidence/pcm-spool-buffer-fresh-confirmation.json \
+            --summary-markdown fresh-evidence/pcm-spool-buffer-fresh-confirmation.md
 
-          measurement_migration = (
-              measurement_revision(Path("baseline")) == "forge-bs1770-5-r3"
-              and measurement_revision(Path("candidate")) == "forge-bs1770-5-r4"
-          )
-          def package_version(root):
-              with (root / "Cargo.toml").open("rb") as source:
-                  return tomllib.load(source)["package"]["version"]
-
-          durability_migration = (
-              package_version(Path("baseline")) == "0.189.5"
-              and package_version(Path("candidate")) == "0.189.6"
-          )
-          control_cpu_limit = (
-              8.0 if measurement_migration else 5.0 if durability_migration else 4.0
-          )
-          resample_wall_limit = (
-              8.0 if measurement_migration else 5.0 if durability_migration else 4.0
-          )
-          resample_cpu_limit = (
-              8.0 if measurement_migration else 4.0 if durability_migration else 3.0
-          )
-          average_limit = (
-              5.0 if measurement_migration else 2.0 if durability_migration else 1.0
-          )
-          wall_changes = []
-          cpu_changes = []
-          isolated_checks = {}
-
-          def record_isolated(mode, case, metric, change, limit):
-              key = (mode, case, metric)
-              previous = isolated_checks.get(key)
-              if previous is None or limit < previous[1]:
-                  isolated_checks[key] = (change, limit)
-
-          for mode in ("default", "one"):
-              for case_id, row in summary["modes"][mode].items():
-                  assert row["samples_per_binary"] == 16, (
-                      mode,
-                      case_id,
-                      "samples per binary",
-                      row["samples_per_binary"],
-                  )
-                  metrics = row["metrics"]
-                  wall = metrics["wall_seconds"]["change_percent"]
-                  cpu = metrics["total_cpu_seconds"]["change_percent"]
-                  pooled_wall = metrics["wall_seconds"]["pooled_change_percent"]
-                  pooled_cpu = metrics["total_cpu_seconds"]["pooled_change_percent"]
-                  rss = metrics["peak_rss_bytes"]
-                  rss_delta = rss["candidate"] - rss["baseline"]
-                  # The balanced-block statistic is authoritative. Retain
-                  # separately pooled medians only as broad tripwires for a
-                  # gross regression that somehow affects every unpaired
-                  # sample while escaping the round-paired comparisons.
-                  record_isolated(mode, case_id, "wall", wall, 10.0)
-                  record_isolated(mode, case_id, "cpu", cpu, 8.0)
-                  assert pooled_wall <= 20.0, (
-                      mode,
-                      case_id,
-                      "pooled wall",
-                      pooled_wall,
-                  )
-                  assert pooled_cpu <= 20.0, (
-                      mode,
-                      case_id,
-                      "pooled CPU",
-                      pooled_cpu,
-                  )
-                  assert rss_delta <= 4 * 1024 * 1024, (
-                      mode,
-                      case_id,
-                      "RSS delta",
-                      rss_delta,
-                  )
-                  wall_changes.append(wall)
-                  cpu_changes.append(cpu)
-          assert len(wall_changes) == 4, wall_changes
-          assert len(cpu_changes) == 4, cpu_changes
-          average_wall = statistics.fmean(wall_changes)
-          average_cpu = statistics.fmean(cpu_changes)
-          for mode in ("default", "one"):
-              control = summary["modes"][mode]["flac-stereo-normalize"]["metrics"]
-              # An unchanged Apple Silicon control measured +3.228% CPU while
-              # its paired modes and the four-case aggregate stayed neutral.
-              # Keep a narrow 4% isolated ceiling and the 1% aggregate gate.
-              record_isolated(
-                  mode,
-                  "flac-stereo-normalize",
-                  "cpu",
-                  control["total_cpu_seconds"]["change_percent"],
-                  control_cpu_limit,
-              )
-          isolated_resample = summary["modes"]["one"][
-              "wav-stereo-resample-normalize"
-          ]["metrics"]
-          # Both sides of later pull-request comparisons already contain the
-          # v0.171 resampler/capture optimization. Keep this as a tight
-          # regression sentinel instead of requiring every unrelated change
-          # to reproduce that feature's original speedup.
-          # A no-runtime-change Apple comparison measured +3.478% in this
-          # isolated short wall sample while the four-case wall average was
-          # +0.410% and the over-budget average was -2.087%. Use the same
-          # narrow 4% jitter envelope as the unchanged-path CPU control.
-          record_isolated(
-              "one",
-              "wav-stereo-resample-normalize",
-              "wall",
-              isolated_resample["wall_seconds"]["change_percent"],
-              resample_wall_limit,
-          )
-          record_isolated(
-              "one",
-              "wav-stereo-resample-normalize",
-              "cpu",
-              isolated_resample["total_cpu_seconds"]["change_percent"],
-              resample_cpu_limit,
-          )
-          # v0.189.5 budgets at most 5% on average for the one-time stable
-          # accumulation migration. v0.189.6 permits at most 2% while adding
-          # durable directory publication; all later comparisons return to 1%.
-          # Individual tripwires still reject concentrated regressions.
-          getters = {
-              "wall": lambda sample: sample["wall_seconds"],
-              "cpu": lambda sample: sample["user_cpu_seconds"]
-              + sample["system_cpu_seconds"],
-          }
-          assert math.isfinite(average_wall), average_wall
-          assert math.isfinite(average_cpu), average_cpu
-
-          def load_full_confirmation():
-              results = {}
-              for mode in ("default", "one"):
-                  path = Path(f"confirmation-full-short-{mode}.json")
-                  document = json.loads(path.read_text(encoding="utf-8"))
-                  assert document["passed"], (path, document["error"])
-                  assert document["configuration"] == {
-                      "duration_seconds": 300,
-                      "rounds": 8,
-                      "samples_per_binary": 16,
-                      "cases": list(paired_benchmark.CASES),
-                  }, (path, document["configuration"])
-                  assert [result["id"] for result in document["results"]] == list(
-                      paired_benchmark.CASES
-                  ), (path, document["results"])
-                  for result in document["results"]:
-                      case_id = result["id"]
-                      assert result["samples_per_binary"] == 16, (path, case_id)
-                      assert len(result["baseline_samples"]) == 16, (path, case_id)
-                      assert len(result["candidate_samples"]) == 16, (path, case_id)
-                      assert result["schedule"] == (
-                          paired_benchmark.alternating_schedule(
-                              8,
-                              inverted=(
-                                  paired_benchmark.CASES.index(case_id) % 2 == 1
-                              ),
-                          )
-                      ), (path, case_id, "unbalanced full confirmation schedule")
-                      results[(mode, case_id)] = result
-              assert len(results) == 4, results.keys()
-              return results
-
-          full_results = None
-          if average_wall > average_limit or average_cpu > average_limit:
-              full_results = load_full_confirmation()
-              confirmation_aggregates = {}
-              for metric, getter in getters.items():
-                  values = [
-                      paired_benchmark.paired_median_change_percent(result, getter)
-                      for result in full_results.values()
-                  ]
-                  assert len(values) == 4, (metric, values)
-                  assert all(math.isfinite(value) for value in values), (
-                      metric,
-                      values,
-                  )
-                  confirmation_aggregates[metric] = statistics.fmean(values)
-              for metric, initial in (
-                  ("wall", average_wall),
-                  ("cpu", average_cpu),
-              ):
-                  if initial <= average_limit:
-                      continue
-                  confirmation = confirmation_aggregates[metric]
-                  assert not paired_benchmark.regression_reproduced(
-                      initial, confirmation, average_limit
-                  ), (
-                      f"average {metric} regression reproduced",
-                      initial,
-                      confirmation,
-                      average_limit,
-                  )
-                  print(
-                      f"average {metric}: initial {initial:+.3f}%, "
-                      f"confirmation {confirmation:+.3f}%, "
-                      f"limit {average_limit:.3f}%"
-                  )
-
-          for (mode, case_id, metric), (initial, limit) in isolated_checks.items():
-              if initial <= limit:
-                  continue
-              if full_results is None:
-                  path = Path(f"confirmation-short-{mode}-{case_id}.json")
-                  document = json.loads(path.read_text(encoding="utf-8"))
-                  assert document["passed"], (path, document["error"])
-                  assert document["configuration"] == {
-                      "duration_seconds": 300,
-                      "rounds": 8,
-                      "samples_per_binary": 16,
-                      "cases": [case_id],
-                  }, (path, document["configuration"])
-                  assert len(document["results"]) == 1, (
-                      path,
-                      document["results"],
-                  )
-                  result = document["results"][0]
-                  assert result["id"] == case_id, (path, result["id"])
-                  assert len(result["baseline_samples"]) == 16, (path, case_id)
-                  assert len(result["candidate_samples"]) == 16, (path, case_id)
-                  assert result["schedule"] == (
-                      paired_benchmark.alternating_schedule(
-                          8,
-                          inverted=(
-                              paired_benchmark.CASES.index(case_id) % 2 == 1
-                          ),
-                      )
-                  ), (path, "unbalanced confirmation schedule")
-              else:
-                  result = full_results[(mode, case_id)]
-              confirmation = paired_benchmark.paired_median_change_percent(
-                  result, getters[metric]
-              )
-              assert math.isfinite(confirmation), (mode, case_id, metric)
-              assert not paired_benchmark.isolated_regression_reproduced(
-                  initial, confirmation, limit
-              ), (
-                  mode,
-                  case_id,
-                  metric,
-                  "isolated regression reproduced",
-                  initial,
-                  confirmation,
-                  limit,
-              )
-              print(
-                  f"isolated {mode}/{case_id}/{metric}: "
-                  f"initial {initial:+.3f}%, confirmation {confirmation:+.3f}%, "
-                  f"limit {limit:.3f}%"
-              )
-          if measurement_migration:
-              print("applied one-time r3 -> r4 measurement migration limits")
-          if durability_migration:
-              print("applied one-time v0.189.5 -> v0.189.6 durability limits")
-          print(f"average wall change: {average_wall:+.3f}%")
-          print(f"average CPU change: {average_cpu:+.3f}%")
-          PY
-
-      - name: Enforce over-budget regression gates
+      - name: Summarize fresh-runner confirmation
+        if: always()
         shell: bash
         run: |
-          python3 - <<'PY'
-          import json
-          import math
-          import statistics
-          import sys
-          import tomllib
-          from pathlib import Path
+          set -euo pipefail
+          summary="fresh-evidence/pcm-spool-buffer-fresh-confirmation.md"
+          if [[ -f "${summary}" ]]; then
+            cat "${summary}" >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "Fresh-runner confirmation evidence is missing." \
+              >> "${GITHUB_STEP_SUMMARY}"
+          fi
 
-          sys.path.insert(0, "candidate/tools")
-          import paired_benchmark
+      - name: Upload fresh-runner confirmation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: pcm-spool-buffer-fresh-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            initial-evidence/pcm-spool-buffer-fresh-plan.json
+            fresh-evidence/*.json
+            fresh-evidence/*.md
+          if-no-files-found: warn
+          retention-days: 30
 
-          def measurement_revision(root):
-              prefix = 'pub const MEASUREMENT_ALGORITHM_REVISION: &str = "'
-              for line in (root / "src/bound_analysis.rs").read_text(
-                  encoding="utf-8"
-              ).splitlines():
-                  if line.startswith(prefix) and line.endswith('";'):
-                      return line[len(prefix):-2]
-              raise AssertionError(f"missing measurement revision in {root}")
-
-          measurement_migration = (
-              measurement_revision(Path("baseline")) == "forge-bs1770-5-r3"
-              and measurement_revision(Path("candidate")) == "forge-bs1770-5-r4"
-          )
-          def package_version(root):
-              with (root / "Cargo.toml").open("rb") as source:
-                  return tomllib.load(source)["package"]["version"]
-
-          durability_migration = (
-              package_version(Path("baseline")) == "0.189.5"
-              and package_version(Path("candidate")) == "0.189.6"
-          )
-          # Durable publication adds an output-file sync and a parent-directory
-          # sync. Those fixed-cost operations are visible in an isolated wall
-          # sample, while the eight-value aggregate remains tightly bounded.
-          isolated_limit = (
-              8.0 if measurement_migration or durability_migration else 5.0
-          )
-          average_limit = 5.0 if measurement_migration else 3.0
-          pooled_limit = 20.0 if measurement_migration else 15.0
-          changes = []
-          isolated_checks = {}
-          getters = {
-              "wall": lambda sample: sample["wall_seconds"],
-              "cpu": lambda sample: sample["user_cpu_seconds"]
-              + sample["system_cpu_seconds"],
-          }
-          for mode in ("default", "one"):
-              path = Path(f"long-{mode}.json")
-              document = json.loads(path.read_text(encoding="utf-8"))
-              assert document["passed"], (mode, document["error"])
-              for result in document["results"]:
-                  case_id = result["id"]
-                  baseline = result["baseline_samples"]
-                  candidate = result["candidate_samples"]
-                  assert len(baseline) == 16, (mode, case_id, "baseline samples")
-                  assert len(candidate) == 16, (mode, case_id, "candidate samples")
-                  for metric, getter in getters.items():
-                      base_value = statistics.median(map(getter, baseline))
-                      candidate_value = statistics.median(map(getter, candidate))
-                      pooled_change = (candidate_value / base_value - 1.0) * 100.0
-                      change = paired_benchmark.paired_median_change_percent(
-                          result, getter
-                      )
-                      assert pooled_change <= pooled_limit, (
-                          mode,
-                          case_id,
-                          f"pooled {metric}",
-                          pooled_change,
-                      )
-                      changes.append(change)
-                      isolated_checks[(mode, case_id, metric)] = change
-                  baseline_rss = [sample["peak_rss_bytes"] for sample in baseline]
-                  candidate_rss = [sample["peak_rss_bytes"] for sample in candidate]
-                  baseline_rss_median = statistics.median(baseline_rss)
-                  rss_delta = (
-                      statistics.median(candidate_rss) - baseline_rss_median
-                  )
-                  assert rss_delta <= 4 * 1024 * 1024, (
-                      mode,
-                      case_id,
-                      "median RSS delta",
-                      rss_delta,
-                  )
-                  gross_rss_samples = sum(
-                      value > baseline_rss_median + 132 * 1024 * 1024
-                      for value in candidate_rss
-                  )
-                  assert gross_rss_samples <= 1, (
-                      mode,
-                      case_id,
-                      "repeated gross RSS samples",
-                      gross_rss_samples,
-                  )
-          assert len(changes) == 8, changes
-          average = statistics.fmean(changes)
-          assert math.isfinite(average), average
-
-          def load_full_confirmation():
-              results = {}
-              for mode in ("default", "one"):
-                  path = Path(f"confirmation-full-long-{mode}.json")
-                  document = json.loads(path.read_text(encoding="utf-8"))
-                  assert document["passed"], (path, document["error"])
-                  assert document["configuration"] == {
-                      "duration_seconds": 600,
-                      "rounds": 8,
-                      "samples_per_binary": 16,
-                      "cases": list(paired_benchmark.CASES),
-                  }, (path, document["configuration"])
-                  assert [result["id"] for result in document["results"]] == list(
-                      paired_benchmark.CASES
-                  ), (path, document["results"])
-                  for result in document["results"]:
-                      case_id = result["id"]
-                      assert result["samples_per_binary"] == 16, (path, case_id)
-                      assert len(result["baseline_samples"]) == 16, (path, case_id)
-                      assert len(result["candidate_samples"]) == 16, (path, case_id)
-                      assert result["schedule"] == (
-                          paired_benchmark.alternating_schedule(
-                              8,
-                              inverted=(
-                                  paired_benchmark.CASES.index(case_id) % 2 == 1
-                              ),
-                          )
-                      ), (path, case_id, "unbalanced full confirmation schedule")
-                      results[(mode, case_id)] = result
-              assert len(results) == 4, results.keys()
-              return results
-
-          full_results = None
-          if average > average_limit:
-              full_results = load_full_confirmation()
-              confirmation_changes = [
-                  paired_benchmark.paired_median_change_percent(result, getter)
-                  for (mode, case_id), result in full_results.items()
-                  for getter in getters.values()
-              ]
-              assert len(confirmation_changes) == 8, confirmation_changes
-              assert all(
-                  math.isfinite(value) for value in confirmation_changes
-              ), confirmation_changes
-              confirmation_average = statistics.fmean(confirmation_changes)
-              assert not paired_benchmark.regression_reproduced(
-                  average, confirmation_average, average_limit
-              ), (
-                  "over-budget average regression reproduced",
-                  average,
-                  confirmation_average,
-                  average_limit,
-              )
-              print(
-                  f"over-budget average: initial {average:+.3f}%, "
-                  f"confirmation {confirmation_average:+.3f}%, "
-                  f"limit {average_limit:.3f}%"
-              )
-
-          for (mode, case_id, metric), initial in isolated_checks.items():
-              if initial <= isolated_limit:
-                  continue
-              if full_results is None:
-                  path = Path(f"confirmation-long-{mode}-{case_id}.json")
-                  document = json.loads(path.read_text(encoding="utf-8"))
-                  assert document["passed"], (path, document["error"])
-                  assert document["configuration"] == {
-                      "duration_seconds": 600,
-                      "rounds": 8,
-                      "samples_per_binary": 16,
-                      "cases": [case_id],
-                  }, (path, document["configuration"])
-                  assert len(document["results"]) == 1, (
-                      path,
-                      document["results"],
-                  )
-                  result = document["results"][0]
-                  assert result["id"] == case_id, (path, result["id"])
-                  assert len(result["baseline_samples"]) == 16, (path, case_id)
-                  assert len(result["candidate_samples"]) == 16, (path, case_id)
-                  assert result["schedule"] == (
-                      paired_benchmark.alternating_schedule(
-                          8,
-                          inverted=(
-                              paired_benchmark.CASES.index(case_id) % 2 == 1
-                          ),
-                      )
-                  ), (path, "unbalanced confirmation schedule")
-              else:
-                  result = full_results[(mode, case_id)]
-              confirmation = paired_benchmark.paired_median_change_percent(
-                  result, getters[metric]
-              )
-              assert math.isfinite(confirmation), (mode, case_id, metric)
-              assert not paired_benchmark.isolated_regression_reproduced(
-                  initial, confirmation, isolated_limit
-              ), (
-                  mode,
-                  case_id,
-                  metric,
-                  "isolated over-budget regression reproduced",
-                  initial,
-                  confirmation,
-                  isolated_limit,
-              )
-              print(
-                  f"isolated long {mode}/{case_id}/{metric}: "
-                  f"initial {initial:+.3f}%, confirmation {confirmation:+.3f}%, "
-                  f"limit {isolated_limit:.3f}%"
-              )
-          if measurement_migration:
-              print("applied one-time r3 -> r4 measurement migration limits")
-          if durability_migration:
-              print("applied one-time v0.189.5 -> v0.189.6 durability limits")
-          print(f"over-budget wall/CPU average change: {average:+.3f}%")
-          PY
+      - name: Enforce fresh-runner timing gates
+        if: always()
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 candidate/tools/pcm_benchmark_gate.py enforce-fresh \
+            --plan initial-evidence/pcm-spool-buffer-fresh-plan.json \
+            --initial-dir initial-evidence \
+            --baseline-root baseline \
+            --candidate-root candidate \
+            --base-sha "${BASE_SHA}" \
+            --head-sha "${HEAD_SHA}" \
+            --runner-os "${RUNNER_OS}" \
+            --runner-arch "${RUNNER_ARCH}" \
+            --confirmation-dir fresh-evidence \
+            --evidence fresh-evidence/pcm-spool-buffer-fresh-confirmation.json

@@ -414,6 +414,7 @@ def main() -> int:
         },
         "configuration": {
             "duration_seconds": args.duration_seconds,
+            "warmup_rounds": WARMUP_ROUNDS,
             "rounds": args.rounds,
             "samples_per_binary": args.rounds * 2,
             "cases": cases,
