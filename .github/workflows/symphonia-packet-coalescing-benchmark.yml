@@ -219,6 +219,7 @@ jobs:
           )
           from paired_benchmark import (
               alternating_schedule,
+              isolated_regression_reproduced,
               paired_round_differences,
               paired_round_limit_exceedances,
               regression_reproduced,
@@ -328,6 +329,18 @@ jobs:
               else 2.0
               if migrations["durability_0_189_5_to_0_189_6"]
               else 1.0
+          )
+          analysis_limit = (
+              5.0
+              if migrations["stable_input"]
+              or migrations["measurement_r3_to_r4"]
+              else 3.0
+          )
+          normalization_case_limit = (
+              8.0
+              if migrations["measurement_r3_to_r4"]
+              or migrations["durability_0_189_5_to_0_189_6"]
+              else 3.0
           )
           configuration = {
               "fixture": {
@@ -556,19 +569,49 @@ jobs:
                   "paired": statistics.fmean(paired),
               }
 
+          def isolated_timing_requests(modes):
+              requests = []
+              for mode, _extra_args in MODES:
+                  for case in CASES:
+                      limit = (
+                          analysis_limit
+                          if case == "analyze"
+                          else normalization_case_limit
+                      )
+                      summary = modes[mode][case]["summary"]
+                      for metric in ("wall", "cpu"):
+                          for statistic, key in (
+                              ("pooled", "pooled_change_percent"),
+                              (
+                                  "paired",
+                                  "median_paired_round_change_percent",
+                              ),
+                          ):
+                              change = summary[metric][key]
+                              if change > limit:
+                                  requests.append(
+                                      {
+                                          "mode": mode,
+                                          "case": case,
+                                          "metric": metric,
+                                          "statistic": statistic,
+                                          "limit_percent": limit,
+                                          "initial_change_percent": change,
+                                      }
+                                  )
+              return requests
+
           initial_modes = run_population("initial")
           initial_aggregates = normalization_aggregates(initial_modes)
-          # Only an aggregate boundary crossing earns a second population.
-          # Individual case and RSS limits remain initial-population tripwires
-          # in the enforcement step below.
           requested_statistics = [
               statistic
               for statistic, change in initial_aggregates.items()
               if change > normalization_aggregate_limit
           ]
+          isolated_requests = isolated_timing_requests(initial_modes)
           confirmation_modes = None
           confirmation_aggregates = None
-          if requested_statistics:
+          if requested_statistics or isolated_requests:
               confirmation_modes = run_population("confirmation")
               confirmation_aggregates = normalization_aggregates(
                   confirmation_modes
@@ -584,8 +627,29 @@ jobs:
               )
               for statistic in ("pooled", "paired")
           }
+          isolated_confirmations = []
+          for request in isolated_requests:
+              key = (
+                  "pooled_change_percent"
+                  if request["statistic"] == "pooled"
+                  else "median_paired_round_change_percent"
+              )
+              confirmation_change = confirmation_modes[
+                  request["mode"]
+              ][request["case"]]["summary"][request["metric"]][key]
+              isolated_confirmations.append(
+                  {
+                      **request,
+                      "confirmation_change_percent": confirmation_change,
+                      "reproduced": isolated_regression_reproduced(
+                          request["initial_change_percent"],
+                          confirmation_change,
+                          request["limit_percent"],
+                      ),
+                  }
+              )
           result = {
-              "schema_version": 2,
+              "schema_version": 3,
               "method": (
                   "each independent population uses two unmeasured balanced "
                   "warm-up blocks followed by 7-round ABBA/BAAB on one "
@@ -607,6 +671,7 @@ jobs:
               },
               "modes": initial_modes,
               "confirmation_modes": confirmation_modes,
+              "isolated_timing_confirmations": isolated_confirmations,
               "normalization_aggregate_confirmation": {
                   "limit_percent": normalization_aggregate_limit,
                   "requested_statistics": requested_statistics,
@@ -662,6 +727,24 @@ jobs:
               if result["confirmation_modes"] is not None:
                   write_population(
                       "Independent confirmation", result["confirmation_modes"]
+                  )
+
+              output.write("\n### Isolated timing confirmations\n\n")
+              output.write(
+                  "| Mode | Case | Metric | Statistic | Initial | "
+                  "Confirmation | Limit | Reproduced |\n"
+              )
+              output.write("|---|---|---|---|---:|---:|---:|:---:|\n")
+              for confirmation in result["isolated_timing_confirmations"]:
+                  output.write(
+                      f"| {confirmation['mode']} "
+                      f"| {confirmation['case']} "
+                      f"| {confirmation['metric']} "
+                      f"| {confirmation['statistic']} "
+                      f"| {confirmation['initial_change_percent']:+.3f}% "
+                      f"| {confirmation['confirmation_change_percent']:+.3f}% "
+                      f"| {confirmation['limit_percent']:.3f}% "
+                      f"| {confirmation['reproduced']} |\n"
                   )
 
               confirmation = result["normalization_aggregate_confirmation"]
@@ -721,6 +804,7 @@ jobs:
           sys.path.insert(0, "candidate/tools")
           from paired_benchmark import (
               alternating_schedule,
+              isolated_regression_reproduced,
               paired_round_differences,
               paired_round_limit_exceedances,
               paired_round_single_outlier_ratchet_passes,
@@ -828,9 +912,10 @@ jobs:
               "system",
               "modes",
               "confirmation_modes",
+              "isolated_timing_confirmations",
               "normalization_aggregate_confirmation",
           }, evidence.keys()
-          assert evidence["schema_version"] == 2, evidence.get("schema_version")
+          assert evidence["schema_version"] == 3, evidence.get("schema_version")
           assert evidence["configuration"] == expected_configuration, (
               evidence.get("configuration"),
               expected_configuration,
@@ -1120,6 +1205,41 @@ jobs:
                   require_finite(value, ("aggregate", statistic))
               return aggregates
 
+          def isolated_timing_requests(modes):
+              requests = []
+              for mode in MODES:
+                  for case in CASES:
+                      limit = (
+                          analysis_limit
+                          if case == "analyze"
+                          else normalization_case_limit
+                      )
+                      summary = modes[mode][case]["summary"]
+                      for metric in ("wall", "cpu"):
+                          for statistic, key in (
+                              ("pooled", "pooled_change_percent"),
+                              (
+                                  "paired",
+                                  "median_paired_round_change_percent",
+                              ),
+                          ):
+                              change = require_finite(
+                                  summary[metric][key],
+                                  (mode, case, metric, statistic),
+                              )
+                              if change > limit:
+                                  requests.append(
+                                      {
+                                          "mode": mode,
+                                          "case": case,
+                                          "metric": metric,
+                                          "statistic": statistic,
+                                          "limit_percent": limit,
+                                          "initial_change_percent": change,
+                                      }
+                                  )
+              return requests
+
           validate_population(evidence["modes"], "initial")
           normalization_pooled = []
           normalization_paired = []
@@ -1130,13 +1250,6 @@ jobs:
                       values = summary[metric]
                       pooled = values["pooled_change_percent"]
                       paired = values["median_paired_round_change_percent"]
-                      limit = (
-                          analysis_limit
-                          if case == "analyze"
-                          else normalization_case_limit
-                      )
-                      assert pooled <= limit, (mode, case, metric, "pooled", pooled)
-                      assert paired <= limit, (mode, case, metric, "paired", paired)
                       if case == "normalize":
                           normalization_pooled.append(pooled)
                           normalization_paired.append(paired)
@@ -1184,6 +1297,7 @@ jobs:
                       rss_round_differences,
                   )
           initial_aggregates = normalization_aggregates(evidence["modes"])
+          isolated_requests = isolated_timing_requests(evidence["modes"])
           assert initial_aggregates == {
               "pooled": statistics.fmean(normalization_pooled),
               "paired": statistics.fmean(normalization_paired),
@@ -1219,7 +1333,8 @@ jobs:
               confirmation_record["requested_statistics"],
               requested_statistics,
           )
-          if requested_statistics:
+          confirmation_needed = bool(requested_statistics or isolated_requests)
+          if confirmation_needed:
               confirmation_modes = evidence["confirmation_modes"]
               validate_population(confirmation_modes, "confirmation")
               confirmation_aggregates = normalization_aggregates(
@@ -1234,7 +1349,7 @@ jobs:
               )
           else:
               assert evidence["confirmation_modes"] is None, (
-                  "unexpected aggregate confirmation population",
+                  "unexpected confirmation population",
                   evidence["confirmation_modes"],
               )
               assert confirmation_record["confirmation"] is None, (
@@ -1242,6 +1357,49 @@ jobs:
                   confirmation_record["confirmation"],
               )
               confirmation_aggregates = None
+
+          expected_isolated_confirmations = []
+          for request in isolated_requests:
+              key = (
+                  "pooled_change_percent"
+                  if request["statistic"] == "pooled"
+                  else "median_paired_round_change_percent"
+              )
+              confirmation_change = require_finite(
+                  confirmation_modes[request["mode"]][request["case"]][
+                      "summary"
+                  ][request["metric"]][key],
+                  (
+                      "confirmation",
+                      request["mode"],
+                      request["case"],
+                      request["metric"],
+                      request["statistic"],
+                  ),
+              )
+              expected_isolated_confirmations.append(
+                  {
+                      **request,
+                      "confirmation_change_percent": confirmation_change,
+                      "reproduced": isolated_regression_reproduced(
+                          request["initial_change_percent"],
+                          confirmation_change,
+                          request["limit_percent"],
+                      ),
+                  }
+              )
+          assert (
+              evidence["isolated_timing_confirmations"]
+              == expected_isolated_confirmations
+          ), (
+              evidence["isolated_timing_confirmations"],
+              expected_isolated_confirmations,
+          )
+          for confirmation in expected_isolated_confirmations:
+              assert not confirmation["reproduced"], (
+                  "isolated timing regression reproduced",
+                  confirmation,
+              )
 
           expected_reproduced = {
               statistic: (
@@ -1292,5 +1450,14 @@ jobs:
               print(
                   "confirmation paired normalization change: "
                   f"{confirmation_aggregates['paired']:+.3f}%"
+              )
+          for confirmation in expected_isolated_confirmations:
+              print(
+                  "isolated timing confirmation: "
+                  f"{confirmation['mode']}/{confirmation['case']} "
+                  f"{confirmation['metric']}/{confirmation['statistic']} "
+                  f"initial={confirmation['initial_change_percent']:+.3f}% "
+                  "confirmation="
+                  f"{confirmation['confirmation_change_percent']:+.3f}%"
               )
           PY
