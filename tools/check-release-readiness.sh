@@ -5,7 +5,23 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 expected_version="${1:-}"
-python3 tools/check-workflow-pins.py
+workflow_check_python="${FORGE_WORKFLOW_CHECK_PYTHON:-python3}"
+if ! workflow_check_version="$("$workflow_check_python" -c \
+  'import importlib.metadata; print(importlib.metadata.version("PyYAML"))' \
+  2>/dev/null)"; then
+  echo "workflow structure checking requires PyYAML 6.0.3." >&2
+  echo "Create a CPython 3.12 environment and install the dedicated lock:" >&2
+  echo "  python -m pip install --require-hashes --only-binary=:all: -r tools/workflow-check-requirements.lock" >&2
+  echo "Activate it or set FORGE_WORKFLOW_CHECK_PYTHON to its Python executable." >&2
+  exit 1
+fi
+if [[ "$workflow_check_version" != "6.0.3" ]]; then
+  echo "workflow structure checking requires PyYAML 6.0.3; found $workflow_check_version." >&2
+  echo "Use CPython 3.12 and install the dedicated lock with --require-hashes and --only-binary=:all:." >&2
+  echo "Activate it or set FORGE_WORKFLOW_CHECK_PYTHON to its Python executable." >&2
+  exit 1
+fi
+"$workflow_check_python" tools/check-workflow-pins.py
 python3 tools/check-schema-registry.py
 python3 -m unittest tools/test_schema_registry.py
 IFS=$'\t' read -r version target_dir < <(

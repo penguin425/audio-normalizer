@@ -9,6 +9,10 @@ on:
       - ".cargo/config.toml"
       - ".gitattributes"
       - ".github/workflows/release.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "src/**"
       - "*.md"
       - "README.md"
       - "CHANGELOG.md"
@@ -185,6 +189,14 @@ on:
       - "NEXT-GENERATION-PLAN.md"
       - "ROADMAP.md"
       - "tools/build-python-wheel.py"
+      - "tools/check-linux-wheel-abi.py"
+      - "tools/manylinux-cmake-toolchain.cmake"
+      - "tools/python-wheel-build-requirements.lock"
+      - "tools/test_linux_wheel_abi.py"
+      - "tools/check-workflow-pins.py"
+      - "tools/test_workflow_pins.py"
+      - "tools/run-pinned-container.py"
+      - "tools/workflow-check-requirements.lock"
       - "tools/build-wasm-package.sh"
       - "tools/package-linux-release.sh"
       - "tools/package-linux-v3-release.sh"
@@ -193,9 +205,8 @@ on:
       - "tools/test_schema_registry.py"
       - "tools/generate-package-metadata.sh"
       - "tools/check-release-readiness.sh"
-      # Cargo-only dependency updates are covered by the full-feature CI jobs.
-      # Release dry-runs still run whenever packaging, public interfaces,
-      # release documentation, or release tooling changes.
+      # Rust source, dependency, and build-script changes intentionally run the
+      # Linux wheel ABI, baseline-CPU, and reproducibility release gates.
   workflow_dispatch:
 
 permissions:
@@ -218,6 +229,27 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
         with:
           fetch-depth: 0
+
+      - name: Select Python 3.12 for workflow structure checks
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the hash-locked workflow structure checker
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
+          workflow_check_root="${RUNNER_TEMP}/forge-workflow-check"
+          python3 -m venv "$workflow_check_root"
+          workflow_check_python="$workflow_check_root/bin/python"
+          "$workflow_check_python" -m pip install \
+            --disable-pip-version-check \
+            --no-cache-dir \
+            --require-hashes \
+            --only-binary=:all: \
+            -r tools/workflow-check-requirements.lock
+          echo "FORGE_WORKFLOW_CHECK_PYTHON=$workflow_check_python" >> "$GITHUB_ENV"
 
       - id: version
         name: Match tag to Cargo package version
@@ -266,6 +298,16 @@ jobs:
       - name: Validate crates.io package metadata and contents
         run: tools/check-release-readiness.sh "${{ steps.version.outputs.version }}"
 
+      - name: Test the Linux wheel release gates
+        run: |
+          "$FORGE_WORKFLOW_CHECK_PYTHON" -m unittest \
+            tools/test_workflow_pins.py tools/test_linux_wheel_abi.py
+          "$FORGE_WORKFLOW_CHECK_PYTHON" -m compileall -q \
+            tools/build-python-wheel.py \
+            tools/check-linux-wheel-abi.py \
+            tools/check-workflow-pins.py \
+            tools/run-pinned-container.py
+
   build:
     name: Build ${{ matrix.asset }}
     needs: validate
@@ -278,7 +320,6 @@ jobs:
             asset: linux-x86_64
             archive: tar
             library: libforge_normalizer.so
-            wheel-platform: manylinux_2_34_x86_64
             features: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service,cuda-truepeak
             rustflags: ""
           - runner: windows-2025
@@ -380,6 +421,7 @@ jobs:
           retention-days: 7
 
       - name: Build the self-contained Python platform wheel
+        if: matrix.asset != 'linux-x86_64'
         env:
           SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
         run: >-
@@ -390,13 +432,8 @@ jobs:
           --outdir .
           --version ${{ needs.validate.outputs.version }}
 
-      - name: Check Linux wheel policy
-        if: matrix.asset == 'linux-x86_64'
-        run: |
-          python -m pip install --disable-pip-version-check auditwheel==6.7.0
-          python -m auditwheel show forge_normalizer-*.whl
-
       - name: Install and smoke-test the platform wheel
+        if: matrix.asset != 'linux-x86_64'
         shell: bash
         run: |
           set -euo pipefail
@@ -520,6 +557,359 @@ jobs:
             forge_normalizer-${{ needs.validate.outputs.version }}-*.whl
           if-no-files-found: error
           retention-days: 7
+
+  build-linux-wheel:
+    name: Build and verify manylinux_2_34 wheel
+    needs: validate
+    runs-on: ubuntu-24.04
+    container:
+      # AlmaLinux 8 retains the x86-64-v1 baseline. The published wheel tag
+      # remains manylinux_2_34 and is set only by auditwheel below.
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+    env:
+      AUDITWHEEL: /tmp/forge-wheel-tools/bin/auditwheel
+      CARGO_HOME: /tmp/forge-cargo
+      CARGO_INCREMENTAL: "0"
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      CFLAGS: -O2 -march=x86-64 -mtune=generic
+      CXXFLAGS: -O2 -march=x86-64 -mtune=generic
+      LC_ALL: C.UTF-8
+      PYTHON: /opt/python/cp310-cp310/bin/python
+      PYTHONHASHSEED: "0"
+      RUSTFLAGS: -C target-cpu=x86-64 --remap-path-prefix=${{ github.workspace }}=/workspace
+      RUSTUP_HOME: /tmp/forge-rustup
+      SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
+      TZ: UTC
+      WHEEL_PYTHON: /tmp/forge-wheel-tools/bin/python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Verify the pinned build floor and Python 3.10
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
+          test "$(uname -m)" = "x86_64"
+          "$PYTHON" -c 'import sys; assert sys.version_info[:2] == (3, 10), sys.version'
+
+      - name: Install checksum-pinned Rust 1.97.0
+        env:
+          RUSTUP_INIT_SHA256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+          RUSTUP_INIT_VERSION: 1.28.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup_init="${RUNNER_TEMP}/rustup-init"
+          curl --fail --show-error --silent --location \
+            --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$rustup_init" \
+            "https://static.rust-lang.org/rustup/archive/${RUSTUP_INIT_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
+          echo "${RUSTUP_INIT_SHA256}  ${rustup_init}" | sha256sum --check --strict -
+          chmod 0755 "$rustup_init"
+          "$rustup_init" -y --no-modify-path --profile minimal --default-toolchain 1.97.0
+          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+          "${CARGO_HOME}/bin/rustc" --version | grep -Fx 'rustc 1.97.0 (2d8144b78 2026-07-07)'
+
+      - name: Materialize and install the hash-locked tool wheelhouse
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$PYTHON" -m venv /tmp/forge-wheel-tools
+          mkdir /tmp/forge-wheelhouse
+          "$WHEEL_PYTHON" -m pip download \
+            --disable-pip-version-check \
+            --require-hashes \
+            --only-binary=:all: \
+            --dest /tmp/forge-wheelhouse \
+            -r tools/python-wheel-build-requirements.lock
+          "$WHEEL_PYTHON" -m pip install \
+            --disable-pip-version-check \
+            --no-index \
+            --find-links /tmp/forge-wheelhouse \
+            --require-hashes \
+            --only-binary=:all: \
+            -r tools/python-wheel-build-requirements.lock
+
+      - name: Build the dedicated generic x86-64 cdylib
+        shell: bash
+        env:
+          CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/tools/manylinux-cmake-toolchain.cmake
+        run: >-
+          cargo build --locked --release --lib
+          --target x86_64-unknown-linux-gnu --no-default-features
+          --features opus-encoding
+
+      - name: Build an unclaimed Linux wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir raw-wheel repaired-wheel
+          "$WHEEL_PYTHON" tools/build-python-wheel.py \
+            --library target/x86_64-unknown-linux-gnu/release/libforge_normalizer.so \
+            --library-name libforge_normalizer.so \
+            --platform linux_x86_64 \
+            --outdir raw-wheel \
+            --version "${{ needs.validate.outputs.version }}"
+
+      - name: Repair to the published manylinux contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t raw_wheels < <(find raw-wheel -maxdepth 1 -type f -name '*.whl' -print | sort)
+          if (( ${#raw_wheels[@]} != 1 )); then
+            echo "expected exactly one raw Linux wheel, found ${#raw_wheels[@]}" >&2
+            exit 1
+          fi
+          "$WHEEL_PYTHON" -m auditwheel repair \
+            --plat manylinux_2_34_x86_64 \
+            --only-plat \
+            --wheel-dir repaired-wheel \
+            "${raw_wheels[0]}"
+
+      - name: Verify every repaired wheel ELF and compatibility tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t wheels < <(find repaired-wheel -maxdepth 1 -type f -name '*.whl' -print | sort)
+          if (( ${#wheels[@]} != 1 )); then
+            echo "expected exactly one repaired Linux wheel, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+          "$WHEEL_PYTHON" -m auditwheel show "${wheels[0]}" | tee auditwheel-show.txt
+          "$WHEEL_PYTHON" tools/check-linux-wheel-abi.py \
+            --auditwheel "$AUDITWHEEL" \
+            "${wheels[0]}"
+
+      - name: Upload only the repaired Linux wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: forge-python-linux-x86_64
+          path: repaired-wheel/forge_normalizer-*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke-linux-wheel-floor:
+    name: Smoke-test Linux wheel without network or x86-64-v2
+    needs: [validate, build-linux-wheel]
+    runs-on: ubuntu-24.04
+    env:
+      MANYLINUX_2_28_IMAGE: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+      MANYLINUX_2_34_IMAGE: quay.io/pypa/manylinux_2_34_x86_64@sha256:934419fa742ff922855f464203cc0ad5afe3317a8541712a00cf3dc7fb893fc8
+      QEMU_CPU: qemu64,-lahf-lm,-pni,-ssse3,-sse4.1,-sse4.2,-popcnt,-cx16,-avx,-avx2
+      QEMU_DEB_SHA256: 5bb397f66063efa349f6fd5cb3b68cd96f29edd0994e4ba5115cf0859a716bf0
+      QEMU_DEB_URL: https://archive.ubuntu.com/ubuntu/pool/universe/q/qemu/qemu-user-static_8.2.2%2bds-0ubuntu1.18_amd64.deb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Download the verified wheel candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-python-linux-x86_64
+          path: ${{ runner.temp }}/linux-wheel
+
+      - name: Install checksum-pinned QEMU and prove the baseline CPU model
+        shell: bash
+        run: |
+          set -euo pipefail
+          qemu_deb="${RUNNER_TEMP}/qemu-user-static.deb"
+          qemu_root="${RUNNER_TEMP}/qemu-user-static"
+          curl --fail --show-error --silent --location \
+            --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$qemu_deb" \
+            "$QEMU_DEB_URL"
+          echo "${QEMU_DEB_SHA256}  ${qemu_deb}" | sha256sum --check --strict -
+          mkdir "$qemu_root"
+          dpkg-deb --extract "$qemu_deb" "$qemu_root"
+          qemu="${qemu_root}/usr/bin/qemu-x86_64-static"
+          test -x "$qemu"
+          echo "QEMU_X86_64=${qemu}" >> "$GITHUB_ENV"
+          python3 tools/test_linux_wheel_abi.py \
+            --qemu-x86-64 "$qemu" \
+            --qemu-cpu "$QEMU_CPU"
+
+      - name: Install, load, and analyze WAV in network-isolated containers
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel_dir="${RUNNER_TEMP}/linux-wheel"
+          mapfile -t wheels < <(find "$wheel_dir" -maxdepth 1 -type f -name '*.whl' -print | sort)
+          if (( ${#wheels[@]} != 1 )); then
+            echo "expected exactly one verified Linux wheel, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+          source_root="$(realpath "$GITHUB_WORKSPACE")"
+          wheel_root="$(realpath "$wheel_dir")"
+          python3 tools/run-pinned-container.py pull "$MANYLINUX_2_34_IMAGE"
+          python3 tools/run-pinned-container.py pull "$MANYLINUX_2_28_IMAGE"
+
+          python3 tools/run-pinned-container.py run "$MANYLINUX_2_34_IMAGE" \
+            --rm --pull never --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --pids-limit 256 --memory 1g \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=256m \
+            --mount "type=bind,src=${source_root},dst=/source,readonly" \
+            --mount "type=bind,src=${wheel_root},dst=/wheel,readonly" \
+            --workdir /source \
+            -- \
+            /bin/bash -lc '
+              set -euo pipefail
+              test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.34"
+              py=/opt/python/cp310-cp310/bin/python
+              "$py" -c "import sys; assert sys.version_info[:2] == (3, 10), sys.version"
+              mkdir /tmp/home /tmp/site
+              HOME=/tmp/home "$py" -m pip install \
+                --disable-pip-version-check --no-cache-dir --no-index --no-deps \
+                --target /tmp/site /wheel/*.whl
+              unset FORGE_NORMALIZER_LIBRARY
+              PYTHONPATH=/tmp/site "$py" -m pip check
+              PYTHONPATH=/tmp/site "$py" /source/python/tests/wheel_smoke.py
+            '
+
+          python3 tools/run-pinned-container.py run "$MANYLINUX_2_28_IMAGE" \
+            --rm --pull never --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --pids-limit 256 --memory 1g \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=256m \
+            --mount "type=bind,src=${source_root},dst=/source,readonly" \
+            --mount "type=bind,src=${wheel_root},dst=/wheel,readonly" \
+            --mount "type=bind,src=${QEMU_X86_64},dst=/qemu-x86_64-static,readonly" \
+            --workdir /source \
+            --env QEMU_CPU="$QEMU_CPU" \
+            -- \
+            /bin/bash -lc '
+              set -euo pipefail
+              test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
+              py=/opt/python/cp310-cp310/bin/python
+              mkdir /tmp/home /tmp/site
+              HOME=/tmp/home "$py" -m pip install \
+                --disable-pip-version-check --no-cache-dir --no-index --no-deps \
+                --only-binary=:all: --platform manylinux_2_34_x86_64 \
+                --target /tmp/site /wheel/*.whl
+              unset FORGE_NORMALIZER_LIBRARY
+              PYTHONPATH=/tmp/site /qemu-x86_64-static \
+                -cpu "$QEMU_CPU" "$py" /source/python/tests/wheel_smoke.py
+            '
+
+  reproducible-linux-wheel:
+    name: Reproduce the repaired Linux wheel
+    needs: [validate, build-linux-wheel]
+    runs-on: ubuntu-24.04
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+    env:
+      AUDITWHEEL: /tmp/forge-wheel-tools/bin/auditwheel
+      CARGO_HOME: /tmp/forge-cargo
+      CARGO_INCREMENTAL: "0"
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      CFLAGS: -O2 -march=x86-64 -mtune=generic
+      CXXFLAGS: -O2 -march=x86-64 -mtune=generic
+      LC_ALL: C.UTF-8
+      PYTHON: /opt/python/cp310-cp310/bin/python
+      PYTHONHASHSEED: "0"
+      RUSTFLAGS: -C target-cpu=x86-64 --remap-path-prefix=${{ github.workspace }}=/workspace
+      RUSTUP_HOME: /tmp/forge-rustup
+      SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
+      TZ: UTC
+      WHEEL_PYTHON: /tmp/forge-wheel-tools/bin/python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Download the independently built candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-python-linux-x86_64
+          path: candidate-wheel
+
+      - name: Verify the pinned reproduction floor and Python 3.10
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
+          test "$(uname -m)" = "x86_64"
+          "$PYTHON" -c 'import sys; assert sys.version_info[:2] == (3, 10), sys.version'
+
+      - name: Install checksum-pinned Rust 1.97.0
+        env:
+          RUSTUP_INIT_SHA256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+          RUSTUP_INIT_VERSION: 1.28.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup_init="${RUNNER_TEMP}/rustup-init"
+          curl --fail --show-error --silent --location \
+            --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$rustup_init" \
+            "https://static.rust-lang.org/rustup/archive/${RUSTUP_INIT_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
+          echo "${RUSTUP_INIT_SHA256}  ${rustup_init}" | sha256sum --check --strict -
+          chmod 0755 "$rustup_init"
+          "$rustup_init" -y --no-modify-path --profile minimal --default-toolchain 1.97.0
+          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+          "${CARGO_HOME}/bin/rustc" --version | grep -Fx 'rustc 1.97.0 (2d8144b78 2026-07-07)'
+
+      - name: Materialize and install the hash-locked tool wheelhouse
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$PYTHON" -m venv /tmp/forge-wheel-tools
+          mkdir /tmp/forge-wheelhouse
+          "$WHEEL_PYTHON" -m pip download \
+            --disable-pip-version-check \
+            --require-hashes \
+            --only-binary=:all: \
+            --dest /tmp/forge-wheelhouse \
+            -r tools/python-wheel-build-requirements.lock
+          "$WHEEL_PYTHON" -m pip install \
+            --disable-pip-version-check \
+            --no-index \
+            --find-links /tmp/forge-wheelhouse \
+            --require-hashes \
+            --only-binary=:all: \
+            -r tools/python-wheel-build-requirements.lock
+
+      - name: Rebuild and repair independently
+        shell: bash
+        env:
+          CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/tools/manylinux-cmake-toolchain.cmake
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --lib \
+            --target x86_64-unknown-linux-gnu --no-default-features \
+            --features opus-encoding
+          mkdir raw-wheel reproduced-wheel
+          "$WHEEL_PYTHON" tools/build-python-wheel.py \
+            --library target/x86_64-unknown-linux-gnu/release/libforge_normalizer.so \
+            --library-name libforge_normalizer.so \
+            --platform linux_x86_64 \
+            --outdir raw-wheel \
+            --version "${{ needs.validate.outputs.version }}"
+          mapfile -t raw_wheels < <(find raw-wheel -maxdepth 1 -type f -name '*.whl' -print | sort)
+          if (( ${#raw_wheels[@]} != 1 )); then
+            echo "expected exactly one reproduced raw wheel, found ${#raw_wheels[@]}" >&2
+            exit 1
+          fi
+          "$WHEEL_PYTHON" -m auditwheel repair \
+            --plat manylinux_2_34_x86_64 \
+            --only-plat \
+            --wheel-dir reproduced-wheel \
+            "${raw_wheels[0]}"
+
+      - name: Verify ABI and compare the repaired wheel byte for byte
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t candidates < <(find candidate-wheel -maxdepth 1 -type f -name '*.whl' -print | sort)
+          mapfile -t reproduced < <(find reproduced-wheel -maxdepth 1 -type f -name '*.whl' -print | sort)
+          if (( ${#candidates[@]} != 1 || ${#reproduced[@]} != 1 )); then
+            echo "expected one candidate and one reproduced wheel" >&2
+            exit 1
+          fi
+          for wheel in "${candidates[0]}" "${reproduced[0]}"; do
+            "$WHEEL_PYTHON" tools/check-linux-wheel-abi.py \
+              --auditwheel "$AUDITWHEEL" \
+              "$wheel"
+          done
+          cmp "${candidates[0]}" "${reproduced[0]}"
+          sha256sum "${candidates[0]}" "${reproduced[0]}"
 
   build-linux-v3:
     name: Build linux-x86_64-v3
@@ -656,18 +1046,9 @@ jobs:
             target/forge-pgo-x86_64-v3/optimized/x86_64-unknown-linux-gnu/release/forge \
             "${{ needs.validate.outputs.source-date-epoch }}" \
             reproduced
-          python tools/build-python-wheel.py \
-            --library target/x86_64-unknown-linux-gnu/release/libforge_normalizer.so \
-            --library-name libforge_normalizer.so \
-            --platform manylinux_2_34_x86_64 \
-            --outdir reproduced \
-            --version "${{ needs.validate.outputs.version }}"
           cmp \
             "actual/forge-v${{ needs.validate.outputs.version }}-linux-x86_64.tar.gz" \
             "reproduced/forge-v${{ needs.validate.outputs.version }}-linux-x86_64.tar.gz"
-          cmp \
-            "actual/forge_normalizer-${{ needs.validate.outputs.version }}-py3-none-manylinux_2_34_x86_64.whl" \
-            "reproduced/forge_normalizer-${{ needs.validate.outputs.version }}-py3-none-manylinux_2_34_x86_64.whl"
           cmp \
             "actual/forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.tar.gz" \
             "reproduced/forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.tar.gz"
@@ -675,9 +1056,7 @@ jobs:
             "actual/forge-v${{ needs.validate.outputs.version }}-linux-x86_64.tar.gz" \
             "reproduced/forge-v${{ needs.validate.outputs.version }}-linux-x86_64.tar.gz" \
             "actual/forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.tar.gz" \
-            "reproduced/forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.tar.gz" \
-            "actual/forge_normalizer-${{ needs.validate.outputs.version }}-py3-none-manylinux_2_34_x86_64.whl" \
-            "reproduced/forge_normalizer-${{ needs.validate.outputs.version }}-py3-none-manylinux_2_34_x86_64.whl"
+            "reproduced/forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.tar.gz"
 
   reproducible-macos-aarch64:
     name: Reproduce macOS ARM64 PGO CLI
@@ -766,7 +1145,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [validate, build, build-linux-v3, reproducible-linux, reproducible-macos-aarch64, wasm]
+    needs: [validate, build, build-linux-wheel, smoke-linux-wheel-floor, reproducible-linux-wheel, build-linux-v3, reproducible-linux, reproducible-macos-aarch64, wasm]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     environment: release
