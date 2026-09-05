@@ -1,0 +1,2 @@
+# Release archives and source fixtures must have the same bytes on every OS.
+* text=auto eol=lf

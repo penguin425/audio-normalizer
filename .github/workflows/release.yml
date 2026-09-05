@@ -7,7 +7,9 @@ on:
   pull_request:
     paths:
       - ".cargo/config.toml"
+      - ".gitattributes"
       - ".github/workflows/release.yml"
+      - "*.md"
       - "README.md"
       - "CHANGELOG.md"
       - "COMPATIBILITY.md"
@@ -16,6 +18,7 @@ on:
       - "DOCUMENTATION.md"
       - "PERFORMANCE.md"
       - "LICENSE"
+      - "schema/**"
       - "include/forge_normalizer.h"
       - "C-API.md"
       - "HOST-ADAPTERS.md"
@@ -46,10 +49,13 @@ on:
       - "schema/analysis-cache-v2.schema.json"
       - "schema/analysis-cache-v3.schema.json"
       - "schema/analysis-cache-v4.schema.json"
+      - "schema/analysis-cache-v5.schema.json"
+      - "schema/channel-layout-v1.schema.json"
       - "src/catalogue.rs"
       - "CATALOGUE.md"
       - "schema/catalogue-report-v1.schema.json"
       - "schema/catalogue-report-v2.schema.json"
+      - "schema/catalogue-report-v3.schema.json"
       - "schema/batch-job-v1.schema.json"
       - "schema/batch-job-v2.schema.json"
       - "schema/batch-progress-v1.schema.json"
@@ -81,12 +87,15 @@ on:
       - "schema/ac4-adapter-request-v1.schema.json"
       - "schema/ac4-adapter-response-v1.schema.json"
       - "schema/ac4-adapter-report-v1.schema.json"
+      - "schema/ac4-adapter-report-v2.schema.json"
       - "schema/mpegh-adapter-request-v1.schema.json"
       - "schema/mpegh-adapter-response-v1.schema.json"
       - "schema/mpegh-adapter-report-v1.schema.json"
+      - "schema/mpegh-adapter-report-v2.schema.json"
       - "schema/dts-adapter-request-v1.schema.json"
       - "schema/dts-adapter-response-v1.schema.json"
       - "schema/dts-adapter-report-v1.schema.json"
+      - "schema/dts-adapter-report-v2.schema.json"
       - "schema/adm-presentation-report-v1.schema.json"
       - "schema/adm-interactivity-report-v1.schema.json"
       - "schema/adm-semantics-report-v1.schema.json"
@@ -147,7 +156,7 @@ on:
       - "src/service_grpc.rs"
       - "tests/service_api.rs"
       - "src/bin/forge-service.rs"
-      - "proto/forge_service.proto"
+      - "proto/**"
       - "src/cli.rs"
       - "src/main.rs"
       - "src/report.rs"
@@ -163,6 +172,7 @@ on:
       - "schema/remote-qc-v1.schema.json"
       - "schema/service-analysis-v1.schema.json"
       - "schema/service-analysis-v2.schema.json"
+      - "schema/service-analysis-v3.schema.json"
       - "schema/service-error-v1.schema.json"
       - "schema/service-health-v1.schema.json"
       - "schema/delivery-manifest-v3.schema.json"
@@ -178,6 +188,7 @@ on:
       - "tools/build-wasm-package.sh"
       - "tools/package-linux-release.sh"
       - "tools/package-linux-v3-release.sh"
+      - "tools/check-release-content.py"
       - "tools/generate-package-metadata.sh"
       - "tools/check-release-readiness.sh"
       # Cargo-only dependency updates are covered by the full-feature CI jobs.
@@ -458,69 +469,12 @@ jobs:
           cp integrations/vst3/external/vst3sdk/CMakeLists.txt \
              "$staging/integrations/vst3/external/vst3sdk/"
           mkdir "$staging/tools" "$staging/schema" "$staging/proto"
-          cp proto/forge_service.proto "$staging/proto/"
+          cp proto/* "$staging/proto/"
           cp tools/benchmark.py tools/test-vst3-adapter.sh tools/test-au-adapter.sh "$staging/tools/"
-          cp schema/performance-benchmark-v1.schema.json "$staging/schema/"
-          cp schema/doctor-report-v1.schema.json "$staging/schema/"
-          cp schema/analysis-cache-v1.schema.json \
-             schema/analysis-cache-v2.schema.json \
-             schema/analysis-cache-v3.schema.json \
-             schema/analysis-cache-v4.schema.json \
-             schema/catalogue-report-v1.schema.json \
-             schema/catalogue-report-v2.schema.json "$staging/schema/"
-          cp schema/batch-job-v1.schema.json \
-             schema/batch-job-v2.schema.json \
-             schema/batch-progress-v1.schema.json \
-             schema/watch-folder-v1.schema.json "$staging/schema/"
-          cp schema/delivery-manifest-v1.schema.json \
-             schema/delivery-manifest-v2.schema.json \
-             schema/delivery-manifest-v3.schema.json \
-             schema/delivery-manifest-v4.schema.json "$staging/schema/"
-          cp schema/multi-delivery-request-v1.schema.json \
-             schema/multi-delivery-report-v1.schema.json "$staging/schema/"
-          cp schema/segment-normalization-request-v1.schema.json \
-             schema/segment-normalization-plan-v1.schema.json \
-             schema/segment-normalization-report-v1.schema.json \
-             schema/segment-normalization-plan-v2.schema.json \
-             schema/segment-normalization-report-v2.schema.json "$staging/schema/"
-          cp schema/ac4-adapter-request-v1.schema.json \
-             schema/ac4-adapter-response-v1.schema.json \
-             schema/ac4-adapter-report-v1.schema.json "$staging/schema/"
-          cp schema/mpegh-adapter-request-v1.schema.json \
-             schema/mpegh-adapter-response-v1.schema.json \
-             schema/mpegh-adapter-report-v1.schema.json "$staging/schema/"
-          cp schema/dts-adapter-request-v1.schema.json \
-             schema/dts-adapter-response-v1.schema.json \
-             schema/dts-adapter-report-v1.schema.json "$staging/schema/"
-          cp schema/adm-presentation-report-v1.schema.json \
-             schema/adm-interactivity-report-v1.schema.json \
-             schema/adm-semantics-report-v1.schema.json "$staging/schema/"
-          cp schema/downmix-qc-request-v1.schema.json \
-             schema/downmix-qc-report-v1.schema.json "$staging/schema/"
-          cp schema/binaural-qc-request-v1.schema.json \
-             schema/binaural-qc-report-v1.schema.json "$staging/schema/"
-          cp schema/remediation-request-v1.schema.json \
-             schema/remediation-report-v1.schema.json "$staging/schema/"
-          cp schema/metadata-repair-request-v1.schema.json \
-             schema/metadata-repair-report-v1.schema.json \
-             schema/metadata-repair-request-v2.schema.json \
-             schema/metadata-repair-report-v2.schema.json "$staging/schema/"
-          cp schema/audio-anomaly-provider-v1.schema.json \
-             schema/anomaly-provider-audit-v1.schema.json \
-             schema/model-qc-v1.schema.json \
-             schema/onnx-anomaly-model-v1.schema.json \
-             schema/onnx-feature-frames-v1.schema.json \
-             schema/remote-range-v1.schema.json \
-             schema/remote-materialization-v1.schema.json \
-             schema/remote-qc-v1.schema.json \
-             schema/service-analysis-v1.schema.json \
-             schema/service-analysis-v2.schema.json \
-             schema/service-error-v1.schema.json \
-             schema/service-health-v1.schema.json "$staging/schema/"
-          cp schema/ebu-qc-results-v2.schema.json \
-             schema/ebu-qc-catalogue-v2-pins.json "$staging/schema/"
+          cp schema/*.json "$staging/schema/"
           cp -R schema/ebu-qc-2026-04 "$staging/schema/"
-          cp README.md CHANGELOG.md COMPATIBILITY.md CONTRIBUTING.md SECURITY.md DOCUMENTATION.md PERFORMANCE.md BATCH-JOBS.md WATCH-FOLDERS.md ANALYSIS-CACHE.md CATALOGUE.md BENCHMARKS.md MULTI-DELIVERY.md SEGMENT-NORMALIZATION.md AC4-ADAPTER.md MPEGH-ADAPTER.md DTS-ADAPTER.md ADM-PRESENTATION-QC.md ADM-INTERACTIVITY-QC.md ADM-SEMANTICS-QC.md ANOMALY-ADAPTER.md SERVICE-METRICS.md C-API.md HOST-ADAPTERS.md VST3-ADAPTER.md AU-ADAPTER.md IMMERSIVE-DOWNMIX.md BINAURAL-QC.md REMEDIATION.md METADATA-REPAIR.md EBU-QC-SCENARIO1.md NEXT-GENERATION-PLAN.md ROADMAP.md LICENSE "$staging/"
+          cp ./*.md LICENSE "$staging/"
+          python3 tools/check-release-content.py "$staging"
           tar -czf "${staging}.tar.gz" "$staging"
 
       - name: Package Windows binary
@@ -547,27 +501,12 @@ jobs:
           Copy-Item integrations/vst3/external/CMakeLists.txt "$staging/integrations/vst3/external/"
           Copy-Item integrations/vst3/external/vst3sdk/CMakeLists.txt "$staging/integrations/vst3/external/vst3sdk/"
           New-Item -ItemType Directory -Path "$staging/tools","$staging/schema","$staging/proto" | Out-Null
-          Copy-Item proto/forge_service.proto "$staging/proto/"
+          Copy-Item "proto/*" "$staging/proto/"
           Copy-Item @("tools/benchmark.py","tools/test-vst3-adapter.sh","tools/test-au-adapter.sh") "$staging/tools/"
-          Copy-Item schema/performance-benchmark-v1.schema.json "$staging/schema/"
-          Copy-Item schema/doctor-report-v1.schema.json "$staging/schema/"
-          Copy-Item "schema/analysis-cache-v1.schema.json","schema/analysis-cache-v2.schema.json","schema/analysis-cache-v3.schema.json","schema/analysis-cache-v4.schema.json","schema/catalogue-report-v1.schema.json","schema/catalogue-report-v2.schema.json" "$staging/schema/"
-          Copy-Item "schema/batch-job-v1.schema.json","schema/batch-job-v2.schema.json","schema/batch-progress-v1.schema.json","schema/watch-folder-v1.schema.json" "$staging/schema/"
-          Copy-Item "schema/delivery-manifest-v1.schema.json","schema/delivery-manifest-v2.schema.json","schema/delivery-manifest-v3.schema.json","schema/delivery-manifest-v4.schema.json" "$staging/schema/"
-          Copy-Item "schema/multi-delivery-request-v1.schema.json","schema/multi-delivery-report-v1.schema.json" "$staging/schema/"
-          Copy-Item "schema/segment-normalization-request-v1.schema.json","schema/segment-normalization-plan-v1.schema.json","schema/segment-normalization-report-v1.schema.json","schema/segment-normalization-plan-v2.schema.json","schema/segment-normalization-report-v2.schema.json" "$staging/schema/"
-          Copy-Item "schema/ac4-adapter-request-v1.schema.json","schema/ac4-adapter-response-v1.schema.json","schema/ac4-adapter-report-v1.schema.json" "$staging/schema/"
-          Copy-Item "schema/mpegh-adapter-request-v1.schema.json","schema/mpegh-adapter-response-v1.schema.json","schema/mpegh-adapter-report-v1.schema.json" "$staging/schema/"
-          Copy-Item "schema/dts-adapter-request-v1.schema.json","schema/dts-adapter-response-v1.schema.json","schema/dts-adapter-report-v1.schema.json" "$staging/schema/"
-          Copy-Item "schema/adm-presentation-report-v1.schema.json","schema/adm-interactivity-report-v1.schema.json","schema/adm-semantics-report-v1.schema.json" "$staging/schema/"
-          Copy-Item "schema/downmix-qc-request-v1.schema.json","schema/downmix-qc-report-v1.schema.json" "$staging/schema/"
-          Copy-Item "schema/binaural-qc-request-v1.schema.json","schema/binaural-qc-report-v1.schema.json" "$staging/schema/"
-          Copy-Item "schema/remediation-request-v1.schema.json","schema/remediation-report-v1.schema.json" "$staging/schema/"
-          Copy-Item "schema/metadata-repair-request-v1.schema.json","schema/metadata-repair-report-v1.schema.json","schema/metadata-repair-request-v2.schema.json","schema/metadata-repair-report-v2.schema.json" "$staging/schema/"
-          Copy-Item "schema/audio-anomaly-provider-v1.schema.json","schema/anomaly-provider-audit-v1.schema.json","schema/model-qc-v1.schema.json","schema/onnx-anomaly-model-v1.schema.json","schema/onnx-feature-frames-v1.schema.json","schema/remote-range-v1.schema.json","schema/remote-materialization-v1.schema.json","schema/remote-qc-v1.schema.json","schema/service-analysis-v1.schema.json","schema/service-analysis-v2.schema.json","schema/service-error-v1.schema.json","schema/service-health-v1.schema.json" "$staging/schema/"
-          Copy-Item "schema/ebu-qc-results-v2.schema.json","schema/ebu-qc-catalogue-v2-pins.json" "$staging/schema/"
+          Copy-Item "schema/*.json" "$staging/schema/"
           Copy-Item schema/ebu-qc-2026-04 "$staging/schema/" -Recurse
-          Copy-Item "README.md","CHANGELOG.md","COMPATIBILITY.md","CONTRIBUTING.md","SECURITY.md","DOCUMENTATION.md","PERFORMANCE.md","BATCH-JOBS.md","WATCH-FOLDERS.md","ANALYSIS-CACHE.md","CATALOGUE.md","BENCHMARKS.md","MULTI-DELIVERY.md","SEGMENT-NORMALIZATION.md","AC4-ADAPTER.md","MPEGH-ADAPTER.md","DTS-ADAPTER.md","ADM-PRESENTATION-QC.md","ADM-INTERACTIVITY-QC.md","ADM-SEMANTICS-QC.md","ANOMALY-ADAPTER.md","SERVICE-METRICS.md","C-API.md","HOST-ADAPTERS.md","VST3-ADAPTER.md","AU-ADAPTER.md","IMMERSIVE-DOWNMIX.md","BINAURAL-QC.md","REMEDIATION.md","METADATA-REPAIR.md","EBU-QC-SCENARIO1.md","NEXT-GENERATION-PLAN.md","ROADMAP.md","LICENSE" $staging
+          Copy-Item "*.md","LICENSE" $staging
+          python tools/check-release-content.py "$staging"
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
 
       - name: Upload packaged binary

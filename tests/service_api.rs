@@ -1,3 +1,5 @@
+use forge_normalizer::channel_layout::ChannelLayoutDescriptor;
+use forge_normalizer::wav::ChannelRole;
 use serde_json::Value;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -179,6 +181,29 @@ fn health_and_upload_analysis_are_schema_shaped() {
     );
     let schema: Value =
         serde_json::from_str(include_str!("../schema/service-analysis-v2.schema.json")).unwrap();
+    assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&value));
+
+    let layout = ChannelLayoutDescriptor::from_channel_roles(vec![ChannelRole::Main])
+        .unwrap()
+        .to_json()
+        .unwrap();
+    let head = format!(
+        "POST /v3/analyze HTTP/1.1\r\nHost: forge\r\nContent-Type: audio/wav\r\nX-Forge-Filename: sample.wav\r\nX-Forge-Channel-Layout: {layout}\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut upload = head.into_bytes();
+    upload.extend_from_slice(&body);
+    let response = request(&address, &upload);
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+    let json_start = response.iter().position(|byte| *byte == b'{').unwrap();
+    let value: Value = serde_json::from_slice(&response[json_start..]).unwrap();
+    assert_eq!(
+        value["schema"],
+        "https://penguin425.github.io/audio-normalizer/schema/service-analysis-v3"
+    );
+    assert_eq!(value["channel_layout"]["origin"], "explicit-override");
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/service-analysis-v3.schema.json")).unwrap();
     assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&value));
 
     child.kill().unwrap();

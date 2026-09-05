@@ -50,7 +50,7 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<bool, String> {
-    let report = ac4_adapter::run(&AdapterOptions {
+    let report = ac4_adapter::run_v2(&AdapterOptions {
         input: cli.input,
         adapter: cli.adapter,
         timeout_seconds: cli.timeout_seconds,
@@ -60,7 +60,7 @@ fn run(cli: Cli) -> Result<bool, String> {
     })?;
     let passed = report.passed;
     let presentation_count = report.presentation_count;
-    ac4_adapter::write_report(&cli.output, &report, cli.compact, cli.overwrite)?;
+    ac4_adapter::write_report_v2(&cli.output, &report, cli.compact, cli.overwrite)?;
     eprintln!(
         "forge-ac4-qc: {} ({presentation_count} presentations)",
         if passed { "PASS" } else { "FAIL" }

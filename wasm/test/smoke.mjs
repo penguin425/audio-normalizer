@@ -2,7 +2,9 @@ import { readFile } from "node:fs/promises";
 import assert from "node:assert/strict";
 import init, {
   analyzeInterleaved,
+  analyzeInterleavedWithLayout,
   analyzeWav,
+  analyzeWavWithLayout,
   limits,
   version,
 } from "../package/index.js";
@@ -93,6 +95,11 @@ assert.equal(
     .channels,
   6,
 );
+const exactWave = analyzeWavWithLayout(
+  floatWave(new Float32Array(6), sampleRate, 6, 0x003f),
+);
+assert.equal(exactWave.channelLayout.origin, "wave");
+assert.equal(exactWave.channelLayout.wave_channel_mask, 0x003f);
 for (const unknownLayoutWave of [
   floatWave(new Float32Array(3), sampleRate, 3),
   floatWave(new Float32Array(2), sampleRate, 2, 0),
@@ -118,6 +125,24 @@ assert.throws(
   () => analyzeInterleaved(new Float32Array(3), sampleRate, 3),
   /more than 2 channels requires an explicit layout.*analyzeWav/,
 );
+
+const threeChannelLayout = {
+  version: 1,
+  assignments: ["main", "main", "main"].map((role) => ({
+    kind: "legacy-role",
+    role,
+  })),
+  provenance: "known-speakers",
+  origin: "explicit-override",
+};
+const exactInterleaved = analyzeInterleavedWithLayout(
+  new Float32Array(3),
+  sampleRate,
+  3,
+  threeChannelLayout,
+);
+assert.equal(exactInterleaved.channels, 3);
+assert.equal(exactInterleaved.channelLayout.origin, "explicit-override");
 
 assert.throws(
   () => analyzeInterleaved(new Float32Array(3), sampleRate, 2),

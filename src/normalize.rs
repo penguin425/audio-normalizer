@@ -12,6 +12,7 @@
 pub use crate::analysis::{analyze, Analysis, AnalysisEngine};
 use crate::atomic::AtomicOutput;
 use crate::bound_analysis::{BoundAnalysis, BoundAnalysisError};
+use crate::channel_layout::ChannelLayoutDescriptor;
 use crate::decoder::{self, InputDescriptor, InputDescriptorOptions};
 use crate::downmix;
 use crate::dsp::limiter::{LimiterConfig, LimiterStatistics, TruePeakLimiter};
@@ -1156,6 +1157,7 @@ pub fn write<P: AsRef<Path>>(
         buf.channels,
         &buf.channel_roles,
         buf.source_kind,
+        None,
         LayoutAliasPolicy::ExplicitLegacy,
     )?;
     match format {
@@ -3192,6 +3194,7 @@ fn normalize_one_descriptor_bound_staged_impl(
         source.channels,
         &source.channel_roles,
         source.kind,
+        Some(descriptor.channel_layout()),
         layout_alias_policy,
     )
     .map_err(BoundAnalysisError::invalid_request)?;
@@ -3215,6 +3218,7 @@ fn normalize_one_descriptor_bound_staged_impl(
             capture_statistics,
             capture_lossless_verification: false,
             verification_channel_roles: None,
+            channel_layout: Some(descriptor.channel_layout()),
             layout_alias_policy,
         },
     )
@@ -3320,6 +3324,10 @@ fn normalize_one_staged_stable_impl(
         std::slice::from_ref(input),
         std::slice::from_ref(&output.to_owned()),
     )?;
+    let channel_layout = match reuse {
+        AnalysisReuse::Bound(analysis) => Some(analysis.channel_layout()),
+        AnalysisReuse::Measure | AnalysisReuse::Legacy(_) => None,
+    };
     let (an, mut source_spool, layout_alias_policy) =
         prepare_analysis_for_render(input, channel_roles, plan, reuse)?;
     validate_plan_for_signal(
@@ -3329,6 +3337,7 @@ fn normalize_one_staged_stable_impl(
         an.channels,
         &an.channel_roles,
         an.kind,
+        channel_layout,
         layout_alias_policy,
     )?;
     let gain = compute_gain(&an, plan);
@@ -3349,6 +3358,7 @@ fn normalize_one_staged_stable_impl(
             capture_statistics,
             capture_lossless_verification: false,
             verification_channel_roles: None,
+            channel_layout,
             layout_alias_policy,
         },
     )?;
@@ -3604,6 +3614,7 @@ pub fn normalize_one_descriptor_bound_corrected_staged_with_policy(
         source.channels,
         &source.channel_roles,
         source.kind,
+        Some(descriptor.channel_layout()),
         layout_alias_policy,
     )
     .map_err(BoundAnalysisError::invalid_request)?;
@@ -3629,6 +3640,7 @@ pub fn normalize_one_descriptor_bound_corrected_staged_with_policy(
                 capture_statistics: true,
                 capture_lossless_verification: true,
                 verification_channel_roles: channel_roles,
+                channel_layout: Some(descriptor.channel_layout()),
                 layout_alias_policy,
             },
         )
@@ -3761,6 +3773,10 @@ fn normalize_one_corrected_stable_impl(
         std::slice::from_ref(input),
         std::slice::from_ref(&output.to_owned()),
     )?;
+    let channel_layout = match reuse {
+        AnalysisReuse::Bound(analysis) => Some(analysis.channel_layout()),
+        AnalysisReuse::Measure | AnalysisReuse::Legacy(_) => None,
+    };
     let (source, mut source_spool, layout_alias_policy) =
         prepare_analysis_for_render(input, channel_roles, plan, reuse)?;
     validate_plan_for_signal(
@@ -3770,6 +3786,7 @@ fn normalize_one_corrected_stable_impl(
         source.channels,
         &source.channel_roles,
         source.kind,
+        channel_layout,
         layout_alias_policy,
     )?;
     let mut gain = compute_gain(&source, plan);
@@ -3793,6 +3810,7 @@ fn normalize_one_corrected_stable_impl(
                 capture_statistics: true,
                 capture_lossless_verification: true,
                 verification_channel_roles: channel_roles,
+                channel_layout,
                 layout_alias_policy,
             },
         )?;
@@ -3889,6 +3907,7 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
             source.channels,
             &source.channel_roles,
             source.kind,
+            None,
             layout_alias_policy,
         )?;
     }
@@ -3920,6 +3939,7 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
                 capture_statistics: true,
                 capture_lossless_verification: true,
                 verification_channel_roles: channel_roles,
+                channel_layout: None,
                 layout_alias_policy,
             },
         )?;
@@ -4486,6 +4506,7 @@ fn normalize_album_stable_impl(
             analysis.channels,
             &analysis.channel_roles,
             analysis.kind,
+            bound_analyses.map(|bound| bound[index].channel_layout()),
             layout_alias_policies[index],
         )?;
     }
@@ -4522,6 +4543,7 @@ fn normalize_album_stable_impl(
                     capture_statistics,
                     capture_lossless_verification: write_album_tags,
                     verification_channel_roles: None,
+                    channel_layout: bound_analyses.map(|bound| bound[i].channel_layout()),
                     layout_alias_policy: layout_alias_policies[i],
                 },
             )
@@ -4870,6 +4892,7 @@ fn normalize_album_corrected_stable_impl(
             source.channels,
             &source.channel_roles,
             source.kind,
+            bound_analyses.map(|bound| bound[index].channel_layout()),
             layout_alias_policies[index],
         )?;
     }
@@ -4909,6 +4932,7 @@ fn normalize_album_corrected_stable_impl(
                         capture_statistics: true,
                         capture_lossless_verification: true,
                         verification_channel_roles: channel_roles,
+                        channel_layout: bound_analyses.map(|bound| bound[index].channel_layout()),
                         layout_alias_policy: layout_alias_policies[index],
                     },
                 )
@@ -5228,6 +5252,7 @@ struct StreamRenderOptions<'a> {
     capture_statistics: bool,
     capture_lossless_verification: bool,
     verification_channel_roles: Option<&'a [ChannelRole]>,
+    channel_layout: Option<&'a ChannelLayoutDescriptor>,
     layout_alias_policy: LayoutAliasPolicy,
 }
 
@@ -5293,10 +5318,11 @@ impl NormalizedStreamWriter {
         format: OutputFormat,
         options: StreamRenderOptions<'_>,
     ) -> Result<Self, String> {
-        validate_output_channel_layout(
+        validate_output_channel_layout_with_descriptor(
             format,
             analysis.channels,
             &analysis.channel_roles,
+            options.channel_layout,
             options.layout_alias_policy,
         )?;
         #[cfg(not(feature = "opus-encoding"))]
@@ -5309,21 +5335,36 @@ impl NormalizedStreamWriter {
                 } else {
                     Vec::new()
                 };
-                let writer = WavStreamWriter::create_with_metadata(
-                    output,
-                    analysis.sample_rate,
-                    analysis.channels,
-                    analysis.frames,
-                    kind,
-                    plan.dither,
-                    plan.wav_container,
-                    &analysis.channel_roles,
-                    &metadata_chunks,
-                )
+                let writer = if let Some(layout) = options.channel_layout {
+                    WavStreamWriter::create_with_channel_layout_and_metadata(
+                        output,
+                        analysis.sample_rate,
+                        analysis.frames,
+                        kind,
+                        plan.dither,
+                        plan.wav_container,
+                        layout,
+                        &metadata_chunks,
+                    )
+                } else {
+                    WavStreamWriter::create_with_metadata(
+                        output,
+                        analysis.sample_rate,
+                        analysis.channels,
+                        analysis.frames,
+                        kind,
+                        plan.dither,
+                        plan.wav_container,
+                        &analysis.channel_roles,
+                        &metadata_chunks,
+                    )
+                }
                 .map_err(|error| format!("write {}: {error}", output.display()))?;
                 let lossless = if options.capture_lossless_verification {
                     let roles = if let Some(roles) = options.verification_channel_roles {
                         roles.to_vec()
+                    } else if let Some(layout) = options.channel_layout {
+                        layout.channel_roles()
                     } else {
                         crate::wav::writer::persisted_channel_roles(&analysis.channel_roles)
                             .map_err(|error| format!("write {}: {error}", output.display()))?
@@ -5346,16 +5387,31 @@ impl NormalizedStreamWriter {
             }
             OutputFormat::Flac => {
                 let bits = flac_bits(plan.output_kind.unwrap_or(analysis.kind))?;
-                let writer = FlacStreamWriter::create(
-                    output,
-                    analysis.sample_rate,
-                    analysis.channels,
-                    bits,
-                    plan.dither,
-                )?;
+                let writer = if let Some(layout) = options.channel_layout {
+                    FlacStreamWriter::create_with_channel_layout(
+                        output,
+                        analysis.sample_rate,
+                        bits,
+                        plan.dither,
+                        layout,
+                    )
+                } else {
+                    FlacStreamWriter::create(
+                        output,
+                        analysis.sample_rate,
+                        analysis.channels,
+                        bits,
+                        plan.dither,
+                    )
+                }?;
                 let lossless = if options.capture_lossless_verification {
                     let roles = options.verification_channel_roles.map_or_else(
-                        || flac_persisted_channel_roles(analysis.channels),
+                        || {
+                            options.channel_layout.map_or_else(
+                                || flac_persisted_channel_roles(analysis.channels),
+                                ChannelLayoutDescriptor::channel_roles,
+                            )
+                        },
                         <[ChannelRole]>::to_vec,
                     );
                     Some(LosslessAnalysisBuilder::new(
@@ -6380,7 +6436,7 @@ fn flac_bits(kind: PcmKind) -> Result<u16, String> {
 }
 
 fn flac_persisted_channel_roles(channels: u16) -> Vec<ChannelRole> {
-    crate::decoder::default_flac_channel_mask(channels)
+    crate::channel_layout::default_flac_channel_mask(channels)
         .map(|mask| crate::wav::reader::roles_from_wave_mask(mask, channels))
         .unwrap_or_default()
 }
@@ -6647,6 +6703,7 @@ fn validate_plan_for_signal(
     channels: u16,
     roles: &[ChannelRole],
     source_kind: PcmKind,
+    channel_layout: Option<&ChannelLayoutDescriptor>,
     alias_policy: LayoutAliasPolicy,
 ) -> Result<(), String> {
     plan.validate()?;
@@ -6662,7 +6719,13 @@ fn validate_plan_for_signal(
     if channels == 0 {
         return Err("output signal must contain at least one channel".into());
     }
-    validate_output_channel_layout(format, channels, roles, alias_policy)?;
+    validate_output_channel_layout_with_descriptor(
+        format,
+        channels,
+        roles,
+        channel_layout,
+        alias_policy,
+    )?;
     validate_plan_format_settings(plan, format, Some(sample_rate), Some(channels))?;
     validate_output_encoder_available(format)?;
     if format == OutputFormat::Wav
@@ -6721,6 +6784,30 @@ pub(crate) fn validate_plan_output_sample_rate(plan: &Plan) -> Result<(), String
 /// Generic aliases are accepted only at APIs where the caller explicitly
 /// supplied the layout. Decoder-derived and unqualified precomputed layouts
 /// must carry exact speaker positions so lossy metadata cannot pass preflight.
+fn validate_output_channel_layout_with_descriptor(
+    format: OutputFormat,
+    channels: u16,
+    roles: &[ChannelRole],
+    channel_layout: Option<&ChannelLayoutDescriptor>,
+    alias_policy: LayoutAliasPolicy,
+) -> Result<(), String> {
+    if let Some(layout) =
+        channel_layout.filter(|_| matches!(format, OutputFormat::Wav | OutputFormat::Flac))
+    {
+        if layout.channel_count() != usize::from(channels) || layout.channel_roles() != roles {
+            return Err("exact channel layout does not match the measured signal".into());
+        }
+        if !layout.is_measurement_ready() {
+            return Err("exact channel layout is not a complete physical-speaker mapping".into());
+        }
+        crate::wav::writer::channel_mask_from_descriptor(layout).map_err(|error| {
+            format!("{format:?} output cannot preserve the exact channel layout: {error}")
+        })?;
+        return Ok(());
+    }
+    validate_output_channel_layout(format, channels, roles, alias_policy)
+}
+
 fn validate_output_channel_layout(
     format: OutputFormat,
     channels: u16,
@@ -7677,6 +7764,7 @@ mod tests {
             capture_statistics: true,
             capture_lossless_verification: false,
             verification_channel_roles: None,
+            channel_layout: None,
             layout_alias_policy: LayoutAliasPolicy::ExactOnly,
         };
         let bypass = normalize_stream(
@@ -7746,6 +7834,7 @@ mod tests {
             capture_statistics: true,
             capture_lossless_verification: true,
             verification_channel_roles: None,
+            channel_layout: None,
             layout_alias_policy: LayoutAliasPolicy::ExactOnly,
         };
         assert!(stream_writer_work_can_overlap(
@@ -8264,6 +8353,71 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_normalization_round_trips_nondefault_layouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("source.wav");
+        let wave_output = directory.path().join("normalized.wav");
+        let flac_output = directory.path().join("normalized.flac");
+        let frames = 48_000;
+        let channels = 4_u16;
+        let layout =
+            crate::channel_layout::ChannelLayoutDescriptor::wave(channels, true, Some(0x5003));
+        let signal = (0..frames)
+            .map(|frame| 0.05 * (std::f32::consts::TAU * 997.0 * frame as f32 / 48_000.0).sin())
+            .collect::<Vec<_>>();
+        let buffer = AudioBuffer {
+            sample_rate: 48_000,
+            channels,
+            frames,
+            data: vec![signal; usize::from(channels)],
+            channel_roles: layout.channel_roles(),
+            source_kind: PcmKind::S24,
+        };
+        WavWriter::write_with_channel_layout(
+            &input,
+            &buffer,
+            PcmKind::S24,
+            false,
+            WavContainer::Riff,
+            &layout,
+        )
+        .unwrap();
+        let descriptor = InputDescriptor::from_path(
+            &input,
+            &StableInputOptions::new(u64::MAX).unwrap(),
+            InputDescriptorOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            descriptor.channel_layout().wave_channel_mask(),
+            Some(0x5003)
+        );
+
+        for (output, format) in [
+            (&wave_output, OutputFormat::Wav),
+            (&flac_output, OutputFormat::Flac),
+        ] {
+            normalize_one_descriptor_with_policy(
+                &descriptor,
+                output,
+                &plan(),
+                format,
+                OutputConflictPolicy::CreateNew,
+            )
+            .unwrap();
+            let (_, actual) =
+                decoder::decode_limited_with_channel_layout(output, u64::MAX).unwrap();
+            assert_eq!(actual.channel_count(), usize::from(channels));
+            assert_eq!(
+                actual.wave_channel_mask().or(actual.flac_channel_mask()),
+                Some(0x5003),
+                "{format:?}"
+            );
+            assert_eq!(actual.channel_roles(), layout.channel_roles());
+        }
+    }
+
+    #[test]
     fn pcm_capture_policy_avoids_raw_io_for_fast_lossy_decoders() {
         assert!(should_capture_pcm(Path::new("album.flac"), false));
         assert!(should_capture_pcm(Path::new("archive.dsf"), false));
@@ -8333,6 +8487,7 @@ mod tests {
                     capture_statistics: false,
                     capture_lossless_verification: true,
                     verification_channel_roles: None,
+                    channel_layout: None,
                     layout_alias_policy: LayoutAliasPolicy::ExactOnly,
                 },
             )
@@ -8379,6 +8534,7 @@ mod tests {
             capture_statistics: true,
             capture_lossless_verification: true,
             verification_channel_roles: None,
+            channel_layout: None,
             layout_alias_policy: LayoutAliasPolicy::ExactOnly,
         };
         let separate_paths = [
@@ -8582,6 +8738,7 @@ mod tests {
             capture_statistics: false,
             capture_lossless_verification: false,
             verification_channel_roles: None,
+            channel_layout: None,
             layout_alias_policy: LayoutAliasPolicy::ExactOnly,
         };
 
@@ -8700,6 +8857,7 @@ mod tests {
                     capture_statistics: false,
                     capture_lossless_verification: true,
                     verification_channel_roles: None,
+                    channel_layout: None,
                     layout_alias_policy: LayoutAliasPolicy::ExactOnly,
                 },
             )

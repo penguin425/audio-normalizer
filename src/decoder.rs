@@ -8,6 +8,9 @@
 //! have. All paths produce the same planar-f32 [`AudioBuffer`] the DSP engine
 //! consumes.
 
+use crate::channel_layout::{
+    default_flac_channel_mask, ChannelAssignment, ChannelLayoutDescriptor, ChannelLayoutOrigin,
+};
 use crate::stable_input::{StableInput, StableInputOptions};
 pub use crate::wav::ChannelLayoutProvenance;
 use crate::wav::{default_channel_roles, AudioBuffer, ChannelRole, PcmKind, WavReader};
@@ -194,7 +197,7 @@ pub struct StreamInfo {
 }
 
 /// Version of the content-, track-, range-, and layout-bound input contract.
-pub const INPUT_DESCRIPTOR_VERSION: u32 = 1;
+pub const INPUT_DESCRIPTOR_VERSION: u32 = 2;
 
 /// Container identified from the retained bytes, never just a file suffix.
 #[non_exhaustive]
@@ -346,6 +349,7 @@ pub struct InputDescriptorOptions {
     start_seconds: f64,
     duration_seconds: Option<f64>,
     channel_roles: Option<Vec<ChannelRole>>,
+    channel_layout: Option<ChannelLayoutDescriptor>,
 }
 
 impl Default for InputDescriptorOptions {
@@ -355,6 +359,7 @@ impl Default for InputDescriptorOptions {
             start_seconds: 0.0,
             duration_seconds: None,
             channel_roles: None,
+            channel_layout: None,
         }
     }
 }
@@ -373,6 +378,15 @@ impl InputDescriptorOptions {
 
     pub fn with_channel_roles(mut self, channel_roles: Vec<ChannelRole>) -> Self {
         self.channel_roles = Some(channel_roles);
+        self.channel_layout = None;
+        self
+    }
+
+    /// Override the decoded PCM-plane assignment with an exact, checked
+    /// channel-layout descriptor.
+    pub fn with_channel_layout(mut self, channel_layout: ChannelLayoutDescriptor) -> Self {
+        self.channel_layout = Some(channel_layout);
+        self.channel_roles = None;
         self
     }
 }
@@ -401,9 +415,14 @@ pub struct InputDescriptor {
     track_index: u32,
     track_id: u32,
     info: StreamInfo,
+    decoder_channel_roles: Vec<ChannelRole>,
     declared_frames: Option<u64>,
+    decoder_layout_provenance: ChannelLayoutProvenance,
     declared_layout_provenance: ChannelLayoutProvenance,
+    declared_channel_layout: ChannelLayoutDescriptor,
+    channel_layout: ChannelLayoutDescriptor,
     explicit_channel_roles: bool,
+    explicit_channel_layout: bool,
     range: SourceFrameRange,
 }
 
@@ -418,12 +437,17 @@ impl std::fmt::Debug for InputDescriptor {
             .field("track_index", &self.track_index)
             .field("track_id", &self.track_id)
             .field("info", &self.info)
+            .field("decoder_channel_roles", &self.decoder_channel_roles)
             .field("declared_frames", &self.declared_frames)
+            .field("decoder_layout_provenance", &self.decoder_layout_provenance)
             .field(
                 "declared_layout_provenance",
                 &self.declared_layout_provenance,
             )
+            .field("declared_channel_layout", &self.declared_channel_layout)
+            .field("channel_layout", &self.channel_layout)
             .field("explicit_channel_roles", &self.explicit_channel_roles)
+            .field("explicit_channel_layout", &self.explicit_channel_layout)
             .field("range", &self.range)
             .finish()
     }
@@ -434,14 +458,16 @@ impl InputDescriptor {
     pub fn probe(input: StableInput, options: InputDescriptorOptions) -> Result<Self, String> {
         validate_descriptor_options(&options)?;
         let probed = probe_registry(&input, options.track)?;
-        if let Some(roles) = options.channel_roles.as_ref() {
-            if roles.len() != usize::from(probed.info.channels) {
-                return Err(format!(
-                    "explicit channel layout has {} channels but selected track has {}",
-                    roles.len(),
-                    probed.info.channels
-                ));
-            }
+        let explicit_layout = if let Some(layout) = options.channel_layout.as_ref() {
+            layout.validate()?;
+            Some(layout.clone())
+        } else if let Some(roles) = options.channel_roles.as_ref() {
+            Some(ChannelLayoutDescriptor::from_channel_roles(roles.clone())?)
+        } else {
+            None
+        };
+        if let Some(layout) = explicit_layout.as_ref() {
+            layout.validate_override_for_channels(probed.info.channels)?;
         }
         let range = source_frame_range(
             probed.info.sample_rate,
@@ -449,10 +475,19 @@ impl InputDescriptor {
             options.duration_seconds,
         )?;
         let explicit_channel_roles = options.channel_roles.is_some();
+        let explicit_channel_layout = options.channel_layout.is_some();
         let mut info = probed.info;
-        if let Some(roles) = options.channel_roles {
-            info.channel_roles = roles;
+        let decoder_channel_roles = info.channel_roles.clone();
+        let declared_channel_layout = probed.channel_layout;
+        let channel_layout = explicit_layout.unwrap_or_else(|| declared_channel_layout.clone());
+        if channel_layout.channel_count() != usize::from(info.channels) {
+            return Err(format!(
+                "channel-layout descriptor has {} channels but selected track has {}",
+                channel_layout.channel_count(),
+                info.channels
+            ));
         }
+        info.channel_roles = channel_layout.channel_roles();
         Ok(Self {
             input,
             route: probed.route,
@@ -462,9 +497,14 @@ impl InputDescriptor {
             track_index: probed.track_index,
             track_id: probed.track_id,
             info,
+            decoder_channel_roles,
             declared_frames: probed.declared_frames,
-            declared_layout_provenance: probed.layout_provenance,
+            decoder_layout_provenance: probed.decoder_layout_provenance,
+            declared_layout_provenance: declared_channel_layout.provenance(),
+            declared_channel_layout,
+            channel_layout,
             explicit_channel_roles,
+            explicit_channel_layout,
             range,
         })
     }
@@ -516,8 +556,23 @@ impl InputDescriptor {
         self.declared_layout_provenance
     }
 
+    /// Exact layout declared by the selected encoded programme before any
+    /// caller override is applied.
+    pub fn declared_channel_layout(&self) -> &ChannelLayoutDescriptor {
+        &self.declared_channel_layout
+    }
+
+    /// Effective exact layout used by measurement and rendering.
+    pub fn channel_layout(&self) -> &ChannelLayoutDescriptor {
+        &self.channel_layout
+    }
+
     pub const fn uses_explicit_channel_roles(&self) -> bool {
-        self.explicit_channel_roles
+        self.explicit_channel_roles || self.explicit_channel_layout
+    }
+
+    pub const fn uses_explicit_channel_layout(&self) -> bool {
+        self.explicit_channel_layout
     }
 
     pub const fn source_range(&self) -> SourceFrameRange {
@@ -526,7 +581,7 @@ impl InputDescriptor {
 
     pub fn decoder_route_id(&self) -> String {
         format!(
-            "forge-input-descriptor-v1:{}:{}:audio-index={}:track-id={}",
+            "forge-input-descriptor-v2:{}:{}:audio-index={}:track-id={}",
             self.container.id(),
             self.codec.id(),
             self.track_index,
@@ -543,7 +598,8 @@ struct RegistryProbe {
     track_id: u32,
     info: StreamInfo,
     declared_frames: Option<u64>,
-    layout_provenance: ChannelLayoutProvenance,
+    decoder_layout_provenance: ChannelLayoutProvenance,
+    channel_layout: ChannelLayoutDescriptor,
 }
 
 struct RegistryIdentity {
@@ -551,7 +607,7 @@ struct RegistryIdentity {
     codec: AudioCodec,
     track_index: u32,
     track_id: u32,
-    stream: Option<(StreamInfo, ChannelLayoutProvenance, Option<u64>)>,
+    stream: Option<(StreamInfo, ChannelLayoutDescriptor, Option<u64>)>,
 }
 
 fn validate_descriptor_options(options: &InputDescriptorOptions) -> Result<(), String> {
@@ -570,6 +626,9 @@ fn validate_descriptor_options(options: &InputDescriptorOptions) -> Result<(), S
         .is_some_and(|roles| roles.is_empty() || roles.len() > usize::from(u16::MAX))
     {
         return Err("input descriptor channel layout must contain 1..=65535 roles".into());
+    }
+    if let Some(layout) = &options.channel_layout {
+        layout.validate()?;
     }
     Ok(())
 }
@@ -612,11 +671,12 @@ fn probe_registry(
     let display = display_input(input);
     if route == DecoderRoute::Wave {
         require_single_track(selection)?;
-        let (wav, layout_provenance) =
-            WavReader::probe_with_layout(path).map_err(|error| format!("{display}: {error}"))?;
+        let (wav, channel_layout) = WavReader::probe_with_channel_layout(path)
+            .map_err(|error| format!("{display}: {error}"))?;
         let bytes_per_frame = u64::from(wav.channels) * wav.kind.bytes_per_sample() as u64;
         let declared_frames = Some(wav.data_size / bytes_per_frame);
         let kind = wav.kind;
+        let decoder_layout_provenance = channel_layout.provenance();
         return Ok(RegistryProbe {
             route,
             container: AudioContainer::Wave,
@@ -630,12 +690,20 @@ fn probe_registry(
                 source_kind: kind,
             },
             declared_frames,
-            layout_provenance,
+            decoder_layout_provenance,
+            channel_layout,
         });
     }
     let identity =
         registry_identity_at(path, input.source_name_hint(), &display, route, selection)?;
-    if let Some((info, layout_provenance, declared_frames)) = identity.stream {
+    if let Some((info, decoder_channel_layout, declared_frames)) = identity.stream {
+        let decoder_layout_provenance = decoder_channel_layout.provenance();
+        let channel_layout = if identity.container == AudioContainer::IsoBmff {
+            crate::isobmff_qc::probe_channel_layout(path, identity.track_id, info.channels)?
+                .unwrap_or(decoder_channel_layout)
+        } else {
+            decoder_channel_layout
+        };
         return Ok(RegistryProbe {
             route,
             container: identity.container,
@@ -644,7 +712,8 @@ fn probe_registry(
             track_id: identity.track_id,
             info,
             declared_frames,
-            layout_provenance,
+            decoder_layout_provenance,
+            channel_layout,
         });
     }
 
@@ -671,6 +740,14 @@ fn probe_registry(
             display_input(input)
         )
     })?;
+    let channel_layout = if identity.container == AudioContainer::IsoBmff {
+        crate::isobmff_qc::probe_channel_layout(path, identity.track_id, info.channels)?
+            .unwrap_or_else(|| {
+                ChannelLayoutDescriptor::decoded_from_roles(&info.channel_roles, layout_provenance)
+            })
+    } else {
+        ChannelLayoutDescriptor::decoded_from_roles(&info.channel_roles, layout_provenance)
+    };
     Ok(RegistryProbe {
         route,
         container: identity.container,
@@ -679,7 +756,8 @@ fn probe_registry(
         track_id: identity.track_id,
         info,
         declared_frames,
-        layout_provenance,
+        decoder_layout_provenance: layout_provenance,
+        channel_layout,
     })
 }
 
@@ -862,7 +940,7 @@ fn probe_symphonia_identity_at(
                 channel_roles: output.channel_roles,
                 source_kind: output.source_kind,
             },
-            output.layout_provenance,
+            output.channel_layout,
             track.num_frames,
         ))
     } else {
@@ -1102,22 +1180,6 @@ fn parse_flac_channel_mask(value: &str) -> Option<u32> {
     u32::from_str_radix(significant, 16).ok()
 }
 
-pub(crate) fn default_flac_channel_mask(channels: u16) -> Option<u32> {
-    // RFC 9639 section 9.1.3 default channel order, expressed using the
-    // WAVEFORMATEXTENSIBLE bits from section 8.6.2.
-    Some(match channels {
-        1 => 0x0004,
-        2 => 0x0003,
-        3 => 0x0007,
-        4 => 0x0033,
-        5 => 0x0037,
-        6 => 0x003f,
-        7 => 0x070f,
-        8 => 0x063f,
-        _ => return None,
-    })
-}
-
 fn require_known_layout(path: &Path, provenance: ChannelLayoutProvenance) -> Result<(), String> {
     match provenance {
         ChannelLayoutProvenance::KnownSpeakers => Ok(()),
@@ -1147,6 +1209,13 @@ pub fn decode(path: &Path) -> Result<AudioBuffer, String> {
 /// authoritative.
 pub fn decode_with_layout(path: &Path) -> Result<(AudioBuffer, ChannelLayoutProvenance), String> {
     decode_limited_with_layout(path, u64::MAX)
+}
+
+/// Full-buffer decode with the exact, versioned channel-layout sidecar.
+pub fn decode_with_channel_layout(
+    path: &Path,
+) -> Result<(AudioBuffer, ChannelLayoutDescriptor), String> {
+    decode_limited_with_channel_layout(path, u64::MAX)
 }
 
 /// Decode supported audio while bounding frames multiplied by channels.
@@ -1281,11 +1350,71 @@ pub fn decode_limited_with_layout(
     decode_symphonia(path, &ext, max_decoded_samples)
 }
 
+/// Bounded full-buffer decode with exact container layout evidence.
+pub fn decode_limited_with_channel_layout(
+    path: &Path,
+    max_decoded_samples: u64,
+) -> Result<(AudioBuffer, ChannelLayoutDescriptor), String> {
+    if max_decoded_samples == 0 {
+        return Err("decoded sample limit must be greater than zero".into());
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if is_wave_extension(&extension) || has_wave_signature(path) {
+        return WavReader::open_with_channel_layout_and_limits(path, u16::MAX, max_decoded_samples)
+            .map_err(|error| format!("{}: {error}", path.display()));
+    }
+
+    let route = sniff_decoder_route(path)?;
+    if route == DecoderRoute::Symphonia {
+        let decoded = decode_symphonia_exact(path, &extension, max_decoded_samples)?;
+        let mut layout = decoded.channel_layout;
+        if decoded.is_iso_bmff {
+            if let Some(container_layout) = crate::isobmff_qc::probe_channel_layout(
+                path,
+                decoded.track_id,
+                decoded.buffer.channels,
+            )? {
+                layout = container_layout;
+            }
+        }
+        if layout.channel_count() != usize::from(decoded.buffer.channels) {
+            return Err("decoded exact channel layout does not match the PCM stream".into());
+        }
+        layout.validate()?;
+        let mut buffer = decoded.buffer;
+        buffer.channel_roles = layout.channel_roles();
+        return Ok((buffer, layout));
+    }
+
+    let (mut buffer, provenance) = decode_limited_with_layout(path, max_decoded_samples)?;
+    let layout = ChannelLayoutDescriptor::decoded_from_roles(&buffer.channel_roles, provenance);
+    if layout.channel_count() != usize::from(buffer.channels) {
+        return Err("decoded exact channel layout does not match the PCM stream".into());
+    };
+    layout.validate()?;
+    buffer.channel_roles = layout.channel_roles();
+    Ok((buffer, layout))
+}
+
 fn decode_symphonia(
     path: &Path,
     ext: &str,
     max_decoded_samples: u64,
 ) -> Result<(AudioBuffer, ChannelLayoutProvenance), String> {
+    let decoded = decode_symphonia_exact(path, ext, max_decoded_samples)?;
+    let provenance = decoded.channel_layout.provenance();
+    Ok((decoded.buffer, provenance))
+}
+
+fn decode_symphonia_exact(
+    path: &Path,
+    ext: &str,
+    max_decoded_samples: u64,
+) -> Result<SymphoniaDecoded, String> {
     use symphonia::core::errors::Error;
     use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::FormatOptions;
@@ -1387,6 +1516,9 @@ fn decode_symphonia(
             )?;
             output.layout_provenance =
                 mpeg_channel_mode.constrain_provenance(output.layout_provenance);
+            output.channel_layout = output
+                .channel_layout
+                .with_provenance(output.layout_provenance);
             planar = (0..ch).map(|_| Vec::new()).collect();
             output_format = Some(output);
         }
@@ -1419,8 +1551,11 @@ fn decode_symphonia(
     }
 
     let frames = planar[0].len();
-    Ok((
-        AudioBuffer {
+    let layout_provenance = output_format.layout_provenance;
+    let channel_layout = output_format.channel_layout;
+    debug_assert_eq!(channel_layout.provenance(), layout_provenance);
+    Ok(SymphoniaDecoded {
+        buffer: AudioBuffer {
             sample_rate: output_format.sample_rate,
             channels: output_format.channels,
             frames,
@@ -1428,8 +1563,10 @@ fn decode_symphonia(
             channel_roles: output_format.channel_roles,
             source_kind: output_format.source_kind,
         },
-        output_format.layout_provenance,
-    ))
+        channel_layout,
+        track_id: track.id,
+        is_iso_bmff: container_format == symphonia::core::formats::well_known::FORMAT_ID_ISOMP4,
+    })
 }
 
 struct SymphoniaAudioTrack {
@@ -1445,8 +1582,16 @@ struct SymphoniaOutputFormat {
     declared_layout: Option<symphonia::core::audio::Channels>,
     channel_roles: Vec<ChannelRole>,
     layout_provenance: ChannelLayoutProvenance,
+    channel_layout: ChannelLayoutDescriptor,
     flac_channel_mask: FlacChannelMaskState,
     source_kind: PcmKind,
+}
+
+struct SymphoniaDecoded {
+    buffer: AudioBuffer,
+    channel_layout: ChannelLayoutDescriptor,
+    track_id: u32,
+    is_iso_bmff: bool,
 }
 
 fn select_symphonia_audio_track(
@@ -1673,6 +1818,20 @@ fn establish_symphonia_output_format_with_mpeg_mode(
             }
         }
     };
+    let channel_layout = if codec_params.codec == CODEC_ID_FLAC && !flac_in_isobmff {
+        match flac_channel_mask {
+            FlacChannelMaskState::Absent => ChannelLayoutDescriptor::flac(channels, None),
+            FlacChannelMaskState::Valid(mask) => {
+                ChannelLayoutDescriptor::flac(channels, Some(mask))
+            }
+            FlacChannelMaskState::Invalid => {
+                channel_layout_from_symphonia(role_layout, ChannelLayoutProvenance::Unknown)
+                    .with_origin(ChannelLayoutOrigin::Flac)
+            }
+        }
+    } else {
+        channel_layout_from_symphonia(role_layout, layout_provenance)
+    };
     Ok(SymphoniaOutputFormat {
         sample_rate,
         channels,
@@ -1680,6 +1839,7 @@ fn establish_symphonia_output_format_with_mpeg_mode(
         declared_layout: codec_params.channels.clone(),
         channel_roles,
         layout_provenance,
+        channel_layout,
         flac_channel_mask,
         source_kind,
     })
@@ -1986,6 +2146,83 @@ fn roles_from_symphonia(channels: &symphonia::core::audio::Channels) -> Vec<Chan
     }
 }
 
+fn channel_layout_from_symphonia(
+    channels: &symphonia::core::audio::Channels,
+    provenance: ChannelLayoutProvenance,
+) -> ChannelLayoutDescriptor {
+    use symphonia::core::audio::{ChannelLabel, Channels};
+
+    let compatibility_roles = roles_from_symphonia(channels);
+    let assignments = match channels {
+        Channels::Positioned(positions) => positions
+            .iter()
+            .zip(compatibility_roles.iter().copied())
+            .enumerate()
+            .map(|(index, (position, role))| {
+                assignment_from_symphonia_position(position, role, index)
+            })
+            .collect(),
+        Channels::Discrete(count) => (0..usize::from(*count))
+            .map(|index| ChannelAssignment::unassigned(index as u32))
+            .collect(),
+        Channels::Ambisonic(order) => {
+            let count = (1 + usize::from(*order)) * (1 + usize::from(*order));
+            (0..count)
+                .map(|index| ChannelAssignment::ambisonic(index as u32))
+                .collect()
+        }
+        Channels::Custom(labels) => labels
+            .iter()
+            .zip(compatibility_roles.iter().copied())
+            .enumerate()
+            .map(|(index, (label, role))| match label {
+                ChannelLabel::Positioned(position) => {
+                    assignment_from_symphonia_position(*position, role, index)
+                }
+                ChannelLabel::Discrete(component) => {
+                    ChannelAssignment::unassigned(u32::from(*component))
+                }
+                ChannelLabel::Ambisonic(component) => {
+                    ChannelAssignment::ambisonic(u32::from(*component))
+                }
+                ChannelLabel::AmbisonicBFormat(_) => ChannelAssignment::ambisonic(index as u32),
+                _ => ChannelAssignment::unassigned(index as u32),
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    if assignments.is_empty() {
+        let roles = roles_from_symphonia(channels);
+        return ChannelLayoutDescriptor::decoded_from_roles(&roles, provenance);
+    }
+    ChannelLayoutDescriptor::decoded(assignments, provenance)
+}
+
+fn assignment_from_symphonia_position(
+    position: symphonia::core::audio::Position,
+    role: ChannelRole,
+    index: usize,
+) -> ChannelAssignment {
+    let bits = position.bits();
+    if bits.count_ones() != 1 {
+        return ChannelAssignment::unassigned(index as u32);
+    }
+    let bit = bits.trailing_zeros() as u8;
+    let cicp = match bit {
+        4 if role == ChannelRole::positioned(-110, 0) => 4,
+        5 if role == ChannelRole::positioned(110, 0) => 5,
+        0..=17 => crate::channel_layout::wave_bit_to_cicp(bit),
+        18 => 26,
+        _ => return ChannelAssignment::unassigned(index as u32),
+    };
+    let assignment = ChannelAssignment::cicp(cicp);
+    if assignment.channel_role() == role {
+        assignment
+    } else {
+        ChannelAssignment::legacy_role(role)
+    }
+}
+
 fn standard_wave_roles_from_symphonia_sequence(sequence: &[u64]) -> Option<Vec<ChannelRole>> {
     let mut mask = 0_u32;
     let mut previous = None;
@@ -2155,6 +2392,23 @@ where
     )
 }
 
+/// Decode a descriptor-bound programme while supplying the effective exact
+/// channel layout before every PCM callback.
+pub fn decode_descriptor_stream_with_channel_layout<F>(
+    descriptor: &InputDescriptor,
+    mut consume: F,
+) -> Result<StreamInfo, String>
+where
+    F: FnMut(&StreamInfo, &ChannelLayoutDescriptor, &mut [Vec<f32>]) -> Result<(), String>,
+{
+    decode_descriptor_stream_with_layout(descriptor, |info, provenance, planar| {
+        if provenance != descriptor.channel_layout.provenance() {
+            return Err("descriptor exact layout provenance changed during decode".into());
+        }
+        consume(info, &descriptor.channel_layout, planar)
+    })
+}
+
 pub(crate) fn decode_descriptor_stream_with_layout_and_declared_frames<F>(
     descriptor: &InputDescriptor,
     mut consume: F,
@@ -2182,8 +2436,8 @@ where
             .frames
             .map_or(available, |frames| available.min(frames))
     });
-    let effective_provenance = if descriptor.explicit_channel_roles {
-        ChannelLayoutProvenance::KnownSpeakers
+    let effective_provenance = if descriptor.uses_explicit_channel_roles() {
+        descriptor.channel_layout.provenance()
     } else {
         descriptor.declared_layout_provenance
     };
@@ -2339,8 +2593,8 @@ where
         source_kind: wav.kind,
     };
     validate_descriptor_decode(descriptor, &decoded_info, provenance)?;
-    let effective_provenance = if descriptor.explicit_channel_roles {
-        ChannelLayoutProvenance::KnownSpeakers
+    let effective_provenance = if descriptor.uses_explicit_channel_roles() {
+        descriptor.channel_layout.provenance()
     } else {
         provenance
     };
@@ -2459,6 +2713,21 @@ pub fn decode_descriptor_limited_with_layout(
     ))
 }
 
+/// Bounded full-buffer descriptor decode with its effective exact layout.
+pub fn decode_descriptor_limited_with_channel_layout(
+    descriptor: &InputDescriptor,
+    max_decoded_samples: u64,
+) -> Result<(AudioBuffer, ChannelLayoutDescriptor), String> {
+    let (buffer, provenance) =
+        decode_descriptor_limited_with_layout(descriptor, max_decoded_samples)?;
+    if provenance != descriptor.channel_layout.provenance()
+        || descriptor.channel_layout.channel_count() != usize::from(buffer.channels)
+    {
+        return Err("descriptor exact layout does not match the decoded PCM stream".into());
+    }
+    Ok((buffer, descriptor.channel_layout.clone()))
+}
+
 fn validate_descriptor_decode(
     descriptor: &InputDescriptor,
     info: &StreamInfo,
@@ -2467,8 +2736,8 @@ fn validate_descriptor_decode(
     if info.sample_rate != descriptor.info.sample_rate
         || info.channels != descriptor.info.channels
         || info.source_kind != descriptor.info.source_kind
-        || info.channel_roles != descriptor.info.channel_roles && !descriptor.explicit_channel_roles
-        || provenance != descriptor.declared_layout_provenance
+        || info.channel_roles != descriptor.decoder_channel_roles
+        || provenance != descriptor.decoder_layout_provenance
     {
         return Err("decoded stream no longer matches its input descriptor".into());
     }
@@ -2740,6 +3009,9 @@ where
             )?;
             output.layout_provenance =
                 mpeg_channel_mode.constrain_provenance(output.layout_provenance);
+            output.channel_layout = output
+                .channel_layout
+                .with_provenance(output.layout_provenance);
             info = Some(StreamInfo {
                 sample_rate: output.sample_rate,
                 channels: output.channels,
@@ -3648,6 +3920,10 @@ mod tests {
             declared_layout: Some(CHANNEL_LAYOUT_STEREO.clone()),
             channel_roles: default_channel_roles(2),
             layout_provenance: ChannelLayoutProvenance::KnownSpeakers,
+            channel_layout: channel_layout_from_symphonia(
+                &CHANNEL_LAYOUT_STEREO,
+                ChannelLayoutProvenance::KnownSpeakers,
+            ),
             flac_channel_mask: FlacChannelMaskState::Absent,
             source_kind: PcmKind::F32,
         }
@@ -3974,6 +4250,27 @@ mod tests {
         assert_eq!(
             roles_from_symphonia(&CHANNEL_LAYOUT_STEREO),
             default_channel_roles(2)
+        );
+    }
+
+    #[test]
+    fn symphonia_five_one_keeps_cicp_bed_identity_and_compatibility_roles_aligned() {
+        let layout = channel_layout_from_symphonia(
+            &CHANNEL_LAYOUT_5P1,
+            ChannelLayoutProvenance::KnownSpeakers,
+        );
+        layout.validate().unwrap();
+        assert_eq!(
+            layout.channel_roles(),
+            roles_from_symphonia(&CHANNEL_LAYOUT_5P1)
+        );
+        assert_eq!(
+            layout
+                .assignments()
+                .iter()
+                .map(ChannelAssignment::cicp_position)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1), Some(2), Some(3), Some(4), Some(5)]
         );
     }
 
@@ -5204,6 +5501,52 @@ mod tests {
         .unwrap();
         assert_eq!(info.channels, 4);
         assert!(callbacks > 0);
+    }
+
+    #[test]
+    fn input_descriptor_retains_exact_wave_layout_and_rejects_source_as_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("non-default.wav");
+        let exact = ChannelLayoutDescriptor::wave(4, true, Some(0x0000_5003));
+        let buffer = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 4,
+            frames: 32,
+            data: vec![vec![0.0; 32]; 4],
+            channel_roles: exact.channel_roles(),
+            source_kind: PcmKind::S16,
+        };
+        crate::wav::WavWriter::write_with_channel_layout(
+            &input,
+            &buffer,
+            PcmKind::S16,
+            false,
+            crate::wav::WavContainer::Riff,
+            &exact,
+        )
+        .unwrap();
+
+        let stable = StableInputOptions::new(u64::MAX).unwrap();
+        let descriptor =
+            InputDescriptor::from_path(&input, &stable, InputDescriptorOptions::default()).unwrap();
+        assert_eq!(descriptor.version(), 2);
+        assert!(descriptor
+            .decoder_route_id()
+            .starts_with("forge-input-descriptor-v2:"));
+        assert_eq!(descriptor.declared_channel_layout(), &exact);
+        assert_eq!(descriptor.channel_layout(), &exact);
+        assert_eq!(
+            descriptor.channel_layout().wave_channel_mask(),
+            Some(0x5003)
+        );
+
+        let error = InputDescriptor::from_path(
+            &input,
+            &stable,
+            InputDescriptorOptions::default().with_channel_layout(exact),
+        )
+        .unwrap_err();
+        assert!(error.contains("explicit-override origin"));
     }
 
     #[test]

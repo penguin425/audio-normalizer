@@ -50,7 +50,7 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<bool, String> {
-    let report = mpegh_adapter::run(&AdapterOptions {
+    let report = mpegh_adapter::run_v2(&AdapterOptions {
         input: cli.input,
         adapter: cli.adapter,
         timeout_seconds: cli.timeout_seconds,
@@ -60,7 +60,7 @@ fn run(cli: Cli) -> Result<bool, String> {
     })?;
     let passed = report.passed;
     let presentation_count = report.presentation_count;
-    mpegh_adapter::write_report(&cli.output, &report, cli.compact, cli.overwrite)?;
+    mpegh_adapter::write_report_v2(&cli.output, &report, cli.compact, cli.overwrite)?;
     eprintln!(
         "forge-mpegh-qc: {} ({presentation_count} presentations)",
         if passed { "PASS" } else { "FAIL" }

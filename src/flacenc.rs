@@ -1,5 +1,6 @@
 //! Bounded-memory, pure-Rust FLAC output.
 
+use crate::channel_layout::{default_flac_channel_mask, ChannelLayoutDescriptor};
 use crate::dsp::convert;
 use crate::wav::{MAX_DECODE_SAMPLE_RATE_HZ, MIN_DECODE_SAMPLE_RATE_HZ};
 use flacenc::bitsink::ByteSink;
@@ -49,6 +50,7 @@ pub struct FlacStreamWriter {
     rngs: Vec<u64>,
     dither: bool,
     parallel_tasks: usize,
+    channel_mask: Option<u32>,
     finalized: bool,
 }
 
@@ -59,6 +61,35 @@ impl FlacStreamWriter {
         channels: u16,
         bits: u16,
         dither: bool,
+    ) -> Result<Self, String> {
+        Self::create_inner(path, sample_rate, channels, bits, dither, None)
+    }
+
+    /// Create a FLAC writer that preserves an exact RFC 9639 channel mask.
+    /// Default layouts omit the redundant comment; non-default, zero, and
+    /// partial masks are written as `WAVEFORMATEXTENSIBLE_CHANNEL_MASK`.
+    pub fn create_with_channel_layout(
+        path: &Path,
+        sample_rate: u32,
+        bits: u16,
+        dither: bool,
+        channel_layout: &ChannelLayoutDescriptor,
+    ) -> Result<Self, String> {
+        channel_layout.validate()?;
+        let channels = u16::try_from(channel_layout.channel_count())
+            .map_err(|_| "too many FLAC channels".to_string())?;
+        let mask = crate::wav::writer::channel_mask_from_descriptor(channel_layout)
+            .map_err(|error| error.to_string())?;
+        Self::create_inner(path, sample_rate, channels, bits, dither, Some(mask))
+    }
+
+    fn create_inner(
+        path: &Path,
+        sample_rate: u32,
+        channels: u16,
+        bits: u16,
+        dither: bool,
+        requested_channel_mask: Option<u32>,
     ) -> Result<Self, String> {
         if !(MIN_DECODE_SAMPLE_RATE_HZ..=MAX_DECODE_SAMPLE_RATE_HZ).contains(&sample_rate) {
             return Err(format!(
@@ -73,6 +104,11 @@ impl FlacStreamWriter {
         if !matches!(bits, 16 | 24) {
             return Err(format!("FLAC output supports 16 or 24 bits, got {bits}"));
         }
+        if requested_channel_mask.is_some_and(|mask| mask.count_ones() > u32::from(channels)) {
+            return Err("FLAC channel mask assigns more speakers than the stream contains".into());
+        }
+        let channel_mask = requested_channel_mask
+            .filter(|mask| Some(*mask) != default_flac_channel_mask(channels));
         let config = EncoderConfig::default()
             .into_verified()
             .map_err(|(_, error)| error.to_string())?;
@@ -105,6 +141,7 @@ impl FlacStreamWriter {
             } else {
                 rayon::current_num_threads().clamp(1, MAX_PARALLEL_TASKS)
             },
+            channel_mask,
             finalized: false,
         };
         let header = writer.header()?;
@@ -321,8 +358,42 @@ impl FlacStreamWriter {
         let stream = Stream::with_stream_info(info);
         let mut sink = ByteSink::new();
         stream.write(&mut sink).map_err(|error| error.to_string())?;
-        Ok(sink.into_inner())
+        let mut header = sink.into_inner();
+        if let Some(mask) = self.channel_mask {
+            append_channel_mask_comment(&mut header, mask)?;
+        }
+        Ok(header)
     }
+}
+
+fn append_channel_mask_comment(header: &mut Vec<u8>, mask: u32) -> Result<(), String> {
+    if header.len() < 8 || &header[..4] != b"fLaC" || header[4] & 0x7f != 0 {
+        return Err("FLAC encoder produced an invalid STREAMINFO header".into());
+    }
+    header[4] &= 0x7f;
+    let vendor = b"forge-normalizer";
+    let comment = format!("WAVEFORMATEXTENSIBLE_CHANNEL_MASK=0x{mask:08x}");
+    let body_len = 4_usize
+        .checked_add(vendor.len())
+        .and_then(|value| value.checked_add(4))
+        .and_then(|value| value.checked_add(4))
+        .and_then(|value| value.checked_add(comment.len()))
+        .ok_or_else(|| "FLAC Vorbis-comment size overflow".to_string())?;
+    if body_len > 0x00ff_ffff {
+        return Err("FLAC Vorbis-comment block exceeds 24-bit length".into());
+    }
+    header.push(0x80 | 4);
+    header.extend_from_slice(&[
+        ((body_len >> 16) & 0xff) as u8,
+        ((body_len >> 8) & 0xff) as u8,
+        (body_len & 0xff) as u8,
+    ]);
+    header.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+    header.extend_from_slice(vendor);
+    header.extend_from_slice(&1_u32.to_le_bytes());
+    header.extend_from_slice(&(comment.len() as u32).to_le_bytes());
+    header.extend_from_slice(comment.as_bytes());
+    Ok(())
 }
 
 impl Drop for FlacStreamWriter {
@@ -336,6 +407,8 @@ impl Drop for FlacStreamWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channel_layout::ChannelLayoutDescriptor;
+    use crate::wav::{default_channel_roles, ChannelLayoutProvenance};
 
     #[test]
     fn unsupported_sample_rates_preserve_existing_destination() {
@@ -352,6 +425,68 @@ mod tests {
             );
             assert_eq!(std::fs::read(&path).unwrap(), b"existing destination");
         }
+    }
+
+    #[test]
+    fn non_default_partial_and_zero_masks_round_trip_through_flac() {
+        let directory = tempfile::tempdir().unwrap();
+        for (channels, mask) in [(4, 0x5003), (6, 0x0003), (4, 0)] {
+            let path = directory.path().join(format!("mask-{mask:08x}.flac"));
+            let layout = ChannelLayoutDescriptor::wave(channels, true, Some(mask));
+            let mut writer =
+                FlacStreamWriter::create_with_channel_layout(&path, 48_000, 16, false, &layout)
+                    .unwrap();
+            writer
+                .write_chunk(&vec![vec![0.0; 64]; usize::from(channels)])
+                .unwrap();
+            writer.finish().unwrap();
+
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(bytes
+                .windows(b"WAVEFORMATEXTENSIBLE_CHANNEL_MASK".len())
+                .any(|window| window == b"WAVEFORMATEXTENSIBLE_CHANNEL_MASK"));
+            let (decoded, exact) = crate::decoder::decode_with_channel_layout(&path).unwrap();
+            assert_eq!(decoded.channels, channels);
+            assert_eq!(exact.flac_channel_mask(), Some(mask));
+            assert_eq!(exact.assignments(), layout.assignments());
+            assert_eq!(exact.provenance(), layout.provenance());
+        }
+    }
+
+    #[test]
+    fn implicit_legacy_stereo_remains_the_rfc_default_layout() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stereo.flac");
+        let layout = ChannelLayoutDescriptor::decoded_from_roles(
+            &default_channel_roles(2),
+            ChannelLayoutProvenance::KnownSpeakers,
+        );
+        let mut writer =
+            FlacStreamWriter::create_with_channel_layout(&path, 48_000, 16, false, &layout)
+                .unwrap();
+        writer.write_chunk(&vec![vec![0.0; 64]; 2]).unwrap();
+        writer.finish().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!bytes
+            .windows(b"WAVEFORMATEXTENSIBLE_CHANNEL_MASK".len())
+            .any(|window| window == b"WAVEFORMATEXTENSIBLE_CHANNEL_MASK"));
+        let (_, exact) = crate::decoder::decode_with_channel_layout(&path).unwrap();
+        assert_eq!(exact.provenance(), ChannelLayoutProvenance::KnownSpeakers);
+        assert_eq!(exact.flac_channel_mask(), None);
+    }
+
+    #[test]
+    fn invalid_exact_mask_does_not_clobber_flac_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing.flac");
+        std::fs::write(&path, b"existing destination").unwrap();
+        let layout = ChannelLayoutDescriptor::wave(2, true, Some(0x7));
+        assert!(
+            FlacStreamWriter::create_with_channel_layout(&path, 48_000, 16, false, &layout,)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing destination");
     }
 
     fn encoded_with_threads(threads: usize, chunks: &[usize], bits: u16, dither: bool) -> Vec<u8> {

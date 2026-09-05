@@ -6,19 +6,33 @@ model payloads, or user-controlled labels.
 
 ## Analysis response versions
 
-Send an audio file as the request body to `POST /v2/analyze`, with its basename
-in `X-Forge-Filename`. The current v2 response records the measurement engine
-and algorithm revision. Decibel-domain fields use a finite JSON number,
+Send an audio file as the request body to `POST /v3/analyze`, with its basename
+in `X-Forge-Filename`. The v3 response records the measurement engine,
+algorithm revision, and effective exact channel layout. Decibel-domain fields use a finite JSON number,
 `"-inf"` for measured digital silence, and `null` when a measurement is
 undefined. The legacy `/v1/analyze` endpoint remains available, but returns
-HTTP 422 when its older finite-number-only contract cannot represent a result.
+HTTP 422 when its older finite-number-only contract cannot represent a result;
+`/v2/analyze` retains its immutable response shape.
 
 ```bash
 curl --fail --data-binary @programme.wav \
   -H 'Content-Type: audio/wav' \
   -H 'X-Forge-Filename: programme.wav' \
-  http://127.0.0.1:8080/v2/analyze
+  http://127.0.0.1:8080/v3/analyze
 ```
+
+When source metadata is ambiguous, v3 accepts a bounded
+`X-Forge-Channel-Layout` header containing a
+[`channel-layout-v1`](schema/channel-layout-v1.schema.json) JSON object with
+origin `explicit-override`. The gRPC equivalent is exposed additively by the
+`ForgeAnalysisV3/Analyze` RPC as `AnalyzeV3Request.channel_layout_json` and
+`AnalyzeV3Response.channel_layout_json`. The original `ForgeAnalysis` service
+and `AnalyzeRequest`/`AnalyzeResponse` messages retain their v1 fields. Both
+analysis services share cancellation IDs, health state, and metrics. Older
+REST routes reject the override header so their semantics cannot change
+silently. REST accepts at most 8 KiB in this header; gRPC accepts at most 256
+KiB for the override. Local C, Python, Wasm, and Rust descriptor APIs use the
+format-wide 16 MiB ceiling.
 
 ## Prometheus
 

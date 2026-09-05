@@ -60,18 +60,48 @@ channels, not bytes, and must be an integer in `1..=2**64 - 1`. The example
 allows at most one hour of 48 kHz stereo audio. Forge fails the operation if
 the decoded input exceeds the limit.
 
-File analysis also requires an authoritative physical-speaker layout. Classic
+`analyze_file` requires an authoritative physical-speaker layout. Classic
 mono/stereo WAVE and supported formats with canonical layouts work directly;
-maskless or partially masked multichannel WAVE, dual-channel MPEG audio, and
-scene-based audio raise `AnalysisError`. The Python/C ABI v1 surface has no
-layout override, so use the native Rust or CLI layout-aware workflow when
-external metadata supplies the missing speaker assignment.
+ambiguous or scene-based inputs raise `AnalysisError`.
+
+Use `analyze_file_with_layout` to obtain the effective exact descriptor or to
+supply an external speaker assignment:
+
+```python
+from forge_normalizer import analyze_file_with_layout
+
+result = analyze_file_with_layout(
+    "maskless.wav",
+    max_decoded_samples=48_000 * 6 * 60,
+    channel_layout={
+        "version": 1,
+        "assignments": [
+            {"kind": "legacy-role", "role": role}
+            for role in ["main", "main", "main", "lfe", "surround", "surround"]
+        ],
+        "provenance": "known-speakers",
+        "origin": "explicit-override",
+    },
+)
+print(result.channel_layout)
+```
+
+The override must conform to
+[`channel-layout-v1`](schema/channel-layout-v1.schema.json), identify every
+physical speaker, contain the decoded channel count, and use
+`explicit-override` without source or renderer evidence. Passing no override
+returns the exact source-derived descriptor. This additive function requires a
+v0.189.9-or-newer native library; the original `analyze_file` remains usable
+with earlier compatible C ABI v1 libraries. Descriptor JSON is bounded at
+16 MiB; the binding automatically retries with the exact returned output size
+when the normal 256 KiB buffer is insufficient.
 
 `path` and an optional `library` argument accept `str` or string-valued
 `os.PathLike` objects. Paths cross the C boundary as UTF-8. Byte paths and
 paths containing a NUL character are rejected.
 
-The returned `Analysis` is an immutable dataclass with these fields:
+The returned `Analysis` is an immutable dataclass with these fields.
+`AnalysisWithLayout` adds a `channel_layout` dictionary:
 
 | Field | Type | Unit or meaning |
 | --- | --- | --- |

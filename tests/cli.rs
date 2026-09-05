@@ -89,7 +89,7 @@ fn sqlite_catalogue_records_normalization_hashes_and_exports_provenance() {
     let report_value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
     let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/catalogue-report-v2.schema.json")).unwrap();
+        serde_json::from_str(include_str!("../schema/catalogue-report-v3.schema.json")).unwrap();
     assert!(jsonschema::validator_for(&schema)
         .unwrap()
         .is_valid(&report_value));
@@ -465,7 +465,7 @@ fn content_addressed_analysis_cache_is_reused_by_real_normalization() {
     assert!(String::from_utf8_lossy(&normalize.stderr).contains("analysis cache hit"));
     assert!(output.is_file());
 
-    let prefix = std::fs::read_dir(cache.join("v4"))
+    let prefix = std::fs::read_dir(cache.join("v5"))
         .unwrap()
         .next()
         .unwrap()
@@ -486,7 +486,7 @@ fn content_addressed_analysis_cache_is_reused_by_real_normalization() {
     let instance: serde_json::Value =
         serde_json::from_slice(&std::fs::read(entry).unwrap()).unwrap();
     let schema: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/analysis-cache-v4.schema.json")).unwrap();
+        serde_json::from_str(include_str!("../schema/analysis-cache-v5.schema.json")).unwrap();
     assert!(jsonschema::validator_for(&schema)
         .unwrap()
         .is_valid(&instance));
@@ -512,7 +512,7 @@ fn dry_run_does_not_populate_analysis_cache_without_warm_cache() {
         String::from_utf8_lossy(&dry_run.stderr)
     );
     assert!(String::from_utf8_lossy(&dry_run.stderr).contains("miss; read-only"));
-    assert!(!cache.join("v4").exists());
+    assert!(!cache.join("v5").exists());
 
     let tag_dry_run = Command::new(env!("CARGO_BIN_EXE_forge"))
         .arg(&input)
@@ -528,7 +528,7 @@ fn dry_run_does_not_populate_analysis_cache_without_warm_cache() {
         String::from_utf8_lossy(&tag_dry_run.stderr)
     );
     assert!(String::from_utf8_lossy(&tag_dry_run.stderr).contains("miss; read-only"));
-    assert!(!cache.join("v4").exists());
+    assert!(!cache.join("v5").exists());
 }
 
 #[test]
@@ -570,7 +570,7 @@ fn reference_analysis_reports_engine_identity_and_uses_an_isolated_cache_entry()
         .unwrap();
     assert!(fast.status.success());
     let mut entry_count = 0;
-    for prefix in std::fs::read_dir(cache.join("v4")).unwrap() {
+    for prefix in std::fs::read_dir(cache.join("v5")).unwrap() {
         for content in std::fs::read_dir(prefix.unwrap().path()).unwrap() {
             entry_count += std::fs::read_dir(content.unwrap().path())
                 .unwrap()
@@ -1713,7 +1713,7 @@ fn selected_audio_track_drives_the_measured_programme() {
         "track selection was not reflected in loudness: quiet={quiet_lufs}, loud={loud_lufs}"
     );
     let mut entry_count = 0;
-    for prefix in std::fs::read_dir(cache.join("v4")).unwrap() {
+    for prefix in std::fs::read_dir(cache.join("v5")).unwrap() {
         for content in std::fs::read_dir(prefix.unwrap().path()).unwrap() {
             entry_count += std::fs::read_dir(content.unwrap().path())
                 .unwrap()

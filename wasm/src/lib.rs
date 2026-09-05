@@ -9,12 +9,15 @@
 
 #[path = "../../src/analysis.rs"]
 mod analysis;
+#[path = "../../src/channel_layout.rs"]
+mod channel_layout;
 #[path = "../../src/dsp/mod.rs"]
 mod dsp;
 #[path = "../../src/wav/mod.rs"]
 mod wav;
 
 use analysis::Analysis;
+use channel_layout::ChannelLayoutDescriptor;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use wav::{
@@ -51,6 +54,14 @@ struct BrowserAnalysis {
     peak_to_loudness_ratio_lu: Option<f64>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserAnalysisWithLayout<'a> {
+    #[serde(flatten)]
+    analysis: BrowserAnalysis,
+    channel_layout: &'a ChannelLayoutDescriptor,
+}
+
 impl From<&Analysis> for BrowserAnalysis {
     fn from(value: &Analysis) -> Self {
         Self {
@@ -79,6 +90,17 @@ fn finite(value: f64) -> Option<f64> {
 fn serialize(value: &Analysis) -> Result<String, JsValue> {
     serde_json::to_string(&BrowserAnalysis::from(value))
         .map_err(|error| JsValue::from_str(&format!("could not serialize analysis: {error}")))
+}
+
+fn serialize_with_layout(
+    value: &Analysis,
+    layout: &ChannelLayoutDescriptor,
+) -> Result<String, JsValue> {
+    serde_json::to_string(&BrowserAnalysisWithLayout {
+        analysis: BrowserAnalysis::from(value),
+        channel_layout: layout,
+    })
+    .map_err(|error| JsValue::from_str(&format!("could not serialize analysis: {error}")))
 }
 
 fn validate_sample_rate(sample_rate: u32) -> Result<(), &'static str> {
@@ -147,6 +169,32 @@ fn decode_wav_input(bytes: &[u8]) -> Result<AudioBuffer, String> {
     Ok(buffer)
 }
 
+fn decode_wav_input_with_layout(
+    bytes: &[u8],
+    override_json: Option<&str>,
+) -> Result<(AudioBuffer, ChannelLayoutDescriptor), String> {
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err("input exceeds the 134217728-byte browser safety limit".into());
+    }
+    let (mut buffer, declared_layout) = WavReader::read_bytes_with_channel_layout_and_limits(
+        bytes,
+        MAX_CHANNELS,
+        MAX_DECODED_SAMPLES,
+    )
+    .map_err(|error| format!("could not decode WAVE input: {error}"))?;
+    let effective_layout = if let Some(json) = override_json {
+        let layout = ChannelLayoutDescriptor::from_json(json)?;
+        layout.validate_override_for_channels(buffer.channels)?;
+        buffer.channel_roles = layout.channel_roles();
+        layout
+    } else {
+        validate_wave_layout(declared_layout.provenance()).map_err(str::to_owned)?;
+        declared_layout
+    };
+    validate_buffer(&buffer).map_err(str::to_owned)?;
+    Ok((buffer, effective_layout))
+}
+
 /// Forge package version.
 #[wasm_bindgen]
 pub fn version() -> String {
@@ -166,6 +214,17 @@ pub fn limits_json() -> String {
 pub fn analyze_wav_json(bytes: &[u8]) -> Result<String, JsValue> {
     let buffer = decode_wav_input(bytes).map_err(|error| JsValue::from_str(&error))?;
     serialize(&analysis::analyze(&buffer))
+}
+
+/// Decode and analyze WAVE while returning or overriding its exact layout.
+#[wasm_bindgen]
+pub fn analyze_wav_with_layout_json(
+    bytes: &[u8],
+    channel_layout_json: Option<String>,
+) -> Result<String, JsValue> {
+    let (buffer, layout) = decode_wav_input_with_layout(bytes, channel_layout_json.as_deref())
+        .map_err(|error| JsValue::from_str(&error))?;
+    serialize_with_layout(&analysis::analyze(&buffer), &layout)
 }
 
 /// Analyze interleaved Float32 PCM supplied by Web Audio or another decoder.
@@ -208,6 +267,63 @@ pub fn analyze_interleaved_json(
     };
     validate_buffer_metadata(&buffer).map_err(JsValue::from_str)?;
     serialize(&analysis::analyze(&buffer))
+}
+
+/// Analyze interleaved PCM with an optional exact speaker-layout override.
+#[wasm_bindgen]
+pub fn analyze_interleaved_with_layout_json(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+    channel_layout_json: Option<String>,
+) -> Result<String, JsValue> {
+    validate_sample_rate(sample_rate).map_err(JsValue::from_str)?;
+    if channels == 0 || channels > MAX_CHANNELS {
+        return Err(JsValue::from_str("channels must be in 1..=32"));
+    }
+    if samples.len() > MAX_DECODED_SAMPLES {
+        return Err(JsValue::from_str(
+            "decoded audio exceeds the 24000000-sample browser safety limit",
+        ));
+    }
+    if !samples.len().is_multiple_of(channels as usize) {
+        return Err(JsValue::from_str(
+            "interleaved sample count must be divisible by channels",
+        ));
+    }
+    validate_finite_samples(samples).map_err(JsValue::from_str)?;
+
+    let layout = if let Some(json) = channel_layout_json.as_deref() {
+        let layout =
+            ChannelLayoutDescriptor::from_json(json).map_err(|error| JsValue::from_str(&error))?;
+        layout
+            .validate_override_for_channels(channels)
+            .map_err(|error| JsValue::from_str(&error))?;
+        layout
+    } else {
+        validate_interleaved_channels(channels).map_err(JsValue::from_str)?;
+        ChannelLayoutDescriptor::from_channel_roles(default_channel_roles(channels))
+            .map_err(|error| JsValue::from_str(&error))?
+    };
+    let frames = samples.len() / channels as usize;
+    let mut planar = (0..channels)
+        .map(|_| Vec::with_capacity(frames))
+        .collect::<Vec<_>>();
+    for frame in samples.chunks_exact(channels as usize) {
+        for (channel, sample) in planar.iter_mut().zip(frame) {
+            channel.push(*sample);
+        }
+    }
+    let buffer = AudioBuffer {
+        sample_rate,
+        channels,
+        frames,
+        data: planar,
+        channel_roles: layout.channel_roles(),
+        source_kind: PcmKind::F32,
+    };
+    validate_buffer_metadata(&buffer).map_err(JsValue::from_str)?;
+    serialize_with_layout(&analysis::analyze(&buffer), &layout)
 }
 
 #[cfg(test)]

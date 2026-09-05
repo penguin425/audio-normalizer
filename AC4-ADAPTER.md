@@ -63,10 +63,14 @@ Absolute paths, `..`, symlink escapes, duplicate IDs, duplicate render paths,
 unsupported presentation versions, stale input hashes, and changed input bytes
 are rejected.
 
-The report follows `schema/ac4-adapter-report-v1.schema.json` and records the
+The report follows `schema/ac4-adapter-report-v2.schema.json` and records the
 input, adapter, and render SHA-256 values; decoder and ETSI versions; decoded
 geometry; measured integrated loudness and true peak; dialnorm drift; optional
-true-peak gating; and per-presentation plus aggregate pass/fail results.
+true-peak gating; and per-presentation plus aggregate pass/fail results. Every
+measurement also carries an exact output-layout descriptor bound to the
+decoder name/version, output configuration, adapter executable hash, and
+adapter-response settings hash. Report v1 remains available for historical
+validation.
 Exit status is 0 for PASS, 1 for completed QC failure, and 2 for invalid input,
 adapter/protocol failure, or unsafe output.
 

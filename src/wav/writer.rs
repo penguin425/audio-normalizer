@@ -1,5 +1,8 @@
 //! RIFF/WAVE, RF64, and BW64 streaming muxer.
 
+use crate::channel_layout::{
+    ChannelAssignment, ChannelAssignmentKind, ChannelLayoutDescriptor, ChannelLayoutOrigin,
+};
 use crate::dsp::convert;
 use crate::wav::{
     default_channel_roles, named_channel_layout, AudioBuffer, ChannelRole, PcmKind,
@@ -127,6 +130,111 @@ impl WavStreamWriter {
         channel_roles: &[ChannelRole],
         metadata_chunks: &[WaveChunk],
     ) -> Result<Self, WavWriteError> {
+        Self::create_with_metadata_and_mask(
+            path,
+            sample_rate,
+            channels,
+            frames,
+            kind,
+            dither,
+            requested_container,
+            channel_roles,
+            metadata_chunks,
+            None,
+        )
+    }
+
+    /// Create a streaming WAVE writer from an exact channel-layout sidecar.
+    ///
+    /// A raw WAVE or RFC 9639 FLAC mask is reused byte-for-byte, including
+    /// zero and partial masks. Other complete speaker layouts are converted to
+    /// a WAVE mask only when every assignment has an exact representation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_channel_layout(
+        path: &Path,
+        sample_rate: u32,
+        frames: usize,
+        kind: PcmKind,
+        dither: bool,
+        requested_container: WavContainer,
+        channel_layout: &ChannelLayoutDescriptor,
+    ) -> Result<Self, WavWriteError> {
+        Self::create_with_channel_layout_and_metadata(
+            path,
+            sample_rate,
+            frames,
+            kind,
+            dither,
+            requested_container,
+            channel_layout,
+            &[],
+        )
+    }
+
+    /// Create a streaming WAVE writer with exact layout and metadata chunks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_channel_layout_and_metadata(
+        path: &Path,
+        sample_rate: u32,
+        frames: usize,
+        kind: PcmKind,
+        dither: bool,
+        requested_container: WavContainer,
+        channel_layout: &ChannelLayoutDescriptor,
+        metadata_chunks: &[WaveChunk],
+    ) -> Result<Self, WavWriteError> {
+        channel_layout
+            .validate()
+            .map_err(|error| WavWriteError::Io(io::Error::other(error)))?;
+        let channels = u16::try_from(channel_layout.assignments().len())
+            .map_err(|_| WavWriteError::Io(io::Error::other("too many WAVE channels")))?;
+        let roles = channel_layout.channel_roles();
+        // Conventional mono/stereo has a normative implicit assignment in a
+        // non-extensible WAVE header. Keep it implicit whenever an exact
+        // descriptor without explicit mask evidence resolves to that default,
+        // including RFC 9639 FLAC's implicit channel order. Converting it into
+        // an extensible header would needlessly change established output
+        // bytes even though it carries no additional layout information.
+        let implicit_default_layout = channels <= 2
+            && channel_layout.wave_channel_mask().is_none()
+            && channel_layout.flac_channel_mask().is_none()
+            && channel_mask_from_descriptor(channel_layout).is_ok_and(|mask| {
+                Some(mask) == crate::channel_layout::default_flac_channel_mask(channels)
+            });
+        let unmasked_wave_source = channel_layout.origin() == ChannelLayoutOrigin::Wave
+            && channel_layout.wave_channel_mask().is_none();
+        let mask = if implicit_default_layout || unmasked_wave_source {
+            None
+        } else {
+            Some(channel_mask_from_descriptor(channel_layout)?)
+        };
+        Self::create_with_metadata_and_mask(
+            path,
+            sample_rate,
+            channels,
+            frames,
+            kind,
+            dither,
+            requested_container,
+            &roles,
+            metadata_chunks,
+            mask,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_with_metadata_and_mask(
+        path: &Path,
+        sample_rate: u32,
+        channels: u16,
+        frames: usize,
+        kind: PcmKind,
+        dither: bool,
+        requested_container: WavContainer,
+        channel_roles: &[ChannelRole],
+        metadata_chunks: &[WaveChunk],
+        exact_channel_mask: Option<u32>,
+    ) -> Result<Self, WavWriteError> {
         if channels == 0 || frames == 0 {
             return Err(WavWriteError::Empty);
         }
@@ -139,7 +247,13 @@ impl WavStreamWriter {
             .checked_mul(channels as u64)
             .and_then(|samples| samples.checked_mul(kind.bytes_per_sample() as u64))
             .ok_or_else(|| WavWriteError::Io(io::Error::other("audio data size overflow")))?;
-        let fmt = format_chunk(sample_rate, channels, kind, channel_roles)?;
+        let fmt = format_chunk(
+            sample_rate,
+            channels,
+            kind,
+            channel_roles,
+            exact_channel_mask,
+        )?;
         let metadata_size = validate_metadata_chunks(metadata_chunks)?;
         let riff_payload_size =
             4_u64
@@ -386,6 +500,77 @@ impl WavWriter {
         writer.write_chunk(&buffer.data)?;
         writer.finish()
     }
+
+    /// Write a complete buffer while preserving an exact channel-layout
+    /// declaration.
+    pub fn write_with_channel_layout<P: AsRef<Path>>(
+        path: P,
+        buffer: &AudioBuffer,
+        kind: PcmKind,
+        dither: bool,
+        container: WavContainer,
+        channel_layout: &ChannelLayoutDescriptor,
+    ) -> Result<(), WavWriteError> {
+        Self::write_with_channel_layout_and_metadata(
+            path,
+            buffer,
+            kind,
+            dither,
+            container,
+            channel_layout,
+            &[],
+        )
+    }
+
+    /// Write a complete buffer with an exact layout and metadata chunks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_with_channel_layout_and_metadata<P: AsRef<Path>>(
+        path: P,
+        buffer: &AudioBuffer,
+        kind: PcmKind,
+        dither: bool,
+        container: WavContainer,
+        channel_layout: &ChannelLayoutDescriptor,
+        metadata_chunks: &[WaveChunk],
+    ) -> Result<(), WavWriteError> {
+        validate_audio_buffer(buffer)?;
+        if channel_layout.assignments().len() != usize::from(buffer.channels) {
+            return Err(WavWriteError::Io(io::Error::other(
+                "channel-layout count does not match audio buffer",
+            )));
+        }
+        if channel_layout.channel_roles() != buffer.channel_roles {
+            return Err(WavWriteError::Io(io::Error::other(
+                "channel layout does not match audio buffer roles",
+            )));
+        }
+        let mut writer = WavStreamWriter::create_with_channel_layout_and_metadata(
+            path.as_ref(),
+            buffer.sample_rate,
+            buffer.frames,
+            kind,
+            dither,
+            container,
+            channel_layout,
+            metadata_chunks,
+        )?;
+        writer.write_chunk(&buffer.data)?;
+        writer.finish()
+    }
+}
+
+fn validate_audio_buffer(buffer: &AudioBuffer) -> Result<(), WavWriteError> {
+    if buffer.data.len() != usize::from(buffer.channels)
+        || buffer
+            .data
+            .iter()
+            .any(|channel| channel.len() != buffer.frames)
+    {
+        return Err(WavWriteError::Io(io::Error::other(
+            "audio buffer geometry does not match its channel/frame declaration",
+        )));
+    }
+    Ok(())
 }
 
 fn write_container_header(
@@ -426,6 +611,7 @@ fn format_chunk(
     channels: u16,
     kind: PcmKind,
     roles: &[ChannelRole],
+    exact_channel_mask: Option<u32>,
 ) -> io::Result<Vec<u8>> {
     if !(MIN_DECODE_SAMPLE_RATE_HZ..=MAX_DECODE_SAMPLE_RATE_HZ).contains(&sample_rate) {
         return Err(io::Error::other(
@@ -447,7 +633,7 @@ fn format_chunk(
     let bytes_per_second = sample_rate
         .checked_mul(block_align as u32)
         .ok_or_else(|| io::Error::other("WAV byte rate overflow"))?;
-    let extensible = channels > 2;
+    let extensible = channels > 2 || exact_channel_mask.is_some();
     let mut body = Vec::with_capacity(if extensible { 40 } else { 16 });
     body.extend_from_slice(&if extensible { 0xfffeu16 } else { real_tag }.to_le_bytes());
     body.extend_from_slice(&channels.to_le_bytes());
@@ -458,7 +644,11 @@ fn format_chunk(
     if extensible {
         body.extend_from_slice(&22u16.to_le_bytes());
         body.extend_from_slice(&bits.to_le_bytes());
-        body.extend_from_slice(&channel_mask(roles)?.to_le_bytes());
+        let mask = match exact_channel_mask {
+            Some(mask) => mask,
+            None => channel_mask(roles)?,
+        };
+        body.extend_from_slice(&mask.to_le_bytes());
         body.extend_from_slice(&real_tag.to_le_bytes());
         body.extend_from_slice(&0u16.to_le_bytes());
         body.extend_from_slice(&[
@@ -470,6 +660,121 @@ fn format_chunk(
     chunk.extend_from_slice(&(body.len() as u32).to_le_bytes());
     chunk.extend_from_slice(&body);
     Ok(chunk)
+}
+
+pub(crate) fn channel_mask_from_descriptor(layout: &ChannelLayoutDescriptor) -> io::Result<u32> {
+    let channels = layout.assignments().len();
+    if let Some(mask) = layout.wave_channel_mask().or(layout.flac_channel_mask()) {
+        if mask.count_ones() as usize > channels {
+            return Err(io::Error::other(
+                "channel mask assigns more speakers than the channel layout contains",
+            ));
+        }
+        return Ok(mask);
+    }
+    if channels <= 2
+        && layout
+            .assignments()
+            .iter()
+            .all(|assignment| assignment.kind() == ChannelAssignmentKind::LegacyRole)
+        && layout.channel_roles() == default_channel_roles(channels as u16)
+    {
+        return crate::channel_layout::default_flac_channel_mask(channels as u16)
+            .ok_or_else(|| io::Error::other("implicit channel layout has no WAVE mask"));
+    }
+
+    let mut mask = 0_u32;
+    let mut exact = true;
+    for assignment in layout.assignments() {
+        let bit = wave_bit_from_assignment(assignment);
+        let Some(bit) = bit else {
+            exact = false;
+            break;
+        };
+        let flag = 1_u32 << bit;
+        if mask & flag != 0 {
+            return Err(io::Error::other(
+                "channel layout assigns the same WAVE speaker more than once",
+            ));
+        }
+        mask |= flag;
+    }
+    if exact {
+        return Ok(mask);
+    }
+
+    channel_mask(&layout.channel_roles())
+}
+
+fn wave_bit_from_assignment(assignment: &ChannelAssignment) -> Option<u8> {
+    if let Some(position) = assignment.cicp_position() {
+        return cicp_to_wave_bit(position);
+    }
+    match assignment.kind() {
+        ChannelAssignmentKind::LowFrequencyEffects => Some(3),
+        ChannelAssignmentKind::Speaker => {
+            wave_bit_from_coordinates(assignment.azimuth_degrees(), assignment.elevation_degrees())
+        }
+        ChannelAssignmentKind::LegacyRole => match assignment.channel_role() {
+            ChannelRole::Lfe => Some(3),
+            ChannelRole::Positioned {
+                azimuth_degrees,
+                elevation_degrees,
+            } => wave_bit_from_coordinates(Some(azimuth_degrees), Some(elevation_degrees)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+const fn wave_bit_from_coordinates(
+    azimuth_degrees: Option<i16>,
+    elevation_degrees: Option<i16>,
+) -> Option<u8> {
+    match (azimuth_degrees, elevation_degrees) {
+        (Some(-30), Some(0)) => Some(0),
+        (Some(30), Some(0)) => Some(1),
+        (Some(0), Some(0)) => Some(2),
+        (Some(-135 | -150), Some(0)) => Some(4),
+        (Some(135 | 150), Some(0)) => Some(5),
+        (Some(-15), Some(0)) => Some(6),
+        (Some(15), Some(0)) => Some(7),
+        (Some(180 | -180), Some(0)) => Some(8),
+        (Some(-90), Some(0)) => Some(9),
+        (Some(90), Some(0)) => Some(10),
+        (Some(0), Some(90)) => Some(11),
+        (Some(-30), Some(45)) => Some(12),
+        (Some(0), Some(45)) => Some(13),
+        (Some(30), Some(45)) => Some(14),
+        (Some(-135 | -150), Some(45)) => Some(15),
+        (Some(180 | -180), Some(45)) => Some(16),
+        (Some(135 | 150), Some(45)) => Some(17),
+        _ => None,
+    }
+}
+
+const fn cicp_to_wave_bit(position: u8) -> Option<u8> {
+    match position {
+        0 => Some(0),
+        1 => Some(1),
+        2 => Some(2),
+        3 => Some(3),
+        4 | 8 => Some(4),
+        5 | 9 => Some(5),
+        6 => Some(6),
+        7 => Some(7),
+        10 => Some(8),
+        13 => Some(9),
+        14 => Some(10),
+        25 => Some(11),
+        17 => Some(12),
+        19 => Some(13),
+        18 => Some(14),
+        20 => Some(15),
+        22 => Some(16),
+        21 => Some(17),
+        _ => None,
+    }
 }
 
 fn channel_mask(roles: &[ChannelRole]) -> io::Result<u32> {
@@ -525,6 +830,7 @@ fn write_chunk(output: &mut File, id: &[u8; 4], body: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channel_layout::ChannelLayoutDescriptor;
     use crate::wav::WavReader;
     use std::io::{Read, Seek, SeekFrom};
 
@@ -683,6 +989,114 @@ mod tests {
             assert_eq!(persisted_channel_roles(&generic).unwrap(), exact, "{name}");
             assert_eq!(persisted_channel_roles(&exact).unwrap(), exact, "{name}");
         }
+    }
+
+    #[test]
+    fn exact_wave_masks_round_trip_without_canonicalization() {
+        let directory = tempfile::tempdir().unwrap();
+        for mask in (0..18).map(|bit| 1_u32 << bit).chain([0, 0x0003, 0x5003]) {
+            let channels = if mask == 0 {
+                4
+            } else if mask == 0x0003 {
+                6
+            } else {
+                mask.count_ones() as u16
+            };
+            let layout = ChannelLayoutDescriptor::wave(channels, true, Some(mask));
+            let buffer = AudioBuffer {
+                sample_rate: 48_000,
+                channels,
+                frames: 16,
+                data: vec![vec![0.0; 16]; usize::from(channels)],
+                channel_roles: layout.channel_roles(),
+                source_kind: PcmKind::S16,
+            };
+            let output = directory.path().join(format!("mask-{mask:08x}.wav"));
+            WavWriter::write_with_channel_layout(
+                &output,
+                &buffer,
+                PcmKind::S16,
+                false,
+                WavContainer::Riff,
+                &layout,
+            )
+            .unwrap();
+
+            let (decoded, actual) = WavReader::open_with_channel_layout(&output).unwrap();
+            assert_eq!(decoded.channels, channels, "mask {mask:#010x}");
+            assert_eq!(actual.wave_channel_mask(), Some(mask), "mask {mask:#010x}");
+            assert_eq!(
+                actual.assignments(),
+                layout.assignments(),
+                "mask {mask:#010x}"
+            );
+            assert_eq!(
+                actual.provenance(),
+                layout.provenance(),
+                "mask {mask:#010x}"
+            );
+        }
+    }
+
+    #[test]
+    fn implicit_flac_mono_and_stereo_keep_byte_identical_wave_headers() {
+        let directory = tempfile::tempdir().unwrap();
+        for channels in [1_u16, 2] {
+            let buffer = AudioBuffer {
+                sample_rate: 48_000,
+                channels,
+                frames: 16,
+                data: vec![vec![0.0; 16]; usize::from(channels)],
+                channel_roles: default_channel_roles(channels),
+                source_kind: PcmKind::S16,
+            };
+            let legacy = directory.path().join(format!("legacy-{channels}.wav"));
+            let exact = directory.path().join(format!("exact-{channels}.wav"));
+            WavWriter::write(&legacy, &buffer, PcmKind::S16, false).unwrap();
+            WavWriter::write_with_channel_layout(
+                &exact,
+                &buffer,
+                PcmKind::S16,
+                false,
+                WavContainer::Riff,
+                &ChannelLayoutDescriptor::flac(channels, None),
+            )
+            .unwrap();
+
+            assert_eq!(
+                std::fs::read(exact).unwrap(),
+                std::fs::read(legacy).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_exact_mask_preserves_existing_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("existing.wav");
+        std::fs::write(&destination, b"existing destination").unwrap();
+        let layout = ChannelLayoutDescriptor::wave(2, true, Some(0x7));
+        let buffer = AudioBuffer {
+            sample_rate: 48_000,
+            channels: 2,
+            frames: 16,
+            data: vec![vec![0.0; 16]; 2],
+            channel_roles: layout.channel_roles(),
+            source_kind: PcmKind::S16,
+        };
+        assert!(WavWriter::write_with_channel_layout(
+            &destination,
+            &buffer,
+            PcmKind::S16,
+            false,
+            WavContainer::Riff,
+            &layout,
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"existing destination"
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@
 use crate::analysis::Analysis;
 use crate::analysis_cache::{ALGORITHM_REVISION, MEASUREMENT_STANDARD};
 use crate::atomic::AtomicOutput;
+use crate::channel_layout::ChannelLayoutDescriptor;
 use crate::decoder::{ChannelLayoutProvenance, InputDescriptor, InputDescriptorOptions};
 use crate::dsp::resample::ResampleQuality;
 use crate::normalization_diff::{self, FileEvidence, MeasurementEvidence};
@@ -28,8 +29,13 @@ pub const CATALOGUE_REPORT_SCHEMA_V1: &str =
 /// Current schema URI used by exported catalogue provenance reports.
 pub const CATALOGUE_REPORT_SCHEMA_V2: &str =
     "https://penguin425.github.io/audio-normalizer/schema/catalogue-report-v2";
+/// Exact-layout schema URI used by current catalogue provenance reports.
+pub const CATALOGUE_REPORT_SCHEMA_V3: &str =
+    "https://penguin425.github.io/audio-normalizer/schema/catalogue-report-v3";
 /// Canonical request identity embedded in catalogue v2 records.
 pub const CATALOGUE_REQUEST_SCHEMA_V1: &str = "forge-catalogue-request-v1";
+/// Canonical request identity carrying exact channel-layout evidence.
+pub const CATALOGUE_REQUEST_SCHEMA_V2: &str = "forge-catalogue-request-v2";
 /// SQLite schema version stored in `PRAGMA user_version`.
 pub const CATALOGUE_DATABASE_VERSION: i32 = 2;
 /// Maximum serialized provenance document accepted for one catalogue row.
@@ -52,6 +58,16 @@ pub struct CatalogueRequestEvidence {
     pub effective_plan: CataloguePlanEvidence,
 }
 
+/// Exact-layout input-selection and processing identity used by catalogue v3.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogueRequestEvidenceV2 {
+    pub schema: &'static str,
+    pub input_descriptor: CatalogueInputDescriptorEvidenceV2,
+    pub renderer: String,
+    pub effective_plan: CataloguePlanEvidence,
+}
+
 /// Serializable subset of [`InputDescriptor`] that affects measured PCM.
 #[non_exhaustive]
 #[derive(Debug, Clone, Serialize)]
@@ -69,6 +85,28 @@ pub struct CatalogueInputDescriptorEvidence {
     pub channel_roles: Vec<String>,
     pub declared_layout_provenance: String,
     pub explicit_channel_roles: bool,
+}
+
+/// Serializable descriptor identity retaining container and effective layouts.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogueInputDescriptorEvidenceV2 {
+    pub version: u32,
+    pub decoder_route: String,
+    pub container: String,
+    pub codec: String,
+    pub audio_track_index: u32,
+    pub audio_track_id: u32,
+    pub source_start_frame: u64,
+    pub source_frames: Option<u64>,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub channel_roles: Vec<String>,
+    pub declared_layout_provenance: String,
+    pub explicit_channel_roles: bool,
+    pub declared_channel_layout: ChannelLayoutDescriptor,
+    pub effective_channel_layout: ChannelLayoutDescriptor,
+    pub explicit_channel_layout: bool,
 }
 
 /// Complete resolved normalization plan used for a catalogue request.
@@ -124,26 +162,62 @@ impl CatalogueRequestEvidence {
                 explicit_channel_roles: descriptor.uses_explicit_channel_roles(),
             },
             renderer: renderer.to_owned(),
-            effective_plan: CataloguePlanEvidence {
-                mode: mode_id(plan.mode).to_owned(),
-                target_lufs: plan.target_lufs,
-                target_peak_dbfs: plan.target_peak_db,
-                target_rms_dbfs: plan.target_rms_db,
-                ceiling_dbtp: plan.ceiling_db,
-                max_gain_db: plan.max_gain_db,
-                dither: plan.dither,
-                output_pcm_kind: plan.output_kind.map(pcm_kind_id).map(ToOwned::to_owned),
-                mp3_bitrate_kbps: plan.mp3_bitrate,
-                mp3_quality: plan.mp3_quality,
-                limiter: plan.limiter.map(|limiter| CatalogueLimiterEvidence {
-                    lookahead_ms: limiter.lookahead_ms,
-                    release_ms: limiter.release_ms,
-                }),
-                wav_container: wav_container_id(plan.wav_container).to_owned(),
-                bwf: plan.bwf,
-                output_sample_rate_hz: plan.output_sample_rate,
-                resample_quality: resample_quality_id(plan.resample_quality).to_owned(),
+            effective_plan: catalogue_plan_evidence(plan),
+        }
+    }
+}
+
+fn catalogue_plan_evidence(plan: &Plan) -> CataloguePlanEvidence {
+    CataloguePlanEvidence {
+        mode: mode_id(plan.mode).to_owned(),
+        target_lufs: plan.target_lufs,
+        target_peak_dbfs: plan.target_peak_db,
+        target_rms_dbfs: plan.target_rms_db,
+        ceiling_dbtp: plan.ceiling_db,
+        max_gain_db: plan.max_gain_db,
+        dither: plan.dither,
+        output_pcm_kind: plan.output_kind.map(pcm_kind_id).map(ToOwned::to_owned),
+        mp3_bitrate_kbps: plan.mp3_bitrate,
+        mp3_quality: plan.mp3_quality,
+        limiter: plan.limiter.map(|limiter| CatalogueLimiterEvidence {
+            lookahead_ms: limiter.lookahead_ms,
+            release_ms: limiter.release_ms,
+        }),
+        wav_container: wav_container_id(plan.wav_container).to_owned(),
+        bwf: plan.bwf,
+        output_sample_rate_hz: plan.output_sample_rate,
+        resample_quality: resample_quality_id(plan.resample_quality).to_owned(),
+    }
+}
+
+impl CatalogueRequestEvidenceV2 {
+    fn new(descriptor: &InputDescriptor, plan: &Plan, renderer: &str) -> Self {
+        let info = descriptor.stream_info();
+        Self {
+            schema: CATALOGUE_REQUEST_SCHEMA_V2,
+            input_descriptor: CatalogueInputDescriptorEvidenceV2 {
+                version: descriptor.version(),
+                decoder_route: descriptor.decoder_route_id(),
+                container: descriptor.container().id().to_owned(),
+                codec: descriptor.codec().id().to_owned(),
+                audio_track_index: descriptor.track_index(),
+                audio_track_id: descriptor.track_id(),
+                source_start_frame: descriptor.source_range().start(),
+                source_frames: descriptor.source_range().frames(),
+                sample_rate_hz: info.sample_rate,
+                channels: info.channels,
+                channel_roles: info.channel_roles.iter().map(channel_role_id).collect(),
+                declared_layout_provenance: layout_provenance_id(
+                    descriptor.declared_layout_provenance(),
+                )
+                .to_owned(),
+                explicit_channel_roles: descriptor.uses_explicit_channel_roles(),
+                declared_channel_layout: descriptor.declared_channel_layout().clone(),
+                effective_channel_layout: descriptor.channel_layout().clone(),
+                explicit_channel_layout: descriptor.uses_explicit_channel_layout(),
             },
+            renderer: renderer.to_owned(),
+            effective_plan: catalogue_plan_evidence(plan),
         }
     }
 }
@@ -271,6 +345,20 @@ pub struct CatalogueReportV2 {
     pub records: Vec<CatalogueRecordV2>,
 }
 
+/// Exact-layout v3 report containing rows committed by an invocation.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogueReportV3 {
+    /// Stable report schema URI.
+    pub schema: &'static str,
+    /// Forge version that generated the report.
+    pub generator: String,
+    /// User-selected catalogue path.
+    pub catalogue: String,
+    /// Committed exact-layout catalogue records.
+    pub records: Vec<CatalogueRecordV2>,
+}
+
 /// Connection to a versioned Forge SQLite catalogue.
 #[derive(Debug)]
 pub struct Catalogue {
@@ -343,6 +431,28 @@ impl Catalogue {
         plan: &Plan,
         renderer: &str,
     ) -> Result<CatalogueRecordV2, String> {
+        self.record_bound_with_schema(asset, descriptor, plan, renderer, false)
+    }
+
+    /// Record an asset with the exact declared and effective channel layouts.
+    pub fn record_bound_v3(
+        &mut self,
+        asset: CatalogueAsset<'_>,
+        descriptor: &InputDescriptor,
+        plan: &Plan,
+        renderer: &str,
+    ) -> Result<CatalogueRecordV2, String> {
+        self.record_bound_with_schema(asset, descriptor, plan, renderer, true)
+    }
+
+    fn record_bound_with_schema(
+        &mut self,
+        asset: CatalogueAsset<'_>,
+        descriptor: &InputDescriptor,
+        plan: &Plan,
+        renderer: &str,
+        exact_layout: bool,
+    ) -> Result<CatalogueRecordV2, String> {
         plan.validate()?;
         validate_label("renderer", renderer, 512)?;
         let source_path = descriptor.stable_input().source_path().ok_or_else(|| {
@@ -368,9 +478,12 @@ impl Catalogue {
             bytes: binding.byte_len(),
             sha256: source_sha256,
         };
-        let request_evidence = CatalogueRequestEvidence::new(descriptor, plan, renderer);
-        let request = serde_json::to_value(request_evidence)
-            .map_err(|error| format!("encode catalogue request: {error}"))?;
+        let request = if exact_layout {
+            serde_json::to_value(CatalogueRequestEvidenceV2::new(descriptor, plan, renderer))
+        } else {
+            serde_json::to_value(CatalogueRequestEvidence::new(descriptor, plan, renderer))
+        }
+        .map_err(|error| format!("encode catalogue request: {error}"))?;
         let request_sha256 = hash_request(&request)?;
         self.record_prepared(
             asset,
@@ -396,6 +509,22 @@ impl Catalogue {
         let descriptor =
             InputDescriptor::from_path(asset.source, &stable_options, descriptor_options)?;
         self.record_bound(asset, &descriptor, plan, renderer)
+    }
+
+    /// Capture a path and record its current exact-layout request identity.
+    pub fn record_bound_path_v3(
+        &mut self,
+        asset: CatalogueAsset<'_>,
+        descriptor_options: InputDescriptorOptions,
+        plan: &Plan,
+        renderer: &str,
+    ) -> Result<CatalogueRecordV2, String> {
+        let stable_options = StableInputOptions::new(u64::MAX)
+            .map_err(|error| error.to_string())?
+            .with_source_name_hint(asset.source);
+        let descriptor =
+            InputDescriptor::from_path(asset.source, &stable_options, descriptor_options)?;
+        self.record_bound_v3(asset, &descriptor, plan, renderer)
     }
 
     fn record_prepared(
@@ -616,6 +745,52 @@ impl Catalogue {
         }
         let report = CatalogueReportV2 {
             schema: CATALOGUE_REPORT_SCHEMA_V2,
+            generator: format!("forge-normalizer/{}", env!("CARGO_PKG_VERSION")),
+            catalogue: self.path.to_string_lossy().into_owned(),
+            records,
+        };
+        let mut bytes = serde_json::to_vec_pretty(&report)
+            .map_err(|error| format!("encode catalogue report: {error}"))?;
+        bytes.push(b'\n');
+        let mut output = AtomicOutput::new_with_overwrite(path, overwrite)?;
+        output.write_all(&bytes)?;
+        output.commit()
+    }
+
+    /// Export exact-layout records as an atomic catalogue-report-v3 document.
+    pub fn write_report_v3(
+        &self,
+        path: &Path,
+        records: Vec<CatalogueRecordV2>,
+    ) -> Result<(), String> {
+        self.write_report_v3_with_overwrite(path, records, true)
+    }
+
+    /// Atomically export catalogue-report-v3 with a replacement policy.
+    pub fn write_report_v3_with_overwrite(
+        &self,
+        path: &Path,
+        records: Vec<CatalogueRecordV2>,
+        overwrite: bool,
+    ) -> Result<(), String> {
+        if records.len() > MAX_REPORT_RECORDS {
+            return Err(format!(
+                "catalogue report contains {} records; limit is {MAX_REPORT_RECORDS}",
+                records.len()
+            ));
+        }
+        if comparison_path(path)? == comparison_path(&self.path)? {
+            return Err("catalogue report must not overwrite the SQLite catalogue".into());
+        }
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("create {}: {error}", parent.display()))?;
+        }
+        let report = CatalogueReportV3 {
+            schema: CATALOGUE_REPORT_SCHEMA_V3,
             generator: format!("forge-normalizer/{}", env!("CARGO_PKG_VERSION")),
             catalogue: self.path.to_string_lossy().into_owned(),
             records,
@@ -1243,6 +1418,62 @@ mod tests {
                 .unwrap()
                 .len(),
             64
+        );
+    }
+
+    #[test]
+    fn exact_layout_api_exports_an_atomic_v3_report() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.wav");
+        fixture(&source_path);
+        let stable_options = StableInputOptions::new(u64::MAX).unwrap();
+        let descriptor = InputDescriptor::from_path(
+            &source_path,
+            &stable_options,
+            InputDescriptorOptions::default(),
+        )
+        .unwrap();
+        let measurement = crate::normalize::analyze_input_descriptor_for_plan(&descriptor, &plan())
+            .unwrap()
+            .analysis()
+            .clone();
+        let source_sha256 = descriptor.stable_input().binding().sha256_hex();
+        let mut catalogue = Catalogue::open(directory.path().join("catalogue.sqlite")).unwrap();
+        let record = catalogue
+            .record_bound_v3(
+                CatalogueAsset {
+                    source: &source_path,
+                    expected_source_sha256: &source_sha256,
+                    output: None,
+                    measurement: &measurement,
+                    operation: "analysis",
+                    profile: "measurement-only",
+                    provenance: serde_json::json!({"mode": "analysis"}),
+                },
+                &descriptor,
+                &plan(),
+                "forge-analysis:fast",
+            )
+            .unwrap();
+        let report_path = directory.path().join("report-v3.json");
+        catalogue
+            .write_report_v3(&report_path, vec![record])
+            .unwrap();
+        let report: Value = serde_json::from_slice(&fs::read(report_path).unwrap()).unwrap();
+        assert_eq!(report["schema"], CATALOGUE_REPORT_SCHEMA_V3);
+        let request = &report["records"][0]["request"];
+        assert_eq!(request["schema"], CATALOGUE_REQUEST_SCHEMA_V2);
+        assert_eq!(
+            request["input_descriptor"]["declared_channel_layout"]["version"],
+            1
+        );
+        assert_eq!(
+            request["input_descriptor"]["effective_channel_layout"]["origin"],
+            "wave"
+        );
+        assert_eq!(
+            request["input_descriptor"]["explicit_channel_layout"],
+            false
         );
     }
 

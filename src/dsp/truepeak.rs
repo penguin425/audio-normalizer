@@ -469,19 +469,16 @@ impl TruePeakMeter {
         self.try_skip_peak_only_block_reduced(samples, block_maximum, has_nan)
     }
 
-    /// Return the discrete sample peak from the same SIMD reduction used to
-    /// decide whether exact FIR interpolation can be skipped. Loudness analysis
-    /// can then avoid repeating a scalar sample-peak reduction in its frame loop.
+    /// Reuse a discrete sample peak from the streaming analyzer's successful
+    /// finite-sample preflight when deciding whether exact FIR interpolation
+    /// can be skipped. This avoids a second channel-contiguous SIMD scan.
     #[inline]
-    pub(crate) fn try_skip_peak_only_block_with_sample_peak(
+    pub(crate) fn try_skip_peak_only_block_with_known_sample_peak(
         &mut self,
         samples: &[f32],
-    ) -> (bool, f32) {
-        let (block_maximum, has_nan) = crate::dsp::simd::abs_max_and_has_nan(samples);
-        (
-            self.try_skip_peak_only_block_reduced(samples, block_maximum, has_nan),
-            block_maximum,
-        )
+        block_maximum: f32,
+    ) -> bool {
+        self.try_skip_peak_only_block_reduced(samples, block_maximum, false)
     }
 
     #[inline]
@@ -1989,9 +1986,11 @@ mod tests {
         for sample_rate in [48_000, 96_000] {
             let mut sample_path = TruePeakMeter::for_sample_rate(sample_rate);
             let mut block_path = TruePeakMeter::for_sample_rate(sample_rate);
+            let mut preflight_path = TruePeakMeter::for_sample_rate(sample_rate);
             for sample in std::iter::once(0.99_f32).chain(quiet.iter().copied().take(1024)) {
                 sample_path.process_peak_only_sample(sample);
                 block_path.process_peak_only_sample(sample);
+                preflight_path.process_peak_only_sample(sample);
             }
             assert!(
                 block_path.pruning_active,
@@ -2001,20 +2000,34 @@ mod tests {
                 sample_path.process_peak_only_sample(sample);
             }
             assert!(block_path.try_skip_peak_only_block(&quiet[1024..]));
+            let block_maximum = crate::dsp::simd::abs_max(&quiet[1024..]);
+            assert!(preflight_path
+                .try_skip_peak_only_block_with_known_sample_peak(&quiet[1024..], block_maximum,));
             assert_eq!(
                 block_path.peak().to_bits(),
                 sample_path.peak().to_bits(),
                 "{sample_rate} Hz quiet block"
             );
+            assert_eq!(
+                preflight_path.peak().to_bits(),
+                sample_path.peak().to_bits(),
+                "{sample_rate} Hz preflight quiet block"
+            );
 
             for &sample in &future {
                 sample_path.process_peak_only_sample(sample);
                 block_path.process_peak_only_sample(sample);
+                preflight_path.process_peak_only_sample(sample);
             }
             assert_eq!(
                 block_path.peak().to_bits(),
                 sample_path.peak().to_bits(),
                 "{sample_rate} Hz future exact windows"
+            );
+            assert_eq!(
+                preflight_path.peak().to_bits(),
+                sample_path.peak().to_bits(),
+                "{sample_rate} Hz preflight future exact windows"
             );
         }
     }

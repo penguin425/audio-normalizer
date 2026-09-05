@@ -6,6 +6,7 @@
 //! every rendered WAVE presentation with Forge's BS.1770 engine.
 
 use crate::analysis;
+use crate::channel_layout::{ChannelLayoutDescriptor, RendererBinding};
 use crate::decoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -29,6 +30,8 @@ pub const RESPONSE_SCHEMA: &str =
     "https://penguin425.github.io/audio-normalizer/schema/mpegh-adapter-response-v1";
 pub const REPORT_SCHEMA: &str =
     "https://penguin425.github.io/audio-normalizer/schema/mpegh-adapter-report-v1";
+pub const REPORT_SCHEMA_V2: &str =
+    "https://penguin425.github.io/audio-normalizer/schema/mpegh-adapter-report-v2";
 
 const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_GROUPS: usize = 128;
@@ -263,6 +266,111 @@ pub struct PresentationResult {
     pub checks: Vec<MpeghCheck>,
 }
 
+#[non_exhaustive]
+#[derive(Debug, Serialize)]
+pub struct MpeghAdapterReportV2 {
+    pub schema: &'static str,
+    pub protocol_version: u32,
+    pub validator: &'static str,
+    pub input_path: String,
+    pub input_bytes: u64,
+    pub input_sha256: String,
+    pub adapter_path: String,
+    pub adapter_sha256: String,
+    pub decoder: DecoderEvidence,
+    pub core_standard: &'static str,
+    pub reference_software_standard: &'static str,
+    pub conformance_standard: &'static str,
+    pub mhas_inventory: MhasInventory,
+    pub profile_level: ProfileLevel,
+    pub scene: SceneMetadata,
+    pub timeout_seconds: u64,
+    pub max_decoded_samples_per_presentation: u64,
+    pub loudness_tolerance_lu: f64,
+    pub max_true_peak_dbtp: Option<f64>,
+    pub presentation_count: usize,
+    pub passed: bool,
+    pub presentations: Vec<PresentationResultV2>,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Serialize)]
+pub struct PresentationResultV2 {
+    pub id: String,
+    pub preset_id: Option<u8>,
+    pub output_layout: String,
+    pub channel_layout: ChannelLayoutDescriptor,
+    pub language: Option<String>,
+    pub accessibility: Option<String>,
+    pub loudness_metadata: MpeghLoudnessMetadata,
+    pub rendered_sha256: String,
+    pub rendered_bytes: u64,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub duration_seconds: f64,
+    pub measured_integrated_lufs: f64,
+    pub measured_true_peak_dbtp: f64,
+    pub loudness_drift_lu: f64,
+    pub loudness_passed: bool,
+    pub true_peak_passed: Option<bool>,
+    pub passed: bool,
+    pub checks: Vec<MpeghCheck>,
+}
+
+impl From<PresentationResultV2> for PresentationResult {
+    fn from(value: PresentationResultV2) -> Self {
+        Self {
+            id: value.id,
+            preset_id: value.preset_id,
+            output_layout: value.output_layout,
+            language: value.language,
+            accessibility: value.accessibility,
+            loudness_metadata: value.loudness_metadata,
+            rendered_sha256: value.rendered_sha256,
+            rendered_bytes: value.rendered_bytes,
+            sample_rate_hz: value.sample_rate_hz,
+            channels: value.channels,
+            duration_seconds: value.duration_seconds,
+            measured_integrated_lufs: value.measured_integrated_lufs,
+            measured_true_peak_dbtp: value.measured_true_peak_dbtp,
+            loudness_drift_lu: value.loudness_drift_lu,
+            loudness_passed: value.loudness_passed,
+            true_peak_passed: value.true_peak_passed,
+            passed: value.passed,
+            checks: value.checks,
+        }
+    }
+}
+
+impl From<MpeghAdapterReportV2> for MpeghAdapterReport {
+    fn from(value: MpeghAdapterReportV2) -> Self {
+        Self {
+            schema: REPORT_SCHEMA,
+            protocol_version: value.protocol_version,
+            validator: value.validator,
+            input_path: value.input_path,
+            input_bytes: value.input_bytes,
+            input_sha256: value.input_sha256,
+            adapter_path: value.adapter_path,
+            adapter_sha256: value.adapter_sha256,
+            decoder: value.decoder,
+            core_standard: value.core_standard,
+            reference_software_standard: value.reference_software_standard,
+            conformance_standard: value.conformance_standard,
+            mhas_inventory: value.mhas_inventory,
+            profile_level: value.profile_level,
+            scene: value.scene,
+            timeout_seconds: value.timeout_seconds,
+            max_decoded_samples_per_presentation: value.max_decoded_samples_per_presentation,
+            loudness_tolerance_lu: value.loudness_tolerance_lu,
+            max_true_peak_dbtp: value.max_true_peak_dbtp,
+            presentation_count: value.presentation_count,
+            passed: value.passed,
+            presentations: value.presentations.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct MpeghCheck {
     pub rule_id: &'static str,
@@ -274,6 +382,10 @@ pub struct MpeghCheck {
 }
 
 pub fn run(options: &AdapterOptions) -> Result<MpeghAdapterReport, String> {
+    run_v2(options).map(Into::into)
+}
+
+pub fn run_v2(options: &AdapterOptions) -> Result<MpeghAdapterReportV2, String> {
     validate_options(options)?;
     let input = fs::canonicalize(&options.input)
         .map_err(|error| format!("resolve MPEG-H input {}: {error}", options.input.display()))?;
@@ -343,6 +455,7 @@ pub fn run(options: &AdapterOptions) -> Result<MpeghAdapterReport, String> {
         return Err("MPEG-H adapter executable changed while it was running".into());
     }
     let response_bytes = read_response(work.path(), &response_path)?;
+    let settings_sha256 = sha256_bytes(&response_bytes);
     let response: AdapterResponse = serde_json::from_slice(&response_bytes)
         .map_err(|error| format!("parse MPEG-H adapter response: {error}"))?;
     validate_response(&response, &input_sha256, &mhas_inventory)?;
@@ -359,7 +472,7 @@ pub fn run(options: &AdapterOptions) -> Result<MpeghAdapterReport, String> {
     for presentation in response.presentations {
         let rendered = resolve_render(&render_root, &presentation.rendered_path)?;
         let (rendered_sha256, rendered_bytes) = sha256_file(&rendered)?;
-        let (mut buffer, layout_provenance) = decoder::decode_limited_with_layout(
+        let (mut buffer, decoded_layout) = decoder::decode_limited_with_channel_layout(
             &rendered,
             options.max_decoded_samples_per_presentation,
         )?;
@@ -368,8 +481,23 @@ pub fn run(options: &AdapterOptions) -> Result<MpeghAdapterReport, String> {
             &presentation.id,
             &presentation.output_layout,
             &mut buffer,
-            layout_provenance,
+            decoded_layout.provenance(),
         )?;
+        let renderer = RendererBinding::new(
+            &response.decoder.name,
+            &response.decoder.version,
+            &presentation.output_layout,
+            &adapter_sha256,
+            &settings_sha256,
+        )?;
+        let assignments =
+            match decoded_layout.assignments_compatible_with_roles(&buffer.channel_roles) {
+                Some(assignments) => assignments,
+                None => ChannelLayoutDescriptor::from_channel_roles(buffer.channel_roles.clone())?
+                    .assignments()
+                    .to_vec(),
+            };
+        let channel_layout = ChannelLayoutDescriptor::rendered(assignments, renderer)?;
         let measured = analysis::analyze(&buffer);
         let (rendered_after, rendered_bytes_after) = sha256_file(&rendered)?;
         if rendered_after != rendered_sha256 || rendered_bytes_after != rendered_bytes {
@@ -408,10 +536,11 @@ pub fn run(options: &AdapterOptions) -> Result<MpeghAdapterReport, String> {
                 passed: true_peak_passed == Some(true),
             });
         }
-        results.push(PresentationResult {
+        results.push(PresentationResultV2 {
             id: presentation.id,
             preset_id: presentation.preset_id,
             output_layout: presentation.output_layout,
+            channel_layout,
             language: presentation.language,
             accessibility: presentation.accessibility,
             loudness_metadata: presentation.loudness,
@@ -430,8 +559,8 @@ pub fn run(options: &AdapterOptions) -> Result<MpeghAdapterReport, String> {
         });
     }
     let passed = results.iter().all(|value| value.passed);
-    Ok(MpeghAdapterReport {
-        schema: REPORT_SCHEMA,
+    Ok(MpeghAdapterReportV2 {
+        schema: REPORT_SCHEMA_V2,
         protocol_version: PROTOCOL_VERSION,
         validator: VALIDATOR,
         input_path: input.to_string_lossy().into_owned(),
@@ -506,6 +635,24 @@ fn apply_output_layout(
 pub fn write_report(
     path: &Path,
     report: &MpeghAdapterReport,
+    compact: bool,
+    overwrite: bool,
+) -> Result<(), String> {
+    write_report_value(path, report, compact, overwrite)
+}
+
+pub fn write_report_v2(
+    path: &Path,
+    report: &MpeghAdapterReportV2,
+    compact: bool,
+    overwrite: bool,
+) -> Result<(), String> {
+    write_report_value(path, report, compact, overwrite)
+}
+
+fn write_report_value<T: Serialize>(
+    path: &Path,
+    report: &T,
     compact: bool,
     overwrite: bool,
 ) -> Result<(), String> {
@@ -1124,6 +1271,15 @@ fn ensure_regular_file(path: &Path, label: &str) -> Result<(), String> {
         return Err(format!("{label} must be a regular file"));
     }
     Ok(())
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
 }
 
 fn sha256_file(path: &Path) -> Result<(String, u64), String> {

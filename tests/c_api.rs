@@ -1,9 +1,10 @@
 use forge_normalizer::c_api::{
     forge_normalizer_analysis_v1_size, forge_normalizer_analyze_file_v1,
-    forge_normalizer_c_api_version, forge_normalizer_live_config_v1_size, forge_normalizer_version,
-    ForgeAnalysisV1, ForgeLiveConfigV1, ForgeStatus, ANALYSIS_V1_SIZE, C_API_VERSION,
-    LIVE_CONFIG_V1_SIZE,
+    forge_normalizer_analyze_file_with_layout_v1, forge_normalizer_c_api_version,
+    forge_normalizer_live_config_v1_size, forge_normalizer_version, ForgeAnalysisV1,
+    ForgeLiveConfigV1, ForgeStatus, ANALYSIS_V1_SIZE, C_API_VERSION, LIVE_CONFIG_V1_SIZE,
 };
+use forge_normalizer::channel_layout::{ChannelLayoutDescriptor, ChannelLayoutOrigin};
 use forge_normalizer::wav::{default_channel_roles, AudioBuffer, ChannelRole, PcmKind, WavWriter};
 use std::f32::consts::TAU;
 use std::ffi::{CStr, CString};
@@ -248,4 +249,77 @@ fn c_api_rejects_maskless_multichannel_without_a_layout_override() {
 
     assert_eq!(status, ForgeStatus::AnalysisFailed);
     assert!(error_text(&error).contains("ambiguous 6-channel layout"));
+}
+
+#[test]
+fn c_api_exact_layout_override_returns_effective_descriptor() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("maskless.wav");
+    let audio = AudioBuffer {
+        sample_rate: 48_000,
+        channels: 6,
+        frames: 48_000,
+        data: vec![vec![0.01; 48_000]; 6],
+        channel_roles: vec![ChannelRole::Main; 6],
+        source_kind: PcmKind::F32,
+    };
+    WavWriter::write(&path, &audio, PcmKind::F32, false).unwrap();
+    let path = CString::new(path.to_str().unwrap()).unwrap();
+    let layout = ChannelLayoutDescriptor::from_channel_roles(default_channel_roles(6)).unwrap();
+    let layout = CString::new(layout.to_json().unwrap()).unwrap();
+    let mut result = MaybeUninit::<ForgeAnalysisV1>::uninit();
+    let mut required = 0_usize;
+    let mut error = [1_i8; 256];
+
+    // A null output buffer performs bounded size negotiation while still
+    // returning the fixed analysis result.
+    // SAFETY: every non-null pointer references live, non-overlapping storage.
+    let status = unsafe {
+        forge_normalizer_analyze_file_with_layout_v1(
+            path.as_ptr(),
+            6 * 48_000,
+            layout.as_ptr(),
+            result.as_mut_ptr(),
+            ANALYSIS_V1_SIZE,
+            ptr::null_mut(),
+            0,
+            &mut required,
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    assert_eq!(status, ForgeStatus::BufferTooSmall);
+    assert!(required > 1);
+    // SAFETY: the size-negotiation result is documented as initialized.
+    assert_eq!(unsafe { result.assume_init() }.channels, 6);
+
+    let mut result = MaybeUninit::<ForgeAnalysisV1>::uninit();
+    let mut effective = vec![0_i8; required];
+    // SAFETY: every pointer references live, sufficiently sized,
+    // non-overlapping caller-owned storage.
+    let status = unsafe {
+        forge_normalizer_analyze_file_with_layout_v1(
+            path.as_ptr(),
+            6 * 48_000,
+            layout.as_ptr(),
+            result.as_mut_ptr(),
+            ANALYSIS_V1_SIZE,
+            effective.as_mut_ptr(),
+            effective.len(),
+            &mut required,
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    assert_eq!(status, ForgeStatus::Ok, "{}", error_text(&error));
+    assert_eq!(required, effective.len());
+    // SAFETY: successful analysis NUL-terminates the returned JSON buffer.
+    let effective = unsafe { CStr::from_ptr(effective.as_ptr()) }
+        .to_str()
+        .unwrap();
+    let effective = ChannelLayoutDescriptor::from_json(effective).unwrap();
+    assert_eq!(effective.channel_count(), 6);
+    assert_eq!(effective.origin(), ChannelLayoutOrigin::ExplicitOverride);
+    // SAFETY: a successful call initialized the fixed result.
+    assert_eq!(unsafe { result.assume_init() }.channels, 6);
 }

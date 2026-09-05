@@ -5,10 +5,15 @@
 //! Requests use an explicit request ID.  A caller can cancel an active job via
 //! the Cancel RPC; cancellation is cooperative at bounded decode/analysis
 //! checkpoints and is also triggered when the client drops the RPC.
+//! Exact channel-layout overrides use the additive `ForgeAnalysisV3` service;
+//! the original `ForgeAnalysis` messages and server trait remain frozen.
 
+use crate::channel_layout::ChannelLayoutDescriptor;
 use crate::decoder;
 use crate::report::{AnalysisReport, ComplianceProfile};
-use crate::service::{ServiceConfig, SERVICE_ANALYSIS_SCHEMA, SERVICE_HEALTH_SCHEMA};
+use crate::service::{
+    ServiceConfig, SERVICE_ANALYSIS_SCHEMA, SERVICE_ANALYSIS_SCHEMA_V3, SERVICE_HEALTH_SCHEMA,
+};
 use crate::service_metrics::{RequestTimer, ServiceMetrics, PROMETHEUS_CONTENT_TYPE};
 use std::collections::HashMap;
 use std::io::Write;
@@ -26,14 +31,16 @@ pub mod proto {
 }
 
 use proto::forge_analysis_server::{ForgeAnalysis, ForgeAnalysisServer};
+use proto::forge_analysis_v3_server::{ForgeAnalysisV3, ForgeAnalysisV3Server};
 use proto::forge_metrics_server::{ForgeMetrics, ForgeMetricsServer};
 use proto::{
-    AnalyzeRequest, AnalyzeResponse, CancelRequest, CancelResponse, HealthRequest, HealthResponse,
-    MetricsRequest, MetricsResponse,
+    AnalyzeRequest, AnalyzeResponse, AnalyzeV3Request, AnalyzeV3Response, CancelRequest,
+    CancelResponse, HealthRequest, HealthResponse, MetricsRequest, MetricsResponse,
 };
 
 const MAX_REQUEST_ID_BYTES: usize = 128;
 const MAX_FILENAME_BYTES: usize = 256;
+const MAX_CHANNEL_LAYOUT_JSON_BYTES: usize = 256 * 1024;
 
 /// Run the optional gRPC endpoint until the process receives Ctrl-C.
 pub fn run(config: ServiceConfig, bind: SocketAddr) -> std::io::Result<()> {
@@ -68,6 +75,10 @@ fn run_internal(
         Server::builder()
             .add_service(
                 ForgeAnalysisServer::new(service.clone())
+                    .max_decoding_message_size(config.max_body_bytes),
+            )
+            .add_service(
+                ForgeAnalysisV3Server::new(service.clone())
                     .max_decoding_message_size(config.max_body_bytes),
             )
             .add_service(ForgeMetricsServer::new(service))
@@ -200,6 +211,44 @@ impl ForgeAnalysis for GrpcService {
 }
 
 #[tonic::async_trait]
+impl ForgeAnalysisV3 for GrpcService {
+    async fn analyze(
+        &self,
+        request: Request<AnalyzeV3Request>,
+    ) -> Result<Response<AnalyzeV3Response>, Status> {
+        let request_bytes = request.get_ref().audio.len() as u64;
+        let timer = AnalyzeRequestTimer::new(self.start_timer(&request), request_bytes);
+        let result = self.analyze_v3_inner(request).await;
+        timer.finish(status_code(&result));
+        result
+    }
+
+    async fn cancel(
+        &self,
+        request: Request<CancelRequest>,
+    ) -> Result<Response<CancelResponse>, Status> {
+        let mut timer = self.start_timer(&request);
+        let result = self.cancel_inner(request).await;
+        if let Some(timer) = timer.take() {
+            timer.finish(status_code(&result), 0);
+        }
+        result
+    }
+
+    async fn health(
+        &self,
+        request: Request<HealthRequest>,
+    ) -> Result<Response<HealthResponse>, Status> {
+        let mut timer = self.start_timer(&request);
+        let result = self.health_inner(request).await;
+        if let Some(timer) = timer.take() {
+            timer.finish(status_code(&result), 0);
+        }
+        result
+    }
+}
+
+#[tonic::async_trait]
 impl ForgeMetrics for GrpcService {
     async fn metrics(
         &self,
@@ -221,6 +270,39 @@ impl GrpcService {
     ) -> Result<Response<AnalyzeResponse>, Status> {
         self.authorize(&request)?;
         let request = request.into_inner();
+        self.analyze_request(AnalyzeInput {
+            audio: request.audio,
+            filename: request.filename,
+            content_type: request.content_type,
+            profile: request.profile,
+            request_id: request.request_id,
+            channel_layout_json: None,
+        })
+        .await
+        .map(AnalysisResult::into_v1)
+        .map(Response::new)
+    }
+
+    async fn analyze_v3_inner(
+        &self,
+        request: Request<AnalyzeV3Request>,
+    ) -> Result<Response<AnalyzeV3Response>, Status> {
+        self.authorize(&request)?;
+        let request = request.into_inner();
+        self.analyze_request(AnalyzeInput {
+            audio: request.audio,
+            filename: request.filename,
+            content_type: request.content_type,
+            profile: request.profile,
+            request_id: request.request_id,
+            channel_layout_json: Some(request.channel_layout_json),
+        })
+        .await
+        .map(AnalysisResult::into_v3)
+        .map(Response::new)
+    }
+
+    async fn analyze_request(&self, request: AnalyzeInput) -> Result<AnalysisResult, Status> {
         let request_id = validate_request_id(&request.request_id)?;
         if request.audio.is_empty() {
             return Err(Status::invalid_argument("audio request body is empty"));
@@ -242,6 +324,23 @@ impl GrpcService {
         let filename = safe_filename(&request.filename)?;
         let suffix = audio_suffix(&filename, &request.content_type)?;
         let profile = resolve_profile(&request.profile)?;
+        let channel_layout = match request
+            .channel_layout_json
+            .filter(|channel_layout_json| !channel_layout_json.is_empty())
+        {
+            Some(channel_layout_json) => {
+                if channel_layout_json.len() > MAX_CHANNEL_LAYOUT_JSON_BYTES {
+                    return Err(Status::invalid_argument(
+                        "channel-layout JSON exceeds 256 KiB",
+                    ));
+                }
+                Some(
+                    ChannelLayoutDescriptor::from_json(&channel_layout_json)
+                        .map_err(Status::invalid_argument)?,
+                )
+            }
+            None => None,
+        };
         let cancelled = self.register(&request_id)?;
         let worker_lease = self.worker_lease(request_id.clone(), Arc::clone(&cancelled), permit);
         let config = Arc::clone(&self.config);
@@ -268,6 +367,7 @@ impl GrpcService {
                     content_type,
                     suffix,
                     profile,
+                    channel_layout,
                     request_id: worker_request_id,
                     max_decoded_samples: config.max_decoded_samples,
                     cancelled,
@@ -276,7 +376,6 @@ impl GrpcService {
             },
         )
         .await
-        .map(Response::new)
     }
 
     async fn cancel_inner(
@@ -447,14 +546,15 @@ impl Drop for AnalysisWorkerLease {
     }
 }
 
-async fn run_analysis_worker<F>(
+async fn run_analysis_worker<T, F>(
     timeout: std::time::Duration,
     worker_lease: AnalysisWorkerLease,
     cancelled: Arc<AtomicBool>,
     analyze: F,
-) -> Result<AnalyzeResponse, Status>
+) -> Result<T, Status>
 where
-    F: FnOnce() -> Result<AnalyzeResponse, Status> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, Status> + Send + 'static,
 {
     // This guard belongs to the RPC future. If tonic drops that future because
     // the client disconnects, or if the timeout below expires, the detached
@@ -476,25 +576,72 @@ where
     }
 }
 
+struct AnalyzeInput {
+    audio: Vec<u8>,
+    filename: String,
+    content_type: String,
+    profile: String,
+    request_id: String,
+    channel_layout_json: Option<String>,
+}
+
+struct AnalysisResult {
+    filename: String,
+    content_type: String,
+    bytes_received: u64,
+    report_json: String,
+    request_id: String,
+    channel_layout_json: String,
+}
+
+impl AnalysisResult {
+    fn into_v1(self) -> AnalyzeResponse {
+        AnalyzeResponse {
+            schema: SERVICE_ANALYSIS_SCHEMA.to_owned(),
+            generator: concat!("forge-normalizer/", env!("CARGO_PKG_VERSION")).to_owned(),
+            filename: self.filename,
+            content_type: self.content_type,
+            bytes_received: self.bytes_received,
+            report_json: self.report_json,
+            request_id: self.request_id,
+        }
+    }
+
+    fn into_v3(self) -> AnalyzeV3Response {
+        AnalyzeV3Response {
+            schema: SERVICE_ANALYSIS_SCHEMA_V3.to_owned(),
+            generator: concat!("forge-normalizer/", env!("CARGO_PKG_VERSION")).to_owned(),
+            filename: self.filename,
+            content_type: self.content_type,
+            bytes_received: self.bytes_received,
+            report_json: self.report_json,
+            request_id: self.request_id,
+            channel_layout_json: self.channel_layout_json,
+        }
+    }
+}
+
 struct AnalyzeJob {
     audio: Vec<u8>,
     filename: String,
     content_type: String,
     suffix: String,
     profile: Option<ComplianceProfile>,
+    channel_layout: Option<ChannelLayoutDescriptor>,
     request_id: String,
     max_decoded_samples: u64,
     cancelled: Arc<AtomicBool>,
     metrics: Option<ServiceMetrics>,
 }
 
-fn analyze_audio(job: AnalyzeJob) -> Result<AnalyzeResponse, Status> {
+fn analyze_audio(job: AnalyzeJob) -> Result<AnalysisResult, Status> {
     let AnalyzeJob {
         audio,
         filename,
         content_type,
         suffix,
         profile,
+        channel_layout,
         request_id,
         max_decoded_samples,
         cancelled,
@@ -517,16 +664,24 @@ fn analyze_audio(job: AnalyzeJob) -> Result<AnalyzeResponse, Status> {
         .map_err(|_| Status::internal("could not store upload"))?;
     check_cancelled(&cancelled)?;
     let path = temporary.path().to_path_buf();
-    let (mut decoded, layout_provenance) =
-        decoder::decode_limited_with_layout(&path, max_decoded_samples)
+    let (mut decoded, declared_layout) =
+        decoder::decode_limited_with_channel_layout(&path, max_decoded_samples)
             .map_err(|_| Status::invalid_argument("audio could not be decoded"))?;
     check_cancelled(&cancelled)?;
+    let has_layout_override = channel_layout.is_some();
+    let effective_layout = channel_layout.unwrap_or(declared_layout);
+    if has_layout_override {
+        effective_layout
+            .validate_override_for_channels(decoded.channels)
+            .map_err(Status::invalid_argument)?;
+    }
+    let override_roles = has_layout_override.then(|| effective_layout.channel_roles());
     decoded.channel_roles = crate::normalize::resolve_decoded_channel_roles(
         &path,
         decoded.channels,
         &decoded.channel_roles,
-        layout_provenance,
-        None,
+        effective_layout.provenance(),
+        override_roles.as_deref(),
     )
     .map_err(|_| Status::invalid_argument("audio could not be decoded"))?;
     check_cancelled(&cancelled)?;
@@ -546,18 +701,20 @@ fn analyze_audio(job: AnalyzeJob) -> Result<AnalyzeResponse, Status> {
     let report_json = serde_json::to_string(&report)
         .map_err(|_| Status::invalid_argument("measurement contains a non-finite value"))?;
     check_cancelled(&cancelled)?;
+    let channel_layout_json = effective_layout
+        .to_json()
+        .map_err(|_| Status::internal("could not serialize channel layout"))?;
     if let Some(metrics) = metrics {
         let decoded_samples = (decoded.frames as u64).saturating_mul(u64::from(decoded.channels));
         metrics.observe_analysis(audio.len() as u64, decoded_samples, analysis.lufs);
     }
-    Ok(AnalyzeResponse {
-        schema: SERVICE_ANALYSIS_SCHEMA.to_owned(),
-        generator: concat!("forge-normalizer/", env!("CARGO_PKG_VERSION")).to_owned(),
+    Ok(AnalysisResult {
         filename,
         content_type,
         bytes_received: audio.len() as u64,
         report_json,
         request_id,
+        channel_layout_json,
     })
 }
 
@@ -718,6 +875,52 @@ mod tests {
         assert!(safe_filename("../").is_err());
     }
 
+    #[tokio::test]
+    async fn v3_analysis_response_carries_the_effective_exact_layout() {
+        let sample_rate = 48_000_u32;
+        let frames = sample_rate as usize;
+        let mut audio = Vec::with_capacity(44 + frames * 2);
+        audio.extend_from_slice(b"RIFF");
+        audio.extend_from_slice(&(36_u32 + frames as u32 * 2).to_le_bytes());
+        audio.extend_from_slice(b"WAVEfmt ");
+        audio.extend_from_slice(&16_u32.to_le_bytes());
+        audio.extend_from_slice(&1_u16.to_le_bytes());
+        audio.extend_from_slice(&1_u16.to_le_bytes());
+        audio.extend_from_slice(&sample_rate.to_le_bytes());
+        audio.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        audio.extend_from_slice(&2_u16.to_le_bytes());
+        audio.extend_from_slice(&16_u16.to_le_bytes());
+        audio.extend_from_slice(b"data");
+        audio.extend_from_slice(&(frames as u32 * 2).to_le_bytes());
+        for _ in 0..frames {
+            audio.extend_from_slice(&1_000_i16.to_le_bytes());
+        }
+        let layout =
+            ChannelLayoutDescriptor::from_channel_roles(vec![crate::wav::ChannelRole::Main])
+                .unwrap();
+        let service = GrpcService::new(ServiceConfig::default(), None);
+        let response = ForgeAnalysisV3::analyze(
+            &service,
+            Request::new(AnalyzeV3Request {
+                audio,
+                filename: "mono.wav".into(),
+                content_type: "audio/wav".into(),
+                profile: String::new(),
+                request_id: "layout-job".into(),
+                channel_layout_json: layout.to_json().unwrap(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(response.schema, SERVICE_ANALYSIS_SCHEMA_V3);
+        let effective = ChannelLayoutDescriptor::from_json(&response.channel_layout_json).unwrap();
+        assert_eq!(
+            effective.origin(),
+            crate::channel_layout::ChannelLayoutOrigin::ExplicitOverride
+        );
+    }
+
     #[test]
     fn cancellation_registry_is_explicit() {
         let service = GrpcService::new(ServiceConfig::default(), None);
@@ -728,6 +931,32 @@ mod tests {
         assert!(flag.load(Ordering::Acquire));
         drop(worker_lease);
         assert!(!service.cancel("job").unwrap());
+    }
+
+    #[tokio::test]
+    async fn v3_cancel_uses_the_shared_request_registry_and_metrics() {
+        let metrics = ServiceMetrics::new();
+        let service = GrpcService::new(ServiceConfig::default(), Some(metrics.clone()));
+        let flag = service.register("v3-job").unwrap();
+        let permit = service.permits.clone().try_acquire_owned().unwrap();
+        let worker_lease = service.worker_lease("v3-job".into(), Arc::clone(&flag), permit);
+
+        let response = ForgeAnalysisV3::cancel(
+            &service,
+            Request::new(CancelRequest {
+                request_id: "v3-job".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(response.cancelled);
+        assert!(flag.load(Ordering::Acquire));
+        drop(worker_lease);
+        let exposition = metrics.render_prometheus();
+        assert!(exposition.contains("forge_service_requests_total 1"));
+        assert!(exposition.contains("forge_service_request_success_total 1"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -939,6 +1168,58 @@ mod tests {
         assert_eq!(error.code(), Code::Internal);
         assert_eq!(service.permits.available_permits(), 1);
         assert!(!service.cancel("panicked-job").unwrap());
+    }
+
+    #[test]
+    fn legacy_analysis_messages_remain_constructible_with_the_v1_fields() {
+        let request = AnalyzeRequest {
+            audio: Vec::new(),
+            filename: String::new(),
+            content_type: String::new(),
+            profile: String::new(),
+            request_id: "job".into(),
+        };
+        assert_eq!(request.encode_to_vec(), b"\x2a\x03job");
+
+        let response = AnalyzeResponse {
+            schema: String::new(),
+            generator: String::new(),
+            filename: String::new(),
+            content_type: String::new(),
+            bytes_received: 0,
+            report_json: String::new(),
+            request_id: "job".into(),
+        };
+        assert_eq!(response.encode_to_vec(), b"\x3a\x03job");
+    }
+
+    #[test]
+    fn v3_layout_fields_use_the_additive_wire_numbers() {
+        let request = AnalyzeV3Request {
+            channel_layout_json: "{}".into(),
+            ..AnalyzeV3Request::default()
+        };
+        let encoded_request = request.encode_to_vec();
+        assert_eq!(encoded_request, b"\x32\x02{}");
+        assert_eq!(
+            AnalyzeV3Request::decode(encoded_request.as_slice())
+                .unwrap()
+                .channel_layout_json,
+            "{}"
+        );
+
+        let response = AnalyzeV3Response {
+            channel_layout_json: "{}".into(),
+            ..AnalyzeV3Response::default()
+        };
+        let encoded_response = response.encode_to_vec();
+        assert_eq!(encoded_response, b"\x42\x02{}");
+        assert_eq!(
+            AnalyzeV3Response::decode(encoded_response.as_slice())
+                .unwrap()
+                .channel_layout_json,
+            "{}"
+        );
     }
 
     #[test]
