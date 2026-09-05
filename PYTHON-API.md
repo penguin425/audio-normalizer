@@ -19,6 +19,36 @@ the standard `ctypes` module, beginning with Python 3.10. They have no Python
 runtime dependencies and are tagged `py3-none-<platform>`. Forge does not
 currently publish this package to PyPI.
 
+The Linux wheel is compiled with generic x86-64 flags in the digest-pinned
+official `manylinux_2_28_x86_64` image. This avoids the x86-64-v2 system
+package baseline of the AlmaLinux 9-based `manylinux_2_34` image while keeping
+the published `manylinux_2_34_x86_64` contract. The build first emits a
+`linux_x86_64` wheel; only the result of `auditwheel repair` is eligible for a
+release. The release gate scans every ELF member for GLIBC symbol versions,
+dynamic dependencies, C++ ABI references, declared ISA requirements, text
+relocations, and executable stacks.
+
+Forge contains CPUID-guarded AVX2 fast paths, so the release does not claim
+that its ELF has no AVX instructions. Instead, the repaired wheel is loaded
+and used to analyze a WAV under QEMU with every x86-64-v2 feature disabled.
+Property-free ELF controls check both CPUID bits and executable instructions
+for LAHF/SAHF, CX16, POPCNT, SSE3, SSSE3, SSE4.1, SSE4.2, AVX, and AVX2. Each
+control is also rerun with its feature enabled to prove that the negative is
+sensitive. A separate fresh glibc 2.34 container installs and exercises the
+wheel. Both container smokes run with no network namespace and read-only
+source and wheel mounts; a shared runner rejects any image without a full
+SHA256 digest at execution time.
+
+The complete Python build-tool closure is recorded in
+`tools/python-wheel-build-requirements.lock`. It was resolved for CPython 3.10
+from the PyPI Simple API on 2026-09-06, and its wheel digests were cross-checked
+against each PyPI release JSON document. Release jobs use `--require-hashes`
+and `--only-binary=:all:` to create a local wheelhouse, then install only from
+that wheelhouse with `--no-index`. QEMU comes from Ubuntu's versioned
+`qemu-user-static` archive package and is checked against the SHA256 in the
+workflow. An independent job repeats the native build and repair and requires
+the candidate and reproduced wheels to be byte-identical before publication.
+
 ## Installation
 
 Download the wheel matching the host from the

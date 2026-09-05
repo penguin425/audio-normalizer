@@ -19,6 +19,27 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
 
+      - name: Select Python 3.12 for workflow structure checks
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the hash-locked workflow structure checker
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
+          workflow_check_root="${RUNNER_TEMP}/forge-workflow-check"
+          python3 -m venv "$workflow_check_root"
+          workflow_check_python="$workflow_check_root/bin/python"
+          "$workflow_check_python" -m pip install \
+            --disable-pip-version-check \
+            --no-cache-dir \
+            --require-hashes \
+            --only-binary=:all: \
+            -r tools/workflow-check-requirements.lock
+          echo "FORGE_WORKFLOW_CHECK_PYTHON=$workflow_check_python" >> "$GITHUB_ENV"
+
       - name: Install Rust 1.97.0
         uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
         with:

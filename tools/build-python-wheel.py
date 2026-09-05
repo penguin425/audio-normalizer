@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and audit one reproducible Forge platform wheel."""
+"""Build one reproducible Forge platform wheel from a supplied native library."""
 
 from __future__ import annotations
 
@@ -17,7 +17,10 @@ from pathlib import Path, PurePosixPath
 SUPPORTED_PLATFORMS = {
     "macosx_10_12_x86_64": "libforge_normalizer.dylib",
     "macosx_11_0_arm64": "libforge_normalizer.dylib",
-    "manylinux_2_34_x86_64": "libforge_normalizer.so",
+    # Linux builds are intentionally emitted with the non-portable tag first.
+    # Only auditwheel repair plus check-linux-wheel-abi.py may produce a
+    # manylinux_2_34 release candidate.
+    "linux_x86_64": "libforge_normalizer.so",
     "win_amd64": "forge_normalizer.dll",
 }
 
