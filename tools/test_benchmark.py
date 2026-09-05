@@ -186,6 +186,41 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(differences, [1, 401, 1])
         self.assertEqual(statistics.median(differences), 1.0)
 
+    def test_paired_rss_ratchet_rejects_two_of_seven_over_limit_rounds(self):
+        limit = 4 * 1024 * 1024
+        differences = [limit + 1, 0, 0, limit + 1, 0, 0, 0]
+        self.assertFalse(
+            paired_benchmark.paired_round_single_outlier_ratchet_passes(
+                differences, limit
+            )
+        )
+        self.assertEqual(
+            paired_benchmark.paired_round_limit_exceedances(differences, limit),
+            [0, 3],
+        )
+
+    def test_paired_rss_ratchet_allows_one_of_seven_over_limit_rounds(self):
+        limit = 4 * 1024 * 1024
+        differences = [0, 0, limit + 1, 0, 0, 0, 0]
+        self.assertTrue(
+            paired_benchmark.paired_round_single_outlier_ratchet_passes(
+                differences, limit
+            )
+        )
+
+    def test_paired_rss_ratchet_treats_exact_limit_as_passing(self):
+        limit = 4 * 1024 * 1024
+        differences = [limit] * 7
+        self.assertTrue(
+            paired_benchmark.paired_round_single_outlier_ratchet_passes(
+                differences, limit
+            )
+        )
+        self.assertEqual(
+            paired_benchmark.paired_round_limit_exceedances(differences, limit),
+            [],
+        )
+
     def test_isolated_regression_must_exceed_the_same_limit_twice(self):
         reproduced = paired_benchmark.isolated_regression_reproduced
         self.assertTrue(reproduced(4.1, 4.2, 4.0))

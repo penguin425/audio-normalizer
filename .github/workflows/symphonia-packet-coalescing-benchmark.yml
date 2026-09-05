@@ -214,7 +214,13 @@ jobs:
               run_measured,
               write_pcm16_wave,
           )
-          from paired_benchmark import alternating_schedule, paired_round_differences
+          from paired_benchmark import (
+              alternating_schedule,
+              paired_round_differences,
+              paired_round_limit_exceedances,
+          )
+
+          RSS_ROUND_LIMIT_BYTES = 4 * 1024 * 1024
 
           root = Path(os.environ["BENCHMARK_ROOT"])
           root.mkdir()
@@ -368,6 +374,9 @@ jobs:
                       lambda sample: sample["peak_rss_bytes"],
                       reducer=max,
                   )
+                  rss_exceeding_rounds = paired_round_limit_exceedances(
+                      rss_round_differences, RSS_ROUND_LIMIT_BYTES
+                  )
                   raw_rss_maxima = {
                       name: max(sample["peak_rss_bytes"] for sample in values)
                       for name, values in samples.items()
@@ -380,6 +389,8 @@ jobs:
                           raw_rss_maxima["candidate"] - raw_rss_maxima["baseline"]
                       ),
                       "paired_round_differences_bytes": rss_round_differences,
+                      "paired_round_limit_bytes": RSS_ROUND_LIMIT_BYTES,
+                      "paired_round_exceeding_indices": rss_exceeding_rounds,
                       "median_paired_round_difference_bytes": statistics.median(
                           rss_round_differences
                       ),
@@ -405,9 +416,10 @@ jobs:
                   output.write(f"\n### {mode}\n\n")
                   output.write(
                       "| Case | Pooled wall | Paired wall | Pooled CPU "
-                      "| Paired CPU | Paired RSS delta | Raw max RSS delta |\n"
+                      "| Paired CPU | Paired RSS delta | RSS rounds >4 MiB "
+                      "| Raw max RSS delta |\n"
                   )
-                  output.write("|---|---:|---:|---:|---:|---:|---:|\n")
+                  output.write("|---|---:|---:|---:|---:|---:|---:|---:|\n")
                   for case, case_result in cases.items():
                       summary = case_result["summary"]
                       rss = summary["peak_rss_bytes"]
@@ -418,6 +430,7 @@ jobs:
                           f"| {summary['cpu']['pooled_change_percent']:+.3f}% "
                           f"| {summary['cpu']['median_paired_round_change_percent']:+.3f}% "
                           f"| {rss['median_paired_round_difference_bytes']:+.0f} B "
+                          f"| {len(rss['paired_round_exceeding_indices'])}/7 "
                           f"| {rss['raw_max_delta_bytes']:+d} B |\n"
                       )
           print(json.dumps({
@@ -447,8 +460,15 @@ jobs:
           python3 - <<'PY'
           import json
           import statistics
+          import sys
           import tomllib
           from pathlib import Path
+
+          sys.path.insert(0, "candidate/tools")
+          from paired_benchmark import (
+              paired_round_limit_exceedances,
+              paired_round_single_outlier_ratchet_passes,
+          )
 
           evidence = json.loads(
               Path("symphonia-packet-coalescing-interleaved.json").read_text(
@@ -532,12 +552,47 @@ jobs:
                           normalization_pooled.append(pooled)
                           normalization_paired.append(paired)
                   rss = summary["peak_rss_bytes"]
+                  rss_limit = 4 * 1024 * 1024
                   rss_delta = rss["median_paired_round_difference_bytes"]
-                  assert rss_delta <= 4 * 1024 * 1024, (
+                  assert rss_delta <= rss_limit, (
                       mode,
                       case,
                       "median paired-round RSS delta",
                       rss_delta,
+                  )
+                  rss_round_differences = rss["paired_round_differences_bytes"]
+                  assert len(rss_round_differences) == 7, (
+                      mode,
+                      case,
+                      "paired RSS round count",
+                      len(rss_round_differences),
+                  )
+                  assert rss["paired_round_limit_bytes"] == rss_limit, (
+                      mode,
+                      case,
+                      "paired RSS round limit",
+                      rss["paired_round_limit_bytes"],
+                  )
+                  rss_exceeding_rounds = paired_round_limit_exceedances(
+                      rss_round_differences, rss_limit
+                  )
+                  assert (
+                      rss["paired_round_exceeding_indices"] == rss_exceeding_rounds
+                  ), (
+                      mode,
+                      case,
+                      "paired RSS exceedance evidence",
+                      rss["paired_round_exceeding_indices"],
+                      rss_exceeding_rounds,
+                  )
+                  assert paired_round_single_outlier_ratchet_passes(
+                      rss_round_differences, rss_limit
+                  ), (
+                      mode,
+                      case,
+                      "repeated paired-round RSS regression",
+                      rss_exceeding_rounds,
+                      rss_round_differences,
                   )
           assert len(normalization_pooled) == 4, normalization_pooled
           assert len(normalization_paired) == 4, normalization_paired

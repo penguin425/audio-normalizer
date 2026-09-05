@@ -144,6 +144,26 @@ def paired_round_differences(
     return differences
 
 
+def paired_round_limit_exceedances(
+    differences: Iterable[float], limit: float
+) -> list[int]:
+    """Return round indexes whose candidate-minus-baseline value exceeds a limit."""
+
+    return [
+        round_index
+        for round_index, difference in enumerate(differences)
+        if difference > limit
+    ]
+
+
+def paired_round_single_outlier_ratchet_passes(
+    differences: Iterable[float], limit: float
+) -> bool:
+    """Allow one isolated over-limit round, but reject two or more."""
+
+    return len(paired_round_limit_exceedances(differences, limit)) <= 1
+
+
 def isolated_regression_reproduced(
     initial_change: float,
     confirmation_change: float,
