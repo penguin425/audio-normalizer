@@ -8,6 +8,17 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.189.11 - 2026-09-06
+
+### Fixed
+
+- Keep locally resolved HLS playlists, segments, initialization maps, partial
+  segments, preload hints, and rendition reports inside the canonical package
+  root.
+- Reject absolute and `file:` references, traversal above the package root,
+  encoded path separators, Windows path forms, invalid URI escapes, and
+  symlink escapes with stable machine-readable containment evidence.
+
 ## 0.189.10 - 2026-09-05
 
 ### Added
