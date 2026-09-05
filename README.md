@@ -140,7 +140,7 @@ Use the checksums and attestation bundle shipped with each
 ## Documentation
 
 - [Documentation map and command index](DOCUMENTATION.md)
-- [JSON schemas](schema/)
+- [JSON schemas and version registry](SCHEMA-REGISTRY.md)
 - [Compatibility and deprecation policy](COMPATIBILITY.md)
 - [Rust API stability policy](API-STABILITY.md)
 - [Performance methodology](PERFORMANCE.md)

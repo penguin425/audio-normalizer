@@ -189,6 +189,8 @@ on:
       - "tools/package-linux-release.sh"
       - "tools/package-linux-v3-release.sh"
       - "tools/check-release-content.py"
+      - "tools/check-schema-registry.py"
+      - "tools/test_schema_registry.py"
       - "tools/generate-package-metadata.sh"
       - "tools/check-release-readiness.sh"
       # Cargo-only dependency updates are covered by the full-feature CI jobs.

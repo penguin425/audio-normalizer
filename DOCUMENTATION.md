@@ -34,8 +34,9 @@ forge-container-qc --help
 - [DTS reference-decoder adapter](DTS-ADAPTER.md)
 - [MPEG-H adapter](MPEGH-ADAPTER.md)
 
-Machine-readable contracts are under [`schema/`](schema/). Each report names
-its schema version and the bounded checks it performs.
+Machine-readable contracts are under [`schema/`](schema/), with lifecycle and
+ownership recorded in the [JSON contract registry](SCHEMA-REGISTRY.md). Each
+report names its schema version and the bounded checks it performs.
 
 ## APIs and host integration
 

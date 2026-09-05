@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -66,6 +67,26 @@ def selected_files(root: Path, patterns: tuple[str, ...]) -> dict[Path, Path]:
     return {path.relative_to(root): path for path in paths}
 
 
+def registered_json_files(repo_root: Path) -> dict[Path, Path]:
+    registry_path = repo_root / "schema" / "schema-registry-v1.json"
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registered: dict[Path, Path] = {}
+    for entry in registry["entries"]:
+        repository_path = Path(entry["path"])
+        try:
+            relative = repository_path.relative_to("schema")
+        except ValueError as error:
+            raise SystemExit(
+                f"registered JSON path is outside schema/: {repository_path}"
+            ) from error
+        if len(relative.parts) != 1:
+            raise SystemExit(
+                f"registered JSON path must be top-level: {repository_path}"
+            )
+        registered[relative] = repo_root / repository_path
+    return registered
+
+
 def verify_sha256_manifest(root: Path) -> None:
     manifest = root / "SHA256SUMS"
     for line in manifest.read_text(encoding="ascii").splitlines():
@@ -106,10 +127,11 @@ def main() -> None:
 
     repo_schema = repo_root / "schema"
     staged_schema = staged_root / "schema"
+    registered_json = registered_json_files(repo_root)
     compare_files(
-        "JSON schema set",
+        "governed JSON set",
         repo_root,
-        selected_files(repo_schema, ("*.json",)),
+        registered_json,
         selected_files(staged_schema, ("*.json",)),
     )
     compare_files(
@@ -124,7 +146,7 @@ def main() -> None:
         "release public file set ready: "
         f"{len(selected_files(repo_root, ('*.md',)))} documents, "
         f"{len(files_under(repo_root / 'proto'))} protocol files, "
-        f"{len(selected_files(repo_schema, ('*.json',)))} JSON schemas, and "
+        f"{len(registered_json)} governed JSON documents, and "
         f"{len(files_under(repo_schema / 'ebu-qc-2026-04'))} EBU QC files"
     )
 
