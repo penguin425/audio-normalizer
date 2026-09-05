@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import statistics
@@ -76,12 +77,18 @@ def paired_round_changes(
             if label == BASELINE:
                 if baseline_index >= len(baseline_samples):
                     raise ValueError("paired benchmark is missing a baseline sample")
-                baseline_values.append(value(baseline_samples[baseline_index]))
+                sample_value = value(baseline_samples[baseline_index])
+                if not math.isfinite(sample_value):
+                    raise ValueError("paired benchmark baseline sample is non-finite")
+                baseline_values.append(sample_value)
                 baseline_index += 1
             elif label == CANDIDATE:
                 if candidate_index >= len(candidate_samples):
                     raise ValueError("paired benchmark is missing a candidate sample")
-                candidate_values.append(value(candidate_samples[candidate_index]))
+                sample_value = value(candidate_samples[candidate_index])
+                if not math.isfinite(sample_value):
+                    raise ValueError("paired benchmark candidate sample is non-finite")
+                candidate_values.append(sample_value)
                 candidate_index += 1
             else:
                 raise ValueError(f"unknown paired benchmark schedule label: {label}")
@@ -108,6 +115,45 @@ def paired_median_change_percent(
     if not changes:
         raise ValueError("paired benchmark has no complete blocks")
     return statistics.median(changes)
+
+
+def pooled_median_change_percent(
+    result: dict[str, Any],
+    value: Callable[[dict[str, Any]], float],
+) -> float:
+    """Return the candidate/baseline change across both complete populations."""
+
+    baseline_samples = result["baseline_samples"]
+    candidate_samples = result["candidate_samples"]
+    if not baseline_samples or len(baseline_samples) != len(candidate_samples):
+        raise ValueError("paired benchmark populations are incomplete or unbalanced")
+    baseline_values = [value(sample) for sample in baseline_samples]
+    candidate_values = [value(sample) for sample in candidate_samples]
+    if not all(math.isfinite(sample) for sample in baseline_values):
+        raise ValueError("paired benchmark baseline population is non-finite")
+    if not all(math.isfinite(sample) for sample in candidate_values):
+        raise ValueError("paired benchmark candidate population is non-finite")
+    baseline_value = statistics.median(baseline_values)
+    candidate_value = statistics.median(candidate_values)
+    if baseline_value <= 0.0:
+        raise ValueError("paired benchmark baseline value must be positive")
+    return (candidate_value / baseline_value - 1.0) * 100.0
+
+
+def paired_and_pooled_gate_passes(
+    paired_change: float,
+    pooled_change: float,
+    limit: float,
+) -> bool:
+    """Require both independent change statistics to stay within one limit."""
+
+    return (
+        math.isfinite(paired_change)
+        and math.isfinite(pooled_change)
+        and math.isfinite(limit)
+        and paired_change <= limit
+        and pooled_change <= limit
+    )
 
 
 def paired_round_differences(
@@ -140,6 +186,10 @@ def paired_round_differences(
             raise ValueError(
                 "paired benchmark round does not contain two samples per binary"
             )
+        if not all(math.isfinite(sample) for sample in baseline_values):
+            raise ValueError("paired benchmark baseline round is non-finite")
+        if not all(math.isfinite(sample) for sample in candidate_values):
+            raise ValueError("paired benchmark candidate round is non-finite")
         differences.append(reducer(candidate_values) - reducer(baseline_values))
     return differences
 
@@ -164,6 +214,21 @@ def paired_round_single_outlier_ratchet_passes(
     return len(paired_round_limit_exceedances(differences, limit)) <= 1
 
 
+def regression_reproduced(
+    initial_change: float,
+    confirmation_change: float,
+    limit: float,
+) -> bool:
+    """Return whether independent populations both exceed the same limit."""
+
+    if not all(
+        math.isfinite(value)
+        for value in (initial_change, confirmation_change, limit)
+    ):
+        raise ValueError("regression comparison contains a non-finite value")
+    return initial_change > limit and confirmation_change > limit
+
+
 def isolated_regression_reproduced(
     initial_change: float,
     confirmation_change: float,
@@ -171,7 +236,7 @@ def isolated_regression_reproduced(
 ) -> bool:
     """Return whether an isolated regression exceeds its limit twice."""
 
-    return initial_change > limit and confirmation_change > limit
+    return regression_reproduced(initial_change, confirmation_change, limit)
 
 
 def selected_cases(requested: Iterable[str] | None) -> list[str]:

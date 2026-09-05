@@ -152,6 +152,126 @@ class BenchmarkTests(unittest.TestCase):
                 result, lambda sample: sample["value"]
             )
 
+    def test_five_round_limiter_schedule_is_balanced_and_inverts_by_case(self):
+        baseline_first = paired_benchmark.alternating_schedule(5)
+        candidate_first = paired_benchmark.alternating_schedule(5, inverted=True)
+        for schedule in (baseline_first, candidate_first):
+            self.assertEqual(len(schedule), 20)
+            self.assertEqual(schedule.count(paired_benchmark.BASELINE), 10)
+            self.assertEqual(schedule.count(paired_benchmark.CANDIDATE), 10)
+            for start in range(0, len(schedule), 4):
+                block = schedule[start : start + 4]
+                self.assertEqual(block.count(paired_benchmark.BASELINE), 2)
+                self.assertEqual(block.count(paired_benchmark.CANDIDATE), 2)
+        self.assertEqual(baseline_first[0], paired_benchmark.BASELINE)
+        self.assertEqual(candidate_first[0], paired_benchmark.CANDIDATE)
+
+    @staticmethod
+    def _chronological_paired_result(schedule, candidate_factor=1.0):
+        samples = {
+            paired_benchmark.BASELINE: [],
+            paired_benchmark.CANDIDATE: [],
+        }
+        for position, label in enumerate(schedule):
+            value = 100.0 + position
+            if label == paired_benchmark.CANDIDATE:
+                value *= candidate_factor
+            samples[label].append({"value": value})
+        return {
+            "schedule": schedule,
+            "baseline_samples": samples[paired_benchmark.BASELINE],
+            "candidate_samples": samples[paired_benchmark.CANDIDATE],
+        }
+
+    def test_small_balanced_blocks_cancel_linear_runner_drift(self):
+        result = self._chronological_paired_result(
+            paired_benchmark.alternating_schedule(5)
+        )
+        changes = paired_benchmark.paired_round_changes(
+            result, lambda sample: sample["value"]
+        )
+        self.assertEqual(len(changes), 5)
+        for change in changes:
+            self.assertAlmostEqual(change, 0.0)
+        self.assertAlmostEqual(
+            paired_benchmark.pooled_median_change_percent(
+                result, lambda sample: sample["value"]
+            ),
+            0.0,
+        )
+
+    def test_paired_statistics_preserve_a_real_regression_during_drift(self):
+        result = self._chronological_paired_result(
+            paired_benchmark.alternating_schedule(5), candidate_factor=1.05
+        )
+        self.assertAlmostEqual(
+            paired_benchmark.paired_median_change_percent(
+                result, lambda sample: sample["value"]
+            ),
+            5.0,
+        )
+        self.assertGreater(
+            paired_benchmark.pooled_median_change_percent(
+                result, lambda sample: sample["value"]
+            ),
+            4.9,
+        )
+
+    def test_paired_statistics_reject_incomplete_populations(self):
+        result = self._chronological_paired_result(
+            paired_benchmark.alternating_schedule(1)
+        )
+        result["candidate_samples"].pop()
+        with self.assertRaisesRegex(ValueError, "missing a candidate sample"):
+            paired_benchmark.paired_round_changes(
+                result, lambda sample: sample["value"]
+            )
+        with self.assertRaisesRegex(ValueError, "incomplete or unbalanced"):
+            paired_benchmark.pooled_median_change_percent(
+                result, lambda sample: sample["value"]
+            )
+
+    def test_paired_statistics_reject_raw_nonfinite_values_before_reduction(self):
+        result = self._chronological_paired_result(
+            paired_benchmark.alternating_schedule(5)
+        )
+        result["baseline_samples"][0]["value"] = float("inf")
+        with self.assertRaisesRegex(ValueError, "baseline sample is non-finite"):
+            paired_benchmark.paired_round_changes(
+                result, lambda sample: sample["value"]
+            )
+        with self.assertRaisesRegex(ValueError, "population is non-finite"):
+            paired_benchmark.pooled_median_change_percent(
+                result, lambda sample: sample["value"]
+            )
+
+        rounds = [
+            {
+                "order": paired_benchmark.alternating_schedule(1),
+                "samples": {
+                    paired_benchmark.BASELINE: [
+                        {"value": 1.0},
+                        {"value": 1.0},
+                    ],
+                    paired_benchmark.CANDIDATE: [
+                        {"value": float("nan")},
+                        {"value": 1.0},
+                    ],
+                },
+            }
+        ]
+        with self.assertRaisesRegex(ValueError, "candidate round is non-finite"):
+            paired_benchmark.paired_round_differences(
+                rounds, lambda sample: sample["value"]
+            )
+
+    def test_paired_and_pooled_gate_uses_exact_fail_closed_thresholds(self):
+        gate = paired_benchmark.paired_and_pooled_gate_passes
+        self.assertTrue(gate(3.0, 3.0, 3.0))
+        self.assertFalse(gate(3.000_001, 3.0, 3.0))
+        self.assertFalse(gate(3.0, 3.000_001, 3.0))
+        self.assertFalse(gate(float("nan"), 0.0, 3.0))
+
     def test_paired_round_max_differences_isolate_one_gross_rss_outlier(self):
         orders = (
             paired_benchmark.alternating_schedule(1),
@@ -227,6 +347,19 @@ class BenchmarkTests(unittest.TestCase):
         self.assertFalse(reproduced(4.1, 3.9, 4.0))
         self.assertFalse(reproduced(3.9, 4.2, 4.0))
         self.assertFalse(reproduced(4.0, 4.1, 4.0))
+
+    def test_wall_and_cpu_aggregate_regressions_require_reproduction(self):
+        for metric in ("wall", "cpu"):
+            with self.subTest(metric=metric):
+                self.assertFalse(
+                    paired_benchmark.regression_reproduced(1.2, 0.9, 1.0)
+                )
+                self.assertTrue(
+                    paired_benchmark.regression_reproduced(1.2, 1.1, 1.0)
+                )
+        for nonfinite in (float("nan"), float("inf"), float("-inf")):
+            with self.assertRaisesRegex(ValueError, "non-finite"):
+                paired_benchmark.regression_reproduced(1.2, nonfinite, 1.0)
 
     def test_selected_cases_default_and_deduplication(self):
         self.assertEqual(
