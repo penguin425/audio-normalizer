@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub const HLS_QC_SCHEMA: &str = "https://penguin425.github.io/audio-normalizer/schema/hls-qc-v1";
 const MAX_PLAYLIST_BYTES: u64 = 16 * 1024 * 1024;
@@ -130,6 +130,15 @@ struct RenditionReport {
     last_part: Option<u64>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum LocalReference {
+    External,
+    Invalid(&'static str),
+    Path(PathBuf),
+}
+
+type InvalidReferenceSet = HashSet<(PathBuf, String)>;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TsAudioStream {
     program: u64,
@@ -153,9 +162,22 @@ impl TsAudioStream {
     }
 }
 
+/// Audits an HLS playlist and the local package resources it references.
+///
+/// # Input stability and security
+///
+/// The caller must keep the entry playlist, its package root (the playlist's parent directory),
+/// and every referenced playlist and resource quiescent for the entire call. This function
+/// performs canonical containment checks when it resolves local references, but those checks do
+/// not provide a filesystem snapshot or isolation against concurrent replacement or mutation.
+/// Callers must materialize untrusted input into a caller-owned, unshared snapshot before calling
+/// this function.
 pub fn audit(path: &Path, profile: HlsProfile) -> Result<HlsAudit, String> {
     let mut findings = Vec::new();
+    let mut invalid_references = InvalidReferenceSet::new();
+    let package_root = package_root(path)?;
     let root = parse_playlist(path, profile, &mut findings)?;
+    audit_reference_safety(&package_root, &root, &mut invalid_references, &mut findings);
     let root_path = root.path.clone();
     let root_independent_segments = root.has_independent_segments;
     let media_renditions = root.media_renditions.clone();
@@ -173,31 +195,53 @@ pub fn audit(path: &Path, profile: HlsProfile) -> Result<HlsAudit, String> {
                 ));
                 break;
             }
-            let Some(reference) = local_reference(&root.path, uri) else {
-                findings.push(finding(
-                    "FORGE-HLS-REMOTE-REFERENCE",
-                    Severity::Warning,
-                    false,
-                    format!("remote playlist was not fetched: {uri}"),
-                    Some(json!(uri)),
-                ));
-                continue;
+            let reference = match checked_local_reference(
+                &package_root,
+                &root.path,
+                "playlist",
+                uri,
+                &mut invalid_references,
+                &mut findings,
+            ) {
+                LocalReference::Path(path) => path,
+                LocalReference::External => {
+                    findings.push(finding(
+                        "FORGE-HLS-REMOTE-REFERENCE",
+                        Severity::Warning,
+                        false,
+                        format!("remote playlist was not fetched: {uri}"),
+                        Some(json!(uri)),
+                    ));
+                    continue;
+                }
+                LocalReference::Invalid(_) => continue,
             };
             if !seen.insert(reference.clone()) {
                 continue;
             }
             match parse_playlist(&reference, profile, &mut findings) {
-                Ok(playlist) if playlist.kind == "media" => media.push(playlist),
-                Ok(_) => findings.push(finding(
-                    "FORGE-HLS-RENDITION-KIND",
-                    Severity::Error,
-                    false,
-                    format!(
-                        "referenced playlist is not a Media Playlist: {}",
-                        reference.display()
-                    ),
-                    None,
-                )),
+                Ok(playlist) => {
+                    audit_reference_safety(
+                        &package_root,
+                        &playlist,
+                        &mut invalid_references,
+                        &mut findings,
+                    );
+                    if playlist.kind == "media" {
+                        media.push(playlist);
+                    } else {
+                        findings.push(finding(
+                            "FORGE-HLS-RENDITION-KIND",
+                            Severity::Error,
+                            false,
+                            format!(
+                                "referenced playlist is not a Media Playlist: {}",
+                                reference.display()
+                            ),
+                            None,
+                        ));
+                    }
+                }
                 Err(error) => findings.push(finding(
                     "FORGE-HLS-RENDITION-READ",
                     Severity::Error,
@@ -237,10 +281,30 @@ pub fn audit(path: &Path, profile: HlsProfile) -> Result<HlsAudit, String> {
     }
 
     for playlist in &media {
-        audit_media_files(playlist, profile, root_independent_segments, &mut findings);
+        audit_media_files(
+            &package_root,
+            playlist,
+            profile,
+            root_independent_segments,
+            &mut invalid_references,
+            &mut findings,
+        );
     }
-    cross_check_renditions(&media, profile, &mut findings);
-    cross_check_cmaf_audio_renditions(&root_path, &media_renditions, &media, &mut findings);
+    cross_check_renditions(
+        &package_root,
+        &media,
+        profile,
+        &mut invalid_references,
+        &mut findings,
+    );
+    cross_check_cmaf_audio_renditions(
+        &package_root,
+        &root_path,
+        &media_renditions,
+        &media,
+        &mut invalid_references,
+        &mut findings,
+    );
 
     let passed = findings
         .iter()
@@ -1068,14 +1132,23 @@ fn current_parent_has_parts(playlist: &Playlist) -> bool {
 }
 
 fn audit_media_files(
+    package_root: &Path,
     playlist: &Playlist,
     profile: HlsProfile,
     inherited_independent_segments: bool,
+    invalid_references: &mut InvalidReferenceSet,
     findings: &mut Vec<HlsFinding>,
 ) {
     let mut xhe_tracks = Vec::new();
     if let Some(uri) = &playlist.map_uri {
-        if let Some(path) = local_reference(&playlist.path, uri) {
+        if let LocalReference::Path(path) = checked_local_reference(
+            package_root,
+            &playlist.path,
+            "initialization resource",
+            uri,
+            invalid_references,
+            findings,
+        ) {
             let exists = path.is_file();
             findings.push(finding(
                 "FORGE-HLS-LOCAL-RESOURCE",
@@ -1108,15 +1181,26 @@ fn audit_media_files(
             last_timed_id3_pts.clear();
             last_emsg_time = None;
         }
-        let Some(path) = local_reference(&playlist.path, uri) else {
-            findings.push(finding(
-                "FORGE-HLS-REMOTE-REFERENCE",
-                Severity::Warning,
-                false,
-                format!("remote segment was not fetched: {uri}"),
-                Some(json!(uri)),
-            ));
-            continue;
+        let path = match checked_local_reference(
+            package_root,
+            &playlist.path,
+            "media segment",
+            uri,
+            invalid_references,
+            findings,
+        ) {
+            LocalReference::Path(path) => path,
+            LocalReference::External => {
+                findings.push(finding(
+                    "FORGE-HLS-REMOTE-REFERENCE",
+                    Severity::Warning,
+                    false,
+                    format!("remote segment was not fetched: {uri}"),
+                    Some(json!(uri)),
+                ));
+                continue;
+            }
+            LocalReference::Invalid(_) => continue,
         };
         let exists = path.is_file();
         findings.push(finding(
@@ -1735,7 +1819,13 @@ fn xhe_tracks_from_init_properties(properties: &Value) -> Vec<XheTrackInit> {
         .collect()
 }
 
-fn cross_check_renditions(media: &[Playlist], profile: HlsProfile, findings: &mut Vec<HlsFinding>) {
+fn cross_check_renditions(
+    package_root: &Path,
+    media: &[Playlist],
+    profile: HlsProfile,
+    invalid_references: &mut InvalidReferenceSet,
+    findings: &mut Vec<HlsFinding>,
+) {
     if media.len() < 2 {
         return;
     }
@@ -1800,14 +1890,16 @@ fn cross_check_renditions(media: &[Playlist], profile: HlsProfile, findings: &mu
             "every Rendition PART-HOLD-BACK covers three times the maximum Part Target",
             Some(json!({"maximum_part_target": maximum_part_target})),
         ));
-        cross_check_low_latency_renditions(media, findings);
+        cross_check_low_latency_renditions(package_root, media, invalid_references, findings);
     }
 }
 
 fn cross_check_cmaf_audio_renditions(
+    package_root: &Path,
     root_path: &Path,
     renditions: &[MediaRendition],
     media: &[Playlist],
+    invalid_references: &mut InvalidReferenceSet,
     findings: &mut Vec<HlsFinding>,
 ) {
     let mut declared_groups = HashMap::<&str, Vec<&MediaRendition>>::new();
@@ -1825,16 +1917,28 @@ fn cross_check_cmaf_audio_renditions(
         .into_iter()
         .filter(|(_, group)| group.len() > 1)
     {
-        let group = declared
-            .iter()
-            .filter_map(|rendition| {
-                let path = local_reference(root_path, rendition.uri.as_deref()?)?;
-                media
-                    .iter()
-                    .find(|playlist| paths_equal(&playlist.path, &path))
-                    .map(|playlist| (*rendition, playlist))
-            })
-            .collect::<Vec<_>>();
+        let mut group = Vec::new();
+        for rendition in &declared {
+            let Some(uri) = rendition.uri.as_deref() else {
+                continue;
+            };
+            let LocalReference::Path(path) = checked_local_reference(
+                package_root,
+                root_path,
+                "playlist",
+                uri,
+                invalid_references,
+                findings,
+            ) else {
+                continue;
+            };
+            if let Some(playlist) = media
+                .iter()
+                .find(|playlist| paths_equal(&playlist.path, &path))
+            {
+                group.push((*rendition, playlist));
+            }
+        }
         if !group.iter().any(|(_, item)| item.is_fmp4) {
             continue;
         }
@@ -1931,15 +2035,30 @@ fn cross_check_cmaf_audio_renditions(
     }
 }
 
-fn cross_check_low_latency_renditions(media: &[Playlist], findings: &mut Vec<HlsFinding>) {
+fn cross_check_low_latency_renditions(
+    package_root: &Path,
+    media: &[Playlist],
+    invalid_references: &mut InvalidReferenceSet,
+    findings: &mut Vec<HlsFinding>,
+) {
     for source in media {
         let source_edge = playlist_edge(source);
         let mut reported = HashSet::new();
         let mut values_match = true;
         for report in &source.rendition_reports {
-            let Some(path) = local_reference(&source.path, &report.uri) else {
-                values_match = false;
-                continue;
+            let path = match checked_local_reference(
+                package_root,
+                &source.path,
+                "rendition report",
+                &report.uri,
+                invalid_references,
+                findings,
+            ) {
+                LocalReference::Path(path) => path,
+                LocalReference::External | LocalReference::Invalid(_) => {
+                    values_match = false;
+                    continue;
+                }
             };
             let Some(target) = media
                 .iter()
@@ -2305,22 +2424,319 @@ fn attributes(value: &str) -> Result<HashMap<String, String>, String> {
     Ok(values)
 }
 
-fn local_reference(playlist: &Path, uri: &str) -> Option<PathBuf> {
-    let lower = uri.to_ascii_lowercase();
-    if lower.starts_with("http://")
-        || lower.starts_with("https://")
-        || lower.starts_with("data:")
-        || uri.starts_with("//")
-    {
-        return None;
+fn package_root(playlist: &Path) -> Result<PathBuf, String> {
+    let parent = playlist
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::canonicalize(parent).map_err(|error| {
+        format!(
+            "canonicalize HLS package root {}: {error}",
+            parent.display()
+        )
+    })
+}
+
+fn audit_reference_safety(
+    package_root: &Path,
+    playlist: &Playlist,
+    invalid_references: &mut InvalidReferenceSet,
+    findings: &mut Vec<HlsFinding>,
+) {
+    let mut validate = |kind: &'static str, uri: &str| {
+        checked_local_reference(
+            package_root,
+            &playlist.path,
+            kind,
+            uri,
+            invalid_references,
+            findings,
+        );
+    };
+
+    for uri in &playlist.referenced_playlists {
+        validate("playlist", uri);
     }
+    if let Some(uri) = &playlist.map_uri {
+        validate("initialization resource", uri);
+    }
+    for uri in &playlist.segment_uris {
+        validate("media segment", uri);
+    }
+    for part in &playlist.parts {
+        validate("partial segment", &part.uri);
+    }
+    for hint in &playlist.preload_hints {
+        validate("preload hint", &hint.uri);
+    }
+    for report in &playlist.rendition_reports {
+        validate("rendition report", &report.uri);
+    }
+}
+
+fn checked_local_reference(
+    package_root: &Path,
+    playlist: &Path,
+    reference_kind: &'static str,
+    uri: &str,
+    invalid_references: &mut InvalidReferenceSet,
+    findings: &mut Vec<HlsFinding>,
+) -> LocalReference {
+    // Deliberately resolve again at each use site instead of caching a successful path. A path
+    // that became an outside symlink is therefore rejected before use; the set only suppresses
+    // duplicate diagnostics for references that were already reported invalid.
+    let reference = local_reference(package_root, playlist, uri);
+    if let LocalReference::Invalid(reason) = &reference {
+        let reason = *reason;
+        if invalid_references.insert((playlist.to_path_buf(), uri.to_owned())) {
+            findings.push(finding(
+                "FORGE-HLS-LOCAL-REFERENCE-CONTAINMENT",
+                Severity::Error,
+                false,
+                format!("unsafe {reference_kind} URI was not resolved as a local file: {reason}"),
+                Some(json!({
+                    "playlist": playlist,
+                    "reference_kind": reference_kind,
+                    "uri": uri,
+                    "reason": reason
+                })),
+            ));
+        }
+    }
+    reference
+}
+
+fn local_reference(package_root: &Path, playlist: &Path, uri: &str) -> LocalReference {
+    if uri.is_empty() {
+        return LocalReference::Invalid("URI is empty");
+    }
+    // The query and fragment are URI metadata, not filesystem path bytes. Only the path is
+    // decoded and mapped to the package after this split.
     let path = uri.split(['?', '#']).next().unwrap_or(uri);
-    Some(
-        playlist
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(path),
-    )
+    if uri
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return LocalReference::Invalid("URI contains whitespace or a control character");
+    }
+    if path.as_bytes().contains(&b'\\') {
+        return LocalReference::Invalid(
+            "URI contains a raw backslash, which is a path separator on Windows",
+        );
+    }
+    if !valid_percent_encoding(uri) {
+        return LocalReference::Invalid("URI contains an invalid percent escape");
+    }
+    if uri.starts_with("//") {
+        if uri.starts_with("///") {
+            return LocalReference::Invalid("URI has an absolute path without a network authority");
+        }
+        return match url::Url::parse(&format!("https:{uri}")) {
+            Ok(url) if url.host_str().is_some() => LocalReference::External,
+            _ => LocalReference::Invalid("URI has an invalid network-path reference"),
+        };
+    }
+
+    if windows_drive_prefix(path) {
+        return LocalReference::Invalid("URI has a Windows drive prefix");
+    }
+    if let Some(scheme) = uri_scheme(path) {
+        if scheme.eq_ignore_ascii_case("file") {
+            return LocalReference::Invalid("file URI is not an allowed HLS package reference");
+        }
+        return match url::Url::parse(uri) {
+            Ok(url) if !matches!(url.scheme(), "http" | "https") || url.host_str().is_some() => {
+                LocalReference::External
+            }
+            _ => LocalReference::Invalid("URI has an invalid absolute reference"),
+        };
+    }
+    if path.is_empty() {
+        return LocalReference::Invalid("URI has no local path");
+    }
+    if path.starts_with('/') {
+        return LocalReference::Invalid("URI has an absolute local path");
+    }
+
+    let parent = playlist
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = match fs::canonicalize(parent) {
+        Ok(parent) if parent.starts_with(package_root) => parent,
+        Ok(_) => {
+            return LocalReference::Invalid("playlist parent resolves outside the HLS package root")
+        }
+        Err(_) => return LocalReference::Invalid("playlist parent could not be canonicalized"),
+    };
+    let mut candidate = parent
+        .strip_prefix(package_root)
+        .ok()
+        .filter(|relative| {
+            relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+        })
+        .map_or(canonical_parent, |relative| package_root.join(relative));
+
+    // RFC 3986 dot segments are applied to the playlist's logical parent. The package root is
+    // the bottom of this stack, so `../shared/...` is valid from a nested playlist while an
+    // additional `..` that would pop the root is rejected.
+    for encoded_segment in path.split('/') {
+        let segment = match decode_uri_path_segment(encoded_segment) {
+            Ok(segment) => segment,
+            Err(reason) => return LocalReference::Invalid(reason),
+        };
+        match segment.as_str() {
+            "" | "." => {}
+            ".." => {
+                if candidate == package_root {
+                    return LocalReference::Invalid("URI dot segments escape the HLS package root");
+                }
+                if !candidate.pop() || !candidate.starts_with(package_root) {
+                    return LocalReference::Invalid("URI dot segments escape the HLS package root");
+                }
+            }
+            _ => {
+                if windows_drive_prefix(&segment) {
+                    return LocalReference::Invalid("URI path segment has a Windows drive prefix");
+                }
+                candidate.push(segment);
+            }
+        }
+    }
+    contained_local_path(package_root, &candidate)
+}
+
+fn decode_uri_path_segment(segment: &str) -> Result<String, &'static str> {
+    let encoded = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut index = 0;
+    while index < encoded.len() {
+        if encoded[index] == b'%' {
+            let Some(hex) = encoded.get(index + 1..index + 3) else {
+                return Err("URI path contains an invalid percent escape");
+            };
+            let (Some(high), Some(low)) = (hex_value(hex[0]), hex_value(hex[1])) else {
+                return Err("URI path contains an invalid percent escape");
+            };
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(encoded[index]);
+            index += 1;
+        }
+    }
+    let decoded = String::from_utf8(decoded)
+        .map_err(|_| "URI path is not valid UTF-8 after percent-decoding")?;
+    if decoded.chars().any(char::is_control) {
+        return Err("URI path contains a decoded NUL or control character");
+    }
+    if decoded.contains('/') {
+        return Err("URI path segment contains a decoded slash");
+    }
+    if decoded.contains('\\') {
+        return Err("URI path segment contains a decoded backslash");
+    }
+    Ok(decoded)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn contained_local_path(package_root: &Path, candidate: &Path) -> LocalReference {
+    match fs::symlink_metadata(candidate) {
+        Ok(_) => {
+            let canonical = match fs::canonicalize(candidate) {
+                Ok(canonical) => canonical,
+                Err(_) => {
+                    return LocalReference::Invalid(
+                        "existing local reference could not be canonicalized",
+                    )
+                }
+            };
+            if !canonical.starts_with(package_root) {
+                return LocalReference::Invalid(
+                    "existing local reference resolves outside the HLS package root",
+                );
+            }
+            // Auditing assumes a quiescent package. The canonical target proves containment,
+            // while the logical candidate preserves RFC 3986 resolution for a symlink alias.
+            // Every later use resolves and checks again, but a writer can still replace the path
+            // between this check and open. Fully eliminating that TOCTOU window requires
+            // handle-relative I/O on every platform.
+            return LocalReference::Path(candidate.to_path_buf());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return LocalReference::Invalid("local reference could not be inspected safely"),
+    }
+
+    // A missing final resource is allowed so the normal LOCAL-RESOURCE finding can report it.
+    // Canonicalizing its nearest existing ancestor also rejects an existing directory symlink
+    // that would otherwise redirect the candidate outside the package.
+    let mut ancestor = candidate.parent();
+    while let Some(path) = ancestor {
+        match fs::canonicalize(path) {
+            Ok(canonical) => {
+                return if canonical.starts_with(package_root) {
+                    LocalReference::Path(candidate.to_path_buf())
+                } else {
+                    LocalReference::Invalid(
+                        "local reference has an ancestor outside the HLS package root",
+                    )
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = path.parent();
+            }
+            Err(_) => {
+                return LocalReference::Invalid(
+                    "local reference ancestor could not be canonicalized",
+                )
+            }
+        }
+    }
+    LocalReference::Invalid("local reference has no resolvable package ancestor")
+}
+
+fn windows_drive_prefix(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn uri_scheme(uri: &str) -> Option<&str> {
+    let colon = uri.find(':')?;
+    let scheme = &uri[..colon];
+    let mut characters = scheme.chars();
+    characters.next()?.is_ascii_alphabetic().then_some(())?;
+    characters
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.'))
+        .then_some(scheme)
+}
+
+fn valid_percent_encoding(uri: &str) -> bool {
+    let bytes = uri.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if bytes
+                .get(index + 1..index + 3)
+                .is_none_or(|hex| !hex.iter().all(u8::is_ascii_hexdigit))
+            {
+                return false;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    true
 }
 
 fn finding(
@@ -2524,6 +2940,319 @@ mod tests {
         let apple = audit(&path, HlsProfile::AppleHls).unwrap();
         assert!(apple.passed, "{apple:#?}");
         assert!(apple.warning_count > 0);
+    }
+
+    #[test]
+    fn decodes_local_uri_path_once_and_preserves_query_fragments() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let playlist = directory.path().join("master.m3u8");
+        fs::create_dir(directory.path().join("media")).unwrap();
+        fs::write(directory.path().join("media/segment one.ts"), b"segment").unwrap();
+
+        assert_eq!(
+            local_reference(
+                &root,
+                &playlist,
+                "media/segment%20one.ts?token=abc#fragment"
+            ),
+            LocalReference::Path(
+                fs::canonicalize(directory.path().join("media/segment one.ts")).unwrap()
+            )
+        );
+        assert_eq!(
+            local_reference(&root, &playlist, "media/%252e%252e.ts"),
+            LocalReference::Path(directory.path().join("media/%2e%2e.ts"))
+        );
+        fs::write(directory.path().join("existing.ts"), b"segment").unwrap();
+        assert_eq!(
+            local_reference(&root, &playlist, "existing.ts?token=abc#fragment"),
+            LocalReference::Path(fs::canonicalize(directory.path().join("existing.ts")).unwrap())
+        );
+
+        for uri in [
+            "https://example.invalid/segment.ts",
+            "http://example.invalid/segment.ts",
+            "data:application/octet-stream,segment",
+            "//cdn.example.invalid/segment.ts",
+            "ftp://example.invalid/segment.ts",
+        ] {
+            assert_eq!(
+                local_reference(&root, &playlist, uri),
+                LocalReference::External,
+                "{uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalizes_dot_segments_against_the_logical_playlist_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("variants")).unwrap();
+        fs::create_dir_all(directory.path().join("shared")).unwrap();
+        fs::write(directory.path().join("shared/segment.ts"), b"segment").unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let playlist = directory.path().join("variants/audio.m3u8");
+
+        assert_eq!(
+            local_reference(&root, &playlist, "../shared/segment.ts"),
+            LocalReference::Path(
+                fs::canonicalize(directory.path().join("shared/segment.ts")).unwrap()
+            )
+        );
+        assert_eq!(
+            local_reference(&root, &playlist, "nested/%2e%2e/../shared/segment.ts"),
+            LocalReference::Path(
+                fs::canonicalize(directory.path().join("shared/segment.ts")).unwrap()
+            )
+        );
+        assert!(matches!(
+            local_reference(&root, &playlist, "%2e%2e/%2e%2e/outside.ts"),
+            LocalReference::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_unsafe_or_invalid_local_uri_paths_on_every_platform() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let playlist = directory.path().join("master.m3u8");
+
+        for uri in [
+            "",
+            "?token=abc",
+            "#fragment",
+            "/root/segment.ts",
+            "///root/segment.ts",
+            "../segment.ts",
+            "nested/../../segment.ts",
+            "C:/segment.ts",
+            "C:segment.ts",
+            r"nested\segment.ts",
+            r"\\server\share\segment.ts",
+            r"\\?\C:\segment.ts",
+            r"\\.\C:\segment.ts",
+            "segment name.ts",
+            "segment%2.ts",
+            "segment%GG.ts",
+            "nested/segment%2Fchild.ts",
+            "nested/segment%5Cchild.ts",
+            "nested/segment%00.ts",
+            "nested/segment%1F.ts",
+            "nested/segment%FF.ts",
+            "nested/segment%C3%28.ts",
+            "%43%3A/segment.ts",
+            "%2e%2e/outside.ts",
+            "file:///root/segment.ts",
+        ] {
+            assert!(
+                matches!(
+                    local_reference(&root, &playlist, uri),
+                    LocalReference::Invalid(_)
+                ),
+                "unsafe URI was accepted: {uri:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reports_invalid_local_references_as_stable_errors_not_remote_warnings() {
+        let directory = tempfile::tempdir().unwrap();
+        for (index, uri) in [
+            "../outside.ts",
+            "/root/outside.ts",
+            "C:/outside.ts",
+            r"nested\outside.ts",
+            "invalid%GG.ts",
+            "?token=abc",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = directory.path().join(format!("unsafe-{index}.m3u8"));
+            fs::write(
+                &path,
+                format!("#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n{uri}\n#EXT-X-ENDLIST\n"),
+            )
+            .unwrap();
+            let result = audit(&path, HlsProfile::Rfc8216).unwrap();
+            assert!(!result.passed, "{uri}: {result:#?}");
+            assert!(result.findings.iter().any(|finding| {
+                finding.rule_id == "FORGE-HLS-LOCAL-REFERENCE-CONTAINMENT"
+                    && finding.severity == Severity::Error
+                    && !finding.passed
+                    && finding.observed.as_ref().is_some_and(|observed| {
+                        observed["reference_kind"] == "media segment"
+                            && observed["uri"].as_str() == Some(uri)
+                    })
+            }));
+            assert!(!result.findings.iter().any(|finding| {
+                finding.rule_id == "FORGE-HLS-REMOTE-REFERENCE"
+                    && finding
+                        .observed
+                        .as_ref()
+                        .is_some_and(|observed| observed.as_str() == Some(uri))
+            }));
+        }
+
+        let empty_map = directory.path().join("empty-map.m3u8");
+        fs::write(
+            &empty_map,
+            "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MAP:URI=\"\"\n\
+             #EXTINF:1,\nhttps://example.invalid/segment.m4s\n#EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+        let result = audit(&empty_map, HlsProfile::Rfc8216).unwrap();
+        assert!(result.findings.iter().any(|finding| {
+            finding.rule_id == "FORGE-HLS-LOCAL-REFERENCE-CONTAINMENT"
+                && finding.severity == Severity::Error
+                && !finding.passed
+                && finding.observed.as_ref().is_some_and(|observed| {
+                    observed["reference_kind"] == "initialization resource" && observed["uri"] == ""
+                })
+        }));
+    }
+
+    #[test]
+    fn reports_missing_decoded_local_paths_as_local_resources() {
+        let directory = tempfile::tempdir().unwrap();
+        let playlist = directory.path().join("missing.m3u8");
+        fs::write(
+            &playlist,
+            "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nmissing%20segment.ts\n\
+             #EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+
+        let result = audit(&playlist, HlsProfile::Rfc8216).unwrap();
+        assert!(result
+            .findings
+            .iter()
+            .any(|finding| { finding.rule_id == "FORGE-HLS-LOCAL-RESOURCE" && !finding.passed }));
+        assert!(!result.findings.iter().any(|finding| {
+            finding.rule_id == "FORGE-HLS-LOCAL-REFERENCE-CONTAINMENT" && !finding.passed
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeps_an_internal_playlist_symlink_as_the_logical_uri_base() {
+        let package = tempfile::tempdir().unwrap();
+        fs::create_dir(package.path().join("alias")).unwrap();
+        fs::create_dir(package.path().join("target")).unwrap();
+        fs::write(package.path().join("target/media.m3u8"), b"#EXTM3U\n").unwrap();
+        fs::write(package.path().join("alias/segment.ts"), b"inside").unwrap();
+        std::os::unix::fs::symlink(
+            package.path().join("target/media.m3u8"),
+            package.path().join("alias/media.m3u8"),
+        )
+        .unwrap();
+        let root = fs::canonicalize(package.path()).unwrap();
+        let master = package.path().join("master.m3u8");
+
+        let LocalReference::Path(playlist) = local_reference(&root, &master, "alias/media.m3u8")
+        else {
+            panic!("internal playlist symlink was not accepted");
+        };
+        assert_eq!(playlist, package.path().join("alias/media.m3u8"));
+        assert_eq!(
+            local_reference(&root, &playlist, "segment.ts"),
+            LocalReference::Path(package.path().join("alias/segment.ts"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_later_invalid_resolution_fails_closed_without_duplicate_findings() {
+        let package = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(package.path().join("inside.ts"), b"inside").unwrap();
+        fs::write(outside.path().join("outside.ts"), b"outside").unwrap();
+        let link = package.path().join("segment.ts");
+        std::os::unix::fs::symlink(package.path().join("inside.ts"), &link).unwrap();
+        let root = fs::canonicalize(package.path()).unwrap();
+        let playlist = package.path().join("media.m3u8");
+        let mut invalid_references = InvalidReferenceSet::new();
+        let mut findings = Vec::new();
+
+        assert!(matches!(
+            checked_local_reference(
+                &root,
+                &playlist,
+                "media segment",
+                "segment.ts",
+                &mut invalid_references,
+                &mut findings,
+            ),
+            LocalReference::Path(_)
+        ));
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("outside.ts"), &link).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                checked_local_reference(
+                    &root,
+                    &playlist,
+                    "media segment",
+                    "segment.ts",
+                    &mut invalid_references,
+                    &mut findings,
+                ),
+                LocalReference::Invalid(_)
+            ));
+        }
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|finding| {
+                    finding.rule_id == "FORGE-HLS-LOCAL-REFERENCE-CONTAINMENT" && !finding.passed
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_existing_symlinks_and_symlinked_ancestors_outside_package_root() {
+        let package = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("segment.ts"), b"outside").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("segment.ts"),
+            package.path().join("escape.ts"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), package.path().join("outside-dir")).unwrap();
+
+        let playlist = package.path().join("media.m3u8");
+        fs::write(
+            &playlist,
+            "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nescape.ts\n\
+             #EXTINF:1,\noutside-dir/missing.ts\n#EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+        let result = audit(&playlist, HlsProfile::Rfc8216).unwrap();
+        let containment_errors = result
+            .findings
+            .iter()
+            .filter(|finding| {
+                finding.rule_id == "FORGE-HLS-LOCAL-REFERENCE-CONTAINMENT" && !finding.passed
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(containment_errors.len(), 2, "{result:#?}");
+        assert!(containment_errors.iter().all(|finding| {
+            finding.severity == Severity::Error
+                && finding.observed.as_ref().is_some_and(|observed| {
+                    observed["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("outside the HLS package root"))
+                })
+        }));
+        assert!(!result
+            .findings
+            .iter()
+            .any(|finding| { finding.rule_id == "FORGE-HLS-LOCAL-RESOURCE" && finding.passed }));
     }
 
     #[test]
@@ -2785,7 +3514,16 @@ mod tests {
             ..Playlist::default()
         };
         let mut findings = Vec::new();
-        audit_media_files(&playlist, HlsProfile::Rfc8216, false, &mut findings);
+        let mut invalid_references = InvalidReferenceSet::new();
+        let package_root = fs::canonicalize(directory.path()).unwrap();
+        audit_media_files(
+            &package_root,
+            &playlist,
+            HlsProfile::Rfc8216,
+            false,
+            &mut invalid_references,
+            &mut findings,
+        );
         assert!(
             findings
                 .iter()
@@ -2796,7 +3534,15 @@ mod tests {
 
         fs::write(directory.path().join("two.m4s"), media_segment(10, 512)).unwrap();
         let mut findings = Vec::new();
-        audit_media_files(&playlist, HlsProfile::Rfc8216, false, &mut findings);
+        let mut invalid_references = InvalidReferenceSet::new();
+        audit_media_files(
+            &package_root,
+            &playlist,
+            HlsProfile::Rfc8216,
+            false,
+            &mut invalid_references,
+            &mut findings,
+        );
         assert!(findings
             .iter()
             .any(|item| item.rule_id == "FORGE-HLS-FRAGMENT-SEQUENCE" && !item.passed));
