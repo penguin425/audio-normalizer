@@ -15,6 +15,7 @@ from forge_normalizer import (
     ForgeStatus,
     LibraryNotFoundError,
     analyze_file,
+    analyze_file_with_layout,
     c_api_version,
     native_version,
 )
@@ -105,6 +106,29 @@ class BindingTests(unittest.TestCase):
             _write_maskless_multichannel_wave(path)
             with self.assertRaisesRegex(AnalysisError, "ambiguous 6-channel layout"):
                 analyze_file(path, max_decoded_samples=48, library=self.library)
+
+    def test_exact_layout_override_and_provenance(self) -> None:
+        roles = ["main", "main", "main", "lfe", "surround", "surround"]
+        layout = {
+            "version": 1,
+            "assignments": [
+                {"kind": "legacy-role", "role": role} for role in roles
+            ],
+            "provenance": "known-speakers",
+            "origin": "explicit-override",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "maskless.wav"
+            _write_maskless_multichannel_wave(path)
+            analysis = analyze_file_with_layout(
+                path,
+                max_decoded_samples=48,
+                channel_layout=layout,
+                library=self.library,
+            )
+        self.assertEqual(analysis.channels, 6)
+        self.assertEqual(analysis.channel_layout["origin"], "explicit-override")
+        self.assertEqual(len(analysis.channel_layout["assignments"]), 6)
 
     def test_invalid_python_inputs_fail_before_native_code(self) -> None:
         missing_library = Path(tempfile.gettempdir()) / "forge-does-not-exist.so"

@@ -1,8 +1,12 @@
 //! Bounded-memory ISO Base Media File Format structural and audio-track QC.
 
+use crate::channel_layout::{
+    ChannelAssignment, ChannelAssignmentKind, ChannelLayoutDescriptor, IsoBmffChannelLayoutEvidence,
+};
 use crate::container_qc::{check, finish_audit, AuditCheck, ContainerAudit};
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -10,6 +14,7 @@ use std::path::Path;
 
 const MAX_BOXES: usize = 200_000;
 const MAX_CONTROL_BOX_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SAMPLE_ENTRY_CHILD_BOXES: usize = 1024;
 const MAX_TRACKS: usize = 4_096;
 const MAX_TABLE_ENTRIES: usize = 10_000_000;
 const MAX_TIMED_ID3_EVENTS: usize = 4_096;
@@ -3500,6 +3505,9 @@ fn sample_entry_child_boxes(entry: &[u8]) -> Result<Vec<(String, &[u8])>, ()> {
     }
     let mut output = Vec::new();
     while offset < entry.len() {
+        if output.len() == MAX_SAMPLE_ENTRY_CHILD_BOXES {
+            return Err(());
+        }
         if entry.len() - offset < 8 {
             return Err(());
         }
@@ -5206,6 +5214,391 @@ fn fragment_first_samples_json(fragments: &[Fragment]) -> Vec<Value> {
         .collect()
 }
 
+/// Probe the selected ISO-BMFF audio track's ISO/IEC 23001-8 `chnl`
+/// declaration without reading media payloads.
+pub(crate) fn probe_channel_layout(
+    path: &Path,
+    track_id: u32,
+    decoded_channels: u16,
+) -> Result<Option<ChannelLayoutDescriptor>, String> {
+    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let file_size = file
+        .metadata()
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .len();
+    let mut box_count = 0_usize;
+    let top = list_boxes(path, &mut file, 0, file_size, &mut box_count)?;
+    let moov = top
+        .iter()
+        .filter(|header| header.kind == *b"moov")
+        .copied()
+        .collect::<Vec<_>>();
+    if moov.len() != 1 {
+        return Ok(None);
+    }
+    let tracks = list_boxes(
+        path,
+        &mut file,
+        moov[0].body_start,
+        moov[0].end,
+        &mut box_count,
+    )?;
+    for track in tracks.into_iter().filter(|header| header.kind == *b"trak") {
+        let children = list_boxes(path, &mut file, track.body_start, track.end, &mut box_count)?;
+        let Some(tkhd) = children.iter().find(|header| header.kind == *b"tkhd") else {
+            continue;
+        };
+        if minimal_track_id(path, &mut file, *tkhd)? != Some(track_id) {
+            continue;
+        }
+        let mdia = children
+            .iter()
+            .find(|header| header.kind == *b"mdia")
+            .copied()
+            .ok_or_else(|| format!("{}: selected track has no mdia box", path.display()))?;
+        return probe_mdia_channel_layout(path, &mut file, mdia, &mut box_count, decoded_channels);
+    }
+    Ok(None)
+}
+
+fn minimal_track_id(
+    path: &Path,
+    file: &mut File,
+    header: BoxHeader,
+) -> Result<Option<u32>, String> {
+    let body = read_control(path, file, header)?;
+    Ok(match body.first().copied() {
+        Some(0) => body.get(12..16).map(be_u32),
+        Some(1) => body.get(20..24).map(be_u32),
+        _ => None,
+    })
+}
+
+fn probe_mdia_channel_layout(
+    path: &Path,
+    file: &mut File,
+    mdia: BoxHeader,
+    box_count: &mut usize,
+    decoded_channels: u16,
+) -> Result<Option<ChannelLayoutDescriptor>, String> {
+    let children = list_boxes(path, file, mdia.body_start, mdia.end, box_count)?;
+    let handler = children
+        .iter()
+        .find(|header| header.kind == *b"hdlr")
+        .map(|header| read_control(path, file, *header))
+        .transpose()?
+        .and_then(|body| body.get(8..12).and_then(|value| value.try_into().ok()));
+    if handler != Some(*b"soun") {
+        return Ok(None);
+    }
+    let minf = children
+        .iter()
+        .find(|header| header.kind == *b"minf")
+        .copied()
+        .ok_or_else(|| format!("{}: selected audio track has no minf box", path.display()))?;
+    let minf_children = list_boxes(path, file, minf.body_start, minf.end, box_count)?;
+    let stbl = minf_children
+        .iter()
+        .find(|header| header.kind == *b"stbl")
+        .copied()
+        .ok_or_else(|| format!("{}: selected audio track has no stbl box", path.display()))?;
+    let stbl_children = list_boxes(path, file, stbl.body_start, stbl.end, box_count)?;
+    let stsd = stbl_children
+        .iter()
+        .find(|header| header.kind == *b"stsd")
+        .copied()
+        .ok_or_else(|| format!("{}: selected audio track has no stsd box", path.display()))?;
+    let body = read_control(path, file, stsd)?;
+    parse_stsd_channel_layout(&body, decoded_channels)
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn parse_stsd_channel_layout(
+    body: &[u8],
+    decoded_channels: u16,
+) -> Result<Option<ChannelLayoutDescriptor>, String> {
+    if body.len() < 8 {
+        return Err("channel-layout probe found a truncated stsd box".into());
+    }
+    let count = usize::try_from(be_u32(&body[4..8]))
+        .map_err(|_| "stsd entry count does not fit memory".to_string())?;
+    let mut offset = 8_usize;
+    let mut observed: Option<ChannelLayoutDescriptor> = None;
+    let mut entries_with_layout = 0_usize;
+    for _ in 0..count {
+        let size = body
+            .get(offset..offset + 4)
+            .map(be_u32)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| "channel-layout probe found a truncated sample entry".to_string())?;
+        if size < 36 || size > body.len().saturating_sub(offset) {
+            return Err("channel-layout probe found an invalid audio sample entry".into());
+        }
+        let entry = &body[offset..offset + size];
+        let entry_channels = u16::from_be_bytes(entry[24..26].try_into().unwrap());
+        if entry_channels != decoded_channels {
+            return Err(format!(
+                "chnl sample entry declares {entry_channels} channels but decoding produced {decoded_channels}"
+            ));
+        }
+        let children = sample_entry_child_boxes(entry)
+            .map_err(|()| "channel-layout probe found malformed sample-entry boxes".to_string())?;
+        let chnl = children
+            .iter()
+            .filter(|(kind, _)| kind == "chnl")
+            .collect::<Vec<_>>();
+        if chnl.len() > 1 {
+            return Err("audio sample entry contains duplicate chnl boxes".into());
+        }
+        if let Some((_, payload)) = chnl.first() {
+            entries_with_layout += 1;
+            let dmix_sha256 = children
+                .iter()
+                .filter(|(kind, _)| kind == "dmix")
+                .map(|(_, payload)| sha256_hex(payload))
+                .collect::<Vec<_>>();
+            let layout = parse_chnl(payload, decoded_channels, dmix_sha256)?;
+            if observed
+                .as_ref()
+                .is_some_and(|previous| previous != &layout)
+            {
+                return Err("audio sample entries contain conflicting chnl/dmix evidence".into());
+            }
+            observed = Some(layout);
+        }
+        offset = offset
+            .checked_add(size)
+            .ok_or_else(|| "stsd sample-entry offset overflow".to_string())?;
+    }
+    if offset != body.len() {
+        return Err("stsd sample entries do not consume the declared box".into());
+    }
+    if entries_with_layout != 0 && entries_with_layout != count {
+        return Err("only some audio sample entries declare a chnl box".into());
+    }
+    Ok(observed)
+}
+
+fn parse_chnl(
+    payload: &[u8],
+    decoded_channels: u16,
+    dmix_sha256: Vec<String>,
+) -> Result<ChannelLayoutDescriptor, String> {
+    if payload.len() < 5 || payload[1..4] != [0, 0, 0] {
+        return Err("chnl must be a bounded FullBox with zero flags".into());
+    }
+    let version = payload[0];
+    if version > 1 {
+        return Err(format!("unsupported chnl version {version}"));
+    }
+    let mut cursor = 4_usize;
+    let packed = take_u8(payload, &mut cursor, "chnl stream_structure")?;
+    let (stream_structure, format_ordering, base_channel_count) = if version == 1 {
+        (
+            packed >> 4,
+            packed & 0x0f,
+            Some(take_u8(payload, &mut cursor, "chnl baseChannelCount")?),
+        )
+    } else {
+        (packed, 0, None)
+    };
+    if stream_structure == 0 || stream_structure & !0x03 != 0 {
+        return Err("chnl stream_structure is invalid".into());
+    }
+    if format_ordering > 2 {
+        return Err("chnl format_ordering uses a reserved value".into());
+    }
+
+    let mut defined_layout = None;
+    let mut channel_order_definition = None;
+    let mut omitted_channels_map = None;
+    let mut assignments = Vec::new();
+    let mut speaker_signal_count = None;
+    if stream_structure & 1 != 0 {
+        let layout = take_u8(payload, &mut cursor, "chnl definedLayout")?;
+        defined_layout = Some(layout);
+        if layout == 0 {
+            let speaker_count = if version == 1 {
+                take_u8(payload, &mut cursor, "chnl speaker count")?
+            } else {
+                u8::try_from(decoded_channels)
+                    .map_err(|_| "chnl version 0 cannot enumerate more than 255 channels")?
+            };
+            speaker_signal_count = Some(usize::from(speaker_count));
+            for channel in 0..speaker_count {
+                let position = take_u8(payload, &mut cursor, "chnl speaker position")?;
+                let assignment = if position == 126 {
+                    let azimuth = take_i16(payload, &mut cursor, "chnl explicit azimuth")?;
+                    let elevation =
+                        i16::from(take_i8(payload, &mut cursor, "chnl explicit elevation")?);
+                    ChannelAssignment::explicit_cicp_speaker(azimuth, elevation)?
+                } else if position == 127 {
+                    ChannelAssignment::unassigned(u32::from(channel))
+                } else {
+                    ChannelAssignment::from_cicp_position(position)?
+                };
+                assignments.push(assignment);
+            }
+        } else {
+            let (omitted_present, order) = if version == 1 {
+                let control = take_u8(payload, &mut cursor, "chnl layout control")?;
+                if control & 0xf0 != 0 {
+                    return Err("chnl layout control uses reserved bits".into());
+                }
+                (control & 1 != 0, (control >> 1) & 0x07)
+            } else {
+                (true, 0)
+            };
+            if order > 4 {
+                return Err("chnl channel_order_definition uses a reserved value".into());
+            }
+            channel_order_definition = Some(order);
+            let omitted = if omitted_present {
+                Some(take_u64(payload, &mut cursor, "chnl omittedChannelsMap")?)
+            } else {
+                None
+            };
+            omitted_channels_map = omitted;
+            if let Some(sequence) = defined_channel_layout(layout) {
+                if omitted.is_some_and(|bits| bits >> sequence.len() != 0) {
+                    return Err("chnl omittedChannelsMap exceeds the defined layout".into());
+                }
+                speaker_signal_count = Some(
+                    sequence
+                        .len()
+                        .saturating_sub(omitted.unwrap_or(0).count_ones() as usize),
+                );
+            }
+            if order == 0 && format_ordering == 0 {
+                if let Some(sequence) = defined_channel_layout(layout) {
+                    assignments = sequence
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| omitted.unwrap_or(0) & (1_u64 << index) == 0)
+                        .map(|(_, position)| ChannelAssignment::from_cicp_position(*position))
+                        .collect::<Result<Vec<_>, _>>()?;
+                }
+            }
+        }
+    }
+
+    let object_count = if stream_structure & 2 != 0 {
+        Some(if version == 0 {
+            take_u8(payload, &mut cursor, "chnl object_count")?
+        } else {
+            let base = base_channel_count.expect("version 1 has baseChannelCount");
+            let speaker_signal_count = match (stream_structure & 1 != 0, speaker_signal_count) {
+                (true, None) => {
+                    return Err(
+                        "chnl cannot derive object_count from an unknown definedLayout".into(),
+                    )
+                }
+                (_, count) => count.unwrap_or(0),
+            };
+            base.checked_sub(u8::try_from(speaker_signal_count).map_err(|_| {
+                "chnl speaker assignment count exceeds baseChannelCount".to_string()
+            })?)
+            .ok_or_else(|| "chnl baseChannelCount is smaller than its speaker count".to_string())?
+        })
+    } else {
+        None
+    };
+    if cursor != payload.len() {
+        return Err("chnl contains trailing bytes".into());
+    }
+
+    let provenance = if stream_structure & 2 != 0 {
+        assignments = (0..u32::from(decoded_channels))
+            .map(ChannelAssignment::object)
+            .collect();
+        crate::wav::ChannelLayoutProvenance::SceneBased
+    } else if assignments.len() == usize::from(decoded_channels)
+        && assignments.iter().all(|assignment| {
+            matches!(
+                assignment.kind(),
+                ChannelAssignmentKind::Speaker | ChannelAssignmentKind::LowFrequencyEffects
+            )
+        })
+    {
+        crate::wav::ChannelLayoutProvenance::KnownSpeakers
+    } else {
+        assignments = (0..u32::from(decoded_channels))
+            .map(ChannelAssignment::unassigned)
+            .collect();
+        crate::wav::ChannelLayoutProvenance::Unknown
+    };
+    let evidence = IsoBmffChannelLayoutEvidence::new(
+        version,
+        stream_structure,
+        format_ordering,
+        base_channel_count,
+        defined_layout,
+        channel_order_definition,
+        omitted_channels_map,
+        object_count,
+        sha256_hex(payload),
+        dmix_sha256,
+    );
+    let descriptor = ChannelLayoutDescriptor::iso_bmff(assignments, provenance, evidence);
+    descriptor.validate()?;
+    Ok(descriptor)
+}
+
+fn defined_channel_layout(layout: u8) -> Option<&'static [u8]> {
+    Some(match layout {
+        1 => &[2],
+        2 => &[0, 1],
+        3 => &[2, 0, 1],
+        4 => &[2, 0, 1, 10],
+        5 => &[2, 0, 1, 4, 5],
+        6 => &[2, 0, 1, 4, 5, 3],
+        7 => &[2, 6, 7, 0, 1, 4, 5, 3],
+        9 => &[0, 1, 10],
+        10 => &[0, 1, 4, 5],
+        11 => &[2, 0, 1, 4, 5, 10, 3],
+        12 => &[2, 0, 1, 4, 5, 8, 9, 3],
+        13 => &[
+            2, 6, 7, 0, 1, 13, 14, 8, 9, 10, 3, 26, 19, 17, 18, 23, 24, 25, 20, 21, 22, 29, 27, 28,
+        ],
+        14 => &[2, 0, 1, 4, 5, 3, 17, 18],
+        _ => return None,
+    })
+}
+
+fn take_u8(bytes: &[u8], cursor: &mut usize, field: &str) -> Result<u8, String> {
+    let value = bytes
+        .get(*cursor)
+        .copied()
+        .ok_or_else(|| format!("{field} is truncated"))?;
+    *cursor += 1;
+    Ok(value)
+}
+
+fn take_i8(bytes: &[u8], cursor: &mut usize, field: &str) -> Result<i8, String> {
+    take_u8(bytes, cursor, field).map(|value| value as i8)
+}
+
+fn take_i16(bytes: &[u8], cursor: &mut usize, field: &str) -> Result<i16, String> {
+    let end = cursor
+        .checked_add(2)
+        .ok_or_else(|| format!("{field} offset overflow"))?;
+    let value = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| format!("{field} is truncated"))?;
+    *cursor = end;
+    Ok(i16::from_be_bytes(value.try_into().unwrap()))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(64);
+    use std::fmt::Write as _;
+    for byte in digest {
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
+}
+
 fn track_json(track: &Track) -> Value {
     json!({
         "track_id": track.id,
@@ -5362,6 +5755,176 @@ mod tests {
         ];
         body.extend(payload);
         body
+    }
+
+    #[test]
+    fn parses_chnl_versions_explicit_positions_defined_layouts_and_objects() {
+        let stereo = parse_chnl(&full_box(0, vec![1, 0, 0, 1]), 2, Vec::new()).unwrap();
+        assert_eq!(
+            stereo
+                .assignments()
+                .iter()
+                .map(ChannelAssignment::cicp_position)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1)]
+        );
+        assert!(stereo.is_measurement_ready());
+
+        let five_one = parse_chnl(&full_box(1, vec![0x10, 6, 6, 0]), 6, Vec::new()).unwrap();
+        assert_eq!(
+            five_one
+                .assignments()
+                .iter()
+                .map(ChannelAssignment::cicp_position)
+                .collect::<Vec<_>>(),
+            [Some(2), Some(0), Some(1), Some(4), Some(5), Some(3)]
+        );
+        assert_eq!(
+            five_one.iso_bmff_evidence().unwrap().defined_layout(),
+            Some(6)
+        );
+
+        let seven_one = parse_chnl(&full_box(1, vec![0x10, 8, 7, 0]), 8, Vec::new()).unwrap();
+        assert_eq!(seven_one.assignments().len(), 8);
+        assert_eq!(seven_one.assignments()[7].cicp_position(), Some(3));
+
+        let mut positioned = vec![1, 0, 126];
+        positioned.extend_from_slice(&(-60_i16).to_be_bytes());
+        positioned.push(29);
+        let positioned = parse_chnl(&full_box(0, positioned), 1, Vec::new()).unwrap();
+        assert_eq!(
+            positioned.assignments()[0].channel_role(),
+            crate::wav::ChannelRole::positioned(-60, 29)
+        );
+        assert_eq!(
+            crate::dsp::lufs::channel_weight(positioned.assignments()[0].channel_role()),
+            1.41
+        );
+
+        let objects = parse_chnl(&full_box(1, vec![0x20, 2]), 2, Vec::new()).unwrap();
+        assert_eq!(
+            objects.provenance(),
+            crate::wav::ChannelLayoutProvenance::SceneBased
+        );
+        assert!(objects
+            .assignments()
+            .iter()
+            .all(|assignment| assignment.kind() == ChannelAssignmentKind::Object));
+        assert_eq!(objects.iso_bmff_evidence().unwrap().object_count(), Some(2));
+    }
+
+    #[test]
+    fn chnl_v1_derives_objects_from_defined_layout_even_with_codec_ordering() {
+        // Six CICP bed channels plus two objects. Ordering 1 delegates PCM
+        // plane order to the codec but does not change the bed population.
+        let layout = parse_chnl(&full_box(1, vec![0x30, 8, 6, 0x02]), 8, Vec::new()).unwrap();
+        let evidence = layout.iso_bmff_evidence().unwrap();
+        assert_eq!(evidence.channel_order_definition(), Some(1));
+        assert_eq!(evidence.object_count(), Some(2));
+        assert_eq!(
+            layout.provenance(),
+            crate::wav::ChannelLayoutProvenance::SceneBased
+        );
+
+        let unknown_layout = full_box(1, vec![0x30, 8, 255, 0]);
+        assert!(parse_chnl(&unknown_layout, 8, Vec::new())
+            .unwrap_err()
+            .contains("cannot derive object_count"));
+    }
+
+    #[test]
+    fn chnl_rejects_reserved_ordering_and_position_values() {
+        assert!(parse_chnl(&full_box(1, vec![0x13, 2, 2, 0]), 2, Vec::new())
+            .unwrap_err()
+            .contains("format_ordering"));
+        assert!(
+            parse_chnl(&full_box(1, vec![0x10, 2, 2, 0x0a]), 2, Vec::new())
+                .unwrap_err()
+                .contains("channel_order_definition")
+        );
+        assert!(parse_chnl(&full_box(0, vec![1, 0, 32]), 1, Vec::new())
+            .unwrap_err()
+            .contains("reserved"));
+
+        let unknown = parse_chnl(&full_box(0, vec![1, 0, 127]), 1, Vec::new()).unwrap();
+        assert_eq!(
+            unknown.provenance(),
+            crate::wav::ChannelLayoutProvenance::Unknown
+        );
+        assert_eq!(
+            unknown.assignments()[0].kind(),
+            ChannelAssignmentKind::Unassigned
+        );
+        assert_eq!(unknown.assignments()[0].cicp_position(), None);
+    }
+
+    #[test]
+    fn chnl_evidence_hashes_the_raw_box_and_each_dmix_payload() {
+        let payload = full_box(0, vec![1, 0, 0, 1]);
+        let dmix = vec![sha256_hex(b"first"), sha256_hex(b"second")];
+        let layout = parse_chnl(&payload, 2, dmix.clone()).unwrap();
+        let evidence = layout.iso_bmff_evidence().unwrap();
+        assert_eq!(evidence.raw_chnl_sha256(), sha256_hex(&payload));
+        assert_eq!(evidence.dmix_sha256(), dmix);
+    }
+
+    fn channel_layout_track(track_id: u32, positions: [u8; 2]) -> Vec<u8> {
+        let mut tkhd = vec![0_u8; 16];
+        tkhd[12..16].copy_from_slice(&track_id.to_be_bytes());
+        let mut hdlr = vec![0_u8; 12];
+        hdlr[8..12].copy_from_slice(b"soun");
+        let chnl = boxed(b"chnl", full_box(0, vec![1, 0, positions[0], positions[1]]));
+        let mut sample_entry = vec![0_u8; 28];
+        sample_entry[16..18].copy_from_slice(&2_u16.to_be_bytes());
+        sample_entry.extend_from_slice(&chnl);
+        let sample_entry = boxed(b"mp4a", sample_entry);
+        let mut stsd = full_box(0, 1_u32.to_be_bytes().to_vec());
+        stsd.extend_from_slice(&sample_entry);
+        boxed(
+            b"trak",
+            [
+                boxed(b"tkhd", tkhd),
+                boxed(
+                    b"mdia",
+                    [
+                        boxed(b"hdlr", hdlr),
+                        boxed(b"minf", boxed(b"stbl", boxed(b"stsd", stsd))),
+                    ]
+                    .concat(),
+                ),
+            ]
+            .concat(),
+        )
+    }
+
+    #[test]
+    fn bounded_probe_navigates_to_the_selected_track_without_media() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("layouts.mp4");
+        let file = boxed(
+            b"moov",
+            [
+                channel_layout_track(3, [2, 10]),
+                channel_layout_track(7, [0, 1]),
+            ]
+            .concat(),
+        );
+        std::fs::write(&path, file).unwrap();
+
+        let layout = probe_channel_layout(&path, 7, 2).unwrap().unwrap();
+        assert_eq!(
+            layout.origin(),
+            crate::channel_layout::ChannelLayoutOrigin::IsoBmff
+        );
+        assert_eq!(
+            layout
+                .assignments()
+                .iter()
+                .map(ChannelAssignment::cicp_position)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1)]
+        );
+        assert!(probe_channel_layout(&path, 99, 2).unwrap().is_none());
     }
 
     #[derive(Clone, Copy)]

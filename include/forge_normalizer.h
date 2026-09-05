@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define FORGE_NORMALIZER_MAX_CHANNEL_LAYOUT_JSON_BYTES 16777216u
+
 #if defined(_WIN32)
 #define FORGE_NORMALIZER_API __declspec(dllimport)
 #elif defined(__GNUC__) || defined(__clang__)
@@ -94,9 +96,10 @@ FORGE_NORMALIZER_API size_t forge_normalizer_live_config_v1_size(void);
  * frames-times-channels. path_utf8 must be NUL-terminated UTF-8. result_size
  * must be at least forge_normalizer_analysis_v1_size().
  *
- * The input must identify an authoritative physical-speaker layout. Because
- * ABI v1 has no layout-override parameter, ambiguous multichannel or
- * scene-based inputs fail instead of using guessed BS.1770 channel weights.
+ * This legacy entry point requires the input to identify an authoritative
+ * physical-speaker layout. Use
+ * forge_normalizer_analyze_file_with_layout_v1() when the caller has an
+ * external exact speaker assignment.
  *
  * error_buffer is optional. When non-NULL with positive capacity, Forge
  * always writes a NUL-terminated UTF-8 message (empty on success). result
@@ -108,6 +111,27 @@ FORGE_NORMALIZER_API ForgeStatus forge_normalizer_analyze_file_v1(
     uint64_t max_decoded_samples,
     ForgeAnalysisV1 *result,
     size_t result_size,
+    char *error_buffer,
+    size_t error_capacity);
+
+/*
+ * Additive exact-layout analysis entry point. channel_layout_json may be NULL
+ * to use source evidence, or point to a version-1 ChannelLayoutDescriptor with
+ * origin "explicit-override". The effective descriptor is returned as
+ * NUL-terminated JSON in layout_buffer. layout_required always receives the
+ * required capacity including that terminator after successful analysis.
+ * A NULL/short layout_buffer returns FORGE_STATUS_BUFFER_TOO_SMALL without
+ * changing the required size; result is nevertheless initialized.
+ */
+FORGE_NORMALIZER_API ForgeStatus forge_normalizer_analyze_file_with_layout_v1(
+    const char *path_utf8,
+    uint64_t max_decoded_samples,
+    const char *channel_layout_json,
+    ForgeAnalysisV1 *result,
+    size_t result_size,
+    char *layout_buffer,
+    size_t layout_capacity,
+    size_t *layout_required,
     char *error_buffer,
     size_t error_capacity);
 

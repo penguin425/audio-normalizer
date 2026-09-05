@@ -35,9 +35,17 @@ this contract.
   must not overlap either the path string or the result.
 - `max_decoded_samples` bounds decoded frames multiplied by channels and must
   be greater than zero.
-- File analysis requires an authoritative speaker layout in the input. C ABI
-  v1 has no layout-override field, so ambiguous or scene-based inputs fail
-  instead of being measured with guessed BS.1770 channel weights.
+- `forge_normalizer_analyze_file_v1` requires an authoritative speaker layout
+  in the input. Ambiguous or scene-based inputs fail instead of being measured
+  with guessed BS.1770 channel weights.
+- `forge_normalizer_analyze_file_with_layout_v1` is an additive ABI-v1 symbol.
+  It accepts an optional version-1 exact descriptor with origin
+  `explicit-override`, and returns the effective descriptor as bounded,
+  caller-owned JSON. Its schema is
+  [`channel-layout-v1`](schema/channel-layout-v1.schema.json).
+  Descriptor JSON is limited to
+  `FORGE_NORMALIZER_MAX_CHANNEL_LAYOUT_JSON_BYTES`; callers may pass a null
+  output buffer first and allocate the reported `layout_required` capacity.
 - Decoded IEEE-float PCM containing NaN or positive/negative infinity fails
   before analysis; no partial measurement is returned.
 - Error text is UTF-8, always NUL-terminated when capacity is positive, may be
@@ -51,6 +59,10 @@ this contract.
 The header and Rust implementation both assert its size and key offsets.
 Callers should still pass `forge_normalizer_analysis_v1_size()` as
 `result_size` so a mismatched library/header pair fails explicitly.
+
+Applications that only use `forge_normalizer_analyze_file_v1` remain
+compatible with earlier ABI-v1 libraries. Resolve the additive exact-layout
+symbol before calling it when an application permits an older shared library.
 
 ## Streaming processor
 

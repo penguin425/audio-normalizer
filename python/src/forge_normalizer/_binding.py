@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import json
 import operator
 import os
 import sys
@@ -11,12 +12,13 @@ from dataclasses import dataclass
 from enum import IntEnum
 from functools import lru_cache
 from pathlib import Path
-from typing import Final
+from typing import Any, Final, Mapping
 
 C_API_VERSION: Final = 1
 ANALYSIS_V1_SIZE: Final = 80
 MAX_U64: Final = (1 << 64) - 1
 ERROR_CAPACITY: Final = 4096
+MAX_CHANNEL_LAYOUT_JSON_BYTES: Final = 16 * 1024 * 1024
 LIBRARY_ENV: Final = "FORGE_NORMALIZER_LIBRARY"
 
 
@@ -69,6 +71,13 @@ class Analysis:
     true_peak_dbtp: float
 
 
+@dataclass(frozen=True, slots=True)
+class AnalysisWithLayout(Analysis):
+    """Loudness result plus the effective versioned channel descriptor."""
+
+    channel_layout: dict[str, Any]
+
+
 class _AnalysisV1(ctypes.Structure):
     _fields_ = [
         ("struct_size", ctypes.c_uint32),
@@ -87,7 +96,7 @@ class _AnalysisV1(ctypes.Structure):
 
 
 class _NativeLibrary:
-    __slots__ = ("analyze", "library", "native_version", "path")
+    __slots__ = ("analyze", "analyze_with_layout", "library", "native_version", "path")
 
     def __init__(self, path: str) -> None:
         try:
@@ -120,10 +129,32 @@ class _NativeLibrary:
                 ctypes.c_size_t,
             )
             analyze.restype = ctypes.c_int32
+
         except AttributeError as error:
             raise AbiMismatchError(
                 f"native library {path!r} does not export the complete Forge C ABI v1"
             ) from error
+
+        # This symbol was added within ABI major 1. Keep loading older v1
+        # libraries for the original API and reject only when the additive
+        # exact-layout API is actually requested.
+        analyze_with_layout = getattr(
+            library, "forge_normalizer_analyze_file_with_layout_v1", None
+        )
+        if analyze_with_layout is not None:
+            analyze_with_layout.argtypes = (
+                ctypes.c_char_p,
+                ctypes.c_uint64,
+                ctypes.c_char_p,
+                ctypes.POINTER(_AnalysisV1),
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_char),
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.POINTER(ctypes.c_char),
+                ctypes.c_size_t,
+            )
+            analyze_with_layout.restype = ctypes.c_int32
 
         actual_version = int(version())
         if actual_version != C_API_VERSION:
@@ -154,6 +185,7 @@ class _NativeLibrary:
             raise AbiMismatchError("Forge returned an empty package-version string")
 
         self.analyze = analyze
+        self.analyze_with_layout = analyze_with_layout
         self.library = library
         self.native_version = native_version
         self.path = path
@@ -314,4 +346,131 @@ def analyze_file(
         rms_dbfs=float(result.rms_dbfs),
         sample_peak_dbfs=float(result.sample_peak_dbfs),
         true_peak_dbtp=float(result.true_peak_dbtp),
+    )
+
+
+def analyze_file_with_layout(
+    path: str | os.PathLike[str],
+    *,
+    max_decoded_samples: int,
+    channel_layout: Mapping[str, Any] | str | None = None,
+    library: str | os.PathLike[str] | None = None,
+) -> AnalysisWithLayout:
+    """Analyze a file and return the exact effective channel layout.
+
+    ``channel_layout`` may be a descriptor mapping, its JSON representation,
+    or ``None`` to use source evidence. Overrides must use descriptor version 1
+    and the ``explicit-override`` origin.
+    """
+
+    path_text = _path_text(path, name="path")
+    try:
+        path_utf8 = path_text.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError("path is not representable as UTF-8") from error
+    if isinstance(max_decoded_samples, bool):
+        raise TypeError("max_decoded_samples must be an integer, not bool")
+    try:
+        sample_limit = operator.index(max_decoded_samples)
+    except TypeError as error:
+        raise TypeError("max_decoded_samples must be an integer") from error
+    if sample_limit <= 0 or sample_limit > MAX_U64:
+        raise ValueError(f"max_decoded_samples must be in 1..={MAX_U64}")
+
+    if channel_layout is None:
+        layout_utf8 = None
+    elif isinstance(channel_layout, str):
+        if "\0" in channel_layout:
+            raise ValueError("channel_layout JSON contains a NUL character")
+        layout_utf8 = channel_layout.encode("utf-8")
+    elif isinstance(channel_layout, Mapping):
+        try:
+            layout_utf8 = json.dumps(
+                channel_layout,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise ValueError("channel_layout is not JSON-serializable") from error
+    else:
+        raise TypeError("channel_layout must be a mapping, JSON string, or None")
+    if (
+        layout_utf8 is not None
+        and len(layout_utf8) > MAX_CHANNEL_LAYOUT_JSON_BYTES
+    ):
+        raise ValueError(
+            "channel_layout JSON exceeds "
+            f"{MAX_CHANNEL_LAYOUT_JSON_BYTES} bytes"
+        )
+
+    native = _native(library)
+    if native.analyze_with_layout is None:
+        raise AbiMismatchError(
+            "native Forge C ABI v1 library does not provide exact-layout analysis"
+        )
+    result = _AnalysisV1()
+    layout_buffer = ctypes.create_string_buffer(256 * 1024 + 1)
+    layout_required = ctypes.c_size_t()
+    error_buffer = ctypes.create_string_buffer(ERROR_CAPACITY)
+
+    def invoke() -> int:
+        return int(
+            native.analyze_with_layout(
+                path_utf8,
+                sample_limit,
+                layout_utf8,
+                ctypes.byref(result),
+                ctypes.sizeof(result),
+                layout_buffer,
+                len(layout_buffer),
+                ctypes.byref(layout_required),
+                error_buffer,
+                len(error_buffer),
+            )
+        )
+
+    status_value = invoke()
+    if status_value == ForgeStatus.BUFFER_TOO_SMALL:
+        required = int(layout_required.value)
+        if required <= len(layout_buffer) or required > MAX_CHANNEL_LAYOUT_JSON_BYTES + 1:
+            raise AbiMismatchError("Forge returned an invalid channel-layout size")
+        layout_buffer = ctypes.create_string_buffer(required)
+        status_value = invoke()
+    try:
+        error_text = error_buffer.value.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise AbiMismatchError("Forge returned non-UTF-8 error text") from error
+    try:
+        status: ForgeStatus | int = ForgeStatus(status_value)
+    except ValueError:
+        status = status_value
+    if status != ForgeStatus.OK:
+        raise AnalysisError(status, error_text or "Forge analysis failed")
+    if result.struct_size != ANALYSIS_V1_SIZE or result.api_version != C_API_VERSION:
+        raise AbiMismatchError(
+            "Forge returned an incompatible result header: "
+            f"size={result.struct_size}, version={result.api_version}"
+        )
+    if layout_required.value == 0 or layout_required.value > len(layout_buffer):
+        raise AbiMismatchError("Forge returned an invalid channel-layout size")
+    try:
+        effective_layout = json.loads(layout_buffer.value.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise AbiMismatchError("Forge returned invalid channel-layout JSON") from error
+    if not isinstance(effective_layout, dict):
+        raise AbiMismatchError("Forge returned a non-object channel layout")
+
+    return AnalysisWithLayout(
+        sample_rate_hz=int(result.sample_rate_hz),
+        channels=int(result.channels),
+        frames=int(result.frames),
+        integrated_lufs=float(result.integrated_lufs),
+        max_momentary_lufs=float(result.max_momentary_lufs),
+        max_short_term_lufs=float(result.max_short_term_lufs),
+        loudness_range_lu=float(result.loudness_range_lu),
+        rms_dbfs=float(result.rms_dbfs),
+        sample_peak_dbfs=float(result.sample_peak_dbfs),
+        true_peak_dbtp=float(result.true_peak_dbtp),
+        channel_layout=effective_layout,
     )

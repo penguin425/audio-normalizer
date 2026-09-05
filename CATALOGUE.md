@@ -66,13 +66,16 @@ writers wait for the bounded busy timeout and then fail visibly.
 ## Provenance reports and bounds
 
 `--catalogue-report PATH` atomically writes only the records committed by the
-current invocation. New reports use
-[`catalogue-report-v2`](schema/catalogue-report-v2.schema.json) and include the
-canonical request evidence. The immutable
+current invocation. New CLI reports use
+[`catalogue-report-v3`](schema/catalogue-report-v3.schema.json) and include the
+canonical request evidence plus declared and effective exact channel-layout
+descriptors. The immutable
 [`catalogue-report-v1`](schema/catalogue-report-v1.schema.json) schema remains
-available for historical validation. The Rust compatibility methods
+available for historical validation, as does
+[`catalogue-report-v2`](schema/catalogue-report-v2.schema.json). The Rust compatibility methods
 `Catalogue::record` and `Catalogue::write_report` continue to return and write
-v1 records; descriptor-bound callers use `record_bound` and `write_report_v2`.
+v1 records; the established descriptor-bound methods retain v2, while
+`record_bound_v3` and `write_report_v3` expose exact-layout evidence.
 Existing report paths require `--overwrite`.
 
 Limits are explicit:

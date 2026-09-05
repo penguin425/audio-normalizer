@@ -22,8 +22,9 @@ snapshot. The address also contains the measurement revision and a canonical
 - decoder route plus actual container and codec IDs;
 - selected audio-track index and container track ID;
 - exact source start frame and frame count;
-- declared layout provenance and every effective channel role, including
-  positioned-channel azimuth and elevation;
+- declared and effective versioned channel-layout descriptors, including
+  every PCM-plane assignment, WAVE/RFC 9639 mask, ISO-BMFF evidence, explicit
+  override, or renderer binding;
 - timeline interval in milliseconds;
 - analysis engine (`fast` or `reference`); and
 - requested output sample rate and `fast`, `balanced`, or `best` resampling
@@ -34,17 +35,18 @@ tracks or ranges in the same container cannot reuse one another. Changed
 bytes, decoder selections, layouts, or measurement-changing options also
 cannot reuse one. The request hash,
 input hash, canonical result-payload hash, generator version, measurement
-standard, and algorithm revision are retained in the entry. Cache v4 records
+standard, and algorithm revision are retained in the entry. Cache v5 records
 normative ITU-R BS.1770-5 / EBU R 128 measurements; caching does not alter
 gating, channel weighting, units, or normalization targets.
 `forge-bs1770-5-r4` is the current implementation revision and changes
 whenever a result-affecting core algorithm changes.
 
 The JSON compatibility boundary is
-[`analysis-cache-v4`](schema/analysis-cache-v4.schema.json). The immutable
+[`analysis-cache-v5`](schema/analysis-cache-v5.schema.json). The immutable
 [`analysis-cache-v1`](schema/analysis-cache-v1.schema.json) and
 [`analysis-cache-v2`](schema/analysis-cache-v2.schema.json), and
-[`analysis-cache-v3`](schema/analysis-cache-v3.schema.json) schemas remain
+[`analysis-cache-v3`](schema/analysis-cache-v3.schema.json) and
+[`analysis-cache-v4`](schema/analysis-cache-v4.schema.json) schemas remain
 available for historical validation, but current runtimes treat earlier entries
 as cache misses. Decibel silence values that are mathematically negative
 infinity are represented as JSON
@@ -58,7 +60,7 @@ windows remain distinct from complete silent windows.
 Recognized entries use this fixed-depth layout:
 
 ```text
-DIR/v4/aa/<64-character-input-sha256>/<64-character-request-sha256>.json
+DIR/v5/aa/<64-character-input-sha256>/<64-character-request-sha256>.json
 ```
 
 Forge creates a sibling temporary file, writes and synchronizes the complete
@@ -76,7 +78,7 @@ returning; replacement, symlink retargeting, and same-length in-place changes
 fail instead of mixing source generations.
 
 The cache never recursively interprets arbitrary files. Capacity accounting
-and eviction recognize only regular JSON files at the exact v4 layout with
+and eviction recognize only regular JSON files at the exact v5 layout with
 lower-case SHA-256 names. Unrecognized files and directories are left alone.
 
 ## Corruption and read-only behavior
@@ -89,7 +91,7 @@ observable miss:
 
 ```text
 analysis cache invalid; repaired: input.wav
-analysis cache warning: cache entry is not valid v4 JSON: ...
+analysis cache warning: cache entry is not valid v5 JSON: ...
 ```
 
 Writable mode recomputes and atomically repairs it. With

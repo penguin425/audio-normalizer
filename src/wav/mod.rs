@@ -8,7 +8,8 @@ pub(crate) const MAX_DECODE_SAMPLE_RATE_HZ: u32 = 384_000;
 ///
 /// The layout-preserving decoder APIs return this sidecar because a channel
 /// count alone cannot identify a multichannel speaker layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ChannelLayoutProvenance {
     /// Every decoded channel is bound to a known physical speaker.
     KnownSpeakers,
@@ -26,7 +27,8 @@ pub use format::{PcmKind, WaveFormat};
 pub use reader::{WavReader, WavStreamInfo};
 pub use writer::{WavContainer, WavStreamWriter, WavWriter, WaveChunk};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ChannelRole {
     /// A conventional front or centre channel with unity loudness weighting.
     Main,

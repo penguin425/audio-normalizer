@@ -38,6 +38,10 @@ Forge independently decodes every WAVE, confirms its declared geometry,
 measures integrated loudness and true peak with ITU-R BS.1770-5, and optionally
 enforces a true-peak ceiling. DTS dialog-normalization metadata is preserved as
 metadata only: it is not programme loudness and is never compared with LUFS.
+The atomic `schema/dts-adapter-report-v2.schema.json` result adds an exact
+output-layout descriptor bound to the decoder name/version, output
+configuration, adapter executable hash, and exact adapter response. Report v1
+remains available for historical validation.
 
 ## Native checks
 

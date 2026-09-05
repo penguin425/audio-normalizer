@@ -6,9 +6,8 @@
 //! measurement-domain request produced those values.
 
 use crate::analysis::Analysis;
-use crate::decoder::{
-    ChannelLayoutProvenance, InputDescriptor, InputDescriptorOptions, SourceFrameRange,
-};
+use crate::channel_layout::ChannelLayoutDescriptor;
+use crate::decoder::{InputDescriptor, InputDescriptorOptions, SourceFrameRange};
 use crate::dsp::resample::ResampleQuality;
 use crate::normalize::Plan;
 use crate::stable_input::{InputContentBinding, StableInput};
@@ -18,7 +17,7 @@ use std::error::Error;
 use std::fmt;
 
 /// Version of the in-process bound-analysis contract.
-pub const BOUND_ANALYSIS_VERSION: u32 = 2;
+pub const BOUND_ANALYSIS_VERSION: u32 = 3;
 
 /// Revision of the measurement implementation represented by bound results.
 pub const MEASUREMENT_ALGORITHM_REVISION: &str = "forge-bs1770-5-r4";
@@ -86,9 +85,10 @@ impl Error for BoundAnalysisError {}
 struct OutputDomainRequest {
     decoder_route: String,
     source_range: SourceFrameRange,
-    declared_layout_provenance: ChannelLayoutProvenance,
+    declared_channel_layout: ChannelLayoutDescriptor,
+    effective_channel_layout: ChannelLayoutDescriptor,
     effective_roles: Vec<ChannelRole>,
-    explicit_roles: bool,
+    explicit_layout: bool,
     output_sample_rate: Option<u32>,
     resample_quality: ResampleQuality,
 }
@@ -165,9 +165,10 @@ impl BoundAnalysis {
         let request = OutputDomainRequest {
             decoder_route: descriptor.decoder_route_id(),
             source_range: descriptor.source_range(),
-            declared_layout_provenance: descriptor.declared_layout_provenance(),
+            declared_channel_layout: descriptor.declared_channel_layout().clone(),
+            effective_channel_layout: descriptor.channel_layout().clone(),
             effective_roles: analysis.channel_roles.clone(),
-            explicit_roles: descriptor.uses_explicit_channel_roles(),
+            explicit_layout: descriptor.uses_explicit_channel_roles(),
             output_sample_rate: plan.output_sample_rate,
             resample_quality: plan.resample_quality,
         };
@@ -211,6 +212,11 @@ impl BoundAnalysis {
         self.algorithm_revision
     }
 
+    /// Effective exact channel layout covered by the request digest.
+    pub fn channel_layout(&self) -> &ChannelLayoutDescriptor {
+        &self.request.effective_channel_layout
+    }
+
     /// Validate content and measurement-domain compatibility before render.
     pub fn validate_for_plan(
         &self,
@@ -224,8 +230,8 @@ impl BoundAnalysis {
             )
         })?;
         let mut options = InputDescriptorOptions::default();
-        if self.request.explicit_roles {
-            options = options.with_channel_roles(self.request.effective_roles.clone());
+        if self.request.explicit_layout {
+            options = options.with_channel_layout(self.request.effective_channel_layout.clone());
         }
         let descriptor = InputDescriptor::probe(input.clone(), options).map_err(|error| {
             BoundAnalysisError::new(BoundAnalysisErrorKind::AnalysisRequestMismatch, error)
@@ -255,9 +261,10 @@ impl BoundAnalysis {
         let expected = OutputDomainRequest {
             decoder_route: descriptor.decoder_route_id(),
             source_range: descriptor.source_range(),
-            declared_layout_provenance: descriptor.declared_layout_provenance(),
+            declared_channel_layout: descriptor.declared_channel_layout().clone(),
+            effective_channel_layout: descriptor.channel_layout().clone(),
             effective_roles: self.request.effective_roles.clone(),
-            explicit_roles: descriptor.uses_explicit_channel_roles(),
+            explicit_layout: descriptor.uses_explicit_channel_roles(),
             output_sample_rate: plan.output_sample_rate,
             resample_quality: plan.resample_quality,
         };
@@ -277,19 +284,19 @@ impl BoundAnalysis {
     }
 
     pub(crate) fn used_explicit_roles(&self) -> bool {
-        self.request.explicit_roles
+        self.request.explicit_layout
     }
 
     pub(crate) fn explicit_roles(&self) -> Option<&[ChannelRole]> {
         self.request
-            .explicit_roles
+            .explicit_layout
             .then_some(self.request.effective_roles.as_slice())
     }
 }
 
 fn request_digest(request: &OutputDomainRequest) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"forge-bound-analysis-request-v2\0output-domain\0");
+    digest.update(b"forge-bound-analysis-request-v3\0output-domain\0");
     update_len_prefixed(&mut digest, request.decoder_route.as_bytes());
     digest.update(request.source_range.start().to_le_bytes());
     match request.source_range.frames() {
@@ -299,12 +306,23 @@ fn request_digest(request: &OutputDomainRequest) -> [u8; 32] {
         }
         None => digest.update([0]),
     }
-    digest.update([match request.declared_layout_provenance {
-        ChannelLayoutProvenance::KnownSpeakers => 0,
-        ChannelLayoutProvenance::Unknown => 1,
-        ChannelLayoutProvenance::SceneBased => 2,
-    }]);
-    digest.update([u8::from(request.explicit_roles)]);
+    update_len_prefixed(
+        &mut digest,
+        request
+            .declared_channel_layout
+            .to_json()
+            .expect("bound descriptor layout was validated")
+            .as_bytes(),
+    );
+    update_len_prefixed(
+        &mut digest,
+        request
+            .effective_channel_layout
+            .to_json()
+            .expect("bound effective layout was validated")
+            .as_bytes(),
+    );
+    digest.update([u8::from(request.explicit_layout)]);
     digest.update((request.effective_roles.len() as u64).to_le_bytes());
     for role in &request.effective_roles {
         match *role {
@@ -482,5 +500,36 @@ mod tests {
                 .kind(),
             BoundAnalysisErrorKind::AnalysisRequestMismatch
         );
+    }
+
+    #[test]
+    fn exact_layout_evidence_changes_the_request_identity() {
+        let input = input(0.1, "track.wav");
+        let layout = |cicp_position: u8, azimuth_degrees: i16| {
+            ChannelLayoutDescriptor::from_json(&format!(
+                r#"{{"version":1,"assignments":[{{"kind":"speaker","role":"main","cicp_position":{cicp_position},"azimuth_degrees":{azimuth_degrees},"elevation_degrees":0}}],"provenance":"known-speakers","origin":"explicit-override"}}"#
+            ))
+            .unwrap()
+        };
+        let left = InputDescriptor::probe(
+            input.clone(),
+            InputDescriptorOptions::default().with_channel_layout(layout(0, -30)),
+        )
+        .unwrap();
+        let centre = InputDescriptor::probe(
+            input,
+            InputDescriptorOptions::default().with_channel_layout(layout(2, 0)),
+        )
+        .unwrap();
+        assert_eq!(
+            left.channel_layout().channel_roles(),
+            centre.channel_layout().channel_roles()
+        );
+        let left = BoundAnalysis::for_descriptor(&left, analysis(vec![ChannelRole::Main]), &plan())
+            .unwrap();
+        let centre =
+            BoundAnalysis::for_descriptor(&centre, analysis(vec![ChannelRole::Main]), &plan())
+                .unwrap();
+        assert_ne!(left.request_sha256(), centre.request_sha256());
     }
 }

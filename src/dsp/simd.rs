@@ -113,6 +113,27 @@ pub(crate) fn abs_max_and_has_nan(buf: &[f32]) -> (f32, bool) {
     abs_max_and_has_nan_scalar(buf)
 }
 
+/// Maximum absolute finite value plus an all-samples-finite classification.
+///
+/// Streaming loudness analysis uses this as a transactional preflight: valid
+/// chunks reuse the maximum for true-peak pruning, while exceptional chunks
+/// fall back to the scalar validator to retain its exact diagnostic location.
+#[inline]
+pub(crate) fn abs_max_and_all_finite(buf: &[f32]) -> (f32, bool) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { abs_max_and_all_finite_avx2(buf) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        abs_max_and_all_finite_neon(buf)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    abs_max_and_all_finite_scalar(buf)
+}
+
 #[inline]
 fn abs_max_scalar(buf: &[f32]) -> f32 {
     let mut m = 0.0f32;
@@ -137,6 +158,20 @@ fn abs_max_and_has_nan_scalar(buf: &[f32]) -> (f32, bool) {
         }
     }
     (maximum, has_nan)
+}
+
+#[inline]
+fn abs_max_and_all_finite_scalar(buf: &[f32]) -> (f32, bool) {
+    let mut maximum = 0.0_f32;
+    let mut all_finite = true;
+    for &sample in buf {
+        if sample.is_finite() {
+            maximum = maximum.max(sample.abs());
+        } else {
+            all_finite = false;
+        }
+    }
+    (maximum, all_finite)
 }
 
 /// Hard-limit (brick-wall clip) every sample to `[-ceil, ceil]`. Used only as a
@@ -290,6 +325,44 @@ unsafe fn abs_max_and_has_nan_avx2(buf: &[f32]) -> (f32, bool) {
     (scalar_maximum, has_nan)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn abs_max_and_all_finite_avx2(buf: &[f32]) -> (f32, bool) {
+    let n = buf.len();
+    let zero = _mm256_setzero_ps();
+    let sign = _mm256_set1_ps(-0.0);
+    let infinity = _mm256_set1_ps(f32::INFINITY);
+    let mut maximum = zero;
+    let mut finite_lanes = 0xff_i32;
+    let mut index = 0;
+    let pointer = buf.as_ptr();
+    while index + 8 <= n {
+        let samples = _mm256_loadu_ps(pointer.add(index));
+        let absolute = _mm256_andnot_ps(sign, samples);
+        let finite = _mm256_cmp_ps(absolute, infinity, _CMP_LT_OQ);
+        finite_lanes &= _mm256_movemask_ps(finite);
+        maximum = _mm256_max_ps(maximum, _mm256_and_ps(absolute, finite));
+        index += 8;
+    }
+
+    let high = _mm256_extractf128_ps(maximum, 1);
+    let low = _mm256_castps256_ps128(maximum);
+    let lanes = _mm_max_ps(low, high);
+    let shuffled = _mm_shuffle_ps(lanes, lanes, 0b01_00_11_10);
+    let pairs = _mm_max_ps(lanes, shuffled);
+    let shuffled_pairs = _mm_shuffle_ps(pairs, pairs, 0b00_01_10_11);
+    let mut scalar_maximum = _mm_cvtss_f32(_mm_max_ps(pairs, shuffled_pairs));
+    let mut all_finite = finite_lanes == 0xff;
+    for &sample in &buf[index..] {
+        if sample.is_finite() {
+            scalar_maximum = scalar_maximum.max(sample.abs());
+        } else {
+            all_finite = false;
+        }
+    }
+    (scalar_maximum, all_finite)
+}
+
 // ---------------------------------------------------------------------------
 // AArch64 Advanced SIMD implementations
 // ---------------------------------------------------------------------------
@@ -363,6 +436,42 @@ unsafe fn abs_max_and_has_nan_neon(buf: &[f32]) -> (f32, bool) {
     (scalar_maximum, has_nan)
 }
 
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn abs_max_and_all_finite_neon(buf: &[f32]) -> (f32, bool) {
+    let zero = vdupq_n_f32(0.0);
+    let infinity = vdupq_n_f32(f32::INFINITY);
+    let mut maximum = zero;
+    let mut non_finite = vdupq_n_u32(0);
+    let mut index = 0;
+    while index + 16 <= buf.len() {
+        for offset in [0, 4, 8, 12] {
+            let absolute = vabsq_f32(vld1q_f32(buf.as_ptr().add(index + offset)));
+            let finite = vcltq_f32(absolute, infinity);
+            non_finite = vorrq_u32(non_finite, vmvnq_u32(finite));
+            maximum = vmaxq_f32(maximum, vbslq_f32(finite, absolute, zero));
+        }
+        index += 16;
+    }
+    while index + 4 <= buf.len() {
+        let absolute = vabsq_f32(vld1q_f32(buf.as_ptr().add(index)));
+        let finite = vcltq_f32(absolute, infinity);
+        non_finite = vorrq_u32(non_finite, vmvnq_u32(finite));
+        maximum = vmaxq_f32(maximum, vbslq_f32(finite, absolute, zero));
+        index += 4;
+    }
+    let mut scalar_maximum = vmaxvq_f32(maximum);
+    let mut all_finite = vmaxvq_u32(non_finite) == 0;
+    for &sample in &buf[index..] {
+        if sample.is_finite() {
+            scalar_maximum = scalar_maximum.max(sample.abs());
+        } else {
+            all_finite = false;
+        }
+    }
+    (scalar_maximum, all_finite)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,6 +537,14 @@ mod tests {
         let (maximum, has_nan) = abs_max_and_has_nan(&[-0.25, 0.75, -1.5, 0.5]);
         assert_eq!(maximum.to_bits(), 1.5_f32.to_bits());
         assert!(!has_nan);
+
+        let (maximum, all_finite) = abs_max_and_all_finite(&samples);
+        assert_eq!(maximum.to_bits(), 1.5_f32.to_bits());
+        assert!(!all_finite);
+
+        let (maximum, all_finite) = abs_max_and_all_finite(&[-0.25, 0.75, -1.5, 0.5]);
+        assert_eq!(maximum.to_bits(), 1.5_f32.to_bits());
+        assert!(all_finite);
     }
 
     #[test]
@@ -448,6 +565,11 @@ mod tests {
                 abs_max_and_has_nan_scalar(&samples),
                 "peak lane {peak_index}"
             );
+            assert_eq!(
+                abs_max_and_all_finite(&samples),
+                abs_max_and_all_finite_scalar(&samples),
+                "finite peak lane {peak_index}"
+            );
         }
 
         let mut state = 0x6a09_e667_f3bc_c909_u64;
@@ -462,6 +584,10 @@ mod tests {
         assert_eq!(
             abs_max_and_has_nan(&samples),
             abs_max_and_has_nan_scalar(&samples)
+        );
+        assert_eq!(
+            abs_max_and_all_finite(&samples),
+            abs_max_and_all_finite_scalar(&samples)
         );
     }
 
@@ -502,6 +628,11 @@ mod tests {
                 abs_max_and_has_nan(input),
                 abs_max_and_has_nan_scalar(input),
                 "peak+nan len={length}"
+            );
+            assert_eq!(
+                abs_max_and_all_finite(input),
+                abs_max_and_all_finite_scalar(input),
+                "peak+finite len={length}"
             );
         }
     }

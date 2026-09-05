@@ -11,6 +11,16 @@ service ForgeAnalysis {
   rpc Health(HealthRequest) returns (HealthResponse);
 }
 
+// Additive v3 analysis surface. The original ForgeAnalysis service and its
+// messages remain frozen so existing generated clients and server trait
+// implementations stay source compatible. Cancellation shares the same
+// request-ID registry as ForgeAnalysis.
+service ForgeAnalysisV3 {
+  rpc Analyze(AnalyzeV3Request) returns (AnalyzeV3Response);
+  rpc Cancel(CancelRequest) returns (CancelResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
 // Kept as a separate service so adding observability does not require
 // downstream implementations of ForgeAnalysis to add a new method.
 service ForgeMetrics {
@@ -35,6 +45,31 @@ message AnalyzeResponse {
   uint64 bytes_received = 5;
   string report_json = 6;
   string request_id = 7;
+}
+
+message AnalyzeV3Request {
+  bytes audio = 1;
+  string filename = 2;
+  string content_type = 3;
+  string profile = 4;
+  // A caller supplied opaque identifier used by Cancel. It is bounded by the
+  // server and must be unique across both analysis services while active.
+  string request_id = 5;
+  // Optional versioned ChannelLayoutDescriptor JSON. An empty string uses
+  // container/decoder evidence; overrides must use explicit-override origin.
+  string channel_layout_json = 6;
+}
+
+message AnalyzeV3Response {
+  string schema = 1;
+  string generator = 2;
+  string filename = 3;
+  string content_type = 4;
+  uint64 bytes_received = 5;
+  string report_json = 6;
+  string request_id = 7;
+  // Exact descriptor used by the measurement, serialized as canonical JSON.
+  string channel_layout_json = 8;
 }
 
 message CancelRequest {

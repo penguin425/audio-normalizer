@@ -2791,9 +2791,9 @@ fn record_catalogue_asset(
         return Ok(());
     };
     let record = if let Some(descriptor) = descriptor {
-        catalogue.record_bound(asset, descriptor, plan, renderer)?
+        catalogue.record_bound_v3(asset, descriptor, plan, renderer)?
     } else {
-        catalogue.record_bound_path(asset, descriptor_options, plan, renderer)?
+        catalogue.record_bound_path_v3(asset, descriptor_options, plan, renderer)?
     };
     records.push(record);
     Ok(())
@@ -2839,7 +2839,7 @@ fn write_catalogue_report(
 ) -> Result<(), String> {
     match (catalogue, report) {
         (Some(catalogue), Some(report)) => {
-            catalogue.write_report_v2_with_overwrite(report, records, overwrite)
+            catalogue.write_report_v3_with_overwrite(report, records, overwrite)
         }
         _ => Ok(()),
     }

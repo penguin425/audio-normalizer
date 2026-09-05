@@ -47,7 +47,7 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<bool, String> {
-    let report = dts_adapter::run(&AdapterOptions {
+    let report = dts_adapter::run_v2(&AdapterOptions {
         input: cli.input,
         adapter: cli.adapter,
         timeout_seconds: cli.timeout_seconds,
@@ -56,7 +56,7 @@ fn run(cli: Cli) -> Result<bool, String> {
     })?;
     let passed = report.passed;
     let count = report.presentation_count;
-    dts_adapter::write_report(&cli.output, &report, cli.compact, cli.overwrite)?;
+    dts_adapter::write_report_v2(&cli.output, &report, cli.compact, cli.overwrite)?;
     eprintln!(
         "forge-dts-qc: {} ({count} presentations)",
         if passed { "PASS" } else { "FAIL" }

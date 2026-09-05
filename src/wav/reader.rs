@@ -7,6 +7,7 @@
 //! scanning stops at the RIFF size (or RF64/BW64 `ds64.riffSize`); bytes after
 //! that declared form are deliberately ignored as out-of-container data.
 
+use crate::channel_layout::ChannelLayoutDescriptor;
 use crate::dsp::convert;
 use crate::wav::{
     default_channel_roles, AudioBuffer, ChannelLayoutProvenance, ChannelRole, PcmKind, WaveFormat,
@@ -104,6 +105,14 @@ impl WavReader {
         Self::open_with_layout_and_limits(path, u16::MAX, u64::MAX)
     }
 
+    /// Decode a WAV file while retaining its exact container channel-layout
+    /// declaration, including zero and partial extensible masks.
+    pub fn open_with_channel_layout<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<(AudioBuffer, ChannelLayoutDescriptor), WavReadError> {
+        Self::open_with_channel_layout_and_limits(path, u16::MAX, u64::MAX)
+    }
+
     /// Parse and decode one unambiguous data chunk while applying the sample
     /// bound before allocating its PCM payload.
     pub fn open_with_layout_and_limits<P: AsRef<Path>>(
@@ -111,8 +120,22 @@ impl WavReader {
         max_channels: u16,
         max_decoded_samples: u64,
     ) -> Result<(AudioBuffer, ChannelLayoutProvenance), WavReadError> {
+        let (buffer, layout) =
+            Self::open_with_channel_layout_and_limits(path, max_channels, max_decoded_samples)?;
+        let provenance = layout.provenance();
+        Ok((buffer, provenance))
+    }
+
+    /// Decode a WAV file with resource bounds and its exact channel-layout
+    /// sidecar. This is the lossless counterpart to
+    /// [`Self::open_with_layout_and_limits`].
+    pub fn open_with_channel_layout_and_limits<P: AsRef<Path>>(
+        path: P,
+        max_channels: u16,
+        max_decoded_samples: u64,
+    ) -> Result<(AudioBuffer, ChannelLayoutDescriptor), WavReadError> {
         let mut file = File::open(path)?;
-        let (info, layout_provenance) = Self::probe_file_with_layout(&mut file)?;
+        let (info, channel_layout) = Self::probe_file_with_channel_layout(&mut file)?;
         if info.channels > max_channels {
             return Err(WavReadError::BadFormat("channel count exceeds limit"));
         }
@@ -142,7 +165,7 @@ impl WavReader {
                 channel_roles: info.channel_roles,
                 source_kind: info.kind,
             },
-            layout_provenance,
+            channel_layout,
         ))
     }
 
@@ -171,6 +194,14 @@ impl WavReader {
         Self::read_bytes_with_layout_and_limits(bytes, u16::MAX, usize::MAX)
     }
 
+    /// Decode an in-memory WAVE and preserve its exact channel-layout
+    /// declaration.
+    pub fn read_bytes_with_channel_layout(
+        bytes: &[u8],
+    ) -> Result<(AudioBuffer, ChannelLayoutDescriptor), WavReadError> {
+        Self::read_bytes_with_channel_layout_and_limits(bytes, u16::MAX, usize::MAX)
+    }
+
     /// Decode an in-memory WAVE while retaining the speaker-layout confidence
     /// sidecar used by normalization entry points.
     pub fn read_bytes_with_layout_and_limits(
@@ -178,6 +209,22 @@ impl WavReader {
         max_channels: u16,
         max_decoded_samples: usize,
     ) -> Result<(AudioBuffer, ChannelLayoutProvenance), WavReadError> {
+        let (buffer, layout) = Self::read_bytes_with_channel_layout_and_limits(
+            bytes,
+            max_channels,
+            max_decoded_samples,
+        )?;
+        let provenance = layout.provenance();
+        Ok((buffer, provenance))
+    }
+
+    /// Decode an in-memory WAVE with allocation bounds and preserve its exact
+    /// channel-layout declaration.
+    pub fn read_bytes_with_channel_layout_and_limits(
+        bytes: &[u8],
+        max_channels: u16,
+        max_decoded_samples: usize,
+    ) -> Result<(AudioBuffer, ChannelLayoutDescriptor), WavReadError> {
         let mut cur = 0usize;
         let container = take(bytes, &mut cur, 4).ok_or(WavReadError::Truncated)?;
         if !matches!(container, b"RIFF" | b"RF64" | b"BW64") {
@@ -317,8 +364,12 @@ impl WavReader {
         }
 
         let planar = convert::decode_planar(data, kind, channels as usize);
-        let (channel_roles, layout_provenance) =
-            resolve_wave_layout(wave_format, channel_mask, channels);
+        let (channel_roles, _) = resolve_wave_layout(wave_format, channel_mask, channels);
+        let channel_layout = ChannelLayoutDescriptor::wave(
+            channels,
+            wave_format == WaveFormat::Extensible,
+            channel_mask,
+        );
         let buf = AudioBuffer {
             sample_rate,
             channels,
@@ -327,7 +378,7 @@ impl WavReader {
             channel_roles,
             source_kind: kind,
         };
-        Ok((buf, layout_provenance))
+        Ok((buf, channel_layout))
     }
 
     /// Read only the RIFF headers required for streaming decode.
@@ -342,13 +393,23 @@ impl WavReader {
     pub fn probe_with_layout<P: AsRef<Path>>(
         path: P,
     ) -> Result<(WavStreamInfo, ChannelLayoutProvenance), WavReadError> {
-        let mut file = File::open(path)?;
-        Self::probe_file_with_layout(&mut file)
+        let (info, layout) = Self::probe_with_channel_layout(path)?;
+        let provenance = layout.provenance();
+        Ok((info, provenance))
     }
 
-    fn probe_file_with_layout(
+    /// Probe a WAVE stream while retaining its exact channel-layout
+    /// declaration, including the raw `dwChannelMask` value.
+    pub fn probe_with_channel_layout<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<(WavStreamInfo, ChannelLayoutDescriptor), WavReadError> {
+        let mut file = File::open(path)?;
+        Self::probe_file_with_channel_layout(&mut file)
+    }
+
+    fn probe_file_with_channel_layout(
         file: &mut File,
-    ) -> Result<(WavStreamInfo, ChannelLayoutProvenance), WavReadError> {
+    ) -> Result<(WavStreamInfo, ChannelLayoutDescriptor), WavReadError> {
         file.seek(SeekFrom::Start(0))?;
         let file_len = file.metadata()?.len();
         let mut riff = [0u8; 12];
@@ -460,8 +521,13 @@ impl WavReader {
                     .as_ref()
                     .ok_or(WavReadError::BadFormat("data precedes fmt chunk"))?;
                 wave_frame_count(chunk_size, parsed.channels, parsed.kind)?;
-                let (channel_roles, layout_provenance) =
+                let (channel_roles, _) =
                     resolve_wave_layout(parsed.wave_format, parsed.channel_mask, parsed.channels);
+                let channel_layout = ChannelLayoutDescriptor::wave(
+                    parsed.channels,
+                    parsed.wave_format == WaveFormat::Extensible,
+                    parsed.channel_mask,
+                );
                 data_info = Some((
                     WavStreamInfo {
                         sample_rate: parsed.sample_rate,
@@ -471,7 +537,7 @@ impl WavReader {
                         data_offset: body_offset,
                         data_size: chunk_size,
                     },
-                    layout_provenance,
+                    channel_layout,
                 ));
             }
             file.seek(SeekFrom::Start(next))?;
@@ -766,7 +832,7 @@ pub(crate) fn roles_from_wave_mask(mask: u32, channels: u16) -> Vec<ChannelRole>
     // about +/-110 degrees. Preserve the established +1.5 dB surround weight
     // while keeping it distinguishable from an explicit +/-90 degree side bed.
     let conventional_five_x_bed =
-        mask & 0x0000_0037 == 0x0000_0037 && mask & (0x0000_00c0 | 0x0000_0700) == 0;
+        crate::channel_layout::wave_mask_uses_conventional_five_x_surround(mask);
     let mut roles = Vec::with_capacity(channels as usize);
     for bit in 0..32 {
         if mask & (1 << bit) == 0 {

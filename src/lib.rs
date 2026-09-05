@@ -43,6 +43,7 @@ pub mod bound_analysis;
 mod bwf_xml_qc;
 pub mod c_api;
 pub mod catalogue;
+pub mod channel_layout;
 #[cfg(feature = "clap-plugin")]
 pub mod clap_plugin;
 pub mod cli;

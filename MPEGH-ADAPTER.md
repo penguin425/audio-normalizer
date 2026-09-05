@@ -92,10 +92,13 @@ interleaved decoded samples by default with a hard maximum of 200,000,000.
 Absolute paths, `..`, symlink escapes, duplicate render paths and non-WAVE
 renders are rejected.
 
-The atomic report follows `schema/mpegh-adapter-report-v1.schema.json` and
+The atomic report follows `schema/mpegh-adapter-report-v2.schema.json` and
 contains input, adapter, and render SHA-256 values; native MHAS evidence;
 decoder and standards evidence; validated scene metadata; decoded geometry;
-measured loudness and true peak; and stable rule IDs. Exit status is 0 for
+measured loudness and true peak; an exact renderer-bound output-layout
+descriptor; and stable rule IDs. The descriptor binds the decoder,
+configuration, adapter executable, and exact adapter response. Report v1
+remains available for historical validation. Exit status is 0 for
 PASS, 1 for completed QC failure, and 2 for invalid input, adapter/protocol
 failure, or unsafe output.
 

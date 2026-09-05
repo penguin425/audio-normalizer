@@ -7,6 +7,7 @@
 use crate::analysis::{Analysis, AnalysisEngine};
 use crate::atomic::AtomicOutput;
 use crate::bound_analysis::{BoundAnalysis, MEASUREMENT_ALGORITHM_REVISION};
+use crate::channel_layout::{ChannelLayoutDescriptor, ChannelLayoutOrigin};
 use crate::decoder::{
     ChannelLayoutProvenance, InputDescriptor, InputDescriptorOptions, INPUT_DESCRIPTOR_VERSION,
 };
@@ -31,10 +32,12 @@ pub const ANALYSIS_CACHE_SCHEMA_V3: &str =
     "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v3";
 pub const ANALYSIS_CACHE_SCHEMA_V4: &str =
     "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v4";
+pub const ANALYSIS_CACHE_SCHEMA_V5: &str =
+    "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v5";
 pub const MEASUREMENT_STANDARD: &str = "ITU-R BS.1770-5 / EBU R 128";
 pub const ALGORITHM_REVISION: &str = MEASUREMENT_ALGORITHM_REVISION;
 
-const LAYOUT_VERSION: &str = "v4";
+const LAYOUT_VERSION: &str = "v5";
 const MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CHANNELS: usize = 1024;
 const MAX_SCAN_ENTRIES: usize = 100_000;
@@ -355,7 +358,7 @@ impl AnalysisCache {
                 .map_err(|error| format!("encode analysis cache result: {error}"))?,
         );
         let document = CacheDocument {
-            schema: ANALYSIS_CACHE_SCHEMA_V4.to_owned(),
+            schema: ANALYSIS_CACHE_SCHEMA_V5.to_owned(),
             generator: format!("forge-normalizer/{}", env!("CARGO_PKG_VERSION")),
             measurement_standard: MEASUREMENT_STANDARD.to_owned(),
             algorithm_revision: ALGORITHM_REVISION.to_owned(),
@@ -642,6 +645,9 @@ struct InputDescriptorRecord {
     channel_roles: Vec<ChannelRoleRecord>,
     declared_layout_provenance: LayoutProvenanceRecord,
     explicit_channel_roles: bool,
+    declared_channel_layout: ChannelLayoutDescriptor,
+    effective_channel_layout: ChannelLayoutDescriptor,
+    explicit_channel_layout: bool,
 }
 
 impl InputDescriptorRecord {
@@ -661,6 +667,9 @@ impl InputDescriptorRecord {
             channel_roles: roles_to_records(&info.channel_roles),
             declared_layout_provenance: descriptor.declared_layout_provenance().into(),
             explicit_channel_roles: descriptor.uses_explicit_channel_roles(),
+            declared_channel_layout: descriptor.declared_channel_layout().clone(),
+            effective_channel_layout: descriptor.channel_layout().clone(),
+            explicit_channel_layout: descriptor.uses_explicit_channel_layout(),
         }
     }
 }
@@ -876,7 +885,7 @@ fn validate_document(
     request_hash: &str,
     request: &RequestRecord,
 ) -> Result<(), String> {
-    if document.schema != ANALYSIS_CACHE_SCHEMA_V4 {
+    if document.schema != ANALYSIS_CACHE_SCHEMA_V5 {
         return Err("cache entry has an unsupported schema".into());
     }
     if document.generator.is_empty() || document.generator.len() > 256 {
@@ -957,6 +966,39 @@ fn validate_input_descriptor_record(descriptor: &InputDescriptorRecord) -> Resul
     }
     if descriptor.channel_roles.len() != usize::from(descriptor.channels) {
         return Err("analysis cache descriptor channel-role count does not match channels".into());
+    }
+    descriptor.declared_channel_layout.validate()?;
+    descriptor.effective_channel_layout.validate()?;
+    let declared_origin_is_input = matches!(
+        descriptor.declared_channel_layout.origin(),
+        ChannelLayoutOrigin::CompatibilityDefault
+            | ChannelLayoutOrigin::Wave
+            | ChannelLayoutOrigin::Flac
+            | ChannelLayoutOrigin::IsoBmff
+            | ChannelLayoutOrigin::Decoder
+    );
+    let effective_roles = roles_to_records(&descriptor.effective_channel_layout.channel_roles());
+    let override_is_consistent = if descriptor.explicit_channel_roles {
+        descriptor.effective_channel_layout.origin() == ChannelLayoutOrigin::ExplicitOverride
+            && descriptor.effective_channel_layout.is_measurement_ready()
+    } else {
+        !descriptor.explicit_channel_layout
+            && descriptor.declared_channel_layout == descriptor.effective_channel_layout
+    };
+    if !declared_origin_is_input
+        || descriptor.declared_channel_layout.channel_count() != usize::from(descriptor.channels)
+        || descriptor.effective_channel_layout.channel_count() != usize::from(descriptor.channels)
+        || descriptor.channel_roles != effective_roles
+        || descriptor.declared_channel_layout.provenance()
+            != match descriptor.declared_layout_provenance {
+                LayoutProvenanceRecord::KnownSpeakers => ChannelLayoutProvenance::KnownSpeakers,
+                LayoutProvenanceRecord::Unknown => ChannelLayoutProvenance::Unknown,
+                LayoutProvenanceRecord::SceneBased => ChannelLayoutProvenance::SceneBased,
+            }
+        || descriptor.explicit_channel_layout && !descriptor.explicit_channel_roles
+        || !override_is_consistent
+    {
+        return Err("analysis cache exact channel layout is inconsistent".into());
     }
     if descriptor.source_frames == Some(0) {
         return Err("analysis cache descriptor source range must not be empty".into());
@@ -1569,12 +1611,12 @@ mod tests {
         let instance: serde_json::Value =
             serde_json::from_slice(&fs::read(entry).unwrap()).unwrap();
         let schema: serde_json::Value =
-            serde_json::from_str(include_str!("../schema/analysis-cache-v4.schema.json")).unwrap();
+            serde_json::from_str(include_str!("../schema/analysis-cache-v5.schema.json")).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         assert!(validator.validate(&instance).is_ok());
 
         let mut legacy = instance.clone();
-        legacy["schema"] = serde_json::json!(ANALYSIS_CACHE_SCHEMA_V3);
+        legacy["schema"] = serde_json::json!(ANALYSIS_CACHE_SCHEMA_V4);
         let legacy: CacheDocument = serde_json::from_value(legacy).unwrap();
         assert!(validate_document(
             &legacy,
@@ -1584,6 +1626,16 @@ mod tests {
         )
         .unwrap_err()
         .contains("unsupported schema"));
+
+        let mut forged_origin = instance.clone();
+        forged_origin["request"]["input_descriptor"]["declared_channel_layout"]["origin"] =
+            serde_json::json!("explicit-override");
+        forged_origin["request"]["input_descriptor"]["effective_channel_layout"]["origin"] =
+            serde_json::json!("explicit-override");
+        let forged_origin: CacheDocument = serde_json::from_value(forged_origin).unwrap();
+        assert!(validate_request(&forged_origin.request)
+            .unwrap_err()
+            .contains("exact channel layout is inconsistent"));
 
         let mut defective = instance;
         defective["result"]["sample_peak_linear"] = serde_json::json!(-1.0);

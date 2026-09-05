@@ -8,6 +8,7 @@
 //! path-based inputs are not accepted.
 
 use crate::analysis::AnalysisEngine;
+use crate::channel_layout::ChannelLayoutDescriptor;
 use crate::decoder;
 use crate::report::{AnalysisReport, AnalysisReportWire, ComplianceProfile};
 use crate::service_metrics::{RequestTimer, ServiceMetrics, PROMETHEUS_CONTENT_TYPE};
@@ -27,6 +28,8 @@ pub const SERVICE_ANALYSIS_SCHEMA: &str =
 pub const SERVICE_ANALYSIS_SCHEMA_V1: &str = SERVICE_ANALYSIS_SCHEMA;
 pub const SERVICE_ANALYSIS_SCHEMA_V2: &str =
     "https://penguin425.github.io/audio-normalizer/schema/service-analysis-v2";
+pub const SERVICE_ANALYSIS_SCHEMA_V3: &str =
+    "https://penguin425.github.io/audio-normalizer/schema/service-analysis-v3";
 pub const SERVICE_ERROR_SCHEMA: &str =
     "https://penguin425.github.io/audio-normalizer/schema/service-error-v1";
 pub const SERVICE_HEALTH_SCHEMA: &str =
@@ -294,6 +297,8 @@ struct AnalysisResponse<'a> {
     max_decoded_samples: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     compliance_profile: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_layout: Option<&'a ChannelLayoutDescriptor>,
     report: ServiceReport<'a>,
 }
 
@@ -383,6 +388,14 @@ fn route(
             timer,
             SERVICE_ANALYSIS_SCHEMA_V2,
         ),
+        ("POST", "/v3/analyze") => analyze_upload(
+            request,
+            config,
+            &target,
+            metrics,
+            timer,
+            SERVICE_ANALYSIS_SCHEMA_V3,
+        ),
         _ => Response::error(404, "not_found", "endpoint not found"),
     }
 }
@@ -431,6 +444,26 @@ fn analyze_upload(
         },
         None => None,
     };
+    let requested_layout = if response_schema == SERVICE_ANALYSIS_SCHEMA_V3 {
+        match request.headers.get("x-forge-channel-layout") {
+            Some(json) => match ChannelLayoutDescriptor::from_json(json) {
+                Ok(layout) => Some(layout),
+                Err(error) => {
+                    return Response::error(400, "invalid_channel_layout", error);
+                }
+            },
+            None => None,
+        }
+    } else {
+        if request.headers.contains_key("x-forge-channel-layout") {
+            return Response::error(
+                400,
+                "unsupported_channel_layout",
+                "channel-layout overrides require /v3/analyze",
+            );
+        }
+        None
+    };
 
     let mut temporary = match Builder::new()
         .prefix("forge-service-")
@@ -444,17 +477,25 @@ fn analyze_upload(
         return Response::error(500, "temporary_file", "could not store upload");
     }
     let path = temporary.path().to_path_buf();
-    let (mut decoded, layout_provenance) =
-        match decoder::decode_limited_with_layout(&path, config.max_decoded_samples) {
+    let has_layout_override = requested_layout.is_some();
+    let (mut decoded, declared_layout) =
+        match decoder::decode_limited_with_channel_layout(&path, config.max_decoded_samples) {
             Ok(decoded) => decoded,
             Err(_) => return Response::error(422, "decode_failed", "audio could not be decoded"),
         };
+    let effective_layout = requested_layout.unwrap_or(declared_layout);
+    if has_layout_override {
+        if let Err(error) = effective_layout.validate_override_for_channels(decoded.channels) {
+            return Response::error(400, "invalid_channel_layout", error);
+        }
+    }
+    let override_roles = has_layout_override.then(|| effective_layout.channel_roles());
     decoded.channel_roles = match crate::normalize::resolve_decoded_channel_roles(
         &path,
         decoded.channels,
         &decoded.channel_roles,
-        layout_provenance,
-        None,
+        effective_layout.provenance(),
+        override_roles.as_deref(),
     ) {
         Ok(roles) => roles,
         Err(_) => return Response::error(422, "decode_failed", "audio could not be decoded"),
@@ -515,6 +556,8 @@ fn analyze_upload(
             bytes_received: request.body.len(),
             max_decoded_samples: config.max_decoded_samples,
             compliance_profile: params.get("profile").map(String::as_str),
+            channel_layout: (response_schema == SERVICE_ANALYSIS_SCHEMA_V3)
+                .then_some(&effective_layout),
             report,
         },
     )

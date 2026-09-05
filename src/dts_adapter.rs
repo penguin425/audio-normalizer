@@ -4,6 +4,7 @@
 //! render.  Normative asset/presentation decoding remains in an explicitly
 //! selected licensed or reference adapter; no DTS decoder is bundled.
 
+use crate::channel_layout::{ChannelLayoutDescriptor, RendererBinding};
 use crate::wav::{AudioBuffer, ChannelRole};
 use crate::{analysis, decoder, normalize};
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,8 @@ pub const RESPONSE_SCHEMA: &str =
     "https://penguin425.github.io/audio-normalizer/schema/dts-adapter-response-v1";
 pub const REPORT_SCHEMA: &str =
     "https://penguin425.github.io/audio-normalizer/schema/dts-adapter-report-v1";
+pub const REPORT_SCHEMA_V2: &str =
+    "https://penguin425.github.io/audio-normalizer/schema/dts-adapter-report-v2";
 
 const CORE_BE: u32 = 0x7FFE_8001;
 const CORE_LE: u32 = 0xFE7F_0180;
@@ -270,6 +273,113 @@ pub struct PresentationResult {
     pub true_peak_passed: Option<bool>,
     pub passed: bool,
     pub checks: Vec<DtsCheck>,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Serialize)]
+pub struct DtsAdapterReportV2 {
+    pub schema: &'static str,
+    pub protocol_version: u32,
+    pub validator: &'static str,
+    pub input_path: String,
+    pub input_bytes: u64,
+    pub input_sha256: String,
+    pub adapter_path: String,
+    pub adapter_sha256: String,
+    pub decoder: DecoderEvidence,
+    pub standard: &'static str,
+    pub profile: DtsProfile,
+    pub dialog_normalization_policy: ProcessingPolicy,
+    pub dynamic_range_control_policy: ProcessingPolicy,
+    pub native_inventory: DtsInventory,
+    pub timeout_seconds: u64,
+    pub max_decoded_samples_per_presentation: u64,
+    pub max_true_peak_dbtp: Option<f64>,
+    pub asset_count: usize,
+    pub assets: Vec<AssetMetadata>,
+    pub presentation_count: usize,
+    pub passed: bool,
+    pub presentations: Vec<PresentationResultV2>,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Serialize)]
+pub struct PresentationResultV2 {
+    pub id: String,
+    pub asset_ids: Vec<String>,
+    pub output_layout: String,
+    pub channel_layout: ChannelLayoutDescriptor,
+    pub language: Option<String>,
+    pub accessibility: Option<String>,
+    pub declared_sample_rate_hz: u32,
+    pub declared_channels: u16,
+    pub rendered_sha256: String,
+    pub rendered_bytes: u64,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub duration_seconds: f64,
+    pub measured_integrated_lufs: f64,
+    pub measured_true_peak_dbtp: f64,
+    pub sample_rate_passed: bool,
+    pub channels_passed: bool,
+    pub true_peak_passed: Option<bool>,
+    pub passed: bool,
+    pub checks: Vec<DtsCheck>,
+}
+
+impl From<PresentationResultV2> for PresentationResult {
+    fn from(value: PresentationResultV2) -> Self {
+        Self {
+            id: value.id,
+            asset_ids: value.asset_ids,
+            output_layout: value.output_layout,
+            language: value.language,
+            accessibility: value.accessibility,
+            declared_sample_rate_hz: value.declared_sample_rate_hz,
+            declared_channels: value.declared_channels,
+            rendered_sha256: value.rendered_sha256,
+            rendered_bytes: value.rendered_bytes,
+            sample_rate_hz: value.sample_rate_hz,
+            channels: value.channels,
+            duration_seconds: value.duration_seconds,
+            measured_integrated_lufs: value.measured_integrated_lufs,
+            measured_true_peak_dbtp: value.measured_true_peak_dbtp,
+            sample_rate_passed: value.sample_rate_passed,
+            channels_passed: value.channels_passed,
+            true_peak_passed: value.true_peak_passed,
+            passed: value.passed,
+            checks: value.checks,
+        }
+    }
+}
+
+impl From<DtsAdapterReportV2> for DtsAdapterReport {
+    fn from(value: DtsAdapterReportV2) -> Self {
+        Self {
+            schema: REPORT_SCHEMA,
+            protocol_version: value.protocol_version,
+            validator: value.validator,
+            input_path: value.input_path,
+            input_bytes: value.input_bytes,
+            input_sha256: value.input_sha256,
+            adapter_path: value.adapter_path,
+            adapter_sha256: value.adapter_sha256,
+            decoder: value.decoder,
+            standard: value.standard,
+            profile: value.profile,
+            dialog_normalization_policy: value.dialog_normalization_policy,
+            dynamic_range_control_policy: value.dynamic_range_control_policy,
+            native_inventory: value.native_inventory,
+            timeout_seconds: value.timeout_seconds,
+            max_decoded_samples_per_presentation: value.max_decoded_samples_per_presentation,
+            max_true_peak_dbtp: value.max_true_peak_dbtp,
+            asset_count: value.asset_count,
+            assets: value.assets,
+            presentation_count: value.presentation_count,
+            passed: value.passed,
+            presentations: value.presentations.into_iter().map(Into::into).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -821,6 +931,10 @@ fn read_at(
 }
 
 pub fn run(options: &AdapterOptions) -> Result<DtsAdapterReport, String> {
+    run_v2(options).map(Into::into)
+}
+
+pub fn run_v2(options: &AdapterOptions) -> Result<DtsAdapterReportV2, String> {
     validate_options(options)?;
     let input = fs::canonicalize(&options.input)
         .map_err(|error| format!("resolve DTS input {}: {error}", options.input.display()))?;
@@ -887,6 +1001,7 @@ pub fn run(options: &AdapterOptions) -> Result<DtsAdapterReport, String> {
         return Err("DTS adapter executable changed while it was running".into());
     }
     let response_bytes = read_response(work.path(), &response_path)?;
+    let settings_sha256 = sha256_bytes(&response_bytes);
     let response: AdapterResponse = serde_json::from_slice(&response_bytes)
         .map_err(|error| format!("parse DTS adapter response: {error}"))?;
     validate_response(&response, &input_sha256, &inventory)?;
@@ -901,17 +1016,32 @@ pub fn run(options: &AdapterOptions) -> Result<DtsAdapterReport, String> {
     for presentation in response.presentations {
         let rendered = resolve_render(&render_root, &presentation.rendered_path)?;
         let (rendered_sha256, rendered_bytes) = sha256_file(&rendered)?;
-        let (buffer, layout_provenance) = decoder::decode_limited_with_layout(
+        let (buffer, decoded_layout) = decoder::decode_limited_with_channel_layout(
             &rendered,
             options.max_decoded_samples_per_presentation,
         )?;
         let buffer = resolve_rendered_layout(
             &rendered,
             buffer,
-            layout_provenance,
+            decoded_layout.provenance(),
             &presentation.output_layout,
             presentation.declared_channels,
         )?;
+        let renderer = RendererBinding::new(
+            &response.decoder.name,
+            &response.decoder.version,
+            &presentation.output_layout,
+            &adapter_sha256,
+            &settings_sha256,
+        )?;
+        let assignments =
+            match decoded_layout.assignments_compatible_with_roles(&buffer.channel_roles) {
+                Some(assignments) => assignments,
+                None => ChannelLayoutDescriptor::from_channel_roles(buffer.channel_roles.clone())?
+                    .assignments()
+                    .to_vec(),
+            };
+        let channel_layout = ChannelLayoutDescriptor::rendered(assignments, renderer)?;
         let measured = analysis::analyze(&buffer);
         let (rendered_after, bytes_after) = sha256_file(&rendered)?;
         if rendered_after != rendered_sha256 || bytes_after != rendered_bytes {
@@ -963,10 +1093,11 @@ pub fn run(options: &AdapterOptions) -> Result<DtsAdapterReport, String> {
             });
         }
         let passed = sample_rate_passed && channels_passed && true_peak_passed != Some(false);
-        results.push(PresentationResult {
+        results.push(PresentationResultV2 {
             id: presentation.id,
             asset_ids: presentation.asset_ids,
             output_layout: presentation.output_layout,
+            channel_layout,
             language: presentation.language,
             accessibility: presentation.accessibility,
             declared_sample_rate_hz: presentation.declared_sample_rate_hz,
@@ -986,8 +1117,8 @@ pub fn run(options: &AdapterOptions) -> Result<DtsAdapterReport, String> {
         });
     }
     let passed = results.iter().all(|item| item.passed);
-    Ok(DtsAdapterReport {
-        schema: REPORT_SCHEMA,
+    Ok(DtsAdapterReportV2 {
+        schema: REPORT_SCHEMA_V2,
         protocol_version: PROTOCOL_VERSION,
         validator: VALIDATOR,
         input_path: input.to_string_lossy().into_owned(),
@@ -1015,6 +1146,24 @@ pub fn run(options: &AdapterOptions) -> Result<DtsAdapterReport, String> {
 pub fn write_report(
     path: &Path,
     report: &DtsAdapterReport,
+    compact: bool,
+    overwrite: bool,
+) -> Result<(), String> {
+    write_report_value(path, report, compact, overwrite)
+}
+
+pub fn write_report_v2(
+    path: &Path,
+    report: &DtsAdapterReportV2,
+    compact: bool,
+    overwrite: bool,
+) -> Result<(), String> {
+    write_report_value(path, report, compact, overwrite)
+}
+
+fn write_report_value<T: Serialize>(
+    path: &Path,
+    report: &T,
     compact: bool,
     overwrite: bool,
 ) -> Result<(), String> {
@@ -1416,6 +1565,15 @@ fn ensure_regular_file(path: &Path, label: &str) -> Result<(), String> {
         return Err(format!("{label} must be a regular file"));
     }
     Ok(())
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
 }
 
 fn sha256_file(path: &Path) -> Result<(String, u64), String> {

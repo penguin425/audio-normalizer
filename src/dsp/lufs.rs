@@ -228,6 +228,24 @@ fn validate_planar_chunk<T>(
     )
 }
 
+fn validate_planar_shape<T>(
+    planar: &[Vec<T>],
+    expected_channels: usize,
+    consumed_frames: usize,
+) -> Result<usize, String> {
+    if planar.len() != expected_channels {
+        return Err("stream channel count changed".into());
+    }
+    let chunk_frames = planar.first().map_or(0, Vec::len);
+    if planar.iter().any(|channel| channel.len() != chunk_frames) {
+        return Err("stream channel length mismatch".into());
+    }
+    consumed_frames
+        .checked_add(chunk_frames)
+        .ok_or_else(|| "stream frame count overflow".to_string())?;
+    Ok(chunk_frames)
+}
+
 const TRUE_PEAK_BACKEND_CPU: u8 = 0;
 #[cfg(all(
     feature = "cuda-truepeak",
@@ -563,6 +581,9 @@ pub struct StreamingAnalyzer {
     #[cfg(target_arch = "x86_64")]
     kweight_quads: Option<Vec<KWeightQuad>>,
     true_peak_meters: Vec<TruePeakMeter>,
+    // Reused per-channel preflight reductions keep packetized decoder input
+    // allocation-free and feed the true-peak block-pruning decision.
+    chunk_sample_peaks: Vec<f32>,
     #[cfg(all(
         feature = "cuda-truepeak",
         any(target_os = "linux", target_os = "windows")
@@ -652,6 +673,7 @@ impl StreamingAnalyzer {
             true_peak_meters: (0..channels)
                 .map(|_| TruePeakMeter::for_finite_sample_rate(sample_rate))
                 .collect(),
+            chunk_sample_peaks: Vec::with_capacity(channels),
             #[cfg(all(
                 feature = "cuda-truepeak",
                 any(target_os = "linux", target_os = "windows")
@@ -691,17 +713,28 @@ impl StreamingAnalyzer {
     }
 
     pub fn process(&mut self, planar: &[Vec<f32>]) -> Result<(), String> {
-        // Validate the complete chunk before advancing any recursive filter,
-        // window, peak, CUDA, or timeline state. Scan each planar channel
-        // contiguously, then choose the lexicographically first (frame,
-        // channel) location so the diagnostic is backend-independent.
-        let chunk_frames = validate_planar_chunk(
-            planar,
-            self.roles.len(),
-            self.frames,
-            |sample| !sample.is_finite(),
-            "non-finite sample",
-        )?;
+        // Validate the complete shape before touching recursive DSP state,
+        // then fuse finite-sample classification with the absolute maxima used
+        // by true-peak block pruning. Exceptional input takes the cold scalar
+        // path so the established first (frame, channel) diagnostic is exact.
+        let chunk_frames = validate_planar_shape(planar, self.roles.len(), self.frames)?;
+        self.chunk_sample_peaks.clear();
+        let mut all_finite = true;
+        for channel in planar {
+            let (sample_peak, channel_is_finite) =
+                crate::dsp::simd::abs_max_and_all_finite(channel);
+            self.chunk_sample_peaks.push(sample_peak);
+            all_finite &= channel_is_finite;
+        }
+        if !all_finite {
+            validate_planar_chunk(
+                planar,
+                self.roles.len(),
+                self.frames,
+                |sample| !sample.is_finite(),
+                "non-finite sample",
+            )?;
+        }
         if chunk_frames != 0 {
             if self.ingress == AnalysisIngress::ScalarTyped {
                 return Err("cannot mix fast f32 and scalar typed PCM chunks".into());
@@ -739,8 +772,15 @@ impl StreamingAnalyzer {
             rayon::current_num_threads(),
         ) {
             let mut true_peak_meters = std::mem::take(&mut self.true_peak_meters);
+            let block_sample_peaks = std::mem::take(&mut self.chunk_sample_peaks);
             let ((), result) = rayon::join(
-                || process_true_peak_channel_group(&mut true_peak_meters, planar),
+                || {
+                    process_true_peak_channel_group(
+                        &mut true_peak_meters,
+                        planar,
+                        &block_sample_peaks,
+                    )
+                },
                 || {
                     self.process_without_true_peak(
                         planar,
@@ -751,6 +791,7 @@ impl StreamingAnalyzer {
                 },
             );
             self.true_peak_meters = true_peak_meters;
+            self.chunk_sample_peaks = block_sample_peaks;
             return result;
         }
         // Stereo is the dominant file-delivery layout. Keeping both filters in
@@ -776,10 +817,12 @@ impl StreamingAnalyzer {
             let (meter0, meter1) = self.true_peak_meters.split_at_mut(1);
             let meter0 = &mut meter0[0];
             let meter1 = &mut meter1[0];
-            let (skip_meter0, block_sample_peak0) =
-                meter0.try_skip_peak_only_block_with_sample_peak(&planar[0]);
-            let (skip_meter1, block_sample_peak1) =
-                meter1.try_skip_peak_only_block_with_sample_peak(&planar[1]);
+            let block_sample_peak0 = self.chunk_sample_peaks[0];
+            let block_sample_peak1 = self.chunk_sample_peaks[1];
+            let skip_meter0 = meter0
+                .try_skip_peak_only_block_with_known_sample_peak(&planar[0], block_sample_peak0);
+            let skip_meter1 = meter1
+                .try_skip_peak_only_block_with_known_sample_peak(&planar[1], block_sample_peak1);
             self.sample_peak = self
                 .sample_peak
                 .max(block_sample_peak0)
@@ -875,15 +918,17 @@ impl StreamingAnalyzer {
                 self.true_peak_meters
                     .par_chunks_mut(2)
                     .zip(planar.par_chunks(2))
-                    .for_each(|(meters, channels)| {
-                        process_true_peak_channel_group(meters, channels);
+                    .zip(self.chunk_sample_peaks.par_chunks(2))
+                    .for_each(|((meters, channels), sample_peaks)| {
+                        process_true_peak_channel_group(meters, channels, sample_peaks);
                     });
             } else {
                 self.true_peak_meters
                     .chunks_mut(2)
                     .zip(planar.chunks(2))
-                    .for_each(|(meters, channels)| {
-                        process_true_peak_channel_group(meters, channels);
+                    .zip(self.chunk_sample_peaks.chunks(2))
+                    .for_each(|((meters, channels), sample_peaks)| {
+                        process_true_peak_channel_group(meters, channels, sample_peaks);
                     });
             }
             for frame in 0..chunk_frames {
@@ -1224,7 +1269,7 @@ impl StreamingAnalyzer {
             Err(error) => {
                 record_cuda_runtime_fallback(error);
                 self.true_peak_meters = (*worker).into_cpu_meters();
-                process_true_peak_cpu(&mut self.true_peak_meters, planar);
+                process_true_peak_cpu(&mut self.true_peak_meters, planar, &self.chunk_sample_peaks);
             }
         }
     }
@@ -1704,12 +1749,19 @@ impl ReferenceStreamingAnalyzer {
 }
 
 #[inline]
-fn process_true_peak_channel_group(meters: &mut [TruePeakMeter], channels: &[Vec<f32>]) {
+fn process_true_peak_channel_group(
+    meters: &mut [TruePeakMeter],
+    channels: &[Vec<f32>],
+    block_sample_peaks: &[f32],
+) {
     debug_assert_eq!(meters.len(), channels.len());
+    debug_assert_eq!(meters.len(), block_sample_peaks.len());
     if meters.len() == 2 {
         let (left_meter, right_meter) = meters.split_at_mut(1);
-        let skip_left = left_meter[0].try_skip_peak_only_block(&channels[0]);
-        let skip_right = right_meter[0].try_skip_peak_only_block(&channels[1]);
+        let skip_left = left_meter[0]
+            .try_skip_peak_only_block_with_known_sample_peak(&channels[0], block_sample_peaks[0]);
+        let skip_right = right_meter[0]
+            .try_skip_peak_only_block_with_known_sample_peak(&channels[1], block_sample_peaks[1]);
         for (&left_sample, &right_sample) in channels[0].iter().zip(&channels[1]) {
             match (skip_left, skip_right) {
                 (false, false) => {
@@ -1729,8 +1781,16 @@ fn process_true_peak_channel_group(meters: &mut [TruePeakMeter], channels: &[Vec
                 (true, true) => {}
             }
         }
-    } else if let (Some(meter), Some(channel)) = (meters.first_mut(), channels.first()) {
-        meter.process(channel);
+    } else if let (Some(meter), Some(channel), Some(&block_sample_peak)) = (
+        meters.first_mut(),
+        channels.first(),
+        block_sample_peaks.first(),
+    ) {
+        if !meter.try_skip_peak_only_block_with_known_sample_peak(channel, block_sample_peak) {
+            for &sample in channel {
+                meter.process_peak_only_sample(sample);
+            }
+        }
     }
 }
 
@@ -1795,23 +1855,30 @@ fn process_kweighted_frame_multichannel(
     feature = "cuda-truepeak",
     any(target_os = "linux", target_os = "windows")
 ))]
-fn process_true_peak_cpu(meters: &mut [TruePeakMeter], planar: &[Vec<f32>]) {
+fn process_true_peak_cpu(
+    meters: &mut [TruePeakMeter],
+    planar: &[Vec<f32>],
+    block_sample_peaks: &[f32],
+) {
     let frames = planar.first().map_or(0, Vec::len);
     if meters.len() >= 4
         && frames >= MIN_PARALLEL_TRUE_PEAK_FRAMES
         && rayon::current_num_threads() > 1
     {
-        meters.par_chunks_mut(2).zip(planar.par_chunks(2)).for_each(
-            |(meter_group, channel_group)| {
-                process_true_peak_channel_group(meter_group, channel_group);
-            },
-        );
+        meters
+            .par_chunks_mut(2)
+            .zip(planar.par_chunks(2))
+            .zip(block_sample_peaks.par_chunks(2))
+            .for_each(|((meter_group, channel_group), sample_peaks)| {
+                process_true_peak_channel_group(meter_group, channel_group, sample_peaks);
+            });
     } else {
         meters
             .chunks_mut(2)
             .zip(planar.chunks(2))
-            .for_each(|(meter_group, channel_group)| {
-                process_true_peak_channel_group(meter_group, channel_group);
+            .zip(block_sample_peaks.chunks(2))
+            .for_each(|((meter_group, channel_group), sample_peaks)| {
+                process_true_peak_channel_group(meter_group, channel_group, sample_peaks);
             });
     }
 }
@@ -2952,15 +3019,15 @@ mod tests {
         let roles = vec![ChannelRole::Main, ChannelRole::Main];
         let prefix = vec![vec![0.1; 137], vec![-0.2; 137]];
         let suffix = vec![vec![0.3; 211], vec![-0.4; 211]];
-        let rejected = vec![
-            vec![0.5, 0.5, f32::INFINITY, 0.5],
-            vec![0.25, f32::NAN, 0.25, f32::NEG_INFINITY],
-        ];
+        let mut rejected = vec![vec![0.5; 17], vec![0.25; 17]];
+        rejected[0][9] = f32::INFINITY;
+        rejected[1][8] = f32::NAN;
+        rejected[1][15] = f32::NEG_INFINITY;
 
         let mut candidate = StreamingAnalyzer::new(48_000, roles.clone());
         candidate.process(&prefix).unwrap();
         let error = candidate.process(&rejected).unwrap_err();
-        assert_eq!(error, "non-finite sample at frame 138, channel 1");
+        assert_eq!(error, "non-finite sample at frame 145, channel 1");
         candidate.process(&suffix).unwrap();
 
         let mut reference = StreamingAnalyzer::new(48_000, roles);
@@ -2991,6 +3058,62 @@ mod tests {
             let error = analyzer.process(&[vec![0.0, value]]).unwrap_err();
             assert_eq!(error, "non-finite sample at frame 1, channel 0");
             assert_eq!(analyzer.finish().frames, 0);
+        }
+    }
+
+    #[test]
+    fn empty_f32_chunks_and_mixed_ingress_rejections_preserve_state() {
+        let roles = vec![ChannelRole::Main];
+
+        let mut empty = StreamingAnalyzer::new(48_000, roles.clone());
+        empty.process(&[Vec::new()]).unwrap();
+        let empty = empty.finish();
+        assert_eq!(empty.frames, 0);
+        assert_eq!(empty.sample_peak.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(empty.true_peak.to_bits(), 0.0_f32.to_bits());
+
+        let typed_prefix = vec![vec![1_024_i16; 137]];
+        let typed_suffix = vec![vec![-2_048_i16; 211]];
+        let mut typed_candidate = StreamingAnalyzer::new(48_000, roles.clone());
+        typed_candidate.process_i16(&typed_prefix).unwrap();
+        assert_eq!(
+            typed_candidate.process(&[vec![0.25; 17]]).unwrap_err(),
+            "cannot mix fast f32 and scalar typed PCM chunks"
+        );
+        typed_candidate.process_i16(&typed_suffix).unwrap();
+        let mut typed_reference = StreamingAnalyzer::new(48_000, roles.clone());
+        typed_reference.process_i16(&typed_prefix).unwrap();
+        typed_reference.process_i16(&typed_suffix).unwrap();
+
+        let fast_prefix = vec![vec![0.125_f32; 137]];
+        let fast_suffix = vec![vec![-0.25_f32; 211]];
+        let mut fast_candidate = StreamingAnalyzer::new(48_000, roles.clone());
+        fast_candidate.process(&fast_prefix).unwrap();
+        assert_eq!(
+            fast_candidate.process_i16(&[vec![1_024; 17]]).unwrap_err(),
+            "cannot mix fast f32 and scalar typed PCM chunks"
+        );
+        fast_candidate.process(&fast_suffix).unwrap();
+        let mut fast_reference = StreamingAnalyzer::new(48_000, roles);
+        fast_reference.process(&fast_prefix).unwrap();
+        fast_reference.process(&fast_suffix).unwrap();
+
+        for (candidate, reference) in [
+            (typed_candidate.finish(), typed_reference.finish()),
+            (fast_candidate.finish(), fast_reference.finish()),
+        ] {
+            assert_eq!(candidate.frames, reference.frames);
+            assert_eq!(
+                candidate.weighted_mean_square.to_bits(),
+                reference.weighted_mean_square.to_bits()
+            );
+            assert_eq!(candidate.rms_db.to_bits(), reference.rms_db.to_bits());
+            assert_eq!(
+                candidate.sample_peak.to_bits(),
+                reference.sample_peak.to_bits()
+            );
+            assert_eq!(candidate.true_peak.to_bits(), reference.true_peak.to_bits());
+            assert_eq!(candidate.ebu.gating_blocks, reference.ebu.gating_blocks);
         }
     }
 

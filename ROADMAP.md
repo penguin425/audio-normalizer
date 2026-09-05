@@ -149,6 +149,10 @@ Forge already provides:
   stream, decoder route, channel-layout request, resampling domain, and
   measurement revision. Live sources and protected aliases are rechecked
   before output publication.
+- Versioned exact channel-layout descriptors retain WAVE/RFC 9639 masks,
+  ISO-BMFF `chnl`/CICP and `dmix` evidence, explicit speaker overrides, and
+  renderer executable/settings bindings across decode, measurement, output,
+  cache/catalogue identity, C, Python, Wasm, REST, and gRPC surfaces.
 - Versioned C ABI v1 for bounded local-file analysis with a fixed
   caller-owned result layout, UTF-8 error contract, decoded-sample limit,
   packaged header/shared libraries, and real C consumer tests on Linux,
@@ -613,7 +617,7 @@ unchanged controls from paths whose normative work factor changed.
 The order below is an implementation plan, not a standards requirement. Each
 normative item must name the exact supported clauses and must not imply
 certification or coverage beyond its fixtures.
-v0.189.1 through v0.189.8 are the completed baseline; later entries are
+v0.189.1 through v0.189.9 are the completed baseline; later entries are
 planned.
 
 | Release | Scope | Classification |

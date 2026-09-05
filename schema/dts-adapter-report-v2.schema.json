@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/dts-adapter-report-v2",
+  "title": "Forge DTS adapter report v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "protocol_version", "validator", "input_path", "input_bytes", "input_sha256", "adapter_path", "adapter_sha256", "decoder", "standard", "profile", "dialog_normalization_policy", "dynamic_range_control_policy", "native_inventory", "timeout_seconds", "max_decoded_samples_per_presentation", "max_true_peak_dbtp", "asset_count", "assets", "presentation_count", "passed", "presentations"],
+  "properties": {
+    "schema": {"const": "https://penguin425.github.io/audio-normalizer/schema/dts-adapter-report-v2"},
+    "protocol_version": {"const": 1},
+    "validator": {"const": "forge-dts-reference-adapter-1"},
+    "input_path": {"type": "string", "minLength": 1},
+    "input_bytes": {"type": "integer", "minimum": 1},
+    "input_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "adapter_path": {"type": "string", "minLength": 1},
+    "adapter_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "decoder": {"$ref": "#/$defs/decoder"},
+    "standard": {"const": "ETSI TS 102 114 V1.6.1 (2019-08)"},
+    "profile": {"$ref": "#/$defs/profile"},
+    "dialog_normalization_policy": {"$ref": "#/$defs/policy"},
+    "dynamic_range_control_policy": {"$ref": "#/$defs/policy"},
+    "native_inventory": {"$ref": "#/$defs/inventory"},
+    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+    "max_decoded_samples_per_presentation": {"type": "integer", "minimum": 1, "maximum": 200000000},
+    "max_true_peak_dbtp": {"type": ["number", "null"], "minimum": -100, "maximum": 0},
+    "asset_count": {"type": "integer", "minimum": 1, "maximum": 32},
+    "assets": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"$ref": "#/$defs/asset"}},
+    "presentation_count": {"type": "integer", "minimum": 1, "maximum": 32},
+    "passed": {"type": "boolean"},
+    "presentations": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"$ref": "#/$defs/result"}}
+  },
+  "$defs": {
+    "channel_role": {
+      "oneOf": [
+        {"enum": ["main", "surround", "dual-mono", "lfe"]},
+        {
+          "type": "object", "additionalProperties": false, "required": ["positioned"],
+          "properties": {"positioned": {
+            "type": "object", "additionalProperties": false,
+            "required": ["azimuth_degrees", "elevation_degrees"],
+            "properties": {
+              "azimuth_degrees": {"type": "integer", "minimum": -180, "maximum": 180},
+              "elevation_degrees": {"type": "integer", "minimum": -90, "maximum": 90}
+            }
+          }}
+        }
+      ]
+    },
+    "channel_assignment": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "role"],
+      "properties": {
+        "kind": {"enum": ["speaker", "low-frequency-effects", "legacy-role"]},
+        "role": {"$ref": "#/$defs/channel_role"},
+        "cicp_position": {"oneOf": [
+          {"type": "integer", "minimum": 0, "maximum": 31},
+          {"type": "integer", "minimum": 36, "maximum": 42},
+          {"const": 126}
+        ]},
+        "azimuth_degrees": {"type": "integer", "minimum": -180, "maximum": 180},
+        "elevation_degrees": {"type": "integer", "minimum": -90, "maximum": 90}
+      }
+    },
+    "decoder": {"type": "object", "additionalProperties": false, "required": ["name", "version"], "properties": {"name": {"type": "string", "minLength": 1, "maxLength": 128}, "version": {"type": "string", "minLength": 1, "maxLength": 128}}},
+    "profile": {"enum": ["core", "es", "96-24", "high-resolution", "master-audio", "express"]},
+    "policy": {"enum": ["disabled", "applied", "not-supported"]},
+    "component": {"enum": ["core", "xch", "xxch", "x96", "xbr", "lbr", "xll"]},
+    "asset": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "extension_substream_index", "asset_index", "language", "channels", "maximum_sample_rate_hz", "pcm_resolution_bits", "coding_components", "dialog_normalization_db"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"},
+        "extension_substream_index": {"type": ["integer", "null"], "minimum": 0, "maximum": 3},
+        "asset_index": {"type": "integer", "minimum": 0, "maximum": 7},
+        "language": {"type": ["string", "null"], "maxLength": 35},
+        "channels": {"type": "integer", "minimum": 1, "maximum": 256},
+        "maximum_sample_rate_hz": {"type": "integer", "minimum": 8000, "maximum": 384000},
+        "pcm_resolution_bits": {"type": "integer", "minimum": 1, "maximum": 32},
+        "coding_components": {"type": "array", "minItems": 1, "maxItems": 7, "uniqueItems": true, "items": {"$ref": "#/$defs/component"}},
+        "dialog_normalization_db": {"type": ["number", "null"], "minimum": -31, "maximum": 0}
+      }
+    },
+    "inventory": {
+      "type": "object", "additionalProperties": false,
+      "required": ["stream_bytes", "frame_count", "core_frame_count", "extension_substream_count", "padding_bytes", "core_sample_blocks", "wire_formats", "core_configurations", "extension_substreams", "declared_presentation_count", "declared_asset_count"],
+      "properties": {
+        "stream_bytes": {"type": "integer", "minimum": 1}, "frame_count": {"type": "integer", "minimum": 1, "maximum": 1000000},
+        "core_frame_count": {"type": "integer", "minimum": 0}, "extension_substream_count": {"type": "integer", "minimum": 0},
+        "padding_bytes": {"type": "integer", "minimum": 0}, "core_sample_blocks": {"type": "integer", "minimum": 0},
+        "wire_formats": {"type": "array", "maxItems": 4, "items": {"$ref": "#/$defs/wire_format"}},
+        "core_configurations": {"type": "array", "maxItems": 1000000, "items": {"$ref": "#/$defs/core_configuration"}},
+        "extension_substreams": {"type": "array", "maxItems": 4, "items": {"$ref": "#/$defs/exss"}},
+        "declared_presentation_count": {"type": "integer", "minimum": 1, "maximum": 8}, "declared_asset_count": {"type": "integer", "minimum": 1, "maximum": 32}
+      }
+    },
+    "wire_format": {"type": "object", "additionalProperties": false, "required": ["format", "count"], "properties": {"format": {"enum": ["sixteen-bit-big-endian", "sixteen-bit-little-endian", "fourteen-bit-big-endian", "fourteen-bit-little-endian"]}, "count": {"type": "integer", "minimum": 1}}},
+    "core_configuration": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sample_rate_hz", "sample_blocks", "audio_mode", "channels", "lfe_mode", "bit_rate_code", "bit_rate_bps", "pcm_resolution_bits", "extension_audio_present", "extension_audio_type", "extension_audio_name", "dialog_normalization_code", "count"],
+      "properties": {
+        "sample_rate_hz": {"type": "integer", "minimum": 8000, "maximum": 192000}, "sample_blocks": {"type": "integer", "minimum": 8, "maximum": 128, "multipleOf": 8},
+        "audio_mode": {"type": "integer", "minimum": 0, "maximum": 15}, "channels": {"type": "integer", "minimum": 1, "maximum": 9}, "lfe_mode": {"type": "integer", "minimum": 0, "maximum": 2},
+        "bit_rate_code": {"type": "integer", "minimum": 0, "maximum": 31}, "bit_rate_bps": {"type": ["integer", "null"], "minimum": 1}, "pcm_resolution_bits": {"enum": [16, 20, 24]},
+        "extension_audio_present": {"type": "boolean"}, "extension_audio_type": {"type": "integer", "minimum": 0, "maximum": 7}, "extension_audio_name": {"type": "string", "minLength": 1},
+        "dialog_normalization_code": {"type": ["integer", "null"], "minimum": 0, "maximum": 15}, "count": {"type": "integer", "minimum": 1}
+      }
+    },
+    "exss": {"type": "object", "additionalProperties": false, "required": ["index", "count", "static_header_count", "maximum_presentations", "maximum_assets"], "properties": {"index": {"type": "integer", "minimum": 0, "maximum": 3}, "count": {"type": "integer", "minimum": 1}, "static_header_count": {"type": "integer", "minimum": 0}, "maximum_presentations": {"type": "integer", "minimum": 0, "maximum": 8}, "maximum_assets": {"type": "integer", "minimum": 0, "maximum": 8}}},
+    "result": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "asset_ids", "output_layout", "channel_layout", "language", "accessibility", "declared_sample_rate_hz", "declared_channels", "rendered_sha256", "rendered_bytes", "sample_rate_hz", "channels", "duration_seconds", "measured_integrated_lufs", "measured_true_peak_dbtp", "sample_rate_passed", "channels_passed", "true_peak_passed", "passed", "checks"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"}, "asset_ids": {"type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"}},
+        "output_layout": {"type": "string", "minLength": 1, "maxLength": 64},
+        "channel_layout": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["version", "assignments", "provenance", "origin", "renderer"],
+          "properties": {
+            "version": {"const": 1},
+            "assignments": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1024,
+          "items": {"$ref": "#/$defs/channel_assignment"}
+            },
+            "provenance": {"const": "known-speakers"},
+            "origin": {"const": "renderer"},
+            "renderer": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["renderer", "version", "output_configuration", "executable_sha256", "settings_sha256"],
+              "properties": {
+                "renderer": {"type": "string", "minLength": 1, "maxLength": 256},
+                "version": {"type": "string", "minLength": 1, "maxLength": 256},
+                "output_configuration": {"type": "string", "minLength": 1, "maxLength": 1024},
+                "executable_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "settings_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              }
+            }
+          }
+        }, "language": {"type": ["string", "null"], "maxLength": 35}, "accessibility": {"type": ["string", "null"], "maxLength": 64},
+        "declared_sample_rate_hz": {"type": "integer", "minimum": 8000, "maximum": 384000}, "declared_channels": {"type": "integer", "minimum": 1, "maximum": 256},
+        "rendered_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "rendered_bytes": {"type": "integer", "minimum": 1}, "sample_rate_hz": {"type": "integer", "minimum": 1}, "channels": {"type": "integer", "minimum": 1},
+        "duration_seconds": {"type": "number", "exclusiveMinimum": 0}, "measured_integrated_lufs": {"type": "number"}, "measured_true_peak_dbtp": {"type": "number"},
+        "sample_rate_passed": {"type": "boolean"}, "channels_passed": {"type": "boolean"}, "true_peak_passed": {"type": ["boolean", "null"]}, "passed": {"type": "boolean"},
+        "checks": {"type": "array", "minItems": 2, "maxItems": 3, "items": {"$ref": "#/$defs/check"}}
+      }
+    },
+    "check": {
+      "type": "object", "additionalProperties": false,
+      "required": ["rule_id", "standard", "measured", "expected", "comparison", "unit", "passed"],
+      "properties": {
+        "rule_id": {"enum": ["FORGE-DTS-RENDER-SAMPLE-RATE", "FORGE-DTS-RENDER-CHANNELS", "FORGE-DTS-TRUE-PEAK"]}, "standard": {"type": "string", "minLength": 1},
+        "measured": {"type": "number"}, "expected": {"type": "number"}, "comparison": {"enum": ["equal", "less-than-or-equal"]}, "unit": {"enum": ["Hz", "channels", "dBTP"]}, "passed": {"type": "boolean"}
+      }
+    }
+  }
+}

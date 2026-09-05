@@ -8,6 +8,46 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.189.9 - 2026-09-05
+
+### Added
+
+- Add a versioned exact channel-layout descriptor across Rust, C, Python,
+  WebAssembly, REST v3, and the additive gRPC `ForgeAnalysisV3` service. It
+  retains per-plane speaker/CICP geometry, explicit overrides, source evidence,
+  and renderer bindings while leaving the original gRPC messages unchanged.
+- Parse selected-track ISO-BMFF `chnl` and related `dmix` evidence, and bind
+  AC-4, MPEG-H, and DTS presentation measurements to the exact renderer
+  executable, settings response, and output configuration.
+- Publish channel-layout schema v1, analysis-cache schema v5, catalogue report
+  v3, service analysis v3, and renderer-adapter report v2 schemas.
+
+### Changed
+
+- Reduce normal `f32` streaming-analysis work by fusing finite-sample
+  validation with the per-channel peak reduction reused by True Peak pruning,
+  without changing measurement or normalized output bytes.
+- Preserve non-default and partial RFC 9639 channel masks through native FLAC
+  and WAVE decode, normalization, output, and re-verification instead of
+  reducing them to conventional role labels.
+- Include the declared and effective exact layout in descriptor-bound request
+  identities, cache addresses, and catalogue evidence. Historical report and
+  cache schemas remain immutable.
+
+### Fixed
+
+- Apply BS.1770-5 Annex 3 positional weighting from exact speaker geometry and
+  exclude LFE while failing closed for unknown or scene-based layouts.
+- Preserve the constructible AC-4, MPEG-H, and DTS adapter report v1 Rust APIs
+  while their CLIs opt in to additive v2 reports carrying exact channel-layout
+  evidence.
+- Allow otherwise valid non-canonical WAVE/FLAC speaker masks through output
+  preflight when the selected writer can preserve their exact plane order.
+- Package the complete public documentation, protocol, and versioned JSON
+  schema sets in every native release archive; keep text bytes stable across
+  operating systems and verify committed bytes plus EBU checksums before
+  creating each archive.
+
 ## 0.189.8 - 2026-09-05
 
 ### Added

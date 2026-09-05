@@ -5,6 +5,7 @@
 //! never cross the boundary. See `C-API.md` and `include/forge_normalizer.h`
 //! for the public contract.
 
+use crate::channel_layout::ChannelLayoutDescriptor;
 use crate::realtime::{RealtimeGainConfig, RealtimeGainProcessor};
 use crate::{decoder, normalize};
 use std::ffi::CStr;
@@ -192,18 +193,8 @@ pub unsafe extern "C" fn forge_normalizer_analyze_file_v1(
     };
 
     let input_path = Path::new(path);
-    let analysis = decoder::decode_limited_with_layout(input_path, max_decoded_samples)
-        .and_then(|(mut audio, layout_provenance)| {
-            audio.channel_roles = normalize::resolve_decoded_channel_roles(
-                input_path,
-                audio.channels,
-                &audio.channel_roles,
-                layout_provenance,
-                None,
-            )?;
-            validate_finite_audio(&audio)?;
-            Ok(normalize::analyze(&audio))
-        })
+    let analysis = analyze_path_with_layout(input_path, max_decoded_samples, None)
+        .map(|(analysis, _)| analysis)
         .and_then(ForgeAnalysisV1::try_from);
     match analysis {
         Ok(analysis) => {
@@ -218,6 +209,189 @@ pub unsafe extern "C" fn forge_normalizer_analyze_file_v1(
             ForgeStatus::AnalysisFailed
         }
     }
+}
+
+/// Analyze one file with an optional exact speaker-layout override and return
+/// the effective descriptor as NUL-terminated UTF-8 JSON.
+///
+/// A null `channel_layout_json` selects container/decoder evidence. When the
+/// output layout buffer is too small, `layout_required` receives the required
+/// capacity including the terminator and the function returns
+/// [`ForgeStatus::BufferTooSmall`].
+///
+/// # Safety
+///
+/// This has the pointer requirements of [`forge_normalizer_analyze_file_v1`].
+/// In addition, a non-null `channel_layout_json` must be NUL-terminated,
+/// `layout_required` must be writable, and a non-null `layout_buffer` must be
+/// writable for `layout_capacity` bytes. All buffers must not overlap.
+#[no_mangle]
+pub unsafe extern "C" fn forge_normalizer_analyze_file_with_layout_v1(
+    path_utf8: *const c_char,
+    max_decoded_samples: u64,
+    channel_layout_json: *const c_char,
+    result: *mut ForgeAnalysisV1,
+    result_size: usize,
+    layout_buffer: *mut c_char,
+    layout_capacity: usize,
+    layout_required: *mut usize,
+    error_buffer: *mut c_char,
+    error_capacity: usize,
+) -> ForgeStatus {
+    // SAFETY: the caller owns the optional error buffer.
+    unsafe { write_error("", error_buffer, error_capacity) };
+    if path_utf8.is_null() || result.is_null() || layout_required.is_null() {
+        // SAFETY: same caller-owned error buffer contract as above.
+        unsafe { write_error("a required pointer is null", error_buffer, error_capacity) };
+        return ForgeStatus::NullPointer;
+    }
+    // SAFETY: `layout_required` is required to point to writable storage.
+    unsafe { layout_required.write(0) };
+    if result_size < ANALYSIS_V1_SIZE {
+        // SAFETY: same caller-owned error buffer contract as above.
+        unsafe {
+            write_error(
+                "ForgeAnalysisV1 output buffer is too small",
+                error_buffer,
+                error_capacity,
+            )
+        };
+        return ForgeStatus::BufferTooSmall;
+    }
+    if max_decoded_samples == 0 || (layout_buffer.is_null() && layout_capacity != 0) {
+        // SAFETY: same caller-owned error buffer contract as above.
+        unsafe {
+            write_error(
+                "invalid analysis buffer or limit",
+                error_buffer,
+                error_capacity,
+            )
+        };
+        return ForgeStatus::InvalidArgument;
+    }
+
+    // SAFETY: the caller promises readable NUL-terminated UTF-8 strings.
+    let path = match unsafe { CStr::from_ptr(path_utf8) }.to_str() {
+        Ok(value) => value,
+        Err(_) => {
+            // SAFETY: same caller-owned error buffer contract as above.
+            unsafe { write_error("path_utf8 is not valid UTF-8", error_buffer, error_capacity) };
+            return ForgeStatus::InvalidUtf8;
+        }
+    };
+    let override_layout = if channel_layout_json.is_null() {
+        None
+    } else {
+        // SAFETY: the caller promises a readable NUL-terminated string.
+        let json = match unsafe { CStr::from_ptr(channel_layout_json) }.to_str() {
+            Ok(value) => value,
+            Err(_) => {
+                // SAFETY: same caller-owned error buffer contract as above.
+                unsafe {
+                    write_error(
+                        "channel_layout_json is not valid UTF-8",
+                        error_buffer,
+                        error_capacity,
+                    )
+                };
+                return ForgeStatus::InvalidUtf8;
+            }
+        };
+        match ChannelLayoutDescriptor::from_json(json) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                // SAFETY: same caller-owned error buffer contract as above.
+                unsafe { write_error(&error, error_buffer, error_capacity) };
+                return ForgeStatus::InvalidArgument;
+            }
+        }
+    };
+
+    let (analysis, layout) = match analyze_path_with_layout(
+        Path::new(path),
+        max_decoded_samples,
+        override_layout.as_ref(),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            // SAFETY: same caller-owned error buffer contract as above.
+            unsafe { write_error(&error, error_buffer, error_capacity) };
+            return ForgeStatus::AnalysisFailed;
+        }
+    };
+    let analysis = match ForgeAnalysisV1::try_from(analysis) {
+        Ok(value) => value,
+        Err(error) => {
+            // SAFETY: same caller-owned error buffer contract as above.
+            unsafe { write_error(&error, error_buffer, error_capacity) };
+            return ForgeStatus::AnalysisFailed;
+        }
+    };
+    let layout_json = match layout.to_json() {
+        Ok(value) => value,
+        Err(error) => {
+            // SAFETY: same caller-owned error buffer contract as above.
+            unsafe { write_error(&error, error_buffer, error_capacity) };
+            return ForgeStatus::AnalysisFailed;
+        }
+    };
+    let required = match layout_json.len().checked_add(1) {
+        Some(value) => value,
+        None => {
+            // SAFETY: same caller-owned error buffer contract as above.
+            unsafe { write_error("layout output size overflow", error_buffer, error_capacity) };
+            return ForgeStatus::AnalysisFailed;
+        }
+    };
+    // SAFETY: checked writable result pointers are supplied by the caller.
+    unsafe {
+        result.write(analysis);
+        layout_required.write(required);
+    }
+    if layout_buffer.is_null() || layout_capacity < required {
+        // SAFETY: same caller-owned error buffer contract as above.
+        unsafe {
+            write_error(
+                "channel-layout output buffer is too small",
+                error_buffer,
+                error_capacity,
+            )
+        };
+        return ForgeStatus::BufferTooSmall;
+    }
+    // SAFETY: capacity was checked for the bytes plus one terminator.
+    unsafe {
+        ptr::copy_nonoverlapping(
+            layout_json.as_ptr(),
+            layout_buffer.cast::<u8>(),
+            layout_json.len(),
+        );
+        layout_buffer.add(layout_json.len()).write(0);
+    }
+    ForgeStatus::Ok
+}
+
+fn analyze_path_with_layout(
+    path: &Path,
+    max_decoded_samples: u64,
+    override_layout: Option<&ChannelLayoutDescriptor>,
+) -> Result<(normalize::Analysis, ChannelLayoutDescriptor), String> {
+    let (mut audio, decoded_layout) =
+        decoder::decode_limited_with_channel_layout(path, max_decoded_samples)?;
+    let effective_layout = override_layout.cloned().unwrap_or(decoded_layout);
+    if override_layout.is_some() {
+        effective_layout.validate_override_for_channels(audio.channels)?;
+    }
+    let override_roles = override_layout.map(ChannelLayoutDescriptor::channel_roles);
+    audio.channel_roles = normalize::resolve_decoded_channel_roles(
+        path,
+        audio.channels,
+        &audio.channel_roles,
+        effective_layout.provenance(),
+        override_roles.as_deref(),
+    )?;
+    validate_finite_audio(&audio)?;
+    Ok((normalize::analyze(&audio), effective_layout))
 }
 
 fn validate_finite_audio(audio: &crate::wav::AudioBuffer) -> Result<(), String> {

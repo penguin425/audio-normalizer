@@ -94,6 +94,10 @@ cp "$response" '{captured_response}'
         .unwrap();
     let instance: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
     assert!(output.status.success(), "{output:#?}\n{instance:#}");
+    assert_eq!(
+        instance["schema"],
+        "https://penguin425.github.io/audio-normalizer/schema/mpegh-adapter-report-v2"
+    );
     assert_eq!(instance["passed"], true);
     assert_eq!(instance["presentation_count"], 2);
     assert_eq!(instance["profile_level"]["profile"], "low-complexity");
@@ -101,6 +105,21 @@ cp "$response" '{captured_response}'
     assert_eq!(instance["mhas_inventory"]["packet_count"], 6);
     assert_eq!(instance["mhas_inventory"]["audio_scene_info_count"], 1);
     assert_eq!(instance["scene"]["presets"][0]["id"], 7);
+    assert_eq!(
+        instance["presentations"][0]["channel_layout"]["origin"],
+        "renderer"
+    );
+    assert_eq!(
+        instance["presentations"][0]["channel_layout"]["renderer"]["executable_sha256"],
+        instance["adapter_sha256"]
+    );
+    assert_eq!(
+        instance["presentations"][0]["channel_layout"]["renderer"]["settings_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
     assert_eq!(instance["presentations"][0]["loudness_passed"], true);
     assert_eq!(instance["presentations"][1]["loudness_passed"], true);
     assert_eq!(
@@ -127,8 +146,38 @@ cp "$response" '{captured_response}'
     );
     validate_schema(
         &instance,
+        include_str!("../schema/mpegh-adapter-report-v2.schema.json"),
+    );
+
+    let legacy =
+        forge_normalizer::mpegh_adapter::run(&forge_normalizer::mpegh_adapter::AdapterOptions {
+            input,
+            adapter,
+            timeout_seconds: 300,
+            max_decoded_samples_per_presentation: 50_000_000,
+            loudness_tolerance_lu: 0.2,
+            max_true_peak_dbtp: None,
+        })
+        .unwrap();
+    assert_eq!(
+        legacy.schema,
+        forge_normalizer::mpegh_adapter::REPORT_SCHEMA
+    );
+    let legacy_value = serde_json::to_value(legacy).unwrap();
+    validate_schema(
+        &legacy_value,
         include_str!("../schema/mpegh-adapter-report-v1.schema.json"),
     );
+    let mut expected_legacy = instance;
+    expected_legacy["schema"] =
+        Value::String(forge_normalizer::mpegh_adapter::REPORT_SCHEMA.into());
+    for presentation in expected_legacy["presentations"].as_array_mut().unwrap() {
+        presentation
+            .as_object_mut()
+            .unwrap()
+            .remove("channel_layout");
+    }
+    assert_eq!(legacy_value, expected_legacy);
 }
 
 #[cfg(unix)]
