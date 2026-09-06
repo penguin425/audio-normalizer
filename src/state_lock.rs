@@ -21,6 +21,16 @@ pub(crate) struct StateFileLock {
     file: File,
 }
 
+impl Drop for StateFileLock {
+    fn drop(&mut self) {
+        // A concurrently forked helper can briefly retain a close-on-exec
+        // duplicate of this descriptor until it reaches exec.  Explicitly
+        // release the lock from the owning process so dropping and reopening
+        // state does not depend on that transient descriptor being closed.
+        let _ = self.file.unlock();
+    }
+}
+
 impl StateFileLock {
     pub(crate) fn acquire(state_path: &Path, description: &str) -> Result<Self, String> {
         let lock_path = sibling_lock_path(state_path)?;

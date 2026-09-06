@@ -4,10 +4,18 @@ use crate::container_qc::ContainerAudit;
 use crate::normalize::{self, Analysis, DialogueMeasurement};
 use serde::Serialize;
 use serde_json::Value;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::Duration;
+
+use crate::subprocess::{run, EnvPolicy, MonitoredDirectory, OutputMode, ProcessSpec, StdinMode};
 
 pub const PROBE_SCHEMA: &str = "ffprobe-json-v1";
+const FFPROBE_TIMEOUT: Duration = Duration::from_secs(60);
+const FFPROBE_STDOUT_MAX_BYTES: usize = 16 * 1024 * 1024;
+const FFPROBE_STDERR_MAX_BYTES: usize = 1024 * 1024;
+const FFPROBE_WORKSPACE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const FFPROBE_WORKSPACE_MAX_ENTRIES: u64 = 32;
 
 #[derive(Debug, Clone)]
 pub struct CodecProbe {
@@ -222,37 +230,59 @@ pub fn probe_and_evaluate(
 }
 
 pub fn probe(input: &Path, command: &Path) -> Result<CodecProbe, String> {
-    let output = Command::new(command)
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_streams",
-            "-show_format",
-            "-show_frames",
-            "-read_intervals",
-            "%+#1",
-            "-of",
-            "json",
-        ])
-        .arg(input)
-        .output()
-        .map_err(|error| {
-            format!(
-                "run codec metadata prober {}: {error}; install ffprobe or pass --codec-prober PATH",
-                command.display()
-            )
-        })?;
-    if !output.status.success() {
+    let input = fs::canonicalize(input)
+        .map_err(|error| format!("resolve codec metadata input {}: {error}", input.display()))?;
+    let work = tempfile::Builder::new()
+        .prefix("forge-codec-probe-")
+        .tempdir()
+        .map_err(|error| format!("create codec metadata workspace: {error}"))?;
+    let mut spec = ProcessSpec::new(command).map_err(|error| {
+        format!(
+            "run codec metadata prober {}: {error}; install ffprobe or pass --codec-prober PATH",
+            command.display()
+        )
+    })?;
+    spec.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_streams",
+        "-show_format",
+        "-show_frames",
+        "-read_intervals",
+        "%+#1",
+        "-of",
+        "json",
+    ])
+    .arg(&input)
+    .env_policy(EnvPolicy::Minimal)
+    .stdin(StdinMode::Null)
+    .stdout(OutputMode::capture(FFPROBE_STDOUT_MAX_BYTES))
+    .stderr(OutputMode::capture(FFPROBE_STDERR_MAX_BYTES))
+    .timeout(FFPROBE_TIMEOUT)
+    .current_dir(work.path().to_path_buf())
+    .monitor_directory(MonitoredDirectory::new(
+        work.path().to_path_buf(),
+        FFPROBE_WORKSPACE_MAX_BYTES,
+        FFPROBE_WORKSPACE_MAX_ENTRIES,
+        "ffprobe workspace",
+    ));
+    let output = run(spec).map_err(|error| {
+        format!(
+            "run codec metadata prober {}: {error}; install ffprobe or pass --codec-prober PATH",
+            command.display()
+        )
+    })?;
+    if !output.success() {
         return Err(format!(
             "codec metadata prober {} failed for {}: {}",
             command.display(),
             input.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            String::from_utf8_lossy(output.stderr()).trim()
         ));
     }
-    let value: Value = serde_json::from_slice(&output.stdout)
+    let value: Value = serde_json::from_slice(output.stdout())
         .map_err(|error| format!("parse codec metadata prober JSON: {error}"))?;
     parse_probe(command, &value)
 }

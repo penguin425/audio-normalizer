@@ -119,6 +119,7 @@ pub mod service_metrics;
 mod service_runtime;
 pub mod stable_input;
 mod state_lock;
+pub(crate) mod subprocess;
 pub mod watch;
 pub mod wav;
 mod wavpack_qc;

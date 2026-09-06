@@ -204,6 +204,8 @@ on:
       - "tools/check-release-content.py"
       - "tools/check-schema-registry.py"
       - "tools/test_schema_registry.py"
+      - "tools/check-subprocess-boundary.py"
+      - "tools/test_subprocess_boundary.py"
       - "tools/generate-package-metadata.sh"
       - "tools/check-release-readiness.sh"
       # Rust source, dependency, and build-script changes intentionally run the

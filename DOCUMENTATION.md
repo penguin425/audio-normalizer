@@ -76,6 +76,71 @@ The release contains the main `forge` normalizer plus focused binaries:
 Some binaries require the Cargo features listed in [`Cargo.toml`](Cargo.toml).
 Use `<command> --help` for its inputs, limits, output schemas, and exit codes.
 
+### Service transport and authentication
+
+`forge-service` accepts plaintext traffic only on a loopback listener by
+default. A non-loopback REST or gRPC listener requires both a bearer token and
+an explicitly declared TLS-terminating proxy. Each `--trusted-proxy-ip IP`
+value is matched against the TCP peer address exactly (with IPv4-mapped IPv6
+normalized), and every admitted request must contain exactly one
+`x-forwarded-proto: https` header. The proxy must remove any client-supplied
+copy of that header and inject its own value after completing TLS; forwarding
+an untrusted value defeats the deployment boundary.
+
+The legacy token in `FORGE_SERVICE_BEARER_TOKEN` grants all endpoints for
+compatibility. Repeatable `--auth-scoped-token-env SCOPES=ENV` options load
+digest-only tokens with any combination of `analyze`, `cancel`, `health`, and
+`metrics`. REST analysis routes use `analyze`, health/readiness use `health`,
+and `/metrics` uses `metrics`; gRPC Analyze, Health, Metrics, and Cancel use
+`analyze`, `health`, `metrics`, and `cancel`, respectively. A cancel token can
+cancel any currently active request ID, so issue that scope only to trusted
+operators. For example:
+
+```sh
+export FORGE_ANALYZE_TOKEN='replace-with-a-high-entropy-secret'
+forge-service \
+  --bind 0.0.0.0:8080 \
+  --trusted-proxy-ip 10.0.0.10 \
+  --auth-scoped-token-env analyze=FORGE_ANALYZE_TOKEN
+```
+
+Forge does not yet terminate TLS itself and does not claim mTLS or OIDC
+support. Do not expose the listener directly to an untrusted network; bind it
+on a private path reachable only by the declared proxy.
+
+The existing library entry points without a `ServiceSecurity` argument remain
+available for source compatibility, but they now fail closed for every
+non-loopback listener even when `ServiceConfig::bearer_token` is set. Library
+callers that intentionally deploy behind a terminating proxy must construct a
+`ServiceSecurity`, call `validate_for_config`, and use the corresponding
+`run_with_security*` or `serve_with_security*` REST/gRPC entry point. The
+legacy `bearer_token`, when present, is merged as an all-scope token and is
+then discarded from the long-lived runtime configuration.
+
+```rust
+use forge_normalizer::service::{
+    self, ScopedServiceToken, ServiceConfig, ServiceScope, ServiceSecurity,
+};
+
+let config = ServiceConfig {
+    bind: "0.0.0.0:8080".parse().expect("valid bind address"),
+    ..ServiceConfig::default()
+};
+let token = ScopedServiceToken::new(
+    std::env::var("FORGE_ANALYZE_TOKEN").expect("token environment variable"),
+    [ServiceScope::Analyze],
+)
+.expect("valid scoped token");
+let security = ServiceSecurity::new()
+    .with_trusted_proxy_ip("10.0.0.10".parse().expect("valid proxy IP"))
+    .with_token(token)
+    .expect("valid security policy");
+security
+    .validate_for_config(&config)
+    .expect("valid service boundary");
+service::run_with_security(config, security).expect("service failed");
+```
+
 ### Service resource controls
 
 `forge-service` requires fixed `Content-Length` framing for REST analysis and
@@ -180,6 +245,38 @@ best-effort write grace; temporary-spool IO failures retain the existing v1
 Existing errors retain `service-error-v1`; newly introduced resource-limit,
 quota, and cancellation failures identify the additive `service-error-v2`
 contract.
+
+### External process boundary
+
+Runtime FFmpeg/ffprobe operations, ADM renderers, AC-4/DTS/MPEG-H adapters,
+provenance verification, and capability probes share one subprocess broker.
+It resolves and hashes a canonical executable before launch, rechecks that
+identity at launch, applies an explicit minimal environment, closes or bounds
+each standard stream, enforces a finite wall-clock deadline, and reaps the
+leader plus ordinary descendants on timeout, cancellation, output overflow,
+I/O failure, normal completion, or caller drop. Unix uses a dedicated process
+group and Windows uses a kill-on-close Job Object; failure to establish the
+platform containment primitive fails the launch.
+
+The broker runs explicitly selected, trusted tools; it is not an OS sandbox.
+It does not yet provide filesystem/syscall isolation, network denial, or
+privilege dropping. Deploy third-party renderers with ordinary host-level
+filesystem quotas and isolation, and treat the later strict sandbox profile as
+a separate security control.
+
+The minimal child environment contains only a fixed system `PATH` and locale
+on Unix, or the Windows system root and system directories; user `PATH`, loader,
+language-runtime, temporary-directory, licence, and vendor variables are not
+inherited. Select helpers by an explicit executable path and pass configuration
+as explicit arguments. A native self-contained launcher is required when a
+vendor runtime cannot operate under that contract. On supported Unix systems,
+Forge executes the opened executable through `/proc/self/fd` or `/dev/fd` to
+bind pathname replacement. Consequently a shebang script observes an fd path
+as `$0`/`argv[0]`; scripts that locate sibling resources through their own path
+are unsupported. The executable check is not an immutability or sandbox
+guarantee against a hostile same-user writer, a separately replaced script
+interpreter, a double-forked daemon, or adversarial renaming of monitored
+directories; use OS isolation for those threat models.
 
 `forge-report ebu-qc-validate` validates EBU QC 2026-04 report structure and
 cross-element semantics; it uses Scenario 1 constraints by default and accepts

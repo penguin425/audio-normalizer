@@ -2,15 +2,19 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::subprocess::{
+    run, CompletedProcess, EnvPolicy, Error as ProcessError, ExecutableIdentity,
+    MonitoredDirectory, OutputMode, ProcessSpec, StdinMode,
+};
 
 pub const PROVENANCE_QC_SCHEMA: &str =
     "https://penguin425.github.io/audio-normalizer/schema/provenance-qc-v1";
+const PROVENANCE_WORKSPACE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const PROVENANCE_WORKSPACE_MAX_ENTRIES: u64 = 32;
 const DEFAULT_MAX_REPORT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,14 +83,10 @@ pub struct VerifierEvidence {
     pub external_manifest: bool,
 }
 
-struct ToolOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
 pub fn audit(path: &Path, options: &ProvenanceOptions) -> Result<ProvenanceAudit, String> {
-    if !path.is_file() {
+    let input_path = std::fs::canonicalize(path)
+        .map_err(|error| format!("resolve provenance input {}: {error}", path.display()))?;
+    if !input_path.is_file() {
         return Err(format!("{} is not a regular file", path.display()));
     }
     if options.max_report_bytes == 0 {
@@ -96,15 +96,28 @@ pub fn audit(path: &Path, options: &ProvenanceOptions) -> Result<ProvenanceAudit
         return Err("timeout must be greater than zero".into());
     }
 
-    let version_output = run_bounded(&options.c2pa_tool, &["-V".into()], options.timeout, 4096)?;
-    if !version_output.status.success() {
+    let tool_identity = ProcessSpec::new(&options.c2pa_tool)
+        .map_err(|error| format!("start {}: {error}", options.c2pa_tool.display()))?;
+    let work = tempfile::Builder::new()
+        .prefix("forge-provenance-")
+        .tempdir()
+        .map_err(|error| format!("create provenance workspace: {error}"))?;
+    let version_output = run_tool(
+        tool_identity.executable(),
+        &options.c2pa_tool,
+        &["-V".into()],
+        options.timeout,
+        4096,
+        work.path(),
+    )?;
+    if !version_output.success() {
         return Err(format!(
             "{} -V failed: {}",
             options.c2pa_tool.display(),
-            display_stderr(&version_output.stderr)
+            display_stderr(version_output.stderr())
         ));
     }
-    let version = String::from_utf8(version_output.stdout)
+    let version = String::from_utf8(version_output.stdout().to_vec())
         .map_err(|_| "c2patool version output is not UTF-8".to_string())?
         .trim()
         .to_string();
@@ -112,8 +125,11 @@ pub fn audit(path: &Path, options: &ProvenanceOptions) -> Result<ProvenanceAudit
         return Err("c2patool returned an empty version".into());
     }
 
-    let mut args = vec![path.as_os_str().to_owned()];
+    let mut args = vec![input_path.as_os_str().to_owned()];
     if let Some(external) = &options.external_manifest {
+        let external = std::fs::canonicalize(external).map_err(|error| {
+            format!("resolve external manifest {}: {error}", external.display())
+        })?;
         args.push("--external-manifest".into());
         args.push(external.as_os_str().to_owned());
     }
@@ -124,28 +140,44 @@ pub fn audit(path: &Path, options: &ProvenanceOptions) -> Result<ProvenanceAudit
         args.push("trust".into());
         if let Some(value) = &options.trust_anchors {
             args.push("--trust_anchors".into());
-            args.push(value.into());
+            args.push(resolve_trust_location(value, "trust anchors")?);
         }
         if let Some(value) = &options.allowed_list {
             args.push("--allowed_list".into());
-            args.push(value.into());
+            args.push(resolve_trust_location(value, "allowed list")?);
         }
         if let Some(value) = &options.trust_config {
             args.push("--trust_config".into());
-            args.push(value.into());
+            args.push(resolve_trust_location(value, "trust configuration")?);
         }
     }
-    let output = run_bounded(
+    let output = run_tool(
+        tool_identity.executable(),
         &options.c2pa_tool,
         &args,
         options.timeout,
         options.max_report_bytes,
+        work.path(),
     )?;
-    if output.stdout.is_empty() {
-        let stderr = display_stderr(&output.stderr);
+    if output.stdout().is_empty() {
+        let stderr = display_stderr(output.stderr());
         if stderr.to_ascii_lowercase().contains("no claim found") {
             return Ok(missing_manifest(path, options, version));
         }
+    }
+    // c2patool reports a missing claim as a non-zero, empty-stdout result.
+    // Handle that explicit sentinel above, but never accept a non-zero result
+    // merely because it also happened to contain parseable JSON.
+    if !output.success() {
+        return Err(format!(
+            "{} audit failed ({}): {}",
+            options.c2pa_tool.display(),
+            output.status(),
+            display_stderr(output.stderr())
+        ));
+    }
+    if output.stdout().is_empty() {
+        let stderr = display_stderr(output.stderr());
         return Err(format!(
             "{} produced no JSON report{}",
             options.c2pa_tool.display(),
@@ -156,14 +188,39 @@ pub fn audit(path: &Path, options: &ProvenanceOptions) -> Result<ProvenanceAudit
             }
         ));
     }
-    let report: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+    let report: Value = serde_json::from_slice(output.stdout()).map_err(|error| {
         format!(
             "parse c2patool JSON (exit {}): {error}; stderr: {}",
-            output.status,
-            display_stderr(&output.stderr)
+            output.status(),
+            display_stderr(output.stderr())
         )
     })?;
     Ok(evaluate_report(path, options, version, report))
+}
+
+fn resolve_trust_location(value: &str, label: &str) -> Result<OsString, String> {
+    // c2patool accepts remote trust-list URLs as well as local paths. Remote
+    // locations are independent of the helper cwd; bind local locations to
+    // the caller's cwd before the helper enters its private workspace.
+    if value
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        || value
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
+        return Ok(value.into());
+    }
+    let path = Path::new(value);
+    let resolved = std::fs::canonicalize(path)
+        .map_err(|error| format!("resolve {label} {}: {error}", path.display()))?;
+    if !resolved.is_file() {
+        return Err(format!(
+            "{label} is not a regular file: {}",
+            resolved.display()
+        ));
+    }
+    Ok(resolved.into_os_string())
 }
 
 fn evaluate_report(
@@ -265,92 +322,41 @@ fn verifier(options: &ProvenanceOptions, version: String) -> VerifierEvidence {
     }
 }
 
-fn run_bounded(
+fn run_tool(
+    identity: &ExecutableIdentity,
     executable: &Path,
-    args: &[std::ffi::OsString],
+    args: &[OsString],
     timeout: Duration,
     limit: usize,
-) -> Result<ToolOutput, String> {
-    let mut stdout_file =
-        tempfile::tempfile().map_err(|error| format!("create stdout spool: {error}"))?;
-    let mut stderr_file =
-        tempfile::tempfile().map_err(|error| format!("create stderr spool: {error}"))?;
-    let stdout_child = stdout_file
-        .try_clone()
-        .map_err(|error| format!("clone stdout spool: {error}"))?;
-    let stderr_child = stderr_file
-        .try_clone()
-        .map_err(|error| format!("clone stderr spool: {error}"))?;
-    let mut child = Command::new(executable)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_child))
-        .stderr(Stdio::from(stderr_child))
-        .spawn()
-        .map_err(|error| format!("start {}: {error}", executable.display()))?;
-    let started = Instant::now();
-    let status = loop {
-        let stdout_bytes = stdout_file
-            .metadata()
-            .map_err(|error| format!("stat stdout spool: {error}"))?
-            .len();
-        let stderr_limit = limit.min(1024 * 1024);
-        let stderr_bytes = stderr_file
-            .metadata()
-            .map_err(|error| format!("stat stderr spool: {error}"))?
-            .len();
-        if stdout_bytes > u64::try_from(limit).unwrap_or(u64::MAX)
-            || stderr_bytes > u64::try_from(stderr_limit).unwrap_or(u64::MAX)
-        {
-            child
-                .kill()
-                .map_err(|error| format!("terminate {}: {error}", executable.display()))?;
-            let _ = child.wait();
-            return Err(format!(
-                "{} output exceeded its safety limit",
-                executable.display()
-            ));
+    current_dir: &Path,
+) -> Result<CompletedProcess, String> {
+    let mut spec = ProcessSpec::from_executable(identity.clone());
+    spec.args(args)
+        .env_policy(EnvPolicy::Minimal)
+        .stdin(StdinMode::Null)
+        .stdout(OutputMode::capture(limit))
+        .stderr(OutputMode::capture(limit.min(1024 * 1024)))
+        .timeout(timeout)
+        .current_dir(current_dir.to_path_buf())
+        .monitor_directory(MonitoredDirectory::new(
+            current_dir.to_path_buf(),
+            PROVENANCE_WORKSPACE_MAX_BYTES,
+            PROVENANCE_WORKSPACE_MAX_ENTRIES,
+            "provenance workspace",
+        ));
+    run(spec).map_err(|error| match error {
+        ProcessError::Spawn(error) => format!("start {}: {error}", executable.display()),
+        ProcessError::Wait(error) => format!("wait for {}: {error}", executable.display()),
+        ProcessError::OutputLimit { .. } => {
+            format!("{} output exceeded its safety limit", executable.display())
         }
-        match child
-            .try_wait()
-            .map_err(|error| format!("wait for {}: {error}", executable.display()))?
-        {
-            Some(status) => break status,
-            None if started.elapsed() >= timeout => {
-                child
-                    .kill()
-                    .map_err(|error| format!("terminate {}: {error}", executable.display()))?;
-                let _ = child.wait();
-                return Err(format!(
-                    "{} exceeded the {} second timeout",
-                    executable.display(),
-                    timeout.as_secs_f64()
-                ));
-            }
-            None => thread::sleep(Duration::from_millis(10)),
-        }
-    };
-    let stdout = read_bounded(&mut stdout_file, limit, "stdout")?;
-    let stderr = read_bounded(&mut stderr_file, limit.min(1024 * 1024), "stderr")?;
-    Ok(ToolOutput {
-        status,
-        stdout,
-        stderr,
+        ProcessError::TimedOut => format!(
+            "{} exceeded the {} second timeout",
+            executable.display(),
+            timeout.as_secs_f64()
+        ),
+        error => format!("run {}: {error}", executable.display()),
     })
-}
-
-fn read_bounded(file: &mut File, limit: usize, label: &str) -> Result<Vec<u8>, String> {
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| format!("seek {label} spool: {error}"))?;
-    let take_limit = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
-    let mut bytes = Vec::new();
-    file.take(take_limit)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("read {label} spool: {error}"))?;
-    if bytes.len() > limit {
-        return Err(format!("{label} exceeds the {limit} byte safety limit"));
-    }
-    Ok(bytes)
 }
 
 fn display_stderr(bytes: &[u8]) -> String {
@@ -467,5 +473,18 @@ mod tests {
             }),
         );
         assert!(!invalid.integrity_valid);
+    }
+
+    #[test]
+    fn remote_trust_locations_accept_case_insensitive_http_schemes() {
+        for location in [
+            "HTTPS://example.invalid/anchors",
+            "Http://example.invalid/list",
+        ] {
+            assert_eq!(
+                resolve_trust_location(location, "test").unwrap(),
+                OsString::from(location)
+            );
+        }
     }
 }

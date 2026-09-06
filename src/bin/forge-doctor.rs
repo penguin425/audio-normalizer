@@ -1,8 +1,9 @@
 use clap::Parser;
+use forge_normalizer::adm;
 use serde::Serialize;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::ExitCode;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const SCHEMA_VERSION: &str = "forge-doctor-v1";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -164,66 +165,17 @@ fn runtime_capabilities() -> Vec<RuntimeCapability> {
 }
 
 fn probe_command(id: &'static str, arguments: &[&str]) -> RuntimeCapability {
-    let mut child = match Command::new(id)
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return RuntimeCapability {
-                id,
-                available: false,
-                detail: "command not found on PATH".into(),
-            };
-        }
-        Err(error) => {
-            return RuntimeCapability {
-                id,
-                available: false,
-                detail: format!("could not start command: {error}"),
-            };
-        }
-    };
-
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return RuntimeCapability {
-                    id,
-                    available: status.success(),
-                    detail: if status.success() {
-                        "command completed successfully".into()
-                    } else {
-                        format!("command exited with {status}")
-                    },
-                };
-            }
-            Ok(None) if started.elapsed() < PROBE_TIMEOUT => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return RuntimeCapability {
-                    id,
-                    available: false,
-                    detail: "command did not finish within 2 seconds".into(),
-                };
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return RuntimeCapability {
-                    id,
-                    available: false,
-                    detail: format!("could not query command status: {error}"),
-                };
-            }
-        }
+    match adm::probe_external_command(id, arguments, PROBE_TIMEOUT) {
+        Ok(probe) => RuntimeCapability {
+            id,
+            available: probe.success,
+            detail: probe.detail,
+        },
+        Err(error) => RuntimeCapability {
+            id,
+            available: false,
+            detail: error,
+        },
     }
 }
 
