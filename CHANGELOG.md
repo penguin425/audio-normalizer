@@ -8,7 +8,7 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
-## 0.189.12 - 2026-09-06
+## 0.189.12 - 2026-09-07
 
 ### Added
 
@@ -27,6 +27,8 @@ tags and keeps public compatibility commitments in
   range-bounded readers, encoded packet and metadata limits, and allocation
   checkpoints for Ogg, FLAC, MPEG/ADTS, Matroska, ISO-BMFF, WAVE, DSD, and
   Opus paths.
+- Keep ordinary WAVE/Symphonia decode and loudness-analysis hot loops free of
+  service checkpoint branches through compile-time path specialization.
 
 ### Fixed
 

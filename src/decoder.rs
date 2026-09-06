@@ -251,19 +251,21 @@ where
     checkpoint()
 }
 
-fn run_decoder_checkpoint<C>(
-    plain: &mut Option<C>,
+#[inline(always)]
+fn run_decoder_checkpoint<const CONTROLLED: bool, C>(
     controlled: &Option<Mutex<C>>,
 ) -> Result<(), String>
 where
     C: FnMut() -> Result<(), String>,
 {
-    if let Some(checkpoint) = controlled {
-        run_locked_checkpoint(checkpoint)
+    if CONTROLLED {
+        run_locked_checkpoint(
+            controlled
+                .as_ref()
+                .expect("a controlled decoder owns its checkpoint"),
+        )
     } else {
-        plain
-            .as_mut()
-            .expect("one decoder checkpoint representation is present")()
+        Ok(())
     }
 }
 
@@ -6000,7 +6002,13 @@ pub(crate) fn decode_descriptor_analysis_stream<F>(
 where
     F: FnMut(&StreamInfo, ChannelLayoutProvenance, AnalysisPcmChunk<'_>) -> Result<(), String>,
 {
-    decode_descriptor_analysis_stream_impl(descriptor, None, None, || Ok(()), consume)
+    decode_descriptor_analysis_stream_impl::<false, _, _>(
+        descriptor,
+        None,
+        None,
+        || Ok(()),
+        consume,
+    )
 }
 
 /// Service-only descriptor decode with bounded cooperative checkpoints.
@@ -6018,7 +6026,7 @@ where
     F: FnMut(&StreamInfo, ChannelLayoutProvenance, AnalysisPcmChunk<'_>) -> Result<(), String>,
     C: FnMut() -> Result<(), String> + Send,
 {
-    decode_descriptor_analysis_stream_impl(
+    decode_descriptor_analysis_stream_impl::<true, _, _>(
         descriptor,
         Some(1),
         Some(max_decoded_samples),
@@ -6027,7 +6035,7 @@ where
     )
 }
 
-fn decode_descriptor_analysis_stream_impl<F, C>(
+fn decode_descriptor_analysis_stream_impl<const CONTROLLED: bool, F, C>(
     descriptor: &InputDescriptor,
     forced_flac_workers: Option<usize>,
     max_packet_samples: Option<u64>,
@@ -6038,7 +6046,10 @@ where
     F: FnMut(&StreamInfo, ChannelLayoutProvenance, AnalysisPcmChunk<'_>) -> Result<(), String>,
     C: FnMut() -> Result<(), String> + Send,
 {
-    checkpoint()?;
+    debug_assert_eq!(CONTROLLED, max_packet_samples.is_some());
+    if CONTROLLED {
+        checkpoint()?;
+    }
     if descriptor.route != DecoderRoute::Wave
         || !matches!(descriptor.info.source_kind, PcmKind::S32 | PcmKind::F64)
     {
@@ -6052,8 +6063,13 @@ where
     }
 
     let path = descriptor.input.stable_path();
-    let (wav, provenance) = WavReader::probe_with_layout_controlled(path, &mut checkpoint)
-        .map_err(|error| format!("{}: {error}", display_input(&descriptor.input)))?;
+    let (wav, provenance) = if CONTROLLED {
+        WavReader::probe_with_layout_controlled(path, &mut checkpoint)
+            .map_err(|error| error.to_string())
+    } else {
+        WavReader::probe_with_layout(path).map_err(|error| error.to_string())
+    }
+    .map_err(|error| format!("{}: {error}", display_input(&descriptor.input)))?;
     let decoded_info = StreamInfo {
         sample_rate: wav.sample_rate,
         channels: wav.channels,
@@ -6085,7 +6101,8 @@ where
             display_input(&descriptor.input)
         ));
     }
-    if let Some(limit) = max_packet_samples {
+    if CONTROLLED {
+        let limit = max_packet_samples.expect("a controlled analysis owns a packet limit");
         let selected_samples = selected_frames
             .checked_mul(channels as u64)
             .ok_or_else(|| "selected WAVE sample count overflow".to_string())?;
@@ -6101,7 +6118,8 @@ where
     file.seek(SeekFrom::Start(byte_offset))
         .map_err(|error| format!("{}: {error}", path.display()))?;
     let configured_chunk_bytes = wav_stream_chunk_bytes(wav.channels, wav.kind);
-    let chunk_bytes = if let Some(limit) = max_packet_samples {
+    let chunk_bytes = if CONTROLLED {
+        let limit = max_packet_samples.expect("a controlled analysis owns a packet limit");
         let max_frames = limit / channels as u64;
         let max_frames = usize::try_from(max_frames).unwrap_or(usize::MAX).max(1);
         configured_chunk_bytes.min(max_frames.saturating_mul(frame_bytes).max(frame_bytes))
@@ -6114,9 +6132,12 @@ where
     let mut f64_planar = Vec::new();
     let mut remaining_frames = selected_frames;
     while remaining_frames != 0 {
-        checkpoint()?;
+        if CONTROLLED {
+            checkpoint()?;
+        }
         let frames = remaining_frames.min(chunk_frames as u64) as usize;
-        if let Some(limit) = max_packet_samples {
+        if CONTROLLED {
+            let limit = max_packet_samples.expect("a controlled analysis owns a packet limit");
             let packet_samples = u64::try_from(frames)
                 .ok()
                 .and_then(|frames| frames.checked_mul(channels as u64))
@@ -6157,7 +6178,9 @@ where
             }
             _ => unreachable!("high-precision WAVE kind was selected above"),
         }
-        checkpoint()?;
+        if CONTROLLED {
+            checkpoint()?;
+        }
         remaining_frames -= frames as u64;
     }
     Ok(descriptor.info.clone())
@@ -6470,6 +6493,49 @@ fn decode_stream_raw_with_selection_and_control<F, C>(
     selection: AudioTrackSelection,
     forced_flac_workers: Option<usize>,
     service_control: Option<ServiceDecodeControl>,
+    checkpoint: C,
+    consume: F,
+) -> Result<StreamInfo, String>
+where
+    F: FnMut(
+        &StreamInfo,
+        ChannelLayoutProvenance,
+        Option<u64>,
+        &mut [Vec<f32>],
+    ) -> Result<(), String>,
+    C: FnMut() -> Result<(), String> + Send,
+{
+    if service_control.is_some() {
+        decode_stream_raw_impl::<true, _, _>(
+            path,
+            route,
+            selection,
+            forced_flac_workers,
+            service_control,
+            checkpoint,
+            consume,
+        )
+    } else {
+        decode_stream_raw_impl::<false, _, _>(
+            path,
+            route,
+            selection,
+            forced_flac_workers,
+            service_control,
+            checkpoint,
+            consume,
+        )
+    }
+}
+
+// Static specialization keeps service polling and packet admission out of the
+// ordinary CLI/library packet loop while sharing the decoder state machine.
+fn decode_stream_raw_impl<const CONTROLLED: bool, F, C>(
+    path: &Path,
+    route: DecoderRoute,
+    selection: AudioTrackSelection,
+    forced_flac_workers: Option<usize>,
+    service_control: Option<ServiceDecodeControl>,
     mut checkpoint: C,
     mut consume: F,
 ) -> Result<StreamInfo, String>
@@ -6493,12 +6559,19 @@ where
         .and_then(|value| value.to_str())
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
-    checkpoint()?;
-    let controlled = service_control.is_some();
-    let max_packet_samples = service_control.map(|control| control.max_packet_samples);
-    let service_preflight = if controlled {
+    debug_assert_eq!(CONTROLLED, service_control.is_some());
+    if CONTROLLED {
+        checkpoint()?;
+    }
+    let active_service_control = if CONTROLLED {
+        Some(service_control.expect("a controlled decode owns service limits"))
+    } else {
+        None
+    };
+    let max_packet_samples = active_service_control.map(|control| control.max_packet_samples);
+    let service_preflight = if CONTROLLED {
         let observed = service_container_preflight(path, &mut checkpoint)?;
-        if service_control
+        if active_service_control
             .and_then(|control| control.expected_preflight)
             .is_some_and(|expected| expected != observed)
         {
@@ -6513,12 +6586,14 @@ where
     };
     if route == DecoderRoute::Wave {
         require_single_track(selection)?;
-        return decode_wav_stream(
+        return decode_wav_stream::<CONTROLLED, _, _>(
             path,
             max_packet_samples,
             &mut checkpoint,
             |info, provenance, declared, planar| {
-                enforce_service_packet_sample_limit(info, planar, max_packet_samples)?;
+                if CONTROLLED {
+                    enforce_service_packet_sample_limit(info, planar, max_packet_samples)?;
+                }
                 consume(info, provenance, declared, planar)
             },
         );
@@ -6558,7 +6633,6 @@ where
                 );
             }
             return crate::opus::decode_stream(path, |info, planar| {
-                enforce_service_packet_sample_limit(info, planar, max_packet_samples)?;
                 // The native Opus parser accepts only RFC 7845 mapping
                 // families 0 and 1, both of which have canonical speakers.
                 consume(info, ChannelLayoutProvenance::KnownSpeakers, None, planar)
@@ -6571,12 +6645,12 @@ where
             );
         }
     }
-    let (mut plain_checkpoint, controlled_checkpoint) = if controlled {
-        (None, Some(Mutex::new(checkpoint)))
+    let controlled_checkpoint = if CONTROLLED {
+        Some(Mutex::new(checkpoint))
     } else {
-        (Some(checkpoint), None)
+        None
     };
-    run_decoder_checkpoint(&mut plain_checkpoint, &controlled_checkpoint)?;
+    run_decoder_checkpoint::<CONTROLLED, _>(&controlled_checkpoint)?;
     let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let source: Box<dyn MediaSource + '_> = if let Some(checkpoint) = &controlled_checkpoint {
         let preflight = service_preflight.expect("controlled decode has service preflight");
@@ -6594,7 +6668,7 @@ where
     if !extension.is_empty() {
         hint.with_extension(&extension);
     }
-    let metadata_options = if controlled {
+    let metadata_options = if CONTROLLED {
         service_metadata_options()
     } else {
         symphonia::core::meta::MetadataOptions::default()
@@ -6690,7 +6764,7 @@ where
     let mut mpeg_channel_mode = MpegChannelModeTracker::default();
 
     loop {
-        run_decoder_checkpoint(&mut plain_checkpoint, &controlled_checkpoint)?;
+        run_decoder_checkpoint::<CONTROLLED, _>(&controlled_checkpoint)?;
         let packet = match format.next_packet() {
             Ok(Some(packet)) => packet,
             Ok(None) => break,
@@ -6723,10 +6797,11 @@ where
         if packet.track_id != track.id {
             continue;
         }
-        if let Some(limit) = max_packet_samples {
+        if CONTROLLED {
+            let limit = max_packet_samples.expect("a controlled decode owns a packet limit");
             enforce_symphonia_packet_sample_limit(&track, &packet, limit)?;
         }
-        run_decoder_checkpoint(&mut plain_checkpoint, &controlled_checkpoint)?;
+        run_decoder_checkpoint::<CONTROLLED, _>(&controlled_checkpoint)?;
         let decoded = require_decoded_packet(decoder.decode(&packet))
             .map_err(|error| format!("{}: decode: {error}", path.display()))?;
         let spec = decoded.spec();
@@ -6774,7 +6849,8 @@ where
         if frames == 0 {
             continue;
         }
-        if let Some(limit) = max_packet_samples {
+        if CONTROLLED {
+            let limit = max_packet_samples.expect("a controlled decode owns a packet limit");
             let packet_samples = u64::try_from(frames)
                 .ok()
                 .and_then(|frames| frames.checked_mul(decoded_channels as u64))
@@ -6783,7 +6859,7 @@ where
                 return Err(SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED.into());
             }
         }
-        run_decoder_checkpoint(&mut plain_checkpoint, &controlled_checkpoint)?;
+        run_decoder_checkpoint::<CONTROLLED, _>(&controlled_checkpoint)?;
         decoded.copy_to_vecs_planar::<f32>(&mut planar);
         consume(
             info.as_ref().unwrap(),
@@ -6791,7 +6867,7 @@ where
             declared_frames,
             &mut planar,
         )?;
-        run_decoder_checkpoint(&mut plain_checkpoint, &controlled_checkpoint)?;
+        run_decoder_checkpoint::<CONTROLLED, _>(&controlled_checkpoint)?;
     }
 
     info.ok_or_else(|| format!("{}: no audio decoded", path.display()))
@@ -7290,7 +7366,8 @@ where
     )
 }
 
-fn decode_wav_stream<F, C>(
+// WAVE has its own chunk loop, so preserve the same compile-time control split.
+fn decode_wav_stream<const CONTROLLED: bool, F, C>(
     path: &Path,
     max_decoded_samples: Option<u64>,
     mut checkpoint: C,
@@ -7305,9 +7382,16 @@ where
     ) -> Result<(), String>,
     C: FnMut() -> Result<(), String>,
 {
-    checkpoint()?;
-    let (wav, layout_provenance) = WavReader::probe_with_layout_controlled(path, &mut checkpoint)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if CONTROLLED {
+        checkpoint()?;
+    }
+    let (wav, layout_provenance) = if CONTROLLED {
+        WavReader::probe_with_layout_controlled(path, &mut checkpoint)
+            .map_err(|error| error.to_string())
+    } else {
+        WavReader::probe_with_layout(path).map_err(|error| error.to_string())
+    }
+    .map_err(|error| format!("{}: {error}", path.display()))?;
     let declared_frames =
         wav.data_size / (u64::from(wav.channels) * wav.kind.bytes_per_sample() as u64);
     if let Some(limit) = max_decoded_samples {
@@ -7347,7 +7431,9 @@ where
     let mut bytes = vec![0; chunk_bytes];
     let mut planar = Vec::new();
     while remaining >= frame_bytes {
-        checkpoint()?;
+        if CONTROLLED {
+            checkpoint()?;
+        }
         let read_size = remaining.min(chunk_bytes);
         let aligned = read_size - read_size % frame_bytes;
         file.read_exact(&mut bytes[..aligned])
@@ -7359,7 +7445,9 @@ where
             &mut planar,
         );
         consume(&info, layout_provenance, Some(declared_frames), &mut planar)?;
-        checkpoint()?;
+        if CONTROLLED {
+            checkpoint()?;
+        }
         remaining -= aligned;
     }
     Ok(info)

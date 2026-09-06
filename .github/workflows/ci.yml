@@ -15,6 +15,8 @@ concurrency:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
@@ -101,11 +103,17 @@ jobs:
       - name: Run tests with static Opus support
         run: cargo test --features opus-encoding
 
+      - name: Reclaim target space before FFmpeg feature tests
+        run: cargo clean
+
       - name: Install FFmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Run tests with FFmpeg AAC, ALAC, and Vorbis support
         run: cargo test --features ffmpeg-encoding
+
+      - name: Reclaim target space before MP3 feature tests
+        run: cargo clean
 
       - name: Install LAME
         run: sudo apt-get install -y libmp3lame-dev

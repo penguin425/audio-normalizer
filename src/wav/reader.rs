@@ -422,7 +422,7 @@ impl WavReader {
         checkpoint()?;
         let mut file = File::open(path).map_err(|error| WavReadError::Io(error).to_string())?;
         let mut control_error = None;
-        let result = Self::probe_file_with_channel_layout_and_control(&mut file, || {
+        let result = Self::probe_file_with_channel_layout_and_control::<true, _>(&mut file, || {
             if let Err(error) = checkpoint() {
                 control_error = Some(error);
                 Err(WavReadError::Io(io::Error::new(
@@ -455,17 +455,19 @@ impl WavReader {
     fn probe_file_with_channel_layout(
         file: &mut File,
     ) -> Result<(WavStreamInfo, ChannelLayoutDescriptor), WavReadError> {
-        Self::probe_file_with_channel_layout_and_control(file, || Ok(()))
+        Self::probe_file_with_channel_layout_and_control::<false, _>(file, || Ok(()))
     }
 
-    fn probe_file_with_channel_layout_and_control<C>(
+    fn probe_file_with_channel_layout_and_control<const CONTROLLED: bool, C>(
         file: &mut File,
         mut checkpoint: C,
     ) -> Result<(WavStreamInfo, ChannelLayoutDescriptor), WavReadError>
     where
         C: FnMut() -> Result<(), WavReadError>,
     {
-        checkpoint()?;
+        if CONTROLLED {
+            checkpoint()?;
+        }
         file.seek(SeekFrom::Start(0))?;
         let file_len = file.metadata()?.len();
         let mut riff = [0u8; 12];
@@ -495,7 +497,7 @@ impl WavReader {
         let mut data_info = None;
         let mut chunk_count = 0usize;
         loop {
-            if chunk_count.is_multiple_of(CONTROLLED_PROBE_CHECKPOINT_CHUNKS) {
+            if CONTROLLED && chunk_count.is_multiple_of(CONTROLLED_PROBE_CHECKPOINT_CHUNKS) {
                 checkpoint()?;
             }
             let header_offset = file.stream_position()?;
@@ -601,7 +603,9 @@ impl WavReader {
             }
             file.seek(SeekFrom::Start(next))?;
         }
-        checkpoint()?;
+        if CONTROLLED {
+            checkpoint()?;
+        }
         if parsed_format.is_none() {
             return Err(WavReadError::BadFormat("missing fmt chunk"));
         }
