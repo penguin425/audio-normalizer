@@ -1,5 +1,6 @@
 //! Streaming AAC, ALAC, and Vorbis encoding through an optional FFmpeg runtime.
 
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -19,7 +20,11 @@ const FFMPEG_WORKSPACE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const FFMPEG_WORKSPACE_MAX_ENTRIES: u64 = 32;
 
 pub struct AacStreamWriter {
-    process: Option<RunningProcess>,
+    // The broker contains poison-aware synchronization used only by its
+    // private supervisor. Wrapping it preserves this public writer's existing
+    // UnwindSafe/RefUnwindSafe auto-trait contract without exposing that
+    // synchronization to callers.
+    process: Option<AssertUnwindSafe<RunningProcess>>,
     _workspace: tempfile::TempDir,
     channels: usize,
     interleaved: Vec<u8>,
@@ -296,7 +301,7 @@ impl AacStreamWriter {
             )
         })?;
         Ok(Self {
-            process: Some(process),
+            process: Some(AssertUnwindSafe(process)),
             _workspace: workspace,
             channels: channels as usize,
             interleaved: Vec::new(),
@@ -330,6 +335,7 @@ impl AacStreamWriter {
         self.process
             .as_mut()
             .ok_or_else(|| format!("{} encoder is already finished", self.codec.name()))?
+            .0
             .write_all(&self.interleaved)
             .map_err(|error| format!("write PCM to FFmpeg {} encoder: {error}", self.codec.name()))
     }
@@ -340,6 +346,7 @@ impl AacStreamWriter {
             .take()
             .ok_or_else(|| format!("{} encoder is already finished", self.codec.name()))?;
         let output = process
+            .0
             .finish()
             .map_err(|error| format!("wait for FFmpeg {} encoder: {error}", self.codec.name()))?;
         if output.success() {
@@ -511,6 +518,12 @@ impl Drop for AacStreamWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_writer_preserves_public_unwind_safety() {
+        fn assert_traits<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        assert_traits::<AacStreamWriter>();
+    }
 
     #[test]
     fn capability_parser_requires_exact_audio_encoder_and_muxer_names() {

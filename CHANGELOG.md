@@ -42,7 +42,8 @@ tags and keeps public compatibility commitments in
 - Resolve local C2PA trust-list/configuration paths before entering the private
   verifier workspace, parse REST request lines with the RFC-required SP
   separators and case-sensitive methods, and explicitly release state-file
-  locks across concurrent helper fork/exec windows.
+  locks across concurrent helper fork/exec windows. Preserve the public
+  unwind-safety auto-trait contract of the broker-backed FFmpeg stream writer.
 
 ## 0.189.12 - 2026-09-07
 
