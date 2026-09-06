@@ -2026,7 +2026,7 @@
       "id_policy": "canonical",
       "document_kind": "json-schema",
       "artifact_class": "wire",
-      "lifecycle": "current",
+      "lifecycle": "supported-legacy",
       "change_policy": "immutable-version",
       "instance_discriminator": {
         "field": "schema",
@@ -2041,6 +2041,32 @@
       "validators": [
         "repo:tests/schema_registry.rs",
         "repo:tests/service_api.rs"
+      ],
+      "successor_path": "schema/service-error-v2.schema.json"
+    },
+    {
+      "path": "schema/service-error-v2.schema.json",
+      "family": "service-error",
+      "version": 2,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/service-error-v2",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "wire",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/service-error-v2"
+      },
+      "producers": [
+        "repo:src/service.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:src/service.rs"
       ]
     },
     {

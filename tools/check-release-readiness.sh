@@ -124,6 +124,7 @@ for file in \
   schema/mpegh-adapter-report-v2.schema.json \
   schema/dts-adapter-report-v2.schema.json \
   schema/service-analysis-v3.schema.json \
+  schema/service-error-v2.schema.json \
   schema/remote-materialization-v1.schema.json \
   schema/ebu-qc-results-v2.schema.json \
   schema/ebu-qc-catalogue-v2-pins.json \

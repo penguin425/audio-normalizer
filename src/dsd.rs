@@ -25,6 +25,8 @@ use std::path::Path;
 const MAX_CHANNELS: u16 = 32;
 const MAX_CHUNKS: usize = 100_000;
 const MAX_CONTROL_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+const CONTROLLED_DSD_READ_BYTES: usize = 4 * 1024;
+const CONTROLLED_DSD_CHECK_BYTES: usize = 256;
 const MAX_SOURCE_SAMPLE_RATE: u32 = 49_152_000;
 const OUTPUT_CHUNK_FRAMES: usize = 4096;
 const HALF_BAND_TAPS: usize = 31;
@@ -106,12 +108,33 @@ pub fn probe(path: &Path) -> Result<DsdInfo, String> {
 }
 
 fn probe_preserving_layout(path: &Path) -> Result<DsdInfo, String> {
+    probe_preserving_layout_with_control(path, None, &mut || Ok(()))
+}
+
+fn probe_preserving_layout_with_control<C>(
+    path: &Path,
+    max_decoded_samples: Option<u64>,
+    mut checkpoint: C,
+) -> Result<DsdInfo, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    checkpoint()?;
     let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
     let file_size = file
         .metadata()
         .map_err(|error| format!("stat {}: {error}", path.display()))?
         .len();
-    parse(&mut file, file_size).map_err(|error| format!("{}: {error}", path.display()))
+    let info = parse_with_control(&mut file, file_size, max_decoded_samples, &mut checkpoint)
+        .map_err(|error| {
+            if error == crate::decoder::SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED {
+                error
+            } else {
+                format!("{}: {error}", path.display())
+            }
+        })?;
+    checkpoint()?;
+    Ok(info)
 }
 
 /// Probe a DSD stream while retaining whether its channel roles are
@@ -120,6 +143,20 @@ pub fn probe_with_layout(
     path: &Path,
 ) -> Result<(DsdInfo, crate::decoder::ChannelLayoutProvenance), String> {
     let info = probe_preserving_layout(path)?;
+    let provenance = dsd_layout_provenance(&info);
+    Ok((info, provenance))
+}
+
+fn probe_with_layout_controlled<C>(
+    path: &Path,
+    max_decoded_samples: u64,
+    mut checkpoint: C,
+) -> Result<(DsdInfo, crate::decoder::ChannelLayoutProvenance), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    let info =
+        probe_preserving_layout_with_control(path, Some(max_decoded_samples), &mut checkpoint)?;
     let provenance = dsd_layout_provenance(&info);
     Ok((info, provenance))
 }
@@ -154,18 +191,40 @@ fn require_known_layout(
 }
 
 fn parse(file: &mut File, file_size: u64) -> Result<DsdInfo, String> {
+    parse_with_control(file, file_size, None, &mut || Ok(()))
+}
+
+fn parse_with_control<C>(
+    file: &mut File,
+    file_size: u64,
+    max_decoded_samples: Option<u64>,
+    mut checkpoint: C,
+) -> Result<DsdInfo, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    checkpoint()?;
     if file_size < 4 {
         return Err("truncated DSD signature".into());
     }
     let signature = read_at::<4>(file, 0, file_size)?;
     match &signature {
-        b"DSD " => parse_dsf(file, file_size),
-        b"FRM8" => parse_dsdiff(file, file_size),
+        b"DSD " => parse_dsf_with_control(file, file_size, max_decoded_samples, &mut checkpoint),
+        b"FRM8" => parse_dsdiff_with_control(file, file_size, max_decoded_samples, &mut checkpoint),
         _ => Err("not a DSF or DSDIFF file".into()),
     }
 }
 
-fn parse_dsf(file: &mut File, file_size: u64) -> Result<DsdInfo, String> {
+fn parse_dsf_with_control<C>(
+    file: &mut File,
+    file_size: u64,
+    max_decoded_samples: Option<u64>,
+    mut checkpoint: C,
+) -> Result<DsdInfo, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    checkpoint()?;
     if file_size < 92 {
         return Err("truncated DSF header".into());
     }
@@ -233,6 +292,7 @@ fn parse_dsf(file: &mut File, file_size: u64) -> Result<DsdInfo, String> {
     }
     let (output_sample_rate, decimation) = output_geometry(source_sample_rate)?;
     let output_frames = source_samples_per_channel / u64::from(decimation);
+    enforce_declared_sample_limit(output_frames, channels, max_decoded_samples)?;
 
     let data_header = read_vec_at(file, 80, 12, file_size)?;
     if &data_header[..4] != b"data" {
@@ -268,7 +328,7 @@ fn parse_dsf(file: &mut File, file_size: u64) -> Result<DsdInfo, String> {
             "DSF data size {data_size} does not match padded sample geometry {required_data_size}"
         ));
     }
-    validate_dsf_padding(
+    validate_dsf_padding_with_control(
         file,
         file_size,
         data_offset,
@@ -276,6 +336,7 @@ fn parse_dsf(file: &mut File, file_size: u64) -> Result<DsdInfo, String> {
         source_samples_per_channel,
         block_size_per_channel,
         bit_order,
+        &mut checkpoint,
     )?;
     if metadata_offset != 0 {
         let id3 = read_at::<3>(file, metadata_offset, file_size)?;
@@ -304,7 +365,16 @@ fn parse_dsf(file: &mut File, file_size: u64) -> Result<DsdInfo, String> {
     })
 }
 
-fn parse_dsdiff(file: &mut File, file_size: u64) -> Result<DsdInfo, String> {
+fn parse_dsdiff_with_control<C>(
+    file: &mut File,
+    file_size: u64,
+    max_decoded_samples: Option<u64>,
+    mut checkpoint: C,
+) -> Result<DsdInfo, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    checkpoint()?;
     if file_size < 16 {
         return Err("truncated DSDIFF FRM8 header".into());
     }
@@ -335,6 +405,7 @@ fn parse_dsdiff(file: &mut File, file_size: u64) -> Result<DsdInfo, String> {
     let mut saw_dst = false;
     let mut saw_audio = false;
     while offset < file_size {
+        checkpoint()?;
         chunk_count = chunk_count
             .checked_add(1)
             .ok_or("DSDIFF chunk count overflow")?;
@@ -359,7 +430,14 @@ fn parse_dsdiff(file: &mut File, file_size: u64) -> Result<DsdInfo, String> {
                 if source_sample_rate.is_some() || channel_ids.is_some() || compression.is_some() {
                     return Err("DSDIFF contains multiple PROP chunks".into());
                 }
-                let props = parse_dff_properties(file, body, size, file_size, &mut chunk_count)?;
+                let props = parse_dff_properties_with_control(
+                    file,
+                    body,
+                    size,
+                    file_size,
+                    &mut chunk_count,
+                    &mut checkpoint,
+                )?;
                 source_sample_rate = props.sample_rate;
                 channel_ids = props.channel_ids;
                 compression = props.compression;
@@ -417,6 +495,8 @@ fn parse_dsdiff(file: &mut File, file_size: u64) -> Result<DsdInfo, String> {
         .and_then(|bytes| bytes.checked_mul(8))
         .ok_or("DSDIFF sample count overflow")?;
     let (output_sample_rate, decimation) = output_geometry(source_sample_rate)?;
+    let output_frames = source_samples_per_channel / u64::from(decimation);
+    enforce_declared_sample_limit(output_frames, channels, max_decoded_samples)?;
 
     Ok(DsdInfo {
         format: DsdFormat::Dsdiff,
@@ -425,7 +505,7 @@ fn parse_dsdiff(file: &mut File, file_size: u64) -> Result<DsdInfo, String> {
         channels,
         channel_roles: dff_channel_roles(&channel_ids),
         source_samples_per_channel,
-        output_frames: source_samples_per_channel / u64::from(decimation),
+        output_frames,
         bit_order: DsdBitOrder::MostSignificantFirst,
         compression: "DSD raw".into(),
         data_offset,
@@ -438,7 +518,8 @@ fn parse_dsdiff(file: &mut File, file_size: u64) -> Result<DsdInfo, String> {
     })
 }
 
-fn validate_dsf_padding(
+#[allow(clippy::too_many_arguments)]
+fn validate_dsf_padding_with_control<C>(
     file: &mut File,
     file_size: u64,
     data_offset: u64,
@@ -446,7 +527,11 @@ fn validate_dsf_padding(
     source_samples_per_channel: u64,
     block_size_per_channel: u32,
     bit_order: DsdBitOrder,
-) -> Result<(), String> {
+    mut checkpoint: C,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
     if source_samples_per_channel == 0 {
         return Ok(());
     }
@@ -465,6 +550,7 @@ fn validate_dsf_padding(
         )
         .ok_or("DSF padding offset overflow")?;
     for channel in 0..u64::from(channels) {
+        checkpoint()?;
         let block = last_round
             .checked_add(
                 channel
@@ -496,6 +582,7 @@ fn validate_dsf_padding(
             .checked_add(block_size)
             .ok_or("DSF padding end overflow")?;
         while padding_offset < padding_end {
+            checkpoint()?;
             let size = (padding_end - padding_offset).min(64 * 1024);
             let padding = read_vec_at(file, padding_offset, size, file_size)?;
             if padding.iter().any(|byte| *byte != 0) {
@@ -516,13 +603,17 @@ struct DffProperties {
     compression: Option<[u8; 4]>,
 }
 
-fn parse_dff_properties(
+fn parse_dff_properties_with_control<C>(
     file: &mut File,
     body: u64,
     size: u64,
     file_size: u64,
     chunk_count: &mut usize,
-) -> Result<DffProperties, String> {
+    mut checkpoint: C,
+) -> Result<DffProperties, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
     if size < 4 {
         return Err("DSDIFF PROP chunk is truncated".into());
     }
@@ -536,6 +627,7 @@ fn parse_dff_properties(
     let mut channel_ids = None;
     let mut compression = None;
     while offset < end {
+        checkpoint()?;
         *chunk_count = chunk_count
             .checked_add(1)
             .ok_or("DSDIFF nested chunk count overflow")?;
@@ -557,8 +649,8 @@ fn parse_dff_properties(
                 if child_size > MAX_CONTROL_CHUNK_BYTES {
                     return Err("DSDIFF CHNL exceeds the control-chunk byte limit".into());
                 }
-                let value = read_vec_at(file, child_body, child_size, file_size)?;
-                let count = usize::from(be_u16(&value[..2]));
+                let count_bytes = read_at::<2>(file, child_body, file_size)?;
+                let count = usize::from(be_u16(&count_bytes));
                 if count == 0 || count > usize::from(MAX_CHANNELS) {
                     return Err(format!(
                         "DSDIFF CHNL count {count} is outside 1..={MAX_CHANNELS}"
@@ -567,12 +659,12 @@ fn parse_dff_properties(
                 let required = 2_usize
                     .checked_add(count.checked_mul(4).ok_or("CHNL size overflow")?)
                     .ok_or("CHNL size overflow")?;
-                if value.len() != required {
+                if child_size != required as u64 {
                     return Err(format!(
-                        "DSDIFF CHNL size {} does not match {count} identifiers",
-                        value.len()
+                        "DSDIFF CHNL size {child_size} does not match {count} identifiers"
                     ));
                 }
+                let value = read_vec_at(file, child_body, child_size, file_size)?;
                 let ids: Vec<[u8; 4]> = value[2..]
                     .chunks_exact(4)
                     .map(|bytes| bytes.try_into().unwrap())
@@ -589,15 +681,15 @@ fn parse_dff_properties(
                 if child_size > MAX_CONTROL_CHUNK_BYTES {
                     return Err("DSDIFF CMPR exceeds the control-chunk byte limit".into());
                 }
-                let value = read_vec_at(file, child_body, child_size, file_size)?;
-                let name_len = usize::from(value[4]);
+                let prefix = read_at::<5>(file, child_body, file_size)?;
+                let name_len = usize::from(prefix[4]);
                 if 5_usize
                     .checked_add(name_len)
-                    .is_none_or(|needed| needed > value.len())
+                    .is_none_or(|needed| needed as u64 > child_size)
                 {
                     return Err("DSDIFF CMPR name exceeds its chunk".into());
                 }
-                compression = Some(value[..4].try_into().unwrap());
+                compression = Some(prefix[..4].try_into().unwrap());
             }
             _ => {}
         }
@@ -717,6 +809,24 @@ fn validate_channels(channels: u16) -> Result<(), String> {
     }
 }
 
+fn enforce_declared_sample_limit(
+    output_frames: u64,
+    channels: u16,
+    max_decoded_samples: Option<u64>,
+) -> Result<(), String> {
+    let Some(limit) = max_decoded_samples else {
+        return Ok(());
+    };
+    let samples = output_frames
+        .checked_mul(u64::from(channels))
+        .ok_or_else(|| "declared DSD output sample count overflow".to_string())?;
+    if samples > limit {
+        Err(crate::decoder::SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED.into())
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_dsf_channel_type(channel_type: u32, channels: u16) -> Result<(), String> {
     let expected = match channel_type {
         1 => 1,
@@ -789,9 +899,14 @@ where
 {
     let (info, provenance) = probe_with_layout(path)?;
     require_known_layout(path, provenance)?;
-    decode_stream_from_info(path, info, provenance, |info, _, _, planar| {
-        consume(info, planar)
-    })
+    decode_stream_from_info(
+        path,
+        info,
+        provenance,
+        false,
+        &mut || Ok(()),
+        |info, _, _, planar| consume(info, planar),
+    )
 }
 
 /// Decode DSD in bounded chunks while exposing channel-layout provenance.
@@ -827,13 +942,45 @@ where
     ) -> Result<(), String>,
 {
     let (info, provenance) = probe_with_layout(path)?;
-    decode_stream_from_info(path, info, provenance, consume)
+    decode_stream_from_info(path, info, provenance, false, &mut || Ok(()), consume)
 }
 
-fn decode_stream_from_info<F>(
+/// Service-only DSD decode with declaration preflight, bounded reads, serial
+/// channel processing, and cooperative checkpoints inside long FIR work.
+pub(crate) fn decode_stream_with_layout_and_declared_frames_controlled<F, C>(
+    path: &Path,
+    max_decoded_samples: u64,
+    mut checkpoint: C,
+    consume: F,
+) -> Result<crate::decoder::StreamInfo, String>
+where
+    F: FnMut(
+        &crate::decoder::StreamInfo,
+        crate::decoder::ChannelLayoutProvenance,
+        Option<u64>,
+        &mut [Vec<f32>],
+    ) -> Result<(), String>,
+    C: FnMut() -> Result<(), String>,
+{
+    checkpoint()?;
+    let (info, provenance) =
+        probe_with_layout_controlled(path, max_decoded_samples, &mut checkpoint)?;
+    let declared_samples = info
+        .output_frames
+        .checked_mul(u64::from(info.channels))
+        .ok_or_else(|| "declared DSD output sample count overflow".to_string())?;
+    if declared_samples > max_decoded_samples {
+        return Err(crate::decoder::SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED.into());
+    }
+    decode_stream_from_info(path, info, provenance, true, &mut checkpoint, consume)
+}
+
+fn decode_stream_from_info<F, C>(
     path: &Path,
     info: DsdInfo,
     layout_provenance: crate::decoder::ChannelLayoutProvenance,
+    controlled: bool,
+    mut checkpoint: C,
     mut consume: F,
 ) -> Result<crate::decoder::StreamInfo, String>
 where
@@ -843,7 +990,9 @@ where
         Option<u64>,
         &mut [Vec<f32>],
     ) -> Result<(), String>,
+    C: FnMut() -> Result<(), String>,
 {
+    checkpoint()?;
     let stream_info = crate::decoder::StreamInfo {
         sample_rate: info.output_sample_rate,
         channels: info.channels,
@@ -858,9 +1007,11 @@ where
     }
     let ratio = info.source_sample_rate / info.output_sample_rate;
     let stages = ratio.trailing_zeros() as usize;
-    let mut pipelines: Vec<DsdPipeline> = (0..info.channels)
-        .map(|_| DsdPipeline::new(stages, info.output_sample_rate))
-        .collect();
+    let mut pipelines = Vec::with_capacity(usize::from(info.channels));
+    for _ in 0..info.channels {
+        checkpoint()?;
+        pipelines.push(DsdPipeline::new(stages, info.output_sample_rate));
+    }
     let mut pending: Vec<Vec<f32>> = (0..info.channels).map(|_| Vec::new()).collect();
     let mut source_samples = vec![0_u64; info.channels as usize];
     let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
@@ -880,6 +1031,8 @@ where
             &mut pending,
             &mut source_samples,
             &stream_info,
+            controlled,
+            &mut checkpoint,
             &mut consume_without_metadata,
         )?,
         DsdLayout::Dsdiff { .. } => decode_dsdiff_data(
@@ -889,15 +1042,19 @@ where
             &mut pending,
             &mut source_samples,
             &stream_info,
+            controlled,
+            &mut checkpoint,
             &mut consume_without_metadata,
         )?,
     }
+    checkpoint()?;
     flush_pending(
         &mut pending,
         &stream_info,
         &mut consume_without_metadata,
         true,
     )?;
+    checkpoint()?;
     if source_samples
         .iter()
         .any(|count| *count != info.source_samples_per_channel)
@@ -919,17 +1076,21 @@ where
     Ok(stream_info)
 }
 
-fn decode_dsf_data<F>(
+#[allow(clippy::too_many_arguments)]
+fn decode_dsf_data<F, C>(
     file: &mut File,
     info: &DsdInfo,
     pipelines: &mut [DsdPipeline],
     pending: &mut [Vec<f32>],
     source_samples: &mut [u64],
     stream_info: &crate::decoder::StreamInfo,
+    controlled: bool,
+    mut checkpoint: C,
     consume: &mut F,
 ) -> Result<(), String>
 where
     F: FnMut(&crate::decoder::StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
+    C: FnMut() -> Result<(), String>,
 {
     let block_size_per_channel = match info.layout {
         DsdLayout::Dsf {
@@ -939,50 +1100,113 @@ where
     };
     let block_size = block_size_per_channel as usize;
     let channels = info.channels as usize;
-    let mut blocks = (0..channels)
-        .map(|_| vec![0_u8; block_size])
-        .collect::<Vec<_>>();
     let bytes_per_channel = info.source_samples_per_channel.div_ceil(8);
     let rounds = bytes_per_channel.div_ceil(u64::from(block_size_per_channel));
-    for _ in 0..rounds {
-        for block in &mut blocks {
-            file.read_exact(block)
-                .map_err(|error| format!("read DSF channel block: {error}"))?;
+    if controlled {
+        let slice_bytes = block_size.min(CONTROLLED_DSD_READ_BYTES);
+        let mut blocks = (0..channels)
+            .map(|_| vec![0_u8; slice_bytes])
+            .collect::<Vec<_>>();
+        let round_stride = u64::from(block_size_per_channel)
+            .checked_mul(u64::from(info.channels))
+            .ok_or_else(|| "DSF round stride overflow".to_string())?;
+        for round in 0..rounds {
+            let round_offset = info
+                .data_offset
+                .checked_add(
+                    round
+                        .checked_mul(round_stride)
+                        .ok_or_else(|| "DSF round offset overflow".to_string())?,
+                )
+                .ok_or_else(|| "DSF round offset overflow".to_string())?;
+            for slice_offset in (0..block_size).step_by(slice_bytes) {
+                checkpoint()?;
+                let read_size = (block_size - slice_offset).min(slice_bytes);
+                for (channel, block) in blocks.iter_mut().enumerate() {
+                    let offset = round_offset
+                        .checked_add(
+                            (channel as u64)
+                                .checked_mul(u64::from(block_size_per_channel))
+                                .ok_or_else(|| "DSF channel offset overflow".to_string())?,
+                        )
+                        .and_then(|offset| offset.checked_add(slice_offset as u64))
+                        .ok_or_else(|| "DSF channel offset overflow".to_string())?;
+                    file.seek(SeekFrom::Start(offset))
+                        .map_err(|error| format!("seek DSF channel block: {error}"))?;
+                    file.read_exact(&mut block[..read_size])
+                        .map_err(|error| format!("read DSF channel block: {error}"))?;
+                    block.truncate(read_size);
+                }
+                push_dsd_channel_blocks_controlled(
+                    &blocks,
+                    info.bit_order,
+                    info.source_samples_per_channel,
+                    source_samples,
+                    pipelines,
+                    pending,
+                    &mut checkpoint,
+                )?;
+                flush_pending(pending, stream_info, consume, false)?;
+                for block in &mut blocks {
+                    block.resize(slice_bytes, 0);
+                }
+                checkpoint()?;
+            }
         }
-        push_dsd_channel_blocks(
-            &blocks,
-            info.bit_order,
-            info.source_samples_per_channel,
-            source_samples,
-            pipelines,
-            pending,
-        );
-        flush_pending(pending, stream_info, consume, false)?;
+    } else {
+        let mut blocks = (0..channels)
+            .map(|_| vec![0_u8; block_size])
+            .collect::<Vec<_>>();
+        for _ in 0..rounds {
+            for block in &mut blocks {
+                file.read_exact(block)
+                    .map_err(|error| format!("read DSF channel block: {error}"))?;
+            }
+            push_dsd_channel_blocks(
+                &blocks,
+                info.bit_order,
+                info.source_samples_per_channel,
+                source_samples,
+                pipelines,
+                pending,
+            );
+            flush_pending(pending, stream_info, consume, false)?;
+        }
     }
     Ok(())
 }
 
-fn decode_dsdiff_data<F>(
+#[allow(clippy::too_many_arguments)]
+fn decode_dsdiff_data<F, C>(
     file: &mut File,
     info: &DsdInfo,
     pipelines: &mut [DsdPipeline],
     pending: &mut [Vec<f32>],
     source_samples: &mut [u64],
     stream_info: &crate::decoder::StreamInfo,
+    controlled: bool,
+    mut checkpoint: C,
     consume: &mut F,
 ) -> Result<(), String>
 where
     F: FnMut(&crate::decoder::StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
+    C: FnMut() -> Result<(), String>,
 {
     let channels = info.channels as usize;
     let frame_bytes = channels;
-    let chunk_frames = (64 * 1024 / frame_bytes).max(1);
+    let target_bytes = if controlled {
+        CONTROLLED_DSD_READ_BYTES
+    } else {
+        64 * 1024
+    };
+    let chunk_frames = (target_bytes / frame_bytes).max(1);
     let mut bytes = vec![0_u8; chunk_frames * frame_bytes];
     let mut channel_bytes = (0..channels)
         .map(|_| Vec::with_capacity(chunk_frames))
         .collect::<Vec<_>>();
     let mut remaining = info.data_size;
     while remaining != 0 {
+        checkpoint()?;
         let read_size = usize::try_from(remaining.min(bytes.len() as u64)).unwrap();
         file.read_exact(&mut bytes[..read_size])
             .map_err(|error| format!("read DSDIFF sound data: {error}"))?;
@@ -997,16 +1221,29 @@ where
                 channel.push(byte);
             }
         }
-        push_dsd_channel_blocks(
-            &channel_bytes,
-            DsdBitOrder::MostSignificantFirst,
-            info.source_samples_per_channel,
-            source_samples,
-            pipelines,
-            pending,
-        );
+        if controlled {
+            push_dsd_channel_blocks_controlled(
+                &channel_bytes,
+                DsdBitOrder::MostSignificantFirst,
+                info.source_samples_per_channel,
+                source_samples,
+                pipelines,
+                pending,
+                &mut checkpoint,
+            )?;
+        } else {
+            push_dsd_channel_blocks(
+                &channel_bytes,
+                DsdBitOrder::MostSignificantFirst,
+                info.source_samples_per_channel,
+                source_samples,
+                pipelines,
+                pending,
+            );
+        }
         remaining -= read_size as u64;
         flush_pending(pending, stream_info, consume, false)?;
+        checkpoint()?;
     }
     Ok(())
 }
@@ -1035,6 +1272,39 @@ fn push_dsd_channel_blocks(
         pending,
         parallel,
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_dsd_channel_blocks_controlled<C>(
+    blocks: &[Vec<u8>],
+    order: DsdBitOrder,
+    limit: u64,
+    source_samples: &mut [u64],
+    pipelines: &mut [DsdPipeline],
+    pending: &mut [Vec<f32>],
+    mut checkpoint: C,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    debug_assert_eq!(blocks.len(), source_samples.len());
+    debug_assert_eq!(blocks.len(), pipelines.len());
+    debug_assert_eq!(blocks.len(), pending.len());
+    // Deliberately serial: service cancellation must be observed on the
+    // request thread and the quota formula does not admit Rayon task scratch.
+    for (((bytes, consumed), pipeline), output) in blocks
+        .iter()
+        .zip(source_samples)
+        .zip(pipelines)
+        .zip(pending)
+    {
+        for bytes in bytes.chunks(CONTROLLED_DSD_CHECK_BYTES) {
+            checkpoint()?;
+            push_dsd_bytes(bytes, order, limit, consumed, pipeline, output);
+        }
+    }
+    checkpoint()?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1649,6 +1919,158 @@ mod tests {
             / settled.len() as f64)
             .sqrt();
         assert!((rms - 0.25 / 2.0_f64.sqrt()).abs() < 0.01, "{rms}");
+    }
+
+    #[test]
+    fn controlled_dsf_preflights_declared_samples_before_pcm_work() {
+        let bits = vec![false, true]
+            .into_iter()
+            .cycle()
+            .take(4096 * 8)
+            .collect::<Vec<_>>();
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("preflight.dsf");
+        fs::write(&path, make_dsf(&[bits], 2_822_400)).unwrap();
+        let mut callbacks = 0;
+        let error = decode_stream_with_layout_and_declared_frames_controlled(
+            &path,
+            1023,
+            || Ok(()),
+            |_, _, _, _| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, crate::decoder::SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED);
+        assert_eq!(callbacks, 0);
+    }
+
+    #[test]
+    fn controlled_dsf_is_bit_exact_serial_and_interruptible_inside_a_block() {
+        let bits = vec![false, true]
+            .into_iter()
+            .cycle()
+            .take(4096 * 8 * 2)
+            .collect::<Vec<_>>();
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("controlled.dsf");
+        fs::write(&path, make_dsf(&[bits.clone(), bits], 2_822_400)).unwrap();
+
+        let mut regular = Vec::new();
+        decode_stream_with_layout_and_declared_frames(&path, |_, _, _, planar| {
+            if regular.is_empty() {
+                regular.resize_with(planar.len(), Vec::new);
+            }
+            for (destination, source) in regular.iter_mut().zip(planar) {
+                destination.extend_from_slice(source);
+            }
+            Ok(())
+        })
+        .unwrap();
+        let mut controlled = Vec::new();
+        let caller = std::thread::current().id();
+        decode_stream_with_layout_and_declared_frames_controlled(
+            &path,
+            4096,
+            || {
+                assert_eq!(std::thread::current().id(), caller);
+                Ok(())
+            },
+            |_, _, _, planar| {
+                if controlled.is_empty() {
+                    controlled.resize_with(planar.len(), Vec::new);
+                }
+                for (destination, source) in controlled.iter_mut().zip(planar) {
+                    destination.extend_from_slice(source);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(controlled, regular);
+
+        let mut probe_checks = 0_usize;
+        probe_with_layout_controlled(&path, u64::MAX, || {
+            probe_checks += 1;
+            Ok(())
+        })
+        .unwrap();
+        let mut checks = 0_usize;
+        let stop_after = probe_checks + 6;
+        let mut delivered = 0_usize;
+        let mid_control =
+            crate::service_runtime::RequestControl::from_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        let checkpoint_control = mid_control.clone();
+        let error = decode_stream_with_layout_and_declared_frames_controlled(
+            &path,
+            4096,
+            || {
+                checks += 1;
+                if checks >= stop_after {
+                    checkpoint_control.cancel();
+                }
+                checkpoint_control
+                    .check()
+                    .map_err(|error| error.to_string())
+            },
+            |_, _, _, planar| {
+                delivered += planar.first().map_or(0, Vec::len);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            mid_control.check().unwrap_err().kind(),
+            crate::service_runtime::ServiceRuntimeErrorKind::Cancelled
+        );
+        assert!(error.contains("cancelled"));
+        assert!(delivered < regular[0].len());
+    }
+
+    #[test]
+    fn controlled_dsf_honors_cancel_and_deadline_before_consuming_pcm() {
+        use crate::service_runtime::{RequestControl, ServiceRuntimeErrorKind};
+        use std::time::{Duration, Instant};
+
+        let bits = vec![false, true]
+            .into_iter()
+            .cycle()
+            .take(4096 * 8)
+            .collect::<Vec<_>>();
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("terminal-control.dsf");
+        fs::write(&path, make_dsf(&[bits], 2_822_400)).unwrap();
+
+        let cancelled = RequestControl::from_timeout(Duration::from_secs(1)).unwrap();
+        assert!(cancelled.cancel());
+        let expired = RequestControl::with_deadline(Instant::now());
+        for (control, expected) in [
+            (cancelled, ServiceRuntimeErrorKind::Cancelled),
+            (expired, ServiceRuntimeErrorKind::DeadlineExceeded),
+        ] {
+            let mut callbacks = 0;
+            let error = decode_stream_with_layout_and_declared_frames_controlled(
+                &path,
+                1024,
+                || control.check().map_err(|error| error.to_string()),
+                |_, _, _, _| {
+                    callbacks += 1;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(control.check().unwrap_err().kind(), expected);
+            assert!(
+                error.contains(if expected == ServiceRuntimeErrorKind::Cancelled {
+                    "cancelled"
+                } else {
+                    "deadline"
+                })
+            );
+            assert_eq!(callbacks, 0);
+        }
     }
 
     #[test]

@@ -9,10 +9,11 @@ use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
 use rubato::{Async, FixedAsync, Indexing, PolynomialDegree, Resampler};
 use serde::Serialize;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 pub use crate::opus_tags::{read_r128_tags, rewrite_r128_tags};
 
@@ -21,6 +22,7 @@ const FRAME_SIZE: usize = 960;
 const MAX_PACKET_FRAMES: usize = 5760;
 const RESAMPLE_CHUNK: usize = 1024;
 const MAX_RESAMPLE_FLUSH_PASSES: usize = 8;
+const CONTROLLED_OGG_READ_BYTES: usize = 32 * 1024;
 static NEXT_SERIAL: AtomicU32 = AtomicU32::new(0x464f_5247);
 
 #[derive(Debug, Clone, Serialize)]
@@ -370,9 +372,55 @@ where
 {
     let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let mut packets = PacketReader::new(BufReader::new(file));
+    decode_stream_packets(path, &mut packets, || Ok(()), &mut consume)
+}
+
+/// Service-only decoder that checks request control on every Ogg reader I/O,
+/// page/packet boundary, and PCM callback. The caller first validates a fixed
+/// encoded-packet cap against the immutable snapshot, so `PacketReader` cannot
+/// grow an unbounded continued-packet vector between checkpoints.
+pub(crate) fn decode_stream_controlled<F, C>(
+    path: &Path,
+    checkpoint: C,
+    mut consume: F,
+) -> Result<StreamInfo, String>
+where
+    F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
+    C: FnMut() -> Result<(), String> + Send,
+{
+    let checkpoint = Mutex::new(checkpoint);
+    let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let reader = CheckpointReader {
+        file,
+        checkpoint: &checkpoint,
+    };
+    let mut packets = PacketReader::new(BufReader::new(reader));
+    decode_stream_packets(
+        path,
+        &mut packets,
+        || run_checkpoint(&checkpoint),
+        &mut consume,
+    )
+}
+
+fn decode_stream_packets<R, F, C>(
+    path: &Path,
+    packets: &mut PacketReader<R>,
+    mut checkpoint: C,
+    consume: &mut F,
+) -> Result<StreamInfo, String>
+where
+    R: Read + Seek,
+    F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
+    C: FnMut() -> Result<(), String>,
+{
     let mut primary_info: Option<StreamInfo> = None;
     let mut chain_index = 0_usize;
-    while let Some(head) = read_ogg_packet(&mut packets, path, "OpusHead")? {
+    loop {
+        checkpoint()?;
+        let Some(head) = read_ogg_packet(packets, path, "OpusHead")? else {
+            break;
+        };
         chain_index += 1;
         if !head.first_in_stream() || !head.data.starts_with(b"OpusHead") {
             return Err(format!(
@@ -404,36 +452,46 @@ where
             head,
             &parsed,
             &info,
-            &mut packets,
-            &mut consume,
+            packets,
+            consume,
+            &mut checkpoint,
         )?;
+        checkpoint()?;
     }
     primary_info.ok_or_else(|| format!("{}: missing OpusHead", path.display()))
 }
 
-fn read_ogg_packet(
-    packets: &mut PacketReader<BufReader<File>>,
+fn read_ogg_packet<R>(
+    packets: &mut PacketReader<R>,
     path: &Path,
     label: &str,
-) -> Result<Option<Packet>, String> {
+) -> Result<Option<Packet>, String>
+where
+    R: Read + Seek,
+{
     packets
         .read_packet()
         .map_err(|error| format!("{}: read {label}: {error}", path.display()))
 }
 
-fn decode_opus_chain<F>(
+#[allow(clippy::too_many_arguments)]
+fn decode_opus_chain<R, F, C>(
     path: &Path,
     chain_index: usize,
     head: Packet,
     parsed: &ParsedOpusHead,
     info: &StreamInfo,
-    packets: &mut PacketReader<BufReader<File>>,
+    packets: &mut PacketReader<R>,
     consume: &mut F,
+    checkpoint: &mut C,
 ) -> Result<(), String>
 where
+    R: Read + Seek,
     F: FnMut(&StreamInfo, &mut [Vec<f32>]) -> Result<(), String>,
+    C: FnMut() -> Result<(), String>,
 {
     let serial = head.stream_serial();
+    checkpoint()?;
     let tags = read_ogg_packet(packets, path, "OpusTags")?.ok_or_else(|| {
         format!(
             "{}: chain {chain_index} is missing OpusTags",
@@ -465,6 +523,7 @@ where
         .map(|_| Vec::with_capacity(MAX_PACKET_FRAMES))
         .collect::<Vec<_>>();
     loop {
+        checkpoint()?;
         let packet = read_ogg_packet(packets, path, "Ogg Opus packet")?.ok_or_else(|| {
             format!(
                 "{}: chain {chain_index} ended without an Ogg EOS page",
@@ -517,6 +576,7 @@ where
                 }
             }
             consume(info, &mut planar)?;
+            checkpoint()?;
         }
         if packet.last_in_stream() {
             if skip != 0 {
@@ -529,6 +589,42 @@ where
         }
     }
     Ok(())
+}
+
+struct CheckpointReader<'a, C> {
+    file: File,
+    checkpoint: &'a Mutex<C>,
+}
+
+fn run_checkpoint<C>(checkpoint: &Mutex<C>) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    let mut checkpoint = checkpoint
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    checkpoint()
+}
+
+impl<C> Read for CheckpointReader<'_, C>
+where
+    C: FnMut() -> Result<(), String> + Send,
+{
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        run_checkpoint(self.checkpoint).map_err(io::Error::other)?;
+        let length = output.len().min(CONTROLLED_OGG_READ_BYTES);
+        self.file.read(&mut output[..length])
+    }
+}
+
+impl<C> Seek for CheckpointReader<'_, C>
+where
+    C: FnMut() -> Result<(), String> + Send,
+{
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        run_checkpoint(self.checkpoint).map_err(io::Error::other)?;
+        self.file.seek(position)
+    }
 }
 
 /// Validate the Ogg wrapper and every sequential Opus logical stream without
@@ -1031,6 +1127,62 @@ mod tests {
         fn assert_traits<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
 
         assert_traits::<OpusStreamWriter>();
+    }
+
+    #[test]
+    fn controlled_decoder_checks_before_packet_reader_io() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("controlled.opus");
+        let roles = default_channel_roles(1);
+        let mut writer =
+            OpusStreamWriter::create(&path, OPUS_RATE, FRAME_SIZE, 1, &roles, 64, -18.0, None)
+                .unwrap();
+        writer.write_chunk(&[vec![0.0; FRAME_SIZE]]).unwrap();
+        writer.finish().unwrap();
+
+        let mut checkpoints = 0;
+        let mut callbacks = 0;
+        let error = decode_stream_controlled(
+            &path,
+            || {
+                checkpoints += 1;
+                if checkpoints == 2 {
+                    Err("controlled Opus read stopped".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_, _| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("read OpusHead: I/O error"), "{error}");
+        assert_eq!(checkpoints, 2);
+        assert_eq!(callbacks, 0);
+    }
+
+    #[test]
+    fn controlled_ogg_reader_splits_large_metadata_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large-tags.bin");
+        std::fs::write(&path, vec![0x5a; CONTROLLED_OGG_READ_BYTES * 2]).unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = std::sync::Arc::clone(&calls);
+        let checkpoint = Mutex::new(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+        let mut reader = CheckpointReader {
+            file: File::open(path).unwrap(),
+            checkpoint: &checkpoint,
+        };
+        let mut bytes = vec![0; CONTROLLED_OGG_READ_BYTES * 2];
+        assert_eq!(reader.read(&mut bytes).unwrap(), CONTROLLED_OGG_READ_BYTES);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(reader.read(&mut bytes).unwrap(), CONTROLLED_OGG_READ_BYTES);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]

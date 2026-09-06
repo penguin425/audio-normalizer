@@ -16,8 +16,9 @@ pub use crate::wav::ChannelLayoutProvenance;
 use crate::wav::{default_channel_roles, AudioBuffer, ChannelRole, PcmKind, WavReader};
 pub(crate) use crate::wav::{MAX_DECODE_SAMPLE_RATE_HZ, MIN_DECODE_SAMPLE_RATE_HZ};
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, IoSliceMut, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Mutex;
 
 const MONO_WAV_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const MULTICHANNEL_WAV_STREAM_CHUNK_BYTES: usize = 1024 * 1024;
@@ -28,10 +29,251 @@ const FLAC_SAMPLE_VALUES_PER_DECODER: u64 = 192_000;
 const FLAC_FILE_BYTES_PER_DECODER: u64 = 192 * 1024;
 const MAX_PARALLEL_FLAC_PACKET_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PARALLEL_FLAC_PCM_BYTES: usize = 32 * 1024 * 1024;
+// The service admits the immutable encoded input separately, but a demuxer
+// may still materialize one packet or metadata item. Preflight every
+// self-delimiting container before handing it to a third-party parser and
+// keep each such allocation within the decoder's fixed 64 MiB allowance.
+const SERVICE_MAX_ENCODED_PACKET_BYTES: u64 = 16 * 1024 * 1024;
+const SERVICE_MAX_METADATA_ITEM_BYTES: u64 = 1024 * 1024;
+const SERVICE_MAX_METADATA_TOTAL_BYTES: u64 = SERVICE_MAX_ENCODED_PACKET_BYTES;
+const SERVICE_MAX_CONTAINER_ITEMS: usize = 100_000;
+const SERVICE_CONTAINER_CHECKPOINT_ITEMS: usize = 64;
+const SERVICE_CONTROLLED_READ_BYTES: usize = 32 * 1024;
+const SERVICE_SYMPHONIA_PROBE_BYTES: u64 = 1024 * 1024;
+const SERVICE_MAX_ISOBMFF_SAMPLE_ENTRIES: u32 = (SERVICE_MAX_ENCODED_PACKET_BYTES / 4) as u32;
 // MP3, AAC, and Vorbis normally decode much smaller packets. The normalization
 // render pass groups whole packets to amortize callbacks and writer work while
 // staying below the analyzer's 16,384-frame True Peak task threshold.
 const TARGET_SYMPHONIA_STREAM_CHUNK_FRAMES: usize = 4_096;
+
+/// Shared allocation-before-read contract for metadata reached through a
+/// service decode. An entry count and aggregate encoded-byte budget complement
+/// the per-value limit; callers decide which physical leaf bytes are counted so
+/// nested container wrappers are not charged twice.
+#[derive(Default)]
+struct ServiceMetadataBudget {
+    entries: usize,
+    encoded_bytes: u64,
+}
+
+/// File-wide metadata accounting used when more than one supplemental tag
+/// family can be visible to Symphonia (for example native FLAC plus APEv2).
+/// Exact APE byte ranges are remembered so the header and footer probe anchors
+/// cannot charge one physical tag twice.
+#[derive(Default)]
+struct ServiceMetadataContext {
+    budget: ServiceMetadataBudget,
+    ape_ranges: Vec<(u64, u64)>,
+}
+
+impl ServiceMetadataContext {
+    fn record_ape(&mut self, start: u64, end: u64, entries: usize) -> Result<bool, String> {
+        if self.ape_ranges.contains(&(start, end)) {
+            return Ok(false);
+        }
+        if self
+            .ape_ranges
+            .iter()
+            .any(|&(seen_start, seen_end)| start < seen_end && seen_start < end)
+        {
+            return Err("overlapping APE metadata ranges".into());
+        }
+        let bytes = end
+            .checked_sub(start)
+            .ok_or_else(|| "APE metadata range underflow".to_string())?;
+        self.budget.add_entries(entries)?;
+        self.budget.add_encoded_bytes(bytes)?;
+        self.ape_ranges.push((start, end));
+        Ok(true)
+    }
+}
+
+impl ServiceMetadataBudget {
+    fn add_entries(&mut self, entries: usize) -> Result<(), String> {
+        self.entries = self
+            .entries
+            .checked_add(entries)
+            .filter(|&count| count <= SERVICE_MAX_CONTAINER_ITEMS)
+            .ok_or_else(|| SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.to_string())?;
+        Ok(())
+    }
+
+    fn add_encoded_bytes(&mut self, bytes: u64) -> Result<(), String> {
+        self.encoded_bytes = self
+            .encoded_bytes
+            .checked_add(bytes)
+            .filter(|&total| total <= SERVICE_MAX_METADATA_TOTAL_BYTES)
+            .ok_or_else(|| SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.to_string())?;
+        Ok(())
+    }
+
+    fn validate_item(bytes: u64) -> Result<(), String> {
+        if bytes > SERVICE_MAX_METADATA_ITEM_BYTES {
+            Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// A Symphonia media source that observes the service's absolute request
+/// control on every underlying read and seek. Forge bounds each actual read to
+/// 32 KiB even when a caller supplies a larger destination and exposes only
+/// the preflighted half-open physical byte range. Container preflight below
+/// separately prevents a parser from allocating an attacker-declared packet
+/// before the first read.
+struct CheckpointMediaSource<'a, C> {
+    file: File,
+    base_offset: u64,
+    byte_len: u64,
+    checkpoint: &'a Mutex<C>,
+}
+
+impl<'a, C> CheckpointMediaSource<'a, C>
+where
+    C: FnMut() -> Result<(), String> + Send,
+{
+    fn new_range(
+        mut file: File,
+        checkpoint: &'a Mutex<C>,
+        base_offset: u64,
+        end_offset: u64,
+    ) -> Result<Self, String> {
+        let physical_len = file
+            .metadata()
+            .map_err(|error| format!("inspect controlled media source: {error}"))?
+            .len();
+        if end_offset > physical_len {
+            return Err("controlled media source end exceeds input length".into());
+        }
+        let byte_len = end_offset
+            .checked_sub(base_offset)
+            .ok_or_else(|| "controlled media source range is reversed".to_string())?;
+        file.seek(SeekFrom::Start(base_offset))
+            .map_err(|error| format!("seek controlled media source: {error}"))?;
+        Ok(Self {
+            file,
+            base_offset,
+            byte_len,
+            checkpoint,
+        })
+    }
+
+    fn check(&self) -> io::Result<()> {
+        let mut checkpoint = self
+            .checkpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        checkpoint().map_err(io::Error::other)
+    }
+}
+
+impl<C> Read for CheckpointMediaSource<'_, C>
+where
+    C: FnMut() -> Result<(), String> + Send,
+{
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        self.check()?;
+        let physical_end = self
+            .base_offset
+            .checked_add(self.byte_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "input length overflow"))?;
+        let position = self.file.stream_position()?;
+        let remaining = physical_end.checked_sub(position).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "controlled media source position exceeds its admitted range",
+            )
+        })?;
+        let length = output
+            .len()
+            .min(SERVICE_CONTROLLED_READ_BYTES)
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        self.file.read(&mut output[..length])
+    }
+
+    fn read_vectored(&mut self, outputs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+        let Some(output) = outputs.iter_mut().find(|output| !output.is_empty()) else {
+            return Ok(0);
+        };
+        let length = output.len().min(SERVICE_CONTROLLED_READ_BYTES);
+        self.read(&mut output[..length])
+    }
+}
+
+impl<C> Seek for CheckpointMediaSource<'_, C>
+where
+    C: FnMut() -> Result<(), String> + Send,
+{
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.check()?;
+        let physical_len = self
+            .base_offset
+            .checked_add(self.byte_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "input length overflow"))?;
+        let absolute = match position {
+            SeekFrom::Start(offset) => self.base_offset.checked_add(offset),
+            SeekFrom::Current(offset) => self.file.stream_position()?.checked_add_signed(offset),
+            SeekFrom::End(offset) => physical_len.checked_add_signed(offset),
+        }
+        .filter(|&offset| offset >= self.base_offset && offset <= physical_len)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek outside controlled media source range",
+            )
+        })?;
+        self.file.seek(SeekFrom::Start(absolute))?;
+        Ok(absolute - self.base_offset)
+    }
+}
+
+impl<C> symphonia::core::io::MediaSource for CheckpointMediaSource<'_, C>
+where
+    C: FnMut() -> Result<(), String> + Send,
+{
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        Some(self.byte_len)
+    }
+}
+
+fn run_locked_checkpoint<C>(checkpoint: &Mutex<C>) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    let mut checkpoint = checkpoint
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    checkpoint()
+}
+
+fn run_decoder_checkpoint<C>(
+    plain: &mut Option<C>,
+    controlled: &Option<Mutex<C>>,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    if let Some(checkpoint) = controlled {
+        run_locked_checkpoint(checkpoint)
+    } else {
+        plain
+            .as_mut()
+            .expect("one decoder checkpoint representation is present")()
+    }
+}
+
+fn service_metadata_options() -> symphonia::core::meta::MetadataOptions {
+    use symphonia::core::common::Limit;
+
+    symphonia::core::meta::MetadataOptions::default()
+        .limit_tag_bytes(Limit::Maximum(SERVICE_MAX_METADATA_ITEM_BYTES as usize))
+        .limit_visual_bytes(Limit::Maximum(SERVICE_MAX_METADATA_ITEM_BYTES as usize))
+}
 
 fn is_wave_extension(extension: &str) -> bool {
     matches!(extension, "wav" | "wave" | "bwf" | "bw64" | "rf64")
@@ -424,6 +666,10 @@ pub struct InputDescriptor {
     explicit_channel_roles: bool,
     explicit_channel_layout: bool,
     range: SourceFrameRange,
+    // Service-only immutable container route and byte range. A controlled
+    // decode must reproduce this exact preflight before reopening the
+    // snapshot; ordinary public descriptors retain `None`.
+    service_preflight: Option<ServiceContainerPreflight>,
 }
 
 impl std::fmt::Debug for InputDescriptor {
@@ -456,8 +702,41 @@ impl std::fmt::Debug for InputDescriptor {
 impl InputDescriptor {
     /// Probe one immutable input and bind the exact selected programme.
     pub fn probe(input: StableInput, options: InputDescriptorOptions) -> Result<Self, String> {
+        Self::probe_impl(input, options, None, || Ok(()))
+    }
+
+    /// Service-only probe with cooperative cancellation and a decoded-sample
+    /// ceiling. Public callers retain the exact legacy probe behaviour.
+    pub(crate) fn probe_with_control<C>(
+        input: StableInput,
+        options: InputDescriptorOptions,
+        max_decoded_samples: u64,
+        checkpoint: C,
+    ) -> Result<Self, String>
+    where
+        C: FnMut() -> Result<(), String> + Send,
+    {
+        Self::probe_impl(input, options, Some(max_decoded_samples), checkpoint)
+    }
+
+    fn probe_impl<C>(
+        input: StableInput,
+        options: InputDescriptorOptions,
+        max_decoded_samples: Option<u64>,
+        mut checkpoint: C,
+    ) -> Result<Self, String>
+    where
+        C: FnMut() -> Result<(), String> + Send,
+    {
+        checkpoint()?;
         validate_descriptor_options(&options)?;
-        let probed = probe_registry(&input, options.track)?;
+        let probed = probe_registry_with_control(
+            &input,
+            options.track,
+            max_decoded_samples,
+            &mut checkpoint,
+        )?;
+        checkpoint()?;
         let explicit_layout = if let Some(layout) = options.channel_layout.as_ref() {
             layout.validate()?;
             Some(layout.clone())
@@ -506,6 +785,7 @@ impl InputDescriptor {
             explicit_channel_roles,
             explicit_channel_layout,
             range,
+            service_preflight: probed.service_preflight,
         })
     }
 
@@ -600,6 +880,7 @@ struct RegistryProbe {
     declared_frames: Option<u64>,
     decoder_layout_provenance: ChannelLayoutProvenance,
     channel_layout: ChannelLayoutDescriptor,
+    service_preflight: Option<ServiceContainerPreflight>,
 }
 
 struct RegistryIdentity {
@@ -662,17 +943,33 @@ fn source_frame_range(
     Ok(SourceFrameRange { start, frames })
 }
 
-fn probe_registry(
+fn probe_registry_with_control<C>(
     input: &StableInput,
     selection: AudioTrackSelection,
-) -> Result<RegistryProbe, String> {
+    max_packet_samples: Option<u64>,
+    mut checkpoint: C,
+) -> Result<RegistryProbe, String>
+where
+    C: FnMut() -> Result<(), String> + Send,
+{
+    checkpoint()?;
     let path = input.stable_path();
+    let service_preflight = max_packet_samples
+        .map(|_| service_container_preflight(path, &mut checkpoint))
+        .transpose()?;
     let route = sniff_decoder_route(path)?;
+    if service_preflight
+        .is_some_and(|preflight| !service_preflight_accepts_decoder_route(preflight.route, route))
+    {
+        return Err("service preflight route disagrees with the selected decoder route".into());
+    }
+    checkpoint()?;
     let display = display_input(input);
     if route == DecoderRoute::Wave {
         require_single_track(selection)?;
-        let (wav, channel_layout) = WavReader::probe_with_channel_layout(path)
-            .map_err(|error| format!("{display}: {error}"))?;
+        let (wav, channel_layout) =
+            WavReader::probe_with_channel_layout_controlled(path, &mut checkpoint)
+                .map_err(|error| format!("{display}: {error}"))?;
         let bytes_per_frame = u64::from(wav.channels) * wav.kind.bytes_per_sample() as u64;
         let declared_frames = Some(wav.data_size / bytes_per_frame);
         let kind = wav.kind;
@@ -692,15 +989,35 @@ fn probe_registry(
             declared_frames,
             decoder_layout_provenance,
             channel_layout,
+            service_preflight,
         });
     }
-    let identity =
-        registry_identity_at(path, input.source_name_hint(), &display, route, selection)?;
+    let identity = if route == DecoderRoute::Symphonia && max_packet_samples.is_some() {
+        probe_symphonia_identity_at_controlled(
+            path,
+            input.source_name_hint(),
+            &display,
+            selection,
+            service_preflight.expect("controlled probe has service preflight"),
+            &mut checkpoint,
+        )?
+    } else {
+        registry_identity_at(path, input.source_name_hint(), &display, route, selection)?
+    };
     if let Some((info, decoder_channel_layout, declared_frames)) = identity.stream {
         let decoder_layout_provenance = decoder_channel_layout.provenance();
         let channel_layout = if identity.container == AudioContainer::IsoBmff {
-            crate::isobmff_qc::probe_channel_layout(path, identity.track_id, info.channels)?
-                .unwrap_or(decoder_channel_layout)
+            let exact = if max_packet_samples.is_some() {
+                crate::isobmff_qc::probe_channel_layout_controlled(
+                    path,
+                    identity.track_id,
+                    info.channels,
+                    &mut checkpoint,
+                )?
+            } else {
+                crate::isobmff_qc::probe_channel_layout(path, identity.track_id, info.channels)?
+            };
+            exact.unwrap_or(decoder_channel_layout)
         } else {
             decoder_channel_layout
         };
@@ -714,16 +1031,22 @@ fn probe_registry(
             declared_frames,
             decoder_layout_provenance,
             channel_layout,
+            service_preflight,
         });
     }
 
     const PROBE_COMPLETE: &str = "__forge_input_descriptor_probe_complete__";
     let mut captured = None;
-    let decoded = decode_stream_raw_with_selection(
+    let decoded = decode_stream_raw_with_selection_and_control(
         path,
         route,
         selection,
         None,
+        max_packet_samples.map(|max_packet_samples| ServiceDecodeControl {
+            max_packet_samples,
+            expected_preflight: service_preflight,
+        }),
+        &mut checkpoint,
         |info, provenance, declared_frames, _| {
             captured = Some((info.clone(), provenance, declared_frames));
             Err(PROBE_COMPLETE.into())
@@ -741,10 +1064,19 @@ fn probe_registry(
         )
     })?;
     let channel_layout = if identity.container == AudioContainer::IsoBmff {
-        crate::isobmff_qc::probe_channel_layout(path, identity.track_id, info.channels)?
-            .unwrap_or_else(|| {
-                ChannelLayoutDescriptor::decoded_from_roles(&info.channel_roles, layout_provenance)
-            })
+        let exact = if max_packet_samples.is_some() {
+            crate::isobmff_qc::probe_channel_layout_controlled(
+                path,
+                identity.track_id,
+                info.channels,
+                &mut checkpoint,
+            )?
+        } else {
+            crate::isobmff_qc::probe_channel_layout(path, identity.track_id, info.channels)?
+        };
+        exact.unwrap_or_else(|| {
+            ChannelLayoutDescriptor::decoded_from_roles(&info.channel_roles, layout_provenance)
+        })
     } else {
         ChannelLayoutDescriptor::decoded_from_roles(&info.channel_roles, layout_provenance)
     };
@@ -758,6 +1090,7 @@ fn probe_registry(
         declared_frames,
         decoder_layout_provenance: layout_provenance,
         channel_layout,
+        service_preflight,
     })
 }
 
@@ -838,6 +1171,2929 @@ fn require_single_track(selection: AudioTrackSelection) -> Result<(), String> {
     }
 }
 
+/// Validate attacker-controlled container framing without materializing media
+/// payloads. The immutable service snapshot is scanned before any third-party
+/// demuxer sees it, so a later parser allocation cannot exceed the admitted
+/// packet/metadata bounds merely by trusting an encoded length field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServiceContainerSniff {
+    NativeBounded,
+    Ogg,
+    Matroska,
+    Flac,
+    IsoBmff,
+    RawMpegOrAdts,
+    UnsupportedMetadataContainer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServiceContainerPreflightRoute {
+    NativeBounded,
+    Ogg,
+    Matroska,
+    Flac,
+    IsoBmff,
+    Mpa,
+    Adts,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ServiceContainerPreflight {
+    route: ServiceContainerPreflightRoute,
+    media_offset: u64,
+    media_end: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ServiceDecodeControl {
+    max_packet_samples: u64,
+    expected_preflight: Option<ServiceContainerPreflight>,
+}
+
+fn service_container_preflight_sniff(prefix: &[u8], file_len: u64) -> ServiceContainerSniff {
+    if (prefix.len() >= 12
+        && matches!(&prefix[..4], b"RIFF" | b"RF64" | b"BW64")
+        && &prefix[8..12] == b"WAVE")
+        || prefix.starts_with(b"DSD ")
+        || (prefix.len() >= 16 && &prefix[..4] == b"FRM8" && &prefix[12..16] == b"DSD ")
+    {
+        ServiceContainerSniff::NativeBounded
+    } else if prefix.starts_with(b"OggS") {
+        ServiceContainerSniff::Ogg
+    } else if prefix.starts_with(&0x1a45_dfa3_u32.to_be_bytes()) {
+        ServiceContainerSniff::Matroska
+    } else if prefix.starts_with(b"fLaC") {
+        ServiceContainerSniff::Flac
+    } else if crate::isobmff_qc::looks_like_isobmff(prefix, file_len) {
+        ServiceContainerSniff::IsoBmff
+    } else if (prefix.len() >= 12
+        && &prefix[..4] == b"FORM"
+        && matches!(&prefix[8..12], b"AIFF" | b"AIFC"))
+        || prefix.starts_with(b"caff")
+    {
+        // These formats are not enabled in the pinned Symphonia build. Keep an
+        // explicit fail-closed registry entry so enabling one cannot silently
+        // bypass metadata allocation preflight.
+        ServiceContainerSniff::UnsupportedMetadataContainer
+    } else {
+        ServiceContainerSniff::RawMpegOrAdts
+    }
+}
+
+fn service_container_preflight<C>(
+    path: &Path,
+    mut checkpoint: C,
+) -> Result<ServiceContainerPreflight, String>
+where
+    C: FnMut() -> Result<(), String> + Send,
+{
+    checkpoint()?;
+    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .len();
+    let mut prefix = [0_u8; 16];
+    let prefix_len = file
+        .read(&mut prefix)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let prefix = &prefix[..prefix_len];
+    let mut metadata = ServiceMetadataContext::default();
+    let preflight = match service_container_preflight_sniff(prefix, file_len) {
+        ServiceContainerSniff::NativeBounded => {
+            // The WAVE and DSD readers perform their own controlled structural
+            // preflight before allocating decoded output.
+            ServiceContainerPreflight {
+                route: ServiceContainerPreflightRoute::NativeBounded,
+                media_offset: 0,
+                media_end: file_len,
+            }
+        }
+        ServiceContainerSniff::Ogg => {
+            preflight_ogg_packets(
+                path,
+                file_len,
+                SERVICE_MAX_ENCODED_PACKET_BYTES,
+                &mut checkpoint,
+            )?;
+            ServiceContainerPreflight {
+                route: ServiceContainerPreflightRoute::Ogg,
+                media_offset: 0,
+                media_end: file_len,
+            }
+        }
+        ServiceContainerSniff::Matroska => {
+            preflight_matroska(
+                path,
+                file_len,
+                SERVICE_MAX_ENCODED_PACKET_BYTES,
+                &mut checkpoint,
+            )?;
+            ServiceContainerPreflight {
+                route: ServiceContainerPreflightRoute::Matroska,
+                media_offset: 0,
+                media_end: file_len,
+            }
+        }
+        ServiceContainerSniff::Flac => {
+            preflight_flac_metadata(path, file_len, &mut metadata.budget, &mut checkpoint)?;
+            preflight_trailing_ape(path, file_len, &mut metadata, &mut checkpoint)?;
+            ServiceContainerPreflight {
+                route: ServiceContainerPreflightRoute::Flac,
+                media_offset: 0,
+                media_end: file_len,
+            }
+        }
+        ServiceContainerSniff::IsoBmff => {
+            preflight_isobmff_top_level(path, file_len, &mut checkpoint)?;
+            ServiceContainerPreflight {
+                route: ServiceContainerPreflightRoute::IsoBmff,
+                media_offset: 0,
+                media_end: file_len,
+            }
+        }
+        ServiceContainerSniff::RawMpegOrAdts => {
+            preflight_trailing_ape(path, file_len, &mut metadata, &mut checkpoint)?;
+            preflight_raw_mpeg_or_id3(path, file_len, prefix, &mut metadata, &mut checkpoint)?
+        }
+        ServiceContainerSniff::UnsupportedMetadataContainer => {
+            return Err(format!(
+                "{}: service input format has no registered bounded metadata preflight",
+                path.display()
+            ));
+        }
+    };
+    checkpoint()?;
+    Ok(preflight)
+}
+
+fn preflight_raw_mpeg_or_id3<C>(
+    path: &Path,
+    file_len: u64,
+    prefix: &[u8],
+    metadata: &mut ServiceMetadataContext,
+    checkpoint: &mut C,
+) -> Result<ServiceContainerPreflight, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    if service_raw_audio_frame(prefix, file_len).is_some()
+        || (prefix.len() >= 3 && &prefix[..3] == b"ID3")
+    {
+        return preflight_raw_mpeg_or_id3_at(path, file_len, 0, prefix, metadata, checkpoint);
+    }
+
+    let Some(audio_start) = preflight_leading_ape(path, file_len, metadata, checkpoint)? else {
+        return Err(format!(
+            "{}: service input has no bounded audio-container signature",
+            path.display()
+        ));
+    };
+    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    file.seek(SeekFrom::Start(audio_start))
+        .map_err(|error| format!("seek {} after leading APE: {error}", path.display()))?;
+    let mut audio_prefix = [0_u8; 16];
+    let prefix_len = file
+        .read(&mut audio_prefix)
+        .map_err(|error| format!("read {} after leading APE: {error}", path.display()))?;
+    preflight_raw_mpeg_or_id3_at(
+        path,
+        file_len,
+        audio_start,
+        &audio_prefix[..prefix_len],
+        metadata,
+        checkpoint,
+    )
+}
+
+fn preflight_raw_mpeg_or_id3_at<C>(
+    path: &Path,
+    file_len: u64,
+    start: u64,
+    prefix: &[u8],
+    metadata: &mut ServiceMetadataContext,
+    checkpoint: &mut C,
+) -> Result<ServiceContainerPreflight, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    if service_raw_audio_frame(prefix, file_len.saturating_sub(start)).is_some() {
+        return preflight_raw_audio_frames(path, file_len, start, metadata, checkpoint);
+    }
+    if prefix.starts_with(b"fLaC") {
+        preflight_flac_metadata_at(path, file_len, start, &mut metadata.budget, checkpoint)?;
+        return Ok(ServiceContainerPreflight {
+            route: ServiceContainerPreflightRoute::Flac,
+            media_offset: start,
+            media_end: file_len,
+        });
+    }
+    if prefix.len() < 10 || &prefix[..3] != b"ID3" {
+        return Err(format!(
+            "{}: service input has no bounded audio-container signature",
+            path.display()
+        ));
+    }
+    let end = preflight_id3v2_at(path, file_len, start, metadata, checkpoint)?;
+    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    file.seek(SeekFrom::Start(end))
+        .map_err(|error| format!("seek {} after ID3: {error}", path.display()))?;
+    let mut sync = [0_u8; 16];
+    let read = file
+        .read(&mut sync)
+        .map_err(|error| format!("read {} after ID3: {error}", path.display()))?;
+    if service_raw_audio_frame(&sync[..read], file_len.saturating_sub(end)).is_none() {
+        return Err(format!(
+            "{}: ID3 metadata is not followed by bounded MPEG/ADTS audio",
+            path.display()
+        ));
+    }
+    preflight_raw_audio_frames(path, file_len, end, metadata, checkpoint)
+}
+
+/// Return the complete first-frame size only after validating the encoded
+/// MPEG audio or ADTS geometry. A two-byte sync word is deliberately
+/// insufficient: supplemental metadata probing must not stop at an arbitrary
+/// `ff fb` sequence embedded before a later tag.
+fn service_raw_audio_frame(
+    prefix: &[u8],
+    remaining: u64,
+) -> Option<(ServiceContainerPreflightRoute, u64)> {
+    if prefix.len() < 4 || prefix[0] != 0xff || prefix[1] & 0xe0 != 0xe0 {
+        return None;
+    }
+    let layer = (prefix[1] >> 1) & 0x03;
+    if layer == 0 {
+        if prefix.len() < 7 || prefix[1] & 0x06 != 0 || prefix[2] >> 2 & 0x0f >= 13 {
+            return None;
+        }
+        let header_bytes = if prefix[1] & 1 == 0 { 9 } else { 7 };
+        if prefix.len() < header_bytes {
+            return None;
+        }
+        let channel_configuration = ((u16::from(prefix[2] & 1)) << 2) | u16::from(prefix[3] >> 6);
+        let frame_bytes = (u64::from(prefix[3] & 0x03) << 11)
+            | (u64::from(prefix[4]) << 3)
+            | u64::from(prefix[5] >> 5);
+        return (channel_configuration != 0
+            && frame_bytes >= header_bytes as u64
+            && frame_bytes <= SERVICE_MAX_ENCODED_PACKET_BYTES
+            && frame_bytes <= remaining)
+            .then_some((ServiceContainerPreflightRoute::Adts, frame_bytes));
+    }
+
+    let version = (prefix[1] >> 3) & 0x03;
+    let bitrate_index = usize::from(prefix[2] >> 4);
+    let rate_index = usize::from((prefix[2] >> 2) & 0x03);
+    if version == 1
+        || bitrate_index == 0
+        || bitrate_index == 15
+        || rate_index == 3
+        || prefix[3] & 0x03 == 2
+    {
+        return None;
+    }
+    const MPEG1_L1: [u32; 14] = [
+        32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448,
+    ];
+    const MPEG1_L2: [u32; 14] = [
+        32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
+    ];
+    const MPEG1_L3: [u32; 14] = [
+        32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    ];
+    const MPEG2_L1: [u32; 14] = [
+        32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256,
+    ];
+    const MPEG2_L23: [u32; 14] = [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+    let table = match (version, layer) {
+        (3, 3) => &MPEG1_L1,
+        (3, 2) => &MPEG1_L2,
+        (3, 1) => &MPEG1_L3,
+        (_, 3) => &MPEG2_L1,
+        _ => &MPEG2_L23,
+    };
+    let bitrate = u64::from(table[bitrate_index - 1]) * 1_000;
+    let base_rate = [44_100_u64, 48_000, 32_000][rate_index];
+    let sample_rate = match version {
+        3 => base_rate,
+        2 => base_rate / 2,
+        0 => base_rate / 4,
+        _ => return None,
+    };
+    let padding = u64::from((prefix[2] >> 1) & 1);
+    let frame_bytes = match layer {
+        3 => (12 * bitrate / sample_rate + padding) * 4,
+        2 => 144 * bitrate / sample_rate + padding,
+        1 if version == 3 => 144 * bitrate / sample_rate + padding,
+        1 => 72 * bitrate / sample_rate + padding,
+        _ => return None,
+    };
+    ((4..=SERVICE_MAX_ENCODED_PACKET_BYTES).contains(&frame_bytes) && frame_bytes <= remaining)
+        .then_some((ServiceContainerPreflightRoute::Mpa, frame_bytes))
+}
+
+#[cfg(test)]
+fn service_raw_audio_frame_bytes(prefix: &[u8], remaining: u64) -> Option<u64> {
+    service_raw_audio_frame(prefix, remaining).map(|(_, bytes)| bytes)
+}
+
+fn service_raw_audio_end(
+    path: &Path,
+    file_len: u64,
+    audio_start: u64,
+    metadata: &ServiceMetadataContext,
+) -> Result<u64, String> {
+    let id3v1_start = if let Some(start) = file_len.checked_sub(128) {
+        let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        file.seek(SeekFrom::Start(start))
+            .map_err(|error| format!("seek {} ID3v1 tag: {error}", path.display()))?;
+        let mut marker = [0_u8; 3];
+        file.read_exact(&mut marker)
+            .map_err(|error| format!("read {} ID3v1 tag: {error}", path.display()))?;
+        (&marker == b"TAG").then_some(start)
+    } else {
+        None
+    };
+    let mut audio_end = metadata
+        .ape_ranges
+        .iter()
+        .filter_map(|&(start, end)| {
+            (start >= audio_start && (end == file_len || id3v1_start == Some(end))).then_some(start)
+        })
+        .min()
+        .unwrap_or(file_len);
+    if let Some(id3v1_start) = id3v1_start {
+        audio_end = audio_end.min(id3v1_start);
+    }
+    Ok(audio_end)
+}
+
+fn preflight_raw_audio_frames<C>(
+    path: &Path,
+    file_len: u64,
+    audio_start: u64,
+    metadata: &ServiceMetadataContext,
+    checkpoint: &mut C,
+) -> Result<ServiceContainerPreflight, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    let audio_end = service_raw_audio_end(path, file_len, audio_start, metadata)?;
+    if audio_end <= audio_start {
+        return Err(format!("{}: raw audio contains no frames", path.display()));
+    }
+    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut cursor = audio_start;
+    let mut frame_count = 0_u64;
+    let mut route = None;
+    while cursor < audio_end {
+        if frame_count.is_multiple_of(SERVICE_CONTAINER_CHECKPOINT_ITEMS as u64) {
+            checkpoint()?;
+        }
+        file.seek(SeekFrom::Start(cursor))
+            .map_err(|error| format!("seek {} raw audio frame: {error}", path.display()))?;
+        let remaining = audio_end - cursor;
+        let mut prefix = [0_u8; 16];
+        let wanted = usize::try_from(remaining.min(prefix.len() as u64)).unwrap();
+        file.read_exact(&mut prefix[..wanted])
+            .map_err(|error| format!("read {} raw audio frame: {error}", path.display()))?;
+        let Some((frame_route, frame_bytes)) =
+            service_raw_audio_frame(&prefix[..wanted], remaining)
+        else {
+            return Err(format!(
+                "{}: raw MPEG/ADTS stream contains inter-frame data or invalid geometry at byte {cursor}",
+                path.display()
+            ));
+        };
+        if route.is_some_and(|route| route != frame_route) {
+            return Err(format!(
+                "{}: raw audio changes MPEG/ADTS format class at byte {cursor}",
+                path.display()
+            ));
+        }
+        route = Some(frame_route);
+        cursor = cursor
+            .checked_add(frame_bytes)
+            .ok_or_else(|| "raw audio frame offset overflow".to_string())?;
+        frame_count = frame_count
+            .checked_add(1)
+            .ok_or_else(|| "raw audio frame count overflow".to_string())?;
+    }
+    let route = route.ok_or_else(|| format!("{}: raw audio contains no frames", path.display()))?;
+    Ok(ServiceContainerPreflight {
+        route,
+        media_offset: audio_start,
+        media_end: audio_end,
+    })
+}
+
+struct ServiceId3BodyReader<'a, C> {
+    path: &'a Path,
+    file: &'a mut File,
+    raw_remaining: u64,
+    unsynchronised: bool,
+    previous: u8,
+    buffer: [u8; SERVICE_CONTROLLED_READ_BYTES],
+    buffer_offset: usize,
+    buffer_len: usize,
+    checkpoint: &'a mut C,
+}
+
+impl<C> ServiceId3BodyReader<'_, C>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    fn raw_byte(&mut self) -> Result<u8, String> {
+        if self.raw_remaining == 0 {
+            return Err(format!("{}: truncated ID3 body", self.path.display()));
+        }
+        if self.buffer_offset == self.buffer_len {
+            (self.checkpoint)()?;
+            let wanted = usize::try_from(self.raw_remaining.min(self.buffer.len() as u64)).unwrap();
+            self.file
+                .read_exact(&mut self.buffer[..wanted])
+                .map_err(|error| format!("read {} ID3 body: {error}", self.path.display()))?;
+            self.buffer_offset = 0;
+            self.buffer_len = wanted;
+        }
+        let byte = self.buffer[self.buffer_offset];
+        self.buffer_offset += 1;
+        self.raw_remaining -= 1;
+        Ok(byte)
+    }
+
+    fn byte(&mut self) -> Result<u8, String> {
+        let mut byte = self.raw_byte()?;
+        if self.unsynchronised && self.previous == 0xff && byte == 0 {
+            byte = self.raw_byte()?;
+        }
+        self.previous = byte;
+        Ok(byte)
+    }
+
+    fn read<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        let mut bytes = [0_u8; N];
+        for byte in &mut bytes {
+            *byte = self.byte()?;
+        }
+        Ok(bytes)
+    }
+
+    fn skip(&mut self, bytes: u64) -> Result<(), String> {
+        for _ in 0..bytes {
+            self.byte()?;
+        }
+        Ok(())
+    }
+}
+
+fn service_syncsafe(bytes: [u8; 4]) -> Result<u64, String> {
+    if bytes.iter().any(|byte| byte & 0x80 != 0) {
+        return Err("invalid ID3 syncsafe integer".into());
+    }
+    Ok(bytes
+        .into_iter()
+        .fold(0_u64, |value, byte| (value << 7) | u64::from(byte)))
+}
+
+fn service_id3_frame_id_valid(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+fn preflight_id3v2_at<C>(
+    path: &Path,
+    file_len: u64,
+    start: u64,
+    metadata: &mut ServiceMetadataContext,
+    checkpoint: &mut C,
+) -> Result<u64, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| format!("seek {} ID3 header: {error}", path.display()))?;
+    let mut header = [0_u8; 10];
+    file.read_exact(&mut header)
+        .map_err(|error| format!("read {} ID3 header: {error}", path.display()))?;
+    let version = header[3];
+    let flags = header[5];
+    if &header[..3] != b"ID3"
+        || !(2..=4).contains(&version)
+        || header[4] == 0xff
+        || (version == 2 && flags & 0x40 != 0)
+    {
+        return Err(format!("{}: invalid ID3 header", path.display()));
+    }
+    let body = service_syncsafe(header[6..10].try_into().unwrap())?;
+    ServiceMetadataBudget::validate_item(body)?;
+    let footer_bytes = if version == 4 && flags & 0x10 != 0 {
+        10
+    } else {
+        0
+    };
+    let end = start
+        .checked_add(10)
+        .and_then(|value| value.checked_add(body))
+        .and_then(|value| value.checked_add(footer_bytes))
+        .filter(|&value| value <= file_len)
+        .ok_or_else(|| format!("{}: truncated ID3 tag", path.display()))?;
+    metadata.budget.add_encoded_bytes(
+        10_u64
+            .checked_add(body)
+            .and_then(|value| value.checked_add(footer_bytes))
+            .ok_or_else(|| "ID3 metadata size overflow".to_string())?,
+    )?;
+    checkpoint()?;
+
+    {
+        let mut reader = ServiceId3BodyReader {
+            path,
+            file: &mut file,
+            raw_remaining: body,
+            unsynchronised: version < 4 && flags & 0x80 != 0,
+            previous: 0,
+            buffer: [0; SERVICE_CONTROLLED_READ_BYTES],
+            buffer_offset: 0,
+            buffer_len: 0,
+            checkpoint,
+        };
+        if flags & 0x40 != 0 {
+            match version {
+                3 => {
+                    let size = u32::from_be_bytes(reader.read()?);
+                    if !matches!(size, 6 | 10) {
+                        return Err("invalid ID3v2.3 extended header size".into());
+                    }
+                    let ext_flags = u16::from_be_bytes(reader.read()?);
+                    reader.read::<4>()?;
+                    if size == 10 {
+                        if ext_flags & 0x8000 == 0 {
+                            return Err("invalid ID3v2.3 CRC extended header".into());
+                        }
+                        reader.read::<4>()?;
+                    }
+                }
+                4 => {
+                    let size = service_syncsafe(reader.read()?)?;
+                    if size < 6 {
+                        return Err("invalid ID3v2.4 extended header size".into());
+                    }
+                    let flag_bytes = reader.byte()?;
+                    let ext_flags = reader.byte()?;
+                    if flag_bytes != 1 || ext_flags & 0x8f != 0 {
+                        return Err("invalid ID3v2.4 extended header flags".into());
+                    }
+                    let mut consumed = 6_u64;
+                    for flag in [0x40, 0x20, 0x10] {
+                        if ext_flags & flag != 0 {
+                            let length = reader.byte()?;
+                            let valid = match flag {
+                                0x40 => matches!(length, 0 | 1),
+                                0x20 => length == 5,
+                                0x10 => length == 1,
+                                _ => unreachable!(),
+                            };
+                            if !valid {
+                                return Err("invalid ID3v2.4 extended header field".into());
+                            }
+                            reader.skip(u64::from(length))?;
+                            consumed = consumed
+                                .checked_add(1 + u64::from(length))
+                                .ok_or_else(|| "ID3 extended header overflow".to_string())?;
+                        }
+                    }
+                    if consumed > size {
+                        return Err("truncated ID3v2.4 extended header".into());
+                    }
+                    reader.skip(size - consumed)?;
+                }
+                _ => return Err("ID3v2.2 does not define an extended header".into()),
+            }
+        }
+
+        let frame_header_bytes = if version == 2 { 6_u64 } else { 10_u64 };
+        let mut frame_count = 0_usize;
+        while reader.raw_remaining >= frame_header_bytes {
+            let mut id = [0_u8; 4];
+            let id_len = if version == 2 {
+                id[..3].copy_from_slice(&reader.read::<3>()?);
+                3
+            } else {
+                id.copy_from_slice(&reader.read::<4>()?);
+                4
+            };
+            if !service_id3_frame_id_valid(&id[..id_len]) {
+                break;
+            }
+            frame_count = frame_count
+                .checked_add(1)
+                .filter(|&count| count <= SERVICE_MAX_CONTAINER_ITEMS)
+                .ok_or_else(|| SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.to_string())?;
+            metadata.budget.add_entries(1)?;
+            if frame_count.is_multiple_of(SERVICE_CONTAINER_CHECKPOINT_ITEMS) {
+                (reader.checkpoint)()?;
+            }
+            let size = match version {
+                2 => {
+                    let bytes = reader.read::<3>()?;
+                    u64::from(u32::from_be_bytes([0, bytes[0], bytes[1], bytes[2]]))
+                }
+                3 => u64::from(u32::from_be_bytes(reader.read()?)),
+                4 => service_syncsafe(reader.read()?)?,
+                _ => unreachable!(),
+            };
+            if version >= 3 {
+                let frame_flags = u16::from_be_bytes(reader.read()?);
+                if (version == 3 && frame_flags & 0x1f1f != 0)
+                    || (version == 4 && frame_flags & 0x8fb0 != 0)
+                    || (version == 4 && frame_flags & 0x08 != 0 && frame_flags & 0x01 == 0)
+                {
+                    return Err("invalid ID3 frame flags".into());
+                }
+                let flag_bytes = if version == 3 {
+                    u64::from(frame_flags & 0x80 != 0) * 4
+                        + u64::from(frame_flags & 0x40 != 0)
+                        + u64::from(frame_flags & 0x20 != 0)
+                } else {
+                    u64::from(frame_flags & 0x40 != 0)
+                        + u64::from(frame_flags & 0x04 != 0)
+                        + u64::from(frame_flags & 0x01 != 0) * 4
+                };
+                if flag_bytes > size {
+                    return Err("ID3 frame is smaller than its flag fields".into());
+                }
+            }
+            ServiceMetadataBudget::validate_item(size)?;
+            reader.skip(size)?;
+        }
+    }
+
+    if footer_bytes != 0 {
+        file.seek(SeekFrom::Start(end - 10))
+            .map_err(|error| format!("seek {} ID3 footer: {error}", path.display()))?;
+        let mut footer = [0_u8; 10];
+        file.read_exact(&mut footer)
+            .map_err(|error| format!("read {} ID3 footer: {error}", path.display()))?;
+        if &footer[..3] != b"3DI" || footer[3..6] != header[3..6] || footer[6..10] != header[6..10]
+        {
+            return Err(format!("{}: invalid ID3 footer", path.display()));
+        }
+    }
+    Ok(end)
+}
+
+const SERVICE_APE_DESCRIPTOR_BYTES: u64 = 32;
+const SERVICE_APE_HAS_HEADER: u32 = 0x8000_0000;
+const SERVICE_APE_HAS_FOOTER: u32 = 0x4000_0000;
+const SERVICE_APE_IS_HEADER: u32 = 0x2000_0000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ServiceApeDescriptor {
+    version: u32,
+    declared_size: u64,
+    item_count: u32,
+    has_header: bool,
+    has_footer: bool,
+    is_header: bool,
+}
+
+fn read_service_ape_descriptor(
+    path: &Path,
+    file: &mut File,
+    offset: u64,
+) -> Result<Option<ServiceApeDescriptor>, String> {
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| format!("seek {} APE descriptor: {error}", path.display()))?;
+    let mut raw = [0_u8; SERVICE_APE_DESCRIPTOR_BYTES as usize];
+    file.read_exact(&mut raw)
+        .map_err(|error| format!("read {} APE descriptor: {error}", path.display()))?;
+    let version = u32::from_le_bytes(raw[8..12].try_into().unwrap());
+    if &raw[..8] != b"APETAGEX" || !matches!(version, 1000 | 2000) {
+        return Ok(None);
+    }
+
+    let declared_size = u64::from(u32::from_le_bytes(raw[12..16].try_into().unwrap()));
+    let item_count = u32::from_le_bytes(raw[16..20].try_into().unwrap());
+    let flags = u32::from_le_bytes(raw[20..24].try_into().unwrap());
+    let (has_header, has_footer, is_header) = if version == 1000 {
+        (false, true, false)
+    } else {
+        (
+            flags & SERVICE_APE_HAS_HEADER != 0,
+            flags & SERVICE_APE_HAS_FOOTER != 0,
+            flags & SERVICE_APE_IS_HEADER != 0,
+        )
+    };
+    if !(SERVICE_APE_DESCRIPTOR_BYTES..=SERVICE_MAX_ENCODED_PACKET_BYTES).contains(&declared_size)
+        || usize::try_from(item_count)
+            .ok()
+            .is_none_or(|count| count > SERVICE_MAX_CONTAINER_ITEMS)
+    {
+        return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+    }
+    Ok(Some(ServiceApeDescriptor {
+        version,
+        declared_size,
+        item_count,
+        has_header,
+        has_footer,
+        is_header,
+    }))
+}
+
+fn service_ape_descriptors_match(
+    header: ServiceApeDescriptor,
+    footer: ServiceApeDescriptor,
+) -> bool {
+    header.version == footer.version
+        && header.declared_size == footer.declared_size
+        && header.item_count == footer.item_count
+        && header.has_header == footer.has_header
+        && header.has_footer == footer.has_footer
+        && header.is_header != footer.is_header
+}
+
+fn preflight_ape_items<C>(
+    path: &Path,
+    file: &mut File,
+    items_start: u64,
+    items_end: u64,
+    descriptor: ServiceApeDescriptor,
+    checkpoint: &mut C,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    let mut cursor = items_start;
+    for item in 0..descriptor.item_count {
+        if usize::try_from(item)
+            .unwrap_or(usize::MAX)
+            .is_multiple_of(SERVICE_CONTAINER_CHECKPOINT_ITEMS)
+        {
+            checkpoint()?;
+        }
+        let fields_end = cursor
+            .checked_add(8)
+            .ok_or_else(|| "APE item header offset overflow".to_string())?;
+        if fields_end > items_end {
+            return Err(format!("{}: truncated APE item", path.display()));
+        }
+        file.seek(SeekFrom::Start(cursor))
+            .map_err(|error| format!("seek {} APE item: {error}", path.display()))?;
+        let mut fields = [0_u8; 8];
+        file.read_exact(&mut fields)
+            .map_err(|error| format!("read {} APE item: {error}", path.display()))?;
+        let value_len = u64::from(u32::from_le_bytes(fields[..4].try_into().unwrap()));
+        ServiceMetadataBudget::validate_item(value_len)?;
+        cursor = fields_end;
+
+        let mut key_bytes = 0_usize;
+        loop {
+            if cursor >= items_end || key_bytes > 255 {
+                return Err(format!(
+                    "{}: invalid or unterminated APE item key",
+                    path.display()
+                ));
+            }
+            file.seek(SeekFrom::Start(cursor))
+                .map_err(|error| format!("seek {} APE item key: {error}", path.display()))?;
+            let mut byte = [0_u8; 1];
+            file.read_exact(&mut byte)
+                .map_err(|error| format!("read {} APE item key: {error}", path.display()))?;
+            cursor = cursor
+                .checked_add(1)
+                .ok_or_else(|| "APE item key offset overflow".to_string())?;
+            if byte[0] == 0 {
+                break;
+            }
+            key_bytes += 1;
+        }
+        if !(2..=255).contains(&key_bytes) {
+            return Err(format!("{}: invalid APE item key", path.display()));
+        }
+        cursor = cursor
+            .checked_add(value_len)
+            .ok_or_else(|| "APE item value offset overflow".to_string())?;
+        if cursor > items_end {
+            return Err(format!("{}: truncated APE value", path.display()));
+        }
+    }
+    if cursor != items_end {
+        return Err(format!(
+            "{}: APE item table does not match its declared size",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn preflight_ape_footer_at<C>(
+    path: &Path,
+    file: &mut File,
+    file_len: u64,
+    footer_start: u64,
+    metadata: &mut ServiceMetadataContext,
+    checkpoint: &mut C,
+) -> Result<bool, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    let Some(footer) = read_service_ape_descriptor(path, file, footer_start)? else {
+        return Ok(false);
+    };
+    checkpoint()?;
+    if footer.is_header {
+        preflight_ape_header_descriptor(
+            path,
+            file,
+            footer_start,
+            footer,
+            file_len,
+            metadata,
+            checkpoint,
+        )?;
+        return Ok(true);
+    }
+    let footer_end = footer_start
+        .checked_add(SERVICE_APE_DESCRIPTOR_BYTES)
+        .ok_or_else(|| "APE footer offset overflow".to_string())?;
+    let physical_size = footer
+        .declared_size
+        .checked_add(if footer.has_header {
+            SERVICE_APE_DESCRIPTOR_BYTES
+        } else {
+            0
+        })
+        .filter(|&size| size <= SERVICE_MAX_ENCODED_PACKET_BYTES)
+        .ok_or_else(|| SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.to_string())?;
+    let tag_start = footer_end
+        .checked_sub(physical_size)
+        .ok_or_else(|| format!("{}: truncated trailing APE metadata", path.display()))?;
+    let items_start = if footer.has_header {
+        let header = read_service_ape_descriptor(path, file, tag_start)?
+            .ok_or_else(|| format!("{}: missing trailing APE header", path.display()))?;
+        if !header.is_header || !service_ape_descriptors_match(header, footer) {
+            return Err(format!(
+                "{}: trailing APE header/footer mismatch",
+                path.display()
+            ));
+        }
+        tag_start
+            .checked_add(SERVICE_APE_DESCRIPTOR_BYTES)
+            .ok_or_else(|| "APE item offset overflow".to_string())?
+    } else {
+        tag_start
+    };
+    if !metadata.record_ape(
+        tag_start,
+        footer_end,
+        usize::try_from(footer.item_count)
+            .map_err(|_| SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.to_string())?,
+    )? {
+        return Ok(true);
+    }
+    preflight_ape_items(path, file, items_start, footer_start, footer, checkpoint)?;
+    Ok(true)
+}
+
+fn preflight_ape_header_descriptor<C>(
+    path: &Path,
+    file: &mut File,
+    marker_start: u64,
+    header: ServiceApeDescriptor,
+    file_len: u64,
+    metadata: &mut ServiceMetadataContext,
+    checkpoint: &mut C,
+) -> Result<u64, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    if header.version != 2000 || !header.is_header || !header.has_header || !header.has_footer {
+        return Err(format!("{}: invalid leading APEv2 header", path.display()));
+    }
+    let physical_size = header
+        .declared_size
+        .checked_add(SERVICE_APE_DESCRIPTOR_BYTES)
+        .filter(|&size| size <= SERVICE_MAX_ENCODED_PACKET_BYTES)
+        .ok_or_else(|| SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.to_string())?;
+    let tag_end = marker_start
+        .checked_add(physical_size)
+        .filter(|&end| end <= file_len)
+        .ok_or_else(|| format!("{}: truncated leading APE metadata", path.display()))?;
+    let footer_start = tag_end - SERVICE_APE_DESCRIPTOR_BYTES;
+    let footer = read_service_ape_descriptor(path, file, footer_start)?
+        .ok_or_else(|| format!("{}: missing leading APE footer", path.display()))?;
+    if footer.is_header || !service_ape_descriptors_match(header, footer) {
+        return Err(format!(
+            "{}: leading APE header/footer mismatch",
+            path.display()
+        ));
+    }
+    if !metadata.record_ape(
+        marker_start,
+        tag_end,
+        usize::try_from(header.item_count)
+            .map_err(|_| SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.to_string())?,
+    )? {
+        return Ok(tag_end);
+    }
+    preflight_ape_items(
+        path,
+        file,
+        marker_start
+            .checked_add(SERVICE_APE_DESCRIPTOR_BYTES)
+            .ok_or_else(|| "APE item offset overflow".to_string())?,
+        footer_start,
+        header,
+        checkpoint,
+    )?;
+    Ok(tag_end)
+}
+
+/// Validate both offsets Symphonia probes for trailing APE metadata. The
+/// `-160` candidate is inspected even without ID3v1 so an unsafe declaration
+/// cannot reach the supplemental parser. It is excluded from a raw audio
+/// range only when the final 128 bytes are a real `TAG` record.
+fn preflight_trailing_ape<C>(
+    path: &Path,
+    file_len: u64,
+    metadata: &mut ServiceMetadataContext,
+    checkpoint: &mut C,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    for anchor in [SERVICE_APE_DESCRIPTOR_BYTES, 160] {
+        let Some(footer_start) = file_len.checked_sub(anchor) else {
+            continue;
+        };
+        preflight_ape_footer_at(
+            path,
+            &mut file,
+            file_len,
+            footer_start,
+            metadata,
+            checkpoint,
+        )?;
+    }
+    Ok(())
+}
+
+/// Find and validate the first leading APEv2 marker in Symphonia's bounded
+/// supplemental probe window. The returned offset is the first byte following
+/// the tag, where the actual format marker must be validated separately.
+fn preflight_leading_ape<C>(
+    path: &Path,
+    file_len: u64,
+    metadata: &mut ServiceMetadataContext,
+    checkpoint: &mut C,
+) -> Result<Option<u64>, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    const MARKER: &[u8; 12] = b"APETAGEX\xd0\x07\0\0";
+    // Symphonia increments its byte counter before checking the two-byte
+    // marker bloom filter, so a marker must start no later than depth - 2.
+    let marker_start_limit = SERVICE_SYMPHONIA_PROBE_BYTES
+        .checked_sub(2)
+        .ok_or_else(|| "APE probe depth underflow".to_string())?;
+    let scan_limit = marker_start_limit
+        .checked_add(MARKER.len() as u64)
+        .ok_or_else(|| "APE probe size overflow".to_string())?;
+    let scan_len = file_len.min(scan_limit);
+    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut offset = 0_u64;
+    let mut carry = Vec::new();
+    let mut block = [0_u8; SERVICE_CONTROLLED_READ_BYTES];
+    while offset < scan_len {
+        checkpoint()?;
+        let count = usize::try_from((scan_len - offset).min(block.len() as u64)).unwrap();
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| format!("seek {} APE probe: {error}", path.display()))?;
+        file.read_exact(&mut block[..count])
+            .map_err(|error| format!("read {} APE probe: {error}", path.display()))?;
+        let carry_len = carry.len();
+        carry.extend_from_slice(&block[..count]);
+        if let Some(position) = carry
+            .windows(MARKER.len())
+            .position(|bytes| bytes == MARKER)
+        {
+            let marker_start = offset
+                .checked_sub(carry_len as u64)
+                .and_then(|base| base.checked_add(position as u64))
+                .ok_or_else(|| "APE probe offset overflow".to_string())?;
+            if marker_start > marker_start_limit {
+                return Ok(None);
+            }
+            let header = read_service_ape_descriptor(path, &mut file, marker_start)?
+                .ok_or_else(|| "APEv2 probe marker disappeared".to_string())?;
+            let tag_end = preflight_ape_header_descriptor(
+                path,
+                &mut file,
+                marker_start,
+                header,
+                file_len,
+                metadata,
+                checkpoint,
+            )?;
+            return Ok(Some(tag_end));
+        }
+        if carry.len() >= MARKER.len() {
+            carry.drain(..carry.len() - (MARKER.len() - 1));
+        }
+        offset = offset
+            .checked_add(count as u64)
+            .ok_or_else(|| "APE probe offset overflow".to_string())?;
+    }
+    Ok(None)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServiceOggCommentCodec {
+    Other,
+    Vorbis,
+    Opus,
+    Flac,
+}
+
+struct ServiceOggCommentScanner {
+    codec: ServiceOggCommentCodec,
+    stage: u8,
+    prefix_seen: usize,
+    field: [u8; 4],
+    field_len: usize,
+    remaining: u64,
+    comments_remaining: u32,
+    comments_seen: usize,
+    declared_comments: usize,
+    budgeted_comments: usize,
+    total_bytes: u64,
+    tail_bytes: u64,
+    tail_first: Option<u8>,
+}
+
+impl ServiceOggCommentScanner {
+    const PREFIX: u8 = 0;
+    const VENDOR_LENGTH: u8 = 1;
+    const VENDOR: u8 = 2;
+    const COMMENT_COUNT: u8 = 3;
+    const COMMENT_LENGTH: u8 = 4;
+    const COMMENT: u8 = 5;
+    const TAIL: u8 = 6;
+
+    fn new(codec: ServiceOggCommentCodec) -> Self {
+        Self {
+            codec,
+            stage: Self::PREFIX,
+            prefix_seen: 0,
+            field: [0; 4],
+            field_len: 0,
+            remaining: 0,
+            comments_remaining: 0,
+            comments_seen: 0,
+            declared_comments: 0,
+            budgeted_comments: 0,
+            total_bytes: 0,
+            tail_bytes: 0,
+            tail_first: None,
+        }
+    }
+
+    fn prefix(&self) -> &'static [u8] {
+        match self.codec {
+            ServiceOggCommentCodec::Vorbis => b"\x03vorbis",
+            ServiceOggCommentCodec::Opus => b"OpusTags",
+            ServiceOggCommentCodec::Flac | ServiceOggCommentCodec::Other => &[],
+        }
+    }
+
+    fn push<C>(&mut self, bytes: &[u8], checkpoint: &mut C) -> Result<(), String>
+    where
+        C: FnMut() -> Result<(), String>,
+    {
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| "Ogg comment packet size overflow".to_string())?;
+        if self.total_bytes > SERVICE_MAX_ENCODED_PACKET_BYTES {
+            return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+        }
+
+        let mut offset = 0_usize;
+        while offset < bytes.len() {
+            match self.stage {
+                Self::PREFIX => {
+                    let prefix = self.prefix();
+                    let count = (prefix.len() - self.prefix_seen).min(bytes.len() - offset);
+                    if bytes[offset..offset + count]
+                        != prefix[self.prefix_seen..self.prefix_seen + count]
+                    {
+                        return Err("invalid Ogg comment packet signature".into());
+                    }
+                    offset += count;
+                    self.prefix_seen += count;
+                    if self.prefix_seen == prefix.len() {
+                        self.stage = Self::VENDOR_LENGTH;
+                    }
+                }
+                Self::VENDOR_LENGTH | Self::COMMENT_COUNT | Self::COMMENT_LENGTH => {
+                    let count = (4 - self.field_len).min(bytes.len() - offset);
+                    self.field[self.field_len..self.field_len + count]
+                        .copy_from_slice(&bytes[offset..offset + count]);
+                    offset += count;
+                    self.field_len += count;
+                    if self.field_len != 4 {
+                        continue;
+                    }
+                    let value = u32::from_le_bytes(self.field);
+                    self.field_len = 0;
+                    match self.stage {
+                        Self::VENDOR_LENGTH => {
+                            if u64::from(value) > SERVICE_MAX_METADATA_ITEM_BYTES {
+                                return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+                            }
+                            self.remaining = u64::from(value);
+                            self.stage = if value == 0 {
+                                Self::COMMENT_COUNT
+                            } else {
+                                Self::VENDOR
+                            };
+                        }
+                        Self::COMMENT_COUNT => {
+                            let count = usize::try_from(value)
+                                .ok()
+                                .filter(|&count| count <= SERVICE_MAX_CONTAINER_ITEMS)
+                                .ok_or_else(|| SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.to_string())?;
+                            if self.declared_comments != 0 {
+                                return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+                            }
+                            self.declared_comments = count;
+                            self.comments_remaining = value;
+                            self.stage = if value == 0 {
+                                Self::TAIL
+                            } else {
+                                Self::COMMENT_LENGTH
+                            };
+                        }
+                        Self::COMMENT_LENGTH => {
+                            if u64::from(value) > SERVICE_MAX_METADATA_ITEM_BYTES {
+                                return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+                            }
+                            self.remaining = u64::from(value);
+                            if value == 0 {
+                                self.complete_comment(checkpoint)?;
+                            } else {
+                                self.stage = Self::COMMENT;
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                Self::VENDOR | Self::COMMENT => {
+                    let count = self.remaining.min((bytes.len() - offset) as u64);
+                    offset += count as usize;
+                    self.remaining -= count;
+                    if self.remaining == 0 {
+                        if self.stage == Self::VENDOR {
+                            self.stage = Self::COMMENT_COUNT;
+                        } else {
+                            self.complete_comment(checkpoint)?;
+                        }
+                    }
+                }
+                Self::TAIL => {
+                    if self.tail_first.is_none() {
+                        self.tail_first = Some(bytes[offset]);
+                    }
+                    self.tail_bytes = self
+                        .tail_bytes
+                        .checked_add((bytes.len() - offset) as u64)
+                        .ok_or_else(|| "Ogg comment tail size overflow".to_string())?;
+                    offset = bytes.len();
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+
+    fn complete_comment<C>(&mut self, checkpoint: &mut C) -> Result<(), String>
+    where
+        C: FnMut() -> Result<(), String>,
+    {
+        self.comments_remaining = self
+            .comments_remaining
+            .checked_sub(1)
+            .ok_or_else(|| "Ogg comment count underflow".to_string())?;
+        self.comments_seen = self
+            .comments_seen
+            .checked_add(1)
+            .ok_or_else(|| "Ogg comment count overflow".to_string())?;
+        if self
+            .comments_seen
+            .is_multiple_of(SERVICE_CONTAINER_CHECKPOINT_ITEMS)
+        {
+            checkpoint()?;
+        }
+        self.stage = if self.comments_remaining == 0 {
+            Self::TAIL
+        } else {
+            Self::COMMENT_LENGTH
+        };
+        Ok(())
+    }
+
+    fn take_unbudgeted_comments(&mut self) -> usize {
+        let comments = self
+            .declared_comments
+            .saturating_sub(self.budgeted_comments);
+        self.budgeted_comments = self.declared_comments;
+        comments
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        if self.stage != Self::TAIL {
+            return Err("truncated Ogg comment packet".into());
+        }
+        if self.codec == ServiceOggCommentCodec::Vorbis
+            && (self.tail_bytes != 1 || self.tail_first != Some(1))
+        {
+            return Err("invalid Vorbis comment framing byte".into());
+        }
+        if self.codec == ServiceOggCommentCodec::Flac && self.tail_bytes != 0 {
+            return Err("FLAC Vorbis-comment block has trailing bytes".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServiceFlacPictureStage {
+    PictureType,
+    MimeLength,
+    Mime,
+    DescriptionLength,
+    Description,
+    Dimensions,
+    DataLength,
+    Data,
+    Done,
+}
+
+struct ServiceFlacPictureScanner {
+    stage: ServiceFlacPictureStage,
+    field: [u8; 4],
+    field_len: usize,
+    remaining: u64,
+}
+
+impl Default for ServiceFlacPictureScanner {
+    fn default() -> Self {
+        Self {
+            stage: ServiceFlacPictureStage::PictureType,
+            field: [0; 4],
+            field_len: 0,
+            remaining: 0,
+        }
+    }
+}
+
+impl ServiceFlacPictureScanner {
+    fn push(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let mut offset = 0_usize;
+        while offset < bytes.len() {
+            match self.stage {
+                ServiceFlacPictureStage::PictureType
+                | ServiceFlacPictureStage::MimeLength
+                | ServiceFlacPictureStage::DescriptionLength
+                | ServiceFlacPictureStage::DataLength => {
+                    let count = (4 - self.field_len).min(bytes.len() - offset);
+                    self.field[self.field_len..self.field_len + count]
+                        .copy_from_slice(&bytes[offset..offset + count]);
+                    self.field_len += count;
+                    offset += count;
+                    if self.field_len != 4 {
+                        continue;
+                    }
+                    let value = u64::from(u32::from_be_bytes(self.field));
+                    self.field_len = 0;
+                    match self.stage {
+                        ServiceFlacPictureStage::PictureType => {
+                            self.stage = ServiceFlacPictureStage::MimeLength;
+                        }
+                        ServiceFlacPictureStage::MimeLength => {
+                            ServiceMetadataBudget::validate_item(value)?;
+                            self.remaining = value;
+                            self.stage = if value == 0 {
+                                ServiceFlacPictureStage::DescriptionLength
+                            } else {
+                                ServiceFlacPictureStage::Mime
+                            };
+                        }
+                        ServiceFlacPictureStage::DescriptionLength => {
+                            ServiceMetadataBudget::validate_item(value)?;
+                            self.remaining = value;
+                            self.stage = if value == 0 {
+                                ServiceFlacPictureStage::Dimensions
+                            } else {
+                                ServiceFlacPictureStage::Description
+                            };
+                            if value == 0 {
+                                self.remaining = 16;
+                            }
+                        }
+                        ServiceFlacPictureStage::DataLength => {
+                            ServiceMetadataBudget::validate_item(value)?;
+                            self.remaining = value;
+                            self.stage = if value == 0 {
+                                ServiceFlacPictureStage::Done
+                            } else {
+                                ServiceFlacPictureStage::Data
+                            };
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                ServiceFlacPictureStage::Mime
+                | ServiceFlacPictureStage::Description
+                | ServiceFlacPictureStage::Dimensions
+                | ServiceFlacPictureStage::Data => {
+                    let count = self.remaining.min((bytes.len() - offset) as u64);
+                    self.remaining -= count;
+                    offset += count as usize;
+                    if self.remaining != 0 {
+                        continue;
+                    }
+                    self.stage = match self.stage {
+                        ServiceFlacPictureStage::Mime => ServiceFlacPictureStage::DescriptionLength,
+                        ServiceFlacPictureStage::Description => {
+                            self.remaining = 16;
+                            ServiceFlacPictureStage::Dimensions
+                        }
+                        ServiceFlacPictureStage::Dimensions => ServiceFlacPictureStage::DataLength,
+                        ServiceFlacPictureStage::Data => ServiceFlacPictureStage::Done,
+                        _ => unreachable!(),
+                    };
+                }
+                ServiceFlacPictureStage::Done => {
+                    return Err("FLAC picture block has trailing bytes".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        if self.stage == ServiceFlacPictureStage::Done {
+            Ok(())
+        } else {
+            Err("truncated FLAC picture block".into())
+        }
+    }
+}
+
+enum ServiceOggFlacPayloadScanner {
+    Skip,
+    Comment(ServiceOggCommentScanner),
+    Picture(ServiceFlacPictureScanner),
+}
+
+#[derive(Default)]
+struct ServiceOggFlacPacketScanner {
+    header: [u8; 4],
+    header_len: usize,
+    payload_remaining: u64,
+    payload: Option<ServiceOggFlacPayloadScanner>,
+    audio: bool,
+}
+
+impl ServiceOggFlacPacketScanner {
+    fn push<C>(
+        &mut self,
+        bytes: &[u8],
+        budget: &mut ServiceMetadataBudget,
+        checkpoint: &mut C,
+    ) -> Result<(), String>
+    where
+        C: FnMut() -> Result<(), String>,
+    {
+        let mut offset = 0_usize;
+        if self.header_len == 0 && bytes.first() == Some(&0xff) {
+            self.audio = true;
+            return Ok(());
+        }
+        if self.audio {
+            return Ok(());
+        }
+        if self.header_len < self.header.len() {
+            let count = (self.header.len() - self.header_len).min(bytes.len());
+            self.header[self.header_len..self.header_len + count].copy_from_slice(&bytes[..count]);
+            self.header_len += count;
+            offset += count;
+            if self.header_len != self.header.len() {
+                return Ok(());
+            }
+            let block_type = self.header[0] & 0x7f;
+            if matches!(block_type, 0 | 0x7f) {
+                return Err("invalid Ogg-FLAC metadata packet type".into());
+            }
+            let payload_len = u64::from(u32::from_be_bytes([
+                0,
+                self.header[1],
+                self.header[2],
+                self.header[3],
+            ]));
+            if matches!(block_type, 4 | 6) {
+                ServiceMetadataBudget::validate_item(payload_len)?;
+            }
+            budget.add_entries(1)?;
+            budget.add_encoded_bytes(
+                4_u64
+                    .checked_add(payload_len)
+                    .ok_or_else(|| "Ogg-FLAC metadata size overflow".to_string())?,
+            )?;
+            self.payload_remaining = payload_len;
+            self.payload = Some(match block_type {
+                4 => ServiceOggFlacPayloadScanner::Comment(ServiceOggCommentScanner::new(
+                    ServiceOggCommentCodec::Flac,
+                )),
+                6 => ServiceOggFlacPayloadScanner::Picture(ServiceFlacPictureScanner::default()),
+                _ => ServiceOggFlacPayloadScanner::Skip,
+            });
+        }
+
+        let available = (bytes.len() - offset) as u64;
+        if available > self.payload_remaining {
+            return Err("Ogg-FLAC metadata packet exceeds its declared block size".into());
+        }
+        let payload = &bytes[offset..];
+        match self
+            .payload
+            .as_mut()
+            .expect("header selects payload scanner")
+        {
+            ServiceOggFlacPayloadScanner::Skip => {}
+            ServiceOggFlacPayloadScanner::Comment(scanner) => {
+                scanner.push(payload, checkpoint)?;
+                budget.add_entries(scanner.take_unbudgeted_comments())?;
+            }
+            ServiceOggFlacPayloadScanner::Picture(scanner) => scanner.push(payload)?,
+        }
+        self.payload_remaining -= available;
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        if self.audio {
+            return Ok(());
+        }
+        if self.header_len != self.header.len() || self.payload_remaining != 0 {
+            return Err("truncated Ogg-FLAC metadata packet".into());
+        }
+        match self
+            .payload
+            .as_ref()
+            .expect("complete header selects scanner")
+        {
+            ServiceOggFlacPayloadScanner::Skip => Ok(()),
+            ServiceOggFlacPayloadScanner::Comment(scanner) => scanner.finish(),
+            ServiceOggFlacPayloadScanner::Picture(scanner) => scanner.finish(),
+        }
+    }
+}
+
+struct ServiceOggMetadataPreflight {
+    packet_index: usize,
+    identity: [u8; 51],
+    identity_len: usize,
+    identity_bytes: u64,
+    codec: Option<ServiceOggCommentCodec>,
+    comment: Option<ServiceOggCommentScanner>,
+    flac_packet: Option<ServiceOggFlacPacketScanner>,
+    budget: ServiceMetadataBudget,
+}
+
+impl Default for ServiceOggMetadataPreflight {
+    fn default() -> Self {
+        Self {
+            packet_index: 0,
+            identity: [0; 51],
+            identity_len: 0,
+            identity_bytes: 0,
+            codec: None,
+            comment: None,
+            flac_packet: None,
+            budget: ServiceMetadataBudget::default(),
+        }
+    }
+}
+
+impl ServiceOggMetadataPreflight {
+    fn wants_packet_bytes(&self) -> bool {
+        self.packet_index == 0
+            || (self.packet_index == 1
+                && self.codec.is_some_and(|codec| {
+                    matches!(
+                        codec,
+                        ServiceOggCommentCodec::Vorbis | ServiceOggCommentCodec::Opus
+                    )
+                }))
+            || (self.packet_index >= 1 && self.codec == Some(ServiceOggCommentCodec::Flac))
+    }
+
+    fn push<C>(&mut self, bytes: &[u8], checkpoint: &mut C) -> Result<(), String>
+    where
+        C: FnMut() -> Result<(), String>,
+    {
+        match self.packet_index {
+            0 => {
+                self.identity_bytes = self
+                    .identity_bytes
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| "Ogg identity packet size overflow".to_string())?;
+                let count = (self.identity.len() - self.identity_len).min(bytes.len());
+                self.identity[self.identity_len..self.identity_len + count]
+                    .copy_from_slice(&bytes[..count]);
+                self.identity_len += count;
+                Ok(())
+            }
+            _ if self.codec == Some(ServiceOggCommentCodec::Flac) => self
+                .flac_packet
+                .get_or_insert_with(ServiceOggFlacPacketScanner::default)
+                .push(bytes, &mut self.budget, checkpoint),
+            1 => {
+                let Some(codec) = self.codec else {
+                    return Err("Ogg codec identity was not completed".into());
+                };
+                if codec == ServiceOggCommentCodec::Other {
+                    return Ok(());
+                }
+                self.budget.add_encoded_bytes(bytes.len() as u64)?;
+                if self.comment.is_none() {
+                    self.budget.add_entries(1)?;
+                }
+                let scanner = self
+                    .comment
+                    .get_or_insert_with(|| ServiceOggCommentScanner::new(codec));
+                scanner.push(bytes, checkpoint)?;
+                self.budget.add_entries(scanner.take_unbudgeted_comments())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn end_packet(&mut self) -> Result<(), String> {
+        match self.packet_index {
+            0 => {
+                self.codec = Some(
+                    if self.identity_bytes == 51
+                        && self.identity_len == 51
+                        && &self.identity[..5] == b"\x7fFLAC"
+                        && self.identity[5] == 1
+                        && &self.identity[9..13] == b"fLaC"
+                        && self.identity[13] & 0x7f == 0
+                        && &self.identity[14..17] == b"\0\0\x22"
+                    {
+                        ServiceOggCommentCodec::Flac
+                    } else if self.identity_len >= 7 && &self.identity[..7] == b"\x01vorbis" {
+                        ServiceOggCommentCodec::Vorbis
+                    } else if self.identity_len >= 8 && &self.identity[..8] == b"OpusHead" {
+                        ServiceOggCommentCodec::Opus
+                    } else {
+                        ServiceOggCommentCodec::Other
+                    },
+                );
+            }
+            _ if self.codec == Some(ServiceOggCommentCodec::Flac) => {
+                self.flac_packet
+                    .take()
+                    .ok_or_else(|| "empty Ogg-FLAC packet".to_string())?
+                    .finish()?;
+            }
+            1 => {
+                if let Some(comment) = &self.comment {
+                    comment.finish()?;
+                } else if self.codec != Some(ServiceOggCommentCodec::Other) {
+                    return Err("missing Ogg comment packet".into());
+                }
+            }
+            _ => {}
+        }
+        self.packet_index = self
+            .packet_index
+            .checked_add(1)
+            .ok_or_else(|| SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.to_string())?;
+        Ok(())
+    }
+
+    fn finish_stream(&self) -> Result<(), String> {
+        if matches!(
+            self.codec,
+            Some(ServiceOggCommentCodec::Vorbis | ServiceOggCommentCodec::Opus)
+        ) && self.packet_index < 2
+        {
+            return Err("Ogg stream is missing its comment packet".into());
+        }
+        if self.codec == Some(ServiceOggCommentCodec::Flac) && self.flac_packet.is_some() {
+            return Err("Ogg-FLAC stream ends in an incomplete metadata packet".into());
+        }
+        Ok(())
+    }
+}
+
+fn preflight_ogg_packets<C>(
+    path: &Path,
+    file_len: u64,
+    packet_limit: u64,
+    checkpoint: &mut C,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String> + Send,
+{
+    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut offset = 0_u64;
+    let mut page_count = 0_usize;
+    let mut current_serial = None;
+    let mut current_ended = false;
+    let mut pending_packet_bytes = 0_u64;
+    let mut metadata = ServiceOggMetadataPreflight::default();
+    while offset < file_len {
+        if page_count == SERVICE_MAX_CONTAINER_ITEMS {
+            return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+        }
+        checkpoint()?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| format!("seek {} Ogg page: {error}", path.display()))?;
+        let mut header = [0_u8; 27];
+        file.read_exact(&mut header)
+            .map_err(|error| format!("read {} Ogg page header: {error}", path.display()))?;
+        if &header[..4] != b"OggS" || header[4] != 0 {
+            return Err(format!(
+                "{}: invalid Ogg page at byte {offset}",
+                path.display()
+            ));
+        }
+        let header_type = header[5];
+        let continued = header_type & 0x01 != 0;
+        let beginning = header_type & 0x02 != 0;
+        let end_of_stream = header_type & 0x04 != 0;
+        let serial = u32::from_le_bytes(header[14..18].try_into().unwrap());
+        match current_serial {
+            None => {
+                if !beginning || continued {
+                    return Err(format!(
+                        "{}: first Ogg page is not a complete stream beginning",
+                        path.display()
+                    ));
+                }
+                current_serial = Some(serial);
+            }
+            Some(previous) if previous != serial => {
+                if !current_ended || !beginning || continued || pending_packet_bytes != 0 {
+                    return Err(format!(
+                        "{}: multiplexed or overlapping Ogg logical streams are unsupported",
+                        path.display()
+                    ));
+                }
+                metadata.finish_stream()?;
+                let budget = std::mem::take(&mut metadata.budget);
+                metadata = ServiceOggMetadataPreflight::default();
+                metadata.budget = budget;
+                current_serial = Some(serial);
+                current_ended = false;
+            }
+            Some(_) => {
+                if current_ended || beginning || continued != (pending_packet_bytes != 0) {
+                    return Err(format!(
+                        "{}: invalid Ogg continuation flags at byte {offset}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        let segment_count = usize::from(header[26]);
+        let mut lacing = [0_u8; 255];
+        file.read_exact(&mut lacing[..segment_count])
+            .map_err(|error| format!("read {} Ogg lacing table: {error}", path.display()))?;
+        let body_bytes = lacing[..segment_count]
+            .iter()
+            .try_fold(0_u64, |total, &length| total.checked_add(u64::from(length)))
+            .ok_or_else(|| "Ogg page byte count overflow".to_string())?;
+        let header_bytes = 27_u64
+            .checked_add(segment_count as u64)
+            .ok_or_else(|| "Ogg page header size overflow".to_string())?;
+        let mut body_offset = offset
+            .checked_add(header_bytes)
+            .ok_or_else(|| "Ogg page body offset overflow".to_string())?;
+        let mut segment = [0_u8; 255];
+        for &length in &lacing[..segment_count] {
+            pending_packet_bytes = pending_packet_bytes
+                .checked_add(u64::from(length))
+                .ok_or_else(|| SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.to_string())?;
+            if pending_packet_bytes > packet_limit {
+                return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+            }
+            if metadata.wants_packet_bytes() && length != 0 {
+                file.seek(SeekFrom::Start(body_offset))
+                    .map_err(|error| format!("seek {} Ogg packet: {error}", path.display()))?;
+                file.read_exact(&mut segment[..usize::from(length)])
+                    .map_err(|error| format!("read {} Ogg packet: {error}", path.display()))?;
+                metadata.push(&segment[..usize::from(length)], checkpoint)?;
+            }
+            body_offset = body_offset
+                .checked_add(u64::from(length))
+                .ok_or_else(|| "Ogg packet offset overflow".to_string())?;
+            if length < 255 {
+                metadata.end_packet()?;
+                pending_packet_bytes = 0;
+            }
+        }
+        let next = offset
+            .checked_add(header_bytes)
+            .and_then(|value| value.checked_add(body_bytes))
+            .ok_or_else(|| "Ogg page size overflow".to_string())?;
+        if next > file_len {
+            return Err(format!("{}: truncated Ogg page body", path.display()));
+        }
+        if end_of_stream {
+            if pending_packet_bytes != 0 {
+                return Err(format!(
+                    "{}: Ogg EOS page ends with an incomplete packet",
+                    path.display()
+                ));
+            }
+            metadata.finish_stream()?;
+            current_ended = true;
+        }
+        offset = next;
+        page_count += 1;
+    }
+    if page_count == 0 || pending_packet_bytes != 0 || !current_ended {
+        return Err(format!("{}: incomplete Ogg logical stream", path.display()));
+    }
+    metadata.finish_stream()?;
+    Ok(())
+}
+
+fn preflight_flac_metadata<C>(
+    path: &Path,
+    file_len: u64,
+    budget: &mut ServiceMetadataBudget,
+    checkpoint: &mut C,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String> + Send,
+{
+    preflight_flac_metadata_at(path, file_len, 0, budget, checkpoint)
+}
+
+fn preflight_flac_metadata_at<C>(
+    path: &Path,
+    file_len: u64,
+    start: u64,
+    budget: &mut ServiceMetadataBudget,
+    checkpoint: &mut C,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata_start = start
+        .checked_add(4)
+        .filter(|&offset| offset <= file_len)
+        .ok_or_else(|| format!("{}: truncated FLAC signature", path.display()))?;
+    file.seek(SeekFrom::Start(metadata_start))
+        .map_err(|error| format!("seek {} FLAC metadata: {error}", path.display()))?;
+    let mut offset = metadata_start;
+    for block_count in 0..SERVICE_MAX_CONTAINER_ITEMS {
+        if block_count.is_multiple_of(SERVICE_CONTAINER_CHECKPOINT_ITEMS) {
+            checkpoint()?;
+        }
+        let mut header = [0_u8; 4];
+        file.read_exact(&mut header)
+            .map_err(|error| format!("read {} FLAC metadata: {error}", path.display()))?;
+        let last = header[0] & 0x80 != 0;
+        let block_type = header[0] & 0x7f;
+        if block_type == 0x7f {
+            return Err(format!(
+                "{}: invalid reserved FLAC metadata type",
+                path.display()
+            ));
+        }
+        let length = u64::from(u32::from_be_bytes([0, header[1], header[2], header[3]]));
+        budget.add_entries(1)?;
+        budget.add_encoded_bytes(
+            4_u64
+                .checked_add(length)
+                .ok_or_else(|| "FLAC metadata size overflow".to_string())?,
+        )?;
+        // PADDING and unknown blocks are skipped by Symphonia and therefore do
+        // not create a payload-sized allocation. Known retained blocks do.
+        if matches!(block_type, 2..=6) {
+            ServiceMetadataBudget::validate_item(length)?;
+        }
+        let payload_start = offset
+            .checked_add(4)
+            .ok_or_else(|| "FLAC metadata offset overflow".to_string())?;
+        offset = payload_start
+            .checked_add(length)
+            .ok_or_else(|| "FLAC metadata offset overflow".to_string())?;
+        if offset > file_len {
+            return Err(format!("{}: truncated FLAC metadata", path.display()));
+        }
+        if matches!(block_type, 4 | 6) {
+            file.seek(SeekFrom::Start(payload_start))
+                .map_err(|error| format!("seek {} FLAC metadata: {error}", path.display()))?;
+            let mut remaining = length;
+            let mut block = [0_u8; SERVICE_CONTROLLED_READ_BYTES];
+            let mut scanner = if block_type == 4 {
+                ServiceOggFlacPayloadScanner::Comment(ServiceOggCommentScanner::new(
+                    ServiceOggCommentCodec::Flac,
+                ))
+            } else {
+                ServiceOggFlacPayloadScanner::Picture(ServiceFlacPictureScanner::default())
+            };
+            while remaining != 0 {
+                checkpoint()?;
+                let count = usize::try_from(remaining.min(block.len() as u64)).unwrap();
+                file.read_exact(&mut block[..count])
+                    .map_err(|error| format!("read {} FLAC metadata: {error}", path.display()))?;
+                match &mut scanner {
+                    ServiceOggFlacPayloadScanner::Comment(comment) => {
+                        comment.push(&block[..count], checkpoint)?;
+                        budget.add_entries(comment.take_unbudgeted_comments())?;
+                    }
+                    ServiceOggFlacPayloadScanner::Picture(picture) => {
+                        picture.push(&block[..count])?;
+                    }
+                    ServiceOggFlacPayloadScanner::Skip => unreachable!(),
+                }
+                remaining -= count as u64;
+            }
+            match &scanner {
+                ServiceOggFlacPayloadScanner::Comment(comment) => comment.finish()?,
+                ServiceOggFlacPayloadScanner::Picture(picture) => picture.finish()?,
+                ServiceOggFlacPayloadScanner::Skip => unreachable!(),
+            }
+        }
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| format!("seek {} FLAC metadata: {error}", path.display()))?;
+        if last {
+            return Ok(());
+        }
+    }
+    Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into())
+}
+
+fn preflight_isobmff_top_level<C>(
+    path: &Path,
+    file_len: u64,
+    checkpoint: &mut C,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut state = ServiceIsoBmffPreflight::default();
+    let mut offset = 0_u64;
+    while offset < file_len {
+        service_isobmff_checkpoint(&mut state, checkpoint)?;
+        let header = read_service_isobmff_box(path, &mut file, offset, file_len)?;
+        let payload = header.end - header.body_start;
+        if !matches!(&header.kind, b"mdat" | b"free" | b"skip" | b"wide")
+            && payload > SERVICE_MAX_ENCODED_PACKET_BYTES
+        {
+            return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+        }
+        match &header.kind {
+            b"moov" | b"moof" => preflight_isobmff_region(
+                path,
+                &mut file,
+                header.body_start,
+                header.end,
+                1,
+                &mut state,
+                checkpoint,
+            )?,
+            b"udta" => preflight_isobmff_metadata_region(
+                path,
+                &mut file,
+                header.body_start,
+                header.end,
+                1,
+                ServiceIsoBmffMetadataRegion::Container,
+                &mut state,
+                checkpoint,
+            )?,
+            b"meta" => preflight_isobmff_metadata_region(
+                path,
+                &mut file,
+                header.body_start,
+                header.end,
+                1,
+                ServiceIsoBmffMetadataRegion::FullBox,
+                &mut state,
+                checkpoint,
+            )?,
+            _ => {}
+        }
+        offset = header.end;
+        if header.extends_to_end {
+            break;
+        }
+    }
+    if offset == file_len {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: ISO-BMFF top-level boxes do not cover the file",
+            path.display()
+        ))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ServiceIsoBmffBox {
+    kind: [u8; 4],
+    body_start: u64,
+    end: u64,
+    extends_to_end: bool,
+}
+
+#[derive(Default)]
+struct ServiceIsoBmffPreflight {
+    boxes: usize,
+    metadata: ServiceMetadataBudget,
+    track_default_sample_sizes: Vec<(u32, u32)>,
+}
+
+#[derive(Default)]
+struct ServiceIsoBmffFragmentDefaults {
+    track_id: Option<u32>,
+    sample_size: Option<u32>,
+}
+
+fn service_isobmff_checkpoint<C>(
+    state: &mut ServiceIsoBmffPreflight,
+    checkpoint: &mut C,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    if state.boxes == SERVICE_MAX_CONTAINER_ITEMS {
+        return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+    }
+    if state
+        .boxes
+        .is_multiple_of(SERVICE_CONTAINER_CHECKPOINT_ITEMS)
+    {
+        checkpoint()?;
+    }
+    state.boxes += 1;
+    Ok(())
+}
+
+fn read_service_isobmff_box(
+    path: &Path,
+    file: &mut File,
+    offset: u64,
+    region_end: u64,
+) -> Result<ServiceIsoBmffBox, String> {
+    if offset > region_end || region_end - offset < 8 {
+        return Err(format!(
+            "{}: truncated ISO-BMFF box header at byte {offset}",
+            path.display()
+        ));
+    }
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| format!("seek {} ISO-BMFF box: {error}", path.display()))?;
+    let mut base = [0_u8; 8];
+    file.read_exact(&mut base)
+        .map_err(|error| format!("read {} ISO-BMFF box: {error}", path.display()))?;
+    let size32 = u32::from_be_bytes(base[..4].try_into().unwrap());
+    let kind = base[4..8].try_into().unwrap();
+    let (size, header_bytes, extends_to_end) = match size32 {
+        0 => (region_end - offset, 8_u64, true),
+        1 => {
+            if region_end - offset < 16 {
+                return Err(format!(
+                    "{}: truncated extended ISO-BMFF box header at byte {offset}",
+                    path.display()
+                ));
+            }
+            let mut extended = [0_u8; 8];
+            file.read_exact(&mut extended).map_err(|error| {
+                format!("read {} extended ISO-BMFF box: {error}", path.display())
+            })?;
+            (u64::from_be_bytes(extended), 16, false)
+        }
+        size => (u64::from(size), 8, false),
+    };
+    if size < header_bytes {
+        return Err(format!(
+            "{}: ISO-BMFF box at byte {offset} is smaller than its header",
+            path.display()
+        ));
+    }
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| "ISO-BMFF box size overflow".to_string())?;
+    if end > region_end || end <= offset {
+        return Err(format!(
+            "{}: ISO-BMFF box at byte {offset} exceeds its parent",
+            path.display()
+        ));
+    }
+    Ok(ServiceIsoBmffBox {
+        kind,
+        body_start: offset + header_bytes,
+        end,
+        extends_to_end,
+    })
+}
+
+fn preflight_isobmff_region<C>(
+    path: &Path,
+    file: &mut File,
+    start: u64,
+    end: u64,
+    depth: usize,
+    state: &mut ServiceIsoBmffPreflight,
+    checkpoint: &mut C,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    const MAX_DEPTH: usize = 16;
+    if depth > MAX_DEPTH {
+        return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+    }
+    let mut offset = start;
+    while offset < end {
+        service_isobmff_checkpoint(state, checkpoint)?;
+        let child = read_service_isobmff_box(path, file, offset, end)?;
+        let payload = child.end - child.body_start;
+        match &child.kind {
+            b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"mvex" | b"moof" => {
+                preflight_isobmff_region(
+                    path,
+                    file,
+                    child.body_start,
+                    child.end,
+                    depth + 1,
+                    state,
+                    checkpoint,
+                )?;
+            }
+            b"udta" => preflight_isobmff_metadata_region(
+                path,
+                file,
+                child.body_start,
+                child.end,
+                depth + 1,
+                ServiceIsoBmffMetadataRegion::Container,
+                state,
+                checkpoint,
+            )?,
+            b"meta" => preflight_isobmff_metadata_region(
+                path,
+                file,
+                child.body_start,
+                child.end,
+                depth + 1,
+                ServiceIsoBmffMetadataRegion::FullBox,
+                state,
+                checkpoint,
+            )?,
+            b"ilst" => preflight_isobmff_metadata_region(
+                path,
+                file,
+                child.body_start,
+                child.end,
+                depth + 1,
+                ServiceIsoBmffMetadataRegion::ItemList,
+                state,
+                checkpoint,
+            )?,
+            b"traf" => preflight_isobmff_traf(
+                path,
+                file,
+                child.body_start,
+                child.end,
+                depth + 1,
+                state,
+                checkpoint,
+            )?,
+            b"stsz" => preflight_isobmff_stsz(path, file, child, checkpoint)?,
+            b"stz2" => preflight_isobmff_stz2(path, file, child, checkpoint)?,
+            b"trex" => preflight_isobmff_trex(path, file, child, state)?,
+            b"free" | b"skip" => {}
+            _ if payload > SERVICE_MAX_ENCODED_PACKET_BYTES => {
+                return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+            }
+            _ => {}
+        }
+        offset = child.end;
+        if child.extends_to_end {
+            break;
+        }
+    }
+    if offset == end {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: nested ISO-BMFF boxes do not cover their parent",
+            path.display()
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServiceIsoBmffMetadataRegion {
+    Container,
+    FullBox,
+    ItemList,
+    Item,
+}
+
+/// Walk the `udta/meta/ilst` hierarchy without reading metadata payloads.
+/// `ilst` entry fourcc values are user-defined metadata keys, so every direct
+/// child is treated as a container while only `data`/`mean`/`name` leaves are
+/// subject to the strict per-item metadata allocation bound.
+#[allow(clippy::too_many_arguments)]
+fn preflight_isobmff_metadata_region<C>(
+    path: &Path,
+    file: &mut File,
+    start: u64,
+    end: u64,
+    depth: usize,
+    region: ServiceIsoBmffMetadataRegion,
+    state: &mut ServiceIsoBmffPreflight,
+    checkpoint: &mut C,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    const MAX_DEPTH: usize = 16;
+    if depth > MAX_DEPTH {
+        return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+    }
+    let mut offset = if region == ServiceIsoBmffMetadataRegion::FullBox {
+        start
+            .checked_add(4)
+            .filter(|offset| *offset <= end)
+            .ok_or_else(|| format!("{}: truncated ISO-BMFF meta FullBox", path.display()))?
+    } else {
+        start
+    };
+    while offset < end {
+        service_isobmff_checkpoint(state, checkpoint)?;
+        let child = read_service_isobmff_box(path, file, offset, end)?;
+        let payload = child.end - child.body_start;
+        state.metadata.add_entries(1)?;
+        let strict_leaf = matches!(&child.kind, b"data" | b"mean" | b"name");
+        let is_container = !strict_leaf
+            && (region == ServiceIsoBmffMetadataRegion::ItemList
+                || matches!(&child.kind, b"udta" | b"meta" | b"ilst"));
+        if !is_container {
+            state.metadata.add_encoded_bytes(
+                child
+                    .end
+                    .checked_sub(offset)
+                    .ok_or_else(|| "ISO-BMFF metadata size underflow".to_string())?,
+            )?;
+        }
+        match region {
+            _ if strict_leaf => {
+                ServiceMetadataBudget::validate_item(payload)?;
+            }
+            ServiceIsoBmffMetadataRegion::ItemList => preflight_isobmff_metadata_region(
+                path,
+                file,
+                child.body_start,
+                child.end,
+                depth + 1,
+                ServiceIsoBmffMetadataRegion::Item,
+                state,
+                checkpoint,
+            )?,
+            _ => match &child.kind {
+                b"udta" => preflight_isobmff_metadata_region(
+                    path,
+                    file,
+                    child.body_start,
+                    child.end,
+                    depth + 1,
+                    ServiceIsoBmffMetadataRegion::Container,
+                    state,
+                    checkpoint,
+                )?,
+                b"meta" => preflight_isobmff_metadata_region(
+                    path,
+                    file,
+                    child.body_start,
+                    child.end,
+                    depth + 1,
+                    ServiceIsoBmffMetadataRegion::FullBox,
+                    state,
+                    checkpoint,
+                )?,
+                b"ilst" => preflight_isobmff_metadata_region(
+                    path,
+                    file,
+                    child.body_start,
+                    child.end,
+                    depth + 1,
+                    ServiceIsoBmffMetadataRegion::ItemList,
+                    state,
+                    checkpoint,
+                )?,
+                _ if payload > SERVICE_MAX_ENCODED_PACKET_BYTES => {
+                    return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+                }
+                _ => {}
+            },
+        }
+        offset = child.end;
+        if child.extends_to_end {
+            break;
+        }
+    }
+    if offset == end {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: ISO-BMFF metadata boxes do not cover their parent",
+            path.display()
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preflight_isobmff_traf<C>(
+    path: &Path,
+    file: &mut File,
+    start: u64,
+    end: u64,
+    depth: usize,
+    state: &mut ServiceIsoBmffPreflight,
+    checkpoint: &mut C,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    if depth > 16 {
+        return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+    }
+    let mut defaults = ServiceIsoBmffFragmentDefaults::default();
+    let mut offset = start;
+    while offset < end {
+        service_isobmff_checkpoint(state, checkpoint)?;
+        let child = read_service_isobmff_box(path, file, offset, end)?;
+        let payload = child.end - child.body_start;
+        match &child.kind {
+            b"tfhd" => preflight_isobmff_tfhd(path, file, child, &mut defaults)?,
+            b"trun" => preflight_isobmff_trun(path, file, child, &defaults, state, checkpoint)?,
+            b"free" | b"skip" => {}
+            _ if payload > SERVICE_MAX_ENCODED_PACKET_BYTES => {
+                return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+            }
+            _ => {}
+        }
+        offset = child.end;
+        if child.extends_to_end {
+            break;
+        }
+    }
+    if offset == end {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: TrackFragmentBox children do not cover their parent",
+            path.display()
+        ))
+    }
+}
+
+fn read_service_box_prefix<const N: usize>(
+    path: &Path,
+    file: &mut File,
+    header: ServiceIsoBmffBox,
+) -> Result<[u8; N], String> {
+    if header.end - header.body_start < N as u64 {
+        return Err(format!(
+            "{}: {} box is truncated",
+            path.display(),
+            String::from_utf8_lossy(&header.kind)
+        ));
+    }
+    file.seek(SeekFrom::Start(header.body_start))
+        .map_err(|error| format!("seek {} ISO-BMFF payload: {error}", path.display()))?;
+    let mut bytes = [0_u8; N];
+    file.read_exact(&mut bytes)
+        .map_err(|error| format!("read {} ISO-BMFF payload: {error}", path.display()))?;
+    Ok(bytes)
+}
+
+fn preflight_isobmff_stsz<C>(
+    path: &Path,
+    file: &mut File,
+    header: ServiceIsoBmffBox,
+    checkpoint: &mut C,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    let prefix = read_service_box_prefix::<12>(path, file, header)?;
+    if prefix[0] != 0 || prefix[1..4] != [0, 0, 0] {
+        return Err(format!("{}: unsupported stsz FullBox", path.display()));
+    }
+    let fixed_size = u32::from_be_bytes(prefix[4..8].try_into().unwrap());
+    let sample_count = u32::from_be_bytes(prefix[8..12].try_into().unwrap());
+    if sample_count > SERVICE_MAX_ISOBMFF_SAMPLE_ENTRIES {
+        return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+    }
+    if u64::from(fixed_size) > SERVICE_MAX_ENCODED_PACKET_BYTES {
+        return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+    }
+    let entries = if fixed_size == 0 {
+        u64::from(sample_count)
+            .checked_mul(4)
+            .ok_or_else(|| "stsz table length overflow".to_string())?
+    } else {
+        0
+    };
+    let expected_end = header
+        .body_start
+        .checked_add(12)
+        .and_then(|offset| offset.checked_add(entries))
+        .ok_or_else(|| "stsz table offset overflow".to_string())?;
+    if expected_end != header.end {
+        return Err(format!("{}: malformed stsz sample table", path.display()));
+    }
+    if fixed_size == 0 {
+        preflight_isobmff_sample_sizes(
+            path,
+            file,
+            header.body_start + 12,
+            sample_count,
+            4,
+            0,
+            checkpoint,
+        )?;
+    }
+    Ok(())
+}
+
+fn preflight_isobmff_stz2<C>(
+    path: &Path,
+    file: &mut File,
+    header: ServiceIsoBmffBox,
+    checkpoint: &mut C,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    let prefix = read_service_box_prefix::<12>(path, file, header)?;
+    if prefix[0] != 0 || prefix[1..4] != [0, 0, 0] {
+        return Err(format!("{}: unsupported stz2 FullBox", path.display()));
+    }
+    let field_size = prefix[7];
+    if !matches!(field_size, 4 | 8 | 16) {
+        return Err(format!("{}: invalid stz2 field size", path.display()));
+    }
+    let sample_count = u32::from_be_bytes(prefix[8..12].try_into().unwrap());
+    if sample_count > SERVICE_MAX_ISOBMFF_SAMPLE_ENTRIES {
+        return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+    }
+    let table_bits = u64::from(sample_count)
+        .checked_mul(u64::from(field_size))
+        .ok_or_else(|| "stz2 table length overflow".to_string())?;
+    let table_bytes = table_bits
+        .checked_add(7)
+        .ok_or_else(|| "stz2 table length overflow".to_string())?
+        / 8;
+    let expected_end = header
+        .body_start
+        .checked_add(12)
+        .and_then(|offset| offset.checked_add(table_bytes))
+        .ok_or_else(|| "stz2 table offset overflow".to_string())?;
+    if expected_end != header.end {
+        return Err(format!("{}: malformed stz2 sample table", path.display()));
+    }
+
+    // Compact entries are at most 16 bits, but scan their complete table in
+    // bounded chunks so cancellation/deadline checks do not depend on how a
+    // third-party parser chooses to consume the box.
+    file.seek(SeekFrom::Start(header.body_start + 12))
+        .map_err(|error| format!("seek {} stz2 table: {error}", path.display()))?;
+    let mut remaining = table_bytes;
+    // At most 64 compact four-bit entries are crossed between checks.
+    let mut buffer = [0_u8; SERVICE_CONTAINER_CHECKPOINT_ITEMS / 2];
+    while remaining != 0 {
+        checkpoint()?;
+        let take = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded ISO-BMFF table read fits usize");
+        file.read_exact(&mut buffer[..take])
+            .map_err(|error| format!("read {} stz2 table: {error}", path.display()))?;
+        remaining -= take as u64;
+    }
+    Ok(())
+}
+
+fn preflight_isobmff_trex(
+    path: &Path,
+    file: &mut File,
+    header: ServiceIsoBmffBox,
+    state: &mut ServiceIsoBmffPreflight,
+) -> Result<(), String> {
+    if header.end - header.body_start != 24 {
+        return Err(format!("{}: malformed trex box", path.display()));
+    }
+    let prefix = read_service_box_prefix::<24>(path, file, header)?;
+    if prefix[0] != 0 || prefix[1..4] != [0, 0, 0] {
+        return Err(format!("{}: unsupported trex FullBox", path.display()));
+    }
+    let track_id = u32::from_be_bytes(prefix[4..8].try_into().unwrap());
+    let sample_size = u32::from_be_bytes(prefix[16..20].try_into().unwrap());
+    if track_id == 0 {
+        return Err(format!("{}: trex track ID is zero", path.display()));
+    }
+    if u64::from(sample_size) > SERVICE_MAX_ENCODED_PACKET_BYTES {
+        return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+    }
+    if let Some((_, existing)) = state
+        .track_default_sample_sizes
+        .iter_mut()
+        .find(|(id, _)| *id == track_id)
+    {
+        *existing = sample_size;
+    } else {
+        state
+            .track_default_sample_sizes
+            .push((track_id, sample_size));
+    }
+    Ok(())
+}
+
+fn preflight_isobmff_tfhd(
+    path: &Path,
+    file: &mut File,
+    header: ServiceIsoBmffBox,
+    defaults: &mut ServiceIsoBmffFragmentDefaults,
+) -> Result<(), String> {
+    let prefix = read_service_box_prefix::<8>(path, file, header)?;
+    let version = prefix[0];
+    let flags = u32::from_be_bytes([0, prefix[1], prefix[2], prefix[3]]);
+    const ALLOWED_FLAGS: u32 = 0x03_003b;
+    if version != 0 || flags & !ALLOWED_FLAGS != 0 {
+        return Err(format!("{}: unsupported tfhd FullBox", path.display()));
+    }
+    let track_id = u32::from_be_bytes(prefix[4..8].try_into().unwrap());
+    if track_id == 0 {
+        return Err(format!("{}: tfhd track ID is zero", path.display()));
+    }
+    let mut cursor = header.body_start + 8;
+    let mut remaining = header.end - cursor;
+    let take_u32 = |file: &mut File, cursor: &mut u64, remaining: &mut u64| {
+        if *remaining < 4 {
+            return Err(format!("{}: truncated tfhd field", path.display()));
+        }
+        file.seek(SeekFrom::Start(*cursor))
+            .map_err(|error| format!("seek {} tfhd field: {error}", path.display()))?;
+        let mut bytes = [0_u8; 4];
+        file.read_exact(&mut bytes)
+            .map_err(|error| format!("read {} tfhd field: {error}", path.display()))?;
+        *cursor += 4;
+        *remaining -= 4;
+        Ok(u32::from_be_bytes(bytes))
+    };
+    if flags & 0x000001 != 0 {
+        if remaining < 8 {
+            return Err(format!("{}: truncated tfhd base offset", path.display()));
+        }
+        cursor += 8;
+        remaining -= 8;
+    }
+    if flags & 0x000002 != 0 {
+        let _ = take_u32(file, &mut cursor, &mut remaining)?;
+    }
+    if flags & 0x000008 != 0 {
+        let _ = take_u32(file, &mut cursor, &mut remaining)?;
+    }
+    let sample_size = if flags & 0x000010 != 0 {
+        Some(take_u32(file, &mut cursor, &mut remaining)?)
+    } else {
+        None
+    };
+    if flags & 0x000020 != 0 {
+        let _ = take_u32(file, &mut cursor, &mut remaining)?;
+    }
+    if remaining != 0 {
+        return Err(format!("{}: malformed tfhd box", path.display()));
+    }
+    if sample_size.is_some_and(|size| u64::from(size) > SERVICE_MAX_ENCODED_PACKET_BYTES) {
+        return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+    }
+    defaults.track_id = Some(track_id);
+    defaults.sample_size = sample_size;
+    Ok(())
+}
+
+fn preflight_isobmff_trun<C>(
+    path: &Path,
+    file: &mut File,
+    header: ServiceIsoBmffBox,
+    defaults: &ServiceIsoBmffFragmentDefaults,
+    state: &ServiceIsoBmffPreflight,
+    checkpoint: &mut C,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    let prefix = read_service_box_prefix::<8>(path, file, header)?;
+    let version = prefix[0];
+    let flags = u32::from_be_bytes([0, prefix[1], prefix[2], prefix[3]]);
+    const ALLOWED_FLAGS: u32 = 0x000f05;
+    if !matches!(version, 0 | 1) || flags & !ALLOWED_FLAGS != 0 {
+        return Err(format!("{}: unsupported trun FullBox", path.display()));
+    }
+    let sample_count = u32::from_be_bytes(prefix[4..8].try_into().unwrap());
+    if sample_count > SERVICE_MAX_ISOBMFF_SAMPLE_ENTRIES {
+        return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+    }
+    let header_fields = usize::from(flags & 0x000001 != 0) + usize::from(flags & 0x000004 != 0);
+    let entry_fields = usize::from(flags & 0x000100 != 0)
+        + usize::from(flags & 0x000200 != 0)
+        + usize::from(flags & 0x000400 != 0)
+        + usize::from(flags & 0x000800 != 0);
+    let header_bytes = u64::try_from(header_fields)
+        .ok()
+        .and_then(|fields| fields.checked_mul(4))
+        .and_then(|bytes| bytes.checked_add(8))
+        .ok_or_else(|| "trun header length overflow".to_string())?;
+    let entry_width = entry_fields
+        .checked_mul(4)
+        .ok_or_else(|| "trun entry width overflow".to_string())?;
+    let table_bytes = u64::from(sample_count)
+        .checked_mul(entry_width as u64)
+        .ok_or_else(|| "trun table length overflow".to_string())?;
+    let expected_end = header
+        .body_start
+        .checked_add(header_bytes)
+        .and_then(|offset| offset.checked_add(table_bytes))
+        .ok_or_else(|| "trun table offset overflow".to_string())?;
+    if expected_end != header.end {
+        return Err(format!("{}: malformed trun sample table", path.display()));
+    }
+
+    if flags & 0x000200 != 0 {
+        let size_offset = usize::from(flags & 0x000100 != 0) * 4;
+        preflight_isobmff_sample_sizes(
+            path,
+            file,
+            header.body_start + header_bytes,
+            sample_count,
+            entry_width,
+            size_offset,
+            checkpoint,
+        )?;
+    } else {
+        let default_size = defaults.sample_size.or_else(|| {
+            let track_id = defaults.track_id?;
+            state
+                .track_default_sample_sizes
+                .iter()
+                .find_map(|(id, size)| (*id == track_id).then_some(*size))
+        });
+        let Some(default_size) = default_size else {
+            // Without an explicit or inherited size, a parser may need to
+            // discover an arbitrarily large sample from the mdat payload.
+            return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+        };
+        if u64::from(default_size) > SERVICE_MAX_ENCODED_PACKET_BYTES {
+            return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+        }
+        if sample_count != 0 && default_size == 0 {
+            return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+        }
+        checkpoint()?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preflight_isobmff_sample_sizes<C>(
+    path: &Path,
+    file: &mut File,
+    start: u64,
+    sample_count: u32,
+    entry_width: usize,
+    size_offset: usize,
+    checkpoint: &mut C,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    if entry_width < size_offset + 4 || entry_width > SERVICE_CONTROLLED_READ_BYTES {
+        return Err(format!(
+            "{}: invalid ISO-BMFF sample-size table",
+            path.display()
+        ));
+    }
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| format!("seek {} sample-size table: {error}", path.display()))?;
+    let records_per_chunk =
+        (SERVICE_CONTROLLED_READ_BYTES / entry_width).min(SERVICE_CONTAINER_CHECKPOINT_ITEMS);
+    let mut buffer = [0_u8; SERVICE_CONTROLLED_READ_BYTES];
+    let mut remaining = sample_count as usize;
+    while remaining != 0 {
+        checkpoint()?;
+        let records = remaining.min(records_per_chunk);
+        let bytes = records
+            .checked_mul(entry_width)
+            .ok_or_else(|| "ISO-BMFF sample-size chunk overflow".to_string())?;
+        file.read_exact(&mut buffer[..bytes])
+            .map_err(|error| format!("read {} sample-size table: {error}", path.display()))?;
+        for entry in buffer[..bytes].chunks_exact(entry_width) {
+            let sample_size =
+                u32::from_be_bytes(entry[size_offset..size_offset + 4].try_into().unwrap());
+            if u64::from(sample_size) > SERVICE_MAX_ENCODED_PACKET_BYTES {
+                return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+            }
+        }
+        remaining -= records;
+    }
+    Ok(())
+}
+
+fn preflight_matroska<C>(
+    path: &Path,
+    file_len: u64,
+    packet_limit: u64,
+    checkpoint: &mut C,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut elements = 0_usize;
+    let mut metadata = ServiceMetadataBudget::default();
+    preflight_ebml_region(
+        path,
+        &mut file,
+        0,
+        file_len,
+        0,
+        packet_limit,
+        &mut elements,
+        &mut metadata,
+        checkpoint,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preflight_ebml_region<C>(
+    path: &Path,
+    file: &mut File,
+    start: u64,
+    end: u64,
+    depth: usize,
+    packet_limit: u64,
+    elements: &mut usize,
+    metadata: &mut ServiceMetadataBudget,
+    checkpoint: &mut C,
+) -> Result<(), String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    const EBML_MAX_DEPTH: usize = 16;
+    if depth > EBML_MAX_DEPTH {
+        return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+    }
+    let mut offset = start;
+    while offset < end {
+        if *elements == SERVICE_MAX_CONTAINER_ITEMS {
+            return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+        }
+        if (*elements).is_multiple_of(SERVICE_CONTAINER_CHECKPOINT_ITEMS) {
+            checkpoint()?;
+        }
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| format!("seek {} EBML element: {error}", path.display()))?;
+        let (id, id_bytes, _) = read_service_ebml_vint(file, true)?;
+        let (size, size_bytes, unknown) = read_service_ebml_vint(file, false)?;
+        let data_start = offset
+            .checked_add(id_bytes as u64)
+            .and_then(|value| value.checked_add(size_bytes as u64))
+            .ok_or_else(|| "EBML element header overflow".to_string())?;
+        let element_end = if unknown {
+            if id != 0x1853_8067 {
+                return Err(format!(
+                    "{}: unknown-sized non-Segment EBML element",
+                    path.display()
+                ));
+            }
+            end
+        } else {
+            data_start
+                .checked_add(size)
+                .ok_or_else(|| "EBML element size overflow".to_string())?
+        };
+        if element_end > end || element_end <= offset {
+            return Err(format!(
+                "{}: invalid EBML element bounds at byte {offset}",
+                path.display()
+            ));
+        }
+        *elements += 1;
+        if service_ebml_master(id) {
+            preflight_ebml_region(
+                path,
+                file,
+                data_start,
+                element_end,
+                depth + 1,
+                packet_limit,
+                elements,
+                metadata,
+                checkpoint,
+            )?;
+        } else if id != 0xec {
+            let payload = element_end - data_start;
+            if service_ebml_packet_leaf(id) && payload > packet_limit {
+                return Err(SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED.into());
+            }
+            if service_ebml_retained_metadata_leaf(id) {
+                ServiceMetadataBudget::validate_item(payload)?;
+                metadata.add_entries(1)?;
+                metadata.add_encoded_bytes(payload)?;
+            }
+        }
+        offset = element_end;
+    }
+    Ok(())
+}
+
+fn service_ebml_packet_leaf(id: u64) -> bool {
+    matches!(id, 0xa1 | 0xa2 | 0xa3 | 0xa4 | 0xa5 | 0xaf)
+}
+
+/// Binary and string leaves the pinned Symphonia Matroska reader materializes
+/// or retains. Numeric geometry, master elements, Void/CRC, and encoded block
+/// payloads are intentionally absent: charging those as metadata either
+/// double-counts audio or rejects skip-only structure without reducing heap.
+fn service_ebml_retained_metadata_leaf(id: u64) -> bool {
+    matches!(
+        id,
+        0x4282
+            | 0x4283
+            | 0x465c
+            | 0x467e
+            | 0x4660
+            | 0x466e
+            | 0x4675
+            | 0x6933
+            | 0x450d
+            | 0x437e
+            | 0x437c
+            | 0x437d
+            | 0x85
+            | 0x6e67
+            | 0x5654
+            | 0x45e4
+            | 0x4521
+            | 0x69a5
+            | 0x4d80
+            | 0x3e83bb
+            | 0x3eb923
+            | 0x3c83ab
+            | 0x3cb923
+            | 0x4444
+            | 0x7384
+            | 0x73a4
+            | 0x7ba9
+            | 0x5741
+            | 0x53ab
+            | 0x4485
+            | 0x447a
+            | 0x447b
+            | 0x45a3
+            | 0x4487
+            | 0x63ca
+            | 0x7d7b
+            | 0x41ed
+            | 0x41a4
+            | 0x26b240
+            | 0x86
+            | 0x3b4040
+            | 0x258688
+            | 0x63a2
+            | 0x3a9697
+            | 0x4255
+            | 0x47e2
+            | 0x47e4
+            | 0x47e3
+            | 0x22b59c
+            | 0x22b59d
+            | 0x536e
+            | 0x66a5
+            | 0xc4
+            | 0xc1
+            | 0x7672
+            | 0x2eb524
+    )
+}
+
+fn read_service_ebml_vint(file: &mut File, id: bool) -> Result<(u64, usize, bool), String> {
+    let mut first = [0_u8; 1];
+    file.read_exact(&mut first)
+        .map_err(|error| format!("read EBML variable integer: {error}"))?;
+    if first[0] == 0 {
+        return Err("EBML variable integer begins with zero".into());
+    }
+    let length = first[0].leading_zeros() as usize + 1;
+    let maximum = if id { 4 } else { 8 };
+    if length > maximum {
+        return Err(format!("EBML variable integer exceeds {maximum} bytes"));
+    }
+    let mut value = if id {
+        u64::from(first[0])
+    } else {
+        u64::from(first[0] & (0xff >> length))
+    };
+    for _ in 1..length {
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte)
+            .map_err(|error| format!("read EBML variable integer: {error}"))?;
+        value = (value << 8) | u64::from(byte[0]);
+    }
+    let unknown = !id && value == (1_u64 << (7 * length)) - 1;
+    Ok((value, length, unknown))
+}
+
+fn service_ebml_master(id: u64) -> bool {
+    matches!(
+        id,
+        0x1a45_dfa3
+            | 0x4281
+            | 0x1853_8067
+            | 0x114d_9b74
+            | 0x4dbb
+            | 0x1549_a966
+            | 0x6924
+            | 0x1f43_b675
+            | 0x1654_ae6b
+            | 0xae
+            | 0xe1
+            | 0xe0
+            | 0x55b0
+            | 0x55d0
+            | 0x7670
+            | 0x41e4
+            | 0x6624
+            | 0xe2
+            | 0xe3
+            | 0xe4
+            | 0xe9
+            | 0x6d80
+            | 0x6240
+            | 0x5034
+            | 0x5035
+            | 0x47e7
+            | 0x1c53_bb6b
+            | 0xbb
+            | 0xb7
+            | 0xdb
+            | 0xa0
+            | 0x75a1
+            | 0xa6
+            | 0xc8
+            | 0x8e
+            | 0xe8
+            | 0x5854
+            | 0x1941_a469
+            | 0x61a7
+            | 0x1043_a770
+            | 0x45b9
+            | 0xb6
+            | 0x80
+            | 0x8f
+            | 0x4520
+            | 0x6944
+            | 0x6911
+            | 0x1254_c367
+            | 0x7373
+            | 0x63c0
+            | 0x67c8
+    )
+}
+
 fn sniff_decoder_route(path: &Path) -> Result<DecoderRoute, String> {
     let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let mut prefix = [0_u8; 16];
@@ -873,21 +4129,148 @@ fn sniff_decoder_route(path: &Path) -> Result<DecoderRoute, String> {
     Ok(DecoderRoute::Symphonia)
 }
 
+fn service_preflight_accepts_decoder_route(
+    service_route: ServiceContainerPreflightRoute,
+    decoder_route: DecoderRoute,
+) -> bool {
+    match service_route {
+        ServiceContainerPreflightRoute::NativeBounded => matches!(
+            decoder_route,
+            DecoderRoute::Wave | DecoderRoute::Dsf | DecoderRoute::Dsdiff
+        ),
+        ServiceContainerPreflightRoute::Ogg => {
+            matches!(decoder_route, DecoderRoute::Opus | DecoderRoute::Symphonia)
+        }
+        ServiceContainerPreflightRoute::Matroska
+        | ServiceContainerPreflightRoute::Flac
+        | ServiceContainerPreflightRoute::IsoBmff
+        | ServiceContainerPreflightRoute::Mpa
+        | ServiceContainerPreflightRoute::Adts => decoder_route == DecoderRoute::Symphonia,
+    }
+}
+
+fn service_preflight_accepts_container(
+    route: ServiceContainerPreflightRoute,
+    container: AudioContainer,
+) -> bool {
+    match route {
+        ServiceContainerPreflightRoute::NativeBounded => {
+            matches!(
+                container,
+                AudioContainer::Wave | AudioContainer::Dsf | AudioContainer::Dsdiff
+            )
+        }
+        ServiceContainerPreflightRoute::Ogg => container == AudioContainer::Ogg,
+        ServiceContainerPreflightRoute::Matroska => container == AudioContainer::Matroska,
+        ServiceContainerPreflightRoute::Flac => container == AudioContainer::Flac,
+        ServiceContainerPreflightRoute::IsoBmff => container == AudioContainer::IsoBmff,
+        ServiceContainerPreflightRoute::Mpa => container == AudioContainer::MpegAudio,
+        ServiceContainerPreflightRoute::Adts => container == AudioContainer::Adts,
+    }
+}
+
+/// Build the service-only format registry after Forge has fully preflighted a
+/// single container class. No metadata readers are registered: the controlled
+/// source starts at the exact audio offset returned by the checked ID3/APEv2
+/// scanner, and supplemental tags are not part of a normalization response.
+fn service_symphonia_probe(
+    route: ServiceContainerPreflightRoute,
+) -> Result<symphonia::core::formats::probe::Probe, String> {
+    use symphonia::core::formats::probe::Probe;
+    use symphonia::default::formats::{
+        AdtsReader, FlacReader, IsoMp4Reader, MkvReader, MpaReader, OggReader,
+    };
+
+    let mut probe = Probe::new();
+    match route {
+        ServiceContainerPreflightRoute::Ogg => probe.register_format::<OggReader<'_>>(),
+        ServiceContainerPreflightRoute::Matroska => probe.register_format::<MkvReader<'_>>(),
+        ServiceContainerPreflightRoute::Flac => probe.register_format::<FlacReader<'_>>(),
+        ServiceContainerPreflightRoute::IsoBmff => probe.register_format::<IsoMp4Reader<'_>>(),
+        ServiceContainerPreflightRoute::Mpa => probe.register_format::<MpaReader<'_>>(),
+        ServiceContainerPreflightRoute::Adts => probe.register_format::<AdtsReader<'_>>(),
+        ServiceContainerPreflightRoute::NativeBounded => {
+            return Err("native service decoder route does not use Symphonia probing".into());
+        }
+    }
+    Ok(probe)
+}
+
 fn probe_symphonia_identity_at(
     path: &Path,
     hint_path: Option<&Path>,
     display: &str,
     selection: AudioTrackSelection,
 ) -> Result<RegistryIdentity, String> {
-    use symphonia::core::audio::AudioSpec;
-    use symphonia::core::formats::probe::Hint;
-    use symphonia::core::formats::FormatOptions;
     use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
-    use symphonia::core::meta::MetadataOptions;
     use symphonia::default::get_probe;
 
     let file = File::open(path).map_err(|error| format!("{display}: {error}"))?;
     let stream = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
+    probe_symphonia_identity_from_stream(
+        path,
+        hint_path,
+        display,
+        selection,
+        stream,
+        symphonia::core::meta::MetadataOptions::default(),
+        get_probe(),
+    )
+}
+
+fn probe_symphonia_identity_at_controlled<C>(
+    path: &Path,
+    hint_path: Option<&Path>,
+    display: &str,
+    selection: AudioTrackSelection,
+    preflight: ServiceContainerPreflight,
+    checkpoint: C,
+) -> Result<RegistryIdentity, String>
+where
+    C: FnMut() -> Result<(), String> + Send,
+{
+    use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+
+    let checkpoint = Mutex::new(checkpoint);
+    run_locked_checkpoint(&checkpoint)?;
+    let file = File::open(path).map_err(|error| format!("{display}: {error}"))?;
+    let source = CheckpointMediaSource::new_range(
+        file,
+        &checkpoint,
+        preflight.media_offset,
+        preflight.media_end,
+    )?;
+    let stream = MediaSourceStream::new(Box::new(source), MediaSourceStreamOptions::default());
+    let probe = service_symphonia_probe(preflight.route)?;
+    let identity = probe_symphonia_identity_from_stream(
+        path,
+        hint_path,
+        display,
+        selection,
+        stream,
+        service_metadata_options(),
+        &probe,
+    )?;
+    if !service_preflight_accepts_container(preflight.route, identity.container) {
+        return Err("controlled Symphonia probe selected a non-preflighted container".into());
+    }
+    run_locked_checkpoint(&checkpoint)?;
+    Ok(identity)
+}
+
+fn probe_symphonia_identity_from_stream(
+    path: &Path,
+    hint_path: Option<&Path>,
+    display: &str,
+    selection: AudioTrackSelection,
+    stream: symphonia::core::io::MediaSourceStream<'_>,
+    metadata_options: symphonia::core::meta::MetadataOptions,
+    probe: &symphonia::core::formats::probe::Probe,
+) -> Result<RegistryIdentity, String> {
+    use symphonia::core::audio::AudioSpec;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::FormatOptions;
+
     let mut hint = Hint::new();
     if let Some(extension) = hint_path
         .and_then(Path::extension)
@@ -895,13 +4278,8 @@ fn probe_symphonia_identity_at(
     {
         hint.with_extension(extension);
     }
-    let mut format = get_probe()
-        .probe(
-            &hint,
-            stream,
-            FormatOptions::default(),
-            MetadataOptions::default(),
-        )
+    let mut format = probe
+        .probe(&hint, stream, FormatOptions::default(), metadata_options)
         .map_err(|error| format!("{display}: probe failed: {error}"))?;
     let container =
         audio_container_from_symphonia(format.format_info().format).ok_or_else(|| {
@@ -1572,6 +4950,7 @@ fn decode_symphonia_exact(
 struct SymphoniaAudioTrack {
     id: u32,
     num_frames: Option<u64>,
+    time_base: Option<symphonia::core::units::TimeBase>,
     codec_params: symphonia::core::codecs::audio::AudioCodecParameters,
 }
 
@@ -1664,6 +5043,7 @@ fn select_symphonia_audio_track_with_selection(
         SymphoniaAudioTrack {
             id: track.id,
             num_frames: track.num_frames,
+            time_base: track.time_base,
             codec_params,
         },
         u32::try_from(index)
@@ -2411,6 +5791,30 @@ where
 
 pub(crate) fn decode_descriptor_stream_with_layout_and_declared_frames<F>(
     descriptor: &InputDescriptor,
+    consume: F,
+) -> Result<StreamInfo, String>
+where
+    F: FnMut(
+        &StreamInfo,
+        ChannelLayoutProvenance,
+        Option<u64>,
+        &mut [Vec<f32>],
+    ) -> Result<(), String>,
+{
+    decode_descriptor_stream_with_layout_and_declared_frames_controlled(
+        descriptor,
+        None,
+        None,
+        || Ok(()),
+        consume,
+    )
+}
+
+fn decode_descriptor_stream_with_layout_and_declared_frames_controlled<F, C>(
+    descriptor: &InputDescriptor,
+    forced_flac_workers: Option<usize>,
+    max_packet_samples: Option<u64>,
+    mut checkpoint: C,
     mut consume: F,
 ) -> Result<StreamInfo, String>
 where
@@ -2420,6 +5824,7 @@ where
         Option<u64>,
         &mut [Vec<f32>],
     ) -> Result<(), String>,
+    C: FnMut() -> Result<(), String> + Send,
 {
     const RANGE_COMPLETE: &str = "__forge_input_descriptor_range_complete__";
     let selection = descriptor.track_selection;
@@ -2443,11 +5848,16 @@ where
     };
     let mut source_frame = 0_u64;
     let mut delivered = 0_u64;
-    let result = decode_stream_raw_with_selection(
+    let result = decode_stream_raw_with_selection_and_control(
         descriptor.input.stable_path(),
         descriptor.route,
         selection,
-        None,
+        forced_flac_workers,
+        max_packet_samples.map(|max_packet_samples| ServiceDecodeControl {
+            max_packet_samples,
+            expected_preflight: descriptor.service_preflight,
+        }),
+        &mut checkpoint,
         |info, provenance, _, planar| {
             validate_descriptor_decode(descriptor, info, provenance)?;
             let chunk_frames = planar.first().map_or(0, Vec::len);
@@ -2563,6 +5973,21 @@ pub(crate) enum AnalysisPcmChunk<'a> {
     F64(&'a [Vec<f64>]),
 }
 
+pub(crate) const SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED: &str =
+    "__forge_service_packet_sample_limit_exceeded__";
+pub(crate) const SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED: &str =
+    "__forge_service_encoded_packet_limit_exceeded__";
+
+impl AnalysisPcmChunk<'_> {
+    pub(crate) fn frames(&self) -> usize {
+        match self {
+            Self::F32(planar) => planar.first().map_or(0, Vec::len),
+            Self::S32(planar) => planar.first().map_or(0, Vec::len),
+            Self::F64(planar) => planar.first().map_or(0, Vec::len),
+        }
+    }
+}
+
 /// Decode the descriptor's exact programme for loudness measurement.
 ///
 /// Native S32/F64 WAVE streams are read directly from their immutable
@@ -2570,21 +5995,64 @@ pub(crate) enum AnalysisPcmChunk<'a> {
 /// normalization is exact and retains the optimized f32 analyzer lane.
 pub(crate) fn decode_descriptor_analysis_stream<F>(
     descriptor: &InputDescriptor,
-    mut consume: F,
+    consume: F,
 ) -> Result<StreamInfo, String>
 where
     F: FnMut(&StreamInfo, ChannelLayoutProvenance, AnalysisPcmChunk<'_>) -> Result<(), String>,
 {
+    decode_descriptor_analysis_stream_impl(descriptor, None, None, || Ok(()), consume)
+}
+
+/// Service-only descriptor decode with bounded cooperative checkpoints.
+///
+/// A controlled decode forces native FLAC onto one decoder so every packet is
+/// observed by the same checkpoint closure. Ordinary library callers retain
+/// the existing parallel route and results.
+pub(crate) fn decode_descriptor_analysis_stream_with_control<F, C>(
+    descriptor: &InputDescriptor,
+    max_decoded_samples: u64,
+    checkpoint: C,
+    consume: F,
+) -> Result<StreamInfo, String>
+where
+    F: FnMut(&StreamInfo, ChannelLayoutProvenance, AnalysisPcmChunk<'_>) -> Result<(), String>,
+    C: FnMut() -> Result<(), String> + Send,
+{
+    decode_descriptor_analysis_stream_impl(
+        descriptor,
+        Some(1),
+        Some(max_decoded_samples),
+        checkpoint,
+        consume,
+    )
+}
+
+fn decode_descriptor_analysis_stream_impl<F, C>(
+    descriptor: &InputDescriptor,
+    forced_flac_workers: Option<usize>,
+    max_packet_samples: Option<u64>,
+    mut checkpoint: C,
+    mut consume: F,
+) -> Result<StreamInfo, String>
+where
+    F: FnMut(&StreamInfo, ChannelLayoutProvenance, AnalysisPcmChunk<'_>) -> Result<(), String>,
+    C: FnMut() -> Result<(), String> + Send,
+{
+    checkpoint()?;
     if descriptor.route != DecoderRoute::Wave
         || !matches!(descriptor.info.source_kind, PcmKind::S32 | PcmKind::F64)
     {
-        return decode_descriptor_stream_with_layout(descriptor, |info, provenance, planar| {
-            consume(info, provenance, AnalysisPcmChunk::F32(planar))
-        });
+        return decode_descriptor_stream_with_layout_and_declared_frames_controlled(
+            descriptor,
+            forced_flac_workers,
+            max_packet_samples,
+            &mut checkpoint,
+            |info, provenance, _, planar| consume(info, provenance, AnalysisPcmChunk::F32(planar)),
+        );
     }
 
     let path = descriptor.input.stable_path();
-    let (wav, provenance) = WavReader::probe_with_layout(path)
+    let (wav, provenance) = WavReader::probe_with_layout_controlled(path, &mut checkpoint)
         .map_err(|error| format!("{}: {error}", display_input(&descriptor.input)))?;
     let decoded_info = StreamInfo {
         sample_rate: wav.sample_rate,
@@ -2617,6 +6085,14 @@ where
             display_input(&descriptor.input)
         ));
     }
+    if let Some(limit) = max_packet_samples {
+        let selected_samples = selected_frames
+            .checked_mul(channels as u64)
+            .ok_or_else(|| "selected WAVE sample count overflow".to_string())?;
+        if selected_samples > limit {
+            return Err(SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED.into());
+        }
+    }
     let byte_offset = start
         .checked_mul(frame_bytes_u64)
         .and_then(|offset| wav.data_offset.checked_add(offset))
@@ -2624,14 +6100,31 @@ where
     let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     file.seek(SeekFrom::Start(byte_offset))
         .map_err(|error| format!("{}: {error}", path.display()))?;
-    let chunk_bytes = wav_stream_chunk_bytes(wav.channels, wav.kind);
+    let configured_chunk_bytes = wav_stream_chunk_bytes(wav.channels, wav.kind);
+    let chunk_bytes = if let Some(limit) = max_packet_samples {
+        let max_frames = limit / channels as u64;
+        let max_frames = usize::try_from(max_frames).unwrap_or(usize::MAX).max(1);
+        configured_chunk_bytes.min(max_frames.saturating_mul(frame_bytes).max(frame_bytes))
+    } else {
+        configured_chunk_bytes
+    };
     let chunk_frames = chunk_bytes / frame_bytes;
     let mut bytes = vec![0_u8; chunk_bytes];
     let mut integer_planar = Vec::new();
     let mut f64_planar = Vec::new();
     let mut remaining_frames = selected_frames;
     while remaining_frames != 0 {
+        checkpoint()?;
         let frames = remaining_frames.min(chunk_frames as u64) as usize;
+        if let Some(limit) = max_packet_samples {
+            let packet_samples = u64::try_from(frames)
+                .ok()
+                .and_then(|frames| frames.checked_mul(channels as u64))
+                .ok_or_else(|| "decoded WAVE chunk sample count overflow".to_string())?;
+            if packet_samples > limit {
+                return Err(SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED.into());
+            }
+        }
         let bytes_to_read = frames
             .checked_mul(frame_bytes)
             .ok_or_else(|| "selected WAVE chunk size overflow".to_string())?;
@@ -2664,6 +6157,7 @@ where
             }
             _ => unreachable!("high-precision WAVE kind was selected above"),
         }
+        checkpoint()?;
         remaining_frames -= frames as u64;
     }
     Ok(descriptor.info.clone())
@@ -2832,7 +6326,7 @@ fn decode_stream_raw_with_selection<F>(
     route: DecoderRoute,
     selection: AudioTrackSelection,
     forced_flac_workers: Option<usize>,
-    mut consume: F,
+    consume: F,
 ) -> Result<StreamInfo, String>
 where
     F: FnMut(
@@ -2842,11 +6336,156 @@ where
         &mut [Vec<f32>],
     ) -> Result<(), String>,
 {
+    decode_stream_raw_with_selection_and_control(
+        path,
+        route,
+        selection,
+        forced_flac_workers,
+        None,
+        || Ok(()),
+        consume,
+    )
+}
+
+fn symphonia_packet_sample_upper_bound(
+    track: &SymphoniaAudioTrack,
+    packet: &symphonia::core::packet::Packet,
+) -> Result<Option<u64>, String> {
+    let Some(channels) = track.codec_params.channels.as_ref() else {
+        return Ok(None);
+    };
+    if let Some(bytes_per_sample) = symphonia_pcm_bytes_per_sample(track.codec_params.codec) {
+        let channels = channels.count() as u64;
+        let bytes_per_frame = channels
+            .checked_mul(bytes_per_sample)
+            .ok_or_else(|| "PCM packet frame size overflow".to_string())?;
+        let packet_bytes = u64::try_from(packet.data.len())
+            .map_err(|_| "PCM packet byte count exceeds u64".to_string())?;
+        let frames = packet_bytes
+            .checked_add(bytes_per_frame - 1)
+            .ok_or_else(|| "PCM packet frame count overflow".to_string())?
+            / bytes_per_frame;
+        return frames
+            .checked_mul(channels)
+            .map(Some)
+            .ok_or_else(|| "PCM packet sample count overflow".to_string());
+    }
+    let frames = if let (Some(time_base), Some(sample_rate)) =
+        (track.time_base, track.codec_params.sample_rate)
+    {
+        let numerator = u128::from(packet.block_dur().get())
+            .checked_mul(u128::from(time_base.numer.get()))
+            .and_then(|value| value.checked_mul(u128::from(sample_rate)))
+            .ok_or_else(|| "declared packet frame geometry overflow".to_string())?;
+        let denominator = u128::from(time_base.denom.get());
+        let frames = numerator
+            .checked_add(denominator - 1)
+            .ok_or_else(|| "declared packet frame geometry overflow".to_string())?
+            / denominator;
+        let frames = u64::try_from(frames)
+            .map_err(|_| "declared packet frame count exceeds u64".to_string())?;
+        if frames == 0 && !packet.data.is_empty() {
+            return Ok(None);
+        }
+        frames
+    } else if let Some(frames) = track.codec_params.max_frames_per_packet {
+        if frames == 0 && !packet.data.is_empty() {
+            return Ok(None);
+        }
+        frames
+    } else {
+        return Ok(None);
+    };
+    frames
+        .checked_mul(channels.count() as u64)
+        .map(Some)
+        .ok_or_else(|| "declared packet sample count overflow".to_string())
+}
+
+fn symphonia_pcm_bytes_per_sample(
+    codec: symphonia::core::codecs::audio::AudioCodecId,
+) -> Option<u64> {
+    use symphonia::core::codecs::audio::well_known::*;
+
+    Some(match codec {
+        CODEC_ID_PCM_S8
+        | CODEC_ID_PCM_S8_PLANAR
+        | CODEC_ID_PCM_U8
+        | CODEC_ID_PCM_U8_PLANAR
+        | CODEC_ID_PCM_ALAW
+        | CODEC_ID_PCM_MULAW => 1,
+        CODEC_ID_PCM_S16LE
+        | CODEC_ID_PCM_S16LE_PLANAR
+        | CODEC_ID_PCM_S16BE
+        | CODEC_ID_PCM_S16BE_PLANAR
+        | CODEC_ID_PCM_U16LE
+        | CODEC_ID_PCM_U16LE_PLANAR
+        | CODEC_ID_PCM_U16BE
+        | CODEC_ID_PCM_U16BE_PLANAR => 2,
+        CODEC_ID_PCM_S24LE
+        | CODEC_ID_PCM_S24LE_PLANAR
+        | CODEC_ID_PCM_S24BE
+        | CODEC_ID_PCM_S24BE_PLANAR
+        | CODEC_ID_PCM_U24LE
+        | CODEC_ID_PCM_U24LE_PLANAR
+        | CODEC_ID_PCM_U24BE
+        | CODEC_ID_PCM_U24BE_PLANAR => 3,
+        CODEC_ID_PCM_S32LE
+        | CODEC_ID_PCM_S32LE_PLANAR
+        | CODEC_ID_PCM_S32BE
+        | CODEC_ID_PCM_S32BE_PLANAR
+        | CODEC_ID_PCM_U32LE
+        | CODEC_ID_PCM_U32LE_PLANAR
+        | CODEC_ID_PCM_U32BE
+        | CODEC_ID_PCM_U32BE_PLANAR
+        | CODEC_ID_PCM_F32LE
+        | CODEC_ID_PCM_F32LE_PLANAR
+        | CODEC_ID_PCM_F32BE
+        | CODEC_ID_PCM_F32BE_PLANAR => 4,
+        CODEC_ID_PCM_F64LE
+        | CODEC_ID_PCM_F64LE_PLANAR
+        | CODEC_ID_PCM_F64BE
+        | CODEC_ID_PCM_F64BE_PLANAR => 8,
+        _ => return None,
+    })
+}
+
+fn enforce_symphonia_packet_sample_limit(
+    track: &SymphoniaAudioTrack,
+    packet: &symphonia::core::packet::Packet,
+    limit: u64,
+) -> Result<(), String> {
+    let packet_samples = symphonia_packet_sample_upper_bound(track, packet)?
+        .ok_or_else(|| SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED.to_string())?;
+    if packet_samples > limit {
+        Err(SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED.into())
+    } else {
+        Ok(())
+    }
+}
+
+fn decode_stream_raw_with_selection_and_control<F, C>(
+    path: &Path,
+    route: DecoderRoute,
+    selection: AudioTrackSelection,
+    forced_flac_workers: Option<usize>,
+    service_control: Option<ServiceDecodeControl>,
+    mut checkpoint: C,
+    mut consume: F,
+) -> Result<StreamInfo, String>
+where
+    F: FnMut(
+        &StreamInfo,
+        ChannelLayoutProvenance,
+        Option<u64>,
+        &mut [Vec<f32>],
+    ) -> Result<(), String>,
+    C: FnMut() -> Result<(), String> + Send,
+{
     use symphonia::core::errors::Error;
     use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::FormatOptions;
-    use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
-    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
     use symphonia::default::{get_codecs, get_probe};
 
     let extension = path
@@ -2854,19 +6493,72 @@ where
         .and_then(|value| value.to_str())
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
+    checkpoint()?;
+    let controlled = service_control.is_some();
+    let max_packet_samples = service_control.map(|control| control.max_packet_samples);
+    let service_preflight = if controlled {
+        let observed = service_container_preflight(path, &mut checkpoint)?;
+        if service_control
+            .and_then(|control| control.expected_preflight)
+            .is_some_and(|expected| expected != observed)
+        {
+            return Err("service container route changed after descriptor preflight".into());
+        }
+        if !service_preflight_accepts_decoder_route(observed.route, route) {
+            return Err("service preflight route disagrees with the selected decoder route".into());
+        }
+        Some(observed)
+    } else {
+        None
+    };
     if route == DecoderRoute::Wave {
         require_single_track(selection)?;
-        return decode_wav_stream(path, consume);
+        return decode_wav_stream(
+            path,
+            max_packet_samples,
+            &mut checkpoint,
+            |info, provenance, declared, planar| {
+                enforce_service_packet_sample_limit(info, planar, max_packet_samples)?;
+                consume(info, provenance, declared, planar)
+            },
+        );
     }
     if matches!(route, DecoderRoute::Dsf | DecoderRoute::Dsdiff) {
         require_single_track(selection)?;
-        return crate::dsd::decode_stream_with_layout_and_declared_frames(path, consume);
+        if let Some(max_decoded_samples) = max_packet_samples {
+            return crate::dsd::decode_stream_with_layout_and_declared_frames_controlled(
+                path,
+                max_decoded_samples,
+                &mut checkpoint,
+                |info, provenance, declared, planar| {
+                    enforce_service_packet_sample_limit(info, planar, max_packet_samples)?;
+                    consume(info, provenance, declared, planar)
+                },
+            );
+        }
+        return crate::dsd::decode_stream_with_layout_and_declared_frames(
+            path,
+            |info, provenance, declared, planar| consume(info, provenance, declared, planar),
+        );
     }
     if route == DecoderRoute::Opus {
         require_single_track(selection)?;
         #[cfg(feature = "opus-encoding")]
         {
+            if max_packet_samples.is_some() {
+                return crate::opus::decode_stream_controlled(
+                    path,
+                    &mut checkpoint,
+                    |info, planar| {
+                        enforce_service_packet_sample_limit(info, planar, max_packet_samples)?;
+                        // The native Opus parser accepts only RFC 7845 mapping
+                        // families 0 and 1, both of which have canonical speakers.
+                        consume(info, ChannelLayoutProvenance::KnownSpeakers, None, planar)
+                    },
+                );
+            }
             return crate::opus::decode_stream(path, |info, planar| {
+                enforce_service_packet_sample_limit(info, planar, max_packet_samples)?;
                 // The native Opus parser accepts only RFC 7845 mapping
                 // families 0 and 1, both of which have canonical speakers.
                 consume(info, ChannelLayoutProvenance::KnownSpeakers, None, planar)
@@ -2879,24 +6571,76 @@ where
             );
         }
     }
+    let (mut plain_checkpoint, controlled_checkpoint) = if controlled {
+        (None, Some(Mutex::new(checkpoint)))
+    } else {
+        (Some(checkpoint), None)
+    };
+    run_decoder_checkpoint(&mut plain_checkpoint, &controlled_checkpoint)?;
     let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let stream = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
+    let source: Box<dyn MediaSource + '_> = if let Some(checkpoint) = &controlled_checkpoint {
+        let preflight = service_preflight.expect("controlled decode has service preflight");
+        Box::new(CheckpointMediaSource::new_range(
+            file,
+            checkpoint,
+            preflight.media_offset,
+            preflight.media_end,
+        )?)
+    } else {
+        Box::new(file)
+    };
+    let stream = MediaSourceStream::new(source, MediaSourceStreamOptions::default());
     let mut hint = Hint::new();
     if !extension.is_empty() {
         hint.with_extension(&extension);
     }
-    let mut format = get_probe()
-        .probe(
-            &hint,
-            stream,
-            FormatOptions::default(),
-            MetadataOptions::default(),
-        )
+    let metadata_options = if controlled {
+        service_metadata_options()
+    } else {
+        symphonia::core::meta::MetadataOptions::default()
+    };
+    let service_probe = service_preflight
+        .map(|preflight| service_symphonia_probe(preflight.route))
+        .transpose()?;
+    let probe = service_probe.as_ref().unwrap_or_else(|| get_probe());
+    let mut format = probe
+        .probe(&hint, stream, FormatOptions::default(), metadata_options)
         .map_err(|error| format!("{}: probe failed: {error}", path.display()))?;
     let container_format = format.format_info().format;
+    if service_preflight.is_some_and(|preflight| {
+        audio_container_from_symphonia(container_format).is_none_or(|container| {
+            !service_preflight_accepts_container(preflight.route, container)
+        })
+    }) {
+        return Err("controlled Symphonia decode selected a non-preflighted container".into());
+    }
     let mut track =
         select_symphonia_audio_track_with_selection(path, format.as_ref(), selection)?.0;
     require_symphonia_sample_rate(path, &track.codec_params)?;
+    if let (Some(limit), Some(frames), Some(channels)) = (
+        max_packet_samples,
+        track.num_frames,
+        track.codec_params.channels.as_ref(),
+    ) {
+        let declared_samples = frames
+            .checked_mul(channels.count() as u64)
+            .ok_or_else(|| "declared decoded sample count overflow".to_string())?;
+        if declared_samples > limit {
+            return Err(SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED.into());
+        }
+    }
+    if let (Some(limit), Some(frames), Some(channels)) = (
+        max_packet_samples,
+        track.codec_params.max_frames_per_packet,
+        track.codec_params.channels.as_ref(),
+    ) {
+        let maximum_packet_samples = frames
+            .checked_mul(channels.count() as u64)
+            .ok_or_else(|| "maximum decoded packet sample count overflow".to_string())?;
+        if maximum_packet_samples > limit {
+            return Err(SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED.into());
+        }
+    }
     let mut flac_metadata = FlacMetadataTracker::default();
     let mut flac_channel_mask = flac_metadata.scan(format.as_mut(), &track);
     let decoder_options = symphonia_decoder_options();
@@ -2946,6 +6690,7 @@ where
     let mut mpeg_channel_mode = MpegChannelModeTracker::default();
 
     loop {
+        run_decoder_checkpoint(&mut plain_checkpoint, &controlled_checkpoint)?;
         let packet = match format.next_packet() {
             Ok(Some(packet)) => packet,
             Ok(None) => break,
@@ -2978,6 +6723,10 @@ where
         if packet.track_id != track.id {
             continue;
         }
+        if let Some(limit) = max_packet_samples {
+            enforce_symphonia_packet_sample_limit(&track, &packet, limit)?;
+        }
+        run_decoder_checkpoint(&mut plain_checkpoint, &controlled_checkpoint)?;
         let decoded = require_decoded_packet(decoder.decode(&packet))
             .map_err(|error| format!("{}: decode: {error}", path.display()))?;
         let spec = decoded.spec();
@@ -3025,6 +6774,16 @@ where
         if frames == 0 {
             continue;
         }
+        if let Some(limit) = max_packet_samples {
+            let packet_samples = u64::try_from(frames)
+                .ok()
+                .and_then(|frames| frames.checked_mul(decoded_channels as u64))
+                .ok_or_else(|| "decoded packet sample count overflow".to_string())?;
+            if packet_samples > limit {
+                return Err(SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED.into());
+            }
+        }
+        run_decoder_checkpoint(&mut plain_checkpoint, &controlled_checkpoint)?;
         decoded.copy_to_vecs_planar::<f32>(&mut planar);
         consume(
             info.as_ref().unwrap(),
@@ -3032,9 +6791,30 @@ where
             declared_frames,
             &mut planar,
         )?;
+        run_decoder_checkpoint(&mut plain_checkpoint, &controlled_checkpoint)?;
     }
 
     info.ok_or_else(|| format!("{}: no audio decoded", path.display()))
+}
+
+fn enforce_service_packet_sample_limit<T>(
+    info: &StreamInfo,
+    planar: &[Vec<T>],
+    limit: Option<u64>,
+) -> Result<(), String> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    let frames = planar.first().map_or(0, Vec::len);
+    let packet_samples = u64::try_from(frames)
+        .ok()
+        .and_then(|frames| frames.checked_mul(u64::from(info.channels)))
+        .ok_or_else(|| "decoded packet sample count overflow".to_string())?;
+    if packet_samples > limit {
+        Err(SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED.into())
+    } else {
+        Ok(())
+    }
 }
 
 fn append_symphonia_stream_chunk<F>(
@@ -3510,7 +7290,12 @@ where
     )
 }
 
-fn decode_wav_stream<F>(path: &Path, mut consume: F) -> Result<StreamInfo, String>
+fn decode_wav_stream<F, C>(
+    path: &Path,
+    max_decoded_samples: Option<u64>,
+    mut checkpoint: C,
+    mut consume: F,
+) -> Result<StreamInfo, String>
 where
     F: FnMut(
         &StreamInfo,
@@ -3518,11 +7303,21 @@ where
         Option<u64>,
         &mut [Vec<f32>],
     ) -> Result<(), String>,
+    C: FnMut() -> Result<(), String>,
 {
-    let (wav, layout_provenance) = WavReader::probe_with_layout(path)
+    checkpoint()?;
+    let (wav, layout_provenance) = WavReader::probe_with_layout_controlled(path, &mut checkpoint)
         .map_err(|error| format!("{}: {error}", path.display()))?;
     let declared_frames =
         wav.data_size / (u64::from(wav.channels) * wav.kind.bytes_per_sample() as u64);
+    if let Some(limit) = max_decoded_samples {
+        let declared_samples = declared_frames
+            .checked_mul(u64::from(wav.channels))
+            .ok_or_else(|| "declared WAVE sample count overflow".to_string())?;
+        if declared_samples > limit {
+            return Err(SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED.into());
+        }
+    }
     let info = StreamInfo {
         sample_rate: wav.sample_rate,
         channels: wav.channels,
@@ -3540,11 +7335,19 @@ where
     })?;
 
     let frame_bytes = info.channels as usize * info.source_kind.bytes_per_sample();
-    let chunk_bytes = wav_stream_chunk_bytes(info.channels, info.source_kind);
+    let configured_chunk_bytes = wav_stream_chunk_bytes(info.channels, info.source_kind);
+    let chunk_bytes = if let Some(limit) = max_decoded_samples {
+        let max_frames = limit / u64::from(info.channels);
+        let max_frames = usize::try_from(max_frames).unwrap_or(usize::MAX).max(1);
+        configured_chunk_bytes.min(max_frames.saturating_mul(frame_bytes).max(frame_bytes))
+    } else {
+        configured_chunk_bytes
+    };
     let mut remaining = data_size;
     let mut bytes = vec![0; chunk_bytes];
     let mut planar = Vec::new();
     while remaining >= frame_bytes {
+        checkpoint()?;
         let read_size = remaining.min(chunk_bytes);
         let aligned = read_size - read_size % frame_bytes;
         file.read_exact(&mut bytes[..aligned])
@@ -3556,6 +7359,7 @@ where
             &mut planar,
         );
         consume(&info, layout_provenance, Some(declared_frames), &mut planar)?;
+        checkpoint()?;
         remaining -= aligned;
     }
     Ok(info)
@@ -4616,6 +8420,29 @@ mod tests {
         riff_wave([(*b"fmt ", format), (*b"data", data)])
     }
 
+    fn exact_pcm_wave_with_junk_chunks(
+        kind: PcmKind,
+        channels: u16,
+        junk_chunks: usize,
+        data: Vec<u8>,
+    ) -> Vec<u8> {
+        let format_tag = if kind.is_float() { 3_u16 } else { 1_u16 };
+        let sample_rate = 48_000_u32;
+        let frame_bytes = channels * kind.bytes_per_sample() as u16;
+        let mut format = Vec::new();
+        format.extend_from_slice(&format_tag.to_le_bytes());
+        format.extend_from_slice(&channels.to_le_bytes());
+        format.extend_from_slice(&sample_rate.to_le_bytes());
+        format.extend_from_slice(&(sample_rate * u32::from(frame_bytes)).to_le_bytes());
+        format.extend_from_slice(&frame_bytes.to_le_bytes());
+        format.extend_from_slice(&kind.bits_per_sample().to_le_bytes());
+        riff_wave(
+            std::iter::once((*b"fmt ", format))
+                .chain((0..junk_chunks).map(|_| (*b"JUNK", Vec::new())))
+                .chain(std::iter::once((*b"data", data))),
+        )
+    }
+
     #[test]
     fn descriptor_analysis_stream_preserves_exact_wave_values_and_range() {
         let directory = tempfile::tempdir().unwrap();
@@ -4683,6 +8510,125 @@ mod tests {
                 .map(|sample| sample.to_bits())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn controlled_descriptor_decode_checks_before_pcm_chunk_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("controlled-s32.wav");
+        let samples = (0_i32..8_192)
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect::<Vec<_>>();
+        std::fs::write(&path, exact_pcm_wave(PcmKind::S32, 1, samples)).unwrap();
+        let descriptor = InputDescriptor::from_path(
+            &path,
+            &StableInputOptions::new(1024 * 1024).unwrap(),
+            InputDescriptorOptions::default(),
+        )
+        .unwrap();
+        let mut checkpoints = 0;
+        let mut callbacks = 0;
+        let error = decode_descriptor_analysis_stream_with_control(
+            &descriptor,
+            8_192,
+            || {
+                checkpoints += 1;
+                if checkpoints == 2 {
+                    Err("cancelled before WAVE chunk".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_, _, _| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.ends_with("cancelled before WAVE chunk"));
+        assert_eq!(callbacks, 0);
+
+        let f32_path = directory.path().join("controlled-f32.wav");
+        std::fs::write(
+            &f32_path,
+            pcm16_wave_with_layout_and_frames(48_000, 2, None, 8_192),
+        )
+        .unwrap();
+        let descriptor = InputDescriptor::from_path(
+            &f32_path,
+            &StableInputOptions::new(1024 * 1024).unwrap(),
+            InputDescriptorOptions::default(),
+        )
+        .unwrap();
+        let mut callbacks = 0;
+        let error = decode_descriptor_analysis_stream_with_control(
+            &descriptor,
+            16_383,
+            || Ok(()),
+            |_, _, _| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED);
+        assert_eq!(callbacks, 0);
+    }
+
+    #[test]
+    fn controlled_wave_probe_checks_during_maximum_chunk_scan_and_exact_reprobe() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("many-junk-chunks.wav");
+        // fmt + 99,998 JUNK + data reaches the parser's 100,000-chunk
+        // acceptance boundary without crossing it.
+        let wave =
+            exact_pcm_wave_with_junk_chunks(PcmKind::S32, 1, 99_998, 1_i32.to_le_bytes().to_vec());
+        std::fs::write(&path, wave).unwrap();
+        let input =
+            StableInput::from_path(&path, &StableInputOptions::new(1024 * 1024).unwrap()).unwrap();
+
+        let mut probe_checkpoints = 0;
+        let error = InputDescriptor::probe_with_control(
+            input.clone(),
+            InputDescriptorOptions::default(),
+            1,
+            || {
+                probe_checkpoints += 1;
+                if probe_checkpoints == 8 {
+                    Err("cancelled during WAVE chunk-table probe".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(error.ends_with("cancelled during WAVE chunk-table probe"));
+
+        // A regular probe traverses the complete boundary-sized table. The
+        // controlled high-precision S32 decode then performs its required
+        // second probe with the same bounded checkpoints.
+        let descriptor = InputDescriptor::probe(input, InputDescriptorOptions::default()).unwrap();
+        let mut reprobe_checkpoints = 0;
+        let mut callbacks = 0;
+        let error = decode_descriptor_analysis_stream_with_control(
+            &descriptor,
+            1,
+            || {
+                reprobe_checkpoints += 1;
+                if reprobe_checkpoints == 5 {
+                    Err("cancelled during exact WAVE re-probe".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_, _, _| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.ends_with("cancelled during exact WAVE re-probe"));
+        assert_eq!(callbacks, 0);
     }
 
     fn pcm16_fmt_body(sample_rate: u32, channels: u16, channel_mask: Option<u32>) -> Vec<u8> {
@@ -5314,16 +9260,19 @@ mod tests {
         let short = SymphoniaAudioTrack {
             id: 0,
             num_frames: Some(48_000),
+            time_base: None,
             codec_params: codec_params(48_000, CHANNEL_LAYOUT_STEREO.clone()),
         };
         let crossover = SymphoniaAudioTrack {
             id: 0,
             num_frames: Some(192_000),
+            time_base: None,
             codec_params: codec_params(48_000, CHANNEL_LAYOUT_STEREO.clone()),
         };
         let unknown = SymphoniaAudioTrack {
             id: 0,
             num_frames: None,
+            time_base: None,
             codec_params: codec_params(48_000, CHANNEL_LAYOUT_STEREO.clone()),
         };
         assert_eq!(parallel_flac_worker_cap(&short, u64::MAX), 1);
@@ -5331,6 +9280,7 @@ mod tests {
         let efficient = SymphoniaAudioTrack {
             id: 0,
             num_frames: Some(384_000),
+            time_base: None,
             codec_params: codec_params(48_000, CHANNEL_LAYOUT_STEREO.clone()),
         };
         assert_eq!(parallel_flac_worker_cap(&efficient, 0), 4);
@@ -5338,6 +9288,1804 @@ mod tests {
         assert_eq!(parallel_flac_worker_cap(&unknown, 383 * 1024), 1);
         assert_eq!(parallel_flac_worker_cap(&unknown, 384 * 1024), 2);
         assert_eq!(parallel_flac_worker_cap(&unknown, u64::MAX), 8);
+    }
+
+    #[test]
+    fn packet_preflight_converts_container_timebase_to_pcm_frames() {
+        use symphonia::core::packet::Packet;
+        use symphonia::core::units::{Duration, TimeBase, Timestamp};
+
+        let track = SymphoniaAudioTrack {
+            id: 0,
+            num_frames: None,
+            time_base: TimeBase::try_new(1, 90_000),
+            codec_params: codec_params(48_000, CHANNEL_LAYOUT_STEREO.clone()),
+        };
+        let packet = Packet::new(0, Timestamp::new(0), Duration::new(1_920), Vec::new());
+        assert_eq!(
+            symphonia_packet_sample_upper_bound(&track, &packet).unwrap(),
+            Some(2_048)
+        );
+    }
+
+    #[test]
+    fn packet_preflight_uses_pcm_bytes_and_rejects_unknown_compressed_geometry() {
+        use symphonia::core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_PCM_S16LE};
+        use symphonia::core::packet::Packet;
+        use symphonia::core::units::{Duration, Timestamp};
+
+        let pcm = SymphoniaAudioTrack {
+            id: 0,
+            num_frames: None,
+            time_base: None,
+            codec_params: codec_params_for_codec(
+                48_000,
+                CHANNEL_LAYOUT_STEREO.clone(),
+                CODEC_ID_PCM_S16LE,
+                None,
+            ),
+        };
+        // Nine bytes are three conservative 4-byte stereo frames. The
+        // malformed trailing byte must round up, never under-admit decoder
+        // output.
+        let packet = Packet::new(0, Timestamp::new(0), Duration::new(0), vec![0; 9]);
+        assert_eq!(
+            symphonia_packet_sample_upper_bound(&pcm, &packet).unwrap(),
+            Some(6)
+        );
+        assert_eq!(
+            enforce_symphonia_packet_sample_limit(&pcm, &packet, 5).unwrap_err(),
+            SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED
+        );
+        enforce_symphonia_packet_sample_limit(&pcm, &packet, 6).unwrap();
+
+        let compressed = SymphoniaAudioTrack {
+            id: 0,
+            num_frames: None,
+            time_base: None,
+            codec_params: codec_params_for_codec(
+                48_000,
+                CHANNEL_LAYOUT_STEREO.clone(),
+                CODEC_ID_AAC,
+                None,
+            ),
+        };
+        assert_eq!(
+            symphonia_packet_sample_upper_bound(&compressed, &packet).unwrap(),
+            None
+        );
+        assert_eq!(
+            enforce_symphonia_packet_sample_limit(&compressed, &packet, u64::MAX).unwrap_err(),
+            SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED
+        );
+    }
+
+    fn ape_footer(version: u32, size: u32, items: u32, flags: u32) -> [u8; 32] {
+        let mut footer = [0_u8; 32];
+        footer[..8].copy_from_slice(b"APETAGEX");
+        footer[8..12].copy_from_slice(&version.to_le_bytes());
+        footer[12..16].copy_from_slice(&size.to_le_bytes());
+        footer[16..20].copy_from_slice(&items.to_le_bytes());
+        footer[20..24].copy_from_slice(&flags.to_le_bytes());
+        footer
+    }
+
+    fn ape_v2_tag(item: &[u8]) -> Vec<u8> {
+        let declared_size = u32::try_from(item.len() + 32).unwrap();
+        let footer_flags = SERVICE_APE_HAS_HEADER | SERVICE_APE_HAS_FOOTER;
+        let footer = ape_footer(
+            2000,
+            declared_size,
+            u32::from(!item.is_empty()),
+            footer_flags,
+        );
+        let mut header = footer;
+        header[20..24].copy_from_slice(&(footer_flags | SERVICE_APE_IS_HEADER).to_le_bytes());
+        [header.as_slice(), item, footer.as_slice()].concat()
+    }
+
+    #[test]
+    fn service_trailing_ape_preflight_bounds_items_and_validates_framing() {
+        let directory = tempfile::tempdir().unwrap();
+        let mpeg_prefix = silent_mpeg1_layer3_frame(0);
+        let mut item = Vec::new();
+        item.extend_from_slice(&3_u32.to_le_bytes());
+        item.extend_from_slice(&0_u32.to_le_bytes());
+        item.extend_from_slice(b"Title\0abc");
+        let tag = ape_v2_tag(&item);
+
+        let mpeg_path = directory.path().join("bounded-ape.mp3");
+        let mut bytes = mpeg_prefix.to_vec();
+        bytes.extend_from_slice(&tag);
+        std::fs::write(&mpeg_path, &bytes).unwrap();
+        service_container_preflight(&mpeg_path, || Ok(())).unwrap();
+
+        let with_id3v1_path = directory.path().join("bounded-ape-id3v1.mp3");
+        let mut with_id3v1 = mpeg_prefix.to_vec();
+        with_id3v1.extend_from_slice(&tag);
+        with_id3v1.extend_from_slice(b"TAG");
+        with_id3v1.extend_from_slice(&[0; 125]);
+        std::fs::write(&with_id3v1_path, &with_id3v1).unwrap();
+        service_container_preflight(&with_id3v1_path, || Ok(())).unwrap();
+
+        let flac_path = directory.path().join("bounded-ape.flac");
+        let mut flac = b"fLaC\x80\0\0\0".to_vec();
+        flac.extend_from_slice(&tag);
+        std::fs::write(&flac_path, &flac).unwrap();
+        service_container_preflight(&flac_path, || Ok(())).unwrap();
+
+        let huge_path = directory.path().join("huge-ape.mp3");
+        let mut huge_item = Vec::new();
+        huge_item.extend_from_slice(
+            &u32::try_from(SERVICE_MAX_METADATA_ITEM_BYTES + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        huge_item.extend_from_slice(&0_u32.to_le_bytes());
+        huge_item.extend_from_slice(b"Title\0");
+        let huge_footer = ape_footer(
+            2000,
+            u32::try_from(huge_item.len() + 32).unwrap(),
+            1,
+            0x4000_0000,
+        );
+        let mut huge = mpeg_prefix.to_vec();
+        huge.extend_from_slice(&huge_item);
+        huge.extend_from_slice(&huge_footer);
+        std::fs::write(&huge_path, &huge).unwrap();
+        assert_eq!(
+            service_container_preflight(&huge_path, || Ok(())).unwrap_err(),
+            SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED
+        );
+
+        let false_footer_path = directory.path().join("false-ape-footer.mp3");
+        let mut false_footer = mpeg_prefix.to_vec();
+        false_footer.extend_from_slice(&ape_footer(9999, 32, 0, 0x4000_0000));
+        std::fs::write(&false_footer_path, &false_footer).unwrap();
+        let error = service_container_preflight(&false_footer_path, || Ok(())).unwrap_err();
+        assert!(
+            error.contains("inter-frame data or invalid geometry"),
+            "{error}"
+        );
+
+        let truncated_path = directory.path().join("truncated-ape.mp3");
+        let mut truncated = mpeg_prefix.to_vec();
+        truncated.extend_from_slice(&ape_footer(2000, 4096, 0, 0x4000_0000));
+        std::fs::write(&truncated_path, &truncated).unwrap();
+        let error = service_container_preflight(&truncated_path, || Ok(())).unwrap_err();
+        assert!(error.contains("truncated trailing APE metadata"), "{error}");
+
+        // Symphonia probes both absolute trailing anchors. A valid marker at
+        // -32 must not hide an unsafe marker at -160 merely because the 128
+        // intervening bytes are not an ID3v1 footer.
+        let both_path = directory.path().join("both-ape-anchors.mp3");
+        let mut both = mpeg_prefix.to_vec();
+        both.extend_from_slice(&huge_item);
+        both.extend_from_slice(&huge_footer);
+        both.extend_from_slice(&[0; 96]);
+        both.extend_from_slice(&ape_footer(2000, 32, 0, SERVICE_APE_HAS_FOOTER));
+        std::fs::write(&both_path, &both).unwrap();
+        assert_eq!(
+            service_container_preflight(&both_path, || Ok(())).unwrap_err(),
+            SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED
+        );
+
+        // A supplemental-probe anchor can point at an APEv2 header followed
+        // by unrelated bytes. Even though the metadata parser can consume the
+        // tag, the complete frame-chain contract rejects the trailing junk.
+        let anchored_header_path = directory.path().join("ape-header-at-minus-160.mp3");
+        let mut anchored_header = mpeg_prefix.to_vec();
+        anchored_header.extend(ape_v2_tag(&[]));
+        anchored_header.extend_from_slice(&[0; 96]);
+        std::fs::write(&anchored_header_path, &anchored_header).unwrap();
+        let error = service_container_preflight(&anchored_header_path, || Ok(())).unwrap_err();
+        assert!(
+            error.contains("inter-frame data or invalid geometry"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn service_leading_ape_preflight_scans_probe_window_without_allocating_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut item = Vec::new();
+        item.extend_from_slice(&3_u32.to_le_bytes());
+        item.extend_from_slice(&0_u32.to_le_bytes());
+        item.extend_from_slice(b"Title\0abc");
+
+        // Place the marker across the end of Symphonia's 1 MiB search range;
+        // the fixed 32 KiB scanner overlap must still recognize its full
+        // 12-byte identity without allocating a probe-sized buffer.
+        let valid_path = directory.path().join("leading-ape.mp3");
+        let mut valid = vec![0; usize::try_from(SERVICE_SYMPHONIA_PROBE_BYTES).unwrap() - 5];
+        valid.extend(ape_v2_tag(&item));
+        valid.extend_from_slice(&silent_mpeg1_layer3_frame(0));
+        std::fs::write(&valid_path, &valid).unwrap();
+        assert_eq!(
+            service_container_preflight(&valid_path, || Ok(())).unwrap(),
+            ServiceContainerPreflight {
+                route: ServiceContainerPreflightRoute::Mpa,
+                media_offset: u64::try_from(valid.len() - 417).unwrap(),
+                media_end: u64::try_from(valid.len()).unwrap(),
+            }
+        );
+
+        let leading_flac_path = directory.path().join("leading-ape.flac");
+        let leading_ape = ape_v2_tag(&item);
+        let mut leading_flac = leading_ape.clone();
+        leading_flac.extend_from_slice(b"fLaC\x80\0\0\0");
+        std::fs::write(&leading_flac_path, &leading_flac).unwrap();
+        assert_eq!(
+            service_container_preflight(&leading_flac_path, || Ok(())).unwrap(),
+            ServiceContainerPreflight {
+                route: ServiceContainerPreflightRoute::Flac,
+                media_offset: u64::try_from(leading_ape.len()).unwrap(),
+                media_end: u64::try_from(leading_flac.len()).unwrap(),
+            }
+        );
+
+        let mut huge_item = Vec::new();
+        huge_item.extend_from_slice(
+            &u32::try_from(SERVICE_MAX_METADATA_ITEM_BYTES + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        huge_item.extend_from_slice(&0_u32.to_le_bytes());
+        huge_item.extend_from_slice(b"Title\0");
+        let huge_path = directory.path().join("leading-huge-ape.mp3");
+        let mut huge = b"junk".to_vec();
+        huge.extend(ape_v2_tag(&huge_item));
+        huge.extend_from_slice(&silent_mpeg1_layer3_frame(0));
+        std::fs::write(&huge_path, &huge).unwrap();
+        assert_eq!(
+            service_container_preflight(&huge_path, || Ok(())).unwrap_err(),
+            SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED
+        );
+
+        let truncated_path = directory.path().join("leading-truncated-ape.mp3");
+        let mut truncated = b"junk".to_vec();
+        let mut header = ape_footer(
+            2000,
+            4096,
+            0,
+            SERVICE_APE_HAS_HEADER | SERVICE_APE_HAS_FOOTER | SERVICE_APE_IS_HEADER,
+        );
+        header[24] = 1;
+        truncated.extend_from_slice(&header);
+        std::fs::write(&truncated_path, &truncated).unwrap();
+        let error = service_container_preflight(&truncated_path, || Ok(())).unwrap_err();
+        assert!(error.contains("truncated leading APE metadata"), "{error}");
+
+        // Unsupported-version lookalikes are not admitted as trailing metadata
+        // and therefore fail the complete raw frame-chain check.
+        let fake_path = directory.path().join("fake-leading-ape.mp3");
+        let mut fake = silent_mpeg1_layer3_frame(0);
+        fake.extend_from_slice(&ape_footer(9999, 32, 0, SERVICE_APE_HAS_FOOTER));
+        std::fs::write(&fake_path, &fake).unwrap();
+        let error = service_container_preflight(&fake_path, || Ok(())).unwrap_err();
+        assert!(
+            error.contains("inter-frame data or invalid geometry"),
+            "{error}"
+        );
+    }
+
+    fn unchecked_ogg_page(flags: u8, serial: u32, sequence: u32, lacing: &[u8]) -> Vec<u8> {
+        let mut page = Vec::with_capacity(
+            27 + lacing.len()
+                + lacing
+                    .iter()
+                    .map(|&value| usize::from(value))
+                    .sum::<usize>(),
+        );
+        page.extend_from_slice(b"OggS");
+        page.push(0);
+        page.push(flags);
+        page.extend_from_slice(&0_u64.to_le_bytes());
+        page.extend_from_slice(&serial.to_le_bytes());
+        page.extend_from_slice(&sequence.to_le_bytes());
+        page.extend_from_slice(&0_u32.to_le_bytes());
+        page.push(u8::try_from(lacing.len()).unwrap());
+        page.extend_from_slice(lacing);
+        for &length in lacing {
+            page.resize(page.len() + usize::from(length), 0);
+        }
+        page
+    }
+
+    fn ogg_page_with_packets(flags: u8, serial: u32, sequence: u32, packets: &[&[u8]]) -> Vec<u8> {
+        let mut lacing = Vec::new();
+        let mut body = Vec::new();
+        for packet in packets {
+            let mut remaining = packet.len();
+            let mut offset = 0_usize;
+            while remaining >= 255 {
+                lacing.push(255);
+                body.extend_from_slice(&packet[offset..offset + 255]);
+                offset += 255;
+                remaining -= 255;
+            }
+            lacing.push(u8::try_from(remaining).unwrap());
+            body.extend_from_slice(&packet[offset..]);
+        }
+        assert!(lacing.len() <= 255);
+        let mut page = Vec::with_capacity(27 + lacing.len() + body.len());
+        page.extend_from_slice(b"OggS");
+        page.push(0);
+        page.push(flags);
+        page.extend_from_slice(&0_u64.to_le_bytes());
+        page.extend_from_slice(&serial.to_le_bytes());
+        page.extend_from_slice(&sequence.to_le_bytes());
+        page.extend_from_slice(&0_u32.to_le_bytes());
+        page.push(u8::try_from(lacing.len()).unwrap());
+        page.extend_from_slice(&lacing);
+        page.extend_from_slice(&body);
+        page
+    }
+
+    fn ogg_page_with_lacing_body(
+        flags: u8,
+        serial: u32,
+        sequence: u32,
+        lacing: &[u8],
+        body: &[u8],
+    ) -> Vec<u8> {
+        assert_eq!(
+            body.len(),
+            lacing
+                .iter()
+                .map(|&length| usize::from(length))
+                .sum::<usize>()
+        );
+        let mut page = Vec::with_capacity(27 + lacing.len() + body.len());
+        page.extend_from_slice(b"OggS");
+        page.push(0);
+        page.push(flags);
+        page.extend_from_slice(&0_u64.to_le_bytes());
+        page.extend_from_slice(&serial.to_le_bytes());
+        page.extend_from_slice(&sequence.to_le_bytes());
+        page.extend_from_slice(&0_u32.to_le_bytes());
+        page.push(u8::try_from(lacing.len()).unwrap());
+        page.extend_from_slice(lacing);
+        page.extend_from_slice(body);
+        page
+    }
+
+    fn append_ogg_packet_pages(
+        output: &mut Vec<u8>,
+        serial: u32,
+        sequence: &mut u32,
+        first_flags: u8,
+        last_flags: u8,
+        packet: &[u8],
+    ) {
+        let mut offset = 0_usize;
+        let mut first = true;
+        loop {
+            let remaining = packet.len() - offset;
+            let full_segments = (remaining / 255).min(255);
+            let page_payload = full_segments * 255;
+            let has_room_for_end = full_segments < 255;
+            let tail = if has_room_for_end {
+                Some(remaining - page_payload)
+            } else {
+                None
+            };
+            let mut lacing = vec![255; full_segments];
+            if let Some(tail) = tail {
+                lacing.push(u8::try_from(tail).unwrap());
+            }
+            let body_len = page_payload + tail.unwrap_or(0);
+            let final_page = offset + body_len == packet.len() && tail.is_some();
+            let flags =
+                (if first { first_flags } else { 0x01 }) | if final_page { last_flags } else { 0 };
+            output.extend(ogg_page_with_lacing_body(
+                flags,
+                serial,
+                *sequence,
+                &lacing,
+                &packet[offset..offset + body_len],
+            ));
+            *sequence += 1;
+            offset += body_len;
+            first = false;
+            if final_page {
+                break;
+            }
+        }
+    }
+
+    fn ogg_flac_identity(header_packets: u16) -> Vec<u8> {
+        let mut packet = b"\x7fFLAC\x01\x00".to_vec();
+        packet.extend_from_slice(&header_packets.to_be_bytes());
+        packet.extend_from_slice(b"fLaC");
+        packet.extend_from_slice(&[0, 0, 0, 34]);
+        packet.extend_from_slice(&[0; 34]);
+        assert_eq!(packet.len(), 51);
+        packet
+    }
+
+    fn ogg_flac_metadata_packet(block_type: u8, payload: &[u8]) -> Vec<u8> {
+        let length = u32::try_from(payload.len()).unwrap();
+        assert!(length <= 0x00ff_ffff);
+        let mut packet = Vec::with_capacity(4 + payload.len());
+        packet.push(block_type);
+        packet.extend_from_slice(&length.to_be_bytes()[1..]);
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    #[test]
+    fn service_ogg_preflight_bounds_vorbis_and_opus_comment_items() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let mut valid_tags = b"OpusTags".to_vec();
+        valid_tags.extend_from_slice(&3_u32.to_le_bytes());
+        valid_tags.extend_from_slice(b"abc");
+        valid_tags.extend_from_slice(&0_u32.to_le_bytes());
+        let valid = ogg_page_with_packets(0x02 | 0x04, 1, 0, &[b"OpusHead", &valid_tags]);
+        let valid_path = directory.path().join("valid-comments.opus");
+        std::fs::write(&valid_path, &valid).unwrap();
+        preflight_ogg_packets(
+            &valid_path,
+            valid.len() as u64,
+            SERVICE_MAX_ENCODED_PACKET_BYTES,
+            &mut || Ok(()),
+        )
+        .unwrap();
+
+        for (name, identity, mut comment) in [
+            (
+                "huge-opus-comment.opus",
+                b"OpusHead".as_slice(),
+                b"OpusTags".to_vec(),
+            ),
+            (
+                "huge-vorbis-comment.ogg",
+                b"\x01vorbis".as_slice(),
+                b"\x03vorbis".to_vec(),
+            ),
+        ] {
+            comment.extend_from_slice(&0_u32.to_le_bytes());
+            comment.extend_from_slice(&1_u32.to_le_bytes());
+            comment.extend_from_slice(
+                &u32::try_from(SERVICE_MAX_METADATA_ITEM_BYTES + 1)
+                    .unwrap()
+                    .to_le_bytes(),
+            );
+            let bytes = ogg_page_with_packets(0x02 | 0x04, 2, 0, &[identity, &comment]);
+            let path = directory.path().join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                preflight_ogg_packets(
+                    &path,
+                    bytes.len() as u64,
+                    SERVICE_MAX_ENCODED_PACKET_BYTES,
+                    &mut || Ok(()),
+                )
+                .unwrap_err(),
+                SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED
+            );
+        }
+
+        let mut many_tags = b"OpusTags".to_vec();
+        many_tags.extend_from_slice(&0_u32.to_le_bytes());
+        many_tags.extend_from_slice(&64_u32.to_le_bytes());
+        for _ in 0..64 {
+            many_tags.extend_from_slice(&0_u32.to_le_bytes());
+        }
+        let many = ogg_page_with_packets(0x02 | 0x04, 3, 0, &[b"OpusHead", &many_tags]);
+        let many_path = directory.path().join("many-comments.opus");
+        std::fs::write(&many_path, &many).unwrap();
+        let mut checkpoints = 0;
+        preflight_ogg_packets(
+            &many_path,
+            many.len() as u64,
+            SERVICE_MAX_ENCODED_PACKET_BYTES,
+            &mut || {
+                checkpoints += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(checkpoints >= 2);
+    }
+
+    #[test]
+    fn service_ogg_preflight_bounds_continued_packets_and_checks_every_page() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("continued.ogg");
+        let mut bytes = unchecked_ogg_page(0x02, 7, 0, &[255]);
+        bytes.extend(unchecked_ogg_page(0x01 | 0x04, 7, 1, &[1]));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut checkpoints = 0;
+        let error = preflight_ogg_packets(&path, bytes.len() as u64, 255, &mut || {
+            checkpoints += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error, SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED);
+        assert_eq!(checkpoints, 2);
+
+        let mut checkpoints = 0;
+        preflight_ogg_packets(&path, bytes.len() as u64, 256, &mut || {
+            checkpoints += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(checkpoints, 2);
+    }
+
+    #[test]
+    fn service_ogg_flac_preflight_validates_metadata_across_continued_pages() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = ogg_flac_identity(2);
+        let mut comment_payload = 300_u32.to_le_bytes().to_vec();
+        comment_payload.extend_from_slice(&[b'v'; 300]);
+        comment_payload.extend_from_slice(&1_u32.to_le_bytes());
+        comment_payload.extend_from_slice(&5_u32.to_le_bytes());
+        comment_payload.extend_from_slice(b"A=B=C");
+        let comment = ogg_flac_metadata_packet(0x04, &comment_payload);
+
+        let mut picture_payload = 3_u32.to_be_bytes().to_vec();
+        picture_payload.extend_from_slice(&9_u32.to_be_bytes());
+        picture_payload.extend_from_slice(b"image/png");
+        picture_payload.extend_from_slice(&0_u32.to_be_bytes());
+        picture_payload.extend_from_slice(&[0; 16]);
+        picture_payload.extend_from_slice(&3_u32.to_be_bytes());
+        picture_payload.extend_from_slice(b"png");
+        let picture = ogg_flac_metadata_packet(0x86, &picture_payload);
+
+        let first_comment = &comment[..255];
+        let mut first_body = identity.clone();
+        first_body.extend_from_slice(first_comment);
+        let mut bytes = ogg_page_with_lacing_body(0x02, 11, 0, &[51, 255], &first_body);
+        let mut final_body = comment[255..].to_vec();
+        final_body.extend_from_slice(&picture);
+        bytes.extend(ogg_page_with_lacing_body(
+            0x01 | 0x04,
+            11,
+            1,
+            &[
+                u8::try_from(comment.len() - 255).unwrap(),
+                u8::try_from(picture.len()).unwrap(),
+            ],
+            &final_body,
+        ));
+        let path = directory.path().join("metadata.oga");
+        std::fs::write(&path, &bytes).unwrap();
+        preflight_ogg_packets(
+            &path,
+            bytes.len() as u64,
+            SERVICE_MAX_ENCODED_PACKET_BYTES,
+            &mut || Ok(()),
+        )
+        .unwrap();
+
+        let huge_le = u32::try_from(SERVICE_MAX_METADATA_ITEM_BYTES + 1)
+            .unwrap()
+            .to_le_bytes();
+        let huge_be = u32::from_le_bytes(huge_le).to_be_bytes();
+        let mut huge_comment = 0_u32.to_le_bytes().to_vec();
+        huge_comment.extend_from_slice(&1_u32.to_le_bytes());
+        huge_comment.extend_from_slice(&huge_le);
+        let mut huge_count = 0_u32.to_le_bytes().to_vec();
+        huge_count.extend_from_slice(
+            &u32::try_from(SERVICE_MAX_CONTAINER_ITEMS + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        let mut huge_mime = 3_u32.to_be_bytes().to_vec();
+        huge_mime.extend_from_slice(&huge_be);
+        let mut huge_description = 3_u32.to_be_bytes().to_vec();
+        huge_description.extend_from_slice(&0_u32.to_be_bytes());
+        huge_description.extend_from_slice(&huge_be);
+        let mut huge_data = 3_u32.to_be_bytes().to_vec();
+        huge_data.extend_from_slice(&0_u32.to_be_bytes());
+        huge_data.extend_from_slice(&0_u32.to_be_bytes());
+        huge_data.extend_from_slice(&[0; 16]);
+        huge_data.extend_from_slice(&huge_be);
+        for (name, kind, payload) in [
+            ("huge-vendor.oga", 0x04, huge_le.to_vec()),
+            ("huge-comment.oga", 0x04, huge_comment),
+            ("huge-comment-count.oga", 0x04, huge_count),
+            ("huge-picture-mime.oga", 0x86, huge_mime),
+            ("huge-picture-description.oga", 0x86, huge_description),
+            ("huge-picture-data.oga", 0x86, huge_data),
+        ] {
+            let metadata = ogg_flac_metadata_packet(kind, &payload);
+            let bytes = ogg_page_with_packets(0x02 | 0x04, 12, 0, &[&identity, &metadata]);
+            let path = directory.path().join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                preflight_ogg_packets(
+                    &path,
+                    bytes.len() as u64,
+                    SERVICE_MAX_ENCODED_PACKET_BYTES,
+                    &mut || Ok(()),
+                )
+                .unwrap_err(),
+                SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED
+            );
+        }
+
+        let mut truncated_payload = 5_u32.to_le_bytes().to_vec();
+        truncated_payload.extend_from_slice(b"xy");
+        let truncated = ogg_flac_metadata_packet(0x84, &truncated_payload);
+        let bytes = ogg_page_with_packets(0x02 | 0x04, 13, 0, &[&identity, &truncated]);
+        let path = directory.path().join("truncated-comments.oga");
+        std::fs::write(&path, &bytes).unwrap();
+        let error = preflight_ogg_packets(
+            &path,
+            bytes.len() as u64,
+            SERVICE_MAX_ENCODED_PACKET_BYTES,
+            &mut || Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.contains("truncated Ogg comment packet"), "{error}");
+    }
+
+    #[test]
+    fn service_ogg_flac_preflight_bounds_block_total_before_next_payload() {
+        let mut metadata = ServiceOggMetadataPreflight {
+            packet_index: 1,
+            codec: Some(ServiceOggCommentCodec::Flac),
+            ..ServiceOggMetadataPreflight::default()
+        };
+        let payload = vec![0; SERVICE_MAX_METADATA_ITEM_BYTES as usize];
+        let packet = ogg_flac_metadata_packet(0x01, &payload);
+        for _ in 0..15 {
+            metadata.push(&packet, &mut || Ok(())).unwrap();
+            metadata.end_packet().unwrap();
+        }
+        // Fifteen full blocks fit after their headers. The sixteenth crosses
+        // the 16 MiB aggregate budget at its four-byte header, before its
+        // payload is examined or copied by a third-party mapper.
+        let error = metadata.push(&packet[..4], &mut || Ok(())).unwrap_err();
+        assert_eq!(error, SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED);
+
+        let mut count_limited = ServiceOggMetadataPreflight {
+            packet_index: 1,
+            codec: Some(ServiceOggCommentCodec::Flac),
+            ..ServiceOggMetadataPreflight::default()
+        };
+        count_limited.budget.entries = SERVICE_MAX_CONTAINER_ITEMS;
+        assert_eq!(
+            count_limited
+                .push(&[0x01, 0, 0, 0], &mut || Ok(()))
+                .unwrap_err(),
+            SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED
+        );
+    }
+
+    #[test]
+    fn service_ogg_metadata_budget_is_file_wide_across_chained_streams() {
+        let directory = tempfile::tempdir().unwrap();
+        let payload_len = usize::try_from(SERVICE_MAX_METADATA_TOTAL_BYTES / 2 + 1).unwrap();
+        let metadata_packet = ogg_flac_metadata_packet(0x81, &vec![0; payload_len]);
+        let identity = ogg_flac_identity(1);
+
+        let mut one_stream = Vec::new();
+        let mut sequence = 0;
+        append_ogg_packet_pages(&mut one_stream, 41, &mut sequence, 0x02, 0, &identity);
+        append_ogg_packet_pages(
+            &mut one_stream,
+            41,
+            &mut sequence,
+            0,
+            0x04,
+            &metadata_packet,
+        );
+        let one_path = directory.path().join("one-large-padding.oga");
+        std::fs::write(&one_path, &one_stream).unwrap();
+        preflight_ogg_packets(
+            &one_path,
+            one_stream.len() as u64,
+            SERVICE_MAX_ENCODED_PACKET_BYTES,
+            &mut || Ok(()),
+        )
+        .unwrap();
+
+        let mut chained = one_stream;
+        let mut second_sequence = 0;
+        append_ogg_packet_pages(&mut chained, 42, &mut second_sequence, 0x02, 0, &identity);
+        append_ogg_packet_pages(
+            &mut chained,
+            42,
+            &mut second_sequence,
+            0,
+            0x04,
+            &metadata_packet,
+        );
+        let chained_path = directory.path().join("aggregate-over-chains.oga");
+        std::fs::write(&chained_path, &chained).unwrap();
+        assert_eq!(
+            preflight_ogg_packets(
+                &chained_path,
+                chained.len() as u64,
+                SERVICE_MAX_ENCODED_PACKET_BYTES,
+                &mut || Ok(()),
+            )
+            .unwrap_err(),
+            SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED
+        );
+    }
+
+    #[test]
+    fn service_flac_allows_large_skip_blocks_but_bounds_retained_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let large = usize::try_from(SERVICE_MAX_METADATA_ITEM_BYTES + 1).unwrap();
+        for (name, kind) in [("padding.flac", 0x81_u8), ("unknown.flac", 0x87)] {
+            let mut bytes = b"fLaC".to_vec();
+            bytes.push(kind);
+            bytes.extend_from_slice(&(large as u32).to_be_bytes()[1..]);
+            bytes.resize(bytes.len() + large, 0);
+            let path = directory.path().join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            service_container_preflight(&path, || Ok(())).unwrap();
+        }
+
+        for (name, kind) in [("comment.flac", 0x84_u8), ("picture.flac", 0x86)] {
+            let mut bytes = b"fLaC".to_vec();
+            bytes.push(kind);
+            bytes.extend_from_slice(&(large as u32).to_be_bytes()[1..]);
+            let path = directory.path().join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                service_container_preflight(&path, || Ok(())).unwrap_err(),
+                SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED
+            );
+        }
+
+        let count_path = directory.path().join("comment-count.flac");
+        let mut count = b"fLaC\x84\0\0\x08".to_vec();
+        count.extend_from_slice(&0_u32.to_le_bytes());
+        count.extend_from_slice(
+            &u32::try_from(SERVICE_MAX_CONTAINER_ITEMS + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        std::fs::write(&count_path, count).unwrap();
+        assert_eq!(
+            service_container_preflight(&count_path, || Ok(())).unwrap_err(),
+            SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED
+        );
+
+        let mut ape_item = Vec::new();
+        ape_item.extend_from_slice(&(SERVICE_MAX_METADATA_ITEM_BYTES as u32).to_le_bytes());
+        ape_item.extend_from_slice(&0_u32.to_le_bytes());
+        ape_item.extend_from_slice(b"Title\0");
+        ape_item.resize(
+            ape_item.len() + usize::try_from(SERVICE_MAX_METADATA_ITEM_BYTES).unwrap(),
+            b'x',
+        );
+        let ape = ape_v2_tag(&ape_item);
+        let padding_len = 15 * 1024 * 1024;
+        let mut mixed = b"fLaC\x81\xf0\0\0".to_vec();
+        mixed.resize(mixed.len() + padding_len, 0);
+        mixed.extend(ape);
+        let mixed_path = directory.path().join("flac-plus-ape-total.flac");
+        std::fs::write(&mixed_path, mixed).unwrap();
+        assert_eq!(
+            service_container_preflight(&mixed_path, || Ok(())).unwrap_err(),
+            SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED
+        );
+
+        let mut budget = ServiceMetadataBudget::default();
+        let mut padding = ServiceOggFlacPacketScanner::default();
+        let header = [0x81, (large as u32).to_be_bytes()[1], 0, 1];
+        padding.push(&header, &mut budget, &mut || Ok(())).unwrap();
+        for chunk in vec![0_u8; large].chunks(SERVICE_CONTROLLED_READ_BYTES) {
+            padding.push(chunk, &mut budget, &mut || Ok(())).unwrap();
+        }
+        padding.finish().unwrap();
+        for kind in [0x84, 0x86] {
+            let mut scanner = ServiceOggFlacPacketScanner::default();
+            assert_eq!(
+                scanner
+                    .push(
+                        &[kind, (large as u32).to_be_bytes()[1], 0, 1],
+                        &mut ServiceMetadataBudget::default(),
+                        &mut || Ok(())
+                    )
+                    .unwrap_err(),
+                SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED
+            );
+        }
+    }
+
+    #[test]
+    fn service_matroska_preflight_rejects_block_before_payload_materialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bounded.mka");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x1a45_dfa3_u32.to_be_bytes());
+        bytes.push(0x80); // Empty EBML header.
+        bytes.extend_from_slice(&0x1853_8067_u32.to_be_bytes());
+        bytes.push(0x87); // Seven-byte Segment payload.
+        bytes.extend_from_slice(&[0xa3, 0x85, 0, 0, 0, 0, 0]);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = preflight_matroska(&path, bytes.len() as u64, 4, &mut || Ok(())).unwrap_err();
+        assert_eq!(error, SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED);
+        preflight_matroska(&path, bytes.len() as u64, 5, &mut || Ok(())).unwrap();
+    }
+
+    fn service_ebml_size(size: usize) -> Vec<u8> {
+        let size = u64::try_from(size).unwrap();
+        for length in 1..=8 {
+            let marker = 1_u64 << (7 * length);
+            if size < marker - 1 {
+                let encoded = (marker | size).to_be_bytes();
+                return encoded[8 - length..].to_vec();
+            }
+        }
+        panic!("test EBML element is too large")
+    }
+
+    fn service_ebml_element(id: &[u8], payload: Vec<u8>) -> Vec<u8> {
+        let mut element = Vec::with_capacity(id.len() + 8 + payload.len());
+        element.extend_from_slice(id);
+        element.extend(service_ebml_size(payload.len()));
+        element.extend(payload);
+        element
+    }
+
+    fn service_matroska_file(segment_payload: Vec<u8>) -> Vec<u8> {
+        let ebml = service_ebml_element(&0x1a45_dfa3_u32.to_be_bytes(), Vec::new());
+        [
+            ebml,
+            service_ebml_element(&0x1853_8067_u32.to_be_bytes(), segment_payload),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn service_matroska_uses_file_wide_budget_only_for_retained_leaves() {
+        let directory = tempfile::tempdir().unwrap();
+        let value = vec![b'x'; usize::try_from(SERVICE_MAX_METADATA_ITEM_BYTES - 1).unwrap()];
+        let mut simple_tags = Vec::new();
+        for _ in 0..17 {
+            let value = service_ebml_element(&[0x44, 0x87], value.clone());
+            simple_tags.extend(service_ebml_element(&[0x67, 0xc8], value));
+        }
+        let tag = service_ebml_element(&[0x73, 0x73], simple_tags);
+        let tags = service_ebml_element(&[0x12, 0x54, 0xc3, 0x67], tag);
+        let bytes = service_matroska_file(tags);
+        let path = directory.path().join("aggregate-metadata.mka");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            preflight_matroska(
+                &path,
+                bytes.len() as u64,
+                SERVICE_MAX_ENCODED_PACKET_BYTES,
+                &mut || Ok(()),
+            )
+            .unwrap_err(),
+            SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED
+        );
+
+        let audio = service_ebml_element(
+            &[0xa3],
+            vec![0; usize::try_from(SERVICE_MAX_METADATA_ITEM_BYTES + 1).unwrap()],
+        );
+        let bytes = service_matroska_file(audio);
+        let path = directory.path().join("large-audio-block.mka");
+        std::fs::write(&path, &bytes).unwrap();
+        preflight_matroska(
+            &path,
+            bytes.len() as u64,
+            SERVICE_MAX_ENCODED_PACKET_BYTES,
+            &mut || Ok(()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn service_metadata_preflight_registry_is_explicit_and_fail_closed() {
+        use ServiceContainerSniff::{
+            Flac, IsoBmff, Matroska, NativeBounded, Ogg, RawMpegOrAdts,
+            UnsupportedMetadataContainer,
+        };
+
+        for (prefix, expected) in [
+            (b"RIFF\0\0\0\0WAVE----".as_slice(), NativeBounded),
+            (b"RF64\0\0\0\0WAVE----".as_slice(), NativeBounded),
+            (b"BW64\0\0\0\0WAVE----".as_slice(), NativeBounded),
+            (b"DSD -------------".as_slice(), NativeBounded),
+            (b"FRM8\0\0\0\0\0\0\0\0DSD ".as_slice(), NativeBounded),
+            (b"OggS------------".as_slice(), Ogg),
+            (&0x1a45_dfa3_u32.to_be_bytes(), Matroska),
+            (b"fLaC------------".as_slice(), Flac),
+            (b"\0\0\0\x18ftypM4A ----".as_slice(), IsoBmff),
+            (b"ID3\x04\0\0\0\0\0\0".as_slice(), RawMpegOrAdts),
+            (
+                b"FORM\0\0\0\0AIFF----".as_slice(),
+                UnsupportedMetadataContainer,
+            ),
+            (
+                b"FORM\0\0\0\0AIFC----".as_slice(),
+                UnsupportedMetadataContainer,
+            ),
+            (b"caff------------".as_slice(), UnsupportedMetadataContainer),
+        ] {
+            assert_eq!(
+                service_container_preflight_sniff(prefix, prefix.len() as u64),
+                expected,
+                "{prefix:?}"
+            );
+        }
+
+        // Every controlled Symphonia route is an explicit opt-in to exactly
+        // one format reader. A future route makes the exhaustive builder fail
+        // to compile until its allocation preflight is reviewed.
+        for route in [
+            ServiceContainerPreflightRoute::Ogg,
+            ServiceContainerPreflightRoute::Matroska,
+            ServiceContainerPreflightRoute::Flac,
+            ServiceContainerPreflightRoute::IsoBmff,
+            ServiceContainerPreflightRoute::Mpa,
+            ServiceContainerPreflightRoute::Adts,
+        ] {
+            service_symphonia_probe(route).unwrap();
+        }
+        assert!(service_symphonia_probe(ServiceContainerPreflightRoute::NativeBounded).is_err());
+
+        // Keep the retained-leaf registry tied to every Binary/String schema
+        // ID in the pinned Matroska reader, excluding skip-only framing and
+        // packet-bearing elements. Adding format support or a retained leaf
+        // requires an explicit review of this table.
+        for id in [
+            0x4282, 0x4283, 0x465c, 0x467e, 0x4660, 0x466e, 0x4675, 0x6933, 0x450d, 0x437e, 0x437c,
+            0x437d, 0x85, 0x6e67, 0x5654, 0x45e4, 0x4521, 0x69a5, 0x4d80, 0x3e83bb, 0x3eb923,
+            0x3c83ab, 0x3cb923, 0x4444, 0x7384, 0x73a4, 0x7ba9, 0x5741, 0x53ab, 0x4485, 0x447a,
+            0x447b, 0x45a3, 0x4487, 0x63ca, 0x7d7b, 0x41ed, 0x41a4, 0x26b240, 0x86, 0x3b4040,
+            0x258688, 0x63a2, 0x3a9697, 0x4255, 0x47e2, 0x47e4, 0x47e3, 0x22b59c, 0x22b59d, 0x536e,
+            0x66a5, 0xc4, 0xc1, 0x7672, 0x2eb524,
+        ] {
+            assert!(service_ebml_retained_metadata_leaf(id), "missing {id:#x}");
+        }
+        for id in [0xec, 0xbf, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xaf] {
+            assert!(
+                !service_ebml_retained_metadata_leaf(id),
+                "misclassified {id:#x}"
+            );
+        }
+        for id in [
+            0x1a45dfa3, 0x4281, 0x18538067, 0x1941a469, 0x61a7, 0x1043a770, 0x45b9, 0xb6, 0x6944,
+            0x6911, 0x80, 0x8f, 0x4520, 0x1f43b675, 0xa0, 0x75a1, 0xa6, 0xc8, 0x8e, 0xe8, 0x5854,
+            0x1c53bb6b, 0xbb, 0xb7, 0xdb, 0x1549a966, 0x6924, 0x114d9b74, 0x4dbb, 0x1254c367,
+            0x7373, 0x67c8, 0x63c0, 0x1654ae6b, 0xae, 0xe1, 0x41e4, 0x6d80, 0x6240, 0x5034, 0x5035,
+            0x47e7, 0xe2, 0xe3, 0xe4, 0xe9, 0x6624, 0xe0, 0x55b0, 0x55d0, 0x7670,
+        ] {
+            assert!(service_ebml_master(id), "missing master {id:#x}");
+        }
+    }
+
+    fn isobmff_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let length = u32::try_from(8 + payload.len()).unwrap();
+        let mut bytes = Vec::with_capacity(length as usize);
+        bytes.extend_from_slice(&length.to_be_bytes());
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn isobmff_extended_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let length = u64::try_from(16 + payload.len()).unwrap();
+        let mut bytes = Vec::with_capacity(length as usize);
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(&length.to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn isobmff_nested_box(kind: &[u8; 4], child: Vec<u8>) -> Vec<u8> {
+        isobmff_box(kind, &child)
+    }
+
+    fn isobmff_preflight_file(metadata: Vec<u8>) -> Vec<u8> {
+        let mut bytes = isobmff_box(b"ftyp", b"M4A \0\0\0\0M4A ");
+        bytes.extend(isobmff_box(b"moov", &metadata));
+        bytes.extend(isobmff_box(b"mdat", &[]));
+        bytes
+    }
+
+    #[test]
+    fn service_isobmff_preflight_rejects_oversized_stsz_before_demux() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized-stsz.m4a");
+        let mut stsz = vec![0; 12];
+        stsz[4..8].copy_from_slice(&((SERVICE_MAX_ENCODED_PACKET_BYTES + 1) as u32).to_be_bytes());
+        stsz[8..12].copy_from_slice(&1_u32.to_be_bytes());
+        let stbl = isobmff_nested_box(b"stbl", isobmff_box(b"stsz", &stsz));
+        let minf = isobmff_nested_box(b"minf", stbl);
+        let mdia = isobmff_nested_box(b"mdia", minf);
+        let trak = isobmff_nested_box(b"trak", mdia);
+        std::fs::write(&path, isobmff_preflight_file(trak)).unwrap();
+
+        let error = service_container_preflight(&path, || Ok(())).unwrap_err();
+        assert_eq!(error, SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED);
+
+        let mut variable_stsz = vec![0; 16];
+        variable_stsz[8..12].copy_from_slice(&1_u32.to_be_bytes());
+        variable_stsz[12..16]
+            .copy_from_slice(&((SERVICE_MAX_ENCODED_PACKET_BYTES + 1) as u32).to_be_bytes());
+        let metadata = isobmff_nested_box(
+            b"trak",
+            isobmff_nested_box(
+                b"mdia",
+                isobmff_nested_box(
+                    b"minf",
+                    isobmff_nested_box(b"stbl", isobmff_box(b"stsz", &variable_stsz)),
+                ),
+            ),
+        );
+        std::fs::write(&path, isobmff_preflight_file(metadata)).unwrap();
+        let error = service_container_preflight(&path, || Ok(())).unwrap_err();
+        assert_eq!(error, SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED);
+    }
+
+    #[test]
+    fn service_isobmff_preflight_accepts_compact_and_fragmented_sample_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let compact_path = directory.path().join("compact-stz2.m4a");
+        let mut stz2 = vec![0; 14];
+        stz2[7] = 8;
+        stz2[8..12].copy_from_slice(&2_u32.to_be_bytes());
+        stz2[12..14].copy_from_slice(&[7, 9]);
+        let metadata = isobmff_nested_box(
+            b"trak",
+            isobmff_nested_box(
+                b"mdia",
+                isobmff_nested_box(
+                    b"minf",
+                    isobmff_nested_box(b"stbl", isobmff_box(b"stz2", &stz2)),
+                ),
+            ),
+        );
+        std::fs::write(&compact_path, isobmff_preflight_file(metadata)).unwrap();
+        service_container_preflight(&compact_path, || Ok(())).unwrap();
+
+        let fragmented_path = directory.path().join("fragmented.m4a");
+        let mut trex = vec![0; 24];
+        trex[4..8].copy_from_slice(&7_u32.to_be_bytes());
+        trex[16..20].copy_from_slice(&4096_u32.to_be_bytes());
+        let mvex = isobmff_nested_box(b"mvex", isobmff_box(b"trex", &trex));
+        let mut bytes = isobmff_box(b"ftyp", b"M4A \0\0\0\0M4A ");
+        bytes.extend(isobmff_box(b"moov", &mvex));
+        let mut tfhd = vec![0; 8];
+        tfhd[1..4].copy_from_slice(&[0x02, 0x00, 0x00]); // default-base-is-moof
+        tfhd[4..8].copy_from_slice(&7_u32.to_be_bytes());
+        let mut trun = vec![0; 8];
+        trun[4..8].copy_from_slice(&3_u32.to_be_bytes());
+        let mut traf = isobmff_box(b"tfhd", &tfhd);
+        traf.extend(isobmff_box(b"trun", &trun));
+        bytes.extend(isobmff_box(b"moof", &isobmff_box(b"traf", &traf)));
+        bytes.extend(isobmff_box(b"mdat", &[0; 12_288]));
+        std::fs::write(&fragmented_path, bytes).unwrap();
+        service_container_preflight(&fragmented_path, || Ok(())).unwrap();
+    }
+
+    #[test]
+    fn service_isobmff_preflight_rejects_oversized_fragment_sample() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized-fragment.m4a");
+        let mut tfhd = vec![0; 8];
+        tfhd[1..4].copy_from_slice(&[0x02, 0x00, 0x00]);
+        tfhd[4..8].copy_from_slice(&1_u32.to_be_bytes());
+        let mut trun = vec![0; 12];
+        trun[1..4].copy_from_slice(&[0, 0x02, 0]); // sample-size-present
+        trun[4..8].copy_from_slice(&1_u32.to_be_bytes());
+        trun[8..12].copy_from_slice(&((SERVICE_MAX_ENCODED_PACKET_BYTES + 1) as u32).to_be_bytes());
+        let mut traf = isobmff_box(b"tfhd", &tfhd);
+        traf.extend(isobmff_box(b"trun", &trun));
+        let mut bytes = isobmff_box(b"ftyp", b"M4A \0\0\0\0M4A ");
+        bytes.extend(isobmff_box(b"moof", &isobmff_box(b"traf", &traf)));
+        bytes.extend(isobmff_box(b"mdat", &[]));
+        std::fs::write(&path, bytes).unwrap();
+
+        let error = service_container_preflight(&path, || Ok(())).unwrap_err();
+        assert_eq!(error, SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED);
+    }
+
+    #[test]
+    fn service_isobmff_preflight_bounds_nested_metadata_items() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metadata.m4a");
+
+        let data = isobmff_box(b"data", b"\0\0\0\x01\0\0\0\0title");
+        let unknown = isobmff_box(b"xtra", b"preserved");
+        let item = isobmff_box(b"\xa9nam", &[data, unknown].concat());
+        let ilst = isobmff_box(b"ilst", &item);
+        let meta = isobmff_box(b"meta", &[vec![0; 4], ilst].concat());
+        let udta = isobmff_box(b"udta", &meta);
+        std::fs::write(&path, isobmff_preflight_file(udta)).unwrap();
+        service_container_preflight(&path, || Ok(())).unwrap();
+
+        for (name, data) in [
+            (
+                "huge-metadata.m4a",
+                isobmff_box(
+                    b"data",
+                    &vec![0; usize::try_from(SERVICE_MAX_METADATA_ITEM_BYTES + 1).unwrap()],
+                ),
+            ),
+            (
+                "huge-extended-metadata.m4a",
+                isobmff_extended_box(
+                    b"mean",
+                    &vec![0; usize::try_from(SERVICE_MAX_METADATA_ITEM_BYTES + 1).unwrap()],
+                ),
+            ),
+        ] {
+            let item = isobmff_box(b"\xa9nam", &data);
+            let ilst = isobmff_box(b"ilst", &item);
+            let meta = isobmff_box(b"meta", &[vec![0; 4], ilst].concat());
+            let udta = isobmff_box(b"udta", &meta);
+            let path = directory.path().join(name);
+            std::fs::write(&path, isobmff_preflight_file(udta)).unwrap();
+            assert_eq!(
+                service_container_preflight(&path, || Ok(())).unwrap_err(),
+                SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED
+            );
+        }
+
+        let direct = directory.path().join("huge-direct-udta-data.m4a");
+        let data = isobmff_box(
+            b"data",
+            &vec![0; usize::try_from(SERVICE_MAX_METADATA_ITEM_BYTES + 1).unwrap()],
+        );
+        std::fs::write(&direct, isobmff_preflight_file(isobmff_box(b"udta", &data))).unwrap();
+        assert_eq!(
+            service_container_preflight(&direct, || Ok(())).unwrap_err(),
+            SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED
+        );
+
+        let mut truncated_data = Vec::new();
+        truncated_data.extend_from_slice(&64_u32.to_be_bytes());
+        truncated_data.extend_from_slice(b"data");
+        let item = isobmff_box(b"\xa9nam", &truncated_data);
+        let ilst = isobmff_box(b"ilst", &item);
+        let meta = isobmff_box(b"meta", &[vec![0; 4], ilst].concat());
+        let udta = isobmff_box(b"udta", &meta);
+        let truncated = directory.path().join("truncated-metadata.m4a");
+        std::fs::write(&truncated, isobmff_preflight_file(udta)).unwrap();
+        let error = service_container_preflight(&truncated, || Ok(())).unwrap_err();
+        assert!(error.contains("exceeds its parent"), "{error}");
+    }
+
+    #[test]
+    fn service_isobmff_preflight_bounds_ilst_children_and_aggregate_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let payload_len = usize::try_from(SERVICE_MAX_METADATA_ITEM_BYTES - 8).unwrap();
+        let data = isobmff_box(b"data", &vec![0; payload_len]);
+
+        let build_ilst = |count: usize| {
+            let mut ilst = Vec::new();
+            for _ in 0..count {
+                ilst.extend(isobmff_box(b"covr", &data));
+            }
+            ilst
+        };
+
+        let accepted = build_ilst(16);
+        let accepted_path = directory.path().join("metadata-total-boundary.bin");
+        std::fs::write(&accepted_path, &accepted).unwrap();
+        let mut accepted_file = File::open(&accepted_path).unwrap();
+        preflight_isobmff_metadata_region(
+            &accepted_path,
+            &mut accepted_file,
+            0,
+            accepted.len() as u64,
+            0,
+            ServiceIsoBmffMetadataRegion::ItemList,
+            &mut ServiceIsoBmffPreflight::default(),
+            &mut || Ok(()),
+        )
+        .unwrap();
+
+        let rejected = build_ilst(17);
+        let rejected_path = directory.path().join("metadata-total-over.bin");
+        std::fs::write(&rejected_path, &rejected).unwrap();
+        let mut rejected_file = File::open(&rejected_path).unwrap();
+        assert_eq!(
+            preflight_isobmff_metadata_region(
+                &rejected_path,
+                &mut rejected_file,
+                0,
+                rejected.len() as u64,
+                0,
+                ServiceIsoBmffMetadataRegion::ItemList,
+                &mut ServiceIsoBmffPreflight::default(),
+                &mut || Ok(()),
+            )
+            .unwrap_err(),
+            SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED
+        );
+
+        let mut budget = ServiceMetadataBudget::default();
+        budget.add_entries(SERVICE_MAX_CONTAINER_ITEMS).unwrap();
+        assert_eq!(
+            budget.add_entries(1).unwrap_err(),
+            SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED
+        );
+    }
+
+    #[test]
+    fn service_raw_preflight_rejects_unknown_prefix_and_bounds_id3() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let disguised = directory.path().join("disguised.audio");
+        let mut bytes = b"junk".to_vec();
+        bytes.extend_from_slice(&0x1a45_dfa3_u32.to_be_bytes());
+        std::fs::write(&disguised, &bytes).unwrap();
+        let error = service_container_preflight(&disguised, || Ok(())).unwrap_err();
+        assert!(
+            error.contains("no bounded audio-container signature"),
+            "{error}"
+        );
+
+        let oversized = directory.path().join("oversized-id3.mp3");
+        let oversized_header = b"ID3\x04\x00\x00\x7f\x7f\x7f\x7f";
+        std::fs::write(&oversized, oversized_header).unwrap();
+        let error = service_container_preflight(&oversized, || Ok(())).unwrap_err();
+        assert_eq!(error, SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED);
+
+        let tagged = directory.path().join("bounded-id3.mp3");
+        let mut tagged_bytes = b"ID3\x04\x00\x00\x00\x00\x00\x03tag".to_vec();
+        tagged_bytes.extend_from_slice(&silent_mpeg1_layer3_frame(0));
+        std::fs::write(&tagged, &tagged_bytes).unwrap();
+        let mut checkpoints = 0;
+        service_container_preflight(&tagged, || {
+            checkpoints += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(checkpoints, 4);
+    }
+
+    fn test_syncsafe(value: usize) -> [u8; 4] {
+        assert!(value < (1 << 28));
+        [
+            ((value >> 21) & 0x7f) as u8,
+            ((value >> 14) & 0x7f) as u8,
+            ((value >> 7) & 0x7f) as u8,
+            (value & 0x7f) as u8,
+        ]
+    }
+
+    fn service_id3_tag(version: u8, flags: u8, body: &[u8]) -> Vec<u8> {
+        let mut header = b"ID3\0\0\0\0\0\0\0".to_vec();
+        header[3] = version;
+        header[5] = flags;
+        header[6..10].copy_from_slice(&test_syncsafe(body.len()));
+        header.extend_from_slice(body);
+        if version == 4 && flags & 0x10 != 0 {
+            let mut footer = header[..10].to_vec();
+            footer[..3].copy_from_slice(b"3DI");
+            header.extend(footer);
+        }
+        header
+    }
+
+    #[test]
+    fn service_raw_audio_requires_complete_mpeg_or_adts_geometry() {
+        let mpeg = silent_mpeg1_layer3_frame(0);
+        assert_eq!(
+            service_raw_audio_frame_bytes(&mpeg[..16], mpeg.len() as u64),
+            Some(417)
+        );
+        assert_eq!(service_raw_audio_frame_bytes(&[0xff, 0xfb], 2), None);
+        assert_eq!(
+            service_raw_audio_frame_bytes(&[0xff, 0xfb, 0, 0], 4096),
+            None
+        );
+
+        let adts = [0xff, 0xf1, 0x50, 0x80, 0x00, 0xff, 0xfc];
+        assert_eq!(
+            service_raw_audio_frame_bytes(&adts, adts.len() as u64),
+            Some(7)
+        );
+        let mut bad_adts = adts;
+        bad_adts[2] = 0x7c; // Reserved sample-rate index.
+        assert_eq!(service_raw_audio_frame_bytes(&bad_adts, 7), None);
+    }
+
+    #[test]
+    fn service_raw_preflight_validates_the_complete_frame_chain_and_audio_offset() {
+        let directory = tempfile::tempdir().unwrap();
+        for count in [1_usize, 2, 65] {
+            let path = directory.path().join(format!("{count}-frames.mp3"));
+            let bytes = silent_mp3_stream(&vec![0; count]);
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                service_container_preflight(&path, || Ok(())).unwrap(),
+                ServiceContainerPreflight {
+                    route: ServiceContainerPreflightRoute::Mpa,
+                    media_offset: 0,
+                    media_end: u64::try_from(bytes.len()).unwrap(),
+                }
+            );
+        }
+
+        let adts_frame = [0xff, 0xf1, 0x50, 0x80, 0x00, 0xff, 0xfc];
+        for count in [1_usize, 2, 65] {
+            let path = directory.path().join(format!("{count}-frames.aac"));
+            let bytes = adts_frame.repeat(count);
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                service_container_preflight(&path, || Ok(())).unwrap(),
+                ServiceContainerPreflight {
+                    route: ServiceContainerPreflightRoute::Adts,
+                    media_offset: 0,
+                    media_end: u64::try_from(bytes.len()).unwrap(),
+                }
+            );
+        }
+
+        let tag = service_id3_tag(4, 0, &[]);
+        let mut tagged = tag.clone();
+        tagged.extend(silent_mp3_stream(&[0, 0]));
+        let path = directory.path().join("leading-id3.mp3");
+        std::fs::write(&path, &tagged).unwrap();
+        assert_eq!(
+            service_container_preflight(&path, || Ok(())).unwrap(),
+            ServiceContainerPreflight {
+                route: ServiceContainerPreflightRoute::Mpa,
+                media_offset: tag.len() as u64,
+                media_end: tagged.len() as u64,
+            }
+        );
+
+        let stable = StableInput::from_path(
+            &path,
+            &StableInputOptions::new(u64::try_from(tagged.len()).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let descriptor = InputDescriptor::probe_with_control(
+            stable,
+            InputDescriptorOptions::default(),
+            10_000,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(descriptor.container(), AudioContainer::MpegAudio);
+        let mut decoded_frames = 0_usize;
+        decode_descriptor_analysis_stream_with_control(
+            &descriptor,
+            10_000,
+            || Ok(()),
+            |_, _, chunk| {
+                decoded_frames += chunk.frames();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(decoded_frames, 2 * 1_152);
+    }
+
+    #[test]
+    fn controlled_raw_decode_cannot_read_frames_embedded_in_trailing_tags() {
+        let directory = tempfile::tempdir().unwrap();
+        let audio = silent_mp3_stream(&[0, 0]);
+        let clean_path = directory.path().join("clean.mp3");
+        std::fs::write(&clean_path, &audio).unwrap();
+
+        // A complete MPEG frame is an APE item value and a complete ADTS
+        // frame is present in the ID3v1 value. Neither is part of the admitted
+        // half-open media range, even though either byte sequence is a valid
+        // raw-audio signature in isolation.
+        let embedded_mpeg = silent_mpeg1_layer3_frame(0);
+        let mut item = Vec::new();
+        item.extend_from_slice(&u32::try_from(embedded_mpeg.len()).unwrap().to_le_bytes());
+        item.extend_from_slice(&0_u32.to_le_bytes());
+        item.extend_from_slice(b"Payload\0");
+        item.extend_from_slice(&embedded_mpeg);
+        let tag = ape_v2_tag(&item);
+        let mut id3v1 = [0_u8; 128];
+        id3v1[..3].copy_from_slice(b"TAG");
+        id3v1[3..10].copy_from_slice(&[0xff, 0xf1, 0x50, 0x80, 0x00, 0xff, 0xfc]);
+        let mut tagged = audio.clone();
+        tagged.extend_from_slice(&tag);
+        tagged.extend_from_slice(&id3v1);
+        let tagged_path = directory.path().join("tag-values-contain-frames.mp3");
+        std::fs::write(&tagged_path, &tagged).unwrap();
+
+        assert_eq!(
+            service_container_preflight(&tagged_path, || Ok(())).unwrap(),
+            ServiceContainerPreflight {
+                route: ServiceContainerPreflightRoute::Mpa,
+                media_offset: 0,
+                media_end: u64::try_from(audio.len()).unwrap(),
+            }
+        );
+
+        let analyze = |path: &Path| {
+            let input_len = std::fs::metadata(path).unwrap().len();
+            let stable =
+                StableInput::from_path(path, &StableInputOptions::new(input_len).unwrap()).unwrap();
+            let descriptor = InputDescriptor::probe_with_control(
+                stable,
+                InputDescriptorOptions::default(),
+                100_000,
+                || Ok(()),
+            )
+            .unwrap();
+            assert_eq!(
+                descriptor.service_preflight,
+                Some(service_container_preflight(path, || Ok(())).unwrap())
+            );
+            let info = descriptor.stream_info().clone();
+            let mut analyzer = crate::dsp::lufs::StreamingAnalyzer::new(
+                info.sample_rate,
+                descriptor.channel_layout().channel_roles(),
+            );
+            let mut decoded_frames = 0_usize;
+            decode_descriptor_analysis_stream_with_control(
+                &descriptor,
+                100_000,
+                || Ok(()),
+                |_, _, chunk| {
+                    let AnalysisPcmChunk::F32(planar) = chunk else {
+                        panic!("MPEG analysis must use the f32 lane");
+                    };
+                    decoded_frames += planar.first().map_or(0, Vec::len);
+                    analyzer.process(planar)
+                },
+            )
+            .unwrap();
+            (decoded_frames, analyzer.finish())
+        };
+
+        let (clean_frames, clean) = analyze(&clean_path);
+        let (tagged_frames, tagged) = analyze(&tagged_path);
+        assert_eq!(clean_frames, 2 * 1_152);
+        assert_eq!(tagged_frames, clean_frames);
+        assert_eq!(tagged.frames, clean.frames);
+        assert_eq!(
+            tagged.ebu.integrated_lufs.to_bits(),
+            clean.ebu.integrated_lufs.to_bits()
+        );
+        assert_eq!(
+            tagged.weighted_mean_square.to_bits(),
+            clean.weighted_mean_square.to_bits()
+        );
+        assert_eq!(tagged.rms_db.to_bits(), clean.rms_db.to_bits());
+        assert_eq!(tagged.sample_peak.to_bits(), clean.sample_peak.to_bits());
+        assert_eq!(tagged.true_peak.to_bits(), clean.true_peak.to_bits());
+        assert_eq!(tagged.ebu.gating_blocks, clean.ebu.gating_blocks);
+    }
+
+    #[test]
+    fn trailing_ape_before_non_id3v1_suffix_is_not_excluded_from_audio() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut bytes = silent_mpeg1_layer3_frame(0);
+        bytes.extend(ape_v2_tag(&[]));
+        bytes.extend_from_slice(&[b'X'; 128]);
+        let path = directory.path().join("ape-before-non-id3v1.mp3");
+        std::fs::write(&path, bytes).unwrap();
+
+        let error = service_container_preflight(&path, || Ok(())).unwrap_err();
+        assert!(
+            error.contains("inter-frame data or invalid geometry"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn service_raw_preflight_rejects_in_band_metadata_and_route_confusion() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut huge_ape_item = Vec::new();
+        huge_ape_item.extend_from_slice(
+            &u32::try_from(SERVICE_MAX_METADATA_ITEM_BYTES + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        huge_ape_item.extend_from_slice(&0_u32.to_le_bytes());
+        huge_ape_item.extend_from_slice(b"Title\0");
+
+        let huge_id3 = b"ID3\x04\0\0\x7f\x7f\x7f\x7f".to_vec();
+        let huge_ape = ape_v2_tag(&huge_ape_item);
+        for (codec, frame) in [
+            ("mp3", silent_mpeg1_layer3_frame(0)),
+            ("adts", vec![0xff, 0xf1, 0x50, 0x80, 0x00, 0xff, 0xfc]),
+        ] {
+            for (metadata_kind, metadata) in
+                [("id3", huge_id3.as_slice()), ("ape", huge_ape.as_slice())]
+            {
+                let mut in_band = frame.clone();
+                in_band.extend_from_slice(metadata);
+                in_band.extend_from_slice(&frame);
+                let path = directory
+                    .path()
+                    .join(format!("in-band-{metadata_kind}.{codec}"));
+                std::fs::write(&path, in_band).unwrap();
+                assert!(service_container_preflight(&path, || Ok(())).is_err());
+            }
+        }
+
+        let raw_inputs = [
+            ("mp3", silent_mpeg1_layer3_frame(0), vec![0xff, 0xfb, 0, 0]),
+            (
+                "adts",
+                vec![0xff, 0xf1, 0x50, 0x80, 0x00, 0xff, 0xfc],
+                vec![0xff, 0xf1, 0x7c, 0, 0, 0, 0],
+            ),
+        ];
+        for (codec, first, invalid) in raw_inputs {
+            for (name, marker) in [
+                ("ebml", b"\x1a\x45\xdf\xa3\x01\xff\xff\xff".as_slice()),
+                ("isobmff", b"\xff\xff\xff\xffmoov".as_slice()),
+                ("ogg", b"OggS\0\0\0\0\0\0\0\0".as_slice()),
+                ("flac", b"fLaC\x04\xff\xff\xff".as_slice()),
+            ] {
+                let mut confused = first.clone();
+                confused.extend_from_slice(&invalid);
+                confused.extend_from_slice(marker);
+                let path = directory
+                    .path()
+                    .join(format!("route-confusion-{codec}-{name}.bin"));
+                std::fs::write(&path, confused).unwrap();
+                let error = service_container_preflight(&path, || Ok(())).unwrap_err();
+                assert!(
+                    error.contains("inter-frame data or invalid geometry"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn service_probe_cannot_fall_back_to_an_unregistered_container() {
+        use symphonia::core::formats::probe::Hint;
+        use symphonia::core::formats::FormatOptions;
+        use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+
+        let probe = service_symphonia_probe(ServiceContainerPreflightRoute::Mpa).unwrap();
+        let wrong_container = MediaSourceStream::new(
+            Box::new(std::io::Cursor::new(b"OggS----------------".to_vec())),
+            MediaSourceStreamOptions::default(),
+        );
+        assert!(probe
+            .probe(
+                &Hint::new(),
+                wrong_container,
+                FormatOptions::default(),
+                service_metadata_options(),
+            )
+            .is_err());
+
+        let ogg_probe = service_symphonia_probe(ServiceContainerPreflightRoute::Ogg).unwrap();
+        let reverse_mismatch = MediaSourceStream::new(
+            Box::new(std::io::Cursor::new(silent_mp3_stream(&[0, 0, 0]))),
+            MediaSourceStreamOptions::default(),
+        );
+        assert!(ogg_probe
+            .probe(
+                &Hint::new(),
+                reverse_mismatch,
+                FormatOptions::default(),
+                service_metadata_options(),
+            )
+            .is_err());
+
+        let expected = MediaSourceStream::new(
+            Box::new(std::io::Cursor::new(silent_mp3_stream(&[0, 0, 0]))),
+            MediaSourceStreamOptions::default(),
+        );
+        let format = probe
+            .probe(
+                &Hint::new(),
+                expected,
+                FormatOptions::default(),
+                service_metadata_options(),
+            )
+            .unwrap();
+        assert_eq!(
+            audio_container_from_symphonia(format.format_info().format),
+            Some(AudioContainer::MpegAudio)
+        );
+    }
+
+    #[test]
+    fn service_id3_scans_every_version_and_rejects_false_sync_and_truncation() {
+        let directory = tempfile::tempdir().unwrap();
+        let frames = [
+            (2, 0, [b"TT2".as_slice(), &[0, 0, 1], b"x"].concat()),
+            (
+                3,
+                0,
+                [b"TIT2".as_slice(), &1_u32.to_be_bytes(), &[0, 0], b"x"].concat(),
+            ),
+            (
+                4,
+                0x10,
+                [b"TIT2".as_slice(), &test_syncsafe(1), &[0, 0], b"x"].concat(),
+            ),
+        ];
+        for (version, flags, body) in frames {
+            let mut bytes = service_id3_tag(version, flags, &body);
+            bytes.extend(silent_mpeg1_layer3_frame(0));
+            let path = directory.path().join(format!("v{version}.mp3"));
+            std::fs::write(&path, &bytes).unwrap();
+            service_container_preflight(&path, || Ok(())).unwrap();
+        }
+
+        let mut v3_extended = 6_u32.to_be_bytes().to_vec();
+        v3_extended.extend_from_slice(&[0; 6]);
+        v3_extended.extend_from_slice(b"TIT2");
+        v3_extended.extend_from_slice(&1_u32.to_be_bytes());
+        v3_extended.extend_from_slice(&[0, 0, b'x']);
+        let mut bytes = service_id3_tag(3, 0x40, &v3_extended);
+        bytes.extend(silent_mpeg1_layer3_frame(0));
+        let path = directory.path().join("v3-extended.mp3");
+        std::fs::write(&path, &bytes).unwrap();
+        service_container_preflight(&path, || Ok(())).unwrap();
+
+        let mut v4_extended = test_syncsafe(6).to_vec();
+        v4_extended.extend_from_slice(&[1, 0]);
+        v4_extended.extend_from_slice(b"TIT2");
+        v4_extended.extend_from_slice(&test_syncsafe(1));
+        v4_extended.extend_from_slice(&[0, 0, b'x']);
+        let mut bytes = service_id3_tag(4, 0x40, &v4_extended);
+        bytes.extend(silent_mpeg1_layer3_frame(0));
+        let path = directory.path().join("v4-extended.mp3");
+        std::fs::write(&path, &bytes).unwrap();
+        service_container_preflight(&path, || Ok(())).unwrap();
+
+        let mut unsynchronised = b"TIT2".to_vec();
+        unsynchronised.extend_from_slice(&2_u32.to_be_bytes());
+        unsynchronised.extend_from_slice(&[0, 0, 0xff, 0, 0xe0]);
+        let mut bytes = service_id3_tag(3, 0x80, &unsynchronised);
+        bytes.extend(silent_mpeg1_layer3_frame(0));
+        let path = directory.path().join("v3-unsynchronised.mp3");
+        std::fs::write(&path, &bytes).unwrap();
+        service_container_preflight(&path, || Ok(())).unwrap();
+
+        let truncated_body = [b"TIT2".as_slice(), &8_u32.to_be_bytes(), &[0, 0]].concat();
+        let truncated = service_id3_tag(3, 0, &truncated_body);
+        let path = directory.path().join("truncated-frame.mp3");
+        std::fs::write(&path, truncated).unwrap();
+        assert!(service_container_preflight(&path, || Ok(())).is_err());
+
+        let mut huge_ape_item = Vec::new();
+        huge_ape_item.extend_from_slice(
+            &u32::try_from(SERVICE_MAX_METADATA_ITEM_BYTES + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        huge_ape_item.extend_from_slice(&0_u32.to_le_bytes());
+        huge_ape_item.extend_from_slice(b"Title\0");
+        let mut false_sync = service_id3_tag(4, 0, &[]);
+        false_sync.extend_from_slice(&[0xff, 0xfb, 0, 0]);
+        false_sync.extend(ape_v2_tag(&huge_ape_item));
+        let path = directory.path().join("false-sync-before-ape.mp3");
+        std::fs::write(&path, false_sync).unwrap();
+        let error = service_container_preflight(&path, || Ok(())).unwrap_err();
+        assert_eq!(error, SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED);
+
+        let mut leading_ape = ape_v2_tag(&[]);
+        leading_ape.extend_from_slice(&[0xff, 0xfb, 0, 0]);
+        leading_ape.extend_from_slice(b"ID3\x04\0\0\x7f\x7f\x7f\x7f");
+        let path = directory
+            .path()
+            .join("leading-ape-false-sync-before-id3.mp3");
+        std::fs::write(&path, leading_ape).unwrap();
+        let error = service_container_preflight(&path, || Ok(())).unwrap_err();
+        assert!(
+            error.contains("no bounded audio-container signature"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn service_id3_frame_count_is_bounded_before_frame_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let build = |count: usize| {
+            let mut body = Vec::with_capacity(count * 6);
+            for _ in 0..count {
+                body.extend_from_slice(b"TT2\0\0\0");
+            }
+            let mut bytes = service_id3_tag(2, 0, &body);
+            bytes.extend(silent_mpeg1_layer3_frame(0));
+            bytes
+        };
+        let boundary = build(SERVICE_MAX_CONTAINER_ITEMS);
+        let path = directory.path().join("id3-frame-boundary.mp3");
+        std::fs::write(&path, boundary).unwrap();
+        service_container_preflight(&path, || Ok(())).unwrap();
+
+        let over = build(SERVICE_MAX_CONTAINER_ITEMS + 1);
+        let path = directory.path().join("id3-frame-over.mp3");
+        std::fs::write(&path, over).unwrap();
+        assert_eq!(
+            service_container_preflight(&path, || Ok(())).unwrap_err(),
+            SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED
+        );
+    }
+
+    #[test]
+    fn controlled_symphonia_probe_checks_underlying_io() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("controlled.flac");
+        write_silent_test_flac(&path, 1, 32);
+        let preflight = service_container_preflight(&path, || Ok(())).unwrap();
+
+        let mut checkpoints = 0;
+        let result = probe_symphonia_identity_at_controlled(
+            &path,
+            Some(&path),
+            &path.display().to_string(),
+            AudioTrackSelection::Default,
+            preflight,
+            || {
+                checkpoints += 1;
+                if checkpoints == 2 {
+                    Err("controlled Symphonia I/O stopped".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("controlled probe unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("controlled Symphonia I/O stopped"),
+            "{error}"
+        );
+        assert_eq!(checkpoints, 2);
+    }
+
+    #[test]
+    fn controlled_media_source_splits_large_scalar_and_vectored_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large-controlled-read.bin");
+        std::fs::write(&path, vec![0x5a; SERVICE_CONTROLLED_READ_BYTES * 3]).unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = std::sync::Arc::clone(&calls);
+        let checkpoint = Mutex::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        });
+        let file = File::open(&path).unwrap();
+        let base = 11_u64;
+        let admitted_bytes = u64::try_from(SERVICE_CONTROLLED_READ_BYTES * 2).unwrap();
+        let mut source =
+            CheckpointMediaSource::new_range(file, &checkpoint, base, base + admitted_bytes)
+                .unwrap();
+        assert_eq!(
+            symphonia::core::io::MediaSource::byte_len(&source),
+            Some(admitted_bytes)
+        );
+
+        let mut scalar = vec![0_u8; SERVICE_CONTROLLED_READ_BYTES * 2];
+        assert_eq!(
+            source.read(&mut scalar).unwrap(),
+            SERVICE_CONTROLLED_READ_BYTES
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let mut first = vec![0_u8; SERVICE_CONTROLLED_READ_BYTES * 2];
+        let mut second = [0_u8; 16];
+        let mut outputs = [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)];
+        assert_eq!(
+            source.read_vectored(&mut outputs).unwrap(),
+            SERVICE_CONTROLLED_READ_BYTES
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        let mut byte = [0_u8; 1];
+        assert_eq!(source.read(&mut byte).unwrap(), 0);
+        assert_eq!(source.seek(SeekFrom::End(0)).unwrap(), admitted_bytes);
+        assert!(source.seek(SeekFrom::End(1)).is_err());
+        assert!(source.seek(SeekFrom::Start(admitted_bytes + 1)).is_err());
+        assert_eq!(source.seek(SeekFrom::Start(0)).unwrap(), 0);
+        assert_eq!(source.read(&mut byte).unwrap(), 1);
+        assert_eq!(byte, [0x5a]);
     }
 
     fn decode_flac_with_workers(

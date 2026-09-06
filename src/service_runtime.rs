@@ -1,15 +1,14 @@
-//! Private resource-control foundation for service transports.
-//!
-//! The REST and gRPC integration is intentionally a later slice. Keeping this
-//! module private lets that integration preserve the constructible public
-//! `ServiceConfig` while sharing one implementation of quotas, cancellation,
-//! deadlines, and upload ownership.
+//! Private resource-control implementation shared by service transports.
 
 #![allow(
     dead_code,
-    reason = "private v0.189.11 foundation is consumed by the following service integration slice"
+    reason = "some private runtime diagnostics and cancellation hooks are transport/test specific"
 )]
 
+use crate::analysis::Analysis;
+use crate::channel_layout::ChannelLayoutDescriptor;
+use crate::decoder::{self, AnalysisPcmChunk, InputDescriptor, InputDescriptorOptions};
+use crate::dsp::lufs;
 use crate::stable_input::{
     create_snapshot, StableInput, StableInputError, StableInputOptions, StableInputTransfer,
 };
@@ -43,14 +42,14 @@ pub(crate) struct ServiceRuntimeError {
 }
 
 impl ServiceRuntimeError {
-    fn new(kind: ServiceRuntimeErrorKind, message: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: ServiceRuntimeErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
         }
     }
 
-    fn io(context: &str, error: io::Error) -> Self {
+    pub(crate) fn io(context: &str, error: io::Error) -> Self {
         Self::new(ServiceRuntimeErrorKind::Io, format!("{context}: {error}"))
     }
 
@@ -228,6 +227,14 @@ impl ResourceGovernor {
     pub(crate) fn temporary_storage_used(&self) -> u64 {
         self.temporary_storage.used()
     }
+
+    pub(crate) fn memory_capacity(&self) -> u64 {
+        self.memory.capacity()
+    }
+
+    pub(crate) fn temporary_storage_capacity(&self) -> u64 {
+        self.temporary_storage.capacity()
+    }
 }
 
 const REQUEST_RUNNING: u8 = 0;
@@ -329,6 +336,21 @@ impl RequestControl {
             .saturating_duration_since(Instant::now()))
     }
 
+    pub(crate) fn same_request(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Mark a timer-driven request as expired without changing an earlier
+    /// terminal cancellation reason.
+    pub(crate) fn expire(&self) {
+        let _ = self.inner.state.compare_exchange(
+            REQUEST_RUNNING,
+            REQUEST_DEADLINE_EXCEEDED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
     fn cancelled_error() -> ServiceRuntimeError {
         ServiceRuntimeError::new(ServiceRuntimeErrorKind::Cancelled, "request was cancelled")
     }
@@ -339,6 +361,437 @@ impl RequestControl {
             "request deadline was exceeded",
         )
     }
+}
+
+/// Result of a service-only, quota-bound streaming decode and analysis.
+///
+/// The private input clone retains the upload file and its temporary-storage
+/// lease, while the memory lease remains live until report construction and
+/// transport serialization have completed.
+#[derive(Debug)]
+pub(crate) struct ControlledAnalysis {
+    pub(crate) analysis: Analysis,
+    pub(crate) channel_layout: ChannelLayoutDescriptor,
+    pub(crate) decoded_samples: u64,
+    _input: StableInput,
+    _decoded_memory_lease: QuotaLease,
+}
+
+#[derive(Debug)]
+pub(crate) enum ControlledAnalysisError {
+    Runtime(ServiceRuntimeError),
+    Media(String),
+}
+
+impl fmt::Display for ControlledAnalysisError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Runtime(error) => error.fmt(formatter),
+            Self::Media(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<ServiceRuntimeError> for ControlledAnalysisError {
+    fn from(error: ServiceRuntimeError) -> Self {
+        Self::Runtime(error)
+    }
+}
+
+pub(crate) const SERVICE_MAX_CHANNELS: u16 = 64;
+const SERVICE_PCM_WORKING_BYTES_PER_SAMPLE: u64 = 16;
+const SERVICE_DECODER_FIXED_ALLOWANCE_BYTES: u64 = 64 * 1024 * 1024;
+const SERVICE_REPORT_ALLOWANCE_BYTES: u64 = 1024 * 1024;
+const SERVICE_CHANNEL_STATE_BYTES: u64 = 4 * 1024;
+/// Maximum admission charge retained by a serialized gRPC response body.
+///
+/// The charge includes both the response message strings and the encoded wire
+/// buffer while tonic transitions between them. Actual responses are charged
+/// by their checked size and rejected if this conservative envelope is
+/// exceeded.
+pub(crate) const SERVICE_RESPONSE_WIRE_ALLOWANCE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Admission charge for the major Forge-owned decode/analysis allocations.
+///
+/// This includes the immutable encoded input as a worst-case demux packet,
+/// two simultaneous eight-byte PCM representations, serial decoder scratch,
+/// the maximum K-weighting window and loudness-block vectors, per-channel DSP
+/// state, and the bounded exact-layout/report response. Controlled service
+/// decoding disables parallel native FLAC, whose multi-decoder batches are not
+/// covered by this formula. This is a conservative admission charge rather
+/// than a hard RSS/allocator cap: third-party decoder implementation overhead,
+/// the async transport stack, thread stacks, and allocator fragmentation are
+/// outside the governor and are bounded/configured separately where possible.
+pub(crate) fn service_analysis_working_set_reservation_bytes(
+    max_input_bytes: u64,
+    max_decoded_samples: u64,
+) -> Result<u64, ServiceRuntimeError> {
+    if max_input_bytes == 0 {
+        return Err(ServiceRuntimeError::new(
+            ServiceRuntimeErrorKind::InvalidLimit,
+            "input byte limit must be greater than zero",
+        ));
+    }
+    if max_decoded_samples == 0 {
+        return Err(ServiceRuntimeError::new(
+            ServiceRuntimeErrorKind::InvalidLimit,
+            "decoded sample limit must be greater than zero",
+        ));
+    }
+    let pcm = max_decoded_samples
+        .checked_mul(SERVICE_PCM_WORKING_BYTES_PER_SAMPLE)
+        .ok_or_else(|| {
+            ServiceRuntimeError::new(
+                ServiceRuntimeErrorKind::ArithmeticOverflow,
+                "decoded PCM working-set reservation exceeds the byte-count domain",
+            )
+        })?;
+    let loudness_blocks = u64::try_from(lufs::MAX_LOUDNESS_BLOCKS)
+        .ok()
+        .and_then(|blocks| blocks.checked_mul(std::mem::size_of::<f64>() as u64))
+        // Vec capacity may temporarily double while each of the two vectors
+        // grows, so charge four maximum f64 vectors in total.
+        .and_then(|bytes| bytes.checked_mul(4))
+        .ok_or_else(|| {
+            ServiceRuntimeError::new(
+                ServiceRuntimeErrorKind::ArithmeticOverflow,
+                "loudness block reservation exceeds the byte-count domain",
+            )
+        })?;
+    let loudness_window = u64::from(decoder::MAX_DECODE_SAMPLE_RATE_HZ)
+        .checked_mul(3)
+        .and_then(|frames| frames.checked_mul(std::mem::size_of::<f64>() as u64))
+        .ok_or_else(|| {
+            ServiceRuntimeError::new(
+                ServiceRuntimeErrorKind::ArithmeticOverflow,
+                "loudness window reservation exceeds the byte-count domain",
+            )
+        })?;
+    let channel_state = u64::from(SERVICE_MAX_CHANNELS)
+        .checked_mul(SERVICE_CHANNEL_STATE_BYTES)
+        .ok_or_else(|| {
+            ServiceRuntimeError::new(
+                ServiceRuntimeErrorKind::ArithmeticOverflow,
+                "channel-state reservation exceeds the byte-count domain",
+            )
+        })?;
+    let layout =
+        u64::try_from(crate::channel_layout::MAX_CHANNEL_LAYOUT_JSON_BYTES).map_err(|_| {
+            ServiceRuntimeError::new(
+                ServiceRuntimeErrorKind::ArithmeticOverflow,
+                "channel-layout response limit exceeds the byte-count domain",
+            )
+        })?;
+    [
+        max_input_bytes,
+        pcm,
+        SERVICE_DECODER_FIXED_ALLOWANCE_BYTES,
+        loudness_blocks,
+        loudness_window,
+        channel_state,
+        layout,
+        SERVICE_REPORT_ALLOWANCE_BYTES,
+    ]
+    .into_iter()
+    .try_fold(0_u64, |total, bytes| total.checked_add(bytes))
+    .ok_or_else(|| {
+        ServiceRuntimeError::new(
+            ServiceRuntimeErrorKind::ArithmeticOverflow,
+            "service analysis working-set reservation exceeds the byte-count domain",
+        )
+    })
+}
+
+fn validate_service_channel_count(channels: u16) -> Result<(), ServiceRuntimeError> {
+    if channels == 0 || channels > SERVICE_MAX_CHANNELS {
+        return Err(ServiceRuntimeError::new(
+            ServiceRuntimeErrorKind::LimitExceeded,
+            format!(
+                "decoded channel count {channels} is outside the service range 1..={SERVICE_MAX_CHANNELS}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Decode and analyze one immutable upload with cooperative checkpoints.
+///
+/// Existing library decode and analysis entry points are untouched. The
+/// service path uses the descriptor streaming decoder so cancellation and the
+/// absolute deadline are observed between bounded codec packets/chunks and
+/// before and after each DSP chunk.
+pub(crate) fn analyze_stable_input(
+    input: StableInput,
+    requested_layout: Option<ChannelLayoutDescriptor>,
+    max_decoded_samples: u64,
+    governor: &ResourceGovernor,
+    control: &RequestControl,
+) -> Result<ControlledAnalysis, ControlledAnalysisError> {
+    analyze_stable_input_impl(
+        input,
+        requested_layout,
+        max_decoded_samples,
+        governor,
+        control,
+        |_| {},
+        |_, _| {},
+    )
+}
+
+#[cfg(test)]
+fn analyze_stable_input_with_checkpoint<F>(
+    input: StableInput,
+    requested_layout: Option<ChannelLayoutDescriptor>,
+    max_decoded_samples: u64,
+    governor: &ResourceGovernor,
+    control: &RequestControl,
+    checkpoint: F,
+) -> Result<ControlledAnalysis, ControlledAnalysisError>
+where
+    F: FnMut(&RequestControl, u64),
+{
+    analyze_stable_input_impl(
+        input,
+        requested_layout,
+        max_decoded_samples,
+        governor,
+        control,
+        |_| {},
+        checkpoint,
+    )
+}
+
+#[cfg(test)]
+fn analyze_stable_input_with_probe_checkpoint<P>(
+    input: StableInput,
+    requested_layout: Option<ChannelLayoutDescriptor>,
+    max_decoded_samples: u64,
+    governor: &ResourceGovernor,
+    control: &RequestControl,
+    probe_checkpoint: P,
+) -> Result<ControlledAnalysis, ControlledAnalysisError>
+where
+    P: FnMut(&RequestControl) + Send,
+{
+    analyze_stable_input_impl(
+        input,
+        requested_layout,
+        max_decoded_samples,
+        governor,
+        control,
+        probe_checkpoint,
+        |_, _| {},
+    )
+}
+
+fn analyze_stable_input_impl<P, F>(
+    input: StableInput,
+    requested_layout: Option<ChannelLayoutDescriptor>,
+    max_decoded_samples: u64,
+    governor: &ResourceGovernor,
+    control: &RequestControl,
+    mut probe_checkpoint: P,
+    mut checkpoint: F,
+) -> Result<ControlledAnalysis, ControlledAnalysisError>
+where
+    P: FnMut(&RequestControl) + Send,
+    F: FnMut(&RequestControl, u64),
+{
+    control.check()?;
+    let reservation =
+        service_analysis_working_set_reservation_bytes(input.byte_len(), max_decoded_samples)?;
+    let decoded_memory_lease = governor.reserve_memory(reservation)?;
+
+    let retained_input = input.clone();
+    let descriptor_options = requested_layout
+        .map_or_else(InputDescriptorOptions::default, |layout| {
+            InputDescriptorOptions::default().with_channel_layout(layout)
+        });
+    const CONTROLLED_STOP: &str = "__forge_service_controlled_analysis_stop__";
+    let descriptor_result =
+        InputDescriptor::probe_with_control(input, descriptor_options, max_decoded_samples, || {
+            probe_checkpoint(control);
+            match control.check() {
+                Ok(()) => Ok(()),
+                Err(_) => Err(CONTROLLED_STOP.into()),
+            }
+        });
+    // A terminal request reason takes precedence over a decoder error that
+    // happened concurrently with cancellation/deadline expiry.
+    control.check()?;
+    let descriptor = match descriptor_result {
+        Ok(descriptor) => descriptor,
+        Err(error) if error == decoder::SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED => {
+            return Err(ControlledAnalysisError::Runtime(ServiceRuntimeError::new(
+                ServiceRuntimeErrorKind::LimitExceeded,
+                format!("decoded audio contains more than {max_decoded_samples} samples"),
+            )));
+        }
+        Err(error) if error == decoder::SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED => {
+            return Err(ControlledAnalysisError::Runtime(ServiceRuntimeError::new(
+                ServiceRuntimeErrorKind::LimitExceeded,
+                "encoded container packet or metadata exceeds the service safety limit",
+            )));
+        }
+        Err(error) => return Err(ControlledAnalysisError::Media(error)),
+    };
+    let info = descriptor.stream_info().clone();
+    validate_service_channel_count(info.channels)?;
+    let channel_layout = descriptor.channel_layout().clone();
+    let override_roles = descriptor
+        .uses_explicit_channel_layout()
+        .then(|| channel_layout.channel_roles());
+    let channel_roles = crate::normalize::resolve_decoded_channel_roles(
+        descriptor.stable_input().stable_path(),
+        info.channels,
+        &info.channel_roles,
+        channel_layout.provenance(),
+        override_roles.as_deref(),
+    )
+    .map_err(ControlledAnalysisError::Media)?;
+    let mut analyzer = lufs::StreamingAnalyzer::new(info.sample_rate, channel_roles.clone());
+    let mut decoded_frames = 0_u64;
+    let mut runtime_failure = None;
+    let decode_result = decoder::decode_descriptor_analysis_stream_with_control(
+        &descriptor,
+        max_decoded_samples,
+        || match control.check() {
+            Ok(()) => Ok(()),
+            Err(_) => Err(CONTROLLED_STOP.into()),
+        },
+        |_, _, chunk| {
+            if let Err(error) = control.check() {
+                runtime_failure = Some(error);
+                return Err(CONTROLLED_STOP.into());
+            }
+            let chunk_frames = chunk.frames();
+            let chunk_frames = match u64::try_from(chunk_frames) {
+                Ok(frames) => frames,
+                Err(_) => {
+                    runtime_failure = Some(ServiceRuntimeError::new(
+                        ServiceRuntimeErrorKind::ArithmeticOverflow,
+                        "decoded chunk frame count exceeds the service byte-count domain",
+                    ));
+                    return Err(CONTROLLED_STOP.into());
+                }
+            };
+            let next_frames = match decoded_frames.checked_add(chunk_frames) {
+                Some(frames) => frames,
+                None => {
+                    runtime_failure = Some(ServiceRuntimeError::new(
+                        ServiceRuntimeErrorKind::ArithmeticOverflow,
+                        "decoded frame count overflow",
+                    ));
+                    return Err(CONTROLLED_STOP.into());
+                }
+            };
+            let next_samples = match next_frames.checked_mul(u64::from(info.channels)) {
+                Some(samples) => samples,
+                None => {
+                    runtime_failure = Some(ServiceRuntimeError::new(
+                        ServiceRuntimeErrorKind::ArithmeticOverflow,
+                        "decoded sample count overflow",
+                    ));
+                    return Err(CONTROLLED_STOP.into());
+                }
+            };
+            if next_samples > max_decoded_samples {
+                runtime_failure = Some(ServiceRuntimeError::new(
+                    ServiceRuntimeErrorKind::LimitExceeded,
+                    format!("decoded audio contains more than {max_decoded_samples} samples"),
+                ));
+                return Err(CONTROLLED_STOP.into());
+            }
+            let dsp_checkpoint = || match control.check() {
+                Ok(()) => Ok(()),
+                Err(_) => Err(CONTROLLED_STOP.into()),
+            };
+            let process_result = match chunk {
+                AnalysisPcmChunk::F32(planar) => {
+                    analyzer.process_with_control(planar, dsp_checkpoint)
+                }
+                AnalysisPcmChunk::S32(planar) => {
+                    analyzer.process_i32_with_control(planar, dsp_checkpoint)
+                }
+                AnalysisPcmChunk::F64(planar) => {
+                    analyzer.process_f64_with_control(planar, dsp_checkpoint)
+                }
+            };
+            process_result?;
+            decoded_frames = next_frames;
+            checkpoint(control, decoded_frames);
+            if let Err(error) = control.check() {
+                runtime_failure = Some(error);
+                return Err(CONTROLLED_STOP.into());
+            }
+            Ok(())
+        },
+    );
+    if let Some(error) = runtime_failure.take() {
+        return Err(ControlledAnalysisError::Runtime(error));
+    }
+    if let Err(error) = decode_result {
+        if let Err(terminal) = control.check() {
+            return Err(ControlledAnalysisError::Runtime(terminal));
+        }
+        if error == decoder::SERVICE_PACKET_SAMPLE_LIMIT_EXCEEDED {
+            return Err(ControlledAnalysisError::Runtime(ServiceRuntimeError::new(
+                ServiceRuntimeErrorKind::LimitExceeded,
+                format!(
+                    "one decoded packet exceeds the {max_decoded_samples}-sample service limit"
+                ),
+            )));
+        }
+        if error == decoder::SERVICE_ENCODED_PACKET_LIMIT_EXCEEDED {
+            return Err(ControlledAnalysisError::Runtime(ServiceRuntimeError::new(
+                ServiceRuntimeErrorKind::LimitExceeded,
+                "encoded container packet or metadata exceeds the service safety limit",
+            )));
+        }
+        return Err(ControlledAnalysisError::Media(error));
+    }
+    control.check()?;
+    let finish_result = analyzer.finish_with_control(|| match control.check() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            runtime_failure = Some(error);
+            Err(CONTROLLED_STOP.into())
+        }
+    });
+    if let Some(error) = runtime_failure {
+        return Err(ControlledAnalysisError::Runtime(error));
+    }
+    let measured = finish_result.map_err(ControlledAnalysisError::Media)?;
+    control.check()?;
+    let decoded_samples = decoded_frames
+        .checked_mul(u64::from(info.channels))
+        .ok_or_else(|| {
+            ControlledAnalysisError::Runtime(ServiceRuntimeError::new(
+                ServiceRuntimeErrorKind::ArithmeticOverflow,
+                "decoded sample count overflow",
+            ))
+        })?;
+    Ok(ControlledAnalysis {
+        analysis: Analysis {
+            sample_rate: info.sample_rate,
+            channels: info.channels,
+            channel_roles,
+            frames: measured.frames,
+            kind: info.source_kind,
+            lufs: measured.ebu.integrated_lufs,
+            max_momentary_lufs: measured.ebu.max_momentary_lufs,
+            max_short_term_lufs: measured.ebu.max_short_term_lufs,
+            loudness_range_lu: measured.ebu.loudness_range_lu,
+            rms_db: measured.rms_db,
+            sample_peak: measured.sample_peak,
+            true_peak: measured.true_peak,
+            loudness_blocks: measured.ebu.gating_blocks,
+        },
+        channel_layout,
+        decoded_samples,
+        _input: retained_input,
+        _decoded_memory_lease: decoded_memory_lease,
+    })
 }
 
 /// Bounded, incrementally hashed upload retained in a private temporary file.
@@ -619,6 +1072,74 @@ mod tests {
         Sha256::digest(bytes).into()
     }
 
+    fn mono_s16_wave(frames: usize) -> Vec<u8> {
+        let sample_rate = 48_000_u32;
+        let data_bytes = u32::try_from(frames.checked_mul(2).unwrap()).unwrap();
+        let mut audio = Vec::with_capacity(44 + data_bytes as usize);
+        audio.extend_from_slice(b"RIFF");
+        audio.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        audio.extend_from_slice(b"WAVEfmt ");
+        audio.extend_from_slice(&16_u32.to_le_bytes());
+        audio.extend_from_slice(&1_u16.to_le_bytes());
+        audio.extend_from_slice(&1_u16.to_le_bytes());
+        audio.extend_from_slice(&sample_rate.to_le_bytes());
+        audio.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        audio.extend_from_slice(&2_u16.to_le_bytes());
+        audio.extend_from_slice(&16_u16.to_le_bytes());
+        audio.extend_from_slice(b"data");
+        audio.extend_from_slice(&data_bytes.to_le_bytes());
+        for frame in 0..frames {
+            let sample = ((frame % 97) as i16).saturating_mul(100);
+            audio.extend_from_slice(&sample.to_le_bytes());
+        }
+        audio
+    }
+
+    fn mono_s16_wave_with_junk_chunks(junk_chunks: usize) -> Vec<u8> {
+        let sample_rate = 48_000_u32;
+        let mut audio = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
+        audio.extend_from_slice(&16_u32.to_le_bytes());
+        audio.extend_from_slice(&1_u16.to_le_bytes());
+        audio.extend_from_slice(&1_u16.to_le_bytes());
+        audio.extend_from_slice(&sample_rate.to_le_bytes());
+        audio.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        audio.extend_from_slice(&2_u16.to_le_bytes());
+        audio.extend_from_slice(&16_u16.to_le_bytes());
+        for _ in 0..junk_chunks {
+            audio.extend_from_slice(b"JUNK");
+            audio.extend_from_slice(&0_u32.to_le_bytes());
+        }
+        audio.extend_from_slice(b"data");
+        audio.extend_from_slice(&2_u32.to_le_bytes());
+        audio.extend_from_slice(&1_i16.to_le_bytes());
+        let riff_size = u32::try_from(audio.len() - 8).unwrap();
+        audio[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        audio
+    }
+
+    fn analysis_reservation(input_bytes: usize, max_samples: u64) -> u64 {
+        service_analysis_working_set_reservation_bytes(input_bytes as u64, max_samples).unwrap()
+    }
+
+    fn spool_bytes(
+        governor: &ResourceGovernor,
+        request_control: &RequestControl,
+        bytes: &[u8],
+    ) -> StableInput {
+        let length = bytes.len() as u64;
+        let mut spool = UploadSpool::create(
+            governor,
+            request_control.clone(),
+            length,
+            options(length, "analysis.wav"),
+        )
+        .unwrap();
+        for chunk in bytes.chunks(997) {
+            spool.write_chunk(chunk).unwrap();
+        }
+        spool.finish_into_stable_input().unwrap()
+    }
+
     #[test]
     fn byte_quota_is_checked_and_zero_capacity_is_well_defined() {
         let quota = Arc::new(ByteQuota::new(4));
@@ -762,6 +1283,11 @@ mod tests {
         let cancelled = running.clone();
         assert!(cancelled.cancel());
         assert!(!running.cancel());
+        assert_eq!(
+            running.check().unwrap_err().kind(),
+            ServiceRuntimeErrorKind::Cancelled
+        );
+        running.expire();
         assert_eq!(
             running.check().unwrap_err().kind(),
             ServiceRuntimeErrorKind::Cancelled
@@ -1026,6 +1552,221 @@ mod tests {
         assert!(!path.exists());
         assert_eq!(governor.memory_used(), 0);
         assert_eq!(governor.temporary_storage_used(), 0);
+    }
+
+    #[test]
+    fn controlled_streaming_analysis_holds_both_quotas_through_result_lifetime() {
+        let audio = mono_s16_wave(24_000);
+        let decoded_limit = 24_000_u64;
+        let reservation = analysis_reservation(audio.len(), decoded_limit);
+        let governor = ResourceGovernor::new(reservation, audio.len() as u64);
+        let request_control = control();
+        let input = spool_bytes(&governor, &request_control, &audio);
+        assert_eq!(governor.temporary_storage_used(), audio.len() as u64);
+
+        let result =
+            analyze_stable_input(input, None, decoded_limit, &governor, &request_control).unwrap();
+        assert_eq!(result.analysis.frames, 24_000);
+        assert_eq!(result.decoded_samples, decoded_limit);
+        let offline = crate::analysis::analyze(
+            &crate::decoder::decode_limited(result._input.stable_path(), decoded_limit).unwrap(),
+        );
+        assert!((result.analysis.lufs - offline.lufs).abs() <= 1e-9);
+        assert!((result.analysis.rms_db - offline.rms_db).abs() <= 1e-9);
+        assert_eq!(
+            result.analysis.true_peak.to_bits(),
+            offline.true_peak.to_bits()
+        );
+        assert_eq!(governor.memory_used(), reservation);
+        assert_eq!(governor.temporary_storage_used(), audio.len() as u64);
+
+        drop(result);
+        assert_eq!(governor.memory_used(), 0);
+        assert_eq!(governor.temporary_storage_used(), 0);
+    }
+
+    #[test]
+    fn decoded_expansion_and_cooperative_cancellation_release_all_resources() {
+        let audio = mono_s16_wave(24_000);
+
+        let limited_reservation = analysis_reservation(audio.len(), 23_999);
+        let limited_governor = ResourceGovernor::new(limited_reservation, audio.len() as u64);
+        let limited_control = control();
+        let limited_input = spool_bytes(&limited_governor, &limited_control, &audio);
+        let error = analyze_stable_input(
+            limited_input,
+            None,
+            23_999,
+            &limited_governor,
+            &limited_control,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ControlledAnalysisError::Runtime(ref runtime)
+                if runtime.kind() == ServiceRuntimeErrorKind::LimitExceeded
+        ));
+        assert_eq!(limited_governor.memory_used(), 0);
+        assert_eq!(limited_governor.temporary_storage_used(), 0);
+
+        let cancelled_governor = ResourceGovernor::new(
+            analysis_reservation(audio.len(), 24_000),
+            audio.len() as u64,
+        );
+        let cancelled_control = control();
+        let cancelled_input = spool_bytes(&cancelled_governor, &cancelled_control, &audio);
+        let mut checkpoints = 0;
+        let error = analyze_stable_input_with_checkpoint(
+            cancelled_input,
+            None,
+            24_000,
+            &cancelled_governor,
+            &cancelled_control,
+            |control, processed_frames| {
+                checkpoints += 1;
+                assert!(processed_frames > 0);
+                control.cancel();
+            },
+        )
+        .unwrap_err();
+        assert_eq!(checkpoints, 1);
+        assert!(matches!(
+            error,
+            ControlledAnalysisError::Runtime(ref runtime)
+                if runtime.kind() == ServiceRuntimeErrorKind::Cancelled
+        ));
+        assert_eq!(cancelled_governor.memory_used(), 0);
+        assert_eq!(cancelled_governor.temporary_storage_used(), 0);
+    }
+
+    #[test]
+    fn junk_heavy_wave_probe_honors_cancel_and_deadline_and_releases_quotas() {
+        let audio = mono_s16_wave_with_junk_chunks(1_024);
+        let reservation = analysis_reservation(audio.len(), 1);
+
+        for (deadline, expected) in [
+            (false, ServiceRuntimeErrorKind::Cancelled),
+            (true, ServiceRuntimeErrorKind::DeadlineExceeded),
+        ] {
+            let governor = ResourceGovernor::new(reservation, audio.len() as u64);
+            let request_control = control();
+            let input = spool_bytes(&governor, &request_control, &audio);
+            let mut checkpoints = 0;
+            let error = analyze_stable_input_with_probe_checkpoint(
+                input,
+                None,
+                1,
+                &governor,
+                &request_control,
+                |control| {
+                    checkpoints += 1;
+                    if checkpoints == 8 {
+                        if deadline {
+                            control.expire();
+                        } else {
+                            control.cancel();
+                        }
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                ControlledAnalysisError::Runtime(ref runtime) if runtime.kind() == expected
+            ));
+            assert_eq!(checkpoints, 8);
+            assert_eq!(governor.memory_used(), 0);
+            assert_eq!(governor.temporary_storage_used(), 0);
+        }
+    }
+
+    #[cfg(feature = "opus-encoding")]
+    #[test]
+    fn ogg_page_scan_cancellation_releases_memory_and_temp_quotas() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("controlled.opus");
+        let roles = crate::wav::default_channel_roles(1);
+        let mut writer =
+            crate::opus::OpusStreamWriter::create(&path, 48_000, 960, 1, &roles, 64, -18.0, None)
+                .unwrap();
+        writer.write_chunk(&[vec![0.0; 960]]).unwrap();
+        writer.finish().unwrap();
+        let audio = std::fs::read(&path).unwrap();
+        let reservation = analysis_reservation(audio.len(), 960);
+        let governor = ResourceGovernor::new(reservation, audio.len() as u64);
+        let request_control = control();
+        let input = spool_bytes(&governor, &request_control, &audio);
+
+        let mut checkpoints = 0;
+        let error = analyze_stable_input_with_probe_checkpoint(
+            input,
+            None,
+            960,
+            &governor,
+            &request_control,
+            |control| {
+                checkpoints += 1;
+                if checkpoints == 4 {
+                    control.cancel();
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(checkpoints, 4);
+        assert!(matches!(
+            error,
+            ControlledAnalysisError::Runtime(ref runtime)
+                if runtime.kind() == ServiceRuntimeErrorKind::Cancelled
+        ));
+        assert_eq!(governor.memory_used(), 0);
+        assert_eq!(governor.temporary_storage_used(), 0);
+    }
+
+    #[test]
+    fn analysis_reservation_is_checked_and_covers_named_working_sets() {
+        assert_eq!(
+            service_analysis_working_set_reservation_bytes(1, 0)
+                .unwrap_err()
+                .kind(),
+            ServiceRuntimeErrorKind::InvalidLimit
+        );
+        assert_eq!(
+            service_analysis_working_set_reservation_bytes(1, u64::MAX)
+                .unwrap_err()
+                .kind(),
+            ServiceRuntimeErrorKind::ArithmeticOverflow
+        );
+        assert_eq!(
+            service_analysis_working_set_reservation_bytes(0, 7)
+                .unwrap_err()
+                .kind(),
+            ServiceRuntimeErrorKind::InvalidLimit
+        );
+        let reservation = service_analysis_working_set_reservation_bytes(7, 7).unwrap();
+        assert!(reservation > 7 + 7 * 16);
+
+        let governor = ResourceGovernor::new(reservation, 1);
+        let exact = governor.reserve_memory(reservation).unwrap();
+        assert_eq!(governor.memory_used(), reservation);
+        assert_eq!(
+            governor.reserve_memory(reservation).unwrap_err().kind(),
+            ServiceRuntimeErrorKind::QuotaExceeded,
+            "a concurrent maximum analysis must not over-admit"
+        );
+        drop(exact);
+        assert!(governor.reserve_memory(reservation).is_ok());
+        let below = ResourceGovernor::new(reservation - 1, 1);
+        assert_eq!(
+            below.reserve_memory(reservation).unwrap_err().kind(),
+            ServiceRuntimeErrorKind::QuotaExceeded
+        );
+        assert!(validate_service_channel_count(SERVICE_MAX_CHANNELS).is_ok());
+        assert_eq!(
+            validate_service_channel_count(SERVICE_MAX_CHANNELS + 1)
+                .unwrap_err()
+                .kind(),
+            ServiceRuntimeErrorKind::LimitExceeded
+        );
     }
 
     #[test]

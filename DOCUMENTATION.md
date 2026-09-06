@@ -75,6 +75,112 @@ The release contains the main `forge` normalizer plus focused binaries:
 
 Some binaries require the Cargo features listed in [`Cargo.toml`](Cargo.toml).
 Use `<command> --help` for its inputs, limits, output schemas, and exit codes.
+
+### Service resource controls
+
+`forge-service` requires fixed `Content-Length` framing for REST analysis and
+streams the body into a bounded private replay spool in 64 KiB reads. The
+process-wide `--temp-quota-mib` admission remains charged until the final
+immutable-input clone is dropped. `--memory-quota-mib` accounts for accepted
+gRPC messages and applies a conservative working-set admission charge through
+streaming decode, DSP, and report serialization. That charge covers the input
+as a worst-case demux packet, two eight-byte PCM representations, serial decoder
+scratch, maximum loudness windows/block vectors, per-channel DSP state, and the
+bounded report/layout response. Controlled service decoding uses serial FLAC
+and serial, 4 KiB-read DSD conversion; DSD FIR work checks control at most every
+256 source bytes. Declared WAVE, DSD, and Symphonia geometries are checked before
+their major PCM allocations, with decoded output checked again after each
+codec packet. The service rejects decoded geometries outside 1..=64 channels
+before creating the analyzer; offline library and CLI decoding retain their
+existing limits.
+Before a service request enters a third-party demuxer, Forge scans the immutable
+snapshot without materializing payloads. Ogg lacing is checked page by page and
+continued packets are capped at 16 MiB; Vorbis/Opus comments and Ogg-FLAC
+Vorbis-comment/picture fields are checked incrementally across page boundaries
+against a 1 MiB encoded/wire-item bound and a file-wide 16 MiB encoded-metadata
+aggregate. Chained Ogg logical streams share that aggregate and item count.
+Matroska is limited to 16 nesting levels, 100,000 elements, 16 MiB
+Block/SimpleBlock payloads, and the same per-item/file-wide bounds for retained
+binary or string metadata leaves. Native FLAC metadata and
+both trailing APE anchors on FLAC/MPEG inputs are bounded before Symphonia sees
+them; leading APEv2 tags in its 1 MiB supplemental probe range use the same
+checked item parser. Native FLAC and supplemental APE tags share one file-wide
+metadata budget; skip-only FLAC PADDING and unknown blocks may exceed 1 MiB but
+remain subject to the 16 MiB aggregate and 100,000-block limits.
+Raw MPEG audio and ADTS inputs are checked as a complete, same-class frame
+chain; only leading checked ID3v2/APEv2, a trailing ID3v1 record beginning with
+`TAG`, and checked APEv2 immediately before EOF or that ID3v1 record are
+excluded. Inter-frame junk, metadata, or another container marker is rejected.
+The resulting container class and exact half-open audio byte range select a
+service-only Symphonia probe containing one format reader and no supplemental
+metadata readers. Controlled reads and seeks cannot expose bytes beyond that
+range. Ordinary library and CLI probes retain Symphonia's full format registry.
+Non-media ISO-BMFF top-level boxes are limited to 16 MiB, and nested
+`udta/meta/ilst` entries are capped at 100,000, `data`/`name`/`mean` items at
+1 MiB, and physical metadata leaves at 16 MiB in aggregate. Controlled Symphonia
+reads/seeks and direct Opus reads check the absolute request control and split
+actual reads at 32 KiB. ISO-BMFF `stsz`/`stz2` and fragmented
+`trex`/`tfhd`/`trun` sample sizes are validated before demux, and Symphonia
+tag/visual allocations are explicitly capped at 1 MiB. PCM packets use codec
+width, channel count, and encoded length for a pre-decode sample bound; a
+compressed packet with no trustworthy nonzero duration bound is rejected before
+codec output allocation.
+These encoded limits bound parser inputs and retained encoded values; they do
+not claim that later character-set conversion uses exactly the same heap size.
+Library users can clone `ServiceRuntimeLimits` across REST and gRPC listeners to
+share the same counters. The memory counter is not a hard RSS cap: third-party
+codec internals, allocator fragmentation, thread stacks, and transport state
+are outside it. Temporary-storage charges are active in-process reservations,
+not durable filesystem accounting; deployments still need filesystem quotas
+and startup scavenging for crash or unlink-failure residue.
+
+The absolute request deadline and cancellation state are checked during upload,
+bounded WAVE chunk-table scans, codec packets, PCM validation/peak scans, and
+DSP frame loops (at most 1024 DSP frames between polls). Dropping a gRPC RPC
+future or calling `Cancel` stops detached blocking work at the next checkpoint.
+Request IDs must be unique only while active and may be reused after completion,
+matching the original v1/v3 contract. Internal request identity prevents an old
+worker's cleanup from deleting a newer registration. Because the existing
+Cancel wire message contains no generation, a delayed Cancel that arrives after
+intentional ID reuse can still address the then-active request; clients that
+need stronger ABA protection should generate process-unique request IDs.
+
+For every unary gRPC method, a shared outer layer validates bearer metadata and
+advances the body only until it can parse the five-byte gRPC frame prefix,
+before tonic's generated protobuf decoder. An HTTP/2 DATA frame may include
+some payload alongside that prefix; the fixed receive windows below bound this
+pre-admission transport buffer. Immediately after route and authentication
+checks, the layer acquires a process-wide semaphore (`workers` for Analyze and
+four reserved control slots), before waiting for that prefix. Once its declared
+length is known, it applies the method-specific cap and admitted-byte memory
+lease before protobuf decoding. The complete Analyze protobuf message,
+including audio and string fields, has a checked size cap and each string also
+has a semantic limit. The listener accepts at most `workers + 1` connections
+and advertises at most `workers + 4` HTTP/2 streams per connection, but both the
+stream and connection receive windows are fixed at 64 KiB; receive credit
+therefore does not multiply by the streams on a connection. An accepted socket
+must complete the HTTP/2 preface and first request headers within the configured
+request timeout even if it sends bytes continuously. Established connections
+have a 120-second IO-idle deadline and a hard IO close after the 30-minute base
+age plus one request-timeout allowance. Forge does not advertise GOAWAY-based
+draining on tonic 0.14.6 because that release's max-age graceful path can panic
+while an RPC is in flight. The same absolute request deadline
+starts before frame-prefix reading and releases admission on timeout or future
+drop. Kernel socket buffers, the listen backlog, HTTP/2 implementation overhead,
+and tonic's bounded per-message bookkeeping remain transport/runtime resources
+rather than memory-quota charges. A future client-streaming RPC would reduce
+per-request latency and copying but is not required for these unary bounds.
+Admission starts the gRPC metric timer before authentication/body reads and
+transfers it once to the decoded handler. Serialized report/layout bytes hold a
+checked memory lease until the actual tonic body is drained or dropped. REST
+response writes remain inside the same absolute request deadline, except that
+legacy `read_timeout`/`incomplete_body` failures get one fixed 100 ms
+best-effort write grace; temporary-spool IO failures retain the existing v1
+`temporary_file` discriminator.
+Existing errors retain `service-error-v1`; newly introduced resource-limit,
+quota, and cancellation failures identify the additive `service-error-v2`
+contract.
+
 `forge-report ebu-qc-validate` validates EBU QC 2026-04 report structure and
 cross-element semantics; it uses Scenario 1 constraints by default and accepts
 `--profile data-model` for the general rules. The release also contains the
