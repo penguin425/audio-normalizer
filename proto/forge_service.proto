@@ -32,8 +32,10 @@ message AnalyzeRequest {
   string filename = 2;
   string content_type = 3;
   string profile = 4;
-  // A caller supplied opaque identifier used by Cancel.  It is bounded by the
-  // server and must be unique while the request is active.
+  // A caller supplied opaque identifier used by Cancel. It is bounded by the
+  // server and must be unique while an analysis with the same ID is active.
+  // A completed ID may be reused; callers should still prefer globally unique
+  // values because this v1 wire format carries no cancellation generation.
   string request_id = 5;
 }
 
@@ -53,7 +55,10 @@ message AnalyzeV3Request {
   string content_type = 3;
   string profile = 4;
   // A caller supplied opaque identifier used by Cancel. It is bounded by the
-  // server and must be unique across both analysis services while active.
+  // server and must be unique across both analysis services while an analysis
+  // with the same ID is active. A completed ID may be reused; callers should
+  // still prefer globally unique values because this v3 wire format carries
+  // no cancellation generation.
   string request_id = 5;
   // Optional versioned ChannelLayoutDescriptor JSON. An empty string uses
   // container/decoder evidence; overrides must use explicit-override origin.

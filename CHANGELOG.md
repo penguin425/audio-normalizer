@@ -8,6 +8,34 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.189.12 - 2026-09-07
+
+### Added
+
+- Add process-wide memory and temporary-storage quotas, bounded upload
+  spooling, absolute deadlines, and cooperative cancellation to the REST and
+  optional gRPC analysis services.
+- Add configurable service quota flags and the additive `service-error-v2`
+  contract for resource-limit and cancellation failures.
+
+### Changed
+
+- Admit authenticated gRPC requests before protobuf decoding, bound HTTP/2
+  connections, streams, windows, idle time, and hard connection lifetime, and
+  retain request and response resource leases until their work is complete.
+- Preflight service inputs before third-party parsing with format-locked,
+  range-bounded readers, encoded packet and metadata limits, and allocation
+  checkpoints for Ogg, FLAC, MPEG/ADTS, Matroska, ISO-BMFF, WAVE, DSD, and
+  Opus paths.
+- Keep ordinary WAVE/Symphonia decode and loudness-analysis hot loops free of
+  service checkpoint branches through compile-time path specialization.
+
+### Fixed
+
+- Preserve the existing REST error and protobuf request-ID contracts while
+  preventing idle-connection, request-ID, metadata, and decoder allocation
+  paths from bypassing service limits.
+
 ## 0.189.11 - 2026-09-06
 
 ### Fixed

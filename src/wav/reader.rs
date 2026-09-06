@@ -20,6 +20,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 const MAX_WAVE_CHUNKS: usize = 100_000;
+const CONTROLLED_PROBE_CHECKPOINT_CHUNKS: usize = 64;
 
 #[derive(Debug)]
 pub enum WavReadError {
@@ -407,9 +408,66 @@ impl WavReader {
         Self::probe_file_with_channel_layout(&mut file)
     }
 
+    /// Service-only WAVE probe with bounded cooperative checkpoints while the
+    /// chunk table is scanned. The public probe methods retain their original
+    /// signatures and behaviour.
+    pub(crate) fn probe_with_channel_layout_controlled<P, C>(
+        path: P,
+        mut checkpoint: C,
+    ) -> Result<(WavStreamInfo, ChannelLayoutDescriptor), String>
+    where
+        P: AsRef<Path>,
+        C: FnMut() -> Result<(), String>,
+    {
+        checkpoint()?;
+        let mut file = File::open(path).map_err(|error| WavReadError::Io(error).to_string())?;
+        let mut control_error = None;
+        let result = Self::probe_file_with_channel_layout_and_control::<true, _>(&mut file, || {
+            if let Err(error) = checkpoint() {
+                control_error = Some(error);
+                Err(WavReadError::Io(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "controlled WAVE probe interrupted",
+                )))
+            } else {
+                Ok(())
+            }
+        });
+        if let Some(error) = control_error {
+            Err(error)
+        } else {
+            result.map_err(|error| error.to_string())
+        }
+    }
+
+    pub(crate) fn probe_with_layout_controlled<P, C>(
+        path: P,
+        checkpoint: C,
+    ) -> Result<(WavStreamInfo, ChannelLayoutProvenance), String>
+    where
+        P: AsRef<Path>,
+        C: FnMut() -> Result<(), String>,
+    {
+        let (info, layout) = Self::probe_with_channel_layout_controlled(path, checkpoint)?;
+        Ok((info, layout.provenance()))
+    }
+
     fn probe_file_with_channel_layout(
         file: &mut File,
     ) -> Result<(WavStreamInfo, ChannelLayoutDescriptor), WavReadError> {
+        Self::probe_file_with_channel_layout_and_control::<false, _>(file, || Ok(()))
+    }
+
+    fn probe_file_with_channel_layout_and_control<const CONTROLLED: bool, C>(
+        file: &mut File,
+        mut checkpoint: C,
+    ) -> Result<(WavStreamInfo, ChannelLayoutDescriptor), WavReadError>
+    where
+        C: FnMut() -> Result<(), WavReadError>,
+    {
+        if CONTROLLED {
+            checkpoint()?;
+        }
         file.seek(SeekFrom::Start(0))?;
         let file_len = file.metadata()?.len();
         let mut riff = [0u8; 12];
@@ -439,6 +497,9 @@ impl WavReader {
         let mut data_info = None;
         let mut chunk_count = 0usize;
         loop {
+            if CONTROLLED && chunk_count.is_multiple_of(CONTROLLED_PROBE_CHECKPOINT_CHUNKS) {
+                checkpoint()?;
+            }
             let header_offset = file.stream_position()?;
             if header_offset == scan_end {
                 break;
@@ -541,6 +602,9 @@ impl WavReader {
                 ));
             }
             file.seek(SeekFrom::Start(next))?;
+        }
+        if CONTROLLED {
+            checkpoint()?;
         }
         if parsed_format.is_none() {
             return Err(WavReadError::BadFormat("missing fmt chunk"));

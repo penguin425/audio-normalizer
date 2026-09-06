@@ -1,7 +1,7 @@
 //! Bounded HTTP analysis service.
 
 use clap::Parser;
-use forge_normalizer::service::{self, ServiceConfig};
+use forge_normalizer::service::{self, ServiceConfig, ServiceRuntimeLimits};
 #[cfg(feature = "grpc-service")]
 use forge_normalizer::service_grpc;
 use forge_normalizer::service_metrics::{JsonlSpanRecorder, ServiceMetrics};
@@ -29,6 +29,16 @@ struct Args {
     /// Maximum decoded samples (frames multiplied by channels) per request.
     #[arg(long, default_value_t = 100_000_000, value_parser = clap::value_parser!(u64))]
     max_decoded_samples: u64,
+
+    /// Process-wide admitted analysis working-set quota in MiB. By default it
+    /// is derived from workers, body/sample limits, and fixed DSP allowances.
+    #[arg(long, value_parser = clap::value_parser!(u64))]
+    memory_quota_mib: Option<u64>,
+
+    /// Process-wide active upload-spool quota in MiB. By default every worker
+    /// can retain one --max-body-mib upload.
+    #[arg(long, value_parser = clap::value_parser!(u64))]
+    temp_quota_mib: Option<u64>,
 
     /// Maximum number of in-flight requests.
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(usize))]
@@ -87,6 +97,48 @@ fn main() -> ExitCode {
         eprintln!("invalid service configuration: {error}");
         return ExitCode::from(2);
     }
+    let default_limits = match ServiceRuntimeLimits::for_config(&config) {
+        Ok(limits) => limits,
+        Err(error) => {
+            eprintln!("invalid service resource limits: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let quota_bytes = |name: &str, mib: Option<u64>, default: u64| -> Result<u64, String> {
+        mib.map_or(Ok(default), |mib| {
+            mib.checked_mul(1024 * 1024)
+                .ok_or_else(|| format!("--{name}-quota-mib is too large"))
+        })
+    };
+    let memory_quota = match quota_bytes(
+        "memory",
+        args.memory_quota_mib,
+        default_limits.memory_capacity_bytes(),
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(2);
+        }
+    };
+    let temp_quota = match quota_bytes(
+        "temp",
+        args.temp_quota_mib,
+        default_limits.temporary_storage_capacity_bytes(),
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(2);
+        }
+    };
+    let runtime_limits = match ServiceRuntimeLimits::new(memory_quota, temp_quota) {
+        Ok(limits) => limits,
+        Err(error) => {
+            eprintln!("invalid service resource limits: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let metrics = if args.metrics || args.otel_jsonl.is_some() {
         let metrics = ServiceMetrics::new();
         if let Some(path) = args.otel_jsonl.as_ref() {
@@ -109,8 +161,13 @@ fn main() -> ExitCode {
         {
             eprintln!("forge-service gRPC listening on {bind}");
             let result = match metrics {
-                Some(metrics) => service_grpc::run_with_metrics(config, bind, metrics),
-                None => service_grpc::run(config, bind),
+                Some(metrics) => service_grpc::run_with_metrics_and_runtime_limits(
+                    config,
+                    bind,
+                    metrics,
+                    runtime_limits,
+                ),
+                None => service_grpc::run_with_runtime_limits(config, bind, runtime_limits),
             };
             return match result {
                 Ok(()) => ExitCode::SUCCESS,
@@ -130,8 +187,10 @@ fn main() -> ExitCode {
     }
     eprintln!("forge-service listening on {}", config.bind);
     let result = match metrics {
-        Some(metrics) => service::run_with_metrics(config, metrics),
-        None => service::run(config),
+        Some(metrics) => {
+            service::run_with_metrics_and_runtime_limits(config, metrics, runtime_limits)
+        }
+        None => service::run_with_runtime_limits(config, runtime_limits),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

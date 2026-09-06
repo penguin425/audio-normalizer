@@ -157,6 +157,7 @@ on:
       - "src/bin/forge-remote-qc.rs"
       - "src/service.rs"
       - "src/service_metrics.rs"
+      - "src/service_runtime.rs"
       - "src/service_grpc.rs"
       - "tests/service_api.rs"
       - "src/bin/forge-service.rs"

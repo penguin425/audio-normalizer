@@ -319,6 +319,29 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             supply_commands,
         )
 
+    def test_ci_bounds_target_growth_between_full_feature_test_sets(self) -> None:
+        rust_job = self.ci["jobs"]["rust"]
+        self.assertEqual(rust_job["env"]["CARGO_INCREMENTAL"], "0")
+        steps = rust_job["steps"]
+        positions = {
+            step["name"]: index
+            for index, step in enumerate(steps)
+            if "name" in step
+        }
+        opus = positions["Run tests with static Opus support"]
+        clean_before_ffmpeg = positions[
+            "Reclaim target space before FFmpeg feature tests"
+        ]
+        ffmpeg = positions["Run tests with FFmpeg AAC, ALAC, and Vorbis support"]
+        clean_before_mp3 = positions["Reclaim target space before MP3 feature tests"]
+        mp3 = positions["Check and test MP3 encoding"]
+        self.assertLess(opus, clean_before_ffmpeg)
+        self.assertLess(clean_before_ffmpeg, ffmpeg)
+        self.assertLess(ffmpeg, clean_before_mp3)
+        self.assertLess(clean_before_mp3, mp3)
+        self.assertEqual(steps[clean_before_ffmpeg]["run"], "cargo clean")
+        self.assertEqual(steps[clean_before_mp3]["run"], "cargo clean")
+
     def test_every_release_readiness_caller_has_the_locked_python(self) -> None:
         callers = 0
         for path in sorted((REPOSITORY / ".github/workflows").glob("*.y*ml")):

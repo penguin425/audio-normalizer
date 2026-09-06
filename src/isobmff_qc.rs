@@ -14,7 +14,9 @@ use std::path::Path;
 
 const MAX_BOXES: usize = 200_000;
 const MAX_CONTROL_BOX_BYTES: u64 = 16 * 1024 * 1024;
+const CONTROLLED_BOX_READ_BYTES: usize = 32 * 1024;
 const MAX_SAMPLE_ENTRY_CHILD_BOXES: usize = 1024;
+const SERVICE_CHECKPOINT_BOXES: usize = 64;
 const MAX_TRACKS: usize = 4_096;
 const MAX_TABLE_ENTRIES: usize = 10_000_000;
 const MAX_TIMED_ID3_EVENTS: usize = 4_096;
@@ -5083,9 +5085,26 @@ fn list_boxes(
     end: u64,
     box_count: &mut usize,
 ) -> Result<Vec<BoxHeader>, String> {
+    list_boxes_controlled(path, file, start, end, box_count, &mut || Ok(()))
+}
+
+fn list_boxes_controlled<C>(
+    path: &Path,
+    file: &mut File,
+    start: u64,
+    end: u64,
+    box_count: &mut usize,
+    checkpoint: &mut C,
+) -> Result<Vec<BoxHeader>, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
     let mut boxes = Vec::new();
     let mut offset = start;
     while offset < end {
+        if (*box_count).is_multiple_of(SERVICE_CHECKPOINT_BOXES) {
+            checkpoint()?;
+        }
         if *box_count == MAX_BOXES {
             return Err(format!(
                 "{}: ISO-BMFF box count exceeds safety limit {MAX_BOXES}",
@@ -5180,6 +5199,37 @@ fn read_control(path: &Path, file: &mut File, header: BoxHeader) -> Result<Vec<u
     Ok(body)
 }
 
+fn read_control_controlled<C>(
+    path: &Path,
+    file: &mut File,
+    header: BoxHeader,
+    checkpoint: &mut C,
+) -> Result<Vec<u8>, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    if header.body_size() > MAX_CONTROL_BOX_BYTES {
+        return Err(format!(
+            "{}: {} control box at byte {} exceeds {} byte safety limit",
+            path.display(),
+            header.name(),
+            header.start,
+            MAX_CONTROL_BOX_BYTES
+        ));
+    }
+    checkpoint()?;
+    let size = usize::try_from(header.body_size()).expect("bounded control box fits usize");
+    let mut body = vec![0_u8; size];
+    file.seek(SeekFrom::Start(header.body_start))
+        .map_err(|error| format!("seek {}: {error}", path.display()))?;
+    for chunk in body.chunks_mut(CONTROLLED_BOX_READ_BYTES) {
+        checkpoint()?;
+        file.read_exact(chunk)
+            .map_err(|error| format!("read {} {} box: {error}", path.display(), header.name()))?;
+    }
+    Ok(body)
+}
+
 fn parse_counted_entries(body: &[u8], width: usize) -> Option<Vec<&[u8]>> {
     if body.len() < 8 || width == 0 {
         return None;
@@ -5221,13 +5271,40 @@ pub(crate) fn probe_channel_layout(
     track_id: u32,
     decoded_channels: u16,
 ) -> Result<Option<ChannelLayoutDescriptor>, String> {
+    probe_channel_layout_impl(path, track_id, decoded_channels, &mut || Ok(()))
+}
+
+/// Service-only variant that observes an absolute request control while
+/// traversing attacker-controlled box tables. Media payloads remain skipped.
+pub(crate) fn probe_channel_layout_controlled<C>(
+    path: &Path,
+    track_id: u32,
+    decoded_channels: u16,
+    mut checkpoint: C,
+) -> Result<Option<ChannelLayoutDescriptor>, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    probe_channel_layout_impl(path, track_id, decoded_channels, &mut checkpoint)
+}
+
+fn probe_channel_layout_impl<C>(
+    path: &Path,
+    track_id: u32,
+    decoded_channels: u16,
+    checkpoint: &mut C,
+) -> Result<Option<ChannelLayoutDescriptor>, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    checkpoint()?;
     let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let file_size = file
         .metadata()
         .map_err(|error| format!("{}: {error}", path.display()))?
         .len();
     let mut box_count = 0_usize;
-    let top = list_boxes(path, &mut file, 0, file_size, &mut box_count)?;
+    let top = list_boxes_controlled(path, &mut file, 0, file_size, &mut box_count, checkpoint)?;
     let moov = top
         .iter()
         .filter(|header| header.kind == *b"moov")
@@ -5236,37 +5313,59 @@ pub(crate) fn probe_channel_layout(
     if moov.len() != 1 {
         return Ok(None);
     }
-    let tracks = list_boxes(
+    let tracks = list_boxes_controlled(
         path,
         &mut file,
         moov[0].body_start,
         moov[0].end,
         &mut box_count,
+        checkpoint,
     )?;
     for track in tracks.into_iter().filter(|header| header.kind == *b"trak") {
-        let children = list_boxes(path, &mut file, track.body_start, track.end, &mut box_count)?;
+        let children = list_boxes_controlled(
+            path,
+            &mut file,
+            track.body_start,
+            track.end,
+            &mut box_count,
+            checkpoint,
+        )?;
         let Some(tkhd) = children.iter().find(|header| header.kind == *b"tkhd") else {
             continue;
         };
-        if minimal_track_id(path, &mut file, *tkhd)? != Some(track_id) {
+        checkpoint()?;
+        if minimal_track_id_controlled(path, &mut file, *tkhd, checkpoint)? != Some(track_id) {
             continue;
         }
+        checkpoint()?;
         let mdia = children
             .iter()
             .find(|header| header.kind == *b"mdia")
             .copied()
             .ok_or_else(|| format!("{}: selected track has no mdia box", path.display()))?;
-        return probe_mdia_channel_layout(path, &mut file, mdia, &mut box_count, decoded_channels);
+        return probe_mdia_channel_layout_controlled(
+            path,
+            &mut file,
+            mdia,
+            &mut box_count,
+            decoded_channels,
+            checkpoint,
+        );
     }
+    checkpoint()?;
     Ok(None)
 }
 
-fn minimal_track_id(
+fn minimal_track_id_controlled<C>(
     path: &Path,
     file: &mut File,
     header: BoxHeader,
-) -> Result<Option<u32>, String> {
-    let body = read_control(path, file, header)?;
+    checkpoint: &mut C,
+) -> Result<Option<u32>, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    let body = read_control_controlled(path, file, header, checkpoint)?;
     Ok(match body.first().copied() {
         Some(0) => body.get(12..16).map(be_u32),
         Some(1) => body.get(20..24).map(be_u32),
@@ -5274,20 +5373,25 @@ fn minimal_track_id(
     })
 }
 
-fn probe_mdia_channel_layout(
+fn probe_mdia_channel_layout_controlled<C>(
     path: &Path,
     file: &mut File,
     mdia: BoxHeader,
     box_count: &mut usize,
     decoded_channels: u16,
-) -> Result<Option<ChannelLayoutDescriptor>, String> {
-    let children = list_boxes(path, file, mdia.body_start, mdia.end, box_count)?;
-    let handler = children
-        .iter()
-        .find(|header| header.kind == *b"hdlr")
-        .map(|header| read_control(path, file, *header))
-        .transpose()?
-        .and_then(|body| body.get(8..12).and_then(|value| value.try_into().ok()));
+    checkpoint: &mut C,
+) -> Result<Option<ChannelLayoutDescriptor>, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    let children =
+        list_boxes_controlled(path, file, mdia.body_start, mdia.end, box_count, checkpoint)?;
+    let handler = if let Some(header) = children.iter().find(|header| header.kind == *b"hdlr") {
+        let body = read_control_controlled(path, file, *header, checkpoint)?;
+        body.get(8..12).and_then(|value| value.try_into().ok())
+    } else {
+        None
+    };
     if handler != Some(*b"soun") {
         return Ok(None);
     }
@@ -5296,27 +5400,34 @@ fn probe_mdia_channel_layout(
         .find(|header| header.kind == *b"minf")
         .copied()
         .ok_or_else(|| format!("{}: selected audio track has no minf box", path.display()))?;
-    let minf_children = list_boxes(path, file, minf.body_start, minf.end, box_count)?;
+    let minf_children =
+        list_boxes_controlled(path, file, minf.body_start, minf.end, box_count, checkpoint)?;
     let stbl = minf_children
         .iter()
         .find(|header| header.kind == *b"stbl")
         .copied()
         .ok_or_else(|| format!("{}: selected audio track has no stbl box", path.display()))?;
-    let stbl_children = list_boxes(path, file, stbl.body_start, stbl.end, box_count)?;
+    let stbl_children =
+        list_boxes_controlled(path, file, stbl.body_start, stbl.end, box_count, checkpoint)?;
     let stsd = stbl_children
         .iter()
         .find(|header| header.kind == *b"stsd")
         .copied()
         .ok_or_else(|| format!("{}: selected audio track has no stsd box", path.display()))?;
-    let body = read_control(path, file, stsd)?;
-    parse_stsd_channel_layout(&body, decoded_channels)
+    let body = read_control_controlled(path, file, stsd, checkpoint)?;
+    parse_stsd_channel_layout_controlled(&body, decoded_channels, checkpoint)
         .map_err(|error| format!("{}: {error}", path.display()))
 }
 
-fn parse_stsd_channel_layout(
+fn parse_stsd_channel_layout_controlled<C>(
     body: &[u8],
     decoded_channels: u16,
-) -> Result<Option<ChannelLayoutDescriptor>, String> {
+    checkpoint: &mut C,
+) -> Result<Option<ChannelLayoutDescriptor>, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    checkpoint()?;
     if body.len() < 8 {
         return Err("channel-layout probe found a truncated stsd box".into());
     }
@@ -5325,7 +5436,10 @@ fn parse_stsd_channel_layout(
     let mut offset = 8_usize;
     let mut observed: Option<ChannelLayoutDescriptor> = None;
     let mut entries_with_layout = 0_usize;
-    for _ in 0..count {
+    for index in 0..count {
+        if index.is_multiple_of(SERVICE_CHECKPOINT_BOXES) {
+            checkpoint()?;
+        }
         let size = body
             .get(offset..offset + 4)
             .map(be_u32)
@@ -5376,6 +5490,7 @@ fn parse_stsd_channel_layout(
     if entries_with_layout != 0 && entries_with_layout != count {
         return Err("only some audio sample entries declare a chnl box".into());
     }
+    checkpoint()?;
     Ok(observed)
 }
 
@@ -5925,6 +6040,56 @@ mod tests {
             [Some(0), Some(1)]
         );
         assert!(probe_channel_layout(&path, 99, 2).unwrap().is_none());
+
+        let mut checkpoints = 0;
+        let error = probe_channel_layout_controlled(&path, 7, 2, || {
+            checkpoints += 1;
+            if checkpoints == 3 {
+                Err("controlled ISO-BMFF probe stopped".into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error, "controlled ISO-BMFF probe stopped");
+        assert_eq!(checkpoints, 3);
+    }
+
+    #[test]
+    fn controlled_box_reads_checkpoint_each_bounded_chunk() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large-control-box.mp4");
+        let payload_bytes = CONTROLLED_BOX_READ_BYTES * 2 + 1;
+        std::fs::write(&path, [vec![0_u8; 8], vec![0x5a; payload_bytes]].concat()).unwrap();
+        let header = BoxHeader {
+            kind: *b"stsd",
+            start: 0,
+            body_start: 8,
+            end: 8 + payload_bytes as u64,
+        };
+        let mut file = File::open(&path).unwrap();
+        let mut checkpoints = 0;
+        let body = read_control_controlled(&path, &mut file, header, &mut || {
+            checkpoints += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(body, vec![0x5a; payload_bytes]);
+        assert_eq!(checkpoints, 4, "one allocation check plus three reads");
+
+        let mut file = File::open(&path).unwrap();
+        let mut checkpoints = 0;
+        let error = read_control_controlled(&path, &mut file, header, &mut || {
+            checkpoints += 1;
+            if checkpoints == 3 {
+                Err("controlled box read stopped".into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error, "controlled box read stopped");
+        assert_eq!(checkpoints, 3);
     }
 
     #[derive(Clone, Copy)]

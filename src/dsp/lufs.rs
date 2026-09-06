@@ -45,6 +45,7 @@ pub const MAX_LOUDNESS_TIMELINE_POINTS: usize = 1_000_000;
 /// Avoid scheduling channel-pair tasks for short decoder packets where task
 /// coordination costs more than the true-peak interpolation work.
 const MIN_PARALLEL_TRUE_PEAK_FRAMES: usize = 16_384;
+const CONTROL_CHECKPOINT_FRAMES: usize = 1_024;
 const LOUDNESS_CLOCK_TICKS_PER_SECOND: u128 = 10;
 // Rebuild common-path rolling sums at an absolute, chunk-independent cadence.
 // At 48 kHz this bounds drift to about 5.8 minutes of binary64 updates while a
@@ -243,6 +244,45 @@ fn validate_planar_shape<T>(
     consumed_frames
         .checked_add(chunk_frames)
         .ok_or_else(|| "stream frame count overflow".to_string())?;
+    Ok(chunk_frames)
+}
+
+/// Controlled counterpart to the sample-validation portion of
+/// [`validate_planar_chunk`]. Shape is checked transactionally first, then the
+/// frame domain is visited in bounded tiles while retaining the established
+/// earliest `(frame, channel)` diagnostic order.
+fn validate_planar_samples_with_control<T, C>(
+    planar: &[Vec<T>],
+    expected_channels: usize,
+    consumed_frames: usize,
+    invalid_sample: impl Fn(&T) -> bool,
+    invalid_label: &str,
+    checkpoint: &mut C,
+) -> Result<usize, String>
+where
+    C: FnMut() -> Result<(), String>,
+{
+    let chunk_frames = validate_planar_shape(planar, expected_channels, consumed_frames)?;
+    for start in (0..chunk_frames).step_by(CONTROL_CHECKPOINT_FRAMES) {
+        checkpoint()?;
+        let end = (start + CONTROL_CHECKPOINT_FRAMES).min(chunk_frames);
+        let first_invalid = planar
+            .iter()
+            .enumerate()
+            .filter_map(|(channel, samples)| {
+                samples[start..end]
+                    .iter()
+                    .position(&invalid_sample)
+                    .map(|offset| (start + offset, channel))
+            })
+            .min();
+        if let Some((frame, channel)) = first_invalid {
+            return Err(format!(
+                "{invalid_label} at frame {}, channel {channel}",
+                consumed_frames + frame
+            ));
+        }
+    }
     Ok(chunk_frames)
 }
 
@@ -713,6 +753,35 @@ impl StreamingAnalyzer {
     }
 
     pub fn process(&mut self, planar: &[Vec<f32>]) -> Result<(), String> {
+        self.process_impl::<false, _>(planar, &mut || Ok(()))
+    }
+
+    /// Process f32 PCM while polling a service cancellation/deadline at most
+    /// every 1024 DSP frames. The ordinary public path remains unchanged.
+    pub(crate) fn process_with_control<F>(
+        &mut self,
+        planar: &[Vec<f32>],
+        mut checkpoint: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
+        self.process_impl::<true, _>(planar, &mut checkpoint)
+    }
+
+    // Keep request polling a compile-time choice so the ordinary file-analysis
+    // monomorphization retains its benchmarked checkpoint-free hot loops.
+    fn process_impl<const CONTROLLED: bool, F>(
+        &mut self,
+        planar: &[Vec<f32>],
+        checkpoint: &mut F,
+    ) -> Result<(), String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
+        if CONTROLLED {
+            checkpoint()?;
+        }
         // Validate the complete shape before touching recursive DSP state,
         // then fuse finite-sample classification with the absolute maxima used
         // by true-peak block pruning. Exceptional input takes the cold scalar
@@ -720,20 +789,45 @@ impl StreamingAnalyzer {
         let chunk_frames = validate_planar_shape(planar, self.roles.len(), self.frames)?;
         self.chunk_sample_peaks.clear();
         let mut all_finite = true;
-        for channel in planar {
-            let (sample_peak, channel_is_finite) =
-                crate::dsp::simd::abs_max_and_all_finite(channel);
-            self.chunk_sample_peaks.push(sample_peak);
-            all_finite &= channel_is_finite;
+        if CONTROLLED {
+            self.chunk_sample_peaks.resize(planar.len(), 0.0);
+            for start in (0..chunk_frames).step_by(CONTROL_CHECKPOINT_FRAMES) {
+                checkpoint()?;
+                let end = (start + CONTROL_CHECKPOINT_FRAMES).min(chunk_frames);
+                for (sample_peak, channel) in self.chunk_sample_peaks.iter_mut().zip(planar) {
+                    let (block_peak, block_is_finite) =
+                        crate::dsp::simd::abs_max_and_all_finite(&channel[start..end]);
+                    *sample_peak = sample_peak.max(block_peak);
+                    all_finite &= block_is_finite;
+                }
+            }
+        } else {
+            for channel in planar {
+                let (sample_peak, channel_is_finite) =
+                    crate::dsp::simd::abs_max_and_all_finite(channel);
+                self.chunk_sample_peaks.push(sample_peak);
+                all_finite &= channel_is_finite;
+            }
         }
         if !all_finite {
-            validate_planar_chunk(
-                planar,
-                self.roles.len(),
-                self.frames,
-                |sample| !sample.is_finite(),
-                "non-finite sample",
-            )?;
+            if CONTROLLED {
+                validate_planar_samples_with_control(
+                    planar,
+                    self.roles.len(),
+                    self.frames,
+                    |sample| !sample.is_finite(),
+                    "non-finite sample",
+                    checkpoint,
+                )?;
+            } else {
+                validate_planar_chunk(
+                    planar,
+                    self.roles.len(),
+                    self.frames,
+                    |sample| !sample.is_finite(),
+                    "non-finite sample",
+                )?;
+            }
         }
         if chunk_frames != 0 {
             if self.ingress == AnalysisIngress::ScalarTyped {
@@ -747,7 +841,7 @@ impl StreamingAnalyzer {
             feature = "cuda-truepeak",
             any(target_os = "linux", target_os = "windows")
         ))]
-        if self.begin_cuda_true_peak(planar, chunk_frames) {
+        if !CONTROLLED && self.begin_cuda_true_peak(planar, chunk_frames) {
             // Transfers and the CUDA kernel are already queued. Preserve the
             // exact CPU K-weighting/reduction order while that independent work
             // runs, then synchronize the tiny per-channel peak result.
@@ -764,13 +858,15 @@ impl StreamingAnalyzer {
         // Rayon task overhead and a separate PCM pass cost more than they save.
         // Ratios above 4x retain the benchmark-gated long-chunk split because
         // their additional interpolation work can amortize those costs.
-        if should_parallelize_stereo_true_peak(
-            self.sample_rate,
-            planar.len(),
-            chunk_frames,
-            self.timeline_interval_frames.is_some(),
-            rayon::current_num_threads(),
-        ) {
+        if !CONTROLLED
+            && should_parallelize_stereo_true_peak(
+                self.sample_rate,
+                planar.len(),
+                chunk_frames,
+                self.timeline_interval_frames.is_some(),
+                rayon::current_num_threads(),
+            )
+        {
             let mut true_peak_meters = std::mem::take(&mut self.true_peak_meters);
             let block_sample_peaks = std::mem::take(&mut self.chunk_sample_peaks);
             let ((), result) = rayon::join(
@@ -832,6 +928,9 @@ impl StreamingAnalyzer {
                 reason = "the measured hot path uses one frame index across two fixed channels"
             )]
             for frame in 0..chunk_frames {
+                if CONTROLLED && frame.is_multiple_of(CONTROL_CHECKPOINT_FRAMES) {
+                    checkpoint()?;
+                }
                 let sample0 = planar[0][frame];
                 let sample1 = planar[1][frame];
                 match (skip_meter0, skip_meter1) {
@@ -906,6 +1005,9 @@ impl StreamingAnalyzer {
                     )?;
                 }
             }
+            if CONTROLLED {
+                checkpoint()?;
+            }
             return Ok(());
         }
         // Multichannel delivery has enough independent true-peak states to
@@ -914,7 +1016,23 @@ impl StreamingAnalyzer {
         // K-weighted energy keeps the established frame/channel reduction
         // order below, so every reported value remains bit-identical.
         if self.timeline_interval_frames.is_none() && planar.len() >= 4 {
-            if chunk_frames >= MIN_PARALLEL_TRUE_PEAK_FRAMES && rayon::current_num_threads() > 1 {
+            if CONTROLLED {
+                for ((meters, channels), sample_peaks) in self
+                    .true_peak_meters
+                    .chunks_mut(2)
+                    .zip(planar.chunks(2))
+                    .zip(self.chunk_sample_peaks.chunks(2))
+                {
+                    process_true_peak_channel_group_with_control(
+                        meters,
+                        channels,
+                        sample_peaks,
+                        checkpoint,
+                    )?;
+                }
+            } else if chunk_frames >= MIN_PARALLEL_TRUE_PEAK_FRAMES
+                && rayon::current_num_threads() > 1
+            {
                 self.true_peak_meters
                     .par_chunks_mut(2)
                     .zip(planar.par_chunks(2))
@@ -932,6 +1050,9 @@ impl StreamingAnalyzer {
                     });
             }
             for frame in 0..chunk_frames {
+                if CONTROLLED && frame.is_multiple_of(CONTROL_CHECKPOINT_FRAMES) {
+                    checkpoint()?;
+                }
                 let weighted = process_kweighted_frame_multichannel(
                     &mut self.filters,
                     #[cfg(target_arch = "x86_64")]
@@ -974,9 +1095,15 @@ impl StreamingAnalyzer {
                     )?;
                 }
             }
+            if CONTROLLED {
+                checkpoint()?;
+            }
             return Ok(());
         }
         for frame in 0..chunk_frames {
+            if CONTROLLED && frame.is_multiple_of(CONTROL_CHECKPOINT_FRAMES) {
+                checkpoint()?;
+            }
             let mut weighted = CompensatedSum::new();
             for ((index, channel), filter) in planar.iter().enumerate().zip(self.filters.iter_mut())
             {
@@ -1036,6 +1163,9 @@ impl StreamingAnalyzer {
             }
         }
         self.remember_timeline_true_peak_tail(planar);
+        if CONTROLLED {
+            checkpoint()?;
+        }
         Ok(())
     }
 
@@ -1087,6 +1217,23 @@ impl StreamingAnalyzer {
         self.process_scalar_typed(planar, frames, |sample| f64::from(sample) / 2_147_483_648.0)
     }
 
+    pub(crate) fn process_i32_with_control<F>(
+        &mut self,
+        planar: &[Vec<i32>],
+        mut checkpoint: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
+        let frames = validate_planar_shape(planar, self.roles.len(), self.frames)?;
+        self.process_scalar_typed_impl::<_, _, true>(
+            planar,
+            frames,
+            |sample| f64::from(sample) / 2_147_483_648.0,
+            &mut checkpoint,
+        )
+    }
+
     /// Process normalized `f64` PCM through the scalar high-precision lane.
     pub fn process_f64(&mut self, planar: &[Vec<f64>]) -> Result<(), String> {
         let frames = validate_planar_chunk(
@@ -1106,12 +1253,63 @@ impl StreamingAnalyzer {
         self.process_scalar_typed(planar, frames, |sample| sample)
     }
 
+    pub(crate) fn process_f64_with_control<F>(
+        &mut self,
+        planar: &[Vec<f64>],
+        mut checkpoint: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
+        let frames = validate_planar_samples_with_control(
+            planar,
+            self.roles.len(),
+            self.frames,
+            |sample| !sample.is_finite(),
+            "non-finite sample",
+            &mut checkpoint,
+        )?;
+        validate_planar_samples_with_control(
+            planar,
+            self.roles.len(),
+            self.frames,
+            |sample| sample.abs() > f64::from(f32::MAX),
+            "sample outside the finite true-peak domain",
+            &mut checkpoint,
+        )?;
+        self.process_scalar_typed_impl::<_, _, true>(
+            planar,
+            frames,
+            |sample| sample,
+            &mut checkpoint,
+        )
+    }
+
     fn process_scalar_typed<T: Copy>(
         &mut self,
         planar: &[Vec<T>],
         chunk_frames: usize,
         normalize: impl Fn(T) -> f64 + Copy,
     ) -> Result<(), String> {
+        self.process_scalar_typed_impl::<_, _, false>(planar, chunk_frames, normalize, &mut || {
+            Ok(())
+        })
+    }
+
+    // High-precision ingress follows the same static split as the f32 path.
+    fn process_scalar_typed_impl<T: Copy, F, const CONTROLLED: bool>(
+        &mut self,
+        planar: &[Vec<T>],
+        chunk_frames: usize,
+        normalize: impl Fn(T) -> f64 + Copy,
+        checkpoint: &mut F,
+    ) -> Result<(), String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
+        if CONTROLLED {
+            checkpoint()?;
+        }
         if chunk_frames != 0 {
             if self.ingress == AnalysisIngress::FastF32 {
                 return Err("cannot mix fast f32 and scalar typed PCM chunks".into());
@@ -1121,6 +1319,9 @@ impl StreamingAnalyzer {
         let momentary_window = self.momentary_clock.window_frames();
         let short_term_window = self.short_term_clock.window_frames();
         for frame in 0..chunk_frames {
+            if CONTROLLED && frame.is_multiple_of(CONTROL_CHECKPOINT_FRAMES) {
+                checkpoint()?;
+            }
             let mut weighted = CompensatedSum::new();
             for (((samples, meter), filter), role) in planar
                 .iter()
@@ -1179,6 +1380,9 @@ impl StreamingAnalyzer {
             }
         }
         self.remember_typed_timeline_true_peak_tail(planar, normalize);
+        if CONTROLLED {
+            checkpoint()?;
+        }
         Ok(())
     }
 
@@ -1426,14 +1630,23 @@ impl StreamingAnalyzer {
     /// post-signal silence required by EBU Tech 3342. Programme duration,
     /// integrated-loudness blocks, RMS/peaks, maxima, and timeline state are
     /// deliberately not advanced.
-    fn append_finite_lra_tail(&mut self) {
+    fn append_finite_lra_tail_impl<const CONTROLLED: bool, F>(
+        &mut self,
+        checkpoint: &mut F,
+    ) -> Result<(), String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
         if self.frames == 0 {
-            return;
+            return Ok(());
         }
         let tail_frames = lra_tail_frames(self.sample_rate);
         let short_term_window = self.short_term_clock.window_frames();
         let mut lra_frame = self.frames;
-        for _ in 0..tail_frames {
+        for tail_frame in 0..tail_frames {
+            if CONTROLLED && tail_frame.is_multiple_of(CONTROL_CHECKPOINT_FRAMES) {
+                checkpoint()?;
+            }
             let weighted = self.process_kweighted_silence_frame();
             self.windows
                 .push(&mut self.momentary_sum, &mut self.short_term_sum, weighted);
@@ -1450,6 +1663,16 @@ impl StreamingAnalyzer {
                     .expect("the bounded LRA tail cannot overflow its rational clock");
             }
         }
+        if CONTROLLED {
+            checkpoint()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn append_finite_lra_tail(&mut self) {
+        self.append_finite_lra_tail_impl::<false, _>(&mut || Ok(()))
+            .expect("the infallible test checkpoint cannot fail");
     }
 
     #[inline(always)]
@@ -1523,17 +1746,42 @@ impl StreamingAnalyzer {
     /// Finish a complete programme measurement, including the EBU Tech 3342
     /// finite-file silence required for Loudness Range.
     pub fn finish(self) -> StreamingMeasurements {
-        self.finish_impl(true)
+        self.finish_impl::<false, _>(true, || Ok(()))
+            .expect("the infallible finish checkpoint cannot fail")
+    }
+
+    /// Finish while allowing a service or host to stop the bounded synthetic
+    /// LRA tail at cooperative checkpoints. Ordinary callers retain the
+    /// allocation-free, infallible [`Self::finish`] path.
+    pub(crate) fn finish_with_control<F>(
+        self,
+        checkpoint: F,
+    ) -> Result<StreamingMeasurements, String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
+        self.finish_impl::<true, _>(true, checkpoint)
     }
 
     /// Finish a selected region when its LRA is not consumed by the caller.
     /// Integrated loudness, energy, duration, RMS, peaks, gating blocks, and
     /// timeline semantics are identical to [`Self::finish`].
     pub(crate) fn finish_without_lra_tail(self) -> StreamingMeasurements {
-        self.finish_impl(false)
+        self.finish_impl::<false, _>(false, || Ok(()))
+            .expect("the infallible finish checkpoint cannot fail")
     }
 
-    fn finish_impl(mut self, append_lra_tail: bool) -> StreamingMeasurements {
+    fn finish_impl<const CONTROLLED: bool, F>(
+        mut self,
+        append_lra_tail: bool,
+        mut checkpoint: F,
+    ) -> Result<StreamingMeasurements, String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
+        if CONTROLLED {
+            checkpoint()?;
+        }
         self.merge_finite_true_peak_tail_into_timeline();
         if self.timeline_interval_frames.is_some() && self.timeline_start_frame < self.frames {
             let momentary_window = self.momentary_clock.window_frames();
@@ -1570,7 +1818,7 @@ impl StreamingAnalyzer {
             .map(TruePeakMeter::finish_peak)
             .fold(0.0, f32::max);
         if append_lra_tail {
-            self.append_finite_lra_tail();
+            self.append_finite_lra_tail_impl::<CONTROLLED, _>(&mut checkpoint)?;
         }
         let mut ebu = measurements_from_blocks(self.gating_blocks, &self.short_term_blocks);
         let momentary_window = self.momentary_clock.window_frames();
@@ -1579,7 +1827,10 @@ impl StreamingAnalyzer {
             maximum_loudness(&[self.max_momentary_sum / momentary_window as f64]);
         ebu.max_short_term_lufs =
             maximum_loudness(&[self.max_short_term_sum / short_term_window as f64]);
-        StreamingMeasurements {
+        if CONTROLLED {
+            checkpoint()?;
+        }
+        Ok(StreamingMeasurements {
             ebu,
             frames: self.frames,
             weighted_mean_square: if self.frames == 0 {
@@ -1595,7 +1846,7 @@ impl StreamingAnalyzer {
             sample_peak: self.sample_peak,
             true_peak,
             timeline: self.timeline,
-        }
+        })
     }
 
     fn remember_timeline_true_peak_tail(&mut self, planar: &[Vec<f32>]) {
@@ -1792,6 +2043,64 @@ fn process_true_peak_channel_group(
             }
         }
     }
+}
+
+fn process_true_peak_channel_group_with_control<F>(
+    meters: &mut [TruePeakMeter],
+    channels: &[Vec<f32>],
+    block_sample_peaks: &[f32],
+    checkpoint: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut() -> Result<(), String>,
+{
+    debug_assert_eq!(meters.len(), channels.len());
+    debug_assert_eq!(meters.len(), block_sample_peaks.len());
+    if meters.len() == 2 {
+        let (left_meter, right_meter) = meters.split_at_mut(1);
+        let skip_left = left_meter[0]
+            .try_skip_peak_only_block_with_known_sample_peak(&channels[0], block_sample_peaks[0]);
+        let skip_right = right_meter[0]
+            .try_skip_peak_only_block_with_known_sample_peak(&channels[1], block_sample_peaks[1]);
+        for (frame, (&left_sample, &right_sample)) in
+            channels[0].iter().zip(&channels[1]).enumerate()
+        {
+            if frame.is_multiple_of(CONTROL_CHECKPOINT_FRAMES) {
+                checkpoint()?;
+            }
+            match (skip_left, skip_right) {
+                (false, false) => {
+                    TruePeakMeter::process_stereo_peak_only_sample(
+                        &mut left_meter[0],
+                        &mut right_meter[0],
+                        left_sample,
+                        right_sample,
+                    );
+                }
+                (false, true) => {
+                    left_meter[0].process_peak_only_sample(left_sample);
+                }
+                (true, false) => {
+                    right_meter[0].process_peak_only_sample(right_sample);
+                }
+                (true, true) => {}
+            }
+        }
+    } else if let (Some(meter), Some(channel), Some(&block_sample_peak)) = (
+        meters.first_mut(),
+        channels.first(),
+        block_sample_peaks.first(),
+    ) {
+        if !meter.try_skip_peak_only_block_with_known_sample_peak(channel, block_sample_peak) {
+            for (frame, &sample) in channel.iter().enumerate() {
+                if frame.is_multiple_of(CONTROL_CHECKPOINT_FRAMES) {
+                    checkpoint()?;
+                }
+                meter.process_peak_only_sample(sample);
+            }
+        }
+    }
+    checkpoint()
 }
 
 /// Advance four channel-contiguous K-weighting states without a planar scratch
@@ -2803,6 +3112,162 @@ mod tests {
         assert_eq!(measure_block_count(0), 0);
         assert_eq!(measure_block_count(short_term_window - tail - 1), 0);
         assert_eq!(measure_block_count(short_term_window - tail), 1);
+    }
+
+    #[test]
+    fn controlled_finish_can_stop_the_synthetic_lra_tail() {
+        let mut analyzer = StreamingAnalyzer::new(48_000, vec![ChannelRole::Main]);
+        analyzer.process(&[vec![0.1; 4_800]]).unwrap();
+        let mut checkpoints = 0;
+        let result = analyzer.finish_with_control(|| {
+            checkpoints += 1;
+            if checkpoints == 2 {
+                Err("cancelled at test checkpoint".into())
+            } else {
+                Ok(())
+            }
+        });
+        let error = match result {
+            Ok(_) => panic!("controlled finish should stop"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "cancelled at test checkpoint");
+        assert_eq!(checkpoints, 2);
+    }
+
+    #[test]
+    fn controlled_process_is_bit_identical_and_checks_inside_frame_loops() {
+        let left = (0..5_000)
+            .map(|frame| ((frame as f64 * 0.017).sin() * 0.2) as f32)
+            .collect::<Vec<_>>();
+        let right = (0..5_000)
+            .map(|frame| ((frame as f64 * 0.023).cos() * 0.1) as f32)
+            .collect::<Vec<_>>();
+        let planar = vec![left, right];
+        let roles = vec![ChannelRole::Main, ChannelRole::Main];
+        let mut ordinary = StreamingAnalyzer::new(48_000, roles.clone());
+        let mut controlled = StreamingAnalyzer::new(48_000, roles.clone());
+        ordinary.process(&planar).unwrap();
+        let mut checkpoints = 0;
+        controlled
+            .process_with_control(&planar, || {
+                checkpoints += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert!(checkpoints >= 12);
+        let ordinary = ordinary.finish();
+        let controlled = controlled.finish();
+        assert_eq!(ordinary.frames, controlled.frames);
+        assert_eq!(
+            ordinary.ebu.integrated_lufs.to_bits(),
+            controlled.ebu.integrated_lufs.to_bits()
+        );
+        assert_eq!(ordinary.rms_db.to_bits(), controlled.rms_db.to_bits());
+        assert_eq!(
+            ordinary.sample_peak.to_bits(),
+            controlled.sample_peak.to_bits()
+        );
+        assert_eq!(ordinary.true_peak.to_bits(), controlled.true_peak.to_bits());
+        assert_eq!(
+            ordinary
+                .ebu
+                .gating_blocks
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            controlled
+                .ebu
+                .gating_blocks
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+
+        let mut cancelled = StreamingAnalyzer::new(48_000, roles.clone());
+        let mut polls = 0;
+        let error = cancelled
+            .process_with_control(&planar, || {
+                polls += 1;
+                if polls == 3 {
+                    Err("cancelled in DSP preflight scan".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(error, "cancelled in DSP preflight scan");
+        assert_eq!(cancelled.frames, 0);
+
+        let mut frame_cancelled = StreamingAnalyzer::new(48_000, roles);
+        let mut polls = 0;
+        let error = frame_cancelled
+            .process_with_control(&planar, || {
+                polls += 1;
+                if polls == 8 {
+                    Err("cancelled in DSP frame loop".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(error, "cancelled in DSP frame loop");
+        assert_eq!(frame_cancelled.frames, CONTROL_CHECKPOINT_FRAMES);
+    }
+
+    #[test]
+    fn controlled_high_precision_lanes_poll_without_changing_results() {
+        let roles = vec![ChannelRole::Main];
+        let i32_planar = vec![(0..3_000).map(|value| value * 100).collect::<Vec<i32>>()];
+        let mut ordinary_i32 = StreamingAnalyzer::new(48_000, roles.clone());
+        let mut controlled_i32 = StreamingAnalyzer::new(48_000, roles.clone());
+        ordinary_i32.process_i32(&i32_planar).unwrap();
+        let mut i32_checkpoints = 0;
+        controlled_i32
+            .process_i32_with_control(&i32_planar, || {
+                i32_checkpoints += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert!(i32_checkpoints >= 5);
+        assert_eq!(
+            ordinary_i32.finish().weighted_mean_square.to_bits(),
+            controlled_i32.finish().weighted_mean_square.to_bits()
+        );
+
+        let f64_planar = vec![(0..3_000)
+            .map(|value| f64::from(value).sin() * 0.1)
+            .collect::<Vec<_>>()];
+        let mut ordinary_f64 = StreamingAnalyzer::new(48_000, roles.clone());
+        let mut controlled_f64 = StreamingAnalyzer::new(48_000, roles.clone());
+        ordinary_f64.process_f64(&f64_planar).unwrap();
+        let mut f64_checkpoints = 0;
+        controlled_f64
+            .process_f64_with_control(&f64_planar, || {
+                f64_checkpoints += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert!(f64_checkpoints >= 11);
+        assert_eq!(
+            ordinary_f64.finish().weighted_mean_square.to_bits(),
+            controlled_f64.finish().weighted_mean_square.to_bits()
+        );
+
+        let mut cancelled_f64 = StreamingAnalyzer::new(48_000, roles);
+        let mut polls = 0;
+        let error = cancelled_f64
+            .process_f64_with_control(&f64_planar, || {
+                polls += 1;
+                if polls == 3 {
+                    Err("cancelled in f64 validation".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(error, "cancelled in f64 validation");
+        assert_eq!(cancelled_f64.frames, 0);
     }
 
     #[test]

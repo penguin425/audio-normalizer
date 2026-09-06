@@ -255,14 +255,39 @@ Forge already provides:
   local normalization or QC commands.
 - Bounded stateless REST upload/analyze service via `forge-service`, with
   loopback-by-default binding, bearer-token enforcement for non-loopback
-  deployments, strict HTTP framing, upload/decoded-sample/concurrency/time
-  limits, and versioned health/analysis/error schemas. The service never
-  accepts a local filesystem path or performs implicit remote access.
+  deployments, strict fixed-length HTTP framing, incremental replay spooling,
+  process-wide active temp/memory quotas, decoded-sample/concurrency/absolute
+  deadline limits, and versioned health/analysis/error schemas. The service
+  never accepts a local filesystem path or performs implicit remote access.
 - Optional tonic gRPC service on the same `forge-service` binary, with a
   versioned `Analyze`/`Cancel`/`Health` protocol, explicit bounded request IDs,
   the REST limits/authentication policy, deadline/disconnect cancellation, and
-  cooperative decode/analysis checkpoints. The default build remains free of
+  cooperative packet/decode/analysis checkpoints. Unary protobuf messages
+  (audio plus metadata) are authenticated, assigned a method-specific size
+  policy, and concurrency-admitted before waiting for their five-byte frame
+  prefix; the declared length is then cap-checked and byte-admitted before
+  protobuf decoding. The first DATA frame may also contain payload; bounded
+  connections, an absolute preface/first-header deadline,
+  established-connection idle and an absolute hard connection age, and fixed
+  64 KiB per-stream and per-connection receive windows bound
+  transport occupancy and prevent stream-count multiplication of HTTP/2 receive
+  credit. Request IDs retain v1/v3 active-only uniqueness and can be reused
+  after completion; generation-safe Cancel would require a future versioned
+  wire message. The default build remains free of
   the async runtime and HTTP/2 stack.
+- Service decode preflights immutable Ogg/Matroska/FLAC/ISO-BMFF framing before
+  third-party demux, caps continued Ogg and Matroska block payloads at 16 MiB,
+  checks Ogg comments and Ogg-FLAC metadata, both trailing and leading-probe APE
+  tags, ISO sample-size tables, and `udta/meta/ilst` items against the 1 MiB
+  encoded-item plus file-wide 16 MiB encoded-metadata aggregate bounds (shared
+  across chained Ogg streams and native-FLAC supplemental tags), and checks
+  request control at bounded 32 KiB Symphonia/direct-Opus reads. Controlled raw
+  MPEG/ADTS inputs must form one complete frame chain, and the checked route is
+  locked to one service-only Symphonia format reader and its exact half-open
+  audio byte range before construction. Checked trailing tags are outside that
+  range and cannot be reached by controlled probe or decode. PCM
+  packet bounds come from encoded bytes/channel width;
+  unknown or zero compressed-packet geometry fails before decoder allocation.
 - Opt-in bounded service observability with fixed Prometheus counters,
   duration histogram buckets, analysis aggregates, REST `GET /metrics`, gRPC
   `Metrics`, and a local JSONL bridge for OpenTelemetry-compatible server-span
@@ -621,7 +646,7 @@ unchanged controls from paths whose normative work factor changed.
 The order below is an implementation plan, not a standards requirement. Each
 normative item must name the exact supported clauses and must not imply
 certification or coverage beyond its fixtures.
-v0.189.1 through v0.189.11 are the completed baseline; later entries are
+v0.189.1 through v0.189.12 are the completed baseline; later entries are
 planned.
 
 | Release | Scope | Classification |
