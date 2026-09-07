@@ -19,6 +19,25 @@ forge-container-qc --help
 - [Segment-aware normalization](SEGMENT-NORMALIZATION.md)
 - [Remediation planning](REMEDIATION.md)
 - [Metadata repair](METADATA-REPAIR.md)
+- [Metadata fidelity, inventory, and single-file transactions](METADATA-FIDELITY.md)
+
+Metadata-bearing file workflows use an explicit `preserve`, `strict`, or
+`strip` policy; `legacy-generic` remains available for compatibility with the
+historical primary/first generic-tag default. The field ledger reports every
+preserved, mapped, recomputed, or dropped field. A bounded registry-backed
+inventory covers repeated and unknown metadata regions and structural regions
+in supported WAVE, FLAC, MP3, Ogg, and ISO-BMFF containers. Sample-indexed
+BWF/DAW timing is converted with exact rational sample-clock arithmetic after
+resampling, while XML-bearing timing remains opaque. A metadata-only job state
+can restart one file transaction from its verified stage and publish with a
+compare-and-swap check. Its state and source-parent directories are a trusted
+boundary rather than a cryptographically authenticated adversarial store; the
+historical `--write-tags` path without a job state remains sequential.
+Generation-level all-or-nothing album/batch publication is deferred to
+v0.189.15. The machine-readable contracts are
+[`metadata-fidelity-report-v1`](schema/metadata-fidelity-report-v1.schema.json),
+[`metadata-inventory-v1`](schema/metadata-inventory-v1.schema.json), and
+[`metadata-job-v1`](schema/metadata-job-v1.schema.json).
 
 ## Quality control and codec adapters
 

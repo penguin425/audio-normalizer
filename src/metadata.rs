@@ -327,22 +327,37 @@ pub fn update_bwf_loudness(path: &Path, analysis: &Analysis) -> Result<(), Strin
     }
     file.seek(SeekFrom::Start(bext.0 + 346))
         .map_err(|error| format!("seek BWF version: {error}"))?;
-    file.write_all(&2u16.to_le_bytes())
+    let fields = bwf_loudness_field_bytes(analysis);
+    file.write_all(&fields[..2])
         .map_err(|error| format!("write BWF version: {error}"))?;
     file.seek(SeekFrom::Start(bext.0 + 412))
         .map_err(|error| format!("seek BWF loudness metadata: {error}"))?;
-    for value in [
+    file.write_all(&fields[2..])
+        .map_err(|error| format!("write BWF loudness metadata: {error}"))?;
+    file.flush()
+        .map_err(|error| format!("flush BWF loudness metadata: {error}"))
+}
+
+/// Exact bytes written into the BWF Version and five EBU R 128 fields.
+/// Keeping this calculation shared lets the fidelity readback compare the
+/// completed file with the same authoritative measured output as the writer.
+pub(crate) fn bwf_loudness_field_bytes(analysis: &Analysis) -> [u8; 12] {
+    let mut fields = [0_u8; 12];
+    fields[..2].copy_from_slice(&2_u16.to_le_bytes());
+    for (index, value) in [
         analysis.lufs,
         analysis.loudness_range_lu,
         analysis.true_peak_db(),
         analysis.max_momentary_lufs,
         analysis.max_short_term_lufs,
-    ] {
-        file.write_all(&bwf_value(value).to_le_bytes())
-            .map_err(|error| format!("write BWF loudness metadata: {error}"))?;
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let start = 2 + index * 2;
+        fields[start..start + 2].copy_from_slice(&bwf_value(value).to_le_bytes());
     }
-    file.flush()
-        .map_err(|error| format!("flush BWF loudness metadata: {error}"))
+    fields
 }
 
 fn bwf_value(value: f64) -> i16 {

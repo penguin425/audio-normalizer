@@ -4,7 +4,7 @@
 //! remained unchanged for the configured interval. State is committed
 //! atomically so a process restart cannot silently lose completed work.
 
-use crate::atomic::AtomicOutput;
+use crate::atomic::{AtomicOutput, DestinationPreimage};
 #[cfg(test)]
 use crate::discovery::MAX_DIRECTORY_DEPTH;
 use crate::discovery::{discover_audio_files_excluding, MAX_FILES};
@@ -44,6 +44,7 @@ pub struct WatchCandidate {
 pub struct WatchProcessingOutput {
     path: PathBuf,
     replace_existing: bool,
+    destination_preimage: DestinationPreimage,
 }
 
 impl WatchProcessingOutput {
@@ -55,6 +56,16 @@ impl WatchProcessingOutput {
     /// Whether publication may replace the output captured by the checkpoint.
     pub fn replace_existing(&self) -> bool {
         self.replace_existing
+    }
+
+    /// Destination state captured by [`WatchFolder::mark_processing_output`].
+    ///
+    /// This is crate-visible because the normalization pipeline must carry the
+    /// checkpoint preimage into [`AtomicOutput`] construction. Keeping the
+    /// token private preserves the existing public watch API while ensuring a
+    /// caller cannot accidentally forge one.
+    pub(crate) fn destination_preimage(&self) -> &DestinationPreimage {
+        &self.destination_preimage
     }
 }
 
@@ -357,9 +368,10 @@ impl WatchFolder {
         if fingerprint(&input)? != entry.fingerprint {
             return Err(format!("watch input changed before processing: {id}"));
         }
-        let prior_output_sha256 = if output.is_file() {
+        let destination_preimage = AtomicOutput::capture_destination_preimage(&output)?;
+        let prior_output_sha256 = if let Some(actual_sha256) = destination_preimage.sha256_hex() {
             if entry.output.as_deref() != output.to_str()
-                || entry.output_sha256.as_deref() != Some(hash_file(&output)?.as_str())
+                || entry.output_sha256.as_deref() != Some(actual_sha256.as_str())
             {
                 return Err(format!(
                     "refusing to replace an unverified watch output: {}",
@@ -381,6 +393,7 @@ impl WatchFolder {
         Ok(WatchProcessingOutput {
             path: output,
             replace_existing,
+            destination_preimage,
         })
     }
 
@@ -517,9 +530,19 @@ fn recover_processing(entry: &mut WatchEntry, input: &Path) -> Result<(), String
             entry.prior_output_sha256 = None;
             entry.status = WatchStatus::Observing;
         } else {
+            // The v1 journal records the prior output digest, but it has no
+            // ready-stage identity or expected post-render digest. After a
+            // process interruption, a different pathname cannot therefore be
+            // distinguished from a competing writer's file. Fail closed and
+            // require the caller's explicit retry instead of authenticating
+            // an ambiguous file as Forge's completed output.
             entry.output_sha256 = Some(actual_output);
             entry.prior_output_sha256 = None;
-            entry.status = WatchStatus::Completed;
+            entry.status = WatchStatus::Failed;
+            entry.error = Some(
+                "watch processing stopped before the published output could be authenticated; use an explicit retry"
+                    .into(),
+            );
         }
     } else {
         let fingerprint = entry.fingerprint.clone();
@@ -943,6 +966,51 @@ mod tests {
     }
 
     #[test]
+    fn processing_output_token_rejects_replacement_before_atomic_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let start = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let (mut folder, input, output) = folder(directory.path(), Duration::from_secs(1), start);
+        let source = input.join("tone.wav");
+        std::fs::write(&source, b"first audio").unwrap();
+        folder.scan_at(start).unwrap();
+        let candidate = folder
+            .scan_at(start + Duration::from_secs(1))
+            .unwrap()
+            .remove(0);
+        let rendered = output.join("tone_normalized.wav");
+        folder.mark_processing(&candidate.id, &rendered).unwrap();
+        std::fs::write(&rendered, b"first output").unwrap();
+        folder.mark_completed(&candidate.id).unwrap();
+
+        std::fs::write(&source, b"changed audio bytes").unwrap();
+        assert!(folder
+            .scan_at(start + Duration::from_secs(2))
+            .unwrap()
+            .is_empty());
+        let changed = folder
+            .scan_at(start + Duration::from_secs(3))
+            .unwrap()
+            .remove(0);
+        let checkpoint = folder
+            .mark_processing_output(&changed.id, &rendered)
+            .unwrap();
+        let displaced = output.join("displaced.wav");
+        std::fs::rename(&rendered, &displaced).unwrap();
+        std::fs::write(&rendered, b"rival output").unwrap();
+
+        let error = AtomicOutput::new_with_overwrite_and_preimage(
+            checkpoint.path(),
+            checkpoint.replace_existing(),
+            checkpoint.destination_preimage().clone(),
+        )
+        .err()
+        .expect("replacement after watch checkpoint must be rejected");
+        assert!(error.contains("preimage changed before staging"), "{error}");
+        assert_eq!(std::fs::read(&rendered).unwrap(), b"rival output");
+        assert_eq!(std::fs::read(&displaced).unwrap(), b"first output");
+    }
+
+    #[test]
     fn changed_input_can_replace_only_its_verified_prior_output() {
         let directory = tempfile::tempdir().unwrap();
         let start = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
@@ -979,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_recovers_a_committed_processing_output() {
+    fn restart_requires_an_explicit_retry_for_an_ambiguous_processing_output() {
         let directory = tempfile::tempdir().unwrap();
         let start = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let (mut folder, input, output) = folder(directory.path(), Duration::from_secs(1), start);
@@ -1007,6 +1075,86 @@ mod tests {
             .scan_at(start + Duration::from_secs(2))
             .unwrap()
             .is_empty());
+        let state: Value =
+            serde_json::from_slice(&std::fs::read(directory.path().join("watch.json")).unwrap())
+                .unwrap();
+        assert_eq!(state["entries"][0]["status"], "failed");
+        assert!(state["entries"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("could be authenticated"));
+        assert_eq!(reopened.retry_failed().unwrap(), 1);
+        let retry = reopened
+            .scan_at(start + Duration::from_secs(2))
+            .unwrap()
+            .remove(0);
+        let planned = reopened
+            .mark_processing_output(&retry.id, &rendered)
+            .unwrap();
+        assert!(planned.replace_existing());
+        assert_schema_valid(&directory.path().join("watch.json"));
+    }
+
+    #[test]
+    fn restart_does_not_authenticate_a_replacement_of_the_prior_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let start = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let (mut folder, input, output) = folder(directory.path(), Duration::from_secs(1), start);
+        let source = input.join("tone.wav");
+        std::fs::write(&source, b"first audio").unwrap();
+        folder.scan_at(start).unwrap();
+        let candidate = folder
+            .scan_at(start + Duration::from_secs(1))
+            .unwrap()
+            .remove(0);
+        let rendered = output.join("tone_normalized.wav");
+        folder.mark_processing(&candidate.id, &rendered).unwrap();
+        std::fs::write(&rendered, b"first output").unwrap();
+        folder.mark_completed(&candidate.id).unwrap();
+
+        std::fs::write(&source, b"changed audio bytes").unwrap();
+        assert!(folder
+            .scan_at(start + Duration::from_secs(2))
+            .unwrap()
+            .is_empty());
+        let changed = folder
+            .scan_at(start + Duration::from_secs(3))
+            .unwrap()
+            .remove(0);
+        folder.mark_processing(&changed.id, &rendered).unwrap();
+        std::fs::write(&rendered, b"rival output").unwrap();
+        drop(folder);
+
+        let mut reopened = WatchFolder::open(
+            directory.path().join("watch.json"),
+            &input,
+            &output,
+            true,
+            Duration::from_secs(1),
+            json!({"target": -16}),
+        )
+        .unwrap();
+        assert!(reopened
+            .scan_at(start + Duration::from_secs(4))
+            .unwrap()
+            .is_empty());
+        let state: Value =
+            serde_json::from_slice(&std::fs::read(directory.path().join("watch.json")).unwrap())
+                .unwrap();
+        assert_eq!(state["entries"][0]["status"], "failed");
+        assert_eq!(
+            state["entries"][0]["output_sha256"],
+            hash_file(&rendered).unwrap()
+        );
+        assert!(state["entries"][0].get("prior_output_sha256").is_none());
+        assert_eq!(reopened.retry_failed().unwrap(), 1);
+        assert_eq!(
+            reopened
+                .scan_at(start + Duration::from_secs(4))
+                .unwrap()
+                .len(),
+            1
+        );
         assert_schema_valid(&directory.path().join("watch.json"));
     }
 

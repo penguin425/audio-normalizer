@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/metadata-job-v1",
+  "title": "Forge single-file metadata transaction job v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generator",
+    "job_id",
+    "revision",
+    "phase",
+    "operation",
+    "policy",
+    "registry_revision",
+    "writer_revision",
+    "max_source_bytes",
+    "semantic_fingerprint",
+    "source",
+    "destination"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/metadata-job-v1"
+    },
+    "generator": {
+      "type": "string",
+      "pattern": "^forge-normalizer/[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "job_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "phase": {
+      "enum": ["prepared", "ready_to_commit", "committed"]
+    },
+    "operation": {
+      "not": {"type": "null"}
+    },
+    "policy": {
+      "enum": ["preserve", "strict", "strip", "legacy_generic"]
+    },
+    "registry_revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "writer_revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "max_source_bytes": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "semantic_fingerprint": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "source": {"$ref": "#/$defs/fileEvidence"},
+    "destination": {"$ref": "#/$defs/fileEvidence"},
+    "stage": {"$ref": "#/$defs/stageEvidence"},
+    "output": {"$ref": "#/$defs/fileEvidence"},
+    "mutation": {
+      "type": ["object", "array", "string", "number", "boolean"]
+    },
+    "verification": {
+      "type": ["object", "array", "string", "number", "boolean"]
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"phase": {"const": "prepared"}}},
+      "then": {
+        "not": {
+          "anyOf": [
+            {"required": ["stage"]},
+            {"required": ["output"]},
+            {"required": ["mutation"]},
+            {"required": ["verification"]}
+          ]
+        }
+      }
+    },
+    {
+      "if": {"properties": {"phase": {"const": "ready_to_commit"}}},
+      "then": {
+        "required": ["stage", "mutation", "verification"],
+        "not": {"required": ["output"]}
+      }
+    },
+    {
+      "if": {"properties": {"phase": {"const": "committed"}}},
+      "then": {
+        "required": ["output", "mutation", "verification"],
+        "not": {"required": ["stage"]}
+      }
+    }
+  ],
+  "$defs": {
+    "fileEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "identity", "byte_len", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "identity": {"type": "string", "minLength": 1, "maxLength": 256},
+        "byte_len": {"type": "integer", "minimum": 0},
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "stageEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "identity", "byte_len", "sha256"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^\\.forge-[^/\\\\]+$"
+        },
+        "identity": {"type": "string", "minLength": 1, "maxLength": 256},
+        "byte_len": {"type": "integer", "minimum": 1},
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    }
+  }
+}

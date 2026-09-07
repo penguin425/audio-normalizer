@@ -1,0 +1,416 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/metadata-inventory-v1",
+  "title": "Forge metadata inventory v1",
+  "description": "Bounded, policy-independent metadata and container-structure discovery for one exact source binding.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "container",
+    "source",
+    "regions",
+    "structural_regions",
+    "issues",
+    "metadata_bytes",
+    "retained_raw_bytes",
+    "limits"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "container": {
+      "enum": ["wave", "flac", "mp3", "ogg_vorbis", "ogg_opus", "ogg", "iso_bmff"]
+    },
+    "source": { "$ref": "#/$defs/sourceBinding" },
+    "regions": {
+      "type": "array",
+      "maxItems": 100000,
+      "description": "Metadata regions are bounded by limits.max_metadata_entries; JSON Schema cannot express that instance-relative bound.",
+      "items": { "$ref": "#/$defs/metadataRegion" }
+    },
+    "structural_regions": {
+      "type": "array",
+      "maxItems": 100000,
+      "description": "Structural regions are bounded by limits.max_metadata_entries; JSON Schema cannot express that instance-relative bound.",
+      "items": { "$ref": "#/$defs/structuralRegion" }
+    },
+    "issues": {
+      "type": "array",
+      "maxItems": 100001,
+      "description": "Issues are bounded by limits.max_metadata_entries plus one aggregate marker; JSON Schema cannot express that instance-relative bound. MetadataInventory::validate requires REGISTRY-MAX-ITEM-BYTES and REGISTRY-MAX-TOTAL-BYTES entries to be budget_exceeded issues identifying matching over-limit regions, unless REGISTRY-MAX-ISSUES explicitly records a suppressed budget code.",
+      "items": { "$ref": "#/$defs/issue" }
+    },
+    "metadata_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unique bytes charged to budgeted metadata extents. MetadataInventory::validate requires this to equal the unique budgeted extents and to be no greater than limits.max_metadata_total_bytes unless a matching REGISTRY-MAX-TOTAL-BYTES budget issue (or an aggregate issue explicitly naming that suppressed code) is present."
+    },
+    "retained_raw_bytes": { "type": "integer", "minimum": 0 },
+    "limits": { "$ref": "#/$defs/limits" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "extent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["offset", "length"],
+      "properties": {
+        "offset": { "type": "integer", "minimum": 0 },
+        "length": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "sourceBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["byte_len", "sha256", "file_identity"],
+      "properties": {
+        "byte_len": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "file_identity": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$"
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_metadata_item_bytes",
+        "max_metadata_total_bytes",
+        "max_metadata_entries",
+        "max_ogg_packet_bytes",
+        "max_ogg_page_bytes",
+        "max_nesting_depth",
+        "max_retained_raw_bytes"
+      ],
+      "properties": {
+        "max_metadata_item_bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+        "max_metadata_total_bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+        "max_metadata_entries": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000,
+          "description": "Bound for retained metadata/structure entries and auxiliary Ogg serial/diagnostic tracking. Excess diagnostics are aggregated into one budget issue."
+        },
+        "max_ogg_packet_bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+        "max_ogg_page_bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+        "max_nesting_depth": { "type": "integer", "minimum": 1, "maximum": 255 },
+        "max_retained_raw_bytes": { "type": "integer", "minimum": 0, "maximum": 16777216 }
+      }
+    },
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "code", "message", "offset", "length"],
+      "properties": {
+        "kind": { "enum": ["malformed", "budget_exceeded"] },
+        "code": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$" },
+        "offset": { "type": ["integer", "null"], "minimum": 0 },
+        "length": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "metadataRegion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ordinal",
+        "path",
+        "kind",
+        "extents",
+        "size",
+        "raw_sha256",
+        "raw",
+        "raw_omitted"
+      ],
+      "properties": {
+        "ordinal": { "type": "integer", "minimum": 0 },
+        "path": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$" }
+        },
+        "kind": { "$ref": "#/$defs/metadataKind" },
+        "extents": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100000,
+          "description": "MetadataInventory::validate requires this count to be no greater than limits.max_metadata_entries.",
+          "items": { "$ref": "#/$defs/extent" }
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "For raw-retainable metadata, a size above limits.max_metadata_item_bytes requires raw_omitted=item_limit (or disabled when max_retained_raw_bytes is zero) and a matching REGISTRY-MAX-ITEM-BYTES issue unless an aggregate issue records its suppression."
+        },
+        "raw_sha256": { "$ref": "#/$defs/sha256" },
+        "raw": {
+          "type": ["array", "null"],
+          "maxItems": 16777216,
+          "description": "When present, raw length is checked against size, limits.max_metadata_item_bytes, and limits.max_retained_raw_bytes by MetadataInventory::validate; the fixed maxItems is the registry's absolute retained-byte ceiling.",
+          "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+        },
+        "raw_omitted": { "$ref": "#/$defs/rawOmission" }
+      }
+    },
+    "rawOmission": {
+      "type": ["string", "null"],
+      "enum": ["disabled", "item_limit", "aggregate_limit", "overlapping_region", null]
+    },
+    "structuralRegion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ordinal", "path", "kind", "extents", "size"],
+      "properties": {
+        "ordinal": { "type": "integer", "minimum": 0 },
+        "path": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$" }
+        },
+        "kind": { "$ref": "#/$defs/structuralKind" },
+        "extents": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100000,
+          "description": "MetadataInventory::validate requires this count to be no greater than limits.max_metadata_entries.",
+          "items": { "$ref": "#/$defs/extent" }
+        },
+        "size": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "metadataKind": {
+      "oneOf": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/tagged" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": { "const": "wave_chunk" },
+                "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$" },
+                "audio_data": { "const": false }
+              },
+              "required": ["id", "audio_data"]
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/tagged" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": { "const": "flac_block" },
+                "block_type": { "type": "integer", "minimum": 1, "maximum": 127 }
+              },
+              "required": ["block_type"]
+            }
+          ]
+        },
+        { "$ref": "#/$defs/id3v2Tag" },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/tagged" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": { "const": "id3v2_frame" },
+                "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$" }
+              },
+              "required": ["id"]
+            }
+          ]
+        },
+        { "$ref": "#/$defs/id3v1Tag" },
+        { "$ref": "#/$defs/apev2Tag" },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/tagged" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": { "const": "apev2_item" },
+                "key": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$" }
+              },
+              "required": ["key"]
+            }
+          ]
+        },
+        { "$ref": "#/$defs/oggPage" },
+        { "$ref": "#/$defs/vorbisComment" },
+        { "$ref": "#/$defs/opusTags" },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/tagged" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": { "const": "iso_bmff_box" },
+                "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$" },
+                "metadata": { "const": true }
+              },
+              "required": ["id", "metadata"]
+            }
+          ]
+        }
+      ]
+    },
+    "structuralKind": {
+      "oneOf": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/tagged" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": { "const": "wave_chunk" },
+                "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$" },
+                "audio_data": { "type": "boolean" }
+              },
+              "required": ["id", "audio_data"]
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/tagged" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": { "const": "flac_block" },
+                "block_type": { "const": 0 }
+              },
+              "required": ["block_type"]
+            }
+          ]
+        },
+        { "$ref": "#/$defs/oggPage" },
+        { "$ref": "#/$defs/oggPacket" },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/tagged" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": { "const": "iso_bmff_box" },
+                "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$" }
+              },
+              "required": ["id"]
+            }
+          ]
+        }
+      ]
+    },
+    "tagged": {
+      "type": "object",
+      "required": ["kind"]
+    },
+    "id3v2Tag": {
+      "allOf": [
+        { "$ref": "#/$defs/tagged" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "kind": { "const": "id3v2_tag" } }
+        }
+      ]
+    },
+    "id3v1Tag": {
+      "allOf": [
+        { "$ref": "#/$defs/tagged" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "kind": { "const": "id3v1_tag" } }
+        }
+      ]
+    },
+    "apev2Tag": {
+      "allOf": [
+        { "$ref": "#/$defs/tagged" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "kind": { "const": "apev2_tag" } }
+        }
+      ]
+    },
+    "oggPage": {
+      "allOf": [
+        { "$ref": "#/$defs/tagged" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "ogg_page" },
+            "serial": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "sequence": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+          },
+          "required": ["serial", "sequence"]
+        }
+      ]
+    },
+    "oggPacket": {
+      "allOf": [
+        { "$ref": "#/$defs/tagged" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "ogg_packet" },
+            "serial": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "packet_index": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+          },
+          "required": ["serial", "packet_index"]
+        }
+      ]
+    },
+    "vorbisComment": {
+      "allOf": [
+        { "$ref": "#/$defs/tagged" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "vorbis_comment" },
+            "serial": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "packet_index": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+          },
+          "required": ["serial", "packet_index"]
+        }
+      ]
+    },
+    "opusTags": {
+      "allOf": [
+        { "$ref": "#/$defs/tagged" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "opus_tags" },
+            "serial": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "packet_index": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+          },
+          "required": ["serial", "packet_index"]
+        }
+      ]
+    }
+  }
+}

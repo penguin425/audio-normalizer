@@ -19,13 +19,21 @@ use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::dsp::resample::ResampleQuality;
 use forge_normalizer::ebu_qc_report;
 use forge_normalizer::ebu_qc_scenario1;
+use forge_normalizer::metadata_fidelity::{
+    MetadataFidelityReport, MetadataPolicy, MetadataPolicyConfig,
+};
+use forge_normalizer::metadata_transaction::{
+    MetadataResume, MetadataTransaction, MetadataTransactionRequest,
+};
 use forge_normalizer::normalization_diff::{
     self, NormalizationDifferenceAsset, NormalizationDifferenceReport,
 };
 use forge_normalizer::normalize::{
     self, DialogueSource, DialogueStandard, Mode, OutputFormat, Plan,
 };
-use forge_normalizer::output::{create_live_file_atomically, write_file_atomically};
+use forge_normalizer::output::{
+    create_live_file_atomically, stage_file_atomically, write_file_atomically, StagedFileOutput,
+};
 use forge_normalizer::output_plan::{OutputPlan, PlannedOutput, ProtectedPath};
 use forge_normalizer::preset::Preset;
 use forge_normalizer::qc::{self, QcOptions};
@@ -33,9 +41,11 @@ use forge_normalizer::report::{
     self, AnalysisReport, CodecMetadata, ComplianceProfile, TimelineReport,
 };
 use forge_normalizer::stable_input::{StableInput, StableInputOptions};
-use forge_normalizer::watch::{WatchCandidate, WatchFolder};
+use forge_normalizer::watch::{WatchCandidate, WatchFolder, WatchProcessingOutput};
 use forge_normalizer::wav::{named_channel_layout, ChannelRole, PcmKind, WavContainer};
 use rayon::{prelude::*, ThreadPoolBuilder};
+use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
@@ -82,6 +92,29 @@ struct AnalysisInvocationOptions {
     audio_track: Option<u32>,
     anomaly_audits: Vec<PathBuf>,
     ebu_qc_xml: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct MetadataInvocationOptions {
+    policy: MetadataPolicyConfig,
+    explicitly_requested: bool,
+    report: Option<PathBuf>,
+    job_state: Option<PathBuf>,
+}
+
+impl MetadataInvocationOptions {
+    fn legacy() -> Self {
+        Self {
+            policy: MetadataPolicyConfig::legacy_generic(),
+            explicitly_requested: false,
+            report: None,
+            job_state: None,
+        }
+    }
+
+    fn active_for_normalization(&self) -> bool {
+        self.explicitly_requested && self.policy.policy() != MetadataPolicy::LegacyGeneric
+    }
 }
 
 impl AnalysisInvocationOptions {
@@ -300,6 +333,45 @@ fn main() -> ExitCode {
                 .conflicts_with("watch")
                 .help("Write an EBU QC 2026-04 Scenario 1 XML report for one input"),
         )
+        .arg(
+            Arg::new("metadata_policy")
+                .long("metadata-policy")
+                .value_name("POLICY")
+                .value_parser(["preserve", "strict", "strip", "legacy-generic"])
+                .conflicts_with_all(["analyze_only", "gain_only", "dry_run"])
+                .help(
+                    "Metadata fidelity policy: preserve, strict, strip, or explicit legacy-generic compatibility",
+                ),
+        )
+        .arg(
+            Arg::new("metadata_strip_locator")
+                .long("metadata-strip-locator")
+                .value_name("LOCATOR")
+                .action(ArgAction::Append)
+                .requires("metadata_policy")
+                .conflicts_with_all(["analyze_only", "gain_only"])
+                .help("With --metadata-policy strip, remove only the exact repeated locator"),
+        )
+        .arg(
+            Arg::new("metadata_report")
+                .long("metadata-report")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .requires("metadata_policy")
+                .conflicts_with_all(["analyze_only", "gain_only", "dry_run"])
+                .help("Write the versioned field-level metadata fidelity report as JSON"),
+        )
+        .arg(
+            Arg::new("metadata_job_state")
+                .long("metadata-job-state")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .requires("write_tags")
+                .conflicts_with_all(["dry_run", "job_state", "progress", "watch"])
+                .help(
+                    "Persist and resume one metadata-only transaction without mutating the live file before commit",
+                ),
+        )
         .get_matches();
     let true_peak_backend = matches
         .get_one::<String>("true_peak_backend")
@@ -341,6 +413,13 @@ fn main() -> ExitCode {
         database: matches.get_one::<PathBuf>("catalogue").cloned(),
         report: matches.get_one::<PathBuf>("catalogue_report").cloned(),
     };
+    let metadata_options = match metadata_invocation_options(&matches) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("forge: error: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let (cli, analysis_engine) =
         match cli::Cli::from_matches_with_config_and_analysis_engine(&matches) {
             Ok(parsed) => parsed,
@@ -356,6 +435,18 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let analysis_from_config = cli.analyze_only
+        && matches.value_source("analyze_only") != Some(clap::parser::ValueSource::CommandLine);
+    if let Err(error) = validate_effective_mode_conflicts(
+        &cli,
+        &batch_options,
+        &watch_options,
+        &metadata_options,
+        analysis_from_config,
+    ) {
+        eprintln!("forge: error: {error}");
+        return ExitCode::from(2);
+    }
     let anomaly_audits = matches
         .get_many::<PathBuf>("anomaly_audit")
         .map(|values| values.cloned().collect::<Vec<_>>())
@@ -368,6 +459,7 @@ fn main() -> ExitCode {
         cache_options,
         watch_options,
         catalogue_options,
+        metadata_options,
         AnalysisInvocationOptions {
             engine: analysis_engine,
             audio_track,
@@ -385,6 +477,123 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
+}
+
+fn metadata_invocation_options(
+    matches: &clap::ArgMatches,
+) -> Result<MetadataInvocationOptions, String> {
+    let Some(policy_name) = matches.get_one::<String>("metadata_policy") else {
+        let mut options = MetadataInvocationOptions::legacy();
+        options.job_state = matches.get_one::<PathBuf>("metadata_job_state").cloned();
+        return Ok(options);
+    };
+    let strip_locators = matches
+        .get_many::<String>("metadata_strip_locator")
+        .map(|values| values.cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let policy = match policy_name.as_str() {
+        "preserve" => {
+            if !strip_locators.is_empty() {
+                return Err("--metadata-strip-locator requires --metadata-policy strip".into());
+            }
+            MetadataPolicyConfig::preserve()
+        }
+        "strict" => {
+            if !strip_locators.is_empty() {
+                return Err("--metadata-strip-locator requires --metadata-policy strip".into());
+            }
+            MetadataPolicyConfig::strict()
+        }
+        "strip" if strip_locators.is_empty() => MetadataPolicyConfig::strip_all(),
+        "strip" => MetadataPolicyConfig::strip_selected(strip_locators)
+            .map_err(|error| error.to_string())?,
+        "legacy-generic" => {
+            if !strip_locators.is_empty() {
+                return Err("--metadata-strip-locator requires --metadata-policy strip".into());
+            }
+            if matches.get_one::<PathBuf>("metadata_report").is_some() {
+                return Err(
+                    "--metadata-report requires preserve, strict, or strip policy semantics".into(),
+                );
+            }
+            MetadataPolicyConfig::legacy_generic()
+        }
+        _ => unreachable!("clap validates metadata policy names"),
+    };
+    Ok(MetadataInvocationOptions {
+        policy,
+        explicitly_requested: true,
+        report: matches.get_one::<PathBuf>("metadata_report").cloned(),
+        job_state: matches.get_one::<PathBuf>("metadata_job_state").cloned(),
+    })
+}
+
+/// Clap validates conflicts among command-line values before the optional TOML
+/// configuration is applied.  A config file can turn `--analyze` on after that
+/// validation, so repeat the mode-boundary checks against the effective CLI
+/// before any paths are prepared or outputs are touched.
+fn validate_effective_mode_conflicts(
+    cli: &cli::Cli,
+    batch_options: &BatchOptions,
+    watch_options: &WatchOptions,
+    metadata_options: &MetadataInvocationOptions,
+    analysis_from_config: bool,
+) -> Result<(), String> {
+    if !cli.analyze_only {
+        return Ok(());
+    }
+
+    let reject = |option: &str| -> Result<(), String> {
+        Err(format!(
+            "the argument '{option}' cannot be used with '--analyze'"
+        ))
+    };
+
+    if let Some(path) = &batch_options.job_state {
+        return reject(&format!("--job-state {}", path.display()));
+    }
+    if let Some(path) = &batch_options.progress {
+        return reject(&format!("--progress {}", path.display()));
+    }
+    if watch_options.enabled {
+        return reject("--watch");
+    }
+    if metadata_options.explicitly_requested {
+        return reject("--metadata-policy");
+    }
+    if cli.preset.is_some() {
+        return reject("--preset");
+    }
+    if cli.sample_rate_hz.is_some() {
+        return reject("--sample-rate");
+    }
+    if cli.write_tags {
+        return reject("--write-tags");
+    }
+    if cli.verify {
+        return reject("--verify");
+    }
+    if cli.difference_report.is_some() {
+        return reject("--difference-report");
+    }
+
+    // These mode flags historically did not declare a direct Clap conflict
+    // with --analyze, but an analysis mode loaded implicitly from config would
+    // otherwise silently swallow them because the analysis branch runs first.
+    // Keep direct command-line behaviour unchanged while rejecting this new
+    // config-induced ambiguity.
+    if analysis_from_config {
+        if cli.gain_only {
+            return reject("--gain-only");
+        }
+        if cli.dry_run {
+            return reject("--dry-run");
+        }
+        if cli.album {
+            return reject("--album");
+        }
+    }
+    Ok(())
 }
 
 fn parse_mode(s: &str) -> Mode {
@@ -422,6 +631,7 @@ fn run(
     cache_options: CacheOptions,
     watch_options: WatchOptions,
     catalogue_options: CatalogueOptions,
+    metadata_options: MetadataInvocationOptions,
     analysis_options: AnalysisInvocationOptions,
 ) -> Result<(), String> {
     if watch_options.enabled {
@@ -433,6 +643,7 @@ fn run(
             analysis_options.engine,
             cache_options,
             watch_options,
+            metadata_options,
             analysis_options.anomaly_audits,
         );
     }
@@ -443,6 +654,7 @@ fn run(
         &batch_options,
         &cache_options,
         &catalogue_options,
+        &metadata_options,
         &analysis_options,
     )?;
     pipeline.emit_stdout()
@@ -453,6 +665,7 @@ fn run_watch(
     analysis_engine: AnalysisEngine,
     cache_options: CacheOptions,
     options: WatchOptions,
+    metadata_options: MetadataInvocationOptions,
     anomaly_audits: Vec<PathBuf>,
 ) -> Result<(), String> {
     if !anomaly_audits.is_empty() {
@@ -486,7 +699,10 @@ fn run_watch(
             .build_global()
             .map_err(|error| format!("thread pool: {error}"))?;
     }
-    let operation = watch_operation_descriptor(&cli);
+    if metadata_options.report.is_some() {
+        return Err("--metadata-report cannot name one path for a watch folder".into());
+    }
+    let operation = watch_operation_descriptor(&cli, &metadata_options);
     let mut watch = WatchFolder::open(
         state,
         &cli.inputs[0],
@@ -512,6 +728,7 @@ fn run_watch(
                 &mut watch,
                 &candidate,
                 &output_root,
+                &metadata_options,
             ) {
                 watch.mark_failed(&candidate.id, &error)?;
                 eprintln!("watch failed: {}: {error}", candidate.input.display());
@@ -536,6 +753,7 @@ fn process_watch_candidate(
     watch: &mut WatchFolder,
     candidate: &WatchCandidate,
     output_root: &Path,
+    metadata_options: &MetadataInvocationOptions,
 ) -> Result<(), String> {
     let format = template
         .format
@@ -562,13 +780,15 @@ fn process_watch_candidate(
     cli.recursive = false;
     cli.overwrite = output.replace_existing();
     let analysis_options = AnalysisInvocationOptions::engine_only(analysis_engine);
-    let result = run_paths(
+    let result = run_paths_with_watch_output(
         cli,
         false,
         &BatchOptions::default(),
         cache_options,
         &CatalogueOptions::default(),
+        metadata_options,
         &analysis_options,
+        Some(output),
     );
     match result {
         Ok(()) => watch.mark_completed(&candidate.id),
@@ -576,8 +796,11 @@ fn process_watch_candidate(
     }
 }
 
-fn watch_operation_descriptor(cli: &cli::Cli) -> serde_json::Value {
-    serde_json::json!({
+fn watch_operation_descriptor(
+    cli: &cli::Cli,
+    metadata_options: &MetadataInvocationOptions,
+) -> serde_json::Value {
+    let descriptor = serde_json::json!({
         "schema": "forge-watch-operation-v1",
         "generator": format!("forge-normalizer/{}", env!("CARGO_PKG_VERSION")),
         "preset": cli.preset,
@@ -604,16 +827,41 @@ fn watch_operation_descriptor(cli: &cli::Cli) -> serde_json::Value {
         "bits": cli.bits,
         "wav_container": cli.wav_container,
         "bwf": cli.bwf,
-    })
+    });
+    metadata_operation_descriptor(descriptor, metadata_options)
 }
 
 fn run_paths(
+    cli: cli::Cli,
+    stdin_requested: bool,
+    batch_options: &BatchOptions,
+    cache_options: &CacheOptions,
+    catalogue_options: &CatalogueOptions,
+    metadata_options: &MetadataInvocationOptions,
+    analysis_options: &AnalysisInvocationOptions,
+) -> Result<(), String> {
+    run_paths_with_watch_output(
+        cli,
+        stdin_requested,
+        batch_options,
+        cache_options,
+        catalogue_options,
+        metadata_options,
+        analysis_options,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_paths_with_watch_output(
     mut cli: cli::Cli,
     stdin_requested: bool,
     batch_options: &BatchOptions,
     cache_options: &CacheOptions,
     catalogue_options: &CatalogueOptions,
+    metadata_options: &MetadataInvocationOptions,
     analysis_options: &AnalysisInvocationOptions,
+    watch_output: Option<WatchProcessingOutput>,
 ) -> Result<(), String> {
     let analysis_engine = analysis_options.engine;
     let audio_track = analysis_options.audio_track;
@@ -628,6 +876,39 @@ fn run_paths(
 
     let (expanded, relative_paths) = expand_inputs(&cli.inputs, cli.recursive)?;
     cli.inputs = expanded;
+    if metadata_options.report.is_some() && cli.inputs.len() != 1 {
+        return Err("--metadata-report requires exactly one expanded input".into());
+    }
+    if metadata_options.job_state.is_some() && cli.inputs.len() != 1 {
+        return Err("--metadata-job-state requires exactly one expanded input".into());
+    }
+    if (metadata_options.active_for_normalization() || metadata_options.job_state.is_some())
+        && (stdin_requested || cli.inputs.iter().any(|input| input == Path::new("-")))
+    {
+        return Err(
+            "metadata fidelity and transaction options require a regular file input".into(),
+        );
+    }
+    if cli.album && metadata_options.active_for_normalization() {
+        return Err(
+            "explicit metadata fidelity policy for album publication is deferred to the generation transaction in v0.189.15"
+                .into(),
+        );
+    }
+    if cli.write_tags
+        && metadata_options.active_for_normalization()
+        && metadata_options.job_state.is_none()
+    {
+        return Err(
+            "explicit metadata fidelity with --write-tags requires --metadata-job-state".into(),
+        );
+    }
+    if cli.write_tags && metadata_options.policy.policy() == MetadataPolicy::Strip {
+        return Err(
+            "--metadata-policy strip is available for a new normalization output; metadata-only stripping is not losslessly implemented"
+                .into(),
+        );
+    }
     if analysis_engine == AnalysisEngine::Reference && !cli.analyze_only {
         return Err("--analysis-engine reference requires --analyze".into());
     }
@@ -759,15 +1040,25 @@ fn run_paths(
     }
     plan.validate()?;
     if cli.write_tags {
+        validate_metadata_control_paths(&cli, metadata_options)?;
         let analysis_cache = cache_options.open(cli.dry_run && !cache_options.warm_cache)?;
         return write_loudness_tags(
             &cli,
             channel_roles_override.as_deref(),
             analysis_cache.as_ref(),
+            metadata_options,
         );
     }
 
     let (outputs, formats) = resolve_outputs_and_formats(&cli, &relative_paths, audio_track)?;
+    if let Some(watch_output) = watch_output.as_ref() {
+        if outputs.len() != 1 || outputs[0] != watch_output.path() {
+            return Err("watch output changed between checkpoint and normalization".into());
+        }
+        if cli.overwrite != watch_output.replace_existing() {
+            return Err("watch output conflict policy changed after checkpoint".into());
+        }
+    }
     if !cli.analyze_only && !cli.gain_only {
         for format in &formats {
             if cli.dry_run {
@@ -782,6 +1073,7 @@ fn run_paths(
         &cli,
         batch_options,
         catalogue_options,
+        metadata_options,
         anomaly_audit_paths,
         ebu_qc_xml,
         &outputs,
@@ -1939,7 +2231,7 @@ fn run_paths(
         return Ok(());
     }
 
-    let operation = batch_operation_descriptor(&cli, &plan, &formats);
+    let operation = batch_operation_descriptor(&cli, &plan, &formats, metadata_options);
     let batch_assets = cli
         .inputs
         .iter()
@@ -2082,14 +2374,26 @@ fn run_paths(
                             Err(error) => return (Err(error), None),
                         }
                     };
-                    let staged = normalize::normalize_one_descriptor_bound_staged_with_policy(
-                        &analyzed.descriptor,
-                        output,
-                        &plan,
-                        formats[asset_index],
-                        &analyzed.analysis,
-                        output_conflict_policy,
-                    )
+                    let staged = if metadata_options.active_for_normalization() {
+                        normalize::normalize_one_descriptor_bound_staged_with_metadata_policy(
+                            &analyzed.descriptor,
+                            output,
+                            &plan,
+                            formats[asset_index],
+                            &analyzed.analysis,
+                            &metadata_options.policy,
+                            output_conflict_policy,
+                        )
+                    } else {
+                        normalize::normalize_one_descriptor_bound_staged_with_policy(
+                            &analyzed.descriptor,
+                            output,
+                            &plan,
+                            formats[asset_index],
+                            &analyzed.analysis,
+                            output_conflict_policy,
+                        )
+                    }
                     .map(|staged| (staged, analyzed.descriptor))
                     .map_err(|error| error.to_string());
                     (staged, observation)
@@ -2103,6 +2407,11 @@ fn run_paths(
                     observe_cache_parts(input, observation.disposition, observation.warning);
                 }
                 let outcome = match staged.and_then(|(staged, descriptor)| {
+                    if let Some(report) = staged.metadata_report() {
+                        report
+                            .require_publication()
+                            .map_err(|error| error.to_string())?;
+                    }
                     if let Some(job) = &mut batch_job {
                         job.mark_ready_to_publish(asset_index, staged.staged_path())?;
                     }
@@ -2232,7 +2541,11 @@ fn run_paths(
                     &plan,
                     audio_track,
                 )?)
-            } else if cli.gain_only || cli.dry_run || cli.verify || cli.difference_report.is_some()
+            } else if cli.gain_only
+                || cli.dry_run
+                || cli.verify
+                || cli.difference_report.is_some()
+                || metadata_options.active_for_normalization()
             {
                 Some(analyze_for_plan_descriptor(
                     input,
@@ -2262,34 +2575,112 @@ fn run_paths(
             } else {
                 prepare_output_directories(std::slice::from_ref(output))?;
                 if cli.verify {
-                    let staged = if let Some(analysis) = cached_analysis.as_ref() {
-                        normalize::normalize_one_descriptor_bound_corrected_staged_with_policy(
-                            &analysis.descriptor,
-                            output,
-                            &plan,
-                            *fmt,
-                            cli.verify_tolerance,
-                            cli.verify_retries as usize,
-                            &analysis.analysis,
-                            output_conflict_policy,
-                        )
+                    let staged = if metadata_options.active_for_normalization() {
+                        let analysis = cached_analysis
+                            .as_ref()
+                            .expect("metadata fidelity captures a bound descriptor analysis");
+                        if let Some(watch_output) = watch_output.as_ref() {
+                            normalize::normalize_one_descriptor_bound_corrected_staged_with_metadata_policy_and_watch_output(
+                                &analysis.descriptor,
+                                output,
+                                &plan,
+                                *fmt,
+                                cli.verify_tolerance,
+                                cli.verify_retries as usize,
+                                &analysis.analysis,
+                                &metadata_options.policy,
+                                output_conflict_policy,
+                                watch_output,
+                            )
+                        } else {
+                            normalize::normalize_one_descriptor_bound_corrected_staged_with_metadata_policy(
+                                &analysis.descriptor,
+                                output,
+                                &plan,
+                                *fmt,
+                                cli.verify_tolerance,
+                                cli.verify_retries as usize,
+                                &analysis.analysis,
+                                &metadata_options.policy,
+                                output_conflict_policy,
+                            )
+                        }
+                        .map_err(|error| error.to_string())?
+                    } else if let Some(analysis) = cached_analysis.as_ref() {
+                        if let Some(watch_output) = watch_output.as_ref() {
+                            normalize::normalize_one_descriptor_bound_corrected_staged_with_watch_output(
+                                &analysis.descriptor,
+                                output,
+                                &plan,
+                                *fmt,
+                                cli.verify_tolerance,
+                                cli.verify_retries as usize,
+                                &analysis.analysis,
+                                output_conflict_policy,
+                                watch_output,
+                            )
+                        } else {
+                            normalize::normalize_one_descriptor_bound_corrected_staged_with_policy(
+                                &analysis.descriptor,
+                                output,
+                                &plan,
+                                *fmt,
+                                cli.verify_tolerance,
+                                cli.verify_retries as usize,
+                                &analysis.analysis,
+                                output_conflict_policy,
+                            )
+                        }
                         .map_err(|error| error.to_string())?
                     } else {
-                        normalize::normalize_one_corrected_staged_with_roles_and_policy(
-                            input,
-                            output,
-                            &plan,
-                            *fmt,
-                            cli.verify_tolerance,
-                            cli.verify_retries as usize,
-                            channel_roles_override.as_deref(),
-                            output_conflict_policy,
-                        )?
+                        if let Some(watch_output) = watch_output.as_ref() {
+                            normalize::normalize_one_corrected_staged_with_roles_and_watch_output(
+                                input,
+                                output,
+                                &plan,
+                                *fmt,
+                                cli.verify_tolerance,
+                                cli.verify_retries as usize,
+                                channel_roles_override.as_deref(),
+                                output_conflict_policy,
+                                watch_output,
+                            )?
+                        } else {
+                            normalize::normalize_one_corrected_staged_with_roles_and_policy(
+                                input,
+                                output,
+                                &plan,
+                                *fmt,
+                                cli.verify_tolerance,
+                                cli.verify_retries as usize,
+                                channel_roles_override.as_deref(),
+                                output_conflict_policy,
+                            )?
+                        }
                     };
+                    let metadata_report = staged.metadata_report().cloned();
+                    let staged_metadata_report = stage_requested_metadata_fidelity_report(
+                        metadata_options,
+                        metadata_report.as_ref(),
+                        cli.overwrite,
+                    )?;
+                    if let Some(report) = staged.metadata_report() {
+                        report
+                            .require_publication()
+                            .map_err(|error| error.to_string())?;
+                    }
                     if let Some(job) = &mut batch_job {
                         job.mark_ready_to_publish(index, staged.staged_path())?;
                     }
                     let corrected = staged.commit()?;
+                    publish_requested_metadata_fidelity_report(
+                        metadata_options,
+                        staged_metadata_report,
+                    )?;
+                    verify_requested_metadata_fidelity_report(
+                        metadata_options,
+                        metadata_report.as_ref(),
+                    )?;
                     print_analysis(input, &corrected.source, Some(corrected.gain));
                     catalogue_measurement = Some(corrected.source.clone());
                     if !print_verification(input, &corrected.verification, &plan) {
@@ -2321,7 +2712,43 @@ fn run_paths(
                     }
                 } else {
                     if cli.difference_report.is_some() {
-                        let (an, gain, render) = if let Some(analysis) = cached_analysis.as_ref() {
+                        let (an, gain, render) = if metadata_options.active_for_normalization() {
+                            let analysis = cached_analysis
+                                .as_ref()
+                                .expect("metadata fidelity captures a bound descriptor analysis");
+                            let staged = normalize::normalize_one_descriptor_bound_audited_staged_with_metadata_policy(
+                                &analysis.descriptor,
+                                output,
+                                &plan,
+                                *fmt,
+                                &analysis.analysis,
+                                &metadata_options.policy,
+                                output_conflict_policy,
+                            )
+                            .map_err(|error| error.to_string())?;
+                            let metadata_report = staged.metadata_report().cloned();
+                            let staged_metadata_report = stage_requested_metadata_fidelity_report(
+                                metadata_options,
+                                metadata_report.as_ref(),
+                                cli.overwrite,
+                            )?;
+                            let outcome = staged.commit()?;
+                            publish_requested_metadata_fidelity_report(
+                                metadata_options,
+                                staged_metadata_report,
+                            )?;
+                            verify_requested_metadata_fidelity_report(
+                                metadata_options,
+                                metadata_report.as_ref(),
+                            )?;
+                            (
+                                outcome.source,
+                                outcome.gain,
+                                outcome
+                                    .render
+                                    .expect("audited metadata render captures statistics"),
+                            )
+                        } else if let Some(analysis) = cached_analysis.as_ref() {
                             normalize::normalize_one_descriptor_bound_audited_with_policy(
                                 &analysis.descriptor,
                                 output,
@@ -2360,30 +2787,102 @@ fn run_paths(
                             },
                         )?);
                     } else {
-                        let (an, gain) = if let Some(analysis) = cached_analysis.as_ref() {
-                            normalize::normalize_one_descriptor_bound_with_policy(
-                                &analysis.descriptor,
-                                output,
-                                &plan,
-                                *fmt,
-                                &analysis.analysis,
-                                output_conflict_policy,
-                            )
-                            .map_err(|error| error.to_string())?
+                        let (an, gain) = if metadata_options.active_for_normalization() {
+                            let analysis = cached_analysis
+                                .as_ref()
+                                .expect("metadata fidelity captures a bound descriptor analysis");
+                            let staged = if let Some(watch_output) = watch_output.as_ref() {
+                                normalize::normalize_one_descriptor_bound_staged_with_metadata_policy_and_watch_output(
+                                    &analysis.descriptor,
+                                    output,
+                                    &plan,
+                                    *fmt,
+                                    &analysis.analysis,
+                                    &metadata_options.policy,
+                                    output_conflict_policy,
+                                    watch_output,
+                                )
+                            } else {
+                                normalize::normalize_one_descriptor_bound_staged_with_metadata_policy(
+                                    &analysis.descriptor,
+                                    output,
+                                    &plan,
+                                    *fmt,
+                                    &analysis.analysis,
+                                    &metadata_options.policy,
+                                    output_conflict_policy,
+                                )
+                            }
+                            .map_err(|error| error.to_string())?;
+                            let metadata_report = staged.metadata_report().cloned();
+                            let staged_metadata_report = stage_requested_metadata_fidelity_report(
+                                metadata_options,
+                                metadata_report.as_ref(),
+                                cli.overwrite,
+                            )?;
+                            let outcome = staged.commit()?;
+                            publish_requested_metadata_fidelity_report(
+                                metadata_options,
+                                staged_metadata_report,
+                            )?;
+                            verify_requested_metadata_fidelity_report(
+                                metadata_options,
+                                metadata_report.as_ref(),
+                            )?;
+                            (outcome.source, outcome.gain)
+                        } else if let Some(analysis) = cached_analysis.as_ref() {
+                            let staged = if let Some(watch_output) = watch_output.as_ref() {
+                                normalize::normalize_one_descriptor_bound_staged_with_watch_output(
+                                    &analysis.descriptor,
+                                    output,
+                                    &plan,
+                                    *fmt,
+                                    &analysis.analysis,
+                                    output_conflict_policy,
+                                    watch_output,
+                                )
+                            } else {
+                                normalize::normalize_one_descriptor_bound_staged_with_policy(
+                                    &analysis.descriptor,
+                                    output,
+                                    &plan,
+                                    *fmt,
+                                    &analysis.analysis,
+                                    output_conflict_policy,
+                                )
+                            }
+                            .map_err(|error| error.to_string())?;
+                            let outcome = staged.commit()?;
+                            (outcome.source, outcome.gain)
                         } else {
                             let descriptor = input_descriptor_for_path(
                                 input,
                                 channel_roles_override.as_deref(),
                                 audio_track,
                             )?;
-                            normalize::normalize_one_descriptor_with_policy(
-                                &descriptor,
-                                output,
-                                &plan,
-                                *fmt,
-                                output_conflict_policy,
-                            )
-                            .map_err(|error| error.to_string())?
+                            if let Some(watch_output) = watch_output.as_ref() {
+                                let staged =
+                                    normalize::normalize_one_descriptor_staged_with_watch_output(
+                                        &descriptor,
+                                        output,
+                                        &plan,
+                                        *fmt,
+                                        output_conflict_policy,
+                                        watch_output,
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                                let outcome = staged.commit()?;
+                                (outcome.source, outcome.gain)
+                            } else {
+                                normalize::normalize_one_descriptor_with_policy(
+                                    &descriptor,
+                                    output,
+                                    &plan,
+                                    *fmt,
+                                    output_conflict_policy,
+                                )
+                                .map_err(|error| error.to_string())?
+                            }
                         };
                         print_analysis(input, &an, Some(gain));
                         catalogue_measurement = Some(an);
@@ -2473,6 +2972,151 @@ fn write_difference_report(
         &NormalizationDifferenceReport::new(assets),
         overwrite,
     )
+}
+
+fn stage_metadata_fidelity_report(
+    path: &Path,
+    report: &MetadataFidelityReport,
+    overwrite: bool,
+) -> Result<StagedFileOutput, String> {
+    report.validate().map_err(|error| error.to_string())?;
+    let encoded = metadata_fidelity_report_bytes(report)?;
+    stage_file_atomically(path, overwrite, |file| {
+        file.write_all(&encoded)
+            .map_err(|error| format!("write metadata fidelity report: {error}"))
+    })
+}
+
+fn metadata_fidelity_report_bytes(report: &MetadataFidelityReport) -> Result<Vec<u8>, String> {
+    report.validate().map_err(|error| error.to_string())?;
+    let mut encoded = serde_json::to_vec_pretty(report)
+        .map_err(|error| format!("encode metadata fidelity report: {error}"))?;
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+/// A committed metadata-only transaction may be resumed after its report was
+/// already published but before the process returned success. Recognize only
+/// the exact deterministic report bytes through the same bounded, symlink-safe
+/// stable-input capture used elsewhere; a different destination still follows
+/// the caller's normal overwrite/no-clobber policy.
+fn metadata_fidelity_report_is_published(
+    options: &MetadataInvocationOptions,
+    report: Option<&MetadataFidelityReport>,
+) -> Result<bool, String> {
+    let (Some(path), Some(report)) = (options.report.as_deref(), report) else {
+        return Ok(false);
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "metadata fidelity report must not be a symbolic link: {}",
+                path.display()
+            ));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(format!(
+                "metadata fidelity report is not a regular file: {}",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "inspect metadata fidelity report {}: {error}",
+                path.display()
+            ));
+        }
+    }
+    let expected = metadata_fidelity_report_bytes(report)?;
+    let expected_byte_len = u64::try_from(expected.len())
+        .map_err(|_| "metadata fidelity report length does not fit u64".to_string())?;
+    let maximum_bytes = expected_byte_len.max(1);
+    let options = StableInputOptions::new(maximum_bytes).map_err(|error| error.to_string())?;
+    let observed = match StableInput::from_path(path, &options) {
+        Ok(observed) => observed,
+        Err(error)
+            if error.kind()
+                == forge_normalizer::stable_input::StableInputErrorKind::LimitExceeded =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(format!("read metadata fidelity report: {error}")),
+    };
+    Ok(observed.byte_len() == expected_byte_len
+        && observed.binding().sha256_hex()
+            == forge_normalizer::metadata_fidelity::sha256_hex(&expected))
+}
+
+fn stage_requested_metadata_fidelity_report(
+    options: &MetadataInvocationOptions,
+    report: Option<&MetadataFidelityReport>,
+    overwrite: bool,
+) -> Result<Option<StagedFileOutput>, String> {
+    match (options.report.as_deref(), report) {
+        (None, _) => Ok(None),
+        (Some(_), None) => {
+            Err("explicit metadata normalization did not produce fidelity evidence".into())
+        }
+        (Some(path), Some(report)) => {
+            // A retry may reach this point after the report was published but
+            // before the source transaction checkpoint was durable. Treat
+            // the exact deterministic bytes as already published so the
+            // no-clobber path remains idempotent. A different existing file
+            // is still handed to AtomicOutput, which rejects it unless the
+            // caller explicitly selected unchanged-destination replacement.
+            if metadata_fidelity_report_is_published(options, Some(report))? {
+                return Ok(None);
+            }
+            stage_metadata_fidelity_report(path, report, overwrite).map(Some)
+        }
+    }
+}
+
+fn publish_requested_metadata_fidelity_report(
+    options: &MetadataInvocationOptions,
+    output: Option<StagedFileOutput>,
+) -> Result<(), String> {
+    let Some(output) = output else {
+        return Ok(());
+    };
+    let path = options
+        .report
+        .as_deref()
+        .expect("a staged metadata report has a destination");
+    output.commit().map_err(|error| {
+        format!(
+            "audio publication succeeded, but metadata fidelity report publication failed for {}: {error}",
+            path.display()
+        )
+    })?;
+    eprintln!("  metadata fidelity report: {}", path.display());
+    Ok(())
+}
+
+/// Confirm the report bytes immediately before returning success from a
+/// normalization or metadata transaction.  `stage_requested...` deliberately
+/// skips an exact existing report for idempotent retries; this final bounded
+/// read closes the resulting audio/report gap by refusing to report success if
+/// that file was removed or replaced after the initial check.
+fn verify_requested_metadata_fidelity_report(
+    options: &MetadataInvocationOptions,
+    report: Option<&MetadataFidelityReport>,
+) -> Result<(), String> {
+    let Some(path) = options.report.as_deref() else {
+        return Ok(());
+    };
+    let report = report.ok_or(
+        "explicit metadata normalization did not produce fidelity evidence for the requested report",
+    )?;
+    if metadata_fidelity_report_is_published(options, Some(report))? {
+        return Ok(());
+    }
+    Err(format!(
+        "audio publication succeeded, but metadata fidelity report was removed or changed before success: {}",
+        path.display()
+    ))
 }
 
 fn write_timeline(
@@ -2666,8 +3310,9 @@ fn batch_operation_descriptor(
     cli: &cli::Cli,
     plan: &Plan,
     formats: &[OutputFormat],
+    metadata_options: &MetadataInvocationOptions,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let descriptor = serde_json::json!({
         "schema": "forge-normalization-operation-v1",
         "mode": match plan.mode {
             Mode::Lufs => "lufs",
@@ -2697,7 +3342,41 @@ fn batch_operation_descriptor(
         "channel_layout": cli.channel_layout,
         "dual_mono": cli.dual_mono,
         "formats": formats.iter().map(|format| fmt_ext(*format)).collect::<Vec<_>>(),
-    })
+    });
+    metadata_operation_descriptor(descriptor, metadata_options)
+}
+
+fn metadata_operation_descriptor(
+    mut descriptor: serde_json::Value,
+    metadata_options: &MetadataInvocationOptions,
+) -> serde_json::Value {
+    if !metadata_options.active_for_normalization() {
+        // Keep the historical operation byte-for-byte compatible when the
+        // explicit fidelity contract is not selected. Existing batch/watch
+        // state files compare this object exactly on resume.
+        return descriptor;
+    }
+    let object = descriptor
+        .as_object_mut()
+        .expect("operation descriptors are JSON objects");
+    object.insert(
+        "metadata_policy".into(),
+        serde_json::to_value(&metadata_options.policy)
+            .expect("metadata policy serialization cannot fail"),
+    );
+    object.insert(
+        "metadata_registry_revision".into(),
+        forge_normalizer::metadata_fidelity::METADATA_REGISTRY_REVISION.into(),
+    );
+    object.insert(
+        "metadata_timing_revision".into(),
+        forge_normalizer::metadata_fidelity::METADATA_TIMING_REVISION.into(),
+    );
+    object.insert(
+        "metadata_fidelity_schema_version".into(),
+        forge_normalizer::metadata_fidelity::METADATA_FIDELITY_SCHEMA_VERSION.into(),
+    );
+    descriptor
 }
 
 fn validate_control_paths(
@@ -2729,6 +3408,39 @@ fn validate_control_paths(
         return Err("--job-state and --progress require different paths".into());
     }
     Ok(())
+}
+
+fn validate_metadata_control_paths(
+    cli: &cli::Cli,
+    options: &MetadataInvocationOptions,
+) -> Result<(), String> {
+    let protected = cli
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(index, path)| ProtectedPath::new(format!("metadata input {index}"), path))
+        .collect::<Vec<_>>();
+    let mut outputs = Vec::new();
+    if let Some(path) = &options.job_state {
+        outputs.push(PlannedOutput::new("metadata transaction state", path, true));
+        outputs.push(PlannedOutput::new(
+            "metadata transaction state lock",
+            state_lock_path(path)?,
+            true,
+        ));
+    }
+    if let Some(path) = &options.report {
+        // A committed metadata job may have published this exact report just
+        // before the prior process stopped. Let recovery inspect it; the
+        // deterministic byte comparison below still rejects a different file
+        // unless the caller explicitly requested overwrite.
+        outputs.push(PlannedOutput::new(
+            "metadata fidelity report",
+            path,
+            cli.overwrite || options.job_state.is_some(),
+        ));
+    }
+    OutputPlan::new(protected, outputs).map(drop)
 }
 
 fn validate_catalogue_paths(
@@ -3186,6 +3898,7 @@ fn write_loudness_tags(
     cli: &cli::Cli,
     channel_roles: Option<&[forge_normalizer::wav::ChannelRole]>,
     cache: Option<&AnalysisCache>,
+    metadata_options: &MetadataInvocationOptions,
 ) -> Result<(), String> {
     let analyses: Vec<_> = cli
         .inputs
@@ -3216,6 +3929,26 @@ fn write_loudness_tags(
                 .fold(0.0_f32, f32::max),
         )
     });
+    if let Some(state) = metadata_options.job_state.as_deref() {
+        let input = cli
+            .inputs
+            .first()
+            .ok_or("metadata transaction requires one input")?;
+        let analysis = analyses
+            .first()
+            .ok_or("metadata transaction requires one analysis")?;
+        print_analysis(input, analysis, None);
+        return write_loudness_tags_transaction(
+            cli,
+            input,
+            analysis,
+            album,
+            isobmff_album,
+            channel_roles,
+            state,
+            metadata_options,
+        );
+    }
     for (input, analysis) in cli.inputs.iter().zip(&analyses) {
         print_analysis(input, analysis, None);
         let scheme = forge_normalizer::metadata::loudness_metadata_scheme(input)?;
@@ -3276,6 +4009,288 @@ fn write_loudness_tags(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_loudness_tags_transaction(
+    cli: &cli::Cli,
+    input: &Path,
+    analysis: &Analysis,
+    album: Option<(f64, f32)>,
+    isobmff_album: Option<(f64, f32, f32)>,
+    channel_roles: Option<&[ChannelRole]>,
+    state: &Path,
+    metadata_options: &MetadataInvocationOptions,
+) -> Result<(), String> {
+    let is_isobmff = forge_normalizer::metadata::is_isobmff_file(input)?;
+    let operation = serde_json::json!({
+        "schema": "forge-metadata-loudness-operation-v1",
+        "analysis": analysis_operation_evidence(analysis),
+        "album": album.map(|(lufs, peak)| serde_json::json!({
+            "lufs_bits": format!("{:016x}", lufs.to_bits()),
+            "true_peak_bits": format!("{:08x}", peak.to_bits()),
+        })),
+        "isobmff_album": isobmff_album.map(|(lufs, sample_peak, true_peak)| serde_json::json!({
+            "lufs_bits": format!("{:016x}", lufs.to_bits()),
+            "sample_peak_bits": format!("{:08x}", sample_peak.to_bits()),
+            "true_peak_bits": format!("{:08x}", true_peak.to_bits()),
+        })),
+        "sound_check": cli.sound_check,
+        "isobmff": is_isobmff,
+        "metadata_policy": metadata_options.policy,
+        "metadata_registry_revision": forge_normalizer::metadata_fidelity::METADATA_REGISTRY_REVISION,
+        "metadata_timing_revision": forge_normalizer::metadata_fidelity::METADATA_TIMING_REVISION,
+        "metadata_fidelity_schema_version": forge_normalizer::metadata_fidelity::METADATA_FIDELITY_SCHEMA_VERSION,
+    });
+    let request = MetadataTransactionRequest::new(input, state, operation)
+        .with_policy(metadata_options.policy.policy());
+    let resume = MetadataTransaction::resume(request)?;
+    let receipt = match resume {
+        MetadataResume::Prepared(transaction) => {
+            let policy = metadata_options.policy.clone();
+            let explicit_fidelity = metadata_options.active_for_normalization();
+            let fidelity_report = RefCell::new(None);
+            let ready = transaction.stage(
+                |stage| {
+                    let expected_sound_check = cli
+                        .sound_check
+                        .then(|| {
+                            forge_normalizer::metadata::SoundCheck::from_r128(
+                                analysis.lufs,
+                                analysis.sample_peak,
+                            )
+                        })
+                        .transpose()?;
+                    let (scheme, isobmff_written) = if explicit_fidelity {
+                        let result = forge_normalizer::write_loudness_metadata_with_fidelity(
+                            stage,
+                            analysis,
+                            album,
+                            isobmff_album,
+                            expected_sound_check.as_ref(),
+                            &policy,
+                        )?;
+                        *fidelity_report.borrow_mut() = Some(result.report().clone());
+                        (result.scheme(), result.isobmff_written())
+                    } else {
+                        let scheme = forge_normalizer::metadata::write_loudness_metadata(
+                            stage,
+                            analysis.lufs,
+                            analysis.true_peak,
+                            album,
+                        )?;
+                        if let Some(expected) = expected_sound_check.as_ref() {
+                            forge_normalizer::metadata::write_sound_check(stage, expected)?;
+                        }
+                        let isobmff_written = is_isobmff
+                            && forge_normalizer::metadata::write_isobmff_loudness_metadata(
+                                stage,
+                                analysis,
+                                isobmff_album,
+                            )?;
+                        (scheme, isobmff_written)
+                    };
+                    let sound_check = expected_sound_check.as_ref().map(|value| {
+                        serde_json::json!({
+                            "engineering_gain_db_bits": format!(
+                                "{:016x}",
+                                value.engineering_gain_db().to_bits()
+                            ),
+                            "engineering_sample_peak_bits": format!(
+                                "{:016x}",
+                                value.engineering_sample_peak().to_bits()
+                            ),
+                        })
+                    });
+                    Ok(serde_json::json!({
+                        "loudness_scheme": scheme.label(),
+                        "sound_check": sound_check,
+                        "isobmff_loudness_written": isobmff_written,
+                    }))
+                },
+                |stage| {
+                    let round_trip = normalize::analyze_file_with_roles(stage, channel_roles)?;
+                    require_same_audio_analysis(analysis, &round_trip)?;
+                    let fidelity = if explicit_fidelity {
+                        let report = fidelity_report.borrow_mut().take().ok_or(
+                            "metadata transaction is missing its loudness fidelity report",
+                        )?;
+                        report
+                            .require_publication()
+                            .map_err(|error| error.to_string())?;
+                        Some(report)
+                    } else {
+                        None
+                    };
+                    Ok(serde_json::json!({
+                        "schema": "forge-metadata-loudness-verification-v1",
+                        "audio_round_trip": analysis_operation_evidence(&round_trip),
+                        "metadata_fidelity_report": fidelity,
+                    }))
+                },
+            )?;
+            let fidelity =
+                validated_transaction_fidelity(ready.verification(), analysis, metadata_options)?;
+            let staged_report = stage_requested_metadata_fidelity_report(
+                metadata_options,
+                fidelity.as_ref(),
+                cli.overwrite,
+            )?;
+            let receipt = ready.commit()?;
+            publish_requested_metadata_fidelity_report(metadata_options, staged_report)?;
+            verify_requested_metadata_fidelity_report(metadata_options, fidelity.as_ref())?;
+            receipt
+        }
+        MetadataResume::Ready(ready) => {
+            let fidelity =
+                validated_transaction_fidelity(ready.verification(), analysis, metadata_options)?;
+            let staged_report = stage_requested_metadata_fidelity_report(
+                metadata_options,
+                fidelity.as_ref(),
+                cli.overwrite,
+            )?;
+            let receipt = ready.commit()?;
+            publish_requested_metadata_fidelity_report(metadata_options, staged_report)?;
+            verify_requested_metadata_fidelity_report(metadata_options, fidelity.as_ref())?;
+            receipt
+        }
+        MetadataResume::Committed(receipt) => {
+            let fidelity =
+                validated_transaction_fidelity(receipt.verification(), analysis, metadata_options)?;
+            let report_was_staged = stage_requested_metadata_fidelity_report(
+                metadata_options,
+                fidelity.as_ref(),
+                cli.overwrite,
+            )?;
+            if report_was_staged.is_some() {
+                publish_requested_metadata_fidelity_report(metadata_options, report_was_staged)?;
+            } else if let Some(path) = metadata_options.report.as_deref() {
+                // `stage_requested_metadata_fidelity_report` returns None
+                // for an exact existing report (and only for that case when
+                // a report path was requested).
+                eprintln!("  metadata fidelity report: {}", path.display());
+            }
+            verify_requested_metadata_fidelity_report(metadata_options, fidelity.as_ref())?;
+            receipt
+        }
+        _ => return Err("unsupported metadata transaction resume state".into()),
+    };
+    eprintln!(
+        "  metadata transaction committed: {} (output sha256 {})",
+        receipt.job_id(),
+        receipt.output_sha256()
+    );
+    Ok(())
+}
+
+fn analysis_operation_evidence(analysis: &Analysis) -> serde_json::Value {
+    serde_json::json!({
+        "sample_rate_hz": analysis.sample_rate,
+        "channels": analysis.channels,
+        "channel_roles": analysis
+            .channel_roles
+            .iter()
+            .map(|role| format!("{role:?}"))
+            .collect::<Vec<_>>(),
+        "frames": analysis.frames,
+        "pcm_kind": format!("{:?}", analysis.kind),
+        "integrated_lufs_bits": format!("{:016x}", analysis.lufs.to_bits()),
+        "max_momentary_lufs_bits": format!("{:016x}", analysis.max_momentary_lufs.to_bits()),
+        "max_short_term_lufs_bits": format!("{:016x}", analysis.max_short_term_lufs.to_bits()),
+        "loudness_range_lu_bits": format!("{:016x}", analysis.loudness_range_lu.to_bits()),
+        "rms_db_bits": format!("{:016x}", analysis.rms_db.to_bits()),
+        "sample_peak_bits": format!("{:08x}", analysis.sample_peak.to_bits()),
+        "true_peak_bits": format!("{:08x}", analysis.true_peak.to_bits()),
+        "loudness_block_count": analysis.loudness_blocks.len(),
+        "loudness_blocks_sha256": loudness_blocks_sha256(&analysis.loudness_blocks),
+    })
+}
+
+fn loudness_blocks_sha256(blocks: &[f64]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"forge-loudness-block-bits-v1\0");
+    hasher.update((blocks.len() as u64).to_be_bytes());
+    for value in blocks {
+        hasher.update(value.to_bits().to_be_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn require_same_audio_analysis(expected: &Analysis, actual: &Analysis) -> Result<(), String> {
+    if analysis_operation_evidence(expected) != analysis_operation_evidence(actual) {
+        return Err(
+            "metadata-only transaction changed decoded audio or its exact measurement evidence"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn fidelity_report_from_verification(
+    verification: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<MetadataFidelityReport>, String> {
+    let Some(value) = verification
+        .get("metadata_fidelity_report")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    let report: MetadataFidelityReport = serde_json::from_value(value.clone())
+        .map_err(|error| format!("decode metadata fidelity transaction evidence: {error}"))?;
+    report.validate().map_err(|error| error.to_string())?;
+    Ok(Some(report))
+}
+
+fn validated_transaction_fidelity(
+    verification: Option<&serde_json::Value>,
+    expected_analysis: &Analysis,
+    options: &MetadataInvocationOptions,
+) -> Result<Option<MetadataFidelityReport>, String> {
+    let verification = verification
+        .and_then(serde_json::Value::as_object)
+        .ok_or("metadata transaction is missing typed verification evidence")?;
+    if verification
+        .get("schema")
+        .and_then(serde_json::Value::as_str)
+        != Some("forge-metadata-loudness-verification-v1")
+    {
+        return Err("metadata transaction verification schema is invalid".into());
+    }
+    let round_trip = verification
+        .get("audio_round_trip")
+        .ok_or("metadata transaction is missing audio round-trip evidence")?;
+    if round_trip != &analysis_operation_evidence(expected_analysis) {
+        return Err(
+            "metadata transaction audio round-trip evidence does not match the current decoded analysis"
+                .into(),
+        );
+    }
+    let report = fidelity_report_from_verification(verification)?;
+    if options.active_for_normalization() {
+        let report = report
+            .as_ref()
+            .ok_or("metadata transaction is missing its fidelity report evidence")?;
+        if report.policy() != &options.policy {
+            return Err("metadata transaction fidelity policy does not match this request".into());
+        }
+        if report.evidence().registry_revision()
+            != forge_normalizer::metadata_fidelity::METADATA_REGISTRY_REVISION
+            || report.evidence().timing_revision()
+                != forge_normalizer::metadata_fidelity::METADATA_TIMING_REVISION
+        {
+            return Err(
+                "metadata transaction fidelity revisions do not match this executable".into(),
+            );
+        }
+        report
+            .require_publication()
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(report)
 }
 
 fn expand_inputs(
@@ -3341,6 +4356,7 @@ fn build_output_plan(
     cli: &cli::Cli,
     batch_options: &BatchOptions,
     catalogue_options: &CatalogueOptions,
+    metadata_options: &MetadataInvocationOptions,
     anomaly_audits: &[PathBuf],
     ebu_qc_xml: Option<&Path>,
     audio_outputs: &[PathBuf],
@@ -3430,6 +4446,13 @@ fn build_output_plan(
     }
     if let Some(path) = &catalogue_options.report {
         outputs.push(PlannedOutput::new("catalogue report", path, cli.overwrite));
+    }
+    if let Some(path) = &metadata_options.report {
+        outputs.push(PlannedOutput::new(
+            "metadata fidelity report",
+            path,
+            cli.overwrite,
+        ));
     }
     OutputPlan::new(protected, outputs)
 }
