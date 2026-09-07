@@ -13,11 +13,11 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::subprocess::{MonitoredDirectory, MonitoredFile, ProcessSpec};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const VALIDATOR: &str = "forge-ac4-reference-adapter-1";
@@ -33,6 +33,9 @@ pub const REPORT_SCHEMA_V2: &str =
     "https://penguin425.github.io/audio-normalizer/schema/ac4-adapter-report-v2";
 
 const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+const WORKSPACE_REQUEST_ALLOWANCE_BYTES: u64 = 16 * 1024 * 1024;
+const WORKSPACE_FILE_COUNT_ALLOWANCE: u64 = 8;
+const RENDER_HEADER_ALLOWANCE: u64 = 1024 * 1024;
 const MAX_PRESENTATIONS: usize = 256;
 const HARD_MAX_DECODED_SAMPLES: u64 = 200_000_000;
 const MAX_TIMEOUT_SECONDS: u64 = 3_600;
@@ -283,16 +286,17 @@ pub fn run_v2(options: &AdapterOptions) -> Result<Ac4AdapterReportV2, String> {
     validate_options(options)?;
     let input = fs::canonicalize(&options.input)
         .map_err(|error| format!("resolve AC-4 input {}: {error}", options.input.display()))?;
-    let adapter = fs::canonicalize(&options.adapter).map_err(|error| {
+    let adapter_identity = ProcessSpec::new(&options.adapter).map_err(|error| {
         format!(
             "resolve AC-4 adapter {}: {error}",
             options.adapter.display()
         )
     })?;
+    let adapter = adapter_identity.executable().path().to_path_buf();
     ensure_regular_file(&input, "AC-4 input")?;
     ensure_regular_file(&adapter, "AC-4 adapter")?;
     let (input_sha256, input_bytes) = sha256_file(&input)?;
-    let (adapter_sha256, _) = sha256_file(&adapter)?;
+    let adapter_sha256 = adapter_identity.executable().sha256_hex();
 
     let work = tempfile::tempdir().map_err(|error| format!("create adapter workspace: {error}"))?;
     let renders = work.path().join("renders");
@@ -318,29 +322,61 @@ pub fn run_v2(options: &AdapterOptions) -> Result<Ac4AdapterReportV2, String> {
     let mut request_bytes = serde_json::to_vec_pretty(&request)
         .map_err(|error| format!("serialize AC-4 adapter request: {error}"))?;
     request_bytes.push(b'\n');
+    let request_bytes_len = request_bytes.len();
     fs::write(&request_path, request_bytes)
         .map_err(|error| format!("write AC-4 adapter request: {error}"))?;
 
-    let tool = run_bounded(
-        &adapter,
-        &[
-            "--request".into(),
-            request_path.as_os_str().to_owned(),
-            "--response".into(),
-            response_path.as_os_str().to_owned(),
-        ],
-        Duration::from_secs(options.timeout_seconds),
-    )?;
-    if !tool.status.success() {
+    let max_render_bytes = render_byte_limit(options.max_decoded_samples_per_presentation)?;
+    let workspace_max_bytes =
+        workspace_byte_limit(max_render_bytes, MAX_PRESENTATIONS, request_bytes_len)?;
+    let mut process = ProcessSpec::from_executable(adapter_identity.executable().clone());
+    process
+        .arg("--request")
+        .arg(request_path.as_os_str())
+        .arg("--response")
+        .arg(response_path.as_os_str())
+        .env_policy(crate::subprocess::EnvPolicy::Minimal)
+        .stdin(crate::subprocess::StdinMode::Null)
+        .stdout(crate::subprocess::OutputMode::capture(TOOL_OUTPUT_LIMIT))
+        .stderr(crate::subprocess::OutputMode::capture(TOOL_OUTPUT_LIMIT))
+        .timeout(Duration::from_secs(options.timeout_seconds))
+        .current_dir(work.path().to_path_buf())
+        .monitor_file(MonitoredFile::new(
+            &response_path,
+            MAX_RESPONSE_BYTES,
+            "AC-4 adapter response",
+        ))
+        .monitor_directory(MonitoredDirectory::new(
+            work.path().to_path_buf(),
+            workspace_max_bytes,
+            MAX_PRESENTATIONS as u64 + WORKSPACE_FILE_COUNT_ALLOWANCE,
+            "AC-4 adapter workspace",
+        ));
+    let tool = crate::subprocess::run(process).map_err(|error| match error {
+        crate::subprocess::Error::OutputLimit { .. } => {
+            "AC-4 adapter output exceeded its 1 MiB safety limit".to_owned()
+        }
+        crate::subprocess::Error::TimedOut => format!(
+            "AC-4 adapter exceeded the {} second timeout",
+            options.timeout_seconds
+        ),
+        crate::subprocess::Error::Spawn(error) => {
+            format!("start AC-4 adapter {}: {error}", adapter.display())
+        }
+        crate::subprocess::Error::Wait(error) => {
+            format!("wait for AC-4 adapter: {error}")
+        }
+        crate::subprocess::Error::Reader { stream, message } => {
+            format!("read adapter {stream}: {message}")
+        }
+        error => format!("run AC-4 adapter: {error}"),
+    })?;
+    if !tool.success() {
         return Err(format!(
             "AC-4 adapter failed ({}): {}",
-            tool.status,
-            String::from_utf8_lossy(&tool.stderr).trim()
+            tool.status(),
+            String::from_utf8_lossy(tool.stderr()).trim()
         ));
-    }
-    let (adapter_after, _) = sha256_file(&adapter)?;
-    if adapter_after != adapter_sha256 {
-        return Err("AC-4 adapter executable changed while it was running".into());
     }
     let response_bytes = read_response(work.path(), &response_path)?;
     let settings_sha256 = sha256_bytes(&response_bytes);
@@ -358,7 +394,8 @@ pub fn run_v2(options: &AdapterOptions) -> Result<Ac4AdapterReportV2, String> {
     let mut results = Vec::with_capacity(response.presentations.len());
     for presentation in response.presentations {
         let rendered = resolve_render(&render_root, &presentation.rendered_path)?;
-        let (rendered_sha256, rendered_bytes) = sha256_file(&rendered)?;
+        let (rendered_sha256, rendered_bytes) =
+            sha256_file_limited(&rendered, max_render_bytes, "AC-4 adapter render")?;
         let (mut buffer, decoded_layout) = decoder::decode_limited_with_channel_layout(
             &rendered,
             options.max_decoded_samples_per_presentation,
@@ -386,7 +423,8 @@ pub fn run_v2(options: &AdapterOptions) -> Result<Ac4AdapterReportV2, String> {
             };
         let channel_layout = ChannelLayoutDescriptor::rendered(assignments, renderer)?;
         let measured = analysis::analyze(&buffer);
-        let (rendered_after, rendered_bytes_after) = sha256_file(&rendered)?;
+        let (rendered_after, rendered_bytes_after) =
+            sha256_file_limited(&rendered, max_render_bytes, "AC-4 adapter render")?;
         if rendered_after != rendered_sha256 || rendered_bytes_after != rendered_bytes {
             return Err(format!(
                 "presentation {} render changed while it was being measured",
@@ -584,6 +622,30 @@ fn validate_options(options: &AdapterOptions) -> Result<(), String> {
     Ok(())
 }
 
+fn render_byte_limit(max_decoded_samples: u64) -> Result<u64, String> {
+    max_decoded_samples
+        .checked_mul(8)
+        .and_then(|bytes| bytes.checked_add(RENDER_HEADER_ALLOWANCE))
+        .ok_or_else(|| "AC-4 render byte limit overflow".to_string())
+}
+
+fn workspace_byte_limit(
+    max_render_bytes: u64,
+    max_presentations: usize,
+    request_bytes: usize,
+) -> Result<u64, String> {
+    let max_presentations = u64::try_from(max_presentations)
+        .map_err(|_| "AC-4 adapter presentation count does not fit in u64".to_string())?;
+    let request_bytes = u64::try_from(request_bytes)
+        .map_err(|_| "AC-4 adapter request length does not fit in u64".to_string())?;
+    max_render_bytes
+        .checked_mul(max_presentations)
+        .and_then(|bytes| bytes.checked_add(MAX_RESPONSE_BYTES))
+        .and_then(|bytes| bytes.checked_add(request_bytes))
+        .and_then(|bytes| bytes.checked_add(WORKSPACE_REQUEST_ALLOWANCE_BYTES))
+        .ok_or_else(|| "AC-4 adapter workspace byte limit overflow".to_string())
+}
+
 fn validate_response(response: &AdapterResponse, input_sha256: &str) -> Result<(), String> {
     if response.schema != RESPONSE_SCHEMA || response.protocol_version != PROTOCOL_VERSION {
         return Err("unsupported AC-4 adapter response schema or protocol version".into());
@@ -709,16 +771,19 @@ fn validate_relative_path(path: &Path) -> Result<(), String> {
 
 fn resolve_render(root: &Path, relative: &Path) -> Result<PathBuf, String> {
     validate_relative_path(relative)?;
-    let path = fs::canonicalize(root.join(relative))
+    let candidate = root.join(relative);
+    let resolved = fs::canonicalize(&candidate)
         .map_err(|error| format!("resolve adapter render {}: {error}", relative.display()))?;
-    if !path.starts_with(root) {
+    if !resolved.starts_with(root) {
         return Err(format!(
             "adapter render escapes its output directory: {}",
             relative.display()
         ));
     }
-    ensure_regular_file(&path, "adapter render")?;
-    Ok(path)
+    // Keep the original path for the no-follow open below.  Returning the
+    // canonical target here would erase a final symlink before the bounded
+    // reader had a chance to reject it.
+    Ok(candidate)
 }
 
 fn read_response(work: &Path, path: &Path) -> Result<Vec<u8>, String> {
@@ -729,22 +794,19 @@ fn read_response(work: &Path, path: &Path) -> Result<Vec<u8>, String> {
     if !resolved.starts_with(root) {
         return Err("AC-4 adapter response escapes its workspace".into());
     }
-    let metadata =
-        fs::metadata(&resolved).map_err(|error| format!("stat AC-4 adapter response: {error}"))?;
-    if !metadata.is_file() || metadata.len() > MAX_RESPONSE_BYTES {
-        return Err(format!(
-            "AC-4 adapter response must be a regular file no larger than {MAX_RESPONSE_BYTES} bytes"
-        ));
-    }
-    fs::read(&resolved).map_err(|error| format!("read AC-4 adapter response: {error}"))
+    read_bounded_file(path, MAX_RESPONSE_BYTES, "AC-4 adapter response")
 }
 
 fn ensure_regular_file(path: &Path, label: &str) -> Result<(), String> {
-    let metadata = fs::metadata(path).map_err(|error| format!("stat {label}: {error}"))?;
-    if !metadata.is_file() {
-        return Err(format!("{label} must be a regular file"));
+    match open_regular_file(path, None) {
+        Ok(_) => Ok(()),
+        Err(SafeFileError::Open(error) | SafeFileError::Metadata(error)) => {
+            Err(format!("stat {label}: {error}"))
+        }
+        Err(SafeFileError::NotRegular | SafeFileError::Reparse | SafeFileError::TooLarge(_)) => {
+            Err(format!("{label} must be a regular file"))
+        }
     }
-    Ok(())
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -757,7 +819,13 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 }
 
 fn sha256_file(path: &Path) -> Result<(String, u64), String> {
-    let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let (mut file, _) = open_regular_file(path, None).map_err(|error| match error {
+        SafeFileError::Open(error) => format!("open {}: {error}", path.display()),
+        SafeFileError::Metadata(error) => format!("stat {}: {error}", path.display()),
+        SafeFileError::NotRegular | SafeFileError::Reparse | SafeFileError::TooLarge(_) => {
+            format!("{} must be a regular file", path.display())
+        }
+    })?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     let mut bytes = 0_u64;
@@ -781,82 +849,129 @@ fn sha256_file(path: &Path) -> Result<(String, u64), String> {
     Ok((hex, bytes))
 }
 
-struct ToolOutput {
-    status: ExitStatus,
-    stderr: Vec<u8>,
+fn sha256_file_limited(path: &Path, max_bytes: u64, label: &str) -> Result<(String, u64), String> {
+    let (file, _) = open_regular_file(path, Some(max_bytes)).map_err(|error| match error {
+        SafeFileError::Open(error) => format!("open {}: {error}", path.display()),
+        SafeFileError::Metadata(error) => format!("stat {label}: {error}"),
+        SafeFileError::NotRegular | SafeFileError::Reparse => {
+            format!("{label} must be a regular file")
+        }
+        SafeFileError::TooLarge(actual) => {
+            format!(
+                "{label} {} exceeds {max_bytes} bytes (size {actual})",
+                path.display()
+            )
+        }
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut bytes = 0_u64;
+    let mut file = file.take(max_bytes.saturating_add(1));
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| format!("{label} length overflow"))?;
+        if bytes > max_bytes {
+            return Err(format!(
+                "{label} {} exceeds {max_bytes} bytes (size at least {bytes})",
+                path.display()
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok((hex, bytes))
 }
 
-fn run_bounded(
-    executable: &Path,
-    args: &[std::ffi::OsString],
-    timeout: Duration,
-) -> Result<ToolOutput, String> {
-    let mut stdout_file =
-        tempfile::tempfile().map_err(|error| format!("create stdout spool: {error}"))?;
-    let mut stderr_file =
-        tempfile::tempfile().map_err(|error| format!("create stderr spool: {error}"))?;
-    let mut child = Command::new(executable)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(
-            stdout_file
-                .try_clone()
-                .map_err(|error| format!("clone stdout spool: {error}"))?,
-        ))
-        .stderr(Stdio::from(
-            stderr_file
-                .try_clone()
-                .map_err(|error| format!("clone stderr spool: {error}"))?,
-        ))
-        .spawn()
-        .map_err(|error| format!("start AC-4 adapter {}: {error}", executable.display()))?;
-    let started = Instant::now();
-    let status = loop {
-        let stdout_len = stdout_file
-            .metadata()
-            .map_err(|error| format!("stat adapter stdout: {error}"))?
-            .len();
-        let stderr_len = stderr_file
-            .metadata()
-            .map_err(|error| format!("stat adapter stderr: {error}"))?
-            .len();
-        if stdout_len > TOOL_OUTPUT_LIMIT as u64 || stderr_len > TOOL_OUTPUT_LIMIT as u64 {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("AC-4 adapter output exceeded its 1 MiB safety limit".into());
+fn read_bounded_file(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<u8>, String> {
+    let (file, _) = open_regular_file(path, Some(max_bytes)).map_err(|error| match error {
+        SafeFileError::Open(error) => format!("read {label}: {error}"),
+        SafeFileError::Metadata(error) => format!("stat {label}: {error}"),
+        SafeFileError::NotRegular | SafeFileError::Reparse | SafeFileError::TooLarge(_) => {
+            format!("{label} must be a regular file no larger than {max_bytes} bytes")
         }
-        match child
-            .try_wait()
-            .map_err(|error| format!("wait for AC-4 adapter: {error}"))?
-        {
-            Some(status) => break status,
-            None if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "AC-4 adapter exceeded the {} second timeout",
-                    timeout.as_secs()
-                ));
-            }
-            None => thread::sleep(Duration::from_millis(10)),
-        }
-    };
-    let _ = read_bounded(&mut stdout_file, TOOL_OUTPUT_LIMIT, "stdout")?;
-    let stderr = read_bounded(&mut stderr_file, TOOL_OUTPUT_LIMIT, "stderr")?;
-    Ok(ToolOutput { status, stderr })
-}
-
-fn read_bounded(file: &mut File, limit: usize, label: &str) -> Result<Vec<u8>, String> {
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| format!("seek adapter {label}: {error}"))?;
+    })?;
     let mut bytes = Vec::new();
-    file.take(limit as u64 + 1)
+    file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|error| format!("read adapter {label}: {error}"))?;
-    if bytes.len() > limit {
-        return Err(format!("AC-4 adapter {label} exceeded its safety limit"));
+        .map_err(|error| format!("read {label}: {error}"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "{label} must be a regular file no larger than {max_bytes} bytes"
+        ));
     }
     Ok(bytes)
+}
+
+#[derive(Debug)]
+enum SafeFileError {
+    Open(io::Error),
+    Metadata(io::Error),
+    NotRegular,
+    #[allow(dead_code)]
+    Reparse,
+    TooLarge(u64),
+}
+
+fn open_readonly_no_follow(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "safe regular-file opening is unavailable on this platform",
+        ))
+    }
+}
+
+fn open_regular_file(path: &Path, max_bytes: Option<u64>) -> Result<(File, u64), SafeFileError> {
+    let file = open_readonly_no_follow(path).map_err(SafeFileError::Open)?;
+    let metadata = file.metadata().map_err(SafeFileError::Metadata)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(SafeFileError::Reparse);
+        }
+    }
+    if !metadata.is_file() {
+        return Err(SafeFileError::NotRegular);
+    }
+    let bytes = metadata.len();
+    if max_bytes.is_some_and(|limit| bytes > limit) {
+        return Err(SafeFileError::TooLarge(bytes));
+    }
+    Ok((file, bytes))
 }
 
 #[cfg(test)]
@@ -876,6 +991,31 @@ mod tests {
             channel_roles: roles,
             source_kind: PcmKind::S16,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_artifact_reads_reject_final_symlinks() {
+        let work = tempfile::tempdir().unwrap();
+        let target = work.path().join("target");
+        let alias = work.path().join("alias");
+        fs::write(&target, b"safe artifact").unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+
+        let error = read_bounded_file(&alias, 1024, "AC-4 artifact").unwrap_err();
+        assert!(error.contains("AC-4 artifact"), "{error}");
+        let error = sha256_file_limited(&alias, 1024, "AC-4 artifact").unwrap_err();
+        assert!(error.contains("open"), "{error}");
+    }
+
+    #[test]
+    fn bounded_artifact_reads_enforce_size_limit() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("artifact");
+        fs::write(&path, b"012345").unwrap();
+
+        assert!(read_bounded_file(&path, 4, "AC-4 artifact").is_err());
+        assert!(sha256_file_limited(&path, 4, "AC-4 artifact").is_err());
     }
 
     #[test]

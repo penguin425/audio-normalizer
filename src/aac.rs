@@ -1,15 +1,31 @@
 //! Streaming AAC, ALAC, and Vorbis encoding through an optional FFmpeg runtime.
 
-use std::io::Write;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::OnceLock;
+use std::time::Duration;
 
+use crate::subprocess::{
+    run_ffmpeg, spawn_ffmpeg, EnvPolicy, ExecutableIdentity, MonitoredDirectory, MonitoredFile,
+    OutputMode, ProcessSpec, RunningProcess, StdinMode,
+};
 use crate::wav::{MAX_DECODE_SAMPLE_RATE_HZ, MIN_DECODE_SAMPLE_RATE_HZ};
 
+const FFMPEG_CAPABILITY_TIMEOUT: Duration = Duration::from_secs(60);
+const FFMPEG_CAPABILITY_OUTPUT_MAX_BYTES: usize = 4 * 1024 * 1024;
+const FFMPEG_ENCODER_TIMEOUT: Duration = Duration::from_secs(3_600);
+const FFMPEG_ENCODER_STDERR_MAX_BYTES: usize = 1024 * 1024;
+const FFMPEG_ENCODER_OUTPUT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const FFMPEG_WORKSPACE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const FFMPEG_WORKSPACE_MAX_ENTRIES: u64 = 32;
+
 pub struct AacStreamWriter {
-    child: Option<Child>,
-    stdin: Option<ChildStdin>,
+    // The broker contains poison-aware synchronization used only by its
+    // private supervisor. Wrapping it preserves this public writer's existing
+    // UnwindSafe/RefUnwindSafe auto-trait contract without exposing that
+    // synchronization to callers.
+    process: Option<AssertUnwindSafe<RunningProcess>>,
+    _workspace: tempfile::TempDir,
     channels: usize,
     interleaved: Vec<u8>,
     codec: FfmpegCodec,
@@ -47,13 +63,23 @@ impl FfmpegCodec {
     }
 }
 
-static AAC_PREFLIGHT: OnceLock<Result<(), String>> = OnceLock::new();
-static ALAC_PREFLIGHT: OnceLock<Result<(), String>> = OnceLock::new();
-static VORBIS_PREFLIGHT: OnceLock<Result<(), String>> = OnceLock::new();
+#[derive(Clone)]
+struct FfmpegPreflight {
+    identity: ExecutableIdentity,
+    result: Result<(), String>,
+}
+
+static AAC_PREFLIGHT: OnceLock<Result<FfmpegPreflight, String>> = OnceLock::new();
+static ALAC_PREFLIGHT: OnceLock<Result<FfmpegPreflight, String>> = OnceLock::new();
+static VORBIS_PREFLIGHT: OnceLock<Result<FfmpegPreflight, String>> = OnceLock::new();
 
 /// Verify the exact encoder and muxer required by one FFmpeg-backed format.
 /// Results are cached per process after the first successful or failed probe.
 pub fn preflight_ffmpeg(codec: FfmpegCodec) -> Result<(), String> {
+    cached_ffmpeg_preflight(codec)?.result
+}
+
+fn cached_ffmpeg_preflight(codec: FfmpegCodec) -> Result<FfmpegPreflight, String> {
     let slot = match codec {
         FfmpegCodec::Aac => &AAC_PREFLIGHT,
         FfmpegCodec::Alac => &ALAC_PREFLIGHT,
@@ -62,45 +88,77 @@ pub fn preflight_ffmpeg(codec: FfmpegCodec) -> Result<(), String> {
     slot.get_or_init(|| run_ffmpeg_preflight(codec)).clone()
 }
 
-fn run_ffmpeg_preflight(codec: FfmpegCodec) -> Result<(), String> {
-    let encoders = ffmpeg_capability_output("-encoders", codec)?;
-    if !listed_ffmpeg_component(&encoders, codec.encoder(), CapabilityKind::Encoder) {
-        return Err(format!(
-            "FFmpeg {} output requires the exact `{}` encoder, but this runtime does not provide it",
-            codec.name(),
-            codec.encoder()
-        ));
-    }
-    let muxers = ffmpeg_capability_output("-muxers", codec)?;
-    if !listed_ffmpeg_component(&muxers, codec.muxer(), CapabilityKind::Muxer) {
-        return Err(format!(
-            "FFmpeg {} output requires the exact `{}` muxer, but this runtime does not provide it",
-            codec.name(),
-            codec.muxer()
-        ));
-    }
-    Ok(())
-}
-
-fn ffmpeg_capability_output(argument: &str, codec: FfmpegCodec) -> Result<String, String> {
-    let output = Command::new("ffmpeg")
-        .args(["-hide_banner", argument])
-        .output()
+fn run_ffmpeg_preflight(codec: FfmpegCodec) -> Result<FfmpegPreflight, String> {
+    let identity = ProcessSpec::new("ffmpeg")
         .map_err(|error| {
             format!(
                 "inspect FFmpeg {} capabilities: {error}; install `ffmpeg` or choose another format",
                 codec.name()
             )
-        })?;
-    if !output.status.success() {
+        })?
+        .executable()
+        .clone();
+    let workspace = tempfile::Builder::new()
+        .prefix("forge-ffmpeg-preflight-")
+        .tempdir()
+        .map_err(|error| format!("create FFmpeg capability workspace: {error}"))?;
+    let result = (|| {
+        let encoders = ffmpeg_capability_output(&identity, "-encoders", codec, workspace.path())?;
+        if !listed_ffmpeg_component(&encoders, codec.encoder(), CapabilityKind::Encoder) {
+            return Err(format!(
+                "FFmpeg {} output requires the exact `{}` encoder, but this runtime does not provide it",
+                codec.name(),
+                codec.encoder()
+            ));
+        }
+        let muxers = ffmpeg_capability_output(&identity, "-muxers", codec, workspace.path())?;
+        if !listed_ffmpeg_component(&muxers, codec.muxer(), CapabilityKind::Muxer) {
+            return Err(format!(
+                "FFmpeg {} output requires the exact `{}` muxer, but this runtime does not provide it",
+                codec.name(),
+                codec.muxer()
+            ));
+        }
+        Ok(())
+    })();
+    Ok(FfmpegPreflight { identity, result })
+}
+
+fn ffmpeg_capability_output(
+    identity: &ExecutableIdentity,
+    argument: &str,
+    codec: FfmpegCodec,
+    workspace: &Path,
+) -> Result<String, String> {
+    let mut spec = ProcessSpec::from_executable(identity.clone());
+    spec.args(["-hide_banner", argument])
+        .env_policy(EnvPolicy::Minimal)
+        .stdin(StdinMode::Null)
+        .stdout(OutputMode::capture(FFMPEG_CAPABILITY_OUTPUT_MAX_BYTES))
+        .stderr(OutputMode::capture(FFMPEG_ENCODER_STDERR_MAX_BYTES))
+        .timeout(FFMPEG_CAPABILITY_TIMEOUT)
+        .current_dir(workspace.to_path_buf())
+        .monitor_directory(MonitoredDirectory::new(
+            workspace,
+            FFMPEG_WORKSPACE_MAX_BYTES,
+            FFMPEG_WORKSPACE_MAX_ENTRIES,
+            "FFmpeg capability workspace",
+        ));
+    let output = run_ffmpeg(spec).map_err(|error| {
+        format!(
+            "inspect FFmpeg {} capabilities: {error}; install `ffmpeg` or choose another format",
+            codec.name()
+        )
+    })?;
+    if !output.success() {
         return Err(format!(
             "inspect FFmpeg {} capabilities failed with {}: {}",
             codec.name(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            output.status(),
+            String::from_utf8_lossy(output.stderr()).trim()
         ));
     }
-    String::from_utf8(output.stdout)
+    String::from_utf8(output.stdout().to_vec())
         .map_err(|_| "FFmpeg capability output is not valid UTF-8".to_string())
 }
 
@@ -147,9 +205,20 @@ impl AacStreamWriter {
         validate_ffmpeg_sample_rate(codec, sample_rate)?;
         let channel_layout = ffmpeg_channel_layout(codec, channels)?;
         validate_ffmpeg_bitrate(codec, sample_rate, channels, bitrate_kbps)?;
-        preflight_ffmpeg(codec)?;
-        let mut command = Command::new("ffmpeg");
-        command.args([
+        let preflight = cached_ffmpeg_preflight(codec).map_err(|error| {
+            format!(
+                "start FFmpeg {} encoder: {error}; install `ffmpeg` or choose another format",
+                codec.name()
+            )
+        })?;
+        preflight.result.clone()?;
+        let output_path = absolute_output_path(path)?;
+        let workspace = tempfile::Builder::new()
+            .prefix("forge-ffmpeg-encode-")
+            .tempdir()
+            .map_err(|error| format!("create FFmpeg encoder workspace: {error}"))?;
+        let mut spec = ProcessSpec::from_executable(preflight.identity);
+        spec.args([
             "-hide_banner",
             "-loglevel",
             "error",
@@ -171,7 +240,7 @@ impl AacStreamWriter {
         ]);
         match codec {
             FfmpegCodec::Aac => {
-                command.args([
+                spec.args([
                     "-c:a",
                     "aac",
                     "-profile:a",
@@ -185,7 +254,7 @@ impl AacStreamWriter {
                 ]);
             }
             FfmpegCodec::Alac => {
-                command.args([
+                spec.args([
                     "-c:a",
                     "alac",
                     "-compression_level",
@@ -197,7 +266,7 @@ impl AacStreamWriter {
                 ]);
             }
             FfmpegCodec::Vorbis => {
-                command.args([
+                spec.args([
                     "-c:a",
                     "libvorbis",
                     "-b:a",
@@ -207,25 +276,33 @@ impl AacStreamWriter {
                 ]);
             }
         }
-        let mut child = command
-            .arg(path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| {
-                format!(
-                    "start FFmpeg {} encoder: {error}; install `ffmpeg` or choose another format",
-                    codec.name()
-                )
-            })?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("FFmpeg {} encoder did not provide stdin", codec.name()))?;
+        spec.arg(&output_path)
+            .env_policy(EnvPolicy::Minimal)
+            .stdin(StdinMode::Piped)
+            .stdout(OutputMode::Null)
+            .stderr(OutputMode::capture(FFMPEG_ENCODER_STDERR_MAX_BYTES))
+            .timeout(FFMPEG_ENCODER_TIMEOUT)
+            .current_dir(workspace.path().to_path_buf())
+            .monitor_file(MonitoredFile::new(
+                &output_path,
+                FFMPEG_ENCODER_OUTPUT_MAX_BYTES,
+                "FFmpeg encoded output",
+            ))
+            .monitor_directory(MonitoredDirectory::new(
+                workspace.path(),
+                FFMPEG_WORKSPACE_MAX_BYTES,
+                FFMPEG_WORKSPACE_MAX_ENTRIES,
+                "FFmpeg encoder workspace",
+            ));
+        let process = spawn_ffmpeg(spec).map_err(|error| {
+            format!(
+                "start FFmpeg {} encoder: {error}; install `ffmpeg` or choose another format",
+                codec.name()
+            )
+        })?;
         Ok(Self {
-            child: Some(child),
-            stdin: Some(stdin),
+            process: Some(AssertUnwindSafe(process)),
+            _workspace: workspace,
             channels: channels as usize,
             interleaved: Vec::new(),
             codec,
@@ -255,34 +332,52 @@ impl AacStreamWriter {
                     .extend_from_slice(&channel[frame].to_le_bytes());
             }
         }
-        self.stdin
+        self.process
             .as_mut()
             .ok_or_else(|| format!("{} encoder is already finished", self.codec.name()))?
+            .0
             .write_all(&self.interleaved)
             .map_err(|error| format!("write PCM to FFmpeg {} encoder: {error}", self.codec.name()))
     }
 
     pub fn finish(mut self) -> Result<(), String> {
-        self.stdin.take();
-        let child = self
-            .child
+        let process = self
+            .process
             .take()
             .ok_or_else(|| format!("{} encoder is already finished", self.codec.name()))?;
-        let output = child
-            .wait_with_output()
+        let output = process
+            .0
+            .finish()
             .map_err(|error| format!("wait for FFmpeg {} encoder: {error}", self.codec.name()))?;
-        if output.status.success() {
+        if output.success() {
             Ok(())
         } else {
-            let details = String::from_utf8_lossy(&output.stderr);
+            let details = String::from_utf8_lossy(output.stderr());
             Err(format!(
                 "FFmpeg {} encoder failed with {}: {}",
                 self.codec.name(),
-                output.status,
+                output.status(),
                 details.trim()
             ))
         }
     }
+}
+
+fn absolute_output_path(path: &Path) -> Result<std::path::PathBuf, String> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("FFmpeg output path has no file name: {}", path.display()))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = std::fs::canonicalize(parent).map_err(|error| {
+        format!(
+            "resolve FFmpeg output directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    Ok(parent.join(name))
 }
 
 fn validate_ffmpeg_sample_rate(codec: FfmpegCodec, sample_rate: u32) -> Result<(), String> {
@@ -416,17 +511,19 @@ fn vorbis_bitrate_range(sample_rate: u32, channels: u16) -> Option<(i32, i32)> {
 
 impl Drop for AacStreamWriter {
     fn drop(&mut self) {
-        self.stdin.take();
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.process.take();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_writer_preserves_public_unwind_safety() {
+        fn assert_traits<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        assert_traits::<AacStreamWriter>();
+    }
 
     #[test]
     fn capability_parser_requires_exact_audio_encoder_and_muxer_names() {

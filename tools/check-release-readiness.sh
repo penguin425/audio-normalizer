@@ -22,6 +22,8 @@ if [[ "$workflow_check_version" != "6.0.3" ]]; then
   exit 1
 fi
 "$workflow_check_python" tools/check-workflow-pins.py
+python3 tools/check-subprocess-boundary.py
+python3 -m unittest tools/test_subprocess_boundary.py
 python3 tools/check-schema-registry.py
 python3 -m unittest tools/test_schema_registry.py
 IFS=$'\t' read -r version target_dir < <(

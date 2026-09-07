@@ -18,9 +18,10 @@ use crate::service_runtime::{
 };
 use crate::stable_input::StableInputOptions;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -44,6 +45,11 @@ pub const SERVICE_HEALTH_SCHEMA: &str =
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HEADER_VALUE_BYTES: usize = 8 * 1024;
+const BEARER_PREFIX: &[u8] = b"Bearer ";
+// REST header limits include the `Bearer ` scheme prefix. Keep the configured
+// secret bound below that wire limit so every accepted token can actually be
+// sent through both the REST parser and the shared security policy.
+const MAX_BEARER_TOKEN_BYTES: usize = MAX_HEADER_VALUE_BYTES - BEARER_PREFIX.len();
 const MAX_FILENAME_BYTES: usize = 256;
 const MAX_ERROR_BYTES: usize = 512;
 const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -52,21 +58,46 @@ const DEFAULT_WORKERS: usize = 4;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const UPLOAD_READ_CHUNK_BYTES: usize = 64 * 1024;
 const DEADLINE_RESPONSE_WRITE_GRACE: Duration = Duration::from_millis(100);
+const MAX_SERVICE_TOKENS: usize = 32;
 // The largest current v3 metadata/wire envelope is about 265 KiB. Reserve a
 // rounded upper allowance so every configured worker can admit one maximum
 // audio body plus the complete bounded protobuf message with room for framing.
 const SERVICE_TRANSPORT_MESSAGE_OVERHEAD_ALLOWANCE_BYTES: u64 = 512 * 1024;
 
-/// Runtime limits and access policy for [`run`].
-#[derive(Clone, Debug)]
+/// Runtime limits and legacy access policy for [`run`].
+///
+/// Security boundary and scoped authentication are supplied through the
+/// additive [`ServiceSecurity`] API.  The fields of this type intentionally
+/// remain unchanged so existing downstream struct literals stay source
+/// compatible.
+#[derive(Clone)]
 pub struct ServiceConfig {
     pub bind: SocketAddr,
     pub max_body_bytes: usize,
     pub max_decoded_samples: u64,
     pub workers: usize,
     pub timeout: Duration,
-    /// When set, every endpoint requires `Authorization: Bearer <token>`.
+    /// Legacy all-scope token for loopback service mode and compatibility
+    /// merging. Non-loopback listeners must use [`ServiceSecurity`] so an
+    /// explicit trusted transport boundary is configured as well.
     pub bearer_token: Option<String>,
+}
+
+impl std::fmt::Debug for ServiceConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServiceConfig")
+            .field("bind", &self.bind)
+            .field("max_body_bytes", &self.max_body_bytes)
+            .field("max_decoded_samples", &self.max_decoded_samples)
+            .field("workers", &self.workers)
+            .field("timeout", &self.timeout)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for ServiceConfig {
@@ -84,6 +115,16 @@ impl Default for ServiceConfig {
 
 impl ServiceConfig {
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_values()?;
+        if !is_loopback_ip(self.bind.ip()) {
+            return Err(
+                "non-loopback service binds require ServiceSecurity::validate_for_config".into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_values(&self) -> Result<(), String> {
         if self.max_body_bytes == 0 || self.max_body_bytes > 512 * 1024 * 1024 {
             return Err("max_body_bytes must be between 1 and 536870912".into());
         }
@@ -99,15 +140,353 @@ impl ServiceConfig {
         if self
             .bearer_token
             .as_ref()
-            .is_some_and(|token| token.is_empty() || token.len() > MAX_HEADER_VALUE_BYTES)
+            .is_some_and(|token| token.is_empty() || token.len() > MAX_BEARER_TOKEN_BYTES)
         {
-            return Err("bearer token must contain 1..=8192 bytes".into());
-        }
-        if !self.bind.ip().is_loopback() && self.bearer_token.is_none() {
-            return Err("a bearer token is required when binding a non-loopback address".into());
+            return Err(format!(
+                "bearer token must contain 1..={MAX_BEARER_TOKEN_BYTES} bytes"
+            ));
         }
         Ok(())
     }
+
+    pub(crate) fn without_legacy_token(mut self) -> Self {
+        // `bearer_token` remains in the public config for source compatibility,
+        // but the runtime only needs the digest retained by ServiceSecurity.
+        // Drop the plaintext before the config is placed in an Arc or handed
+        // to a worker so it is not kept for the lifetime of the listener.
+        self.bearer_token = None;
+        self
+    }
+
+    #[cfg(feature = "grpc-service")]
+    pub(crate) fn validate_values_for_service(&self) -> Result<(), String> {
+        self.validate_values()
+    }
+}
+
+/// Endpoint authorization scope for service bearer tokens.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceScope {
+    /// REST/gRPC analysis methods.
+    Analyze,
+    /// REST has no cancellation endpoint; this scope covers gRPC Cancel.
+    Cancel,
+    /// Health/readiness endpoints.
+    Health,
+    /// Prometheus metrics endpoints.
+    Metrics,
+}
+
+impl ServiceScope {
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Analyze => 1 << 0,
+            Self::Cancel => 1 << 1,
+            Self::Health => 1 << 2,
+            Self::Metrics => 1 << 3,
+        }
+    }
+}
+
+/// A bearer token with an explicit set of service endpoint scopes.
+///
+/// Only a SHA-256 digest is retained after construction.  The digest is
+/// compared with a fixed-length constant-time operation during authorization;
+/// the plaintext secret is not exposed by `Debug`.
+pub struct ScopedServiceToken {
+    digest: [u8; 32],
+    scopes: u8,
+}
+
+impl Clone for ScopedServiceToken {
+    fn clone(&self) -> Self {
+        Self {
+            digest: self.digest,
+            scopes: self.scopes,
+        }
+    }
+}
+
+impl std::fmt::Debug for ScopedServiceToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScopedServiceToken")
+            .field("digest", &"<redacted>")
+            .field("scopes", &self.scopes)
+            .finish()
+    }
+}
+
+impl ScopedServiceToken {
+    /// Hash `secret` and grant the resulting token the supplied scopes.
+    pub fn new<I>(secret: impl AsRef<[u8]>, scopes: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = ServiceScope>,
+    {
+        let secret = secret.as_ref();
+        if secret.is_empty() || secret.len() > MAX_BEARER_TOKEN_BYTES {
+            return Err(format!(
+                "service token must contain 1..={MAX_BEARER_TOKEN_BYTES} bytes"
+            ));
+        }
+        let mut scope_bits = 0_u8;
+        for scope in scopes {
+            scope_bits |= scope.bit();
+        }
+        if scope_bits == 0 {
+            return Err("service token must grant at least one scope".into());
+        }
+        let digest = Sha256::digest(secret);
+        let mut digest_bytes = [0_u8; 32];
+        digest_bytes.copy_from_slice(&digest);
+        Ok(Self {
+            digest: digest_bytes,
+            scopes: scope_bits,
+        })
+    }
+
+    /// Construct a compatibility token that authorizes every endpoint.
+    pub fn all(secret: impl AsRef<[u8]>) -> Result<Self, String> {
+        Self::new(
+            secret,
+            [
+                ServiceScope::Analyze,
+                ServiceScope::Cancel,
+                ServiceScope::Health,
+                ServiceScope::Metrics,
+            ],
+        )
+    }
+
+    pub const fn allows(&self, scope: ServiceScope) -> bool {
+        self.scopes & scope.bit() != 0
+    }
+}
+
+/// Explicit service boundary and scoped bearer-token policy.
+///
+/// Plain TCP is intentionally only accepted for loopback listeners.  A
+/// non-loopback listener must declare one or more exact trusted proxy peer IPs;
+/// requests from those peers must carry exactly one `x-forwarded-proto: https`
+/// marker.  Direct TLS is not represented by this type until Forge can perform
+/// the TLS handshake itself.
+#[derive(Clone)]
+pub struct ServiceSecurity {
+    tokens: Vec<ScopedServiceToken>,
+    trusted_proxy_ips: Vec<IpAddr>,
+}
+
+impl Default for ServiceSecurity {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for ServiceSecurity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServiceSecurity")
+            .field("token_count", &self.tokens.len())
+            .field("trusted_proxy_ips", &self.trusted_proxy_ips)
+            .finish()
+    }
+}
+
+impl ServiceSecurity {
+    pub const fn new() -> Self {
+        Self {
+            tokens: Vec::new(),
+            trusted_proxy_ips: Vec::new(),
+        }
+    }
+
+    /// Add a scoped token.  At most 32 token digests are retained.
+    pub fn with_token(mut self, token: ScopedServiceToken) -> Result<Self, String> {
+        if let Some(existing) = self
+            .tokens
+            .iter_mut()
+            .find(|existing| existing.digest == token.digest)
+        {
+            existing.scopes |= token.scopes;
+            return Ok(self);
+        }
+        if self.tokens.len() >= MAX_SERVICE_TOKENS {
+            return Err("service security supports at most 32 tokens".into());
+        }
+        self.tokens.push(token);
+        Ok(self)
+    }
+
+    /// Declare an exact IP address from which the TLS-terminating trusted
+    /// proxy may connect.  This does not itself enable plaintext non-loopback
+    /// traffic; the request marker is checked at the transport boundary too.
+    pub fn with_trusted_proxy_ip(mut self, ip: IpAddr) -> Self {
+        let ip = normalize_ip(ip);
+        if !self.trusted_proxy_ips.contains(&ip) {
+            self.trusted_proxy_ips.push(ip);
+        }
+        self
+    }
+
+    /// Build the legacy all-scope policy from `ServiceConfig`.
+    pub(crate) fn from_legacy_config(config: &ServiceConfig) -> Result<Self, String> {
+        Self::new().with_legacy_config(config)
+    }
+
+    pub(crate) fn validate_for_bind(&self, bind: SocketAddr) -> Result<(), String> {
+        if is_loopback_ip(bind.ip()) {
+            return Ok(());
+        }
+        if self.tokens.is_empty() {
+            return Err(
+                "a scoped bearer token is required when binding a non-loopback address".into(),
+            );
+        }
+        if self.trusted_proxy_ips.is_empty() {
+            return Err(
+                "non-loopback service binds require encrypted transport or an explicit trusted proxy"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Validate this security policy against a complete service
+    /// configuration before listeners, quotas, or readiness messages are
+    /// announced. The backwards-compatible config token is included in the
+    /// validation, matching the behavior of the `*_with_security` entry
+    /// points.
+    pub fn validate_for_config(&self, config: &ServiceConfig) -> Result<(), String> {
+        config.validate_values()?;
+        self.clone()
+            .with_legacy_config(config)?
+            .validate_for_bind(config.bind)
+    }
+
+    pub(crate) fn validate_peer(
+        &self,
+        bind: SocketAddr,
+        peer: Option<IpAddr>,
+        forwarded_proto_count: usize,
+        forwarded_proto: Option<&[u8]>,
+    ) -> Result<(), ServiceBoundaryFailure> {
+        // An ordinary loopback listener has no proxy boundary to enforce. If
+        // trusted peers were explicitly configured, however, this is an
+        // intentional proxy deployment even when the proxy happens to run on
+        // the same host, so require the exact peer and HTTPS marker there too.
+        if is_loopback_ip(bind.ip()) && self.trusted_proxy_ips.is_empty() {
+            return Ok(());
+        }
+        let trusted = peer.is_some_and(|peer| {
+            let peer = normalize_ip(peer);
+            self.trusted_proxy_ips
+                .iter()
+                .any(|allowed| normalize_ip(*allowed) == peer)
+        });
+        if !trusted || forwarded_proto_count != 1 || forwarded_proto != Some(b"https") {
+            return Err(ServiceBoundaryFailure::TrustedProxyRequired);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn authorize_header(
+        &self,
+        header: Option<&[u8]>,
+        scope: ServiceScope,
+    ) -> Result<(), ServiceAuthFailure> {
+        self.authorize_header_for_scope(header, scope)
+    }
+
+    fn authorize_header_for_scope(
+        &self,
+        header: Option<&[u8]>,
+        scope: ServiceScope,
+    ) -> Result<(), ServiceAuthFailure> {
+        if self.tokens.is_empty() {
+            return Ok(());
+        }
+        let Some(header) = header else {
+            return Err(ServiceAuthFailure::Invalid);
+        };
+        if !header.starts_with(BEARER_PREFIX)
+            || header.len() == BEARER_PREFIX.len()
+            || header.len() - BEARER_PREFIX.len() > MAX_BEARER_TOKEN_BYTES
+        {
+            return Err(ServiceAuthFailure::Invalid);
+        }
+        let supplied = &header[BEARER_PREFIX.len()..];
+        let digest = Sha256::digest(supplied);
+        let mut supplied_digest = [0_u8; 32];
+        supplied_digest.copy_from_slice(&digest);
+        let mut matched = 0_u8;
+        let mut authorized = 0_u8;
+        for token in &self.tokens {
+            let equal = u8::from(constant_time_digest_eq(&supplied_digest, &token.digest));
+            matched |= equal;
+            let allows = token.allows(scope);
+            authorized |= equal & u8::from(allows);
+        }
+        if authorized != 0 && matched != 0 {
+            Ok(())
+        } else if matched != 0 {
+            Err(ServiceAuthFailure::InsufficientScope)
+        } else {
+            Err(ServiceAuthFailure::Invalid)
+        }
+    }
+
+    /// Merge the backwards-compatible `ServiceConfig` bearer token into an
+    /// explicit security policy. Equal digests are coalesced and receive the
+    /// union of their scopes, so a legacy all-scope token cannot accidentally
+    /// be dropped or consume one of the bounded token slots twice.
+    pub(crate) fn with_legacy_config(mut self, config: &ServiceConfig) -> Result<Self, String> {
+        if let Some(token) = config.bearer_token.as_deref() {
+            let token = ScopedServiceToken::all(token.as_bytes())?;
+            if let Some(existing) = self
+                .tokens
+                .iter_mut()
+                .find(|existing| existing.digest == token.digest)
+            {
+                existing.scopes |= token.scopes;
+            } else {
+                self = self.with_token(token)?;
+            }
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ServiceBoundaryFailure {
+    TrustedProxyRequired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ServiceAuthFailure {
+    Invalid,
+    InsufficientScope,
+}
+
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map_or(IpAddr::V6(address), IpAddr::V4),
+        IpAddr::V4(address) => IpAddr::V4(address),
+    }
+}
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    normalize_ip(ip).is_loopback()
+}
+
+fn constant_time_digest_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    let mut difference = 0_u8;
+    for (left, right) in left.iter().zip(right) {
+        difference |= left ^ right;
+    }
+    difference == 0
 }
 
 /// Process-wide memory and temporary-storage admission limits for service work.
@@ -149,7 +528,9 @@ impl ServiceRuntimeLimits {
     /// upload, the bounded protobuf metadata/wire envelope, and one
     /// conservative maximum decoded-PCM admission.
     pub fn for_config(config: &ServiceConfig) -> Result<Self, String> {
-        config.validate()?;
+        // Authentication and transport-boundary checks happen after an
+        // explicit ServiceSecurity policy is merged by the entry point.
+        config.validate_values()?;
         let workers = u64::try_from(config.workers)
             .map_err(|_| "service worker count exceeds the byte-count domain")?;
         let upload_bytes = u64::try_from(config.max_body_bytes)
@@ -210,8 +591,9 @@ impl ServiceRuntimeLimits {
 
 /// Start the service and accept connections until the listener fails.
 pub fn run(config: ServiceConfig) -> io::Result<()> {
+    let security = ServiceSecurity::from_legacy_config(&config).map_err(invalid_config)?;
     let limits = ServiceRuntimeLimits::for_config(&config).map_err(invalid_config)?;
-    run_internal(config, None, limits)
+    run_internal(config, None, limits, security)
 }
 
 /// Start the service with an optional shared metrics registry.
@@ -220,8 +602,9 @@ pub fn run(config: ServiceConfig) -> io::Result<()> {
 /// need observability.  This variant exposes the same bounded HTTP API and
 /// additionally serves `GET /metrics`.
 pub fn run_with_metrics(config: ServiceConfig, metrics: ServiceMetrics) -> io::Result<()> {
+    let security = ServiceSecurity::from_legacy_config(&config).map_err(invalid_config)?;
     let limits = ServiceRuntimeLimits::for_config(&config).map_err(invalid_config)?;
-    run_internal(config, Some(metrics), limits)
+    run_internal(config, Some(metrics), limits, security)
 }
 
 /// Start the service with explicitly shared process-wide resource budgets.
@@ -229,7 +612,8 @@ pub fn run_with_runtime_limits(
     config: ServiceConfig,
     limits: ServiceRuntimeLimits,
 ) -> io::Result<()> {
-    run_internal(config, None, limits)
+    let security = ServiceSecurity::from_legacy_config(&config).map_err(invalid_config)?;
+    run_internal(config, None, limits, security)
 }
 
 /// Start the service with metrics and explicitly shared resource budgets.
@@ -238,17 +622,73 @@ pub fn run_with_metrics_and_runtime_limits(
     metrics: ServiceMetrics,
     limits: ServiceRuntimeLimits,
 ) -> io::Result<()> {
-    run_internal(config, Some(metrics), limits)
+    let security = ServiceSecurity::from_legacy_config(&config).map_err(invalid_config)?;
+    run_internal(config, Some(metrics), limits, security)
+}
+
+/// Start the REST service with an explicit boundary and scoped-token policy.
+/// The legacy `ServiceConfig::bearer_token`, when present, is merged as an
+/// all-scope token so upgrading an existing caller cannot silently remove its
+/// authentication credential.
+pub fn run_with_security(config: ServiceConfig, security: ServiceSecurity) -> io::Result<()> {
+    let security = security
+        .with_legacy_config(&config)
+        .map_err(invalid_config)?;
+    let limits = ServiceRuntimeLimits::for_config(&config).map_err(invalid_config)?;
+    run_internal(config, None, limits, security)
+}
+
+/// Start the REST service with explicit security and metrics.
+pub fn run_with_security_and_metrics(
+    config: ServiceConfig,
+    security: ServiceSecurity,
+    metrics: ServiceMetrics,
+) -> io::Result<()> {
+    let security = security
+        .with_legacy_config(&config)
+        .map_err(invalid_config)?;
+    let limits = ServiceRuntimeLimits::for_config(&config).map_err(invalid_config)?;
+    run_internal(config, Some(metrics), limits, security)
+}
+
+/// Start the REST service with explicit security and shared resource limits.
+pub fn run_with_security_and_runtime_limits(
+    config: ServiceConfig,
+    security: ServiceSecurity,
+    limits: ServiceRuntimeLimits,
+) -> io::Result<()> {
+    let security = security
+        .with_legacy_config(&config)
+        .map_err(invalid_config)?;
+    run_internal(config, None, limits, security)
+}
+
+/// Start the REST service with explicit security, metrics, and resource limits.
+pub fn run_with_security_metrics_and_runtime_limits(
+    config: ServiceConfig,
+    security: ServiceSecurity,
+    metrics: ServiceMetrics,
+    limits: ServiceRuntimeLimits,
+) -> io::Result<()> {
+    let security = security
+        .with_legacy_config(&config)
+        .map_err(invalid_config)?;
+    run_internal(config, Some(metrics), limits, security)
 }
 
 fn run_internal(
     config: ServiceConfig,
     metrics: Option<ServiceMetrics>,
     limits: ServiceRuntimeLimits,
+    security: ServiceSecurity,
 ) -> io::Result<()> {
-    config.validate().map_err(invalid_config)?;
+    let config = config.without_legacy_token();
+    config.validate_values().map_err(invalid_config)?;
+    security
+        .validate_for_bind(config.bind)
+        .map_err(invalid_config)?;
     let listener = TcpListener::bind(config.bind)?;
-    serve_internal(listener, config, metrics, limits)
+    serve_internal(listener, config, metrics, limits, security)
 }
 
 fn invalid_config(message: String) -> io::Error {
@@ -260,8 +700,9 @@ fn invalid_config(message: String) -> io::Error {
 /// in the public daemon API.
 pub fn serve(listener: TcpListener, config: ServiceConfig) -> io::Result<()> {
     let config = effective_listener_config(&listener, config)?;
+    let security = ServiceSecurity::from_legacy_config(&config).map_err(invalid_config)?;
     let limits = ServiceRuntimeLimits::for_config(&config).map_err(invalid_config)?;
-    serve_internal(listener, config, None, limits)
+    serve_internal(listener, config, None, limits, security)
 }
 
 /// Serve an already-bound listener with a shared metrics registry.
@@ -271,8 +712,9 @@ pub fn serve_with_metrics(
     metrics: ServiceMetrics,
 ) -> io::Result<()> {
     let config = effective_listener_config(&listener, config)?;
+    let security = ServiceSecurity::from_legacy_config(&config).map_err(invalid_config)?;
     let limits = ServiceRuntimeLimits::for_config(&config).map_err(invalid_config)?;
-    serve_internal(listener, config, Some(metrics), limits)
+    serve_internal(listener, config, Some(metrics), limits, security)
 }
 
 /// Serve an already-bound listener with shared process-wide resource budgets.
@@ -282,7 +724,8 @@ pub fn serve_with_runtime_limits(
     limits: ServiceRuntimeLimits,
 ) -> io::Result<()> {
     let config = effective_listener_config(&listener, config)?;
-    serve_internal(listener, config, None, limits)
+    let security = ServiceSecurity::from_legacy_config(&config).map_err(invalid_config)?;
+    serve_internal(listener, config, None, limits, security)
 }
 
 /// Serve an already-bound listener with metrics and shared resource budgets.
@@ -293,7 +736,66 @@ pub fn serve_with_metrics_and_runtime_limits(
     limits: ServiceRuntimeLimits,
 ) -> io::Result<()> {
     let config = effective_listener_config(&listener, config)?;
-    serve_internal(listener, config, Some(metrics), limits)
+    let security = ServiceSecurity::from_legacy_config(&config).map_err(invalid_config)?;
+    serve_internal(listener, config, Some(metrics), limits, security)
+}
+
+/// Serve an already-bound REST listener with an explicit security policy.
+pub fn serve_with_security(
+    listener: TcpListener,
+    config: ServiceConfig,
+    security: ServiceSecurity,
+) -> io::Result<()> {
+    let config = effective_listener_config(&listener, config)?;
+    let security = security
+        .with_legacy_config(&config)
+        .map_err(invalid_config)?;
+    let limits = ServiceRuntimeLimits::for_config(&config).map_err(invalid_config)?;
+    serve_internal(listener, config, None, limits, security)
+}
+
+/// Serve an already-bound REST listener with explicit security and metrics.
+pub fn serve_with_security_and_metrics(
+    listener: TcpListener,
+    config: ServiceConfig,
+    security: ServiceSecurity,
+    metrics: ServiceMetrics,
+) -> io::Result<()> {
+    let config = effective_listener_config(&listener, config)?;
+    let security = security
+        .with_legacy_config(&config)
+        .map_err(invalid_config)?;
+    let limits = ServiceRuntimeLimits::for_config(&config).map_err(invalid_config)?;
+    serve_internal(listener, config, Some(metrics), limits, security)
+}
+
+/// Serve an already-bound REST listener with explicit security and resource limits.
+pub fn serve_with_security_and_runtime_limits(
+    listener: TcpListener,
+    config: ServiceConfig,
+    security: ServiceSecurity,
+    limits: ServiceRuntimeLimits,
+) -> io::Result<()> {
+    let config = effective_listener_config(&listener, config)?;
+    let security = security
+        .with_legacy_config(&config)
+        .map_err(invalid_config)?;
+    serve_internal(listener, config, None, limits, security)
+}
+
+/// Serve an already-bound REST listener with explicit security, metrics, and limits.
+pub fn serve_with_security_metrics_and_runtime_limits(
+    listener: TcpListener,
+    config: ServiceConfig,
+    security: ServiceSecurity,
+    metrics: ServiceMetrics,
+    limits: ServiceRuntimeLimits,
+) -> io::Result<()> {
+    let config = effective_listener_config(&listener, config)?;
+    let security = security
+        .with_legacy_config(&config)
+        .map_err(invalid_config)?;
+    serve_internal(listener, config, Some(metrics), limits, security)
 }
 
 fn effective_listener_config(
@@ -301,7 +803,7 @@ fn effective_listener_config(
     mut config: ServiceConfig,
 ) -> io::Result<ServiceConfig> {
     config.bind = listener.local_addr()?;
-    config.validate().map_err(invalid_config)?;
+    config.validate_values().map_err(invalid_config)?;
     Ok(config)
 }
 
@@ -310,9 +812,14 @@ fn serve_internal(
     config: ServiceConfig,
     metrics: Option<ServiceMetrics>,
     limits: ServiceRuntimeLimits,
+    security: ServiceSecurity,
 ) -> io::Result<()> {
-    let config = effective_listener_config(&listener, config)?;
+    let config = effective_listener_config(&listener, config)?.without_legacy_token();
+    security
+        .validate_for_bind(config.bind)
+        .map_err(invalid_config)?;
     let config = Arc::new(config);
+    let security = Arc::new(security);
     // Header/auth parsing has its own small bound so a slow unauthenticated
     // peer cannot consume an analysis worker. One control connection of
     // headroom remains available while every worker is analyzing audio.
@@ -339,12 +846,14 @@ fn serve_internal(
         let config = Arc::clone(&config);
         let metrics = metrics.clone();
         let limits = limits.clone();
+        let security = Arc::clone(&security);
         let worker_gate = Arc::clone(&worker_gate);
         thread::spawn(move || {
-            handle_connection(
+            handle_connection_with_security(
                 stream,
                 &config,
                 &limits,
+                &security,
                 metrics.as_ref(),
                 timer,
                 &worker_gate,
@@ -525,14 +1034,40 @@ enum ServiceReport<'a> {
     V2(Box<AnalysisReportWire<'a>>),
 }
 
+#[cfg(test)]
 fn handle_connection(
+    stream: TcpStream,
+    config: &ServiceConfig,
+    limits: &ServiceRuntimeLimits,
+    metrics: Option<&ServiceMetrics>,
+    timer: Option<RequestTimer>,
+    worker_gate: &Arc<ConcurrencyGate>,
+) {
+    let security = ServiceSecurity::from_legacy_config(config).unwrap_or_default();
+    handle_connection_with_security(
+        stream,
+        config,
+        limits,
+        &security,
+        metrics,
+        timer,
+        worker_gate,
+    );
+}
+
+fn handle_connection_with_security(
     mut stream: TcpStream,
     config: &ServiceConfig,
     limits: &ServiceRuntimeLimits,
+    security: &ServiceSecurity,
     metrics: Option<&ServiceMetrics>,
     mut timer: Option<RequestTimer>,
     worker_gate: &Arc<ConcurrencyGate>,
 ) {
+    let peer_ip = stream
+        .peer_addr()
+        .ok()
+        .map(|address| normalize_ip(address.ip()));
     let _ = stream.set_write_timeout(Some(config.timeout));
     let mut request_bytes = 0_u64;
     let control = match RequestControl::from_timeout(config.timeout) {
@@ -551,7 +1086,7 @@ fn handle_connection(
             if let Some(timer) = timer.as_mut() {
                 timer.set_traceparent(request.headers.get("traceparent").map(String::as_str));
             }
-            if let Some(response) = authorize_http_request(&request, config) {
+            if let Some(response) = authorize_http_request(&request, config, security, peer_ip) {
                 response
             } else if let Some(worker_permit) = worker_gate.try_acquire() {
                 let mut context = HttpRequestContext {
@@ -584,11 +1119,68 @@ fn handle_connection(
     }
 }
 
-fn authorize_http_request(request: &HttpRequest, config: &ServiceConfig) -> Option<Response> {
-    let token = config.bearer_token.as_ref()?;
-    let expected = format!("Bearer {token}");
-    (request.headers.get("authorization") != Some(&expected))
-        .then(|| Response::error(401, "unauthorized", "a valid bearer token is required"))
+fn authorize_http_request(
+    request: &HttpRequest,
+    config: &ServiceConfig,
+    security: &ServiceSecurity,
+    peer_ip: Option<IpAddr>,
+) -> Option<Response> {
+    let forwarded_proto = request
+        .headers
+        .get("x-forwarded-proto")
+        .map(String::as_bytes);
+    if security
+        .validate_peer(
+            config.bind,
+            peer_ip,
+            usize::from(forwarded_proto.is_some()),
+            forwarded_proto,
+        )
+        .is_err()
+    {
+        return Some(Response::error(
+            400,
+            "invalid_request",
+            "a trusted proxy HTTPS marker is required",
+        ));
+    }
+    let authorization = request.headers.get("authorization").map(String::as_bytes);
+    let Some(scope) = http_request_scope(request) else {
+        // An unclassified route must never fall back to an all-scope token:
+        // adding a route without updating this table would otherwise silently
+        // grant it to every valid credential. Preserve the normal not-found
+        // response while failing closed before body admission.
+        return Some(Response::error(404, "not_found", "endpoint not found"));
+    };
+    let result = security.authorize_header(authorization, scope);
+    match result {
+        Ok(()) => None,
+        Err(ServiceAuthFailure::InsufficientScope) => Some(Response::error(
+            403,
+            "unauthorized",
+            "the bearer token does not grant this endpoint scope",
+        )),
+        Err(ServiceAuthFailure::Invalid) => Some(Response::error(
+            401,
+            "unauthorized",
+            "a valid bearer token is required",
+        )),
+    }
+}
+
+fn http_request_scope(request: &HttpRequest) -> Option<ServiceScope> {
+    let path = request
+        .target
+        .split_once('?')
+        .map_or(request.target.as_str(), |(path, _)| path);
+    match (request.method.as_str(), path) {
+        ("GET", "/healthz") | ("GET", "/readyz") => Some(ServiceScope::Health),
+        ("GET", "/metrics") => Some(ServiceScope::Metrics),
+        ("POST", "/v1/analyze") | ("POST", "/v2/analyze") | ("POST", "/v3/analyze") => {
+            Some(ServiceScope::Analyze)
+        }
+        _ => None,
+    }
 }
 
 struct HttpRequestContext<'a> {
@@ -602,13 +1194,6 @@ struct HttpRequestContext<'a> {
 }
 
 fn route(request: HttpRequest, context: &mut HttpRequestContext<'_>) -> Response {
-    if let Some(token) = &context.config.bearer_token {
-        let expected = format!("Bearer {token}");
-        if request.headers.get("authorization") != Some(&expected) {
-            return Response::error(401, "unauthorized", "a valid bearer token is required");
-        }
-    }
-
     let target = match Url::parse(&format!("http://forge.invalid{}", request.target)) {
         Ok(target) => target,
         Err(_) => return Response::error(400, "invalid_target", "request target is invalid"),
@@ -891,6 +1476,45 @@ fn content_type_extension(value: &str) -> Option<String> {
     )
 }
 
+fn validate_http_target(target: &str) -> Result<(), RequestError> {
+    let parsed = Url::parse(&format!("http://forge.invalid{target}"))
+        .map_err(|_| RequestError::new(400, "invalid_target", "request target is invalid"))?;
+    if parsed.fragment().is_some() {
+        return Err(RequestError::new(
+            400,
+            "invalid_target",
+            "fragments are not valid in HTTP targets",
+        ));
+    }
+    let raw_path = target.split_once('?').map_or(target, |(path, _)| path);
+    if parsed.path() != raw_path {
+        return Err(RequestError::new(
+            400,
+            "invalid_target",
+            "non-canonical request targets are not accepted",
+        ));
+    }
+    Ok(())
+}
+
+fn is_header_name_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!' | b'#'..=b'\'' | b'*' | b'+' | b'-' | b'.' | b'0'..=b'9'
+            | b'A'..=b'Z'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'a'..=b'z'
+            | b'|'
+            | b'~'
+    )
+}
+
+fn trim_ascii_ows(value: &str) -> &str {
+    value.trim_matches(|character| character == ' ' || character == '\t')
+}
+
 fn read_request_head(
     stream: &mut TcpStream,
     max_body_bytes: usize,
@@ -934,17 +1558,28 @@ fn read_request_head(
     let request_line = lines
         .next()
         .ok_or_else(|| RequestError::new(400, "invalid_request", "request line is missing"))?;
-    let mut parts = request_line.split_ascii_whitespace();
+    // RFC 9112 permits exactly SP between the three request-line fields.
+    // Accepting tabs or other ASCII whitespace here can make this backend and
+    // a trusted reverse proxy disagree about the authenticated request.
+    let mut parts = request_line.split(' ');
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or_default();
     let version = parts.next().unwrap_or_default();
-    if parts.next().is_some() || target.len() > MAX_HEADER_VALUE_BYTES || !target.starts_with('/') {
+    if method.is_empty()
+        || method.bytes().any(|byte| !is_header_name_byte(byte))
+        || target.is_empty()
+        || version.is_empty()
+        || parts.next().is_some()
+        || target.len() > MAX_HEADER_VALUE_BYTES
+        || !target.starts_with('/')
+    {
         return Err(RequestError::new(
             400,
             "invalid_request",
             "request line is invalid",
         ));
     }
+    validate_http_target(target)?;
     if version != "HTTP/1.0" && version != "HTTP/1.1" {
         return Err(RequestError::new(
             505,
@@ -972,14 +1607,20 @@ fn read_request_head(
                 "header line is invalid",
             ));
         };
-        let name = name.trim().to_ascii_lowercase();
-        let value = value.trim();
+        if name.is_empty() || name.bytes().any(|byte| !is_header_name_byte(byte)) {
+            return Err(RequestError::new(
+                400,
+                "invalid_headers",
+                "header name is invalid",
+            ));
+        }
+        let name = name.to_ascii_lowercase();
+        let value = trim_ascii_ows(value);
         if name.is_empty()
-            || name
-                .bytes()
-                .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'-'))
             || value.len() > MAX_HEADER_VALUE_BYTES
-            || value.bytes().any(|byte| byte < 0x20 && byte != b'\t')
+            || value
+                .bytes()
+                .any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
         {
             return Err(RequestError::new(
                 400,
@@ -1026,7 +1667,10 @@ fn read_request_head(
         ));
     }
     Ok(HttpRequest {
-        method: method.to_ascii_uppercase(),
+        // HTTP methods are case-sensitive. Preserve the exact token so a
+        // lowercase spelling cannot be authenticated and routed as `GET` by
+        // this backend when the trusted proxy treated it as a distinct method.
+        method: method.to_owned(),
         target: target.to_owned(),
         headers,
         content_length,
@@ -1168,6 +1812,7 @@ fn write_response(mut stream: TcpStream, response: Response) -> io::Result<()> {
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         408 => "Request Timeout",
         413 => "Payload Too Large",
@@ -1199,6 +1844,7 @@ fn write_response_controlled(
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         408 => "Request Timeout",
         413 => "Payload Too Large",
@@ -1369,6 +2015,36 @@ mod tests {
         response
     }
 
+    fn invoke_security_http(
+        request: &[u8],
+        config: ServiceConfig,
+        security: ServiceSecurity,
+    ) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let limits = ServiceRuntimeLimits::for_config(&config).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let worker_gate = Arc::new(ConcurrencyGate::new(config.workers));
+            handle_connection_with_security(
+                stream,
+                &config,
+                &limits,
+                &security,
+                None,
+                None,
+                &worker_gate,
+            );
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(request).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        server.join().unwrap();
+        response
+    }
+
     fn http_timeout_response(partial_request: &[u8]) -> Vec<u8> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -1409,6 +2085,223 @@ mod tests {
             ..ServiceConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn scoped_security_requires_proxy_boundary_for_non_loopback() {
+        let config = ServiceConfig {
+            bind: "0.0.0.0:8080".parse().unwrap(),
+            ..ServiceConfig::default()
+        };
+        let token = ScopedServiceToken::all("secret").unwrap();
+        let security = ServiceSecurity::new().with_token(token).unwrap();
+        assert!(security.validate_for_config(&config).is_err());
+        let security = security.with_trusted_proxy_ip("127.0.0.1".parse().unwrap());
+        assert!(security.validate_for_config(&config).is_ok());
+    }
+
+    #[test]
+    fn configured_loopback_proxy_is_not_an_implicit_boundary_bypass() {
+        let bind = "127.0.0.1:8080".parse().unwrap();
+        let security =
+            ServiceSecurity::new().with_trusted_proxy_ip("::ffff:127.0.0.1".parse().unwrap());
+        assert_eq!(
+            security.trusted_proxy_ips,
+            vec!["127.0.0.1".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            security.validate_peer(
+                bind,
+                Some("::ffff:127.0.0.1".parse().unwrap()),
+                1,
+                Some(b"https")
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            security.validate_peer(bind, Some("127.0.0.1".parse().unwrap()), 0, None),
+            Err(ServiceBoundaryFailure::TrustedProxyRequired)
+        );
+    }
+
+    #[test]
+    fn scoped_auth_reports_insufficient_scope_and_merges_legacy_token() {
+        let analyze = ScopedServiceToken::new("analyze", [ServiceScope::Analyze]).unwrap();
+        let security = ServiceSecurity::new().with_token(analyze).unwrap();
+        assert_eq!(
+            security.authorize_header(Some(b"Bearer analyze"), ServiceScope::Health),
+            Err(ServiceAuthFailure::InsufficientScope)
+        );
+        assert!(security
+            .authorize_header(Some(b"Bearer analyze"), ServiceScope::Analyze)
+            .is_ok());
+
+        let config = ServiceConfig {
+            bearer_token: Some("legacy".into()),
+            ..ServiceConfig::default()
+        };
+        let merged = security.with_legacy_config(&config).unwrap();
+        assert!(merged
+            .authorize_header(Some(b"Bearer legacy"), ServiceScope::Metrics)
+            .is_ok());
+        let debug = format!("{merged:?}");
+        assert!(!debug.contains("legacy"));
+        assert!(!debug.contains("analyze"));
+    }
+
+    #[test]
+    fn bearer_token_limit_includes_the_authorization_scheme_prefix() {
+        let accepted = "x".repeat(MAX_BEARER_TOKEN_BYTES);
+        let config = ServiceConfig {
+            bearer_token: Some(accepted.clone()),
+            ..ServiceConfig::default()
+        };
+        assert!(config.validate().is_ok());
+        assert!(ScopedServiceToken::all(&accepted).is_ok());
+        let header = format!("Bearer {accepted}");
+        assert_eq!(header.len(), MAX_HEADER_VALUE_BYTES);
+
+        let rejected = "x".repeat(MAX_BEARER_TOKEN_BYTES + 1);
+        let config = ServiceConfig {
+            bearer_token: Some(rejected.clone()),
+            ..ServiceConfig::default()
+        };
+        assert!(config.validate().is_err());
+        assert!(ScopedServiceToken::all(rejected).is_err());
+    }
+
+    #[test]
+    fn runtime_config_drops_legacy_secret_after_security_merge() {
+        let config = ServiceConfig {
+            bearer_token: Some("legacy-secret".into()),
+            ..ServiceConfig::default()
+        };
+        let security = ServiceSecurity::from_legacy_config(&config).unwrap();
+        let runtime_config = config.without_legacy_token();
+        assert!(runtime_config.bearer_token.is_none());
+        assert!(security
+            .authorize_header(Some(b"Bearer legacy-secret"), ServiceScope::Health)
+            .is_ok());
+    }
+
+    #[test]
+    fn rest_rejects_noncanonical_targets_before_scope_authentication() {
+        let config = ServiceConfig {
+            bind: "0.0.0.0:8080".parse().unwrap(),
+            ..ServiceConfig::default()
+        };
+        let security = ServiceSecurity::new()
+            .with_token(ScopedServiceToken::new("health", [ServiceScope::Health]).unwrap())
+            .unwrap()
+            .with_trusted_proxy_ip("127.0.0.1".parse().unwrap());
+        for target in [
+            "/v1/./analyze",
+            "/v1/%2e/analyze",
+            "/v1/foo/../analyze",
+            "/v1\\analyze",
+        ] {
+            let request = format!(
+                "POST {target} HTTP/1.1\r\nHost: forge\r\nAuthorization: Bearer health\r\nX-Forwarded-Proto: https\r\nContent-Length: 0\r\n\r\n"
+            );
+            let response =
+                invoke_security_http(request.as_bytes(), config.clone(), security.clone());
+            assert!(
+                response.starts_with(b"HTTP/1.1 400"),
+                "{target}: {response:?}"
+            );
+            assert_eq!(response_json(&response)["error_code"], "invalid_target");
+        }
+    }
+
+    #[test]
+    fn rest_unknown_routes_fail_closed_without_an_all_scope_fallback() {
+        let config = ServiceConfig {
+            bind: "0.0.0.0:8080".parse().unwrap(),
+            ..ServiceConfig::default()
+        };
+        let security = ServiceSecurity::new()
+            .with_token(ScopedServiceToken::new("health", [ServiceScope::Health]).unwrap())
+            .unwrap()
+            .with_trusted_proxy_ip("127.0.0.1".parse().unwrap());
+        for request in [
+            b"GET /future HTTP/1.1\r\nHost: forge\r\nAuthorization: Bearer health\r\nX-Forwarded-Proto: https\r\n\r\n".as_slice(),
+            b"get /healthz HTTP/1.1\r\nHost: forge\r\nAuthorization: Bearer health\r\nX-Forwarded-Proto: https\r\n\r\n".as_slice(),
+        ] {
+            let response = invoke_security_http(request, config.clone(), security.clone());
+            assert!(response.starts_with(b"HTTP/1.1 404"));
+            assert_eq!(response_json(&response)["error_code"], "not_found");
+        }
+    }
+
+    #[test]
+    fn rest_rejects_whitespace_padded_header_names() {
+        let config = ServiceConfig {
+            bind: "0.0.0.0:8080".parse().unwrap(),
+            ..ServiceConfig::default()
+        };
+        let security = ServiceSecurity::new()
+            .with_token(ScopedServiceToken::new("health", [ServiceScope::Health]).unwrap())
+            .unwrap()
+            .with_trusted_proxy_ip("127.0.0.1".parse().unwrap());
+        let request = b"GET /healthz HTTP/1.1\r\nHost: forge\r\nAuthorization: Bearer health\r\n X-Forwarded-Proto: https\r\n\r\n";
+        let response = invoke_security_http(request, config, security);
+        assert!(response.starts_with(b"HTTP/1.1 400"));
+        assert_eq!(response_json(&response)["error_code"], "invalid_headers");
+    }
+
+    #[test]
+    fn real_http_proxy_boundary_and_scopes_are_enforced_before_routing() {
+        let config = ServiceConfig {
+            bind: "0.0.0.0:8080".parse().unwrap(),
+            bearer_token: None,
+            ..ServiceConfig::default()
+        };
+        let security = ServiceSecurity::new()
+            .with_token(ScopedServiceToken::new("analyze", [ServiceScope::Analyze]).unwrap())
+            .unwrap()
+            .with_token(ScopedServiceToken::new("health", [ServiceScope::Health]).unwrap())
+            .unwrap()
+            .with_trusted_proxy_ip("127.0.0.1".parse().unwrap());
+        let request = |authorization: Option<&str>, forwarded: &[&str]| {
+            let mut request = String::from("GET /healthz HTTP/1.1\r\nHost: forge\r\n");
+            if let Some(authorization) = authorization {
+                request.push_str(&format!("Authorization: Bearer {authorization}\r\n"));
+            }
+            for value in forwarded {
+                request.push_str(&format!("X-Forwarded-Proto: {value}\r\n"));
+            }
+            request.push_str("\r\n");
+            request.into_bytes()
+        };
+
+        let ok = invoke_security_http(
+            &request(Some("health"), &["https"]),
+            config.clone(),
+            security.clone(),
+        );
+        assert!(ok.starts_with(b"HTTP/1.1 200"));
+        let wrong_scope = invoke_security_http(
+            &request(Some("analyze"), &["https"]),
+            config.clone(),
+            security.clone(),
+        );
+        assert!(wrong_scope.starts_with(b"HTTP/1.1 403"));
+        let missing =
+            invoke_security_http(&request(None, &["https"]), config.clone(), security.clone());
+        assert!(missing.starts_with(b"HTTP/1.1 401"));
+        let missing_https = invoke_security_http(
+            &request(Some("health"), &[]),
+            config.clone(),
+            security.clone(),
+        );
+        assert!(missing_https.starts_with(b"HTTP/1.1 400"));
+        let duplicate_https = invoke_security_http(
+            &request(Some("health"), &["https", "https"]),
+            config,
+            security,
+        );
+        assert!(duplicate_https.starts_with(b"HTTP/1.1 400"));
+        assert!(String::from_utf8_lossy(&duplicate_https).contains("duplicate_header"));
     }
 
     #[test]
@@ -1503,6 +2396,28 @@ mod tests {
     #[test]
     fn parser_rejects_chunked_and_oversized_body() {
         let control = RequestControl::from_timeout(Duration::from_secs(5)).unwrap();
+        for request in [
+            b"GET\t/healthz HTTP/1.1\r\nHost: forge\r\n\r\n".as_slice(),
+            b"GET  /healthz HTTP/1.1\r\nHost: forge\r\n\r\n".as_slice(),
+            b"GE(T /healthz HTTP/1.1\r\nHost: forge\r\n\r\n".as_slice(),
+        ] {
+            let mut stream = mock_stream(request);
+            assert_eq!(
+                read_request_head(&mut stream, 1024, &control)
+                    .unwrap_err()
+                    .status,
+                400
+            );
+        }
+
+        let mut lowercase = mock_stream(b"get /healthz HTTP/1.1\r\nHost: forge\r\n\r\n");
+        assert_eq!(
+            read_request_head(&mut lowercase, 1024, &control)
+                .unwrap()
+                .method,
+            "get"
+        );
+
         let request =
             b"POST /v1/analyze HTTP/1.1\r\nHost: forge\r\nTransfer-Encoding: chunked\r\n\r\n";
         let mut stream = mock_stream(request);

@@ -8,6 +8,43 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.189.13 - 2026-09-07
+
+### Added
+
+- Add an explicit trusted-proxy service boundary with exact peer-IP checks,
+  HTTPS forwarding evidence, and independently scoped bearer tokens for
+  analysis, cancellation, health, and metrics endpoints.
+- Add one bounded external-process broker for codecs, renderers, metadata
+  probes, provenance verification, and runtime capability checks, with
+  executable identity checks, sanitized environments, per-stream output
+  limits, deadlines, cooperative cancellation, and process-tree cleanup.
+
+### Changed
+
+- Reject plain non-loopback REST and gRPC listeners before accepting traffic
+  unless a configured TLS-terminating proxy and scoped authentication policy
+  establish the boundary. Existing loopback and legacy all-scope tokens remain
+  compatible on loopback. Library callers that bind non-loopback addresses
+  must migrate from the legacy `run*`/`serve*` entry points to the additive
+  `ServiceSecurity` variants; token secrets are redacted, removed from the
+  long-lived runtime configuration, and compared by constant-time digests.
+- Supervise streaming FFmpeg encoders and one-shot external tools through the
+  same RAII lifecycle so timeout, cancellation, output overflow, I/O failure,
+  and caller drop cannot leave an ordinary child process tree running.
+- Run helpers with a fixed minimal environment and private working directories
+  where their protocol permits it. On Unix, identity-bound shebang scripts see
+  an fd path as `$0`/`argv[0]`; scripts that discover adjacent resources from
+  their own pathname must be replaced by a self-contained native launcher.
+
+### Fixed
+
+- Resolve local C2PA trust-list/configuration paths before entering the private
+  verifier workspace, parse REST request lines with the RFC-required SP
+  separators and case-sensitive methods, and explicitly release state-file
+  locks across concurrent helper fork/exec windows. Preserve the public
+  unwind-safety auto-trait contract of the broker-backed FFmpeg stream writer.
+
 ## 0.189.12 - 2026-09-07
 
 ### Added

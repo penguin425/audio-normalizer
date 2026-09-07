@@ -88,18 +88,6 @@ impl AtomicOutput {
             .map_err(|error| format!("write {}: {error}", self.temporary.path().display()))
     }
 
-    pub(crate) fn copy_from_path(&mut self, source: &Path) -> Result<u64, String> {
-        let mut input =
-            File::open(source).map_err(|error| format!("open {}: {error}", source.display()))?;
-        std::io::copy(&mut input, &mut self.temporary).map_err(|error| {
-            format!(
-                "copy {} into {}: {error}",
-                source.display(),
-                self.temporary.path().display()
-            )
-        })
-    }
-
     /// Adopt the regular file currently named by the staging path after a
     /// trusted path-based writer has completed.
     ///

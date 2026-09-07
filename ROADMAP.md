@@ -25,6 +25,11 @@ Forge already provides:
 - `forge-doctor` reports the exact compile-time features, bounded runtime
   probes, CPU SIMD support, and effective read/write format matrix; repeatable
   `--require` checks make missing deployment capabilities fail with exit 1.
+- External codecs, renderers, metadata probers, provenance verifiers, and
+  runtime probes share one broker with canonical executable identity,
+  fixed minimal environments, bounded stdout/stderr and produced-file
+  monitoring, finite deadlines, cancellation, RAII reaping, and ordinary
+  descendant cleanup through Unix process groups or Windows Job Objects.
 - Corrected BWF and ReplayGain finalization reuses the already-verified output
   analysis under container-default channel roles, while explicit custom roles
   retain the independent container re-analysis needed for compatibility.
@@ -254,11 +259,13 @@ Forge already provides:
   `forge-remote-qc` header/prefix probe. Remote access is never implicit in
   local normalization or QC commands.
 - Bounded stateless REST upload/analyze service via `forge-service`, with
-  loopback-by-default binding, bearer-token enforcement for non-loopback
-  deployments, strict fixed-length HTTP framing, incremental replay spooling,
-  process-wide active temp/memory quotas, decoded-sample/concurrency/absolute
-  deadline limits, and versioned health/analysis/error schemas. The service
-  never accepts a local filesystem path or performs implicit remote access.
+  loopback-only plaintext by default, an exact-peer and HTTPS-evidence policy
+  for explicitly trusted terminating proxies, constant-time scoped bearer
+  authentication, strict fixed-length HTTP framing, incremental replay
+  spooling, process-wide active temp/memory quotas,
+  decoded-sample/concurrency/absolute deadline limits, and versioned
+  health/analysis/error schemas. The service never accepts a local filesystem
+  path or performs implicit remote access.
 - Optional tonic gRPC service on the same `forge-service` binary, with a
   versioned `Analyze`/`Cancel`/`Health` protocol, explicit bounded request IDs,
   the REST limits/authentication policy, deadline/disconnect cancellation, and
@@ -517,11 +524,8 @@ v0.189.6. Before adding another broad parser surface, Forge will:
   policies, report every preserved/mapped/recomputed/dropped field, adjust
   sample-indexed BWF/DAW timing with exact rational arithmetic after
   resampling, and make metadata-only library jobs resumable;
-- require encrypted transport (or an explicitly declared trusted proxy) for
-  non-loopback bearer authentication, add scoped constant-time token handling,
-  and route every external codec/renderer through one bounded subprocess
-  broker with output limits, deadlines, cancellation, and process-tree
-  cleanup. A strict broker profile will additionally combine OS filesystem and
+- retain the v0.189.13 secure service boundary and bounded subprocess broker.
+  A later strict broker profile will additionally combine OS filesystem and
   syscall isolation, disable networking and privilege gain, and fail closed
   when the promised sandbox cannot be installed; and
 - keep every GitHub Action and reproducibility-sensitive toolchain at immutable
@@ -646,7 +650,7 @@ unchanged controls from paths whose normative work factor changed.
 The order below is an implementation plan, not a standards requirement. Each
 normative item must name the exact supported clauses and must not imply
 certification or coverage beyond its fixtures.
-v0.189.1 through v0.189.12 are the completed baseline; later entries are
+v0.189.1 through v0.189.13 are the completed baseline; later entries are
 planned.
 
 | Release | Scope | Classification |

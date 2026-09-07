@@ -8,14 +8,26 @@
 
 use crate::metadata;
 use crate::normalize::{self, Analysis};
+use crate::stable_input::{StableInput, StableInputOptions};
+use crate::subprocess::{
+    run, EnvPolicy, Error as ProcessError, ExecutableIdentity, MonitoredDirectory, MonitoredFile,
+    OutputMode, ProcessSpec, StdinMode,
+};
 use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::time::Duration;
 
 pub const RENDERER_STANDARD: &str = "ITU-R BS.2127-1";
 pub const PROFILE_STANDARD: &str = "ITU-R BS.2168-0";
@@ -27,6 +39,14 @@ pub const PRODUCTION_PROFILE_LEVEL: &str = "1";
 pub const PRODUCTION_VALIDATOR: &str = "forge-tech3393-2025-bs2076-3-3";
 pub const ADM_STANDARD: &str = "ITU-R BS.2076-3";
 pub const ADM_VERSION: &str = "ITU-R_BS.2076-3";
+
+const ADM_RENDERER_TIMEOUT: Duration = Duration::from_secs(3_600);
+const ADM_RENDERER_OUTPUT_LIMIT: usize = 1024 * 1024;
+const ADM_RENDER_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const ADM_WORKSPACE_CONFIG_ALLOWANCE_BYTES: u64 = 16 * 1024 * 1024;
+const ADM_WORKSPACE_FILE_COUNT_LIMIT: u64 = 8;
+const RUNTIME_PROBE_WORKSPACE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const RUNTIME_PROBE_WORKSPACE_MAX_ENTRIES: u64 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -127,6 +147,75 @@ impl Default for ReferenceRendererOptions {
     }
 }
 
+/// The small, policy-bound result returned by a runtime command probe.
+///
+/// This is a package-internal bridge for the `forge-doctor` binary and is not
+/// part of Forge's stable documented Rust API.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalCommandProbe {
+    pub success: bool,
+    pub detail: String,
+}
+
+/// Probe a trusted runtime command through Forge's bounded process broker.
+///
+/// This intentionally exposes only the high-level status needed by
+/// diagnostics; executable identity, environment, output limits, timeout,
+/// and process-tree cleanup remain owned by the broker.
+#[doc(hidden)]
+pub fn probe_external_command(
+    executable: impl AsRef<OsStr>,
+    arguments: &[&str],
+    timeout: Duration,
+) -> Result<ExternalCommandProbe, String> {
+    if timeout.is_zero() {
+        return Err("runtime probe timeout must be greater than zero".into());
+    }
+    let executable = executable.as_ref();
+    let display = Path::new(executable).display().to_string();
+    let work = tempfile::Builder::new()
+        .prefix("forge-doctor-")
+        .tempdir()
+        .map_err(|error| format!("could not create runtime probe workspace: {error}"))?;
+    let mut spec = ProcessSpec::new(executable).map_err(|error| match error {
+        ProcessError::InvalidExecutable(message)
+            if message.starts_with("executable not found:") =>
+        {
+            "command not found on PATH".to_owned()
+        }
+        error => format!("could not start command: {error}"),
+    })?;
+    spec.args(arguments.iter().copied())
+        .env_policy(EnvPolicy::Minimal)
+        .stdin(StdinMode::Null)
+        .stdout(OutputMode::capture(64 * 1024))
+        .stderr(OutputMode::capture(64 * 1024))
+        .timeout(timeout)
+        .current_dir(work.path().to_path_buf())
+        .monitor_directory(MonitoredDirectory::new(
+            work.path().to_path_buf(),
+            RUNTIME_PROBE_WORKSPACE_MAX_BYTES,
+            RUNTIME_PROBE_WORKSPACE_MAX_ENTRIES,
+            "runtime probe workspace",
+        ));
+    let output = run(spec).map_err(|error| match error {
+        ProcessError::TimedOut => format!(
+            "command did not finish within {} seconds",
+            timeout.as_secs()
+        ),
+        error => format!("could not query command status for {display}: {error}"),
+    })?;
+    Ok(ExternalCommandProbe {
+        success: output.success(),
+        detail: if output.success() {
+            "command completed successfully".into()
+        } else {
+            format!("command exited with {}", output.status())
+        },
+    })
+}
+
 #[derive(Debug)]
 pub struct ReferenceRenderResult {
     pub analysis: Analysis,
@@ -138,13 +227,201 @@ pub struct ReferenceRenderResult {
     pub output_path: Option<PathBuf>,
 }
 
+/// Bytes captured from one renderer output handle and verified before use.
+///
+/// The handle is opened without following a final-component symlink (and in
+/// non-blocking mode on Unix), checked for regular-file status, read under a
+/// byte limit, rewound, and hashed again. Consumers must use `bytes` rather
+/// than reopen `path`; this makes a pathname replacement after capture
+/// irrelevant to decoding, measurement, and retention.
+#[derive(Debug)]
+pub(crate) struct StableFileContents {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) sha256: String,
+    pub(crate) byte_len: u64,
+}
+
+/// Capture a bounded regular file from one no-follow/non-blocking handle.
+///
+/// A renderer can replace its output pathname, turn it into a symlink, or
+/// mutate the inode while a caller is checking it. Opening once and comparing
+/// two complete reads from that same handle makes those races fail closed (or
+/// leaves the caller with the already captured immutable bytes). The caller
+/// must perform all subsequent parsing and analysis from the returned bytes.
+pub(crate) fn read_stable_regular_file(
+    path: &Path,
+    max_bytes: u64,
+    label: &str,
+) -> Result<StableFileContents, String> {
+    if max_bytes == 0 {
+        return Err(format!("{label} byte limit must be greater than zero"));
+    }
+    let mut file = open_regular_file_nofollow(path, label)?;
+    let initial_len = file
+        .metadata()
+        .map_err(|error| format!("inspect {label} {}: {error}", path.display()))?
+        .len();
+    if initial_len > max_bytes {
+        return Err(format!(
+            "{label} {} exceeds {max_bytes} bytes (size {initial_len})",
+            path.display()
+        ));
+    }
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind {label} {}: {error}", path.display()))?;
+    let (bytes, first_digest, first_len) = read_file_contents(&mut file, max_bytes, label)?;
+    let after_first_len = file
+        .metadata()
+        .map_err(|error| format!("inspect {label} {}: {error}", path.display()))?
+        .len();
+    if after_first_len != first_len {
+        return Err(format!(
+            "{label} {} changed while it was being read",
+            path.display()
+        ));
+    }
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind {label} {}: {error}", path.display()))?;
+    let (second_digest, second_len) = hash_file_contents(&mut file, max_bytes, label)?;
+    let after_second_len = file
+        .metadata()
+        .map_err(|error| format!("inspect {label} {}: {error}", path.display()))?
+        .len();
+    if first_len != second_len || first_digest != second_digest || after_second_len != second_len {
+        return Err(format!(
+            "{label} {} changed while it was being verified",
+            path.display()
+        ));
+    }
+
+    Ok(StableFileContents {
+        bytes,
+        sha256: digest_hex(first_digest),
+        byte_len: first_len,
+    })
+}
+
+fn open_regular_file_nofollow(path: &Path, label: &str) -> Result<File, String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(windows)]
+    {
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("open {label} {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect {label} {}: {error}", path.display()))?;
+    #[cfg(windows)]
+    if metadata.file_attributes() & 0x0000_0400 != 0 {
+        return Err(format!("{label} must not be a reparse point"));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!("{label} must be a regular file"));
+    }
+    Ok(file)
+}
+
+fn read_file_contents(
+    file: &mut File,
+    max_bytes: u64,
+    label: &str,
+) -> Result<(Vec<u8>, [u8; 32], u64), String> {
+    let mut bytes = Vec::new();
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("read {label}: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        let next = total
+            .checked_add(read as u64)
+            .ok_or_else(|| format!("{label} byte length overflow"))?;
+        if next > max_bytes {
+            return Err(format!(
+                "{label} exceeds {max_bytes} bytes (size at least {next})"
+            ));
+        }
+        bytes
+            .try_reserve(read)
+            .map_err(|_| format!("allocate bounded {label} contents"))?;
+        bytes.extend_from_slice(&buffer[..read]);
+        hasher.update(&buffer[..read]);
+        total = next;
+    }
+    Ok((bytes, hasher.finalize().into(), total))
+}
+
+fn hash_file_contents(
+    file: &mut File,
+    max_bytes: u64,
+    label: &str,
+) -> Result<([u8; 32], u64), String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("read {label} for verification: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| format!("{label} byte length overflow"))?;
+        if total > max_bytes {
+            return Err(format!("{label} exceeds {max_bytes} bytes"));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok((hasher.finalize().into(), total))
+}
+
+fn digest_hex(digest: [u8; 32]) -> String {
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut hex, "{byte:02x}").expect("writing a digest to String cannot fail");
+    }
+    hex
+}
+
 pub fn validate_and_render(
     input: &Path,
     retained_output: Option<&Path>,
     options: &ReferenceRendererOptions,
 ) -> Result<ReferenceRenderResult, String> {
     validate_options(options)?;
-    require_adm_chunks(input)?;
+    // Capture the caller's input before any helper is launched. Both the
+    // internal chunk/profile checks and both renderer stages then receive the
+    // same private path, while the live source is hash-checked again before
+    // success so an in-place or replacement race fails closed.
+    let observed_input_bytes = fs::metadata(input)
+        .map_err(|error| format!("inspect ADM input {}: {error}", input.display()))?
+        .len();
+    let stable_options = StableInputOptions::new(observed_input_bytes.max(1))
+        .map_err(|error| format!("prepare stable ADM input: {error}"))?;
+    let stable_input = StableInput::from_path(input, &stable_options)
+        .map_err(|error| format!("capture stable ADM input {}: {error}", input.display()))?;
+    let input = stable_input.stable_path().to_path_buf();
+    require_adm_chunks(&input)?;
     if !options.overwrite && retained_output.is_some_and(Path::exists) {
         return Err(format!(
             "ADM rendered output already exists: {}",
@@ -159,17 +436,32 @@ pub fn validate_and_render(
     let validate_config = work.path().join("validate.json");
     let render_config = work.path().join("render.json");
     let rendered = work.path().join("rendered.wav");
+    let renderer_identity = ProcessSpec::new(&options.command).map_err(|error| {
+        format!(
+            "resolve ADM renderer {}: {error}",
+            options.command.display()
+        )
+    })?;
     write_config(&validate_config, &validation_config(options.profile_level))?;
     write_config(&render_config, &render_config_value())?;
 
     run_eat(
         options,
+        renderer_identity.executable(),
         &validate_config,
         &[("input.path", input.as_os_str())],
         "BS.2168 profile validation",
+        None,
+        MonitoredDirectory::new(
+            work.path().to_path_buf(),
+            ADM_WORKSPACE_CONFIG_ALLOWANCE_BYTES,
+            ADM_WORKSPACE_FILE_COUNT_LIMIT,
+            "ADM validation workspace",
+        ),
     )?;
     run_eat(
         options,
+        renderer_identity.executable(),
         &render_config,
         &[
             ("input.path", input.as_os_str()),
@@ -180,27 +472,39 @@ pub fn validate_and_render(
             ("output.path", rendered.as_os_str()),
         ],
         "BS.2127 rendering",
+        Some(MonitoredFile::new(
+            &rendered,
+            ADM_RENDER_MAX_BYTES,
+            "ADM rendered output",
+        )),
+        MonitoredDirectory::new(
+            work.path().to_path_buf(),
+            adm_workspace_byte_limit()?,
+            ADM_WORKSPACE_FILE_COUNT_LIMIT,
+            "ADM renderer workspace",
+        ),
     )?;
-    if !rendered.is_file() {
-        return Err(format!(
-            "ADM renderer succeeded without creating {}",
-            rendered.display()
-        ));
-    }
-
-    let analysis = normalize::analyze_file(&rendered)?;
+    let rendered_contents =
+        read_stable_regular_file(&rendered, ADM_RENDER_MAX_BYTES, "ADM rendered output")?;
+    let analysis_buffer = crate::wav::WavReader::read_bytes_with_limits(
+        &rendered_contents.bytes,
+        u16::MAX,
+        rendered_contents.bytes.len(),
+    )
+    .map_err(|error| format!("decode ADM rendered output {}: {error}", rendered.display()))?;
+    let analysis = normalize::analyze(&analysis_buffer);
     let output_path = retained_output
         .map(|destination| {
-            fs::copy(&rendered, destination).map_err(|error| {
-                format!(
-                    "retain ADM render {} as {}: {error}",
-                    rendered.display(),
-                    destination.display()
-                )
-            })?;
+            let mut output =
+                crate::atomic::AtomicOutput::new_with_overwrite(destination, options.overwrite)?;
+            output.write_all(&rendered_contents.bytes)?;
+            output.commit()?;
             Ok::<_, String>(destination.to_path_buf())
         })
         .transpose()?;
+    stable_input
+        .verify_source()
+        .map_err(|error| format!("ADM input changed during validation and rendering: {error}"))?;
     Ok(ReferenceRenderResult {
         analysis,
         renderer: options.command.display().to_string(),
@@ -1695,40 +1999,60 @@ fn write_config(path: &Path, value: &Value) -> Result<(), String> {
 
 fn run_eat(
     options: &ReferenceRendererOptions,
+    renderer: &ExecutableIdentity,
     config: &Path,
-    overrides: &[(&str, &std::ffi::OsStr)],
+    overrides: &[(&str, &OsStr)],
     stage: &str,
+    monitored_file: Option<MonitoredFile>,
+    monitored_directory: MonitoredDirectory,
 ) -> Result<(), String> {
-    let mut command = Command::new(&options.command);
-    command.arg(config);
-    for (name, value) in overrides {
-        command.arg("-o").arg(name).arg(value);
+    let mut spec = ProcessSpec::from_executable(renderer.clone());
+    spec.arg(config)
+        .env_policy(EnvPolicy::Minimal)
+        .stdin(StdinMode::Null)
+        .stdout(OutputMode::capture(ADM_RENDERER_OUTPUT_LIMIT))
+        .stderr(OutputMode::capture(ADM_RENDERER_OUTPUT_LIMIT))
+        .timeout(ADM_RENDERER_TIMEOUT)
+        .current_dir(
+            config
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+        );
+    if let Some(monitored_file) = monitored_file {
+        spec.monitor_file(monitored_file);
     }
-    let output = command.output().map_err(|error| {
+    spec.monitor_directory(monitored_directory);
+    for (name, value) in overrides {
+        spec.arg("-o").arg(name).arg(value);
+    }
+    let output = run(spec).map_err(|error| {
         format!(
-            "start ADM renderer {} for {stage}: {error}; install the EBU ADM Toolbox or pass --adm-renderer",
+            "run ADM renderer {} for {stage}: {error}; install the EBU ADM Toolbox or pass --adm-renderer",
             options.command.display()
         )
     })?;
-    check_output(output, &options.command, stage)
-}
-
-fn check_output(output: Output, command: &Path, stage: &str) -> Result<(), String> {
-    if output.status.success() {
+    if output.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(output.stderr());
     let detail = stderr.trim();
     Err(format!(
         "ADM renderer {} failed during {stage} ({}): {}",
-        command.display(),
-        output.status,
+        options.command.display(),
+        output.status(),
         if detail.is_empty() {
             "no diagnostic output"
         } else {
             detail
         }
     ))
+}
+
+fn adm_workspace_byte_limit() -> Result<u64, String> {
+    ADM_RENDER_MAX_BYTES
+        .checked_add(ADM_WORKSPACE_CONFIG_ALLOWANCE_BYTES)
+        .ok_or_else(|| "ADM renderer workspace byte limit overflow".to_string())
 }
 
 fn validation_config(level: u8) -> Value {
@@ -2082,6 +2406,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stable_file_capture_returns_verified_bytes() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("render.wav");
+        fs::write(&path, b"stable renderer output").unwrap();
+
+        let captured = read_stable_regular_file(&path, 1024, "render")
+            .expect("regular renderer output should be capturable");
+        assert_eq!(captured.bytes, b"stable renderer output");
+        assert_eq!(captured.byte_len, captured.bytes.len() as u64);
+        assert_eq!(
+            captured.sha256,
+            digest_hex(Sha256::digest(&captured.bytes).into())
+        );
+
+        // The caller owns an immutable copy, so a later pathname replacement
+        // cannot change the bytes that will be decoded or retained.
+        fs::write(&path, b"replacement").unwrap();
+        assert_eq!(captured.bytes, b"stable renderer output");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_file_capture_rejects_final_symlinks_and_fifos() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let work = tempfile::tempdir().unwrap();
+        let target = work.path().join("target.wav");
+        let link = work.path().join("link.wav");
+        let fifo = work.path().join("render.fifo");
+        fs::write(&target, b"not through a link").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let symlink_error = read_stable_regular_file(&link, 1024, "render").unwrap_err();
+        assert!(
+            symlink_error.contains("open") || symlink_error.contains("regular file"),
+            "unexpected symlink error: {symlink_error}"
+        );
+
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        let return_code = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
+        assert_eq!(
+            return_code,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let fifo_error = read_stable_regular_file(&fifo, 1024, "render").unwrap_err();
+        assert!(
+            fifo_error.contains("regular file"),
+            "unexpected FIFO error: {fifo_error}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn adapter_validates_renders_and_measures_external_output() {
@@ -2091,6 +2470,7 @@ mod tests {
         let input = work.path().join("input.bw64");
         let retained = work.path().join("rendered.wav");
         let renderer = work.path().join("eat-process");
+        let invocations_log = work.path().join("invocations.log");
         let samples = (0..48_000)
             .map(|frame| {
                 (2.0 * std::f32::consts::PI * 997.0 * frame as f32 / 48_000.0).sin() * 0.05
@@ -2124,9 +2504,9 @@ mod tests {
         .unwrap();
         fs::write(
             &renderer,
-            r#"#!/usr/bin/env sh
+            format!(
+                r#"#!/usr/bin/env sh
 set -eu
-printf '%s\n' "$*" >> "$0.log"
 input=
 output=
 while [ "$#" -gt 0 ]; do
@@ -2140,8 +2520,11 @@ while [ "$#" -gt 0 ]; do
         shift
     fi
 done
+printf '%s\n' "$input" >> "{}"
 [ -z "$output" ] || cp "$input" "$output"
 "#,
+                invocations_log.display()
+            ),
         )
         .unwrap();
         fs::set_permissions(&renderer, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2162,8 +2545,9 @@ done
         assert_eq!(result.profile_level, 1);
         assert_eq!(result.output_path.as_deref(), Some(retained.as_path()));
         assert!(retained.is_file());
-        let invocations = fs::read_to_string(renderer.with_extension("log")).unwrap();
+        let invocations = fs::read_to_string(invocations_log).unwrap();
         assert_eq!(invocations.lines().count(), 2);
-        assert!(invocations.contains("render.layout 0+1+0"));
+        let paths = invocations.lines().collect::<Vec<_>>();
+        assert_eq!(paths[0], paths[1]);
     }
 }

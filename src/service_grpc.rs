@@ -13,8 +13,8 @@
 use crate::channel_layout::ChannelLayoutDescriptor;
 use crate::report::{AnalysisReport, ComplianceProfile};
 use crate::service::{
-    ServiceConfig, ServiceRuntimeLimits, SERVICE_ANALYSIS_SCHEMA, SERVICE_ANALYSIS_SCHEMA_V3,
-    SERVICE_HEALTH_SCHEMA,
+    ServiceAuthFailure, ServiceBoundaryFailure, ServiceConfig, ServiceRuntimeLimits, ServiceScope,
+    ServiceSecurity, SERVICE_ANALYSIS_SCHEMA, SERVICE_ANALYSIS_SCHEMA_V3, SERVICE_HEALTH_SCHEMA,
 };
 use crate::service_metrics::{RequestTimer, ServiceMetrics, PROMETHEUS_CONTENT_TYPE};
 use crate::service_runtime::{
@@ -26,7 +26,7 @@ use prost::Message;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -70,8 +70,9 @@ const GRPC_CONNECTION_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 /// Run the optional gRPC endpoint until the process receives Ctrl-C.
 pub fn run(config: ServiceConfig, bind: SocketAddr) -> std::io::Result<()> {
     let config = effective_config(config, bind)?;
+    let security = ServiceSecurity::from_legacy_config(&config).map_err(invalid_config)?;
     let limits = ServiceRuntimeLimits::for_config(&config).map_err(invalid_config)?;
-    run_internal(config, None, limits)
+    run_internal(config, None, limits, security)
 }
 
 /// Run the optional gRPC endpoint with a shared metrics registry.
@@ -81,8 +82,9 @@ pub fn run_with_metrics(
     metrics: ServiceMetrics,
 ) -> std::io::Result<()> {
     let config = effective_config(config, bind)?;
+    let security = ServiceSecurity::from_legacy_config(&config).map_err(invalid_config)?;
     let limits = ServiceRuntimeLimits::for_config(&config).map_err(invalid_config)?;
-    run_internal(config, Some(metrics), limits)
+    run_internal(config, Some(metrics), limits, security)
 }
 
 /// Run the gRPC endpoint with explicitly shared process-wide resource limits.
@@ -92,7 +94,8 @@ pub fn run_with_runtime_limits(
     limits: ServiceRuntimeLimits,
 ) -> std::io::Result<()> {
     let config = effective_config(config, bind)?;
-    run_internal(config, None, limits)
+    let security = ServiceSecurity::from_legacy_config(&config).map_err(invalid_config)?;
+    run_internal(config, None, limits, security)
 }
 
 /// Run gRPC with metrics and explicitly shared process-wide resource limits.
@@ -103,15 +106,86 @@ pub fn run_with_metrics_and_runtime_limits(
     limits: ServiceRuntimeLimits,
 ) -> std::io::Result<()> {
     let config = effective_config(config, bind)?;
-    run_internal(config, Some(metrics), limits)
+    let security = ServiceSecurity::from_legacy_config(&config).map_err(invalid_config)?;
+    run_internal(config, Some(metrics), limits, security)
+}
+
+/// Run gRPC with an explicit boundary and scoped-token policy. A legacy
+/// `ServiceConfig::bearer_token`, when present, is merged as an all-scope
+/// token for source-compatible upgrades.
+pub fn run_with_security(
+    config: ServiceConfig,
+    bind: SocketAddr,
+    security: ServiceSecurity,
+) -> std::io::Result<()> {
+    let config = effective_config_for_security(config, bind)?;
+    let security = security
+        .with_legacy_config(&config)
+        .map_err(invalid_config)?;
+    let limits = ServiceRuntimeLimits::for_config(&config).map_err(invalid_config)?;
+    run_internal(config, None, limits, security)
+}
+
+/// Run gRPC with explicit security and metrics.
+pub fn run_with_security_and_metrics(
+    config: ServiceConfig,
+    bind: SocketAddr,
+    security: ServiceSecurity,
+    metrics: ServiceMetrics,
+) -> std::io::Result<()> {
+    let config = effective_config_for_security(config, bind)?;
+    let security = security
+        .with_legacy_config(&config)
+        .map_err(invalid_config)?;
+    let limits = ServiceRuntimeLimits::for_config(&config).map_err(invalid_config)?;
+    run_internal(config, Some(metrics), limits, security)
+}
+
+/// Run gRPC with explicit security and shared process-wide limits.
+pub fn run_with_security_and_runtime_limits(
+    config: ServiceConfig,
+    bind: SocketAddr,
+    security: ServiceSecurity,
+    limits: ServiceRuntimeLimits,
+) -> std::io::Result<()> {
+    let config = effective_config_for_security(config, bind)?;
+    let security = security
+        .with_legacy_config(&config)
+        .map_err(invalid_config)?;
+    run_internal(config, None, limits, security)
+}
+
+/// Run gRPC with explicit security, metrics, and shared process-wide limits.
+pub fn run_with_security_metrics_and_runtime_limits(
+    config: ServiceConfig,
+    bind: SocketAddr,
+    security: ServiceSecurity,
+    metrics: ServiceMetrics,
+    limits: ServiceRuntimeLimits,
+) -> std::io::Result<()> {
+    let config = effective_config_for_security(config, bind)?;
+    let security = security
+        .with_legacy_config(&config)
+        .map_err(invalid_config)?;
+    run_internal(config, Some(metrics), limits, security)
 }
 
 fn run_internal(
     config: ServiceConfig,
     metrics: Option<ServiceMetrics>,
     limits: ServiceRuntimeLimits,
+    security: ServiceSecurity,
 ) -> std::io::Result<()> {
-    config.validate().map_err(invalid_config)?;
+    // The legacy token has already been merged into `security` by the public
+    // entry point. Drop its plaintext before the config is moved into the
+    // long-lived runtime future and cloned into transport services.
+    let config = config.without_legacy_token();
+    config
+        .validate_values_for_service()
+        .map_err(invalid_config)?;
+    security
+        .validate_for_bind(config.bind)
+        .map_err(invalid_config)?;
     let bind = config.bind;
     let v1_message_limit = grpc_analyze_v1_message_limit(&config).map_err(invalid_config)?;
     let v3_message_limit = grpc_analyze_v3_message_limit(&config).map_err(invalid_config)?;
@@ -125,12 +199,18 @@ fn run_internal(
         .build()
         .map_err(|error| std::io::Error::other(format!("tokio runtime: {error}")))?;
     runtime.block_on(async move {
-        let service = GrpcService::with_runtime_limits(config.clone(), metrics, limits);
-        let transport_admission = GrpcTransportAdmissionLayer::new_with_metrics(
+        let service = GrpcService::with_runtime_limits_and_security(
+            config.clone(),
+            metrics,
+            limits,
+            security,
+        );
+        let transport_admission = GrpcTransportAdmissionLayer::new_with_metrics_and_security(
             Arc::clone(&service.permits),
             config.clone(),
             service.limits.clone(),
             service.metrics.clone(),
+            Arc::clone(&service.security),
         );
         let listener = TcpListener::bind(bind).await?;
         let incoming = ConnectionLimitedIncoming::new(
@@ -179,6 +259,17 @@ fn run_internal(
 fn effective_config(mut config: ServiceConfig, bind: SocketAddr) -> std::io::Result<ServiceConfig> {
     config.bind = bind;
     config.validate().map_err(invalid_config)?;
+    Ok(config)
+}
+
+fn effective_config_for_security(
+    mut config: ServiceConfig,
+    bind: SocketAddr,
+) -> std::io::Result<ServiceConfig> {
+    config.bind = bind;
+    config
+        .validate_values_for_service()
+        .map_err(invalid_config)?;
     Ok(config)
 }
 
@@ -307,13 +398,14 @@ impl Stream for ConnectionLimitedIncoming {
         }
 
         match self.listener.poll_accept(context) {
-            Poll::Ready(Ok((stream, _))) => {
+            Poll::Ready(Ok((stream, peer_addr))) => {
                 let permit = self
                     .permit
                     .take()
                     .expect("accepted connection owns a permit");
                 Poll::Ready(Some(Ok(ConnectionPermitIo::new(
                     stream,
+                    peer_addr.ip(),
                     permit,
                     self.handshake_header_timeout,
                     self.idle_timeout,
@@ -344,10 +436,12 @@ impl ConnectionLifecycle {
 #[derive(Clone, Debug)]
 struct GrpcConnectionInfo {
     lifecycle: Arc<ConnectionLifecycle>,
+    peer_ip: IpAddr,
 }
 
 struct ConnectionPermitIo {
     stream: TcpStream,
+    peer_ip: IpAddr,
     permit: Option<OwnedSemaphorePermit>,
     lifecycle: Arc<ConnectionLifecycle>,
     handshake_header_deadline: Pin<Box<time::Sleep>>,
@@ -360,6 +454,7 @@ struct ConnectionPermitIo {
 impl ConnectionPermitIo {
     fn new(
         stream: TcpStream,
+        peer_ip: IpAddr,
         permit: OwnedSemaphorePermit,
         handshake_header_timeout: Duration,
         idle_timeout: Duration,
@@ -368,6 +463,7 @@ impl ConnectionPermitIo {
         let now = time::Instant::now();
         Self {
             stream,
+            peer_ip,
             permit: Some(permit),
             lifecycle: Arc::new(ConnectionLifecycle {
                 headers_observed: AtomicBool::new(false),
@@ -484,6 +580,7 @@ impl Connected for ConnectionPermitIo {
     fn connect_info(&self) -> Self::ConnectInfo {
         GrpcConnectionInfo {
             lifecycle: Arc::clone(&self.lifecycle),
+            peer_ip: self.peer_ip,
         }
     }
 }
@@ -498,7 +595,15 @@ enum GrpcMethodKind {
 struct GrpcMethodPolicy {
     kind: GrpcMethodKind,
     max_message_bytes: usize,
+    scope: ServiceScope,
 }
+
+/// Private marker inserted only after the transport boundary has verified the
+/// bearer digest for this exact method scope. The decoded handler uses it to
+/// avoid hashing and scanning the same credential a second time. Direct trait
+/// calls do not carry this marker and therefore retain the fallback check.
+#[derive(Clone, Copy)]
+struct GrpcVerifiedAuth(ServiceScope);
 
 fn grpc_method_policy(
     path: &str,
@@ -508,29 +613,33 @@ fn grpc_method_policy(
         grpc_analyze_v1_message_limit(config).map(|max_message_bytes| GrpcMethodPolicy {
             kind: GrpcMethodKind::Analyze,
             max_message_bytes,
+            scope: ServiceScope::Analyze,
         })
     };
     let analyze_v3 = || {
         grpc_analyze_v3_message_limit(config).map(|max_message_bytes| GrpcMethodPolicy {
             kind: GrpcMethodKind::Analyze,
             max_message_bytes,
+            scope: ServiceScope::Analyze,
         })
     };
-    let control = |max_message_bytes| {
+    let control = |max_message_bytes, scope| {
         Ok(GrpcMethodPolicy {
             kind: GrpcMethodKind::Control,
             max_message_bytes,
+            scope,
         })
     };
     match path {
         "/forge.service.v1.ForgeAnalysis/Analyze" => analyze_v1().map(Some),
         "/forge.service.v1.ForgeAnalysisV3/Analyze" => analyze_v3().map(Some),
         "/forge.service.v1.ForgeAnalysis/Cancel" | "/forge.service.v1.ForgeAnalysisV3/Cancel" => {
-            control(grpc_cancel_message_limit()).map(Some)
+            control(grpc_cancel_message_limit(), ServiceScope::Cancel).map(Some)
         }
-        "/forge.service.v1.ForgeAnalysis/Health"
-        | "/forge.service.v1.ForgeAnalysisV3/Health"
-        | "/forge.service.v1.ForgeMetrics/Metrics" => control(0).map(Some),
+        "/forge.service.v1.ForgeAnalysis/Health" | "/forge.service.v1.ForgeAnalysisV3/Health" => {
+            control(0, ServiceScope::Health).map(Some)
+        }
+        "/forge.service.v1.ForgeMetrics/Metrics" => control(0, ServiceScope::Metrics).map(Some),
         _ => Ok(None),
     }
 }
@@ -542,6 +651,7 @@ struct GrpcTransportAdmissionLayer {
     config: Arc<ServiceConfig>,
     limits: ServiceRuntimeLimits,
     metrics: Option<ServiceMetrics>,
+    security: Arc<ServiceSecurity>,
 }
 
 impl GrpcTransportAdmissionLayer {
@@ -554,11 +664,30 @@ impl GrpcTransportAdmissionLayer {
         Self::new_with_metrics(analysis_permits, config, limits, None)
     }
 
+    #[cfg(test)]
     fn new_with_metrics(
         analysis_permits: Arc<Semaphore>,
         config: ServiceConfig,
         limits: ServiceRuntimeLimits,
         metrics: Option<ServiceMetrics>,
+    ) -> Self {
+        let security = ServiceSecurity::from_legacy_config(&config)
+            .expect("GrpcTransportAdmission test/internal construction requires valid security");
+        Self::new_with_metrics_and_security(
+            analysis_permits,
+            config,
+            limits,
+            metrics,
+            Arc::new(security),
+        )
+    }
+
+    fn new_with_metrics_and_security(
+        analysis_permits: Arc<Semaphore>,
+        config: ServiceConfig,
+        limits: ServiceRuntimeLimits,
+        metrics: Option<ServiceMetrics>,
+        security: Arc<ServiceSecurity>,
     ) -> Self {
         Self {
             analysis_permits,
@@ -566,6 +695,7 @@ impl GrpcTransportAdmissionLayer {
             config: Arc::new(config),
             limits,
             metrics,
+            security,
         }
     }
 }
@@ -581,6 +711,7 @@ impl<S> Layer<S> for GrpcTransportAdmissionLayer {
             config: Arc::clone(&self.config),
             limits: self.limits.clone(),
             metrics: self.metrics.clone(),
+            security: Arc::clone(&self.security),
         }
     }
 }
@@ -593,6 +724,7 @@ struct GrpcTransportAdmission<S> {
     config: Arc<ServiceConfig>,
     limits: ServiceRuntimeLimits,
     metrics: Option<ServiceMetrics>,
+    security: Arc<ServiceSecurity>,
 }
 
 struct GrpcTransportResources {
@@ -822,18 +954,75 @@ async fn read_grpc_frame_header(
     ))
 }
 
-fn authorize_grpc_headers(headers: &http::HeaderMap, config: &ServiceConfig) -> Result<(), Status> {
-    let Some(expected) = &config.bearer_token else {
-        return Ok(());
-    };
-    let actual = headers
-        .get(http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
-    let expected = format!("Bearer {expected}");
-    if actual == Some(expected.as_str()) {
-        Ok(())
-    } else {
-        Err(Status::unauthenticated("a valid bearer token is required"))
+fn forwarded_proto(headers: &http::HeaderMap) -> (usize, Option<&[u8]>) {
+    let mut values = headers.get_all("x-forwarded-proto").iter();
+    let first = values.next().map(http::HeaderValue::as_bytes);
+    (
+        usize::from(first.is_some()) + usize::from(values.next().is_some()),
+        first,
+    )
+}
+
+fn validate_grpc_peer(
+    headers: &http::HeaderMap,
+    config: &ServiceConfig,
+    security: &ServiceSecurity,
+    connection: Option<&GrpcConnectionInfo>,
+) -> Result<(), Status> {
+    let (forwarded_proto_count, forwarded_proto) = forwarded_proto(headers);
+    security
+        .validate_peer(
+            config.bind,
+            connection.map(|connection| connection.peer_ip),
+            forwarded_proto_count,
+            forwarded_proto,
+        )
+        .map_err(|ServiceBoundaryFailure::TrustedProxyRequired| {
+            Status::failed_precondition("a trusted proxy HTTPS marker is required")
+        })
+}
+
+fn authorize_grpc_headers(
+    headers: &http::HeaderMap,
+    security: &ServiceSecurity,
+    scope: ServiceScope,
+) -> Result<(), Status> {
+    let actual = grpc_authorization_header(headers)?;
+    security
+        .authorize_header(actual, scope)
+        .map_err(grpc_auth_status)
+}
+
+fn grpc_authorization_header(headers: &http::HeaderMap) -> Result<Option<&[u8]>, Status> {
+    let mut values = headers.get_all(http::header::AUTHORIZATION).iter();
+    let actual = values.next().map(http::HeaderValue::as_bytes);
+    if values.next().is_some() {
+        return Err(Status::invalid_argument(
+            "duplicate authorization metadata is not accepted",
+        ));
+    }
+    Ok(actual)
+}
+
+fn grpc_metadata_authorization_header(
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<Option<&[u8]>, Status> {
+    let mut values = metadata.get_all("authorization").iter();
+    let actual = values.next().map(tonic::metadata::MetadataValue::as_bytes);
+    if values.next().is_some() {
+        return Err(Status::invalid_argument(
+            "duplicate authorization metadata is not accepted",
+        ));
+    }
+    Ok(actual)
+}
+
+fn grpc_auth_status(error: ServiceAuthFailure) -> Status {
+    match error {
+        ServiceAuthFailure::Invalid => Status::unauthenticated("a valid bearer token is required"),
+        ServiceAuthFailure::InsufficientScope => {
+            Status::permission_denied("the bearer token does not grant this endpoint scope")
+        }
     }
 }
 
@@ -919,20 +1108,47 @@ where
         let config = Arc::clone(&self.config);
         let limits = self.limits.clone();
         let metrics = self.metrics.clone();
+        let security = Arc::clone(&self.security);
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         Box::pin(async move {
             let policy = match policy {
                 Ok(Some(policy)) => policy,
-                Ok(None) => return inner.call(request).await,
+                Ok(None) => {
+                    let connection = request.extensions().get::<GrpcConnectionInfo>();
+                    if let Err(status) =
+                        validate_grpc_peer(request.headers(), &config, &security, connection)
+                    {
+                        return Ok(status.into_http());
+                    }
+                    // Unknown methods are rejected at the transport boundary
+                    // instead of being handed to tonic with an all-scope
+                    // fallback. This keeps a newly added RPC fail-closed if
+                    // its method policy is not updated alongside the route.
+                    return Ok(Status::unimplemented("gRPC method is not supported").into_http());
+                }
                 Err(error) => return Ok(Status::internal(error).into_http()),
             };
             let timer = SharedGrpcRequestTimer::start(metrics.as_ref(), request.headers());
             let mut outer_timer = OuterGrpcRequestTimer::new(timer.clone());
             let mut request_bytes = 0_u64;
-            if let Err(status) = authorize_grpc_headers(request.headers(), &config) {
+            let connection = request.extensions().get::<GrpcConnectionInfo>();
+            if let Err(status) =
+                validate_grpc_peer(request.headers(), &config, &security, connection)
+            {
                 return Ok(metered_grpc_error(&timer, status, request_bytes));
             }
+            if let Err(status) = authorize_grpc_headers(request.headers(), &security, policy.scope)
+            {
+                return Ok(metered_grpc_error(&timer, status, request_bytes));
+            }
+            // Keep the successful transport decision with the request so the
+            // decoded handler can prove that this same method scope was
+            // admitted without repeating the digest scan.
+            let mut request = request;
+            request
+                .extensions_mut()
+                .insert(GrpcVerifiedAuth(policy.scope));
             let control = match RequestControl::from_timeout(config.timeout) {
                 Ok(control) => control,
                 Err(error) => {
@@ -1105,6 +1321,7 @@ struct RequestRegistry {
 #[derive(Clone)]
 struct GrpcService {
     config: Arc<ServiceConfig>,
+    security: Arc<ServiceSecurity>,
     limits: ServiceRuntimeLimits,
     registry: Arc<Mutex<RequestRegistry>>,
     permits: Arc<Semaphore>,
@@ -1121,14 +1338,28 @@ impl GrpcService {
         Self::with_runtime_limits(config, metrics, limits)
     }
 
+    #[cfg(test)]
     fn with_runtime_limits(
         config: ServiceConfig,
         metrics: Option<ServiceMetrics>,
         limits: ServiceRuntimeLimits,
     ) -> Self {
+        let security = ServiceSecurity::from_legacy_config(&config)
+            .expect("GrpcService test/internal construction requires valid security");
+        Self::with_runtime_limits_and_security(config, metrics, limits, security)
+    }
+
+    fn with_runtime_limits_and_security(
+        config: ServiceConfig,
+        metrics: Option<ServiceMetrics>,
+        limits: ServiceRuntimeLimits,
+        security: ServiceSecurity,
+    ) -> Self {
+        let config = config.without_legacy_token();
         Self {
             permits: Arc::new(Semaphore::new(config.workers)),
             config: Arc::new(config),
+            security: Arc::new(security),
             limits,
             registry: Arc::new(Mutex::new(RequestRegistry::default())),
             metrics,
@@ -1137,20 +1368,26 @@ impl GrpcService {
         }
     }
 
-    fn authorize<T>(&self, request: &Request<T>) -> Result<(), Status> {
-        let Some(expected) = &self.config.bearer_token else {
-            return Ok(());
-        };
-        let actual = request
-            .metadata()
-            .get("authorization")
-            .and_then(|value| value.to_str().ok());
-        let expected = format!("Bearer {expected}");
-        if actual == Some(expected.as_str()) {
-            Ok(())
-        } else {
-            Err(Status::unauthenticated("a valid bearer token is required"))
+    fn authorize<T>(&self, request: &Request<T>, scope: ServiceScope) -> Result<(), Status> {
+        if let Some(verified) = request.extensions().get::<GrpcVerifiedAuth>() {
+            if verified.0 == scope {
+                return Ok(());
+            }
+            return Err(Status::internal(
+                "gRPC transport authorization scope does not match the RPC method",
+            ));
         }
+        let actual = grpc_metadata_authorization_header(request.metadata())?;
+        self.security
+            .authorize_header(actual, scope)
+            .map_err(|error| match error {
+                ServiceAuthFailure::Invalid => {
+                    Status::unauthenticated("a valid bearer token is required")
+                }
+                ServiceAuthFailure::InsufficientScope => {
+                    Status::permission_denied("the bearer token does not grant this endpoint scope")
+                }
+            })
     }
 
     fn take_transport_resources<T>(
@@ -1322,7 +1559,7 @@ impl GrpcService {
         mut request: Request<AnalyzeRequest>,
     ) -> Result<Response<AnalyzeResponse>, Status> {
         let response_lease = request.extensions().get::<GrpcResponseLeaseSlot>().cloned();
-        self.authorize(&request)?;
+        self.authorize(&request, ServiceScope::Analyze)?;
         let transport_resources =
             self.take_transport_resources(&mut request, GrpcMethodKind::Analyze)?;
         let message_bytes = request.get_ref().encoded_len();
@@ -1355,7 +1592,7 @@ impl GrpcService {
         mut request: Request<AnalyzeV3Request>,
     ) -> Result<Response<AnalyzeV3Response>, Status> {
         let response_lease = request.extensions().get::<GrpcResponseLeaseSlot>().cloned();
-        self.authorize(&request)?;
+        self.authorize(&request, ServiceScope::Analyze)?;
         let transport_resources =
             self.take_transport_resources(&mut request, GrpcMethodKind::Analyze)?;
         let message_bytes = request.get_ref().encoded_len();
@@ -1491,7 +1728,7 @@ impl GrpcService {
         &self,
         request: Request<CancelRequest>,
     ) -> Result<Response<CancelResponse>, Status> {
-        self.authorize(&request)?;
+        self.authorize(&request, ServiceScope::Cancel)?;
         let request_id = request.into_inner().request_id;
         Ok(Response::new(CancelResponse {
             cancelled: self.cancel(&request_id)?,
@@ -1502,7 +1739,7 @@ impl GrpcService {
         &self,
         request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
-        self.authorize(&request)?;
+        self.authorize(&request, ServiceScope::Health)?;
         Ok(Response::new(HealthResponse {
             schema: SERVICE_HEALTH_SCHEMA.to_owned(),
             generator: concat!("forge-normalizer/", env!("CARGO_PKG_VERSION")).to_owned(),
@@ -1514,7 +1751,7 @@ impl GrpcService {
         &self,
         request: Request<MetricsRequest>,
     ) -> Result<Response<MetricsResponse>, Status> {
-        self.authorize(&request)?;
+        self.authorize(&request, ServiceScope::Metrics)?;
         let Some(metrics) = &self.metrics else {
             return Err(Status::not_found("metrics exporter is disabled"));
         };
@@ -2331,6 +2568,145 @@ mod tests {
     }
 
     #[test]
+    fn grpc_duplicate_authorization_headers_are_rejected() {
+        let security = ServiceSecurity::new()
+            .with_token(
+                crate::service::ScopedServiceToken::all("secret").expect("valid test token"),
+            )
+            .unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer secret"),
+        );
+        headers.append(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer secret"),
+        );
+        let error = authorize_grpc_headers(&headers, &security, ServiceScope::Health)
+            .expect_err("duplicate authorization metadata must fail closed");
+        assert_eq!(error.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn grpc_proxy_boundary_and_method_scopes_fail_closed() {
+        let config = ServiceConfig {
+            bind: "0.0.0.0:50051".parse().unwrap(),
+            ..ServiceConfig::default()
+        };
+        let security = ServiceSecurity::new()
+            .with_token(
+                crate::service::ScopedServiceToken::new("health-secret", [ServiceScope::Health])
+                    .unwrap(),
+            )
+            .unwrap()
+            .with_trusted_proxy_ip("10.0.0.10".parse().unwrap());
+        let connection = GrpcConnectionInfo {
+            lifecycle: Arc::new(ConnectionLifecycle {
+                headers_observed: AtomicBool::new(false),
+            }),
+            peer_ip: "10.0.0.10".parse().unwrap(),
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-forwarded-proto", http::HeaderValue::from_static("https"));
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer health-secret"),
+        );
+
+        assert!(validate_grpc_peer(&headers, &config, &security, Some(&connection)).is_ok());
+        assert!(authorize_grpc_headers(&headers, &security, ServiceScope::Health).is_ok());
+        assert_eq!(
+            authorize_grpc_headers(&headers, &security, ServiceScope::Analyze)
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+
+        let mut missing_marker = headers.clone();
+        missing_marker.remove("x-forwarded-proto");
+        assert_eq!(
+            validate_grpc_peer(&missing_marker, &config, &security, Some(&connection))
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        let untrusted_connection = GrpcConnectionInfo {
+            peer_ip: "10.0.0.11".parse().unwrap(),
+            ..connection
+        };
+        assert_eq!(
+            validate_grpc_peer(&headers, &config, &security, Some(&untrusted_connection),)
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_direct_duplicate_authorization_metadata_is_rejected() {
+        let service = GrpcService::new(
+            ServiceConfig {
+                bearer_token: Some("secret".into()),
+                ..ServiceConfig::default()
+            },
+            None,
+        );
+        let mut request = Request::new(HealthRequest::default());
+        request
+            .metadata_mut()
+            .append("authorization", "Bearer secret".parse().unwrap());
+        request
+            .metadata_mut()
+            .append("authorization", "Bearer secret".parse().unwrap());
+        let error = service
+            .authorize(&request, ServiceScope::Health)
+            .expect_err("duplicate authorization metadata must fail closed");
+        assert_eq!(error.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn unknown_grpc_methods_fail_closed_before_body_admission() {
+        let config = ServiceConfig::default();
+        let limits = ServiceRuntimeLimits::for_config(&config).unwrap();
+        let layer = GrpcTransportAdmissionLayer::new(
+            Arc::new(Semaphore::new(config.workers)),
+            config,
+            limits,
+        );
+        let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut service = layer.layer(AdmissionProbe {
+            entered,
+            release_analysis: Arc::new(Semaphore::new(0)),
+        });
+        let (body, polls) = grpc_raw_test_body(Vec::new(), true);
+        let response = service
+            .call(
+                http::Request::builder()
+                    .uri("/forge.service.v1.Future/Analyze")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grpc_response_code(&response), Code::Unimplemented);
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
+        assert!(entered_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn grpc_runtime_config_drops_legacy_secret_after_security_merge() {
+        let service = GrpcService::new(
+            ServiceConfig {
+                bearer_token: Some("legacy-secret".into()),
+                ..ServiceConfig::default()
+            },
+            None,
+        );
+        assert!(service.config.bearer_token.is_none());
+    }
+
+    #[test]
     fn complete_protobuf_message_and_metadata_have_explicit_bounds() {
         let config = ServiceConfig {
             max_body_bytes: 4,
@@ -2674,6 +3050,44 @@ mod tests {
             GRPC_CONTROL_STREAM_HEADROOM
         );
         assert_eq!(limits.memory_used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn verified_scope_extension_reaches_tonic_handler_and_mismatch_fails_closed() {
+        let config = ServiceConfig {
+            bearer_token: Some("secret".into()),
+            ..ServiceConfig::default()
+        };
+        let service = GrpcService::new(config, None);
+
+        // Tonic's server decoder preserves HTTP request extensions when it
+        // constructs the decoded Request<T>. Exercise that same conversion
+        // so the transport's one successful digest scan is enough for the
+        // handler.
+        let mut http_request = http::Request::new(HealthRequest {});
+        http_request
+            .extensions_mut()
+            .insert(GrpcVerifiedAuth(ServiceScope::Health));
+        let request = Request::from_http(http_request);
+        assert!(service.health_inner(request).await.is_ok());
+
+        let mut mismatch = http::Request::new(HealthRequest {});
+        mismatch
+            .extensions_mut()
+            .insert(GrpcVerifiedAuth(ServiceScope::Metrics));
+        let error = service
+            .health_inner(Request::from_http(mismatch))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Internal);
+
+        // No private marker means a direct trait invocation must still use
+        // the metadata fallback rather than treating the request as trusted.
+        let error = service
+            .health_inner(Request::new(HealthRequest {}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Unauthenticated);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -5,7 +5,11 @@
 //! step to the EBU ADM Renderer (`ear-render`). Every rendered signal is then
 //! measured independently with Forge's BS.1770 engine.
 
-use crate::wav::{named_channel_layout, AudioBuffer, ChannelRole};
+use crate::subprocess::{
+    run as run_process, EnvPolicy, MonitoredDirectory, MonitoredFile, OutputMode, ProcessSpec,
+    StdinMode,
+};
+use crate::wav::{named_channel_layout, AudioBuffer, ChannelRole, WavReader};
 use crate::{adm, analysis, decoder, metadata, normalize};
 use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
@@ -14,11 +18,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const REPORT_SCHEMA: &str =
@@ -34,6 +36,7 @@ pub const MAX_TIMEOUT_SECONDS: u64 = 3600;
 
 const TOOL_OUTPUT_LIMIT: usize = 1024 * 1024;
 const RENDER_HEADER_ALLOWANCE: u64 = 1024 * 1024;
+const WORKSPACE_FILE_COUNT_ALLOWANCE: u64 = 8;
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -174,13 +177,20 @@ pub fn run(options: &Options) -> Result<AdmPresentationReport, String> {
         )
     })?;
     let max_render_bytes = render_byte_limit(options.max_decoded_samples_per_presentation)?;
+    let workspace_max_bytes = workspace_byte_limit(max_render_bytes, options.max_presentations)?;
     let input = fs::canonicalize(&options.input)
         .map_err(|error| format!("resolve ADM input {}: {error}", options.input.display()))?;
     ensure_regular_file(&input, "ADM input")?;
-    let renderer = resolve_executable(&options.renderer)?;
+    let renderer_identity = ProcessSpec::new(&options.renderer).map_err(|error| {
+        format!(
+            "resolve ADM renderer {}: {error}",
+            options.renderer.display()
+        )
+    })?;
+    let renderer = renderer_identity.executable().path().to_path_buf();
     ensure_regular_file(&renderer, "ADM renderer")?;
     let (input_sha256, input_bytes) = sha256_file(&input)?;
-    let (renderer_sha256, renderer_bytes) = sha256_file(&renderer)?;
+    let renderer_sha256 = renderer_identity.executable().sha256_hex();
     let axml = metadata::read_wave_chunk(&input, *b"axml")?
         .ok_or_else(|| "ADM presentation QC requires an axml chunk".to_string())?;
     if metadata::read_wave_chunk(&input, *b"chna")?.is_none() {
@@ -212,34 +222,63 @@ pub fn run(options: &Options) -> Result<AdmPresentationReport, String> {
         }
         args.push(input.as_os_str().to_owned());
         args.push(rendered.as_os_str().to_owned());
-        let tool = run_bounded(
-            &renderer,
-            &args,
-            Duration::from_secs(options.timeout_seconds),
-            &rendered,
-            max_render_bytes,
-        )?;
-        if !tool.status.success() {
+        let mut spec = ProcessSpec::from_executable(renderer_identity.executable().clone());
+        spec.args(&args)
+            .env_policy(EnvPolicy::Minimal)
+            .stdin(StdinMode::Null)
+            .stdout(OutputMode::capture(TOOL_OUTPUT_LIMIT))
+            .stderr(OutputMode::capture(TOOL_OUTPUT_LIMIT))
+            .timeout(Duration::from_secs(options.timeout_seconds))
+            .current_dir(work.path().to_path_buf())
+            .monitor_file(MonitoredFile::new(
+                &rendered,
+                max_render_bytes,
+                "ADM presentation render",
+            ))
+            .monitor_directory(MonitoredDirectory::new(
+                work.path().to_path_buf(),
+                workspace_max_bytes,
+                u64::try_from(options.max_presentations)
+                    .map_err(|_| "presentation limit does not fit in u64")?
+                    .checked_add(WORKSPACE_FILE_COUNT_ALLOWANCE)
+                    .ok_or_else(|| "ADM presentation workspace file limit overflow".to_string())?,
+                "ADM presentation workspace",
+            ));
+        let tool = run_process(spec).map_err(|error| {
+            format!(
+                "ADM renderer failed for {}: {error}",
+                variant_id(programme, &variant.selected)
+            )
+        })?;
+        if !tool.success() {
             return Err(format!(
                 "ADM renderer failed for {} ({}): {}",
                 variant_id(programme, &variant.selected),
-                tool.status,
-                diagnostic(&tool.stderr)
+                tool.status(),
+                diagnostic(tool.stderr())
             ));
         }
-        ensure_regular_file(&rendered, "ADM presentation render")?;
-        ensure_unchanged(
-            &renderer,
-            &renderer_sha256,
-            renderer_bytes,
-            "ADM renderer executable changed while it was running",
-        )?;
-
-        let (rendered_sha256, rendered_bytes) = sha256_file(&rendered)?;
-        let (buffer, layout_provenance) = decoder::decode_limited_with_layout(
-            &rendered,
-            options.max_decoded_samples_per_presentation,
-        )?;
+        // Open and capture the renderer output once. The helper refuses
+        // symlinks/FIFOs and verifies two bounded reads from that same
+        // no-follow, non-blocking regular-file handle. Decode and retain the
+        // captured bytes so no later pathname race can alter the report.
+        let rendered_contents =
+            adm::read_stable_regular_file(&rendered, max_render_bytes, "ADM presentation render")?;
+        let max_decoded_samples = usize::try_from(options.max_decoded_samples_per_presentation)
+            .map_err(|_| {
+                "decoded sample limit does not fit in this platform's usize".to_string()
+            })?;
+        let (buffer, layout_provenance) = WavReader::read_bytes_with_layout_and_limits(
+            &rendered_contents.bytes,
+            u16::MAX,
+            max_decoded_samples,
+        )
+        .map_err(|error| {
+            format!(
+                "decode ADM presentation render {}: {error}",
+                rendered.display()
+            )
+        })?;
         let buffer = resolve_rendered_layout(
             &rendered,
             buffer,
@@ -248,12 +287,6 @@ pub fn run(options: &Options) -> Result<AdmPresentationReport, String> {
             &declared_roles,
         )?;
         let measured = analysis::analyze(&buffer);
-        ensure_unchanged(
-            &rendered,
-            &rendered_sha256,
-            rendered_bytes,
-            "ADM presentation render changed while it was being measured",
-        )?;
 
         let measured_lufs = measured.lufs.is_finite().then_some(measured.lufs);
         let measured_true_peak = measured
@@ -292,7 +325,7 @@ pub fn run(options: &Options) -> Result<AdmPresentationReport, String> {
             && true_peak_passed != Some(false);
         let retained_render_path = retained_root
             .as_deref()
-            .map(|root| retain_render(root, &rendered, index, options.overwrite))
+            .map(|root| retain_render(root, &rendered_contents.bytes, index, options.overwrite))
             .transpose()?
             .map(|path| path.to_string_lossy().into_owned());
         presentations.push(PresentationResult {
@@ -302,8 +335,8 @@ pub fn run(options: &Options) -> Result<AdmPresentationReport, String> {
             programme_language: programme.language.clone(),
             selected_complementary_object_ids: variant.selected.clone(),
             declared_loudness: declared,
-            rendered_sha256,
-            rendered_bytes,
+            rendered_sha256: rendered_contents.sha256,
+            rendered_bytes: rendered_contents.byte_len,
             retained_render_path,
             sample_rate_hz: measured.sample_rate,
             channels: measured.channels,
@@ -323,12 +356,6 @@ pub fn run(options: &Options) -> Result<AdmPresentationReport, String> {
         &input_sha256,
         input_bytes,
         "ADM input changed during presentation QC",
-    )?;
-    ensure_unchanged(
-        &renderer,
-        &renderer_sha256,
-        renderer_bytes,
-        "ADM renderer executable changed during presentation QC",
     )?;
     let passed = production_profile.passed && presentations.iter().all(|item| item.passed);
     Ok(AdmPresentationReport {
@@ -730,6 +757,15 @@ fn render_byte_limit(max_decoded_samples: u64) -> Result<u64, String> {
         .ok_or_else(|| "ADM render byte limit overflow".to_string())
 }
 
+fn workspace_byte_limit(max_render_bytes: u64, max_presentations: usize) -> Result<u64, String> {
+    let max_presentations = u64::try_from(max_presentations)
+        .map_err(|_| "presentation limit does not fit in u64".to_string())?;
+    max_render_bytes
+        .checked_mul(max_presentations)
+        .and_then(|bytes| bytes.checked_add(RENDER_HEADER_ALLOWANCE))
+        .ok_or_else(|| "ADM presentation workspace byte limit overflow".to_string())
+}
+
 fn enumerate_variants(
     inventory: &AdmInventory,
     max_presentations: usize,
@@ -999,35 +1035,6 @@ fn optional_f64(parsed: &ParsedXml, parent: usize, name: &str) -> Result<Option<
         .transpose()
 }
 
-fn resolve_executable(command: &Path) -> Result<PathBuf, String> {
-    if command.is_absolute() || command.components().count() > 1 {
-        return fs::canonicalize(command)
-            .map_err(|error| format!("resolve ADM renderer {}: {error}", command.display()));
-    }
-    let path = std::env::var_os("PATH")
-        .ok_or_else(|| "PATH is unavailable while resolving the ADM renderer".to_string())?;
-    for directory in std::env::split_paths(&path) {
-        let candidate = directory.join(command);
-        if candidate.is_file() {
-            return fs::canonicalize(&candidate)
-                .map_err(|error| format!("resolve ADM renderer {}: {error}", candidate.display()));
-        }
-        #[cfg(windows)]
-        {
-            let candidate = directory.join(format!("{}.exe", command.to_string_lossy()));
-            if candidate.is_file() {
-                return fs::canonicalize(&candidate).map_err(|error| {
-                    format!("resolve ADM renderer {}: {error}", candidate.display())
-                });
-            }
-        }
-    }
-    Err(format!(
-        "ADM renderer {} was not found in PATH; install the EBU ADM Renderer or pass --renderer",
-        command.display()
-    ))
-}
-
 fn prepare_retained_root(
     options: &Options,
     presentation_count: usize,
@@ -1065,7 +1072,7 @@ fn prepare_retained_root(
 
 fn retain_render(
     root: &Path,
-    source: &Path,
+    source: &[u8],
     index: usize,
     overwrite: bool,
 ) -> Result<PathBuf, String> {
@@ -1077,7 +1084,7 @@ fn retain_render(
         ));
     }
     let mut output = crate::atomic::AtomicOutput::new_with_overwrite(&destination, overwrite)?;
-    output.copy_from_path(source)?;
+    output.write_all(source)?;
     output.commit()?;
     Ok(destination)
 }
@@ -1126,100 +1133,6 @@ fn ensure_unchanged(
         return Err(message.into());
     }
     Ok(())
-}
-
-struct ToolOutput {
-    status: ExitStatus,
-    stderr: Vec<u8>,
-}
-
-fn run_bounded(
-    executable: &Path,
-    args: &[OsString],
-    timeout: Duration,
-    rendered: &Path,
-    max_render_bytes: u64,
-) -> Result<ToolOutput, String> {
-    let mut stdout_file =
-        tempfile::tempfile().map_err(|error| format!("create renderer stdout spool: {error}"))?;
-    let mut stderr_file =
-        tempfile::tempfile().map_err(|error| format!("create renderer stderr spool: {error}"))?;
-    let mut child = Command::new(executable)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file.try_clone().map_err(|error| {
-            format!("clone renderer stdout spool: {error}")
-        })?))
-        .stderr(Stdio::from(stderr_file.try_clone().map_err(|error| {
-            format!("clone renderer stderr spool: {error}")
-        })?))
-        .spawn()
-        .map_err(|error| format!("start ADM renderer {}: {error}", executable.display()))?;
-    let started = Instant::now();
-    let status = loop {
-        let stdout_len = stdout_file
-            .metadata()
-            .map_err(|error| format!("stat renderer stdout: {error}"))?
-            .len();
-        let stderr_len = stderr_file
-            .metadata()
-            .map_err(|error| format!("stat renderer stderr: {error}"))?
-            .len();
-        if stdout_len > TOOL_OUTPUT_LIMIT as u64 || stderr_len > TOOL_OUTPUT_LIMIT as u64 {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("ADM renderer output exceeded its 1 MiB per-stream safety limit".into());
-        }
-        match fs::symlink_metadata(rendered) {
-            Ok(metadata) if metadata.len() > max_render_bytes => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "ADM render exceeded its {max_render_bytes} byte safety limit"
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "stat ADM render while renderer is running: {error}"
-                ));
-            }
-        }
-        match child
-            .try_wait()
-            .map_err(|error| format!("wait for ADM renderer: {error}"))?
-        {
-            Some(status) => break status,
-            None if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "ADM renderer exceeded the {} second per-presentation timeout",
-                    timeout.as_secs()
-                ));
-            }
-            None => thread::sleep(Duration::from_millis(10)),
-        }
-    };
-    let _ = read_bounded(&mut stdout_file, TOOL_OUTPUT_LIMIT, "stdout")?;
-    let stderr = read_bounded(&mut stderr_file, TOOL_OUTPUT_LIMIT, "stderr")?;
-    Ok(ToolOutput { status, stderr })
-}
-
-fn read_bounded(file: &mut File, limit: usize, label: &str) -> Result<Vec<u8>, String> {
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| format!("seek renderer {label}: {error}"))?;
-    let mut bytes = Vec::new();
-    file.take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("read renderer {label}: {error}"))?;
-    if bytes.len() > limit {
-        return Err(format!("ADM renderer {label} exceeded its safety limit"));
-    }
-    Ok(bytes)
 }
 
 fn diagnostic(stderr: &[u8]) -> String {
