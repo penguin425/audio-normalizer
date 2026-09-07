@@ -27,7 +27,7 @@ pub(crate) struct AtomicOutput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum DestinationState {
+pub(crate) enum DestinationPreimage {
     Missing,
     Present {
         identity: StableFileIdentity,
@@ -36,13 +36,64 @@ enum DestinationState {
     },
 }
 
+type DestinationState = DestinationPreimage;
+
 impl AtomicOutput {
     pub(crate) fn new(destination: &Path) -> Result<Self, String> {
         Self::new_with_overwrite(destination, true)
     }
 
     pub(crate) fn new_with_overwrite(destination: &Path, overwrite: bool) -> Result<Self, String> {
-        let expected_destination = DestinationState::capture(destination)?;
+        Self::new_with_overwrite_and_limit(destination, overwrite, u64::MAX)
+    }
+
+    /// Create an atomic output while bounding the bytes read to capture an
+    /// existing destination preimage.
+    pub(crate) fn new_with_overwrite_and_limit(
+        destination: &Path,
+        overwrite: bool,
+        maximum_destination_bytes: u64,
+    ) -> Result<Self, String> {
+        let expected_destination =
+            DestinationState::capture(destination, maximum_destination_bytes)?;
+        Self::from_expected_destination(destination, overwrite, expected_destination)
+    }
+
+    /// Capture the exact destination state for a caller that has already
+    /// checkpointed an output decision. The returned token includes the file
+    /// identity, byte length, and complete content digest; a missing path is
+    /// represented explicitly so a later creator is also detected.
+    pub(crate) fn capture_destination_preimage(
+        destination: &Path,
+    ) -> Result<DestinationPreimage, String> {
+        DestinationState::capture(destination, u64::MAX)
+    }
+
+    /// Create an atomic output against a previously captured destination
+    /// preimage. Capturing again here closes the interval between a watch
+    /// checkpoint and construction of the staging file; commit performs the
+    /// existing final CAS check as well.
+    pub(crate) fn new_with_overwrite_and_preimage(
+        destination: &Path,
+        overwrite: bool,
+        expected_destination: DestinationPreimage,
+    ) -> Result<Self, String> {
+        let maximum_destination_bytes = expected_destination.maximum_capture_bytes();
+        let observed = DestinationState::capture(destination, maximum_destination_bytes)?;
+        if observed != expected_destination {
+            return Err(format!(
+                "output destination preimage changed before staging: {}",
+                destination.display()
+            ));
+        }
+        Self::from_expected_destination(destination, overwrite, expected_destination)
+    }
+
+    fn from_expected_destination(
+        destination: &Path,
+        overwrite: bool,
+        expected_destination: DestinationState,
+    ) -> Result<Self, String> {
         if !overwrite && expected_destination != DestinationState::Missing {
             return Err(format!(
                 "output already exists: {} (enable overwrite to replace it)",
@@ -74,8 +125,75 @@ impl AtomicOutput {
         })
     }
 
+    /// Re-open a stage that was deliberately retained by a restartable
+    /// transaction.  The expected destination state is supplied by the
+    /// transaction journal; the current pathname is captured and must match
+    /// it before the returned value can be committed.
+    pub(crate) fn from_existing_stage(
+        destination: &Path,
+        stage: &Path,
+        expected_identity: StableFileIdentity,
+        expected_byte_len: u64,
+        expected_sha256: [u8; 32],
+    ) -> Result<Self, String> {
+        let expected_destination = DestinationState::capture(destination, expected_byte_len)?;
+        let DestinationState::Present {
+            identity,
+            byte_len,
+            sha256,
+        } = &expected_destination
+        else {
+            return Err(format!(
+                "metadata transaction destination disappeared: {}",
+                destination.display()
+            ));
+        };
+        if *identity != expected_identity
+            || *byte_len != expected_byte_len
+            || *sha256 != expected_sha256
+        {
+            return Err(format!(
+                "metadata transaction destination preimage changed: {}",
+                destination.display()
+            ));
+        }
+
+        let file = open_regular_stage(stage, false)?;
+        let path = tempfile::TempPath::try_from_path(stage).map_err(|error| {
+            format!(
+                "retain metadata transaction stage {}: {error}",
+                stage.display()
+            )
+        })?;
+        let mut temporary = tempfile::NamedTempFile::from_parts(file, path);
+        // A ready stage is owned by the journal until publication succeeds.
+        // Keeping cleanup disabled means a commit-time conflict leaves the
+        // exact bytes available for a later resume instead of silently
+        // converting the job back into an untracked partial operation.
+        temporary.disable_cleanup(true);
+        let output = Self {
+            destination: destination.to_owned(),
+            expected_destination,
+            temporary,
+        };
+        output.bound_stage_file().map(drop)?;
+        Ok(output)
+    }
+
     pub(crate) fn path(&self) -> &Path {
         self.temporary.path()
+    }
+
+    /// Destination pathname captured by this atomic output.
+    pub(crate) fn destination_path(&self) -> &Path {
+        &self.destination
+    }
+
+    /// Keep the stage pathname after this value is dropped.  Restartable
+    /// callers invoke this only after the stage has been fully verified and
+    /// are responsible for recording the path in a durable journal.
+    pub(crate) fn retain_stage(&mut self) {
+        self.temporary.disable_cleanup(true);
     }
 
     pub(crate) fn file_mut(&mut self) -> &mut File {
@@ -86,6 +204,14 @@ impl AtomicOutput {
         self.temporary
             .write_all(bytes)
             .map_err(|error| format!("write {}: {error}", self.temporary.path().display()))
+    }
+
+    /// Synchronize the owned staging inode without publishing it.
+    pub(crate) fn sync_stage(&self) -> Result<(), String> {
+        self.temporary
+            .as_file()
+            .sync_all()
+            .map_err(|error| format!("sync {}: {error}", self.temporary.path().display()))
     }
 
     /// Adopt the regular file currently named by the staging path after a
@@ -117,7 +243,7 @@ impl AtomicOutput {
             return Ok(());
         }
 
-        let replacement = open_regular_stage(&path, true)?;
+        let replacement = open_regular_stage(&path, false)?;
         let replacement_identity =
             identity_from_open_file(&replacement, &path).map_err(|error| {
                 format!("identify adopted writer output {}: {error}", path.display())
@@ -140,7 +266,23 @@ impl AtomicOutput {
         self.commit_open().map(drop)
     }
 
+    /// Publish after one caller-owned destination check performed immediately
+    /// after the built-in identity/content comparison and before rename.
+    pub(crate) fn commit_with_destination_check(
+        self,
+        check: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.commit_open_with_destination_check(check).map(drop)
+    }
+
     pub(crate) fn commit_open(self) -> Result<File, String> {
+        self.commit_open_with_destination_check(|_| Ok(()))
+    }
+
+    fn commit_open_with_destination_check(
+        self,
+        check: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> Result<File, String> {
         // Sync the owned inode first, then minimize (but cannot portably
         // eliminate) the pathname race by binding immediately before persist.
         // An intentional path-replacing rewrite must first be adopted.
@@ -153,6 +295,7 @@ impl AtomicOutput {
             .expected_destination
             .verify_immediately_before_commit(&self.destination)?;
         let destination = self.destination;
+        check(&destination)?;
         let overwrite = matches!(self.expected_destination, DestinationState::Present { .. });
         let persisted = persist_temporary(self.temporary, &destination, overwrite)?;
         // The same open inode was synchronized immediately before the rename,
@@ -334,7 +477,28 @@ fn persist_temporary(
 }
 
 impl DestinationState {
-    fn capture(path: &Path) -> Result<Self, String> {
+    fn maximum_capture_bytes(&self) -> u64 {
+        match self {
+            Self::Missing => u64::MAX,
+            Self::Present { byte_len, .. } => *byte_len,
+        }
+    }
+
+    pub(crate) fn sha256_hex(&self) -> Option<String> {
+        match self {
+            Self::Missing => None,
+            Self::Present { sha256, .. } => {
+                let mut text = String::with_capacity(sha256.len() * 2);
+                for byte in sha256 {
+                    use std::fmt::Write as _;
+                    write!(&mut text, "{byte:02x}").expect("writing to String cannot fail");
+                }
+                Some(text)
+            }
+        }
+    }
+
+    fn capture(path: &Path, maximum_bytes: u64) -> Result<Self, String> {
         let file = match open_regular_destination(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::Missing),
@@ -345,7 +509,7 @@ impl DestinationState {
                 ))
             }
         };
-        let snapshot = snapshot_open_destination(&file, path)?;
+        let snapshot = snapshot_open_destination(&file, path, maximum_bytes)?;
         let confirmation = open_regular_destination(path).map_err(|error| {
             format!(
                 "reopen output destination {} after hashing: {error}",
@@ -382,7 +546,11 @@ impl DestinationState {
                 path.display()
             )
         })?;
-        let observed = snapshot_open_destination(&current, path)?;
+        let maximum_bytes = match self {
+            Self::Present { byte_len, .. } => *byte_len,
+            Self::Missing => unreachable!("missing destination returned above"),
+        };
+        let observed = snapshot_open_destination(&current, path, maximum_bytes)?;
         if &observed != self {
             return Err(format!(
                 "output destination changed after processing began; refusing to replace {}",
@@ -407,7 +575,11 @@ impl DestinationState {
     }
 }
 
-fn snapshot_open_destination(file: &File, path: &Path) -> Result<DestinationState, String> {
+fn snapshot_open_destination(
+    file: &File,
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<DestinationState, String> {
     let before = file.metadata().map_err(|error| {
         format!(
             "inspect opened output destination {}: {error}",
@@ -417,6 +589,12 @@ fn snapshot_open_destination(file: &File, path: &Path) -> Result<DestinationStat
     if !before.is_file() {
         return Err(format!(
             "output destination is not a regular file: {}",
+            path.display()
+        ));
+    }
+    if before.len() > maximum_bytes {
+        return Err(format!(
+            "output destination exceeds the configured {maximum_bytes}-byte bound: {}",
             path.display()
         ));
     }
@@ -625,6 +803,79 @@ mod tests {
     }
 
     #[test]
+    fn destination_preimage_capture_is_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("result.wav");
+        std::fs::write(&destination, b"destination bytes").unwrap();
+
+        let result = AtomicOutput::new_with_overwrite_and_limit(&destination, true, 4);
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"destination bytes");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn checkpointed_destination_preimage_rejects_replacement_before_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("result.wav");
+        let displaced = directory.path().join("displaced.wav");
+        std::fs::write(&destination, b"checkpointed destination").unwrap();
+        let preimage = AtomicOutput::capture_destination_preimage(&destination).unwrap();
+        std::fs::rename(&destination, &displaced).unwrap();
+        std::fs::write(&destination, b"competitor destination").unwrap();
+
+        let error = AtomicOutput::new_with_overwrite_and_preimage(&destination, true, preimage)
+            .err()
+            .expect("replacement must be rejected before staging");
+        assert!(error.contains("preimage changed before staging"), "{error}");
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"competitor destination"
+        );
+        assert_eq!(
+            std::fs::read(&displaced).unwrap(),
+            b"checkpointed destination"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn checkpointed_destination_preimage_is_checked_again_at_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("result.wav");
+        std::fs::write(&destination, b"checkpointed destination").unwrap();
+        let preimage = AtomicOutput::capture_destination_preimage(&destination).unwrap();
+        let mut output =
+            AtomicOutput::new_with_overwrite_and_preimage(&destination, true, preimage).unwrap();
+        output.write_all(b"generated output").unwrap();
+        std::fs::write(&destination, b"competitor destination").unwrap();
+
+        let error = output.commit().unwrap_err();
+        assert!(error.contains("changed after processing began"), "{error}");
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"competitor destination"
+        );
+    }
+
+    #[test]
+    fn checkpointed_missing_destination_rejects_a_racing_creator() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("result.wav");
+        let preimage = AtomicOutput::capture_destination_preimage(&destination).unwrap();
+        std::fs::write(&destination, b"competitor destination").unwrap();
+
+        let error = AtomicOutput::new_with_overwrite_and_preimage(&destination, false, preimage)
+            .err()
+            .expect("racing creator must be rejected before staging");
+        assert!(error.contains("preimage changed before staging"), "{error}");
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"competitor destination"
+        );
+    }
+
+    #[test]
     fn commit_rejects_same_inode_same_length_destination_changes() {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("result.wav");
@@ -647,11 +898,11 @@ mod tests {
         let mut output = AtomicOutput::new(&destination).unwrap();
         output.write_all(b"generated").unwrap();
         std::fs::rename(&destination, &displaced).unwrap();
-        std::fs::write(&destination, b"competitor").unwrap();
+        std::fs::write(&destination, b"rivalxxx").unwrap();
 
         let error = output.commit().unwrap_err();
         assert!(error.contains("changed after processing began"), "{error}");
-        assert_eq!(std::fs::read(&destination).unwrap(), b"competitor");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"rivalxxx");
         assert_eq!(std::fs::read(&displaced).unwrap(), b"original");
     }
 
@@ -696,6 +947,65 @@ mod tests {
             std::fs::read(&destination).unwrap(),
             b"replacement stage inode"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_path_replacement_is_adopted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("result.wav");
+        std::fs::write(&destination, b"original destination").unwrap();
+        let mut output = AtomicOutput::new(&destination).unwrap();
+        output.write_all(b"obsolete stage inode").unwrap();
+
+        let mut replacement = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        replacement.write_all(b"read-only replacement").unwrap();
+        replacement.persist(output.path()).unwrap();
+        std::fs::set_permissions(output.path(), std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        output.adopt_path_writer_output().unwrap();
+        output.commit().unwrap();
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"read-only replacement"
+        );
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_hardlink_check_runs_after_preflight() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("result.wav");
+        let alias = directory.path().join("result-alias.wav");
+        std::fs::write(&destination, b"original destination").unwrap();
+        let mut output = AtomicOutput::new(&destination).unwrap();
+        output.write_all(b"generated destination").unwrap();
+
+        let result = output.commit_with_destination_check(|path| {
+            // This mutation occurs after AtomicOutput has completed its own
+            // preimage comparison and immediately before persist. A caller's
+            // final hard-link policy must therefore reject publication.
+            std::fs::hard_link(path, &alias).map_err(|error| error.to_string())?;
+            let links = std::fs::metadata(path)
+                .map_err(|error| error.to_string())?
+                .nlink();
+            if links > 1 {
+                Err("destination acquired a hard-link alias".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"original destination"
+        );
+        assert_eq!(std::fs::read(&alias).unwrap(), b"original destination");
     }
 
     #[cfg(unix)]

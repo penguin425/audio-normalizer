@@ -8,6 +8,7 @@ on:
       - "Cargo.toml"
       - "schema/performance-benchmark-v1.schema.json"
       - "src/opus.rs"
+      - "src/sample_time.rs"
       - "tools/benchmark.py"
       - "tools/test_benchmark.py"
 

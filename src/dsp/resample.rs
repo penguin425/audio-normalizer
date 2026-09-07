@@ -1,5 +1,6 @@
 //! Bounded-memory, delay-compensated sample-rate conversion.
 
+use crate::sample_time::{output_frame_count, SampleTimeTransform};
 use crate::wav::AudioBuffer;
 use rubato::audioadapter::Adapter;
 use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
@@ -42,11 +43,23 @@ impl ResampleQuality {
     }
 }
 
-fn direct_input_batch_blocks(input_rate: u32, output_rate: u32) -> usize {
-    let blocks = (TARGET_DIRECT_OUTPUT_BATCH_FRAMES as u128)
-        .saturating_mul(input_rate as u128)
-        .div_ceil((CHUNK_FRAMES as u128).saturating_mul(output_rate as u128));
-    blocks.clamp(1, MAX_DIRECT_INPUT_BATCH_BLOCKS as u128) as usize
+fn direct_input_batch_blocks(input_rate: u32, output_rate: u32) -> Result<usize, String> {
+    if output_rate == 0 {
+        return Err("sample-rate converter output rate must be positive".into());
+    }
+    let denominator = (CHUNK_FRAMES as u128)
+        .checked_mul(output_rate as u128)
+        .ok_or_else(|| "sample-rate converter batch denominator overflow".to_string())?;
+    let numerator = (TARGET_DIRECT_OUTPUT_BATCH_FRAMES as u128)
+        .checked_mul(input_rate as u128)
+        .ok_or_else(|| "sample-rate converter batch numerator overflow".to_string())?;
+    let blocks = numerator
+        .checked_add(denominator - 1)
+        .ok_or_else(|| "sample-rate converter batch rounding overflow".to_string())?
+        / denominator;
+    let blocks = blocks.clamp(1, MAX_DIRECT_INPUT_BATCH_BLOCKS as u128);
+    usize::try_from(blocks)
+        .map_err(|_| "sample-rate converter batch count does not fit platform usize".to_string())
 }
 
 fn maximum_batched_output_frames(resampler: &Fft<f32>, blocks: usize) -> Option<usize> {
@@ -86,9 +99,8 @@ impl SampleRateConverter {
         channels: usize,
         quality: ResampleQuality,
     ) -> Result<Self, String> {
-        let expected_output_frames = ((input_frames as u128 * output_rate as u128
-            + input_rate as u128 / 2)
-            / input_rate as u128) as usize;
+        let expected_output_frames = output_frame_count(input_frames, input_rate, output_rate)
+            .map_err(|error| format!("calculate sample-rate converter output duration: {error}"))?;
         Self::new_inner(
             input_rate,
             output_rate,
@@ -134,16 +146,22 @@ impl SampleRateConverter {
         quality: ResampleQuality,
         expected_output_frames: Option<usize>,
     ) -> Result<Self, String> {
-        if input_rate == 0 || output_rate == 0 || channels == 0 {
+        SampleTimeTransform::new(input_rate, output_rate)
+            .map_err(|error| format!("create sample-rate converter: {error}"))?;
+        if channels == 0 {
             return Err("sample rates and channel count must be positive".into());
         }
         if input_rate == output_rate {
             return Err("sample-rate converter requires different input and output rates".into());
         }
         let (sub_chunks, window) = quality.fft_settings();
+        let input_rate_usize = usize::try_from(input_rate)
+            .map_err(|_| "sample-rate converter input rate does not fit platform usize")?;
+        let output_rate_usize = usize::try_from(output_rate)
+            .map_err(|_| "sample-rate converter output rate does not fit platform usize")?;
         let resampler = Fft::new_custom(
-            input_rate as usize,
-            output_rate as usize,
+            input_rate_usize,
+            output_rate_usize,
             CHUNK_FRAMES,
             sub_chunks,
             channels,
@@ -155,14 +173,23 @@ impl SampleRateConverter {
         // Fixed-input FFT resampling can temporarily retain almost one complete
         // FFT block. Bound tail flushing by one block plus a small safety margin,
         // including rate pairs whose minimum FFT block is larger than CHUNK_FRAMES.
-        let ratio = resampler.resample_ratio();
         // output_delay() is floor(fft_size_out / 2). Add one before mapping
         // back to input frames so odd output block sizes remain bounded too.
-        let fft_block_output_upper = delay_frames_remaining.saturating_mul(2).saturating_add(1);
-        let fft_block_input_frames = (fft_block_output_upper as f64 / ratio).ceil() as usize;
-        let max_flush_passes = fft_block_input_frames.div_ceil(CHUNK_FRAMES) + 3;
+        let fft_block_output_upper = delay_frames_remaining
+            .checked_mul(2)
+            .and_then(|frames| frames.checked_add(1))
+            .ok_or_else(|| "sample-rate converter flush bound overflow".to_string())?;
+        let reverse_rate = SampleTimeTransform::new(output_rate, input_rate)
+            .map_err(|error| format!("calculate sample-rate converter flush bound: {error}"))?;
+        let fft_block_input_frames = reverse_rate
+            .map_ceil_usize(fft_block_output_upper)
+            .map_err(|error| format!("calculate sample-rate converter flush bound: {error}"))?;
+        let max_flush_passes = fft_block_input_frames
+            .div_ceil(CHUNK_FRAMES)
+            .checked_add(3)
+            .ok_or_else(|| "sample-rate converter flush bound overflow".to_string())?;
         let input_capacity = resampler.input_frames_max();
-        let direct_input_batch_blocks = direct_input_batch_blocks(input_rate, output_rate);
+        let direct_input_batch_blocks = direct_input_batch_blocks(input_rate, output_rate)?;
         let batched_output_capacity =
             maximum_batched_output_frames(&resampler, direct_input_batch_blocks)
                 .ok_or_else(|| "sample-rate converter output capacity overflow".to_string())?;
@@ -302,9 +329,7 @@ impl SampleRateConverter {
         &mut self,
         mut consume: impl FnMut(&mut [Vec<f32>]) -> Result<(), String>,
     ) -> Result<(), String> {
-        let calculated_output_frames = ((self.input_frames_seen as u128 * self.output_rate as u128
-            + self.input_rate as u128 / 2)
-            / self.input_rate as u128) as usize;
+        let calculated_output_frames = self.calculated_output_frames()?;
         if let Some(expected) = self.expected_output_frames {
             if expected != calculated_output_frames {
                 return Err(format!(
@@ -344,9 +369,7 @@ impl SampleRateConverter {
         &mut self,
         mut consume: impl FnMut(Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, String>,
     ) -> Result<(), String> {
-        let calculated_output_frames = ((self.input_frames_seen as u128 * self.output_rate as u128
-            + self.input_rate as u128 / 2)
-            / self.input_rate as u128) as usize;
+        let calculated_output_frames = self.calculated_output_frames()?;
         if let Some(expected) = self.expected_output_frames {
             if expected != calculated_output_frames {
                 return Err(format!(
@@ -529,7 +552,7 @@ impl SampleRateConverter {
         &mut self,
         consume: &mut impl FnMut(&mut [Vec<f32>]) -> Result<(), String>,
     ) -> Result<(), String> {
-        if !self.prepare_output_for_emit() {
+        if !self.prepare_output_for_emit()? {
             return Ok(());
         }
         consume(&mut self.output_buffer)
@@ -539,7 +562,7 @@ impl SampleRateConverter {
         &mut self,
         consume: &mut impl FnMut(Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, String>,
     ) -> Result<(), String> {
-        if !self.prepare_output_for_emit() {
+        if !self.prepare_output_for_emit()? {
             return Ok(());
         }
         let output = std::mem::take(&mut self.output_buffer);
@@ -555,7 +578,7 @@ impl SampleRateConverter {
         Ok(())
     }
 
-    fn prepare_output_for_emit(&mut self) -> bool {
+    fn prepare_output_for_emit(&mut self) -> Result<bool, String> {
         let frames = self.output_buffer.first().map_or(0, Vec::len);
         let start = self.delay_frames_remaining.min(frames);
         self.delay_frames_remaining -= start;
@@ -567,19 +590,28 @@ impl SampleRateConverter {
             for channel in &mut self.output_buffer {
                 channel.clear();
             }
-            return false;
+            return Ok(false);
         }
+        let emitted = end - start;
+        let new_emitted_frames = self
+            .emitted_frames
+            .checked_add(emitted)
+            .ok_or_else(|| "sample-rate converter emitted frame count overflow".to_string())?;
         if start > 0 {
             for channel in &mut self.output_buffer {
                 channel.copy_within(start..end, 0);
             }
         }
-        let emitted = end - start;
         for channel in &mut self.output_buffer {
             channel.truncate(emitted);
         }
-        self.emitted_frames += end - start;
-        true
+        self.emitted_frames = new_emitted_frames;
+        Ok(true)
+    }
+
+    fn calculated_output_frames(&self) -> Result<usize, String> {
+        output_frame_count(self.input_frames_seen, self.input_rate, self.output_rate)
+            .map_err(|error| format!("calculate sample-rate converter output duration: {error}"))
     }
 
     fn validate(&self, planar: &[Vec<f32>]) -> Result<(), String> {
@@ -681,7 +713,9 @@ mod tests {
             .max_by(|left, right| left.1.abs().total_cmp(&right.1.abs()))
             .unwrap()
             .0;
-        let expected = (10_000.0_f64 * 44_100.0 / 48_000.0).round() as usize;
+        let expected =
+            usize::try_from(crate::sample_time::map_sample_index(10_000, 48_000, 44_100).unwrap())
+                .unwrap();
         assert!(
             peak.abs_diff(expected) <= 1,
             "impulse at {peak}, expected {expected}"
@@ -725,8 +759,7 @@ mod tests {
         let mut planar = vec![vec![0.0_f32; frames]; 2];
         planar[0][1_000] = 1.0;
         planar[1][3_000] = -1.0;
-        let expected_frames = ((frames as u128 * output_rate as u128 + input_rate as u128 / 2)
-            / input_rate as u128) as usize;
+        let expected_frames = output_frame_count(frames, input_rate, output_rate).unwrap();
         let mut converter = SampleRateConverter::new(
             input_rate,
             output_rate,
@@ -777,10 +810,16 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let expected_left = (1_000.0_f64 * output_rate as f64 / input_rate as f64).round();
-        let expected_right = (3_000.0_f64 * output_rate as f64 / input_rate as f64).round();
-        assert!(peaks[0].0.abs_diff(expected_left as usize) <= 1);
-        assert!(peaks[1].0.abs_diff(expected_right as usize) <= 1);
+        let expected_left = usize::try_from(
+            crate::sample_time::map_sample_index(1_000, input_rate, output_rate).unwrap(),
+        )
+        .unwrap();
+        let expected_right = usize::try_from(
+            crate::sample_time::map_sample_index(3_000, input_rate, output_rate).unwrap(),
+        )
+        .unwrap();
+        assert!(peaks[0].0.abs_diff(expected_left) <= 1);
+        assert!(peaks[1].0.abs_diff(expected_right) <= 1);
         assert!(*peaks[0].1 > 0.5);
         assert!(*peaks[1].1 < -0.5);
     }
@@ -1225,7 +1264,7 @@ mod tests {
     fn coprime_rates_flush_across_zero_output_chunks() {
         let input = sine(1_031, CHUNK_FRAMES);
         let output = convert_buffer(&input, 1_033, ResampleQuality::Balanced).unwrap();
-        let expected = ((CHUNK_FRAMES as u128 * 1_033 + 1_031 / 2) / 1_031) as usize;
+        let expected = output_frame_count(CHUNK_FRAMES, 1_031, 1_033).unwrap();
         assert_eq!(output.frames, expected);
         assert!(output.data[0].iter().any(|sample| sample.abs() > 0.01));
     }
@@ -1236,5 +1275,13 @@ mod tests {
         let output = convert_buffer(&input, 1, ResampleQuality::Balanced).unwrap();
         assert_eq!(output.frames, 1);
         assert!(output.data[0][0].is_finite());
+    }
+
+    #[test]
+    fn zero_input_rate_is_rejected_without_division_by_zero() {
+        assert!(SampleRateConverter::new(0, 48_000, 1, 1, ResampleQuality::Balanced).is_err());
+        assert!(
+            SampleRateConverter::new_streaming(48_000, 0, 1, ResampleQuality::Balanced).is_err()
+        );
     }
 }

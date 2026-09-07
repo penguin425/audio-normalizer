@@ -56,9 +56,13 @@ still holds the old one. State and lock paths are protected from output-path,
 hard-link, reparse-point, and platform case aliases.
 
 On restart, a `processing` entry with no newly committed output is safely
-requeued. If the transactional output was committed before the state update,
-Forge hashes and adopts it as completed. Missing completed outputs are
-requeued. Modified completed outputs are rejected rather than overwritten.
+requeued. The v1 state contract does not contain a ready-stage identity or the
+expected post-render digest, so an output that differs from the recorded prior
+output cannot be authenticated after an interruption. Forge records that
+ambiguous path and digest as `failed` instead of adopting it as completed;
+`--watch-retry-failed` is the explicit instruction to render it again. Missing
+completed outputs are requeued. Modified completed outputs are rejected rather
+than overwritten.
 When a completed input changes, its previously recorded output must still
 match its SHA-256 before Forge will replace it. A first-time output is
 published with atomic no-clobber semantics; replacement is allowed only for

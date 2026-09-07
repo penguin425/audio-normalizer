@@ -115,11 +115,15 @@ for file in \
   ANALYSIS-CACHE.md \
   CATALOGUE.md \
   EBU-QC-SCENARIO1.md \
+  METADATA-FIDELITY.md \
   schema/analysis-cache-v4.schema.json \
   schema/analysis-cache-v5.schema.json \
   schema/schema-registry-v1.schema.json \
   schema/schema-registry-v1.json \
   schema/channel-layout-v1.schema.json \
+  schema/metadata-fidelity-report-v1.schema.json \
+  schema/metadata-inventory-v1.schema.json \
+  schema/metadata-job-v1.schema.json \
   schema/catalogue-report-v2.schema.json \
   schema/catalogue-report-v3.schema.json \
   schema/ac4-adapter-report-v2.schema.json \

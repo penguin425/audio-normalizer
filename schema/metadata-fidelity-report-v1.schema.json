@@ -1,0 +1,444 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/metadata-fidelity-report-v1",
+  "title": "Forge metadata fidelity report v1",
+  "description": "Container-neutral, field-level metadata policy and publication evidence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "policy",
+    "evidence",
+    "entries",
+    "publication"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/metadata-fidelity-report-v1"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "policy": {
+      "$ref": "#/$defs/policy"
+    },
+    "evidence": {
+      "$ref": "#/$defs/evidence"
+    },
+    "entries": {
+      "type": "array",
+      "maxItems": 1000000,
+      "items": {
+        "$ref": "#/$defs/entry"
+      }
+    },
+    "publication": {
+      "$ref": "#/$defs/publication"
+    }
+  },
+  "$defs": {
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy",
+        "strip_scope",
+        "strip_locators"
+      ],
+      "properties": {
+        "policy": {
+          "enum": [
+            "preserve",
+            "strict",
+            "strip",
+            "legacy_generic"
+          ]
+        },
+        "strip_scope": {
+          "enum": [
+            "none",
+            "all",
+            "selected"
+          ]
+        },
+        "strip_locators": {
+          "type": "array",
+          "description": "Exact source metadata inventory locators eligible for policy-driven removal.",
+          "maxItems": 1000000,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/locator"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "policy": {
+                "const": "strip"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "strip_scope": {
+                "enum": [
+                  "all",
+                  "selected"
+                ]
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "strip_scope": {
+                "const": "none"
+              },
+              "strip_locators": {
+                "maxItems": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "strip_scope": {
+                "const": "selected"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "strip_locators": {
+                "minItems": 1
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "strip_locators": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "registry_revision",
+        "timing_revision",
+        "sample_time_transform"
+      ],
+      "properties": {
+        "registry_revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "timing_revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "sample_time_transform": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/sampleTimeTransform"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "sampleTimeTransform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_rate_hz",
+        "output_rate_hz",
+        "crop_origin_source_frames",
+        "rounding"
+      ],
+      "properties": {
+        "source_rate_hz": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "output_rate_hz": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "crop_origin_source_frames": {
+          "type": "string",
+          "pattern": "^-?(0|[1-9][0-9]{0,38})$"
+        },
+        "rounding": {
+          "enum": [
+            "half-up",
+            "ties-to-even"
+          ]
+        }
+      }
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "field",
+        "outcome",
+        "loss_class",
+        "reason",
+        "source_locator",
+        "destination_locator",
+        "before_sha256",
+        "after_sha256"
+      ],
+      "properties": {
+        "field": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Length is measured in Unicode scalar values, not UTF-8 bytes.",
+          "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*[^\\u0000-\\u001F\\u007F-\\u009F\\u0009\\u000A\\u000B\\u000C\\u000D\\u0020\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF][^\\u0000-\\u001F\\u007F-\\u009F]*$"
+        },
+        "outcome": {
+          "enum": [
+            "preserved",
+            "mapped",
+            "recomputed",
+            "dropped"
+          ]
+        },
+        "loss_class": {
+          "enum": [
+            "none",
+            "representation",
+            "semantic",
+            "unsupported",
+            "policy"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "description": "Length is measured in Unicode scalar values, not UTF-8 bytes.",
+          "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*[^\\u0000-\\u001F\\u007F-\\u009F\\u0009\\u000A\\u000B\\u000C\\u000D\\u0020\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF][^\\u0000-\\u001F\\u007F-\\u009F]*$"
+        },
+        "source_locator": {
+          "description": "Container-specific source inventory locator, when a source field exists.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/locator"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "destination_locator": {
+          "description": "Container-specific destination locator, when a destination field exists. Dropped entries use null.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/locator"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "before_sha256": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "after_sha256": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "preserved"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "loss_class": {
+                "const": "none"
+              },
+              "source_locator": {
+                "$ref": "#/$defs/locator"
+              },
+              "destination_locator": {
+                "$ref": "#/$defs/locator"
+              },
+              "before_sha256": {
+                "$ref": "#/$defs/sha256"
+              },
+              "after_sha256": {
+                "$ref": "#/$defs/sha256"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "mapped"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "loss_class": {
+                "enum": [
+                  "none",
+                  "representation",
+                  "semantic"
+                ]
+              },
+              "source_locator": {
+                "$ref": "#/$defs/locator"
+              },
+              "destination_locator": {
+                "$ref": "#/$defs/locator"
+              },
+              "before_sha256": {
+                "$ref": "#/$defs/sha256"
+              },
+              "after_sha256": {
+                "$ref": "#/$defs/sha256"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "recomputed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "loss_class": {
+                "enum": [
+                  "none",
+                  "representation",
+                  "semantic",
+                  "unsupported"
+                ]
+              },
+              "destination_locator": {
+                "$ref": "#/$defs/locator"
+              },
+              "after_sha256": {
+                "$ref": "#/$defs/sha256"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "dropped"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "loss_class": {
+                "enum": [
+                  "representation",
+                  "semantic",
+                  "unsupported",
+                  "policy"
+                ]
+              },
+              "source_locator": {
+                "$ref": "#/$defs/locator"
+              },
+              "before_sha256": {
+                "$ref": "#/$defs/sha256"
+              },
+              "destination_locator": {
+                "type": "null"
+              },
+              "after_sha256": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "publication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "blocking_entries"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "allowed",
+            "blocked"
+          ]
+        },
+        "blocking_entries": {
+          "type": "array",
+          "maxItems": 1000000,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "locator": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "description": "Length is measured in Unicode scalar values, not UTF-8 bytes.",
+      "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*[^\\u0000-\\u001F\\u007F-\\u009F\\u0009\\u000A\\u000B\\u000C\\u000D\\u0020\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF][^\\u0000-\\u001F\\u007F-\\u009F]*$"
+    },
+    "revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Length is measured in Unicode scalar values, not UTF-8 bytes.",
+      "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*[^\\u0000-\\u001F\\u007F-\\u009F\\u0009\\u000A\\u000B\\u000C\\u000D\\u0020\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF][^\\u0000-\\u001F\\u007F-\\u009F]*$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

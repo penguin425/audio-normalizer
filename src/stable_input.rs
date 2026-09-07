@@ -887,12 +887,23 @@ pub(crate) fn path_identity_if_exists(
 }
 
 #[cfg(windows)]
-fn windows_file_identity(file: &File) -> Result<(u32, u64), StableInputError> {
+pub(crate) fn windows_file_identity(file: &File) -> Result<(u32, u64), StableInputError> {
     let information = windows_file_information(file)?;
     Ok((
         information.dwVolumeSerialNumber,
         (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
     ))
+}
+
+/// Return the hard-link count recorded for an already-open Windows file.
+///
+/// The standard-library metadata accessors for this field are still unstable
+/// (`windows_by_handle`). Keep callers on the handle-based Win32 path so a
+/// failure to inspect the count can be treated as a hard error by security
+/// sensitive callers.
+#[cfg(windows)]
+pub(crate) fn windows_file_link_count(file: &File) -> Result<u32, StableInputError> {
+    Ok(windows_file_information(file)?.nNumberOfLinks)
 }
 
 #[cfg(windows)]

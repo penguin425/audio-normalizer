@@ -2,6 +2,7 @@
 
 use crate::decoder::StreamInfo;
 use crate::opus_tags::{build_opus_tags as opus_tags, parse_r128_comments};
+use crate::sample_time::output_frame_count;
 use crate::wav::{default_channel_roles, named_channel_layout, ChannelRole, PcmKind};
 use ::opus::{Application, Bitrate, Channels, Decoder, Encoder, MSDecoder, MSEncoder};
 use ogg::{Packet, PacketReader, PacketWriteEndInfo, PacketWriter};
@@ -123,8 +124,8 @@ impl OpusStreamWriter {
             .as_ref()
             .map_or(0, |resampler| resampler.output_delay());
         let expected_output_frames = u64::try_from(
-            (input_frames as u128 * OPUS_RATE as u128 + input_rate as u128 / 2)
-                / input_rate as u128,
+            output_frame_count(input_frames, input_rate, OPUS_RATE)
+                .map_err(|error| format!("calculate Opus output duration: {error}"))?,
         )
         .map_err(|_| "Opus output frame count exceeds the supported range".to_string())?;
         let head = opus_head(channels, pre_skip as u16, input_rate, &layout);
@@ -1307,8 +1308,9 @@ mod tests {
         let path = directory.path().join("exact-chunks.opus");
         let input_rate = 44_100;
         let input_frames = RESAMPLE_CHUNK * 2;
-        let expected_frames = ((input_frames as u128 * OPUS_RATE as u128 + input_rate as u128 / 2)
-            / input_rate as u128) as u64;
+        let expected_frames =
+            u64::try_from(output_frame_count(input_frames, input_rate, OPUS_RATE).unwrap())
+                .unwrap();
         let mut writer = OpusStreamWriter::create(
             &path,
             input_rate,
@@ -1399,8 +1401,9 @@ mod tests {
         assert_eq!(writer.resample_output[0].capacity(), output_capacity);
         writer.finish().unwrap();
 
-        let expected_frames = ((total_frames as u128 * OPUS_RATE as u128 + input_rate as u128 / 2)
-            / input_rate as u128) as u64;
+        let expected_frames =
+            u64::try_from(output_frame_count(total_frames, input_rate, OPUS_RATE).unwrap())
+                .unwrap();
         assert_eq!(inspect(&path).unwrap().total_frames, expected_frames);
     }
 

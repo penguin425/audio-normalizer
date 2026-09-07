@@ -254,6 +254,10 @@ fn watch_folder_waits_for_stability_then_checkpoints_and_skips_completed_output(
         .unwrap()
         .iter()
         .all(|entry| entry["status"] == "completed"));
+    assert!(state_value["operation"].get("metadata_policy").is_none());
+    assert!(state_value["operation"]
+        .get("metadata_registry_revision")
+        .is_none());
 
     let third = run();
     assert!(
@@ -828,6 +832,10 @@ fn resumable_batch_skips_verified_outputs_and_recovers_only_missing_or_changed_a
         .is_valid(&state));
     assert_eq!(state["asset_count"], 2);
     assert_eq!(state["completed_count"], 2);
+    assert!(state["operation"].get("metadata_policy").is_none());
+    assert!(state["operation"]
+        .get("metadata_registry_revision")
+        .is_none());
     let first_output = PathBuf::from(state["assets"][0]["output"].as_str().unwrap());
     let second_output = PathBuf::from(state["assets"][1]["output"].as_str().unwrap());
     assert!(first_output.is_file());

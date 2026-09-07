@@ -16,6 +16,7 @@ on:
       - "src/normalize.rs"
       - "src/opus.rs"
       - "src/pcm_spool.rs"
+      - "src/sample_time.rs"
       - "tools/benchmark.py"
       - "tools/paired_benchmark.py"
       - "tools/pcm_benchmark_gate.py"

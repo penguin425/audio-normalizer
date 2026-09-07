@@ -518,12 +518,14 @@ core:
 
 New standards coverage must not outrun the safety of the ordinary file and
 service workflows. The filesystem and state-coordination gates shipped in
-v0.189.6. Before adding another broad parser surface, Forge will:
+v0.189.6, and the metadata-fidelity gates below shipped in v0.189.14. Before
+adding another broad parser surface, Forge will:
 
-- make metadata handling explicit through `preserve`, `strict`, and `strip`
-  policies, report every preserved/mapped/recomputed/dropped field, adjust
-  sample-indexed BWF/DAW timing with exact rational arithmetic after
-  resampling, and make metadata-only library jobs resumable;
+- retain explicit `preserve`, `strict`, and `strip` metadata policies,
+  field-level preserved/mapped/recomputed/dropped reporting, exact rational
+  sample-indexed BWF/DAW timing conversion after resampling, and resumable
+  metadata-only single-file jobs;
+- defer generation-level all-or-nothing album/batch publication to v0.189.15;
 - retain the v0.189.13 secure service boundary and bounded subprocess broker.
   A later strict broker profile will additionally combine OS filesystem and
   syscall isolation, disable networking and privilege gain, and fail closed
@@ -532,6 +534,26 @@ v0.189.6. Before adding another broad parser surface, Forge will:
   revisions, reject symbolic workflow references in CI and release readiness,
   and run scheduled advisory checks. These workflow gates and release-tag
   update/deletion protection shipped immediately after v0.189.8.
+
+### Metadata fidelity delivered in v0.189.14
+
+The v0.189.14 implementation makes policy and evidence explicit without
+claiming that every container-specific writer is lossless. `preserve` reports
+best-effort mappings and losses, `strict` blocks publication on any loss, and
+`strip` permits only an all-fields or exact-locator scope. The historical
+primary/first generic-tag behavior remains available as `legacy-generic` and
+is still selected by the CLI when no policy is supplied.
+
+The registry-backed inventory is bounded and policy-independent. It discovers
+repeated and unknown metadata plus structural regions across supported WAVE,
+FLAC, MP3, Ogg, and ISO-BMFF inputs, retaining locators, physical extents,
+hashes, and scan issues under explicit item, aggregate, entry-count, nesting,
+and raw-retention limits. Supported sample-indexed BWF/DAW timing fields use
+checked exact rational sample-clock conversion, including an explicit tie rule
+and crop origin; XML-bearing timing remains opaque. A restartable transaction
+binds one source file to a private verified stage and publishes it once with a
+compare-and-swap check. Album/batch generation atomicity is intentionally the
+v0.189.15 follow-up.
 
 ### Newly identified integrity gates
 
@@ -650,7 +672,7 @@ unchanged controls from paths whose normative work factor changed.
 The order below is an implementation plan, not a standards requirement. Each
 normative item must name the exact supported clauses and must not imply
 certification or coverage beyond its fixtures.
-v0.189.1 through v0.189.13 are the completed baseline; later entries are
+v0.189.1 through v0.189.14 are the completed baseline; later entries are
 planned.
 
 | Release | Scope | Classification |

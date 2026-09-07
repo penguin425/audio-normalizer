@@ -10,7 +10,7 @@
 //! professional loudness normalizers avoid clipping without a dynamic limiter.
 
 pub use crate::analysis::{analyze, Analysis, AnalysisEngine};
-use crate::atomic::AtomicOutput;
+use crate::atomic::{AtomicOutput, DestinationPreimage};
 use crate::bound_analysis::{BoundAnalysis, BoundAnalysisError};
 use crate::channel_layout::ChannelLayoutDescriptor;
 use crate::decoder::{self, InputDescriptor, InputDescriptorOptions};
@@ -21,12 +21,15 @@ use crate::dsp::sum::CompensatedSum;
 use crate::dsp::{convert, lufs, simd};
 use crate::flacenc::FlacStreamWriter;
 use crate::metadata;
+use crate::metadata_fidelity::{MetadataFidelityReport, MetadataPolicyConfig};
+use crate::metadata_pipeline::{DestinationLoudnessWriter, MetadataDestination, PreparedMetadata};
 #[cfg(feature = "mp3-encoding")]
 use crate::mp3enc;
 use crate::pcm_spool::PcmSpool;
 use crate::stable_input::{paths_alias_if_existing, StableInput, StableInputOptions};
+use crate::watch::WatchProcessingOutput;
 use crate::wav::{
-    AudioBuffer, ChannelRole, PcmKind, WavContainer, WavStreamWriter, WavWriter,
+    AudioBuffer, ChannelRole, PcmKind, WavContainer, WavStreamWriter, WavWriter, WaveChunk,
     MAX_DECODE_SAMPLE_RATE_HZ, MIN_DECODE_SAMPLE_RATE_HZ,
 };
 use rayon::prelude::*;
@@ -351,6 +354,7 @@ pub struct StagedNormalization {
     output: AtomicOutput,
     outcome: NormalizationOutcome,
     protected_inputs: Vec<StableInput>,
+    metadata_report: Option<MetadataFidelityReport>,
 }
 
 impl StagedNormalization {
@@ -367,13 +371,27 @@ impl StagedNormalization {
         self.output.path()
     }
 
+    /// Field-level metadata decisions for an explicitly selected policy.
+    ///
+    /// Legacy entry points return `None`; the additive metadata-policy APIs
+    /// return a validated report before publication is possible.
+    pub fn metadata_report(&self) -> Option<&MetadataFidelityReport> {
+        self.metadata_report.as_ref()
+    }
+
     /// Synchronize and atomically replace the destination with this render.
     pub fn commit(self) -> Result<NormalizationOutcome, String> {
         let Self {
             output,
             outcome,
             protected_inputs,
+            metadata_report,
         } = self;
+        if let Some(report) = &metadata_report {
+            report
+                .require_publication()
+                .map_err(|error| error.to_string())?;
+        }
         verify_stable_inputs(&protected_inputs, "input changed before output publication")?;
         output.commit()?;
         Ok(outcome)
@@ -388,6 +406,7 @@ pub struct StagedCorrectedNormalization {
     output: AtomicOutput,
     outcome: CorrectedNormalization,
     protected_inputs: Vec<StableInput>,
+    metadata_report: Option<MetadataFidelityReport>,
 }
 
 impl StagedCorrectedNormalization {
@@ -401,13 +420,24 @@ impl StagedCorrectedNormalization {
         self.output.path()
     }
 
+    /// Field-level metadata decisions for an explicitly selected policy.
+    pub fn metadata_report(&self) -> Option<&MetadataFidelityReport> {
+        self.metadata_report.as_ref()
+    }
+
     /// Revalidate the source and atomically publish the corrected render.
     pub fn commit(self) -> Result<CorrectedNormalization, String> {
         let Self {
             output,
             outcome,
             protected_inputs,
+            metadata_report,
         } = self;
+        if let Some(report) = &metadata_report {
+            report
+                .require_publication()
+                .map_err(|error| error.to_string())?;
+        }
         verify_stable_inputs(
             &protected_inputs,
             "input changed before corrected output publication",
@@ -2042,15 +2072,13 @@ fn expected_pcm_spool_bytes(
     ) {
         return None;
     }
-    let source_frames = u128::from(declared_frames?);
+    let source_frames = usize::try_from(declared_frames?).ok()?;
     let output_frames = if output_rate == info.sample_rate {
         source_frames
     } else {
-        (source_frames * u128::from(output_rate) + u128::from(info.sample_rate) / 2)
-            / u128::from(info.sample_rate)
+        crate::sample_time::output_frame_count(source_frames, info.sample_rate, output_rate).ok()?
     };
-    usize::try_from(output_frames)
-        .ok()?
+    output_frames
         .checked_mul(info.channels as usize)?
         .checked_mul(std::mem::size_of::<f32>())
 }
@@ -2756,6 +2784,30 @@ pub fn normalize_one_staged_with_roles_and_policy<P: AsRef<Path>>(
     )
 }
 
+/// Watch-folder variant that binds the output destination to the preimage
+/// captured while the watch entry was checkpointed.
+pub fn normalize_one_staged_with_roles_and_watch_output(
+    input: &Path,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    channel_roles: Option<&[ChannelRole]>,
+    output_policy: OutputConflictPolicy,
+    watch_output: &WatchProcessingOutput,
+) -> Result<StagedNormalization, String> {
+    normalize_one_staged_with_roles_impl_with_destination_preimage(
+        input,
+        output,
+        plan,
+        format,
+        channel_roles,
+        None,
+        false,
+        output_policy,
+        Some(watch_output.destination_preimage().clone()),
+    )
+}
+
 /// Compatibility entry point accepting an unbound precomputed analysis.
 ///
 /// The input is measured again from a private snapshot and must match exactly;
@@ -2960,6 +3012,7 @@ pub fn normalize_one_bound_staged_with_policy(
         AnalysisReuse::Bound(analysis),
         false,
         output_policy,
+        None,
     )
     .map_err(BoundAnalysisError::render_failed)
 }
@@ -3004,6 +3057,7 @@ pub fn normalize_one_bound_audited_with_policy(
         AnalysisReuse::Bound(analysis),
         true,
         output_policy,
+        None,
     )
     .map_err(BoundAnalysisError::render_failed)?
     .commit()
@@ -3081,8 +3135,95 @@ pub fn normalize_one_descriptor_staged_with_policy(
         &analysis,
         prepared.spool,
         false,
+        None,
         output_policy,
     )
+}
+
+/// Watch-folder variant of descriptor staging that carries the checkpointed
+/// output preimage into atomic construction.
+pub fn normalize_one_descriptor_staged_with_watch_output(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    output_policy: OutputConflictPolicy,
+    watch_output: &WatchProcessingOutput,
+) -> Result<StagedNormalization, BoundAnalysisError> {
+    plan.validate_for_format(format)
+        .map_err(BoundAnalysisError::invalid_request)?;
+    let prepared = prepare_descriptor_analysis_for_render(descriptor, plan)
+        .map_err(BoundAnalysisError::analysis_failed)?;
+    let analysis = BoundAnalysis::for_descriptor(descriptor, prepared.analysis, plan)?;
+    normalize_one_descriptor_bound_staged_impl_with_destination_preimage(
+        descriptor,
+        output,
+        plan,
+        format,
+        &analysis,
+        prepared.spool,
+        false,
+        None,
+        output_policy,
+        Some(watch_output.destination_preimage().clone()),
+    )
+}
+
+/// Analyze and stage one descriptor with an explicit metadata-fidelity policy.
+///
+/// The bounded registry and strict capability checks run before decoding or
+/// creating the destination stage. Existing normalization entry points retain
+/// their historical generic-tag behavior.
+pub fn normalize_one_descriptor_staged_with_metadata_policy(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    metadata_policy: &MetadataPolicyConfig,
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedNormalization, BoundAnalysisError> {
+    plan.validate_for_format(format)
+        .map_err(BoundAnalysisError::invalid_request)?;
+    let metadata = prepare_descriptor_metadata(descriptor, plan, format, metadata_policy)?;
+    let prepared = prepare_descriptor_analysis_for_render(descriptor, plan)
+        .map_err(BoundAnalysisError::analysis_failed)?;
+    let analysis = BoundAnalysis::for_descriptor(descriptor, prepared.analysis, plan)?;
+    normalize_one_descriptor_bound_staged_impl(
+        descriptor,
+        output,
+        plan,
+        format,
+        &analysis,
+        prepared.spool,
+        false,
+        Some(metadata),
+        output_policy,
+    )
+}
+
+/// Normalize, publish, and return the explicit metadata-fidelity report.
+pub fn normalize_one_descriptor_with_metadata_policy(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    metadata_policy: &MetadataPolicyConfig,
+    output_policy: OutputConflictPolicy,
+) -> Result<(Analysis, f32, MetadataFidelityReport), BoundAnalysisError> {
+    let staged = normalize_one_descriptor_staged_with_metadata_policy(
+        descriptor,
+        output,
+        plan,
+        format,
+        metadata_policy,
+        output_policy,
+    )?;
+    let report = staged
+        .metadata_report()
+        .cloned()
+        .expect("metadata-policy staging always produces a report");
+    let outcome = staged.commit().map_err(BoundAnalysisError::render_failed)?;
+    Ok((outcome.source, outcome.gain, report))
 }
 
 /// Stage a normalization render from the exact descriptor used to produce a
@@ -3104,8 +3245,151 @@ pub fn normalize_one_descriptor_bound_staged_with_policy(
         analysis,
         None,
         false,
+        None,
         output_policy,
     )
+}
+
+/// Watch-folder variant that carries the checkpointed output preimage into
+/// atomic staging.
+pub fn normalize_one_descriptor_bound_staged_with_watch_output(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    analysis: &BoundAnalysis,
+    output_policy: OutputConflictPolicy,
+    watch_output: &WatchProcessingOutput,
+) -> Result<StagedNormalization, BoundAnalysisError> {
+    normalize_one_descriptor_bound_staged_impl_with_destination_preimage(
+        descriptor,
+        output,
+        plan,
+        format,
+        analysis,
+        None,
+        false,
+        None,
+        output_policy,
+        Some(watch_output.destination_preimage().clone()),
+    )
+}
+
+/// Stage a descriptor-bound analysis with an explicit metadata policy.
+pub fn normalize_one_descriptor_bound_staged_with_metadata_policy(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    analysis: &BoundAnalysis,
+    metadata_policy: &MetadataPolicyConfig,
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedNormalization, BoundAnalysisError> {
+    plan.validate_for_format(format)
+        .map_err(BoundAnalysisError::invalid_request)?;
+    analysis.validate_descriptor_for_plan(descriptor, plan)?;
+    let metadata = prepare_descriptor_metadata(descriptor, plan, format, metadata_policy)?;
+    normalize_one_descriptor_bound_staged_impl(
+        descriptor,
+        output,
+        plan,
+        format,
+        analysis,
+        None,
+        false,
+        Some(metadata),
+        output_policy,
+    )
+}
+
+/// Watch-folder variant of explicit metadata-fidelity staging with the
+/// checkpointed output preimage bound into atomic construction.
+#[allow(clippy::too_many_arguments)]
+pub fn normalize_one_descriptor_bound_staged_with_metadata_policy_and_watch_output(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    analysis: &BoundAnalysis,
+    metadata_policy: &MetadataPolicyConfig,
+    output_policy: OutputConflictPolicy,
+    watch_output: &WatchProcessingOutput,
+) -> Result<StagedNormalization, BoundAnalysisError> {
+    plan.validate_for_format(format)
+        .map_err(BoundAnalysisError::invalid_request)?;
+    analysis.validate_descriptor_for_plan(descriptor, plan)?;
+    let metadata = prepare_descriptor_metadata(descriptor, plan, format, metadata_policy)?;
+    normalize_one_descriptor_bound_staged_impl_with_destination_preimage(
+        descriptor,
+        output,
+        plan,
+        format,
+        analysis,
+        None,
+        false,
+        Some(metadata),
+        output_policy,
+        Some(watch_output.destination_preimage().clone()),
+    )
+}
+
+/// Stage an audited descriptor-bound render with explicit metadata fidelity.
+pub fn normalize_one_descriptor_bound_audited_staged_with_metadata_policy(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    analysis: &BoundAnalysis,
+    metadata_policy: &MetadataPolicyConfig,
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedNormalization, BoundAnalysisError> {
+    plan.validate_for_format(format)
+        .map_err(BoundAnalysisError::invalid_request)?;
+    analysis.validate_descriptor_for_plan(descriptor, plan)?;
+    let metadata = prepare_descriptor_metadata(descriptor, plan, format, metadata_policy)?;
+    normalize_one_descriptor_bound_staged_impl(
+        descriptor,
+        output,
+        plan,
+        format,
+        analysis,
+        None,
+        true,
+        Some(metadata),
+        output_policy,
+    )
+}
+
+fn prepare_descriptor_metadata(
+    descriptor: &InputDescriptor,
+    plan: &Plan,
+    format: OutputFormat,
+    policy: &MetadataPolicyConfig,
+) -> Result<PreparedMetadata, BoundAnalysisError> {
+    let source_rate_hz = descriptor.stream_info().sample_rate;
+    let output_rate_hz = plan.output_sample_rate.unwrap_or(source_rate_hz);
+    PreparedMetadata::prepare(
+        descriptor.stable_input().stable_path(),
+        metadata_destination(format),
+        source_rate_hz,
+        output_rate_hz,
+        i128::from(descriptor.source_range().start()),
+        descriptor.source_range().is_complete(),
+        plan.bwf,
+        policy,
+    )
+    .map_err(BoundAnalysisError::invalid_request)
+}
+
+const fn metadata_destination(format: OutputFormat) -> MetadataDestination {
+    match format {
+        OutputFormat::Wav => MetadataDestination::Wave,
+        OutputFormat::Flac => MetadataDestination::Flac,
+        OutputFormat::Mp3 => MetadataDestination::Mp3,
+        OutputFormat::Opus => MetadataDestination::OggOpus,
+        OutputFormat::M4a | OutputFormat::Alac => MetadataDestination::IsoBmff,
+        OutputFormat::Vorbis => MetadataDestination::OggVorbis,
+    }
 }
 
 /// Normalize and publish one descriptor-bound programme.
@@ -3125,6 +3409,7 @@ pub fn normalize_one_descriptor_bound_with_policy(
         analysis,
         None,
         false,
+        None,
         output_policy,
     )?;
     let outcome = staged.commit().map_err(BoundAnalysisError::render_failed)?;
@@ -3148,6 +3433,7 @@ pub fn normalize_one_descriptor_bound_audited_with_policy(
         analysis,
         None,
         true,
+        None,
         output_policy,
     )?
     .commit()
@@ -3168,9 +3454,37 @@ fn normalize_one_descriptor_bound_staged_impl(
     plan: &Plan,
     format: OutputFormat,
     analysis: &BoundAnalysis,
+    source_spool: Option<PcmSpool>,
+    capture_statistics: bool,
+    metadata: Option<PreparedMetadata>,
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedNormalization, BoundAnalysisError> {
+    normalize_one_descriptor_bound_staged_impl_with_destination_preimage(
+        descriptor,
+        output,
+        plan,
+        format,
+        analysis,
+        source_spool,
+        capture_statistics,
+        metadata,
+        output_policy,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_one_descriptor_bound_staged_impl_with_destination_preimage(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    analysis: &BoundAnalysis,
     mut source_spool: Option<PcmSpool>,
     capture_statistics: bool,
+    metadata: Option<PreparedMetadata>,
     output_policy: OutputConflictPolicy,
+    destination_preimage: Option<DestinationPreimage>,
 ) -> Result<StagedNormalization, BoundAnalysisError> {
     plan.validate_for_format(format)
         .map_err(BoundAnalysisError::invalid_request)?;
@@ -3199,8 +3513,15 @@ fn normalize_one_descriptor_bound_staged_impl(
     )
     .map_err(BoundAnalysisError::invalid_request)?;
     let gain = compute_gain(&source, plan);
-    let mut staged = AtomicOutput::new_with_overwrite(output, output_policy.allows_overwrite())
-        .map_err(BoundAnalysisError::render_failed)?;
+    let mut staged = match destination_preimage {
+        Some(destination_preimage) => AtomicOutput::new_with_overwrite_and_preimage(
+            output,
+            output_policy.allows_overwrite(),
+            destination_preimage,
+        ),
+        None => AtomicOutput::new_with_overwrite(output, output_policy.allows_overwrite()),
+    }
+    .map_err(BoundAnalysisError::render_failed)?;
     let replaying_spool = source_spool.is_some();
     let rendered = normalize_stream(
         StreamSource {
@@ -3215,6 +3536,7 @@ fn normalize_one_descriptor_bound_staged_impl(
         format,
         StreamRenderOptions {
             opus_album_lufs: None,
+            wave_metadata_chunks: metadata.as_ref().and_then(PreparedMetadata::wave_chunks),
             capture_statistics,
             capture_lossless_verification: false,
             verification_channel_roles: None,
@@ -3223,16 +3545,33 @@ fn normalize_one_descriptor_bound_staged_impl(
         },
     )
     .map_err(BoundAnalysisError::render_failed)?;
-    finalize_metadata(
-        input.stable_path(),
-        &mut staged,
-        format,
-        None,
-        source.lufs + gain_db(gain),
-        None,
-        plan,
-    )
-    .map_err(BoundAnalysisError::render_failed)?;
+    let metadata_report = if let Some(metadata) = metadata {
+        Some(
+            finalize_metadata_explicit(
+                input.stable_path(),
+                &mut staged,
+                format,
+                None,
+                source.lufs + gain_db(gain),
+                None,
+                plan,
+                metadata,
+            )
+            .map_err(BoundAnalysisError::render_failed)?,
+        )
+    } else {
+        finalize_metadata(
+            input.stable_path(),
+            &mut staged,
+            format,
+            None,
+            source.lufs + gain_db(gain),
+            None,
+            plan,
+        )
+        .map_err(BoundAnalysisError::render_failed)?;
+        None
+    };
     Ok(StagedNormalization {
         output: staged,
         outcome: NormalizationOutcome {
@@ -3241,6 +3580,7 @@ fn normalize_one_descriptor_bound_staged_impl(
             render: rendered.statistics,
         },
         protected_inputs: vec![input.clone()],
+        metadata_report,
     })
 }
 
@@ -3280,6 +3620,31 @@ fn normalize_one_staged_with_roles_impl(
     capture_statistics: bool,
     output_policy: OutputConflictPolicy,
 ) -> Result<StagedNormalization, String> {
+    normalize_one_staged_with_roles_impl_with_destination_preimage(
+        input,
+        output,
+        plan,
+        format,
+        channel_roles,
+        preanalyzed,
+        capture_statistics,
+        output_policy,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_one_staged_with_roles_impl_with_destination_preimage(
+    input: &Path,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    channel_roles: Option<&[ChannelRole]>,
+    preanalyzed: Option<&Analysis>,
+    capture_statistics: bool,
+    output_policy: OutputConflictPolicy,
+    destination_preimage: Option<DestinationPreimage>,
+) -> Result<StagedNormalization, String> {
     plan.validate()?;
     // A legacy pre-analysis is remeasured below before it can affect a render,
     // but it can still prove that the requested container cannot represent the
@@ -3305,6 +3670,7 @@ fn normalize_one_staged_with_roles_impl(
         preanalyzed.map_or(AnalysisReuse::Measure, AnalysisReuse::Legacy),
         capture_statistics,
         output_policy,
+        destination_preimage,
     )
 }
 
@@ -3318,6 +3684,7 @@ fn normalize_one_staged_stable_impl(
     reuse: AnalysisReuse<'_>,
     capture_statistics: bool,
     output_policy: OutputConflictPolicy,
+    destination_preimage: Option<DestinationPreimage>,
 ) -> Result<StagedNormalization, String> {
     plan.validate_for_format(format)?;
     validate_output_aliases(
@@ -3341,7 +3708,14 @@ fn normalize_one_staged_stable_impl(
         layout_alias_policy,
     )?;
     let gain = compute_gain(&an, plan);
-    let mut staged = AtomicOutput::new_with_overwrite(output, output_policy.allows_overwrite())?;
+    let mut staged = match destination_preimage {
+        Some(destination_preimage) => AtomicOutput::new_with_overwrite_and_preimage(
+            output,
+            output_policy.allows_overwrite(),
+            destination_preimage,
+        )?,
+        None => AtomicOutput::new_with_overwrite(output, output_policy.allows_overwrite())?,
+    };
     let rendered = normalize_stream(
         StreamSource {
             path: input.stable_path(),
@@ -3355,6 +3729,7 @@ fn normalize_one_staged_stable_impl(
         format,
         StreamRenderOptions {
             opus_album_lufs: None,
+            wave_metadata_chunks: None,
             capture_statistics,
             capture_lossless_verification: false,
             verification_channel_roles: None,
@@ -3379,6 +3754,7 @@ fn normalize_one_staged_stable_impl(
             render: rendered.statistics,
         },
         protected_inputs: vec![input.clone()],
+        metadata_report: None,
     })
 }
 
@@ -3466,6 +3842,34 @@ pub fn normalize_one_corrected_staged_with_roles_and_policy<P: AsRef<Path>>(
         channel_roles,
         None,
         output_policy,
+    )
+}
+
+/// Watch-folder variant of corrected normalization that binds the destination
+/// to the watch checkpoint preimage.
+#[allow(clippy::too_many_arguments)]
+pub fn normalize_one_corrected_staged_with_roles_and_watch_output(
+    input: &Path,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    tolerance: f64,
+    max_retries: usize,
+    channel_roles: Option<&[ChannelRole]>,
+    output_policy: OutputConflictPolicy,
+    watch_output: &WatchProcessingOutput,
+) -> Result<StagedCorrectedNormalization, String> {
+    normalize_one_corrected_staged_with_optional_analysis_and_destination_preimage(
+        input,
+        output,
+        plan,
+        format,
+        tolerance,
+        max_retries,
+        channel_roles,
+        None,
+        output_policy,
+        Some(watch_output.destination_preimage().clone()),
     )
 }
 
@@ -3570,6 +3974,7 @@ pub fn normalize_one_bound_corrected_staged_with_policy(
         channel_roles,
         AnalysisReuse::Bound(analysis),
         output_policy,
+        None,
     )
     .map_err(BoundAnalysisError::render_failed)
 }
@@ -3585,6 +3990,160 @@ pub fn normalize_one_descriptor_bound_corrected_staged_with_policy(
     max_retries: usize,
     analysis: &BoundAnalysis,
     output_policy: OutputConflictPolicy,
+) -> Result<StagedCorrectedNormalization, BoundAnalysisError> {
+    normalize_one_descriptor_bound_corrected_staged_impl(
+        descriptor,
+        output,
+        plan,
+        format,
+        tolerance,
+        max_retries,
+        analysis,
+        None,
+        output_policy,
+    )
+}
+
+/// Watch-folder variant of corrected descriptor staging that carries the
+/// checkpointed destination preimage to atomic publication.
+#[allow(clippy::too_many_arguments)]
+pub fn normalize_one_descriptor_bound_corrected_staged_with_watch_output(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    tolerance: f64,
+    max_retries: usize,
+    analysis: &BoundAnalysis,
+    output_policy: OutputConflictPolicy,
+    watch_output: &WatchProcessingOutput,
+) -> Result<StagedCorrectedNormalization, BoundAnalysisError> {
+    normalize_one_descriptor_bound_corrected_staged_impl_with_destination_preimage(
+        descriptor,
+        output,
+        plan,
+        format,
+        tolerance,
+        max_retries,
+        analysis,
+        None,
+        output_policy,
+        Some(watch_output.destination_preimage().clone()),
+    )
+}
+
+/// Produce a verified corrected descriptor render with explicit metadata
+/// fidelity and return it without publishing.
+#[allow(clippy::too_many_arguments)]
+pub fn normalize_one_descriptor_bound_corrected_staged_with_metadata_policy(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    tolerance: f64,
+    max_retries: usize,
+    analysis: &BoundAnalysis,
+    metadata_policy: &MetadataPolicyConfig,
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedCorrectedNormalization, BoundAnalysisError> {
+    plan.validate_for_format(format)
+        .map_err(BoundAnalysisError::invalid_request)?;
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err(BoundAnalysisError::invalid_request(
+            "verification tolerance must be a finite non-negative number",
+        ));
+    }
+    analysis.validate_descriptor_for_plan(descriptor, plan)?;
+    let metadata = prepare_descriptor_metadata(descriptor, plan, format, metadata_policy)?;
+    normalize_one_descriptor_bound_corrected_staged_impl(
+        descriptor,
+        output,
+        plan,
+        format,
+        tolerance,
+        max_retries,
+        analysis,
+        Some(metadata),
+        output_policy,
+    )
+}
+
+/// Watch-folder variant of corrected descriptor staging with explicit metadata
+/// fidelity and a checkpointed destination preimage.
+#[allow(clippy::too_many_arguments)]
+pub fn normalize_one_descriptor_bound_corrected_staged_with_metadata_policy_and_watch_output(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    tolerance: f64,
+    max_retries: usize,
+    analysis: &BoundAnalysis,
+    metadata_policy: &MetadataPolicyConfig,
+    output_policy: OutputConflictPolicy,
+    watch_output: &WatchProcessingOutput,
+) -> Result<StagedCorrectedNormalization, BoundAnalysisError> {
+    plan.validate_for_format(format)
+        .map_err(BoundAnalysisError::invalid_request)?;
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err(BoundAnalysisError::invalid_request(
+            "verification tolerance must be a finite non-negative number",
+        ));
+    }
+    analysis.validate_descriptor_for_plan(descriptor, plan)?;
+    let metadata = prepare_descriptor_metadata(descriptor, plan, format, metadata_policy)?;
+    normalize_one_descriptor_bound_corrected_staged_impl_with_destination_preimage(
+        descriptor,
+        output,
+        plan,
+        format,
+        tolerance,
+        max_retries,
+        analysis,
+        Some(metadata),
+        output_policy,
+        Some(watch_output.destination_preimage().clone()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_one_descriptor_bound_corrected_staged_impl(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    tolerance: f64,
+    max_retries: usize,
+    analysis: &BoundAnalysis,
+    metadata: Option<PreparedMetadata>,
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedCorrectedNormalization, BoundAnalysisError> {
+    normalize_one_descriptor_bound_corrected_staged_impl_with_destination_preimage(
+        descriptor,
+        output,
+        plan,
+        format,
+        tolerance,
+        max_retries,
+        analysis,
+        metadata,
+        output_policy,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_one_descriptor_bound_corrected_staged_impl_with_destination_preimage(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    tolerance: f64,
+    max_retries: usize,
+    analysis: &BoundAnalysis,
+    metadata: Option<PreparedMetadata>,
+    output_policy: OutputConflictPolicy,
+    destination_preimage: Option<DestinationPreimage>,
 ) -> Result<StagedCorrectedNormalization, BoundAnalysisError> {
     plan.validate_for_format(format)
         .map_err(BoundAnalysisError::invalid_request)?;
@@ -3620,8 +4179,15 @@ pub fn normalize_one_descriptor_bound_corrected_staged_with_policy(
     .map_err(BoundAnalysisError::invalid_request)?;
     let mut gain = compute_gain(&source, plan);
     let mut intended_level = None;
-    let mut staged = AtomicOutput::new_with_overwrite(output, output_policy.allows_overwrite())
-        .map_err(BoundAnalysisError::render_failed)?;
+    let mut staged = match destination_preimage {
+        Some(destination_preimage) => AtomicOutput::new_with_overwrite_and_preimage(
+            output,
+            output_policy.allows_overwrite(),
+            destination_preimage,
+        ),
+        None => AtomicOutput::new_with_overwrite(output, output_policy.allows_overwrite()),
+    }
+    .map_err(BoundAnalysisError::render_failed)?;
 
     for attempt in 0..=max_retries {
         let rendered = normalize_stream(
@@ -3637,6 +4203,7 @@ pub fn normalize_one_descriptor_bound_corrected_staged_with_policy(
             format,
             StreamRenderOptions {
                 opus_album_lufs: None,
+                wave_metadata_chunks: metadata.as_ref().and_then(PreparedMetadata::wave_chunks),
                 capture_statistics: true,
                 capture_lossless_verification: true,
                 verification_channel_roles: channel_roles,
@@ -3663,16 +4230,33 @@ pub fn normalize_one_descriptor_bound_corrected_staged_with_policy(
             .map_err(BoundAnalysisError::render_failed)?
         };
         if verification.passed() {
-            finalize_metadata(
-                input.stable_path(),
-                &mut staged,
-                format,
-                channel_roles.is_none().then_some(&verification.output),
-                verification.output.lufs,
-                None,
-                plan,
-            )
-            .map_err(BoundAnalysisError::render_failed)?;
+            let metadata_report = if let Some(metadata) = metadata {
+                Some(
+                    finalize_metadata_explicit(
+                        input.stable_path(),
+                        &mut staged,
+                        format,
+                        channel_roles.is_none().then_some(&verification.output),
+                        verification.output.lufs,
+                        None,
+                        plan,
+                        metadata,
+                    )
+                    .map_err(BoundAnalysisError::render_failed)?,
+                )
+            } else {
+                finalize_metadata(
+                    input.stable_path(),
+                    &mut staged,
+                    format,
+                    channel_roles.is_none().then_some(&verification.output),
+                    verification.output.lufs,
+                    None,
+                    plan,
+                )
+                .map_err(BoundAnalysisError::render_failed)?;
+                None
+            };
             return Ok(StagedCorrectedNormalization {
                 output: staged,
                 outcome: CorrectedNormalization {
@@ -3683,6 +4267,7 @@ pub fn normalize_one_descriptor_bound_corrected_staged_with_policy(
                     attempts: attempt + 1,
                 },
                 protected_inputs: vec![input.clone()],
+                metadata_report,
             });
         }
         if attempt == max_retries {
@@ -3735,6 +4320,33 @@ fn normalize_one_corrected_staged_with_optional_analysis(
     preanalyzed: Option<&Analysis>,
     output_policy: OutputConflictPolicy,
 ) -> Result<StagedCorrectedNormalization, String> {
+    normalize_one_corrected_staged_with_optional_analysis_and_destination_preimage(
+        input,
+        output,
+        plan,
+        format,
+        tolerance,
+        max_retries,
+        channel_roles,
+        preanalyzed,
+        output_policy,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_one_corrected_staged_with_optional_analysis_and_destination_preimage(
+    input: &Path,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    tolerance: f64,
+    max_retries: usize,
+    channel_roles: Option<&[ChannelRole]>,
+    preanalyzed: Option<&Analysis>,
+    output_policy: OutputConflictPolicy,
+    destination_preimage: Option<DestinationPreimage>,
+) -> Result<StagedCorrectedNormalization, String> {
     plan.validate_for_format(format)?;
     if !tolerance.is_finite() || tolerance < 0.0 {
         return Err("verification tolerance must be a finite non-negative number".into());
@@ -3750,6 +4362,7 @@ fn normalize_one_corrected_staged_with_optional_analysis(
         channel_roles,
         preanalyzed.map_or(AnalysisReuse::Measure, AnalysisReuse::Legacy),
         output_policy,
+        destination_preimage,
     )
 }
 
@@ -3764,6 +4377,7 @@ fn normalize_one_corrected_stable_impl(
     channel_roles: Option<&[ChannelRole]>,
     reuse: AnalysisReuse<'_>,
     output_policy: OutputConflictPolicy,
+    destination_preimage: Option<DestinationPreimage>,
 ) -> Result<StagedCorrectedNormalization, String> {
     plan.validate_for_format(format)?;
     if !tolerance.is_finite() || tolerance < 0.0 {
@@ -3791,7 +4405,14 @@ fn normalize_one_corrected_stable_impl(
     )?;
     let mut gain = compute_gain(&source, plan);
     let mut intended_level = None;
-    let mut staged = AtomicOutput::new_with_overwrite(output, output_policy.allows_overwrite())?;
+    let mut staged = match destination_preimage {
+        Some(destination_preimage) => AtomicOutput::new_with_overwrite_and_preimage(
+            output,
+            output_policy.allows_overwrite(),
+            destination_preimage,
+        ),
+        None => AtomicOutput::new_with_overwrite(output, output_policy.allows_overwrite()),
+    }?;
 
     for attempt in 0..=max_retries {
         let rendered = normalize_stream(
@@ -3807,6 +4428,7 @@ fn normalize_one_corrected_stable_impl(
             format,
             StreamRenderOptions {
                 opus_album_lufs: None,
+                wave_metadata_chunks: None,
                 capture_statistics: true,
                 capture_lossless_verification: true,
                 verification_channel_roles: channel_roles,
@@ -3850,6 +4472,7 @@ fn normalize_one_corrected_stable_impl(
                     attempts: attempt + 1,
                 },
                 protected_inputs: vec![input.clone()],
+                metadata_report: None,
             });
         }
         if attempt == max_retries {
@@ -3936,6 +4559,7 @@ pub(crate) fn normalize_multi_delivery_corrected_with_roles(
             formats,
             StreamRenderOptions {
                 opus_album_lufs: None,
+                wave_metadata_chunks: None,
                 capture_statistics: true,
                 capture_lossless_verification: true,
                 verification_channel_roles: channel_roles,
@@ -4540,6 +5164,7 @@ fn normalize_album_stable_impl(
                 fmt,
                 StreamRenderOptions {
                     opus_album_lufs: Some(album_output_lufs),
+                    wave_metadata_chunks: None,
                     capture_statistics,
                     capture_lossless_verification: write_album_tags,
                     verification_channel_roles: None,
@@ -4929,6 +5554,7 @@ fn normalize_album_corrected_stable_impl(
                     format,
                     StreamRenderOptions {
                         opus_album_lufs: Some(album_output_lufs),
+                        wave_metadata_chunks: None,
                         capture_statistics: true,
                         capture_lossless_verification: true,
                         verification_channel_roles: channel_roles,
@@ -5116,12 +5742,75 @@ fn finalize_metadata(
     album: Option<AlbumLoudnessMetadata>,
     plan: &Plan,
 ) -> Result<(), String> {
+    finalize_metadata_impl(
+        input,
+        output,
+        format,
+        measured_output,
+        _track_lufs,
+        album,
+        plan,
+        None,
+    )
+    .map(drop)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_metadata_explicit(
+    input: &Path,
+    output: &mut AtomicOutput,
+    format: OutputFormat,
+    measured_output: Option<&Analysis>,
+    track_lufs: f64,
+    album: Option<AlbumLoudnessMetadata>,
+    plan: &Plan,
+    metadata_plan: PreparedMetadata,
+) -> Result<MetadataFidelityReport, String> {
+    finalize_metadata_impl(
+        input,
+        output,
+        format,
+        measured_output,
+        track_lufs,
+        album,
+        plan,
+        Some(metadata_plan),
+    )?
+    .ok_or_else(|| "explicit metadata finalization did not produce a report".into())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_metadata_impl(
+    input: &Path,
+    output: &mut AtomicOutput,
+    format: OutputFormat,
+    measured_output: Option<&Analysis>,
+    _track_lufs: f64,
+    album: Option<AlbumLoudnessMetadata>,
+    plan: &Plan,
+    metadata_plan: Option<PreparedMetadata>,
+) -> Result<Option<MetadataFidelityReport>, String> {
     let output_path = output.path().to_owned();
-    metadata::copy_metadata(input, &output_path)?;
-    output.adopt_path_writer_output()?;
+    let mut expected_bwf_fields = None;
+    if metadata_plan
+        .as_ref()
+        .is_none_or(PreparedMetadata::should_copy_generic)
+    {
+        metadata::copy_metadata(input, &output_path)?;
+        output.adopt_path_writer_output()?;
+    }
+    // Keep a destination metadata preimage before any authoritative loudness
+    // writer runs.  The post-writer diff is carried as exact kind/locator/hash
+    // evidence, so destination-only output is trusted only for bytes actually
+    // changed or inserted by this finalization step.
+    let destination_preimage = metadata_plan
+        .as_ref()
+        .map(|metadata| metadata.destination_inventory(&output_path))
+        .transpose()?;
     if format == OutputFormat::Wav && plan.bwf {
         let measured = known_or_analyze_output(&output_path, measured_output)?;
         metadata::update_bwf_loudness(&output_path, &measured)?;
+        expected_bwf_fields = Some(metadata::bwf_loudness_field_bytes(&measured));
         output.adopt_path_writer_output()?;
     }
     if format == OutputFormat::Opus {
@@ -5136,10 +5825,15 @@ fn finalize_metadata(
             output.adopt_path_writer_output()?;
         }
     }
+    // Preserve the historical default path: native FLAC output already owns
+    // its channel-layout comment, and legacy normalization did not add a
+    // ReplayGain tag. Explicit fidelity policies opt into the FLAC writer so
+    // its complete preimage/postimage can be accounted for below.
     if matches!(
         format,
         OutputFormat::M4a | OutputFormat::Alac | OutputFormat::Vorbis
-    ) {
+    ) || (format == OutputFormat::Flac && metadata_plan.is_some())
+    {
         let measured = known_or_analyze_output(&output_path, measured_output)?;
         metadata::write_replaygain(
             &output_path,
@@ -5159,7 +5853,48 @@ fn finalize_metadata(
             }
         }
     }
-    Ok(())
+    let generated_destination_regions = metadata_plan
+        .as_ref()
+        .map(|metadata| {
+            let before = destination_preimage
+                .as_ref()
+                .ok_or("missing destination metadata preimage")?;
+            let after = metadata.destination_inventory(&output_path)?;
+            #[cfg(feature = "opus-encoding")]
+            if format == OutputFormat::Opus {
+                let track_lufs = measured_output.map_or(_track_lufs, |measured| measured.lufs);
+                let expected_tags =
+                    crate::opus_tags::build_opus_tags(track_lufs, album.map(|album| album.lufs));
+                return Ok::<_, String>(metadata.destination_loudness_evidence_with_opus_tags(
+                    before,
+                    &after,
+                    &expected_tags,
+                ));
+            }
+            let writers = match format {
+                OutputFormat::Flac | OutputFormat::Vorbis => {
+                    vec![DestinationLoudnessWriter::ReplayGain]
+                }
+                OutputFormat::M4a | OutputFormat::Alac => vec![
+                    DestinationLoudnessWriter::ReplayGain,
+                    DestinationLoudnessWriter::IsoBmffNative,
+                ],
+                _ => Vec::new(),
+            };
+            Ok::<_, String>(metadata.destination_loudness_evidence(before, &after, &writers))
+        })
+        .transpose()?;
+    metadata_plan
+        .map(|metadata| {
+            metadata
+                .finish_with_bwf_loudness_and_evidence(
+                    &output_path,
+                    expected_bwf_fields,
+                    generated_destination_regions.as_deref().unwrap_or(&[]),
+                )
+                .map(Some)
+        })
+        .unwrap_or(Ok(None))
 }
 
 /// Reuse a PCM-derived measurement when its channel-role interpretation is
@@ -5249,6 +5984,7 @@ fn shared_corrected_gain(
 #[derive(Debug, Clone, Copy)]
 struct StreamRenderOptions<'a> {
     opus_album_lufs: Option<f64>,
+    wave_metadata_chunks: Option<&'a [WaveChunk]>,
     capture_statistics: bool,
     capture_lossless_verification: bool,
     verification_channel_roles: Option<&'a [ChannelRole]>,
@@ -5330,11 +6066,14 @@ impl NormalizedStreamWriter {
         match format {
             OutputFormat::Wav => {
                 let kind = plan.output_kind.unwrap_or(analysis.kind);
-                let metadata_chunks = if plan.bwf {
-                    metadata::prepare_broadcast_chunks(input)?
-                } else {
-                    Vec::new()
-                };
+                let metadata_chunks: Cow<'_, [WaveChunk]> =
+                    if let Some(chunks) = options.wave_metadata_chunks {
+                        Cow::Borrowed(chunks)
+                    } else if plan.bwf {
+                        Cow::Owned(metadata::prepare_broadcast_chunks(input)?)
+                    } else {
+                        Cow::Owned(Vec::new())
+                    };
                 let writer = if let Some(layout) = options.channel_layout {
                     WavStreamWriter::create_with_channel_layout_and_metadata(
                         output,
@@ -5344,7 +6083,7 @@ impl NormalizedStreamWriter {
                         plan.dither,
                         plan.wav_container,
                         layout,
-                        &metadata_chunks,
+                        metadata_chunks.as_ref(),
                     )
                 } else {
                     WavStreamWriter::create_with_metadata(
@@ -5356,7 +6095,7 @@ impl NormalizedStreamWriter {
                         plan.dither,
                         plan.wav_container,
                         &analysis.channel_roles,
-                        &metadata_chunks,
+                        metadata_chunks.as_ref(),
                     )
                 }
                 .map_err(|error| format!("write {}: {error}", output.display()))?;
@@ -7761,6 +8500,7 @@ mod tests {
         ));
         let options = StreamRenderOptions {
             opus_album_lufs: None,
+            wave_metadata_chunks: None,
             capture_statistics: true,
             capture_lossless_verification: false,
             verification_channel_roles: None,
@@ -7831,6 +8571,7 @@ mod tests {
     fn lossless_writer_overlap_is_limited_to_expensive_wave_verification() {
         let verified = StreamRenderOptions {
             opus_album_lufs: None,
+            wave_metadata_chunks: None,
             capture_statistics: true,
             capture_lossless_verification: true,
             verification_channel_roles: None,
@@ -8484,6 +9225,7 @@ mod tests {
                 format,
                 StreamRenderOptions {
                     opus_album_lufs: None,
+                    wave_metadata_chunks: None,
                     capture_statistics: false,
                     capture_lossless_verification: true,
                     verification_channel_roles: None,
@@ -8531,6 +9273,7 @@ mod tests {
         let gain = compute_gain(&source, &plan());
         let options = StreamRenderOptions {
             opus_album_lufs: None,
+            wave_metadata_chunks: None,
             capture_statistics: true,
             capture_lossless_verification: true,
             verification_channel_roles: None,
@@ -8735,6 +9478,7 @@ mod tests {
         let ceiling = 10.0_f64.powf(render_plan.ceiling_db / 20.0) as f32;
         let options = StreamRenderOptions {
             opus_album_lufs: None,
+            wave_metadata_chunks: None,
             capture_statistics: false,
             capture_lossless_verification: false,
             verification_channel_roles: None,
@@ -8854,6 +9598,7 @@ mod tests {
                 OutputFormat::Flac,
                 StreamRenderOptions {
                     opus_album_lufs: None,
+                    wave_metadata_chunks: None,
                     capture_statistics: false,
                     capture_lossless_verification: true,
                     verification_channel_roles: None,

@@ -67,6 +67,9 @@ Run `forge --help` for the complete option list.
 - Atomic output publication with no-clobber or unchanged-destination checks.
 - Output re-verification, ReplayGain, native M4A/ALAC `tlou`/`alou`, BWF
   metadata, and delivery compliance profiles.
+- Explicit metadata-fidelity policies, bounded registry-backed full-container
+  inventory, exact sample-clock conversion for supported timing fields, and
+  restartable single-file metadata-only transactions with field-level evidence.
 - Bounded parsers and companion QC tools for broadcast, streaming, immersive,
   and packaged media.
 
@@ -116,6 +119,29 @@ measured ISO-BMFF `ludt/tlou` and combined-album `alou` loudness metadata
 without re-encoding media. Other commands cover IMF, AES31,
 RTP/AES67/ST 2110, NMOS, codec adapters, remediation, and multi-delivery
 workflows.
+
+### Metadata fidelity
+
+Metadata-bearing file workflows accept an explicit `--metadata-policy`
+selection: `preserve` reports best-effort mappings and losses, `strict` blocks
+publication on any loss, and `strip` requires an explicit all-fields or exact
+locator scope. `legacy-generic` keeps the historical primary/first generic-tag
+behavior available, and remains the default when no policy is supplied. The
+field-level report uses the versioned
+[metadata-fidelity contract](METADATA-FIDELITY.md); the bounded inventory
+records repeated and unknown fields, physical extents, hashes, and structural
+regions for supported WAVE, FLAC, MP3, Ogg, and ISO-BMFF containers.
+
+When resampling, supported sample-indexed BWF/DAW timing is converted with exact
+rational sample-clock arithmetic and an explicit rounding rule. XML-bearing
+timing is retained as opaque evidence. `--metadata-job-state` persists and
+resumes one metadata-only file transaction with staged verification and
+compare-and-swap publication. Its state and source-parent directories must be
+trusted against hostile writers; the journal is validated but not
+cryptographically authenticated. The historical `--write-tags` path without a
+job state writes requested tag families sequentially and does not provide that
+transaction guarantee. Generation-level all-or-nothing album/batch publication
+is deliberately deferred to v0.189.15.
 
 See the [documentation map](DOCUMENTATION.md#command-line-tools) or run any
 command with `--help`.

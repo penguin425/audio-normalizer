@@ -77,7 +77,12 @@ mod isobmff_qc;
 mod lv2;
 mod matroska_qc;
 pub mod metadata;
+pub mod metadata_fidelity;
+mod metadata_pipeline;
+pub use metadata_pipeline::{write_loudness_metadata_with_fidelity, LoudnessMetadataWriteResult};
+pub mod metadata_registry;
 pub mod metadata_repair;
+pub mod metadata_transaction;
 mod monkeys_audio_qc;
 mod mp3_qc;
 #[cfg(feature = "mp3-encoding")]
@@ -111,6 +116,7 @@ pub mod report;
 pub mod report_tools;
 pub mod rtp_qc;
 pub mod sadm;
+pub mod sample_time;
 pub mod segment_normalize;
 pub mod service;
 #[cfg(feature = "grpc-service")]
@@ -122,4 +128,5 @@ mod state_lock;
 pub(crate) mod subprocess;
 pub mod watch;
 pub mod wav;
+pub mod wave_metadata_timing;
 mod wavpack_qc;

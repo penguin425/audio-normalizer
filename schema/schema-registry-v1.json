@@ -1137,6 +1137,81 @@
       ]
     },
     {
+      "path": "schema/metadata-fidelity-report-v1.schema.json",
+      "family": "metadata-fidelity-report",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/metadata-fidelity-report-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/metadata-fidelity-report-v1"
+      },
+      "producers": [
+        "repo:src/metadata_fidelity.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:src/metadata_fidelity.rs",
+        "repo:tests/schema_registry.rs"
+      ]
+    },
+    {
+      "path": "schema/metadata-inventory-v1.schema.json",
+      "family": "metadata-inventory",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/metadata-inventory-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema_version",
+        "value": 1
+      },
+      "producers": [
+        "repo:src/metadata_registry.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:src/metadata_registry.rs",
+        "repo:tests/schema_registry.rs"
+      ]
+    },
+    {
+      "path": "schema/metadata-job-v1.schema.json",
+      "family": "metadata-job",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/metadata-job-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "durable",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/metadata-job-v1"
+      },
+      "producers": [
+        "repo:src/metadata_transaction.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:src/metadata_transaction.rs",
+        "repo:tests/schema_registry.rs"
+      ]
+    },
+    {
       "path": "schema/metadata-repair-report-v1.schema.json",
       "family": "metadata-repair-report",
       "version": 1,

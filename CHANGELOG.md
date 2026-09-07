@@ -8,6 +8,63 @@ tags and keeps public compatibility commitments in
 
 - No user-visible changes yet.
 
+## 0.189.14 - 2026-09-07
+
+### Added
+
+- Add explicit metadata-fidelity policies: `preserve`, `strict`, and `strip`,
+  with exact selected-strip locators and a deterministic field ledger that
+  reports every preserved, mapped, recomputed, or dropped field. Keep the
+  historical primary/first generic-tag behavior available as the explicit
+  `legacy-generic` compatibility mode.
+- Add a bounded, registry-backed metadata inventory for WAVE, FLAC, MP3, Ogg,
+  and ISO-BMFF inputs. The inventory retains repeated and unknown fields with
+  physical order, locators, extents, hashes, structural regions, and scan
+  issues while enforcing item, aggregate, entry-count, nesting, and retained
+  raw-byte limits.
+- Add exact rational sample-clock conversion for sample-indexed WAVE BWF/DAW
+  timing after resampling, including an explicit rounding rule and crop-origin
+  evidence. XML-bearing timing remains opaque and is reported rather than
+  rewritten by the generic transform.
+- Add a restartable single-file metadata-only transaction with stable source
+  identity, a semantic fingerprint, a private staged copy, readback
+  verification, durable ready/commit phases, and compare-and-swap publication
+  of the destination.
+
+### Compatibility and boundaries
+
+- Keep the existing CLI default behavior when no metadata policy is supplied;
+  callers can opt into the new policies with `--metadata-policy`, while
+  `legacy-generic` makes the compatibility choice explicit. The metadata-only
+  transaction is intentionally single-file; generation-level all-or-nothing
+  album/batch publication remains the v0.189.15 scope.
+- Validate and synchronize an optional fidelity report before audio
+  publication, then publish the two paths in order. The report contract
+  documents the remaining cross-path crash window; metadata-only state retains
+  the validated report evidence for retry.
+- Bind watch-folder output replacement to the identity, length, and complete
+  digest captured by its processing checkpoint. After a process interruption,
+  leave an output that the v1 journal cannot authenticate in `failed` state
+  until the caller explicitly selects `--watch-retry-failed`.
+- Document that the single-file metadata journal provides crash recovery within
+  trusted state and source-parent directories, not authentication against a
+  hostile path owner. Any writer-plan or writer-meaning change requires a
+  writer-revision bump and a reviewed migration; legacy tag writes without a
+  job state remain sequential.
+- Bind generated FLAC padding, Ogg comments, OpusTags, ISO-BMFF loudness
+  fields, and their fully accounted container ancestors to private writer
+  preimages. Existing composite tags are not wholly trusted merely because a
+  loudness field changed; strict publication remains blocked until every
+  non-writer-owned child is independently proved.
+- Strict normalization is evidence-backed for clean WAVE -> FLAC, Vorbis,
+  Opus, and M4A, and metadata-only updates are supported for clean FLAC.
+  MP3/WAVE metadata mutation, Sound Check, and existing composite-tag rewrites
+  fail closed until a field-specific adapter proves every affected field.
+- Require a transaction-issued stage capability for the high-level
+  metadata-only writer, re-read requested Sound Check data after every writer,
+  decode inventory JSON behind a 128 MiB pre-allocation cap, and resolve RF64
+  `ds64` entries in linear rather than quadratic time.
+
 ## 0.189.13 - 2026-09-07
 
 ### Added

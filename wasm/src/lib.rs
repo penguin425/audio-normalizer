@@ -13,6 +13,8 @@ mod analysis;
 mod channel_layout;
 #[path = "../../src/dsp/mod.rs"]
 mod dsp;
+#[path = "../../src/sample_time.rs"]
+mod sample_time;
 #[path = "../../src/wav/mod.rs"]
 mod wav;
 
