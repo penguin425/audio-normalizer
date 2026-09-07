@@ -1602,21 +1602,47 @@ fn reject_reparse_point_path(_path: &Path, _description: &str) -> Result<(), Str
 }
 
 fn reject_multiply_linked(path: &Path, description: &str) -> Result<(), String> {
-    let metadata = fs::metadata(path)
-        .map_err(|error| format!("inspect {description} {}: {error}", path.display()))?;
     #[cfg(unix)]
-    if metadata.nlink() > 1 {
-        return Err(format!(
-            "{description} must not have hard-link aliases: {}",
-            path.display()
-        ));
+    {
+        let metadata = fs::metadata(path)
+            .map_err(|error| format!("inspect {description} {}: {error}", path.display()))?;
+        if metadata.nlink() > 1 {
+            return Err(format!(
+                "{description} must not have hard-link aliases: {}",
+                path.display()
+            ));
+        }
     }
     #[cfg(windows)]
-    if metadata.number_of_links().is_some_and(|links| links > 1) {
-        return Err(format!(
-            "{description} must not have hard-link aliases: {}",
-            path.display()
-        ));
+    {
+        // `MetadataExt::number_of_links` is still unstable
+        // (`windows_by_handle`). Inspect a no-follow handle through the
+        // stable Win32 helper so reparse points and inspection failures remain
+        // fail-closed.
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+        let file = options
+            .open(path)
+            .map_err(|error| format!("inspect {description} {}: {error}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("inspect {description} {}: {error}", path.display()))?;
+        reject_reparse_point_metadata(&metadata, path, description)?;
+        let links = crate::stable_input::windows_file_link_count(&file)
+            .map_err(|error| format!("inspect {description} {}: {error}", path.display()))?;
+        if links > 1 {
+            return Err(format!(
+                "{description} must not have hard-link aliases: {}",
+                path.display()
+            ));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Keep the pre-existing fail-closed existence/regular-file inspection
+        // on platforms without a stable link-count API.
+        fs::metadata(path)
+            .map_err(|error| format!("inspect {description} {}: {error}", path.display()))?;
     }
     Ok(())
 }

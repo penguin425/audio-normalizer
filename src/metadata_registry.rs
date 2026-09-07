@@ -7,6 +7,8 @@
 //! SHA-256 digest.  A bounded optional raw copy is retained when the configured
 //! item and aggregate budgets allow it.
 
+#[cfg(windows)]
+use crate::stable_input::{identity_from_open_file, path_identity_if_exists};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1101,6 +1103,13 @@ fn open_regular_path(path: &Path) -> Result<(File, u64, Option<String>), Metadat
             path.display()
         )));
     }
+    // `volume_serial_number` and `file_index` on Windows metadata are still
+    // unstable (`windows_by_handle`). Capture the pre-open identity through
+    // the stable handle-based helper instead, so the existing path/open race
+    // check remains fail-closed on Rust 1.89 and newer.
+    #[cfg(windows)]
+    let link_identity = path_identity_if_exists(path)
+        .map_err(|error| MetadataRegistryError::Io(format!("{}: {error}", path.display())))?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -1134,15 +1143,17 @@ fn open_regular_path(path: &Path) -> Result<(File, u64, Option<String>), Metadat
         )));
     }
     #[cfg(windows)]
-    if link_metadata.volume_serial_number() != metadata.volume_serial_number()
-        || link_metadata.file_index() != metadata.file_index()
     {
-        return Err(MetadataRegistryError::Io(format!(
-            "{}: metadata source changed while it was opened",
-            path.display()
-        )));
+        let opened_identity = identity_from_open_file(&file, path)
+            .map_err(|error| MetadataRegistryError::Io(format!("{}: {error}", path.display())))?;
+        if link_identity.as_ref() != Some(&opened_identity) {
+            return Err(MetadataRegistryError::Io(format!(
+                "{}: metadata source changed while it was opened",
+                path.display()
+            )));
+        }
     }
-    let identity = file_identity(&file, &metadata);
+    let identity = file_identity(&file, &metadata)?;
     Ok((file, length, identity))
 }
 
@@ -1320,7 +1331,7 @@ impl InputSource<'_> {
         let metadata = file
             .metadata()
             .map_err(|error| MetadataRegistryError::Io(error.to_string()))?;
-        Ok(Some((metadata.len(), file_identity(file, &metadata))))
+        Ok(Some((metadata.len(), file_identity(file, &metadata)?)))
     }
 
     fn initial_file_identity(&self) -> Option<String> {
@@ -1974,22 +1985,26 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex_digest(digest.finalize())
 }
 
-fn file_identity(file: &File, metadata: &fs::Metadata) -> Option<String> {
+fn file_identity(
+    file: &File,
+    metadata: &fs::Metadata,
+) -> Result<Option<String>, MetadataRegistryError> {
     #[cfg(unix)]
     {
         let _ = file;
-        Some(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
+        Ok(Some(format!("unix:{}:{}", metadata.dev(), metadata.ino())))
     }
     #[cfg(windows)]
     {
-        let volume = metadata.volume_serial_number()?;
-        let index = metadata.file_index()?;
-        Some(format!("windows:{volume}:{index}"))
+        let _ = metadata;
+        let (volume, index) = crate::stable_input::windows_file_identity(file)
+            .map_err(|error| MetadataRegistryError::Io(format!("identify open file: {error}")))?;
+        Ok(Some(format!("windows:{volume}:{index}")))
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (file, metadata);
-        None
+        Ok(None)
     }
 }
 
