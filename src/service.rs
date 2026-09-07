@@ -1982,6 +1982,19 @@ mod tests {
         audio
     }
 
+    fn finish_request_body(client: &TcpStream) {
+        if let Err(error) = client.shutdown(std::net::Shutdown::Write) {
+            // A fail-fast server may close after writing its terminal response
+            // before the test client half-closes.  The response assertions below
+            // still prove that the expected protocol result was delivered.
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::NotConnected,
+                "unexpected request shutdown error: {error}"
+            );
+        }
+    }
+
     fn http_analyze(
         audio: &[u8],
         declared_length: u64,
@@ -2002,7 +2015,7 @@ mod tests {
         )
         .unwrap();
         client.write_all(audio).unwrap();
-        client.shutdown(std::net::Shutdown::Write).unwrap();
+        finish_request_body(&client);
         let mut response = Vec::new();
         if let Err(error) = client.read_to_end(&mut response) {
             assert_eq!(
@@ -2038,7 +2051,7 @@ mod tests {
         });
         let mut client = TcpStream::connect(address).unwrap();
         client.write_all(request).unwrap();
-        client.shutdown(std::net::Shutdown::Write).unwrap();
+        finish_request_body(&client);
         let mut response = Vec::new();
         client.read_to_end(&mut response).unwrap();
         server.join().unwrap();
@@ -2361,7 +2374,7 @@ mod tests {
             });
             let mut client = TcpStream::connect(address).unwrap();
             client.write_all(request).unwrap();
-            client.shutdown(std::net::Shutdown::Write).unwrap();
+            finish_request_body(&client);
             let mut response = String::new();
             client.read_to_string(&mut response).unwrap();
             server.join().unwrap();
