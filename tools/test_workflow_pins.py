@@ -61,6 +61,34 @@ class WorkflowCheckerLockTests(unittest.TestCase):
         self.assertIn("workflow-check-requirements.lock", completed.stderr)
         self.assertNotIn("Traceback", completed.stderr)
 
+    def test_wheel_build_lock_includes_the_windows_dependency_closure(self) -> None:
+        lock = (TOOLS / "python-wheel-build-requirements.lock").read_text(
+            encoding="utf-8"
+        )
+        requirements = {
+            match.group(1).lower()
+            for match in re.finditer(
+                r"^([A-Za-z0-9_-]+)==[^ \\]+ \\$", lock, re.MULTILINE
+            )
+        }
+        self.assertEqual(
+            requirements,
+            {
+                "auditwheel",
+                "build",
+                "colorama",
+                "packaging",
+                "pyelftools",
+                "pyproject-hooks",
+                "setuptools",
+                "tomli",
+                "wheel",
+            },
+        )
+        hashes = re.findall(r"--hash=sha256:([0-9a-f]{64})", lock)
+        self.assertEqual(len(hashes), len(requirements))
+        self.assertEqual(len(set(hashes)), len(requirements))
+
 
 class WorkflowPinTests(unittest.TestCase):
     def test_container_image_requires_sha256_digest(self) -> None:
