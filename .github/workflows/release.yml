@@ -821,8 +821,11 @@ jobs:
       MANYLINUX_2_28_IMAGE: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
       MANYLINUX_2_34_IMAGE: quay.io/pypa/manylinux_2_34_x86_64@sha256:934419fa742ff922855f464203cc0ad5afe3317a8541712a00cf3dc7fb893fc8
       QEMU_CPU: qemu64,-lahf-lm,-pni,-ssse3,-sse4.1,-sse4.2,-popcnt,-cx16,-avx,-avx2
-      QEMU_DEB_SHA256: 5bb397f66063efa349f6fd5cb3b68cd96f29edd0994e4ba5115cf0859a716bf0
-      QEMU_DEB_URL: https://archive.ubuntu.com/ubuntu/pool/universe/q/qemu/qemu-user-static_8.2.2%2bds-0ubuntu1.18_amd64.deb
+      # QEMU 8.2 regressed x86-64 /proc/self/maps emulation (upstream #2170)
+      # and crashes programs that inspect their own thread mappings. Use the
+      # maintained Debian Bookworm 7.2 build from before that regression.
+      QEMU_DEB_SHA256: c3e3ba2bd87f8c5b9a5da5ef21b5a3b82d7c63b89dd448d9ddaa4eabc5b6e402
+      QEMU_DEB_URL: https://snapshot.debian.org/archive/debian/20260526T203455Z/pool/main/q/qemu/qemu-user-static_7.2%2bdfsg-7%2bdeb12u18%2bb3_amd64.deb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
 

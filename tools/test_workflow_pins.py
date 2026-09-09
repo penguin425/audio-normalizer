@@ -406,6 +406,16 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
     def test_cpu_model_is_passed_from_workflow_to_real_elf_controls(self) -> None:
         smoke = self.workflow["jobs"]["smoke-linux-wheel-floor"]
         self.assertTrue(smoke["env"]["QEMU_CPU"])
+        self.assertEqual(
+            smoke["env"]["QEMU_DEB_SHA256"],
+            "c3e3ba2bd87f8c5b9a5da5ef21b5a3b82d7c63b89dd448d9ddaa4eabc5b6e402",
+        )
+        self.assertEqual(
+            smoke["env"]["QEMU_DEB_URL"],
+            "https://snapshot.debian.org/archive/debian/20260526T203455Z/"
+            "pool/main/q/qemu/"
+            "qemu-user-static_7.2%2bdfsg-7%2bdeb12u18%2bb3_amd64.deb",
+        )
         commands = "\n".join(
             step.get("run", "") for step in smoke["steps"]
         )
