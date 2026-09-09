@@ -733,8 +733,7 @@ fn move_path_without_replacing(source: &Path, destination: &Path) -> Result<(), 
             if restored == 0 {
                 let restore_error = std::io::Error::last_os_error();
                 return Err(format!(
-                    "move generation path {} to {} without replacing: {error}; "
-                        + "restore source attributes: {restore_error}",
+                    "move generation path {} to {} without replacing: {error}; restore source attributes: {restore_error}",
                     source.display(),
                     destination.display()
                 ));
