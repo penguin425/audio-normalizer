@@ -29,6 +29,7 @@ on:
       - "VST3-ADAPTER.md"
       - "AU-ADAPTER.md"
       - "integrations/**"
+      - "tests/fixtures/c_api_consumer.c"
       - "tests/fixtures/ffmpeg_bridge_consumer.c"
       - "tools/test-host-adapters.sh"
       - "tools/test-vst3-adapter.sh"
@@ -46,6 +47,7 @@ on:
       - "schema/ebu-qc-2026-04/**"
       - "tests/cli.rs"
       - "fuzz/fuzz_targets/ebu_qc_validation.rs"
+      - "fuzz/Cargo.lock"
       - "src/bin/forge-doctor.rs"
       - "tests/doctor_cli.rs"
       - "schema/doctor-report-v1.schema.json"
@@ -196,10 +198,16 @@ on:
       - "NEXT-GENERATION-PLAN.md"
       - "ROADMAP.md"
       - "tools/build-python-wheel.py"
+      - "packaging/**"
+      - "tests/fixtures/native_package/**"
+      - "tools/check-linux-native-abi.py"
       - "tools/check-linux-wheel-abi.py"
       - "tools/manylinux-cmake-toolchain.cmake"
+      - "tools/native_package_metadata.py"
       - "tools/python-wheel-build-requirements.lock"
+      - "tools/test_linux_native_abi.py"
       - "tools/test_linux_wheel_abi.py"
+      - "tools/test_native_package_metadata.py"
       - "tools/check-workflow-pins.py"
       - "tools/test_workflow_pins.py"
       - "tools/run-pinned-container.py"
@@ -207,7 +215,10 @@ on:
       - "tools/build-wasm-package.sh"
       - "tools/package-linux-release.sh"
       - "tools/package-linux-v3-release.sh"
+      - "tools/test-native-package.sh"
+      - "tools/test-native-package.ps1"
       - "tools/check-release-content.py"
+      - "tools/test_release_content.py"
       - "tools/check-schema-registry.py"
       - "tools/test_schema_registry.py"
       - "tools/check-subprocess-boundary.py"
@@ -266,6 +277,10 @@ jobs:
         run: |
           set -euo pipefail
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Native release metadata requires numeric MAJOR.MINOR.PATCH without leading zeros: ${version}"
+            exit 1
+          fi
           python_version="$(
             python3 -c \
               "import runpy; print(runpy.run_path('python/src/forge_normalizer/_version.py')['__version__'])"
@@ -307,15 +322,130 @@ jobs:
       - name: Validate crates.io package metadata and contents
         run: tools/check-release-readiness.sh "${{ steps.version.outputs.version }}"
 
-      - name: Test the Linux wheel release gates
+      - name: Test the native-package and Linux ABI release gates
         run: |
           "$FORGE_WORKFLOW_CHECK_PYTHON" -m unittest \
-            tools/test_workflow_pins.py tools/test_linux_wheel_abi.py
+            tools/test_workflow_pins.py \
+            tools/test_linux_wheel_abi.py \
+            tools/test_linux_native_abi.py \
+            tools/test_native_package_metadata.py \
+            tools/test_release_content.py
           "$FORGE_WORKFLOW_CHECK_PYTHON" -m compileall -q \
             tools/build-python-wheel.py \
+            tools/check-linux-native-abi.py \
             tools/check-linux-wheel-abi.py \
             tools/check-workflow-pins.py \
+            tools/native_package_metadata.py \
             tools/run-pinned-container.py
+
+  build-linux:
+    name: Build portable linux-x86_64 archive
+    needs: validate
+    runs-on: ubuntu-24.04
+    container:
+      # Build below the published glibc 2.34 runtime floor and retain the
+      # generic x86-64-v1 CPU baseline. Runtime acceptance is a separate job.
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+    env:
+      CARGO_HOME: /tmp/forge-cargo
+      CARGO_INCREMENTAL: "0"
+      CFLAGS: -O2 -march=x86-64 -mtune=generic
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/tools/manylinux-cmake-toolchain.cmake
+      CXXFLAGS: -O2 -march=x86-64 -mtune=generic
+      LC_ALL: C.UTF-8
+      RUSTFLAGS: -C target-cpu=x86-64 --remap-path-prefix=${{ github.workspace }}=/workspace
+      RUSTUP_HOME: /tmp/forge-rustup
+      SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Verify the pinned build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
+          test "$(uname -m)" = "x86_64"
+          command -v cc cmake pkg-config python3 readelf >/dev/null
+
+      - name: Install checksum-pinned Rust 1.97.0 and LLVM PGO tools
+        env:
+          RUSTUP_INIT_SHA256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+          RUSTUP_INIT_VERSION: 1.28.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup_init="${RUNNER_TEMP}/rustup-init"
+          curl --fail --show-error --silent --location \
+            --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$rustup_init" \
+            "https://static.rust-lang.org/rustup/archive/${RUSTUP_INIT_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
+          echo "${RUSTUP_INIT_SHA256}  ${rustup_init}" | sha256sum --check --strict -
+          chmod 0755 "$rustup_init"
+          "$rustup_init" -y --no-modify-path --profile minimal --default-toolchain 1.97.0
+          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+          "${CARGO_HOME}/bin/rustup" component add llvm-tools-preview
+          "${CARGO_HOME}/bin/rustc" --version | grep -Fx 'rustc 1.97.0 (2d8144b78 2026-07-07)'
+
+      - name: Build the portable release set
+        shell: bash
+        run: >-
+          cargo build --locked --release --target x86_64-unknown-linux-gnu
+          --features opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service,cuda-truepeak
+
+      - name: Apply reproducible PGO to the portable normalizer CLI
+        env:
+          FORGE_PGO_FEATURES: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service,cuda-truepeak
+          FORGE_PGO_RUSTFLAGS: -C target-cpu=x86-64 --remap-path-prefix=${{ github.workspace }}=/workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools/build-pgo-forge.sh x86_64-unknown-linux-gnu
+          cp \
+            target/forge-pgo-x86_64-unknown-linux-gnu/optimized/x86_64-unknown-linux-gnu/release/forge \
+            target/x86_64-unknown-linux-gnu/release/forge
+          cp \
+            target/forge-pgo-x86_64-unknown-linux-gnu/canonical-profile.txt \
+            "forge-v${{ needs.validate.outputs.version }}-linux-x86_64.pgo-profile.txt"
+          cp \
+            target/forge-pgo-x86_64-unknown-linux-gnu/training.json \
+            "forge-v${{ needs.validate.outputs.version }}-linux-x86_64.pgo-training.json"
+
+      - name: Upload portable Linux PGO build inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: forge-pgo-profile-linux-x86_64
+          path: |
+            forge-v${{ needs.validate.outputs.version }}-linux-x86_64.pgo-profile.txt
+            forge-v${{ needs.validate.outputs.version }}-linux-x86_64.pgo-training.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Package and verify the portable native archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools/package-linux-release.sh \
+            "${{ needs.validate.outputs.version }}" \
+            x86_64-unknown-linux-gnu \
+            "${{ needs.validate.outputs.source-date-epoch }}" \
+            .
+          mkdir extracted
+          tar --extract --gzip \
+            --file "forge-v${{ needs.validate.outputs.version }}-linux-x86_64.tar.gz" \
+            --directory extracted
+          prefix="extracted/forge-v${{ needs.validate.outputs.version }}-linux-x86_64"
+          python3 tools/check-linux-native-abi.py "$prefix"
+          tools/test-native-package.sh "$prefix" "${{ needs.validate.outputs.version }}"
+
+      - name: Upload packaged portable Linux archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: forge-linux-x86_64
+          path: forge-v${{ needs.validate.outputs.version }}-linux-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
 
   build:
     name: Build ${{ matrix.asset }}
@@ -324,13 +454,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            asset: linux-x86_64
-            archive: tar
-            library: libforge_normalizer.so
-            features: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service,cuda-truepeak
-            rustflags: ""
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
             asset: windows-x86_64
@@ -359,13 +482,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
 
+      - name: Initialize the MSVC developer environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
       - name: Install Rust 1.97.0
         uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
         with:
           targets: ${{ matrix.target }}
 
       - name: Install matching LLVM PGO tools
-        if: matrix.asset == 'linux-x86_64' || matrix.asset == 'macos-aarch64'
+        if: matrix.asset == 'macos-aarch64'
         run: rustup component add llvm-tools-preview
 
       - name: Install Python 3.14
@@ -373,8 +500,11 @@ jobs:
         with:
           python-version: "3.14"
 
-      - name: Install pinned Python wheel build tools
-        run: python -m pip install --disable-pip-version-check build==1.5.0 setuptools==83.0.0 wheel==0.47.0
+      - name: Install hash-locked Python wheel build tools
+        run: >-
+          python -m pip install --disable-pip-version-check
+          --require-hashes --only-binary=:all:
+          -r tools/python-wheel-build-requirements.lock
 
       - name: Build release binary
         env:
@@ -383,7 +513,7 @@ jobs:
         run: cargo build --locked --release --target ${{ matrix.target }} --features ${{ matrix.features }}
 
       - name: Apply reproducible PGO to the normalizer CLI
-        if: matrix.asset == 'linux-x86_64' || matrix.asset == 'macos-aarch64'
+        if: matrix.asset == 'macos-aarch64'
         shell: bash
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
@@ -407,30 +537,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Stage Linux PGO build inputs
-        if: matrix.asset == 'linux-x86_64'
-        shell: bash
-        run: |
-          cp \
-            "target/forge-pgo-${{ matrix.target }}/canonical-profile.txt" \
-            "forge-v${{ needs.validate.outputs.version }}-linux-x86_64.pgo-profile.txt"
-          cp \
-            "target/forge-pgo-${{ matrix.target }}/training.json" \
-            "forge-v${{ needs.validate.outputs.version }}-linux-x86_64.pgo-training.json"
-
-      - name: Upload Linux PGO build inputs
-        if: matrix.asset == 'linux-x86_64'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
-        with:
-          name: forge-pgo-profile-linux-x86_64
-          path: |
-            forge-v${{ needs.validate.outputs.version }}-linux-x86_64.pgo-profile.txt
-            forge-v${{ needs.validate.outputs.version }}-linux-x86_64.pgo-training.json
-          if-no-files-found: error
-          retention-days: 7
-
       - name: Build the self-contained Python platform wheel
-        if: matrix.asset != 'linux-x86_64'
         env:
           SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
         run: >-
@@ -442,7 +549,6 @@ jobs:
           --version ${{ needs.validate.outputs.version }}
 
       - name: Install and smoke-test the platform wheel
-        if: matrix.asset != 'linux-x86_64'
         shell: bash
         run: |
           set -euo pipefail
@@ -450,11 +556,6 @@ jobs:
           python -m pip install forge_normalizer-*.whl
           python -m pip check
           python python/tests/wheel_smoke.py
-
-      - name: Package reproducible Linux binary
-        if: matrix.asset == 'linux-x86_64'
-        shell: bash
-        run: tools/package-linux-release.sh "${{ needs.validate.outputs.version }}" "${{ matrix.target }}" "${{ needs.validate.outputs.source-date-epoch }}" .
 
       - name: Package macOS binary
         if: startsWith(matrix.asset, 'macos-')
@@ -500,8 +601,14 @@ jobs:
              "$staging/forge-live.clap"
           cp "target/${{ matrix.target }}/release/${{ matrix.library }}" \
              "$staging/${{ matrix.library }}"
-          mkdir "$staging/include"
+          mkdir "$staging/include" "$staging/lib"
           cp include/forge_normalizer.h "$staging/include/"
+          cp "target/${{ matrix.target }}/release/${{ matrix.library }}" \
+             "$staging/lib/${{ matrix.library }}"
+          python3 tools/native_package_metadata.py \
+            --root "$staging" \
+            --version "${{ needs.validate.outputs.version }}" \
+            --platform macos
           mkdir -p "$staging/integrations/ffmpeg" "$staging/integrations/gstreamer"
           cp integrations/ffmpeg/forge_ffmpeg_bridge.c \
              integrations/ffmpeg/forge_ffmpeg_bridge.h "$staging/integrations/ffmpeg/"
@@ -522,7 +629,11 @@ jobs:
           cp schema/*.json "$staging/schema/"
           cp -R schema/ebu-qc-2026-04 "$staging/schema/"
           cp ./*.md LICENSE "$staging/"
-          python3 tools/check-release-content.py "$staging"
+          python3 tools/check-release-content.py "$staging" \
+            --native-platform macos \
+            --version "${{ needs.validate.outputs.version }}"
+          tools/test-native-package.sh \
+            "$staging" "${{ needs.validate.outputs.version }}"
           tar -czf "${staging}.tar.gz" "$staging"
 
       - name: Package Windows binary
@@ -534,11 +645,15 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/forge.exe","target/${{ matrix.target }}/release/forge-live.exe","target/${{ matrix.target }}/release/forge-doctor.exe","target/${{ matrix.target }}/release/forge-compare.exe","target/${{ matrix.target }}/release/forge-audio-compare.exe","target/${{ matrix.target }}/release/forge-container-qc.exe","target/${{ matrix.target }}/release/forge-streaming-qc.exe","target/${{ matrix.target }}/release/forge-presentation-qc.exe","target/${{ matrix.target }}/release/forge-adm-presentation-qc.exe","target/${{ matrix.target }}/release/forge-adm-interactivity-qc.exe","target/${{ matrix.target }}/release/forge-adm-semantics-qc.exe","target/${{ matrix.target }}/release/forge-downmix-qc.exe","target/${{ matrix.target }}/release/forge-binaural-qc.exe","target/${{ matrix.target }}/release/forge-remediate.exe","target/${{ matrix.target }}/release/forge-metadata-repair.exe","target/${{ matrix.target }}/release/forge-sadm-qc.exe","target/${{ matrix.target }}/release/forge-dialogue-provider.exe","target/${{ matrix.target }}/release/forge-anomaly-provider.exe","target/${{ matrix.target }}/release/forge-onnx-provider.exe","target/${{ matrix.target }}/release/forge-remote-qc.exe","target/${{ matrix.target }}/release/forge-service.exe","target/${{ matrix.target }}/release/forge-provenance-qc.exe","target/${{ matrix.target }}/release/forge-imf-qc.exe","target/${{ matrix.target }}/release/forge-aes31-qc.exe","target/${{ matrix.target }}/release/forge-rtp-qc.exe","target/${{ matrix.target }}/release/forge-nmos-qc.exe","target/${{ matrix.target }}/release/forge-st2022-7-qc.exe","target/${{ matrix.target }}/release/forge-report.exe","target/${{ matrix.target }}/release/forge-multi-delivery.exe","target/${{ matrix.target }}/release/forge-segment-normalize.exe","target/${{ matrix.target }}/release/forge-ac4-qc.exe","target/${{ matrix.target }}/release/forge-mpegh-qc.exe","target/${{ matrix.target }}/release/forge-dts-qc.exe" $staging
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.library }}" "$staging/forge-live.clap"
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.library }}" "$staging/${{ matrix.library }}"
-          $importLibrary = Get-ChildItem "target/${{ matrix.target }}/release" -Filter "forge_normalizer*.lib" | Select-Object -First 1
-          if ($null -eq $importLibrary) { throw "Forge import library was not produced" }
+          $importLibraries = @(Get-ChildItem "target/${{ matrix.target }}/release" -File -Filter "forge_normalizer*.lib")
+          if ($importLibraries.Count -ne 1) { throw "Expected one Forge import library, found $($importLibraries.Count)" }
+          $importLibrary = $importLibraries[0]
           Copy-Item $importLibrary.FullName "$staging/forge_normalizer.lib"
-          New-Item -ItemType Directory -Path "$staging/include" | Out-Null
+          New-Item -ItemType Directory -Path "$staging/include","$staging/bin","$staging/lib" | Out-Null
           Copy-Item include/forge_normalizer.h "$staging/include/"
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.library }}" "$staging/bin/forge_normalizer.dll"
+          Copy-Item $importLibrary.FullName "$staging/lib/forge_normalizer.lib"
+          python tools/native_package_metadata.py --root $staging --version "${{ needs.validate.outputs.version }}" --platform windows
           New-Item -ItemType Directory -Path "$staging/integrations/ffmpeg","$staging/integrations/gstreamer" | Out-Null
           Copy-Item "integrations/ffmpeg/forge_ffmpeg_bridge.c","integrations/ffmpeg/forge_ffmpeg_bridge.h" "$staging/integrations/ffmpeg/"
           Copy-Item integrations/gstreamer/gstforge.c "$staging/integrations/gstreamer/"
@@ -554,7 +669,8 @@ jobs:
           Copy-Item "schema/*.json" "$staging/schema/"
           Copy-Item schema/ebu-qc-2026-04 "$staging/schema/" -Recurse
           Copy-Item "*.md","LICENSE" $staging
-          python tools/check-release-content.py "$staging"
+          python tools/check-release-content.py "$staging" --native-platform windows --version "${{ needs.validate.outputs.version }}"
+          tools/test-native-package.ps1 -Root $staging -ExpectedVersion "${{ needs.validate.outputs.version }}"
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
 
       - name: Upload packaged binary
@@ -698,8 +814,8 @@ jobs:
           retention-days: 7
 
   smoke-linux-wheel-floor:
-    name: Smoke-test Linux wheel without network or x86-64-v2
-    needs: [validate, build-linux-wheel]
+    name: Smoke-test portable Linux artifacts at the runtime and CPU floors
+    needs: [validate, build-linux, build-linux-wheel]
     runs-on: ubuntu-24.04
     env:
       MANYLINUX_2_28_IMAGE: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
@@ -715,6 +831,27 @@ jobs:
         with:
           name: forge-python-linux-x86_64
           path: ${{ runner.temp }}/linux-wheel
+
+      - name: Download the portable native archive candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-linux-x86_64
+          path: ${{ runner.temp }}/linux-native
+
+      - name: Extract safely and verify every native ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/linux-native/forge-v${{ needs.validate.outputs.version }}-linux-x86_64.tar.gz"
+          extraction="${RUNNER_TEMP}/linux-native-extracted"
+          mkdir "$extraction"
+          root_name="forge-v${{ needs.validate.outputs.version }}-linux-x86_64"
+          native_root="${extraction}/${root_name}"
+          python3 tools/check-linux-native-abi.py \
+            --archive "$archive" \
+            --extract-to "$extraction" \
+            --expected-root "$root_name"
+          echo "FORGE_NATIVE_ROOT=$(realpath "$native_root")" >> "$GITHUB_ENV"
 
       - name: Install checksum-pinned QEMU and prove the baseline CPU model
         shell: bash
@@ -748,6 +885,7 @@ jobs:
           fi
           source_root="$(realpath "$GITHUB_WORKSPACE")"
           wheel_root="$(realpath "$wheel_dir")"
+          native_root="$(realpath "$FORGE_NATIVE_ROOT")"
           python3 tools/run-pinned-container.py pull "$MANYLINUX_2_34_IMAGE"
           python3 tools/run-pinned-container.py pull "$MANYLINUX_2_28_IMAGE"
 
@@ -758,7 +896,9 @@ jobs:
             --tmpfs /tmp:rw,exec,nosuid,nodev,size=256m \
             --mount "type=bind,src=${source_root},dst=/source,readonly" \
             --mount "type=bind,src=${wheel_root},dst=/wheel,readonly" \
+            --mount "type=bind,src=${native_root},dst=/native,readonly" \
             --workdir /source \
+            --env FORGE_VERSION="${{ needs.validate.outputs.version }}" \
             -- \
             /bin/bash -lc '
               set -euo pipefail
@@ -772,6 +912,9 @@ jobs:
               unset FORGE_NORMALIZER_LIBRARY
               PYTHONPATH=/tmp/site "$py" -m pip check
               PYTHONPATH=/tmp/site "$py" /source/python/tests/wheel_smoke.py
+              test "$(/native/forge --version)" = "forge ${FORGE_VERSION}"
+              /native/forge --help >/dev/null
+              /source/tools/test-native-package.sh /native "$FORGE_VERSION"
             '
 
           python3 tools/run-pinned-container.py run "$MANYLINUX_2_28_IMAGE" \
@@ -781,8 +924,10 @@ jobs:
             --tmpfs /tmp:rw,exec,nosuid,nodev,size=256m \
             --mount "type=bind,src=${source_root},dst=/source,readonly" \
             --mount "type=bind,src=${wheel_root},dst=/wheel,readonly" \
+            --mount "type=bind,src=${native_root},dst=/native,readonly" \
             --mount "type=bind,src=${QEMU_X86_64},dst=/qemu-x86_64-static,readonly" \
             --workdir /source \
+            --env FORGE_VERSION="${{ needs.validate.outputs.version }}" \
             --env QEMU_CPU="$QEMU_CPU" \
             -- \
             /bin/bash -lc '
@@ -797,6 +942,16 @@ jobs:
               unset FORGE_NORMALIZER_LIBRARY
               PYTHONPATH=/tmp/site /qemu-x86_64-static \
                 -cpu "$QEMU_CPU" "$py" /source/python/tests/wheel_smoke.py
+              test "$(/qemu-x86_64-static -cpu "$QEMU_CPU" /native/forge --version)" \
+                = "forge ${FORGE_VERSION}"
+              PKG_CONFIG_PATH=/native/lib/pkgconfig \
+                cc -std=c11 -Wall -Wextra -Werror \
+                  /source/tests/fixtures/c_api_consumer.c \
+                  $(PKG_CONFIG_PATH=/native/lib/pkgconfig \
+                    pkg-config --cflags --libs forge-normalizer) \
+                  -o /tmp/forge-native-consumer
+              LD_LIBRARY_PATH=/native/lib /qemu-x86_64-static \
+                -cpu "$QEMU_CPU" /tmp/forge-native-consumer
             '
 
   reproducible-linux-wheel:
@@ -924,14 +1079,41 @@ jobs:
     name: Build linux-x86_64-v3
     needs: validate
     runs-on: ubuntu-24.04
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+    env:
+      CARGO_HOME: /tmp/forge-cargo
+      CARGO_INCREMENTAL: "0"
+      CFLAGS: -O2 -march=x86-64 -mtune=generic
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/tools/manylinux-cmake-toolchain.cmake
+      CXXFLAGS: -O2 -march=x86-64 -mtune=generic
+      LC_ALL: C.UTF-8
+      RUSTUP_HOME: /tmp/forge-rustup
+      SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
+      TZ: UTC
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
 
-      - name: Install Rust 1.97.0
-        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
-        with:
-          targets: x86_64-unknown-linux-gnu
-          components: llvm-tools-preview
+      - name: Install checksum-pinned Rust 1.97.0 and LLVM PGO tools
+        env:
+          RUSTUP_INIT_SHA256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+          RUSTUP_INIT_VERSION: 1.28.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
+          rustup_init="${RUNNER_TEMP}/rustup-init"
+          curl --fail --show-error --silent --location \
+            --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$rustup_init" \
+            "https://static.rust-lang.org/rustup/archive/${RUSTUP_INIT_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
+          echo "${RUSTUP_INIT_SHA256}  ${rustup_init}" | sha256sum --check --strict -
+          chmod 0755 "$rustup_init"
+          "$rustup_init" -y --no-modify-path --profile minimal --default-toolchain 1.97.0
+          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+          "${CARGO_HOME}/bin/rustup" component add llvm-tools-preview
+          "${CARGO_HOME}/bin/rustc" --version | grep -Fx 'rustc 1.97.0 (2d8144b78 2026-07-07)'
 
       - name: Build the reproducible PGO x86-64-v3 CLI
         env:
@@ -981,26 +1163,44 @@ jobs:
 
   reproducible-linux:
     name: Reproduce Linux release
-    needs: [validate, build, build-linux-v3]
+    needs: [validate, build-linux, build-linux-v3]
     runs-on: ubuntu-24.04
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+    env:
+      CARGO_HOME: /tmp/forge-cargo
+      CARGO_INCREMENTAL: "0"
+      CFLAGS: -O2 -march=x86-64 -mtune=generic
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/tools/manylinux-cmake-toolchain.cmake
+      CXXFLAGS: -O2 -march=x86-64 -mtune=generic
+      LC_ALL: C.UTF-8
+      RUSTFLAGS: -C target-cpu=x86-64 --remap-path-prefix=${{ github.workspace }}=/workspace
+      RUSTUP_HOME: /tmp/forge-rustup
+      SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
+      TZ: UTC
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
 
-      - name: Install Rust 1.97.0
-        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
-        with:
-          targets: x86_64-unknown-linux-gnu
-
-      - name: Install matching LLVM PGO tools
-        run: rustup component add llvm-tools-preview
-
-      - name: Install Python 3.14
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.14"
-
-      - name: Install pinned Python wheel build tools
-        run: python -m pip install --disable-pip-version-check build==1.5.0 setuptools==83.0.0 wheel==0.47.0
+      - name: Install checksum-pinned Rust 1.97.0 and LLVM PGO tools
+        env:
+          RUSTUP_INIT_SHA256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+          RUSTUP_INIT_VERSION: 1.28.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
+          rustup_init="${RUNNER_TEMP}/rustup-init"
+          curl --fail --show-error --silent --location \
+            --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$rustup_init" \
+            "https://static.rust-lang.org/rustup/archive/${RUSTUP_INIT_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
+          echo "${RUSTUP_INIT_SHA256}  ${rustup_init}" | sha256sum --check --strict -
+          chmod 0755 "$rustup_init"
+          "$rustup_init" -y --no-modify-path --profile minimal --default-toolchain 1.97.0
+          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+          "${CARGO_HOME}/bin/rustup" component add llvm-tools-preview
+          "${CARGO_HOME}/bin/rustc" --version | grep -Fx 'rustc 1.97.0 (2d8144b78 2026-07-07)'
 
       - name: Download published build candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
@@ -1028,13 +1228,10 @@ jobs:
 
       - name: Rebuild from recorded PGO inputs and compare
         env:
-          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           FORGE_PGO_FEATURES: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service,cuda-truepeak
-          FORGE_PGO_RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace
+          FORGE_PGO_RUSTFLAGS: -C target-cpu=x86-64 --remap-path-prefix=${{ github.workspace }}=/workspace
           FORGE_PGO_V3_ROOT: ${{ github.workspace }}/target/forge-pgo-x86_64-v3
           FORGE_PGO_V3_RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace -Ctarget-cpu=x86-64-v3
-          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/workspace
-          SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1154,7 +1351,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [validate, build, build-linux-wheel, smoke-linux-wheel-floor, reproducible-linux-wheel, build-linux-v3, reproducible-linux, reproducible-macos-aarch64, wasm]
+    needs: [validate, build, build-linux, build-linux-wheel, smoke-linux-wheel-floor, reproducible-linux-wheel, build-linux-v3, reproducible-linux, reproducible-macos-aarch64, wasm]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     environment: release

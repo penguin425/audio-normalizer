@@ -1,12 +1,24 @@
 # Forge C ABI v1
 
-Forge release archives contain a versioned C interface for bounded local-file
-loudness analysis and a bounded real-time gain processor:
+Forge's platform native archives contain a versioned C interface for bounded
+local-file loudness analysis and a bounded real-time gain processor. The
+supplemental Linux x86-64-v3 CLI-only archive is not a native development
+archive. The platform native archives retain the historical archive-root
+library copies for existing consumers and also provide one canonical
+development layout:
 
 - `include/forge_normalizer.h`;
-- `libforge_normalizer.so` on Linux;
-- `libforge_normalizer.dylib` on macOS; and
-- `forge_normalizer.dll` plus `forge_normalizer.lib` on Windows.
+- `lib/libforge_normalizer.so` on Linux or `lib/libforge_normalizer.dylib` on
+  macOS;
+- `lib/cmake/ForgeNormalizer/*` on every platform native archive;
+- `lib/pkgconfig/forge-normalizer.pc` on Linux and macOS; and
+- `bin/forge_normalizer.dll` plus `lib/forge_normalizer.lib` on Windows.
+
+The compatibility copies are `libforge_normalizer.so` or
+`libforge_normalizer.dylib` on Unix, and `forge_normalizer.dll` plus
+`forge_normalizer.lib` on Windows. The C package ships the dynamic library
+only; it does not provide a static library. Runtime loader-path setup remains
+the consumer's responsibility.
 
 The normative public declaration is
 [`include/forge_normalizer.h`](include/forge_normalizer.h).
@@ -21,6 +33,29 @@ incompatible interface must use new symbol and type names and increment
 
 CLAP and LV2 plugin entry points are separate host ABIs and are not part of
 this contract.
+
+## Native package metadata
+
+The canonical CMake package is relocatable within an extracted native archive:
+
+```cmake
+find_package(ForgeNormalizer CONFIG REQUIRED)
+target_link_libraries(example PRIVATE Forge::Normalizer)
+```
+
+The same package can be installed under a consumer-selected prefix. On Linux
+and macOS, a C consumer can use the canonical pkg-config module:
+
+```sh
+export PKG_CONFIG_PATH="$PWD/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+cc example.c $(pkg-config --cflags --libs forge-normalizer) -o example
+```
+
+The CMake package and pkg-config module select the shared library and header
+relative to their installed metadata location. They do not set a runtime
+loader search path; use the platform's loader configuration, an rpath, or an
+equivalent consumer-owned mechanism when running the program. On Windows,
+`forge_normalizer.lib` is the import library for `bin/forge_normalizer.dll`.
 
 ## Ownership and safety
 
@@ -148,6 +183,10 @@ int main(int argc, char **argv) {
 On Linux, compile from an extracted release directory with:
 
 ```sh
-cc example.c -I include -L . -lforge_normalizer \
-  -Wl,-rpath,'$ORIGIN' -o example
+cc example.c -I include -L lib -lforge_normalizer \
+  -Wl,-rpath,'$ORIGIN/lib' -o example
 ```
+
+The historical archive-root library copy remains available for callers that
+still use `-L .`; new consumers should prefer the canonical layout or the
+pkg-config/CMake metadata above.

@@ -268,8 +268,16 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
                 "Cargo.toml",
                 "Cargo.lock",
                 "build.rs",
+                "packaging/**",
                 "src/**",
+                "tests/fixtures/c_api_consumer.c",
+                "tests/fixtures/native_package/**",
+                "tools/check-linux-native-abi.py",
                 "tools/manylinux-cmake-toolchain.cmake",
+                "tools/native_package_metadata.py",
+                "tools/test-native-package.sh",
+                "tools/test-native-package.ps1",
+                "tools/test_native_package_metadata.py",
                 "tools/workflow-check-requirements.lock",
             }
             <= paths
@@ -392,6 +400,54 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             }
             <= needs
         )
+
+    def test_publish_needs_every_portable_native_archive_gate(self) -> None:
+        needs = set(self.workflow["jobs"]["publish"]["needs"])
+        self.assertTrue(
+            {
+                "build-linux",
+                "smoke-linux-wheel-floor",
+                "reproducible-linux",
+            }
+            <= needs
+        )
+
+    def test_generic_linux_archive_is_built_below_its_runtime_floor(self) -> None:
+        image = (
+            "quay.io/pypa/manylinux_2_28_x86_64@sha256:"
+            "53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c"
+        )
+        for job_name in ("build-linux", "build-linux-v3", "reproducible-linux"):
+            with self.subTest(job=job_name):
+                job = self.workflow["jobs"][job_name]
+                self.assertEqual(job["container"]["image"], image)
+                commands = "\n".join(
+                    step.get("run", "") for step in job["steps"]
+                )
+                self.assertIn('glibc 2.28', commands)
+                self.assertIn("RUSTUP_INIT_SHA256", commands)
+        generic = self.workflow["jobs"]["build-linux"]
+        self.assertIn("-C target-cpu=x86-64", generic["env"]["RUSTFLAGS"])
+        self.assertIn("-march=x86-64", generic["env"]["CFLAGS"])
+        commands = "\n".join(
+            step.get("run", "") for step in generic["steps"]
+        )
+        self.assertIn("tools/check-linux-native-abi.py", commands)
+        self.assertIn("tools/test-native-package.sh", commands)
+
+    def test_oldest_supported_linux_runtime_exercises_both_artifacts(self) -> None:
+        smoke = self.workflow["jobs"]["smoke-linux-wheel-floor"]
+        self.assertTrue({"build-linux", "build-linux-wheel"} <= set(smoke["needs"]))
+        commands = "\n".join(
+            step.get("run", "") for step in smoke["steps"]
+        )
+        self.assertIn('glibc 2.34', commands)
+        self.assertIn("/native/forge --version", commands)
+        self.assertIn("/source/tools/test-native-package.sh", commands)
+        self.assertIn("tools/check-linux-native-abi.py", commands)
+        self.assertIn("--archive", commands)
+        self.assertIn("--expected-root", commands)
+        self.assertIn("/qemu-x86_64-static", commands)
 
     def test_linux_wheel_builds_preserve_opus_analysis(self) -> None:
         builds = {

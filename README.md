@@ -166,12 +166,25 @@ Forge provides a Rust library, a versioned [C API](C-API.md),
 host adapters. Source integrations for FFmpeg, GStreamer, VST3, and Audio Unit
 are documented in [HOST-ADAPTERS.md](HOST-ADAPTERS.md),
 [VST3-ADAPTER.md](VST3-ADAPTER.md), and [AU-ADAPTER.md](AU-ADAPTER.md).
+Native C ABI archives retain their historical root-level library copies and
+also provide the canonical `include/` and `lib/` layout. CMake consumers use
+`find_package(ForgeNormalizer CONFIG REQUIRED)` and `Forge::Normalizer`; Linux
+and macOS consumers may use `pkg-config --cflags --libs forge-normalizer`.
+Only the dynamic library is shipped, and runtime loader-path configuration is
+owned by the consumer. See [C-API.md](C-API.md) for the archive layout and
+compatibility contract.
 
 ## Releases and verification
 
 Tagged releases contain platform archives, Python wheels, checksums, SPDX and
 CycloneDX SBOMs, and SLSA provenance. Linux and Apple Silicon release builds
 also pass independent reproducibility checks before publication.
+The official generic Linux native archive and wheel floor is x86-64 with glibc
+2.34 or newer. Those generic artifacts use x86-64-v1 flags in a pinned
+manylinux 2.28 build and ABI-stress environment; this is not a glibc 2.28
+wheel-install claim. The supplemental x86-64-v3 CLI is built in the same
+pinned environment with an explicit v3 target. The ordinary Linux archive is
+built, ELF-inspected, and runtime-smoked at the official floor.
 
 Use the checksums and attestation bundle shipped with each
 [GitHub Release](https://github.com/penguin425/audio-normalizer/releases).

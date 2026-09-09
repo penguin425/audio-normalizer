@@ -706,7 +706,7 @@ unchanged controls from paths whose normative work factor changed.
 The order below is an implementation plan, not a standards requirement. Each
 normative item must name the exact supported clauses and must not imply
 certification or coverage beyond its fixtures.
-v0.189.1 through v0.189.15 are the completed baseline; later entries are
+v0.189.1 through v0.189.16 are the completed baseline; later entries are
 planned.
 
 | Release | Scope | Classification |

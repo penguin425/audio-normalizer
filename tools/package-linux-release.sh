@@ -10,15 +10,66 @@ version="$1"
 target="$2"
 source_date_epoch="$3"
 output_dir="$4"
-asset="forge-v${version}-linux-x86_64"
-staging="${output_dir}/${asset}"
 
-if [[ -e "$staging" || -e "${staging}.tar.gz" ]]; then
+# Keep release names and filesystem arguments in a deliberately small ASCII
+# subset.  Apart from making the archive name unambiguous, this prevents an
+# argument from becoming a path component or an option to one of the tools
+# below.
+export LC_ALL=C
+if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+  echo "invalid release version: $version" >&2
+  exit 2
+fi
+if [[ ! "$target" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "invalid Rust target triple: $target" >&2
+  exit 2
+fi
+if [[ ! "$source_date_epoch" =~ ^[0-9]+$ ]]; then
+  echo "invalid SOURCE_DATE_EPOCH: $source_date_epoch" >&2
+  exit 2
+fi
+
+# Resolve the output directory before changing directory to the repository.
+# Relative output arguments have historically been relative to the caller's
+# working directory, while all repository inputs below are intentionally
+# rooted from this script's own location.
+caller_root="$(pwd -P)"
+if [[ -z "$output_dir" || "$output_dir" =~ (^|/)\.\.(/|$) ]]; then
+  echo "output directory must not contain path traversal: $output_dir" >&2
+  exit 2
+fi
+if [[ "$output_dir" == /* ]]; then
+  output_candidate="$output_dir"
+else
+  output_candidate="${caller_root}/${output_dir}"
+fi
+if [[ ! -d "$output_candidate" ]]; then
+  echo "output directory does not exist: $output_dir" >&2
+  exit 2
+fi
+if ! output_root="$(cd -- "$output_candidate" && pwd -P)"; then
+  echo "cannot resolve output directory: $output_dir" >&2
+  exit 2
+fi
+if [[ "$output_root" == "/" ]]; then
+  echo "output directory must not be the filesystem root" >&2
+  exit 2
+fi
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+repo_root="$(cd -- "${script_dir}/.." && pwd -P)"
+cd -- "$repo_root"
+
+asset="forge-v${version}-linux-x86_64"
+staging="${output_root}/${asset}"
+
+if [[ -e "$staging" || -L "$staging" || -e "${staging}.tar.gz" || -L "${staging}.tar.gz" ]]; then
   echo "refusing to overwrite existing release output: $staging" >&2
   exit 1
 fi
 
-mkdir -p "$staging"
+mkdir "$staging"
+native_library="target/${target}/release/libforge_normalizer.so"
 for binary in \
   forge \
   forge-live \
@@ -54,42 +105,51 @@ for binary in \
   forge-remote-qc \
   forge-service
 do
-  cp "target/${target}/release/${binary}" "$staging/"
+  cp -- "target/${target}/release/${binary}" "$staging/"
 done
 
-cp "target/${target}/release/libforge_normalizer.so" "$staging/forge-live.clap"
-cp "target/${target}/release/libforge_normalizer.so" "$staging/"
-cp -R plugins/forge-live.lv2 "$staging/"
-cp "target/${target}/release/libforge_normalizer.so" \
+cp -- "$native_library" "$staging/forge-live.clap"
+cp -- "$native_library" "$staging/"
+mkdir "$staging/lib"
+cp -- "$native_library" "$staging/lib/libforge_normalizer.so"
+cp -R -- plugins/forge-live.lv2 "$staging/"
+cp -- "$native_library" \
   "$staging/forge-live.lv2/forge_live.so"
 mkdir "$staging/include" "$staging/proto"
-cp include/forge_normalizer.h "$staging/include/"
-cp proto/* "$staging/proto/"
+cp -- include/forge_normalizer.h "$staging/include/"
+cp -- proto/* "$staging/proto/"
 mkdir -p "$staging/integrations/ffmpeg" "$staging/integrations/gstreamer"
-cp integrations/ffmpeg/forge_ffmpeg_bridge.c \
+cp -- integrations/ffmpeg/forge_ffmpeg_bridge.c \
    integrations/ffmpeg/forge_ffmpeg_bridge.h "$staging/integrations/ffmpeg/"
-cp integrations/gstreamer/gstforge.c "$staging/integrations/gstreamer/"
+cp -- integrations/gstreamer/gstforge.c "$staging/integrations/gstreamer/"
 mkdir -p "$staging/integrations/au"
-cp integrations/au/CMakeLists.txt integrations/au/au-info.plist \
+cp -- integrations/au/CMakeLists.txt integrations/au/au-info.plist \
    "$staging/integrations/au/"
 mkdir -p "$staging/integrations/vst3/external/vst3sdk"
-cp integrations/vst3/CMakeLists.txt integrations/vst3/*.h \
+cp -- integrations/vst3/CMakeLists.txt integrations/vst3/*.h \
    integrations/vst3/*.cpp "$staging/integrations/vst3/"
-cp integrations/vst3/external/CMakeLists.txt \
+cp -- integrations/vst3/external/CMakeLists.txt \
    "$staging/integrations/vst3/external/"
-cp integrations/vst3/external/vst3sdk/CMakeLists.txt \
+cp -- integrations/vst3/external/vst3sdk/CMakeLists.txt \
    "$staging/integrations/vst3/external/vst3sdk/"
 mkdir "$staging/tools" "$staging/schema"
-cp tools/benchmark.py tools/build-pgo-forge.sh tools/train-pgo.py \
+cp -- tools/benchmark.py tools/build-pgo-forge.sh tools/train-pgo.py \
    tools/canonicalize-pgo-profile.py tools/package-linux-v3-release.sh \
    tools/test-vst3-adapter.sh tools/test-au-adapter.sh "$staging/tools/"
 # Every released binary shares this schema directory. Copying the complete
 # top-level set prevents one platform or a newly versioned report from being
 # silently omitted from an archive.
-cp schema/*.json "$staging/schema/"
-cp -R schema/ebu-qc-2026-04 "$staging/schema/"
-cp ./*.md LICENSE "$staging/"
-python3 tools/check-release-content.py "$staging"
+cp -- schema/*.json "$staging/schema/"
+cp -R -- schema/ebu-qc-2026-04 "$staging/schema/"
+cp -- ./*.md LICENSE "$staging/"
+python3 tools/native_package_metadata.py \
+  --root "$staging" \
+  --version "$version" \
+  --platform linux
+python3 tools/check-release-content.py \
+  --native-platform linux \
+  --version "$version" \
+  "$staging"
 
 find "$staging" -exec touch -h -d "@${source_date_epoch}" {} +
 tar \
@@ -98,6 +158,6 @@ tar \
   --owner=0 \
   --group=0 \
   --numeric-owner \
-  -C "$output_dir" \
+  -C "$output_root" \
   -cf - "$asset" |
   gzip -n >"${staging}.tar.gz"

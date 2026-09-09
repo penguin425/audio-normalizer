@@ -19,10 +19,13 @@ the standard `ctypes` module, beginning with Python 3.10. They have no Python
 runtime dependencies and are tagged `py3-none-<platform>`. Forge does not
 currently publish this package to PyPI.
 
-The Linux wheel is compiled with generic x86-64 flags in the digest-pinned
-official `manylinux_2_28_x86_64` image. This avoids the x86-64-v2 system
-package baseline of the AlmaLinux 9-based `manylinux_2_34` image while keeping
-the published `manylinux_2_34_x86_64` contract. The build first emits a
+The official generic Linux native archive and wheel floor is x86-64 with glibc
+2.34 or newer. The Linux wheel is published as
+`manylinux_2_34_x86_64` and is built with generic x86-64 flags in the
+digest-pinned `manylinux_2_28_x86_64` image. For the wheel, that image provides
+the generic x86-64-v1 build and ABI stress; it is not a claim that the wheel
+installs or runs on glibc 2.28. The ordinary Linux archive is built, ELF-
+inspected, and runtime-smoked at the official floor. The build first emits a
 `linux_x86_64` wheel; only the result of `auditwheel repair` is eligible for a
 release. The release gate scans every ELF member for GLIBC symbol versions,
 dynamic dependencies, C++ ABI references, declared ISA requirements, text
@@ -59,9 +62,12 @@ install the local file:
 python -m pip install ./forge_normalizer-0.97.0-py3-none-manylinux_2_34_x86_64.whl
 ```
 
-Replace the version and platform tag with the selected release asset. Verify
-the asset against `SHA256SUMS`; the same release also contains a GitHub SLSA
-provenance bundle covering every wheel.
+Replace the version and platform tag with the selected release asset. The
+official `manylinux_2_34_x86_64` wheel is expected to run on glibc 2.34 or
+newer without `FORGE_NORMALIZER_LIBRARY` or another native-library override.
+The pinned glibc-2.28 environment is only the generic-build and ABI-stress
+floor described above. Verify the asset against `SHA256SUMS`; the same release
+also contains a GitHub SLSA provenance bundle covering every wheel.
 
 For development from a source checkout, put `python/src` on `PYTHONPATH` and
 select a compatible native library:
