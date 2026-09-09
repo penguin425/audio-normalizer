@@ -99,6 +99,8 @@ class GenerationTests(unittest.TestCase):
             self.assertNotIn("IMPORTED_IMPLIB", config)
             pc = outputs[2].read_text(encoding="utf-8")
             self.assertIn("prefix=${pcfiledir}/../..", pc)
+            self.assertIn('Libs: -L"${libdir}" -lforge_normalizer', pc)
+            self.assertIn('Cflags: -I"${includedir}"', pc)
             self.assertNotIn("Libs.private", pc)
 
     def test_macos_uses_dylib_and_windows_use_dll_and_import_library(self) -> None:

@@ -6,5 +6,5 @@ includedir=${prefix}/include
 Name: forge-normalizer
 Description: Forge EBU R128 and ITU-R BS.1770-5 loudness normalizer C ABI v1
 Version: @PACKAGE_VERSION@
-Libs: -L${libdir} -lforge_normalizer
-Cflags: -I${includedir}
+Libs: -L"${libdir}" -lforge_normalizer
+Cflags: -I"${includedir}"
