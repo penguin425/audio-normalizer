@@ -3,6 +3,8 @@ use forge_normalizer::wav::{
     default_channel_roles, AudioBuffer, PcmKind, WavContainer, WavWriter, WaveChunk,
 };
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -324,6 +326,43 @@ fn watch_folder_validates_required_paths_and_incompatible_modes() {
 }
 
 #[test]
+fn configured_difference_report_cannot_bypass_watch_conflict() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("input");
+    let output = directory.path().join("output");
+    let state = directory.path().join("watch.json");
+    let config = directory.path().join("forge.toml");
+    std::fs::create_dir(&input).unwrap();
+    write_batch_test_wav(&input.join("tone.wav"), 440.0);
+    std::fs::write(
+        &config,
+        r#"
+            [output]
+            difference_report = "reports/difference.json"
+        "#,
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .arg("--config")
+        .arg(&config)
+        .arg("--watch")
+        .arg("--watch-once")
+        .arg("--watch-state")
+        .arg(&state)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("--difference-report"));
+    assert!(!output.exists());
+    assert!(!state.exists());
+    assert!(!directory.path().join("reports").exists());
+}
+
+#[test]
 fn recursive_watch_preserves_relative_paths_and_ignores_nested_output() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("input");
@@ -398,6 +437,70 @@ fn recursive_dry_run_preserves_relative_directories() {
     assert!(!output.exists(), "dry-run created the output directory");
 
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_dry_run_is_rejected_before_outputs_or_adm_renderer() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("tone.wav");
+    let renderer = directory.path().join("fake-renderer");
+    let renderer_started = directory.path().join("renderer-started");
+    let report = directory.path().join("missing/reports/analysis.csv");
+    let rendered_output = directory.path().join("missing/render/rendered.wav");
+    write_batch_test_wav(&input, 440.0);
+
+    std::fs::write(
+        &renderer,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nexit 99\n",
+            renderer_started.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&renderer, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .args(["--analyze", "--dry-run", "--csv"])
+        .arg(&report)
+        .args(["--adm-render", "--adm-renderer"])
+        .arg(&renderer)
+        .args(["--adm-rendered-output"])
+        .arg(&rendered_output)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&result.stderr)
+        .contains("the argument '--dry-run' cannot be used with '--analyze'"));
+    assert!(!report.parent().unwrap().exists());
+    assert!(!rendered_output.parent().unwrap().exists());
+    assert!(!renderer_started.exists(), "ADM renderer was launched");
+}
+
+#[test]
+fn configured_analysis_dry_run_is_rejected_before_output_parent_creation() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("tone.wav");
+    let config = directory.path().join("forge.toml");
+    let output = directory.path().join("missing/output/normalized.wav");
+    write_batch_test_wav(&input, 440.0);
+    std::fs::write(&config, "[analysis]\nenabled = true\n").unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .args(["--config"])
+        .arg(&config)
+        .args(["--dry-run", "--output"])
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&result.stderr)
+        .contains("the argument '--dry-run' cannot be used with '--analyze'"));
+    assert!(!output.parent().unwrap().exists());
 }
 
 #[cfg(not(feature = "opus-encoding"))]
@@ -771,7 +874,146 @@ fn album_verification_consumes_cached_source_analyses() {
 }
 
 #[test]
-fn resumable_batch_skips_verified_outputs_and_recovers_only_missing_or_changed_assets() {
+fn album_job_state_publishes_one_recoverable_generation() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.wav");
+    let second = directory.path().join("second.wav");
+    let output = directory.path().join("normalized");
+    let state = directory.path().join("album-job.json");
+    let progress = directory.path().join("album-progress.ndjson");
+    write_batch_test_wav(&first, 440.0);
+    write_batch_test_wav(&second, 880.0);
+
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_forge"))
+            .arg(&first)
+            .arg(&second)
+            .arg("--album")
+            .arg("--job-state")
+            .arg(&state)
+            .arg("--progress")
+            .arg(&progress)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .unwrap()
+    };
+    let initial = run();
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    assert_eq!(document["operation"]["album"], true);
+    assert_eq!(document["completed_count"], 2);
+    let generation: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(state.with_file_name("album-job.json.generation.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(generation["phase"], "committed");
+    assert!(output.join("first_normalized.wav").is_file());
+    assert!(output.join("second_normalized.wav").is_file());
+
+    let events = std::fs::read_to_string(&progress)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../schema/batch-progress-v2.schema.json")).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    assert!(events.iter().all(|event| validator.is_valid(event)));
+    assert_eq!(events.last().unwrap()["event"], "job_completed");
+
+    let resumed = run();
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let resumed_events = std::fs::read_to_string(&progress)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["event"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        resumed_events,
+        [
+            "job_started",
+            "asset_skipped",
+            "asset_skipped",
+            "job_completed"
+        ]
+    );
+}
+
+#[test]
+fn verified_batch_waits_for_every_corrected_stage_before_publication() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.wav");
+    let second = directory.path().join("second.wav");
+    let output = directory.path().join("normalized");
+    let state = directory.path().join("verified-job.json");
+    write_batch_test_wav(&first, 440.0);
+    write_batch_test_wav(&second, 880.0);
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&first)
+        .arg(&second)
+        .arg("--verify")
+        .arg("--verify-tolerance")
+        .arg("1")
+        .arg("--job-state")
+        .arg(&state)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let batch: serde_json::Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    assert_eq!(batch["completed_count"], 2);
+    let generation: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(state.with_file_name("verified-job.json.generation.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(generation["phase"], "committed");
+}
+
+#[test]
+fn generation_control_path_lexically_aliasing_an_output_is_rejected_before_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.wav");
+    let second = directory.path().join("second.wav");
+    let output = directory.path().join("normalized");
+    write_batch_test_wav(&first, 440.0);
+    write_batch_test_wav(&second, 880.0);
+    let aliased_state = output
+        .join("missing-component")
+        .join("..")
+        .join("first_normalized.wav");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&first)
+        .arg(&second)
+        .arg("--output")
+        .arg(&output)
+        .arg("--job-state")
+        .arg(&aliased_state)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("must not overwrite"));
+    assert!(!output.exists());
+}
+
+#[test]
+fn resumable_batch_commits_and_rebuilds_only_whole_generations() {
     let directory = tempfile::tempdir().unwrap();
     let first_input = directory.path().join("first.wav");
     let second_input = directory.path().join("second.wav");
@@ -801,7 +1043,7 @@ fn resumable_batch_skips_verified_outputs_and_recovers_only_missing_or_changed_a
     };
     let read_events = || {
         let schema: serde_json::Value =
-            serde_json::from_str(include_str!("../schema/batch-progress-v1.schema.json")).unwrap();
+            serde_json::from_str(include_str!("../schema/batch-progress-v2.schema.json")).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         std::fs::read_to_string(&progress_path)
             .unwrap()
@@ -824,22 +1066,45 @@ fn resumable_batch_skips_verified_outputs_and_recovers_only_missing_or_changed_a
         String::from_utf8_lossy(&first_run.stderr)
     );
     let state_schema: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/batch-job-v2.schema.json")).unwrap();
+        serde_json::from_str(include_str!("../schema/batch-job-v3.schema.json")).unwrap();
     let state: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-    assert!(jsonschema::validator_for(&state_schema)
-        .unwrap()
-        .is_valid(&state));
+    let state_validator = jsonschema::validator_for(&state_schema).unwrap();
+    let state_errors = state_validator
+        .iter_errors(&state)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    assert!(state_errors.is_empty(), "{state_errors:?}\n{state:#}");
     assert_eq!(state["asset_count"], 2);
     assert_eq!(state["completed_count"], 2);
     assert!(state["operation"].get("metadata_policy").is_none());
     assert!(state["operation"]
         .get("metadata_registry_revision")
         .is_none());
+    assert_eq!(state["operation"]["album"], false);
+    assert_eq!(
+        state["operation"]["formats"],
+        serde_json::json!(["wav", "wav"])
+    );
+    assert_eq!(
+        state["operation"]["analysis_engine"],
+        "forge-fast-bs1770-r4"
+    );
+    assert_eq!(state["failure_policy"], "fail_fast");
+    assert!(state["semantic_context"].is_object());
     let first_output = PathBuf::from(state["assets"][0]["output"].as_str().unwrap());
     let second_output = PathBuf::from(state["assets"][1]["output"].as_str().unwrap());
     assert!(first_output.is_file());
     assert!(second_output.is_file());
+    let generation_path = state_path.with_file_name("job.json.generation.json");
+    let generation_schema: serde_json::Value =
+        serde_json::from_str(include_str!("../schema/generation-job-v1.schema.json")).unwrap();
+    let generation: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&generation_path).unwrap()).unwrap();
+    assert!(jsonschema::validator_for(&generation_schema)
+        .unwrap()
+        .is_valid(&generation));
+    assert_eq!(generation["phase"], "committed");
     assert_eq!(
         read_events()
             .iter()
@@ -874,9 +1139,62 @@ fn resumable_batch_skips_verified_outputs_and_recovers_only_missing_or_changed_a
         ]
     );
 
+    std::fs::remove_file(&generation_path).unwrap();
+    let missing_journal = run(false);
+    assert!(!missing_journal.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_journal.stderr).contains("missing its generation journal")
+    );
+    let rebuilt_missing_journal = run(true);
+    assert!(
+        rebuilt_missing_journal.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rebuilt_missing_journal.stderr)
+    );
+    assert!(generation_path.is_file());
+
+    let same_bytes = std::fs::read(&first_output).unwrap();
+    let replacement = first_output.with_extension("replacement");
+    std::fs::write(&replacement, &same_bytes).unwrap();
+    #[cfg(unix)]
+    std::fs::rename(&replacement, &first_output).unwrap();
+    #[cfg(windows)]
+    {
+        std::fs::remove_file(&first_output).unwrap();
+        std::fs::rename(&replacement, &first_output).unwrap();
+    }
+    let rejected_identity_change = run(false);
+    assert!(!rejected_identity_change.status.success());
+    assert!(String::from_utf8_lossy(&rejected_identity_change.stderr)
+        .contains("committed generation output changed"));
+    let rebuilt_identity_change = run(true);
+    assert!(
+        rebuilt_identity_change.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rebuilt_identity_change.stderr)
+    );
+    assert_eq!(std::fs::read(&first_output).unwrap(), same_bytes);
+    assert_eq!(
+        read_events()
+            .iter()
+            .map(|event| event["event"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "job_started",
+            "asset_started",
+            "asset_started",
+            "asset_completed",
+            "asset_completed",
+            "job_completed"
+        ]
+    );
+
     let first_before_recovery = std::fs::read(&first_output).unwrap();
     std::fs::remove_file(&second_output).unwrap();
-    let recovered = run(false);
+    let rejected_missing = run(false);
+    assert!(!rejected_missing.status.success());
+    assert!(String::from_utf8_lossy(&rejected_missing.stderr).contains("changed or disappeared"));
+    let recovered = run(true);
     assert!(
         recovered.status.success(),
         "{}",
@@ -891,8 +1209,9 @@ fn resumable_batch_skips_verified_outputs_and_recovers_only_missing_or_changed_a
             .collect::<Vec<_>>(),
         [
             "job_started",
-            "asset_skipped",
             "asset_started",
+            "asset_started",
+            "asset_completed",
             "asset_completed",
             "job_completed"
         ]
@@ -901,7 +1220,7 @@ fn resumable_batch_skips_verified_outputs_and_recovers_only_missing_or_changed_a
     std::fs::write(&first_output, b"externally changed").unwrap();
     let rejected = run(false);
     assert!(!rejected.status.success());
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("completed output changed"));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("changed or disappeared"));
 
     let rebuilt = run(true);
     assert!(
@@ -918,15 +1237,16 @@ fn resumable_batch_skips_verified_outputs_and_recovers_only_missing_or_changed_a
         [
             "job_started",
             "asset_started",
+            "asset_started",
             "asset_completed",
-            "asset_skipped",
+            "asset_completed",
             "job_completed"
         ]
     );
 }
 
 #[test]
-fn resumable_batch_checkpoints_before_a_later_asset_fails() {
+fn resumable_batch_failure_publishes_no_generation_prefix() {
     let directory = tempfile::tempdir().unwrap();
     let valid_input = directory.path().join("valid.wav");
     let invalid_input = directory.path().join("invalid.wav");
@@ -975,7 +1295,7 @@ fn resumable_batch_checkpoints_before_a_later_asset_fails() {
     assert!(!first_run.status.success());
     let state: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-    assert_eq!(state["completed_count"], 1);
+    assert_eq!(state["completed_count"], 0);
     assert_eq!(
         event_names(),
         [
@@ -983,8 +1303,8 @@ fn resumable_batch_checkpoints_before_a_later_asset_fails() {
             "asset_started",
             "asset_started",
             "asset_started",
-            "asset_completed",
-            "asset_failed"
+            "asset_failed",
+            "job_failed"
         ]
     );
     assert_eq!(
@@ -992,25 +1312,240 @@ fn resumable_batch_checkpoints_before_a_later_asset_fails() {
         b"preserve later destination"
     );
     let valid_output = PathBuf::from(state["assets"][0]["output"].as_str().unwrap());
-    let valid_output_bytes = std::fs::read(&valid_output).unwrap();
+    assert!(!valid_output.exists());
+    assert!(!state_path
+        .with_file_name("job.json.generation.json")
+        .exists());
 
     let resumed = run();
     assert!(!resumed.status.success());
-    assert_eq!(std::fs::read(valid_output).unwrap(), valid_output_bytes);
+    assert!(!valid_output.exists());
     assert_eq!(
         event_names(),
         [
             "job_started",
-            "asset_skipped",
             "asset_started",
             "asset_started",
-            "asset_failed"
+            "asset_started",
+            "asset_failed",
+            "job_failed"
         ]
     );
     assert_eq!(
         std::fs::read(later_output).unwrap(),
         b"preserve later destination"
     );
+}
+
+#[test]
+fn keep_going_reports_bounded_failures_and_publishes_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_input = directory.path().join("first.wav");
+    let invalid_input = directory.path().join("invalid.wav");
+    let third_input = directory.path().join("third.wav");
+    let output_directory = directory.path().join("normalized");
+    let state_path = directory.path().join("job.json");
+    let progress_path = directory.path().join("progress.ndjson");
+    let failure_path = directory.path().join("failures.json");
+    write_batch_test_wav(&first_input, 440.0);
+    std::fs::write(&invalid_input, b"not audio").unwrap();
+    write_batch_test_wav(&third_input, 880.0);
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&first_input)
+        .arg(&invalid_input)
+        .arg(&third_input)
+        .arg("-o")
+        .arg(&output_directory)
+        .arg("--job-state")
+        .arg(&state_path)
+        .arg("--keep-going")
+        .arg("--failure-report")
+        .arg(&failure_path)
+        .arg("--progress")
+        .arg(&progress_path)
+        .arg("--jobs")
+        .arg("3")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("no generation was published"));
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(state["failure_policy"], "keep_going");
+    assert_eq!(state["completed_count"], 0);
+    for asset in state["assets"].as_array().unwrap() {
+        assert!(!PathBuf::from(asset["output"].as_str().unwrap()).exists());
+    }
+    assert!(!state_path
+        .with_file_name("job.json.generation.json")
+        .exists());
+
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../schema/batch-failure-report-v1.schema.json"
+    ))
+    .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&failure_path).unwrap()).unwrap();
+    assert!(jsonschema::validator_for(&schema)
+        .unwrap()
+        .is_valid(&report));
+    assert_eq!(report["total"], 3);
+    assert_eq!(report["succeeded"], 2);
+    assert_eq!(report["failed"], 1);
+    assert_eq!(report["failures"][0]["index"], 1);
+}
+
+#[test]
+fn completed_resume_repairs_requested_catalogue_and_failure_reports_without_audio_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_input = directory.path().join("first.wav");
+    let second_input = directory.path().join("second.wav");
+    let output_directory = directory.path().join("normalized");
+    let state_path = directory.path().join("job.json");
+    let catalogue_path = directory.path().join("catalogue.sqlite");
+    let catalogue_report = directory.path().join("catalogue-report.json");
+    let failure_report = directory.path().join("failures.json");
+    let progress_path = directory.path().join("progress.ndjson");
+    write_batch_test_wav(&first_input, 440.0);
+    write_batch_test_wav(&second_input, 880.0);
+
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_forge"))
+            .arg(&first_input)
+            .arg(&second_input)
+            .arg("-o")
+            .arg(&output_directory)
+            .arg("--job-state")
+            .arg(&state_path)
+            .arg("--keep-going")
+            .arg("--failure-report")
+            .arg(&failure_report)
+            .arg("--catalogue")
+            .arg(&catalogue_path)
+            .arg("--catalogue-report")
+            .arg(&catalogue_report)
+            .arg("--progress")
+            .arg(&progress_path)
+            .output()
+            .unwrap()
+    };
+
+    let first = run();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_output = output_directory.join("first_normalized.wav");
+    let second_output = output_directory.join("second_normalized.wav");
+    let first_bytes = std::fs::read(&first_output).unwrap();
+    let second_bytes = std::fs::read(&second_output).unwrap();
+    std::fs::remove_file(&catalogue_report).unwrap();
+    std::fs::remove_file(&failure_report).unwrap();
+
+    let resumed = run();
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(std::fs::read(&first_output).unwrap(), first_bytes);
+    assert_eq!(std::fs::read(&second_output).unwrap(), second_bytes);
+
+    let failure: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&failure_report).unwrap()).unwrap();
+    assert_eq!(failure["succeeded"], 2);
+    assert_eq!(failure["failed"], 0);
+    let catalogue: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&catalogue_report).unwrap()).unwrap();
+    assert_eq!(catalogue["records"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn recovery_inspection_is_side_effect_free_and_reclaim_requires_confirmation() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_input = directory.path().join("first.wav");
+    let second_input = directory.path().join("second.wav");
+    let output_directory = directory.path().join("normalized");
+    let state_path = directory.path().join("job.json");
+    write_batch_test_wav(&first_input, 440.0);
+    write_batch_test_wav(&second_input, 880.0);
+    let normalized = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&first_input)
+        .arg(&second_input)
+        .arg("-o")
+        .arg(&output_directory)
+        .arg("--job-state")
+        .arg(&state_path)
+        .output()
+        .unwrap();
+    assert!(
+        normalized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&normalized.stderr)
+    );
+
+    let generation = state_path.with_file_name("job.json.generation.json");
+    let lock = generation.with_file_name("job.json.generation.json.lock");
+    std::fs::remove_file(&lock).unwrap();
+    let inspect = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg("recovery")
+        .arg("inspect")
+        .arg(&generation)
+        .output()
+        .unwrap();
+    assert!(
+        inspect.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let inspected: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(inspected["action"], "inspected");
+    assert_eq!(inspected["phase"], "committed");
+    assert!(!lock.exists());
+
+    let dry_reclaim = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg("recovery")
+        .arg("reclaim")
+        .arg(&generation)
+        .output()
+        .unwrap();
+    assert!(dry_reclaim.status.success());
+    let planned: serde_json::Value = serde_json::from_slice(&dry_reclaim.stdout).unwrap();
+    assert_eq!(planned["action"], "nothing_to_reclaim");
+    assert_eq!(planned["confirmed"], false);
+    assert_eq!(planned["lock_state"], "missing");
+    assert_eq!(planned["private_file_count"], 0);
+    let recovery_schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../schema/generation-recovery-report-v1.schema.json"
+    ))
+    .unwrap();
+    assert!(jsonschema::validator_for(&recovery_schema)
+        .unwrap()
+        .is_valid(&planned));
+    assert!(!lock.exists());
+
+    let reclaimed = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg("recovery")
+        .arg("reclaim")
+        .arg(&generation)
+        .arg("--yes")
+        .output()
+        .unwrap();
+    assert!(
+        reclaimed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reclaimed.stderr)
+    );
+    let record: serde_json::Value = serde_json::from_slice(&reclaimed.stdout).unwrap();
+    assert_eq!(record["action"], "reclaimed");
+    assert_eq!(record["confirmed"], true);
+    assert!(jsonschema::validator_for(&recovery_schema)
+        .unwrap()
+        .is_valid(&record));
+    assert!(!lock.exists());
 }
 
 #[test]
@@ -2769,6 +3304,72 @@ fn configured_difference_report_path_is_relative_to_config() {
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
     assert_eq!(report["assets"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn configured_difference_report_cannot_bypass_generation_publication() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.wav");
+    let second = directory.path().join("second.wav");
+    let output = directory.path().join("normalized");
+    let state = directory.path().join("job.json");
+    let config = directory.path().join("forge.toml");
+    write_batch_test_wav(&first, 440.0);
+    write_batch_test_wav(&second, 880.0);
+    std::fs::write(
+        &config,
+        r#"
+            [output]
+            difference_report = "difference.json"
+        "#,
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&first)
+        .arg(&second)
+        .arg("--config")
+        .arg(&config)
+        .arg("--output")
+        .arg(&output)
+        .arg("--job-state")
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("--difference-report"));
+    assert!(!output.exists());
+    assert!(!state.exists());
+}
+
+#[test]
+fn configured_verification_cannot_be_silently_ignored_by_dry_run() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("input.wav");
+    let output = directory.path().join("missing").join("normalized.wav");
+    let config = directory.path().join("forge.toml");
+    write_batch_test_wav(&input, 440.0);
+    std::fs::write(
+        &config,
+        r#"
+            [output]
+            verify = true
+        "#,
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .arg(&input)
+        .arg("--config")
+        .arg(&config)
+        .arg("--dry-run")
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("--verify"));
+    assert!(!output.parent().unwrap().exists());
 }
 
 #[test]

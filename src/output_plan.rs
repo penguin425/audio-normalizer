@@ -171,7 +171,6 @@ fn inspect_path(path: &Path, output: bool, label: &str) -> Result<InspectedPath,
             return Err(format!("{label} is not a regular file: {}", path.display()));
         }
     }
-    let resolved = resolve_path(path, 0)?;
     let identity = if metadata.as_ref().is_some_and(|metadata| metadata.is_file()) {
         path_identity_if_exists(path)
             .map_err(|error| format!("identify {label} {}: {error}", path.display()))?
@@ -179,10 +178,30 @@ fn inspect_path(path: &Path, output: bool, label: &str) -> Result<InspectedPath,
         None
     };
     Ok(InspectedPath {
-        route_key: route_key(&resolved),
+        route_key: physical_route_key(path)?,
         identity,
         exists: metadata.is_some(),
     })
+}
+
+/// Return the route key for a path after resolving existing symlinked
+/// ancestors (and an existing final symlink) without creating or modifying
+/// any filesystem entry.
+///
+/// Generation journals use the same physical route identity as invocation
+/// output planning so that a lexical alias through a symlink cannot evade
+/// state/lock, destination, stage, or backup collision checks.
+pub(crate) fn physical_route_key(path: &Path) -> Result<String, String> {
+    let resolved = physical_normalized_path(path)?;
+    Ok(route_key(&resolved))
+}
+
+/// Resolve the existing path prefix component by component, then append a
+/// missing suffix lexically. This preserves filesystem semantics for paths
+/// such as `symlink/../new-file`, where collapsing `..` before resolving the
+/// symlink would select a different parent.
+pub(crate) fn physical_normalized_path(path: &Path) -> Result<PathBuf, String> {
+    resolve_path(path, 0)
 }
 
 fn resolve_path(path: &Path, symlink_depth: usize) -> Result<PathBuf, String> {
@@ -200,81 +219,64 @@ fn resolve_path(path: &Path, symlink_depth: usize) -> Result<PathBuf, String> {
             .map_err(|error| format!("resolve {}: {error}", path.display()))?
             .join(path)
     };
-    let lexical = lexical_normalize(&absolute)?;
-    match std::fs::canonicalize(&lexical) {
-        Ok(resolved) => return Ok(resolved),
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            return Err(format!("resolve {}: {error}", path.display()))
-        }
-        Err(_) => {}
-    }
-
-    if let Ok(metadata) = std::fs::symlink_metadata(&lexical) {
-        if metadata.file_type().is_symlink() {
-            let target = std::fs::read_link(&lexical)
-                .map_err(|error| format!("read link {}: {error}", lexical.display()))?;
-            let target = if target.is_absolute() {
-                target
-            } else {
-                lexical
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(target)
-            };
-            return resolve_path(&target, symlink_depth + 1);
-        }
-    }
-
-    let mut ancestor = lexical.as_path();
-    let mut suffix = Vec::new();
-    loop {
-        match std::fs::symlink_metadata(ancestor) {
-            Ok(_) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let name = ancestor
-                    .file_name()
-                    .ok_or_else(|| format!("cannot resolve path {}", path.display()))?;
-                suffix.push(name.to_owned());
-                ancestor = ancestor
-                    .parent()
-                    .ok_or_else(|| format!("cannot resolve path {}", path.display()))?;
-            }
-            Err(error) => {
-                return Err(format!(
-                    "inspect ancestor {} while resolving {}: {error}",
-                    ancestor.display(),
-                    path.display()
-                ));
-            }
-        }
-    }
-    let mut resolved = std::fs::canonicalize(ancestor)
-        .map_err(|error| format!("resolve {}: {error}", path.display()))?;
-    for name in suffix.iter().rev() {
-        resolved.push(name);
-    }
-    Ok(resolved)
-}
-
-fn lexical_normalize(path: &Path) -> Result<PathBuf, String> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
+    let components = absolute.components().collect::<Vec<_>>();
+    let mut resolved = PathBuf::new();
+    for (index, component) in components.iter().enumerate() {
         match component {
-            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
-                normalized.push(component.as_os_str());
-            }
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
             Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(format!(
-                        "path escapes its filesystem root: {}",
-                        path.display()
-                    ));
+            Component::ParentDir | Component::Normal(_) => {
+                let candidate = resolved.join(component.as_os_str());
+                match std::fs::canonicalize(&candidate) {
+                    Ok(canonical) => resolved = canonical,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // Preserve filesystem component order through the
+                        // existing prefix. In particular, a symlink followed
+                        // by `..` must pop from the symlink target, not from
+                        // its lexical parent. Once a component is missing,
+                        // later components cannot be resolved safely; append
+                        // their lexical suffix without following links.
+                        if let Ok(metadata) = std::fs::symlink_metadata(&candidate) {
+                            if metadata_is_link(&metadata) {
+                                let target = std::fs::read_link(&candidate).map_err(|error| {
+                                    format!("read link {}: {error}", candidate.display())
+                                })?;
+                                let target = if target.is_absolute() {
+                                    target
+                                } else {
+                                    candidate
+                                        .parent()
+                                        .unwrap_or_else(|| Path::new("."))
+                                        .join(target)
+                                };
+                                resolved = resolve_path(&target, symlink_depth + 1)?;
+                                continue;
+                            }
+                        }
+                        append_unresolved_components(&mut resolved, &components[index..]);
+                        break;
+                    }
+                    Err(error) => return Err(format!("resolve {}: {error}", path.display())),
                 }
             }
         }
     }
-    Ok(normalized)
+    Ok(resolved)
+}
+
+fn append_unresolved_components(resolved: &mut PathBuf, components: &[Component<'_>]) {
+    for component in components {
+        match component {
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = resolved.pop();
+            }
+            Component::Normal(value) => resolved.push(value),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -299,12 +301,25 @@ fn route_key(path: &Path) -> String {
         .join("\\")
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+))]
 fn route_key(path: &Path) -> String {
     path.to_string_lossy().to_lowercase()
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(
+    windows,
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+)))]
 fn route_key(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -382,6 +397,28 @@ mod tests {
             vec![PlannedOutput::new("output", &output, true)]
         )
         .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn physical_route_resolves_symlink_before_parent_components() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real").join("nested");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = directory.path().join("alias");
+        symlink(&real, &alias).unwrap();
+
+        // The missing suffix is deliberately after `alias/..`. Resolving
+        // lexically would point at directory/marker; the filesystem resolves
+        // alias to real/nested first, so `..` points at real.
+        let through_alias = alias.join("..").join("marker");
+        let through_real = directory.path().join("real").join("marker");
+        assert_eq!(
+            physical_route_key(&through_alias).unwrap(),
+            physical_route_key(&through_real).unwrap()
+        );
     }
 
     #[test]

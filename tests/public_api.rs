@@ -1,9 +1,11 @@
+use forge_normalizer::analysis::AnalysisEngine;
 use forge_normalizer::analysis_cache::{AnalysisCache, AnalysisCachePolicy, CacheDisposition};
 use forge_normalizer::decoder;
 use forge_normalizer::ebu_qc_validation::{
     validate_xml, EbuQcValidationProfile, EBU_QC_2026_04_SCHEMA_SHA256,
     EBU_QC_2026_04_SOURCE_COMMIT,
 };
+use forge_normalizer::generation::{GenerationPhase, GenerationTransaction};
 use forge_normalizer::normalize::{
     analyze, apply_gain_and_protect, compute_gain, Mode, OutputFormat, Plan,
 };
@@ -180,6 +182,46 @@ fn documented_public_api_works_from_a_downstream_crate() {
     assert!(outcome.source.lufs.is_finite());
     assert!(outcome.gain.is_finite());
     assert!(WavReader::probe(&staged_path).is_ok());
+
+    let generation_path = temporary.path().join("generation.wav");
+    let generation_stage = forge_normalizer::normalize::normalize_one_staged_with_roles(
+        &wave_path,
+        &generation_path,
+        &plan,
+        OutputFormat::Wav,
+        None,
+    )
+    .expect("render public generation stage");
+    let (prepared, generation_outcome) = generation_stage
+        .into_generation_parts()
+        .expect("convert public stage into generation member");
+    assert!(generation_outcome.source.lufs.is_finite());
+    let generation_state = temporary.path().join("generation-state.json");
+    let transaction = GenerationTransaction::prepare(
+        &generation_state,
+        "public-api-generation-v1",
+        vec![prepared],
+    )
+    .expect("prepare public generation transaction");
+    assert_eq!(transaction.phase(), GenerationPhase::Ready);
+    let committed = transaction.commit().expect("commit public generation");
+    assert_eq!(committed.phase(), GenerationPhase::Committed);
+    assert_eq!(committed.outputs().len(), 1);
+    committed.outputs()[0]
+        .verify_live_destination()
+        .expect("verify public committed generation evidence");
+    assert!(WavReader::probe(&generation_path).is_ok());
+
+    let semantic_context = forge_normalizer::runtime_fingerprint::normalization_semantic_context(
+        AnalysisEngine::Fast,
+        None,
+        &[OutputFormat::Wav],
+    )
+    .expect("construct public normalization semantic context");
+    assert_eq!(
+        semantic_context["schema"],
+        forge_normalizer::runtime_fingerprint::NORMALIZATION_SEMANTIC_CONTEXT_SCHEMA
+    );
 
     let dropped_path = temporary.path().join("dropped-stage.wav");
     std::fs::write(&dropped_path, b"preserve me").expect("seed dropped destination");

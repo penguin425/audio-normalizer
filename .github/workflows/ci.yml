@@ -138,7 +138,7 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Install pinned wasm-bindgen CLI
-        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+        run: cargo install wasm-bindgen-cli --version 0.2.127 --locked
 
       - name: Check WASM formatting and lints
         run: |

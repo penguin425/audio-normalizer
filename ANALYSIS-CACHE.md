@@ -77,6 +77,13 @@ writable misses, and read-only misses rebind and hash the live source before
 returning; replacement, symlink retargeting, and same-length in-place changes
 fail instead of mixing source generations.
 
+The caller-selected cache root and its parent directories are a trusted
+storage boundary. Entry reads reject symlinks and use platform no-follow
+handles where available, but the cache does not authenticate a hostile owner
+that can replace the root or its directory prefix. Do not share a writable
+cache root with an untrusted process; use an authenticated, access-controlled
+storage boundary when crossing that trust boundary.
+
 The cache never recursively interprets arbitrary files. Capacity accounting
 and eviction recognize only regular JSON files at the exact v5 layout with
 lower-case SHA-256 names. Unrecognized files and directories are left alone.
@@ -104,6 +111,27 @@ are errors rather than silent cache bypasses.
 does not create, repair, or evict cache entries. Add `--warm-cache` alongside
 `--dry-run --analysis-cache DIR` only when populating the cache is an intended
 side effect.
+
+## Generation identity and warming
+
+The cache is deliberately outside the semantic identity of a resumable v3
+batch or album generation. Cache directory paths, hit/miss observations,
+repair decisions, eviction order, and warm/cold status are not included in the
+`normalization-semantic-context-v1` document or its `job_id`. A warm run and a
+cold run therefore bind to the same generation only when all byte-affecting
+analysis, decoder, track, and writer evidence is otherwise identical.
+The context keeps the requested output format IDs in order, including repeated
+formats, while recording each writer capability evidence object only at its
+first occurrence; a large repeated-format batch therefore cannot inflate its
+semantic identity with duplicate runtime probes.
+
+`--job-state` and its sibling generation journal are incompatible with
+`--dry-run`. A dry run creates no state, generation stage, progress stream,
+failure report, catalogue output, or external renderer output. The only
+durable exception is an explicit
+`--dry-run --analysis-cache DIR --warm-cache`; that command may write or evict
+bounded v5 cache entries, but it still does not create audio destinations or
+any job/generation state.
 
 ## Resource limits and eviction
 

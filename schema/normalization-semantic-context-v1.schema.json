@@ -1,0 +1,224 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/normalization-semantic-context-v1",
+  "title": "Forge normalization semantic context v1",
+  "description": "Stable runtime evidence used by a resumable normalization job identity. Format IDs retain ordered duplicates; writer evidence is retained once, in first-occurrence order.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "revision",
+    "bound_analysis_version",
+    "measurement_algorithm_revision",
+    "input_content_binding_version",
+    "analysis_engine",
+    "analysis_engine_id",
+    "decoder",
+    "input_descriptor_semantic_revision",
+    "audio_track",
+    "audio_track_selection",
+    "normalization",
+    "output_formats",
+    "writers"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/normalization-semantic-context-v1"
+    },
+    "revision": {
+      "const": 1
+    },
+    "bound_analysis_version": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "measurement_algorithm_revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "input_content_binding_version": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "analysis_engine": {
+      "$ref": "#/$defs/analysisEngine"
+    },
+    "analysis_engine_id": {
+      "type": "string",
+      "enum": ["forge-fast-bs1770-r4", "forge-reference-bs1770-r1"]
+    },
+    "decoder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["semantic_revision", "input_descriptor_version"],
+      "properties": {
+        "semantic_revision": {"type": "string", "minLength": 1, "maxLength": 128},
+        "input_descriptor_version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "input_descriptor_semantic_revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "audio_track": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "audio_track_selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "index"],
+      "properties": {
+        "kind": {"enum": ["default", "index"]},
+        "index": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "default"}}},
+          "then": {"properties": {"index": {"const": null}}}
+        },
+        {
+          "if": {"properties": {"kind": {"const": "index"}}},
+          "then": {
+            "required": ["index"],
+            "properties": {"index": {"type": "integer", "minimum": 0}}
+          }
+        }
+      ]
+    },
+    "normalization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pipeline_revision"],
+      "properties": {
+        "pipeline_revision": {"type": "string", "minLength": 1, "maxLength": 128}
+      }
+    },
+    "output_formats": {
+      "type": "array",
+      "maxItems": 100000,
+      "items": {
+        "enum": ["wav", "flac", "mp3", "opus", "m4a", "alac", "vorbis"]
+      }
+    },
+    "writers": {
+      "type": "array",
+      "maxItems": 7,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/writer"}
+    }
+  },
+  "$defs": {
+    "analysisEngine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "enum": ["forge-fast-bs1770-r4", "forge-reference-bs1770-r1"]
+        }
+      }
+    },
+    "writer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "implementation_id",
+        "pipeline_revision",
+        "capability_success",
+        "runtime"
+      ],
+      "properties": {
+        "format": {
+          "enum": ["wav", "flac", "mp3", "opus", "m4a", "alac", "vorbis"]
+        },
+        "implementation_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "pipeline_revision": {"type": "string", "minLength": 1, "maxLength": 128},
+        "capability_success": {"const": true},
+        "runtime": {"$ref": "#/$defs/runtime"}
+      }
+    },
+    "runtime": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "capability_success"],
+          "properties": {
+            "kind": {"const": "native"},
+            "capability_success": {"const": true}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "lame_get_version", "lame_version", "capability_success"],
+          "properties": {
+            "kind": {"const": "lame"},
+            "lame_get_version": {"type": "string", "minLength": 1, "maxLength": 256},
+            "lame_version": {"type": "string", "minLength": 1, "maxLength": 256},
+            "capability_success": {"const": true}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "opus_version", "container", "capability_success"],
+          "properties": {
+            "kind": {"const": "libopus"},
+            "opus_version": {"type": "string", "minLength": 1, "maxLength": 256},
+            "container": {"const": "ogg"},
+            "capability_success": {"const": true}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "executable_byte_len",
+            "executable_sha256",
+            "byte_len",
+            "sha256",
+            "encoder",
+            "muxer",
+            "capability_success"
+          ],
+          "properties": {
+            "kind": {"const": "ffmpeg"},
+            "executable_byte_len": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 18446744073709551615
+            },
+            "executable_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "byte_len": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 18446744073709551615
+            },
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "encoder": {"type": "string", "minLength": 1, "maxLength": 128},
+            "muxer": {"type": "string", "minLength": 1, "maxLength": 128},
+            "capability_success": {"const": true}
+          }
+        }
+      ]
+    }
+  }
+}

@@ -396,6 +396,41 @@ impl StagedNormalization {
         output.commit()?;
         Ok(outcome)
     }
+
+    /// Convert this single-file stage into a generation member and its owned
+    /// measurements without publishing either one.
+    ///
+    /// The source snapshot and metadata policy are checked before ownership
+    /// moves into [`crate::generation::PreparedGenerationOutput`].  A caller
+    /// can therefore assemble a generation only from stages that still refer
+    /// to the exact inputs used during rendering.
+    pub fn into_generation_parts(
+        self,
+    ) -> Result<
+        (
+            crate::generation::PreparedGenerationOutput,
+            NormalizationOutcome,
+        ),
+        String,
+    > {
+        let Self {
+            output,
+            outcome,
+            protected_inputs,
+            metadata_report,
+        } = self;
+        if let Some(report) = &metadata_report {
+            report
+                .require_publication()
+                .map_err(|error| error.to_string())?;
+        }
+        verify_stable_inputs(
+            &protected_inputs,
+            "input changed before generation preparation",
+        )?;
+        let prepared = crate::generation::PreparedGenerationOutput::from_atomic(output)?;
+        Ok((prepared, outcome))
+    }
 }
 
 /// A verified corrected render that has not yet replaced its destination.
@@ -445,6 +480,36 @@ impl StagedCorrectedNormalization {
         output.commit()?;
         Ok(outcome)
     }
+
+    /// Convert this corrected stage into a generation member and its owned
+    /// verification evidence without publishing the destination.
+    pub fn into_generation_parts(
+        self,
+    ) -> Result<
+        (
+            crate::generation::PreparedGenerationOutput,
+            CorrectedNormalization,
+        ),
+        String,
+    > {
+        let Self {
+            output,
+            outcome,
+            protected_inputs,
+            metadata_report,
+        } = self;
+        if let Some(report) = &metadata_report {
+            report
+                .require_publication()
+                .map_err(|error| error.to_string())?;
+        }
+        verify_stable_inputs(
+            &protected_inputs,
+            "input changed before corrected generation preparation",
+        )?;
+        let prepared = crate::generation::PreparedGenerationOutput::from_atomic(output)?;
+        Ok((prepared, outcome))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -457,6 +522,166 @@ pub struct CorrectedAlbumNormalization {
     pub actual_album_lufs: f64,
     /// Number of complete album encoding passes, including the initial pass.
     pub attempts: usize,
+}
+
+/// Measurements and optional audited render statistics for one album track.
+pub type AlbumTrackNormalizationOutcome = (Analysis, f32, Option<RenderStatistics>);
+
+/// Generation members and their caller-ordered album measurements.
+pub type PreparedAlbumGeneration = (
+    Vec<crate::generation::PreparedGenerationOutput>,
+    Vec<AlbumTrackNormalizationOutcome>,
+);
+
+/// A completely rendered album whose destinations have not been replaced.
+///
+/// Each output owns its sibling stage and destination preimage.  The captured
+/// source snapshots are retained until [`Self::commit`] or
+/// [`Self::into_generation_parts`] so a batch coordinator cannot accidentally
+/// publish bytes from inputs that changed after rendering.
+pub struct StagedAlbumNormalization {
+    outputs: Vec<AtomicOutput>,
+    outcomes: Vec<AlbumTrackNormalizationOutcome>,
+    protected_inputs: Vec<StableInput>,
+}
+
+impl StagedAlbumNormalization {
+    /// Per-track measurements captured while producing the staged album.
+    pub fn outcomes(&self) -> &[AlbumTrackNormalizationOutcome] {
+        &self.outcomes
+    }
+
+    /// Return one track's measurements by caller index.
+    pub fn outcome(&self, index: usize) -> Option<&AlbumTrackNormalizationOutcome> {
+        self.outcomes.get(index)
+    }
+
+    /// Number of staged album members.
+    pub fn len(&self) -> usize {
+        self.outputs.len()
+    }
+
+    /// Whether this staged album contains no members.
+    pub fn is_empty(&self) -> bool {
+        self.outputs.is_empty()
+    }
+
+    /// Path of one complete sibling file awaiting publication.
+    pub fn staged_path(&self, index: usize) -> Option<&Path> {
+        self.outputs.get(index).map(AtomicOutput::path)
+    }
+
+    /// Revalidate every source snapshot, then publish all members in caller
+    /// order.  No destination is touched when any source has changed.
+    pub fn commit(self) -> Result<Vec<AlbumTrackNormalizationOutcome>, String> {
+        let Self {
+            outputs,
+            outcomes,
+            protected_inputs,
+        } = self;
+        verify_stable_inputs(
+            &protected_inputs,
+            "album input changed before output publication",
+        )?;
+        for output in outputs {
+            output.commit()?;
+        }
+        Ok(outcomes)
+    }
+
+    /// Transfer every staged output to a generation coordinator together with
+    /// the owned per-track measurements, without publishing destinations.
+    pub fn into_generation_parts(self) -> Result<PreparedAlbumGeneration, String> {
+        let Self {
+            outputs,
+            outcomes,
+            protected_inputs,
+        } = self;
+        verify_stable_inputs(
+            &protected_inputs,
+            "album input changed before generation preparation",
+        )?;
+        let prepared = outputs
+            .into_iter()
+            .map(crate::generation::PreparedGenerationOutput::from_atomic)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((prepared, outcomes))
+    }
+}
+
+/// A corrected, fully verified album whose destinations have not been
+/// replaced.
+pub struct StagedCorrectedAlbumNormalization {
+    outputs: Vec<AtomicOutput>,
+    outcome: CorrectedAlbumNormalization,
+    protected_inputs: Vec<StableInput>,
+}
+
+impl StagedCorrectedAlbumNormalization {
+    /// Corrected album measurements captured for the staged render.
+    pub fn outcome(&self) -> &CorrectedAlbumNormalization {
+        &self.outcome
+    }
+
+    /// Number of staged album members.
+    pub fn len(&self) -> usize {
+        self.outputs.len()
+    }
+
+    /// Whether this staged album contains no members.
+    pub fn is_empty(&self) -> bool {
+        self.outputs.is_empty()
+    }
+
+    /// Path of one complete, verified sibling file awaiting publication.
+    pub fn staged_path(&self, index: usize) -> Option<&Path> {
+        self.outputs.get(index).map(AtomicOutput::path)
+    }
+
+    /// Revalidate every source snapshot, then publish all corrected members in
+    /// caller order.
+    pub fn commit(self) -> Result<CorrectedAlbumNormalization, String> {
+        let Self {
+            outputs,
+            outcome,
+            protected_inputs,
+        } = self;
+        verify_stable_inputs(
+            &protected_inputs,
+            "album input changed before corrected output publication",
+        )?;
+        for output in outputs {
+            output.commit()?;
+        }
+        Ok(outcome)
+    }
+
+    /// Transfer every corrected stage to a generation coordinator together
+    /// with its owned album verification evidence.
+    pub fn into_generation_parts(
+        self,
+    ) -> Result<
+        (
+            Vec<crate::generation::PreparedGenerationOutput>,
+            CorrectedAlbumNormalization,
+        ),
+        String,
+    > {
+        let Self {
+            outputs,
+            outcome,
+            protected_inputs,
+        } = self;
+        verify_stable_inputs(
+            &protected_inputs,
+            "album input changed before corrected generation preparation",
+        )?;
+        let prepared = outputs
+            .into_iter()
+            .map(crate::generation::PreparedGenerationOutput::from_atomic)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((prepared, outcome))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2886,21 +3111,48 @@ pub fn normalize_one_audited_with_roles_and_policy<P: AsRef<Path>>(
     channel_roles: Option<&[ChannelRole]>,
     output_policy: OutputConflictPolicy,
 ) -> Result<(Analysis, f32, RenderStatistics), String> {
-    let (analysis, gain, render) = normalize_one_with_roles_impl(
+    let outcome = normalize_one_audited_staged_with_roles_and_policy(
         input,
         output,
+        plan,
+        format,
+        channel_roles,
+        output_policy,
+    )?
+    .commit()?;
+    Ok((
+        outcome.source,
+        outcome.gain,
+        outcome
+            .render
+            .expect("audited normalization captures render statistics"),
+    ))
+}
+
+/// Stage an audited normalization without publishing its destination.
+///
+/// This is the generation-safe counterpart of
+/// [`normalize_one_audited_with_roles_and_policy`]. The returned value keeps
+/// the exact render statistics and destination preimage until its caller
+/// chooses a single-file or generation-level commit.
+pub fn normalize_one_audited_staged_with_roles_and_policy<P: AsRef<Path>>(
+    input: P,
+    output: P,
+    plan: &Plan,
+    format: OutputFormat,
+    channel_roles: Option<&[ChannelRole]>,
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedNormalization, String> {
+    normalize_one_staged_with_roles_impl(
+        input.as_ref(),
+        output.as_ref(),
         plan,
         format,
         channel_roles,
         None,
         true,
         output_policy,
-    )?;
-    Ok((
-        analysis,
-        gain,
-        render.expect("audited normalization captures render statistics"),
-    ))
+    )
 }
 
 /// Audited normalization using an unbound compatibility analysis.
@@ -3044,11 +3296,39 @@ pub fn normalize_one_bound_audited_with_policy(
     analysis: &BoundAnalysis,
     output_policy: OutputConflictPolicy,
 ) -> Result<(Analysis, f32, RenderStatistics), BoundAnalysisError> {
+    let outcome = normalize_one_bound_audited_staged_with_policy(
+        input,
+        output,
+        plan,
+        format,
+        analysis,
+        output_policy,
+    )?
+    .commit()
+    .map_err(BoundAnalysisError::render_failed)?;
+    Ok((
+        outcome.source,
+        outcome.gain,
+        outcome
+            .render
+            .expect("audited bound normalization captures render statistics"),
+    ))
+}
+
+/// Stage an audited bound render without publishing its destination.
+pub fn normalize_one_bound_audited_staged_with_policy(
+    input: &StableInput,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    analysis: &BoundAnalysis,
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedNormalization, BoundAnalysisError> {
     plan.validate_for_format(format)
         .map_err(BoundAnalysisError::invalid_request)?;
     analysis.validate_for_plan(input, plan)?;
     let channel_roles = analysis.explicit_roles();
-    let outcome = normalize_one_staged_stable_impl(
+    normalize_one_staged_stable_impl(
         input,
         output,
         plan,
@@ -3059,16 +3339,7 @@ pub fn normalize_one_bound_audited_with_policy(
         output_policy,
         None,
     )
-    .map_err(BoundAnalysisError::render_failed)?
-    .commit()
-    .map_err(BoundAnalysisError::render_failed)?;
-    Ok((
-        outcome.source,
-        outcome.gain,
-        outcome
-            .render
-            .expect("audited bound normalization captures render statistics"),
-    ))
+    .map_err(BoundAnalysisError::render_failed)
 }
 
 /// Prepare the descriptor's output-domain analysis and retain decoded PCM
@@ -3135,6 +3406,36 @@ pub fn normalize_one_descriptor_staged_with_policy(
         &analysis,
         prepared.spool,
         false,
+        None,
+        output_policy,
+    )
+}
+
+/// Analyze and stage one audited descriptor-bound programme.
+///
+/// Unlike the immediate audited entry point, this preserves the private
+/// output for a generation coordinator while still capturing pre-codec render
+/// statistics.
+pub fn normalize_one_descriptor_audited_staged_with_policy(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedNormalization, BoundAnalysisError> {
+    plan.validate_for_format(format)
+        .map_err(BoundAnalysisError::invalid_request)?;
+    let prepared = prepare_descriptor_analysis_for_render(descriptor, plan)
+        .map_err(BoundAnalysisError::analysis_failed)?;
+    let analysis = BoundAnalysis::for_descriptor(descriptor, prepared.analysis, plan)?;
+    normalize_one_descriptor_bound_staged_impl(
+        descriptor,
+        output,
+        plan,
+        format,
+        &analysis,
+        prepared.spool,
+        true,
         None,
         output_policy,
     )
@@ -3425,15 +3726,12 @@ pub fn normalize_one_descriptor_bound_audited_with_policy(
     analysis: &BoundAnalysis,
     output_policy: OutputConflictPolicy,
 ) -> Result<(Analysis, f32, RenderStatistics), BoundAnalysisError> {
-    let outcome = normalize_one_descriptor_bound_staged_impl(
+    let outcome = normalize_one_descriptor_bound_audited_staged_with_policy(
         descriptor,
         output,
         plan,
         format,
         analysis,
-        None,
-        true,
-        None,
         output_policy,
     )?
     .commit()
@@ -3445,6 +3743,28 @@ pub fn normalize_one_descriptor_bound_audited_with_policy(
             .render
             .expect("audited descriptor render captures statistics"),
     ))
+}
+
+/// Stage an audited descriptor-bound render without publishing it.
+pub fn normalize_one_descriptor_bound_audited_staged_with_policy(
+    descriptor: &InputDescriptor,
+    output: &Path,
+    plan: &Plan,
+    format: OutputFormat,
+    analysis: &BoundAnalysis,
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedNormalization, BoundAnalysisError> {
+    normalize_one_descriptor_bound_staged_impl(
+        descriptor,
+        output,
+        plan,
+        format,
+        analysis,
+        None,
+        true,
+        None,
+        output_policy,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4728,7 +5048,62 @@ pub fn normalize_album_with_roles_and_policy(
     channel_roles: Option<&[ChannelRole]>,
     output_policy: OutputConflictPolicy,
 ) -> Result<Vec<(Analysis, f32)>, String> {
-    Ok(normalize_album_with_roles_impl(
+    Ok(normalize_album_staged_with_roles_and_policy(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        channel_roles,
+        output_policy,
+    )?
+    .commit()?
+    .into_iter()
+    .map(|(analysis, gain, _)| (analysis, gain))
+    .collect())
+}
+
+/// Render an album and finalize every output without replacing destinations.
+///
+/// The returned value owns all sibling stages until it is committed, moved to
+/// a generation, or dropped.  Dropping it leaves existing destinations
+/// untouched.
+pub fn normalize_album_staged(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+) -> Result<StagedAlbumNormalization, String> {
+    normalize_album_staged_with_roles(inputs, outputs, plan, formats, None)
+}
+
+/// Stage an album with an optional source channel-role override.
+pub fn normalize_album_staged_with_roles(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    channel_roles: Option<&[ChannelRole]>,
+) -> Result<StagedAlbumNormalization, String> {
+    normalize_album_staged_with_roles_and_policy(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        channel_roles,
+        OutputConflictPolicy::ReplaceUnchanged,
+    )
+}
+
+/// Stage an album with an explicit output conflict policy.
+pub fn normalize_album_staged_with_roles_and_policy(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    channel_roles: Option<&[ChannelRole]>,
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedAlbumNormalization, String> {
+    normalize_album_with_roles_impl(
         inputs,
         outputs,
         plan,
@@ -4737,10 +5112,7 @@ pub fn normalize_album_with_roles_and_policy(
         None,
         false,
         output_policy,
-    )?
-    .into_iter()
-    .map(|(analysis, gain, _)| (analysis, gain))
-    .collect())
+    )
 }
 
 /// Album normalization using unbound compatibility analyses.
@@ -4754,7 +5126,30 @@ pub fn normalize_album_preanalyzed_with_roles(
     channel_roles: Option<&[ChannelRole]>,
     analyses: &[Analysis],
 ) -> Result<Vec<(Analysis, f32)>, String> {
-    Ok(normalize_album_with_roles_impl(
+    Ok(normalize_album_preanalyzed_staged_with_roles(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        channel_roles,
+        analyses,
+    )?
+    .commit()?
+    .into_iter()
+    .map(|(analysis, gain, _)| (analysis, gain))
+    .collect())
+}
+
+/// Stage an album using unbound compatibility analyses.
+pub fn normalize_album_preanalyzed_staged_with_roles(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    channel_roles: Option<&[ChannelRole]>,
+    analyses: &[Analysis],
+) -> Result<StagedAlbumNormalization, String> {
+    normalize_album_with_roles_impl(
         inputs,
         outputs,
         plan,
@@ -4763,10 +5158,7 @@ pub fn normalize_album_preanalyzed_with_roles(
         Some(analyses),
         false,
         OutputConflictPolicy::ReplaceUnchanged,
-    )?
-    .into_iter()
-    .map(|(analysis, gain, _)| (analysis, gain))
-    .collect())
+    )
 }
 
 pub fn normalize_album_audited_with_roles(
@@ -4795,16 +5187,15 @@ pub fn normalize_album_audited_with_roles_and_policy(
     channel_roles: Option<&[ChannelRole]>,
     output_policy: OutputConflictPolicy,
 ) -> Result<Vec<(Analysis, f32, RenderStatistics)>, String> {
-    Ok(normalize_album_with_roles_impl(
+    Ok(normalize_album_audited_staged_with_roles_and_policy(
         inputs,
         outputs,
         plan,
         formats,
         channel_roles,
-        None,
-        true,
         output_policy,
     )?
+    .commit()?
     .into_iter()
     .map(|(analysis, gain, render)| {
         (
@@ -4816,6 +5207,45 @@ pub fn normalize_album_audited_with_roles_and_policy(
     .collect())
 }
 
+/// Stage an audited album without publishing its destinations.
+pub fn normalize_album_audited_staged_with_roles(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    channel_roles: Option<&[ChannelRole]>,
+) -> Result<StagedAlbumNormalization, String> {
+    normalize_album_audited_staged_with_roles_and_policy(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        channel_roles,
+        OutputConflictPolicy::ReplaceUnchanged,
+    )
+}
+
+/// Stage an audited album with an explicit output conflict policy.
+pub fn normalize_album_audited_staged_with_roles_and_policy(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    channel_roles: Option<&[ChannelRole]>,
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedAlbumNormalization, String> {
+    normalize_album_with_roles_impl(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        channel_roles,
+        None,
+        true,
+        output_policy,
+    )
+}
+
 /// Audited album normalization using unbound compatibility analyses.
 pub fn normalize_album_preanalyzed_audited_with_roles(
     inputs: &[PathBuf],
@@ -4825,16 +5255,15 @@ pub fn normalize_album_preanalyzed_audited_with_roles(
     channel_roles: Option<&[ChannelRole]>,
     analyses: &[Analysis],
 ) -> Result<Vec<(Analysis, f32, RenderStatistics)>, String> {
-    Ok(normalize_album_with_roles_impl(
+    Ok(normalize_album_preanalyzed_audited_staged_with_roles(
         inputs,
         outputs,
         plan,
         formats,
         channel_roles,
-        Some(analyses),
-        true,
-        OutputConflictPolicy::ReplaceUnchanged,
+        analyses,
     )?
+    .commit()?
     .into_iter()
     .map(|(analysis, gain, render)| {
         (
@@ -4844,6 +5273,27 @@ pub fn normalize_album_preanalyzed_audited_with_roles(
         )
     })
     .collect())
+}
+
+/// Stage an audited album using unbound compatibility analyses.
+pub fn normalize_album_preanalyzed_audited_staged_with_roles(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    channel_roles: Option<&[ChannelRole]>,
+    analyses: &[Analysis],
+) -> Result<StagedAlbumNormalization, String> {
+    normalize_album_with_roles_impl(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        channel_roles,
+        Some(analyses),
+        true,
+        OutputConflictPolicy::ReplaceUnchanged,
+    )
 }
 
 /// Normalize an album from immutable inputs and content-bound analyses.
@@ -4877,6 +5327,52 @@ pub fn normalize_album_bound_with_policy(
     analyses: &[BoundAnalysis],
     output_policy: OutputConflictPolicy,
 ) -> Result<Vec<(Analysis, f32)>, BoundAnalysisError> {
+    let staged = normalize_album_bound_staged_with_policy(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        analyses,
+        output_policy,
+    )?;
+    staged
+        .commit()
+        .map(|outcomes| {
+            outcomes
+                .into_iter()
+                .map(|(analysis, gain, _)| (analysis, gain))
+                .collect()
+        })
+        .map_err(BoundAnalysisError::render_failed)
+}
+
+/// Render a bound album without publishing any destination.
+pub fn normalize_album_bound_staged(
+    inputs: &[StableInput],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    analyses: &[BoundAnalysis],
+) -> Result<StagedAlbumNormalization, BoundAnalysisError> {
+    normalize_album_bound_staged_with_policy(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        analyses,
+        OutputConflictPolicy::ReplaceUnchanged,
+    )
+}
+
+/// Stage a bound album with an explicit output conflict policy.
+pub fn normalize_album_bound_staged_with_policy(
+    inputs: &[StableInput],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    analyses: &[BoundAnalysis],
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedAlbumNormalization, BoundAnalysisError> {
     let channel_roles = validate_bound_album_request(inputs, outputs, plan, formats, analyses)?;
     normalize_album_stable_impl(
         inputs,
@@ -4889,12 +5385,6 @@ pub fn normalize_album_bound_with_policy(
         false,
         output_policy,
     )
-    .map(|results| {
-        results
-            .into_iter()
-            .map(|(analysis, gain, _)| (analysis, gain))
-            .collect()
-    })
     .map_err(BoundAnalysisError::render_failed)
 }
 
@@ -4925,6 +5415,58 @@ pub fn normalize_album_bound_audited_with_policy(
     analyses: &[BoundAnalysis],
     output_policy: OutputConflictPolicy,
 ) -> Result<Vec<(Analysis, f32, RenderStatistics)>, BoundAnalysisError> {
+    let staged = normalize_album_bound_audited_staged_with_policy(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        analyses,
+        output_policy,
+    )?;
+    staged
+        .commit()
+        .map(|outcomes| {
+            outcomes
+                .into_iter()
+                .map(|(analysis, gain, render)| {
+                    (
+                        analysis,
+                        gain,
+                        render.expect("audited bound album normalization captures statistics"),
+                    )
+                })
+                .collect()
+        })
+        .map_err(BoundAnalysisError::render_failed)
+}
+
+/// Stage a bound album with pre-codec render statistics.
+pub fn normalize_album_bound_audited_staged(
+    inputs: &[StableInput],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    analyses: &[BoundAnalysis],
+) -> Result<StagedAlbumNormalization, BoundAnalysisError> {
+    normalize_album_bound_audited_staged_with_policy(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        analyses,
+        OutputConflictPolicy::ReplaceUnchanged,
+    )
+}
+
+/// Stage an audited bound album with an explicit output conflict policy.
+pub fn normalize_album_bound_audited_staged_with_policy(
+    inputs: &[StableInput],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    analyses: &[BoundAnalysis],
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedAlbumNormalization, BoundAnalysisError> {
     let channel_roles = validate_bound_album_request(inputs, outputs, plan, formats, analyses)?;
     normalize_album_stable_impl(
         inputs,
@@ -4937,18 +5479,6 @@ pub fn normalize_album_bound_audited_with_policy(
         true,
         output_policy,
     )
-    .map(|results| {
-        results
-            .into_iter()
-            .map(|(analysis, gain, render)| {
-                (
-                    analysis,
-                    gain,
-                    render.expect("audited bound album normalization captures statistics"),
-                )
-            })
-            .collect()
-    })
     .map_err(BoundAnalysisError::render_failed)
 }
 
@@ -5005,7 +5535,7 @@ fn normalize_album_with_roles_impl(
     preanalyzed: Option<&[Analysis]>,
     capture_statistics: bool,
     output_policy: OutputConflictPolicy,
-) -> Result<Vec<(Analysis, f32, Option<RenderStatistics>)>, String> {
+) -> Result<StagedAlbumNormalization, String> {
     if inputs.is_empty() {
         return Err("cannot normalize an empty album".into());
     }
@@ -5051,7 +5581,7 @@ fn normalize_album_stable_impl(
     bound_analyses: Option<&[BoundAnalysis]>,
     capture_statistics: bool,
     output_policy: OutputConflictPolicy,
-) -> Result<Vec<(Analysis, f32, Option<RenderStatistics>)>, String> {
+) -> Result<StagedAlbumNormalization, String> {
     if captured.is_empty() {
         return Err("cannot normalize an empty album".into());
     }
@@ -5212,16 +5742,17 @@ fn normalize_album_stable_impl(
         })
         .collect::<Vec<_>>();
     finalized.into_iter().collect::<Result<Vec<_>, _>>()?;
-    let results = analyses
+    let outcomes = analyses
         .into_iter()
         .zip(statistics)
-        .map(|(analysis, statistics)| (analysis, gain, statistics))
+        .map(|(analysis, render)| (analysis, gain, render))
         .collect();
     verify_stable_inputs(captured, "album input changed before output publication")?;
-    for output in staged {
-        output.commit()?;
-    }
-    Ok(results)
+    Ok(StagedAlbumNormalization {
+        outputs: staged,
+        outcomes,
+        protected_inputs: captured.to_vec(),
+    })
 }
 
 /// Album normalization with a shared gain and iterative post-encode
@@ -5279,6 +5810,75 @@ pub fn normalize_album_corrected_with_roles_and_policy(
     channel_roles: Option<&[ChannelRole]>,
     output_policy: OutputConflictPolicy,
 ) -> Result<CorrectedAlbumNormalization, String> {
+    normalize_album_corrected_staged_with_roles_and_policy(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        tolerance,
+        max_retries,
+        channel_roles,
+        output_policy,
+    )?
+    .commit()
+}
+
+/// Render, correct, and verify an album without replacing its destinations.
+pub fn normalize_album_corrected_staged(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    tolerance: f64,
+    max_retries: usize,
+) -> Result<StagedCorrectedAlbumNormalization, String> {
+    normalize_album_corrected_staged_with_roles(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        tolerance,
+        max_retries,
+        None,
+    )
+}
+
+/// Stage and verify a corrected album with an optional source channel-role
+/// override.
+#[allow(clippy::too_many_arguments)]
+pub fn normalize_album_corrected_staged_with_roles(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    tolerance: f64,
+    max_retries: usize,
+    channel_roles: Option<&[ChannelRole]>,
+) -> Result<StagedCorrectedAlbumNormalization, String> {
+    normalize_album_corrected_staged_with_roles_and_policy(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        tolerance,
+        max_retries,
+        channel_roles,
+        OutputConflictPolicy::ReplaceUnchanged,
+    )
+}
+
+/// Stage and verify a corrected album with an explicit output conflict policy.
+#[allow(clippy::too_many_arguments)]
+pub fn normalize_album_corrected_staged_with_roles_and_policy(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    tolerance: f64,
+    max_retries: usize,
+    channel_roles: Option<&[ChannelRole]>,
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedCorrectedAlbumNormalization, String> {
     normalize_album_corrected_with_optional_analyses(
         inputs,
         outputs,
@@ -5304,6 +5904,31 @@ pub fn normalize_album_preanalyzed_corrected_with_roles(
     channel_roles: Option<&[ChannelRole]>,
     analyses: &[Analysis],
 ) -> Result<CorrectedAlbumNormalization, String> {
+    normalize_album_preanalyzed_corrected_staged_with_roles(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        tolerance,
+        max_retries,
+        channel_roles,
+        analyses,
+    )?
+    .commit()
+}
+
+/// Stage a corrected album using unbound compatibility analyses.
+#[allow(clippy::too_many_arguments)]
+pub fn normalize_album_preanalyzed_corrected_staged_with_roles(
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    tolerance: f64,
+    max_retries: usize,
+    channel_roles: Option<&[ChannelRole]>,
+    analyses: &[Analysis],
+) -> Result<StagedCorrectedAlbumNormalization, String> {
     normalize_album_corrected_with_optional_analyses(
         inputs,
         outputs,
@@ -5352,6 +5977,56 @@ pub fn normalize_album_bound_corrected_with_policy(
     analyses: &[BoundAnalysis],
     output_policy: OutputConflictPolicy,
 ) -> Result<CorrectedAlbumNormalization, BoundAnalysisError> {
+    normalize_album_bound_corrected_staged_with_policy(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        tolerance,
+        max_retries,
+        analyses,
+        output_policy,
+    )?
+    .commit()
+    .map_err(BoundAnalysisError::render_failed)
+}
+
+/// Correct and verify a bound album without publishing its destinations.
+#[allow(clippy::too_many_arguments)]
+pub fn normalize_album_bound_corrected_staged(
+    inputs: &[StableInput],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    tolerance: f64,
+    max_retries: usize,
+    analyses: &[BoundAnalysis],
+) -> Result<StagedCorrectedAlbumNormalization, BoundAnalysisError> {
+    normalize_album_bound_corrected_staged_with_policy(
+        inputs,
+        outputs,
+        plan,
+        formats,
+        tolerance,
+        max_retries,
+        analyses,
+        OutputConflictPolicy::ReplaceUnchanged,
+    )
+}
+
+/// Stage and verify a corrected bound album with an explicit output conflict
+/// policy.
+#[allow(clippy::too_many_arguments)]
+pub fn normalize_album_bound_corrected_staged_with_policy(
+    inputs: &[StableInput],
+    outputs: &[PathBuf],
+    plan: &Plan,
+    formats: &[OutputFormat],
+    tolerance: f64,
+    max_retries: usize,
+    analyses: &[BoundAnalysis],
+    output_policy: OutputConflictPolicy,
+) -> Result<StagedCorrectedAlbumNormalization, BoundAnalysisError> {
     let channel_roles = validate_bound_album_request(inputs, outputs, plan, formats, analyses)?;
     if !tolerance.is_finite() || tolerance < 0.0 {
         return Err(BoundAnalysisError::invalid_request(
@@ -5384,7 +6059,7 @@ fn normalize_album_corrected_with_optional_analyses(
     channel_roles: Option<&[ChannelRole]>,
     preanalyzed: Option<&[Analysis]>,
     output_policy: OutputConflictPolicy,
-) -> Result<CorrectedAlbumNormalization, String> {
+) -> Result<StagedCorrectedAlbumNormalization, String> {
     if inputs.is_empty() {
         return Err("cannot correct an empty album".into());
     }
@@ -5435,7 +6110,7 @@ fn normalize_album_corrected_stable_impl(
     preanalyzed: Option<&[Analysis]>,
     bound_analyses: Option<&[BoundAnalysis]>,
     output_policy: OutputConflictPolicy,
-) -> Result<CorrectedAlbumNormalization, String> {
+) -> Result<StagedCorrectedAlbumNormalization, String> {
     if captured.is_empty() {
         return Err("cannot correct an empty album".into());
     }
@@ -5649,17 +6324,18 @@ fn normalize_album_corrected_stable_impl(
                 captured,
                 "album input changed before corrected output publication",
             )?;
-            for output in staged {
-                output.commit()?;
-            }
-            return Ok(CorrectedAlbumNormalization {
-                sources,
-                gain,
-                verifications,
-                renders,
-                expected_album_lufs,
-                actual_album_lufs,
-                attempts: attempt + 1,
+            return Ok(StagedCorrectedAlbumNormalization {
+                outputs: staged,
+                outcome: CorrectedAlbumNormalization {
+                    sources,
+                    gain,
+                    verifications,
+                    renders,
+                    expected_album_lufs,
+                    actual_album_lufs,
+                    attempts: attempt + 1,
+                },
+                protected_inputs: captured.to_vec(),
             });
         }
         if attempt == max_retries {
@@ -8201,6 +8877,70 @@ mod tests {
         let outcome = staged.commit().unwrap();
         assert!(output.is_file());
         assert!(outcome.verification.passed());
+    }
+
+    #[test]
+    fn staged_album_keeps_all_destinations_unpublished_until_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.wav");
+        let second = directory.path().join("second.wav");
+        let first_output = directory.path().join("first-output.wav");
+        let second_output = directory.path().join("second-output.wav");
+        write_mono_tone(&first, 0.1);
+        write_mono_tone(&second, 0.15);
+
+        let staged = normalize_album_staged(
+            &[first, second],
+            &[first_output.clone(), second_output.clone()],
+            &plan(),
+            &[OutputFormat::Wav, OutputFormat::Wav],
+        )
+        .unwrap();
+        assert_eq!(staged.len(), 2);
+        assert_eq!(staged.outcomes().len(), 2);
+        assert!(staged.staged_path(0).is_some_and(Path::is_file));
+        assert!(staged.staged_path(1).is_some_and(Path::is_file));
+        assert!(!first_output.exists());
+        assert!(!second_output.exists());
+
+        let outcomes = staged.commit().unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(first_output.is_file());
+        assert!(second_output.is_file());
+    }
+
+    #[test]
+    fn corrected_staged_album_can_be_committed_after_verification() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.wav");
+        let second = directory.path().join("second.wav");
+        let first_output = directory.path().join("first-output.wav");
+        let second_output = directory.path().join("second-output.wav");
+        write_mono_tone(&first, 0.1);
+        write_mono_tone(&second, 0.15);
+
+        let staged = normalize_album_corrected_staged(
+            &[first, second],
+            &[first_output.clone(), second_output.clone()],
+            &plan(),
+            &[OutputFormat::Wav, OutputFormat::Wav],
+            0.01,
+            2,
+        )
+        .unwrap();
+        assert_eq!(staged.len(), 2);
+        assert!(staged
+            .outcome()
+            .verifications
+            .iter()
+            .all(Verification::passed));
+        assert!(!first_output.exists());
+        assert!(!second_output.exists());
+
+        let outcome = staged.commit().unwrap();
+        assert!(outcome.verifications.iter().all(Verification::passed));
+        assert!(first_output.is_file());
+        assert!(second_output.is_file());
     }
 
     #[test]

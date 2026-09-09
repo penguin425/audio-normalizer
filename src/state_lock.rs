@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 
@@ -19,6 +19,49 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 pub(crate) struct StateFileLock {
     #[allow(dead_code)]
     file: File,
+}
+
+pub(crate) enum StateFileLockProbe {
+    Missing,
+    Available(StateFileLock),
+    Active,
+}
+
+fn reject_state_hardlink_alias(
+    file: &File,
+    metadata: &std::fs::Metadata,
+    path: &Path,
+    description: &str,
+) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let _ = file;
+        if metadata.nlink() > 1 {
+            return Err(format!(
+                "refuse hard-link-aliased {description} {}",
+                path.display()
+            ));
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = metadata;
+        if crate::stable_input::windows_file_link_count(file).map_err(|error| {
+            format!(
+                "inspect {description} link count {}: {error}",
+                path.display()
+            )
+        })? > 1
+        {
+            return Err(format!(
+                "refuse hard-link-aliased {description} {}",
+                path.display()
+            ));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = (file, metadata, path, description);
+    Ok(())
 }
 
 impl Drop for StateFileLock {
@@ -80,6 +123,64 @@ impl StateFileLock {
         })?;
         Ok(Self { file })
     }
+
+    /// Probe an already-existing persistent lock without creating either the
+    /// lock or its parent. The acquired variant holds the advisory lock until
+    /// it is dropped, allowing a read-only recovery assessment to inspect a
+    /// stable journal/filesystem snapshot.
+    pub(crate) fn probe_existing(
+        state_path: &Path,
+        description: &str,
+    ) -> Result<StateFileLockProbe, String> {
+        let lock_path = sibling_lock_path(state_path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(unix)]
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        #[cfg(windows)]
+        options.custom_flags(0x0020_0000);
+        let file = match options.open(&lock_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(StateFileLockProbe::Missing)
+            }
+            Err(error) => {
+                return Err(format!(
+                    "open {description} lock {} without creating it: {error}",
+                    lock_path.display()
+                ))
+            }
+        };
+        let metadata = file.metadata().map_err(|error| {
+            format!(
+                "inspect {description} lock {}: {error}",
+                lock_path.display()
+            )
+        })?;
+        #[cfg(windows)]
+        if metadata.file_attributes() & 0x0000_0400 != 0 {
+            return Err(format!(
+                "refuse reparse-point {description} lock {}",
+                lock_path.display()
+            ));
+        }
+        if !metadata.is_file() {
+            return Err(format!(
+                "refuse non-regular {description} lock {}",
+                lock_path.display()
+            ));
+        }
+        match file.try_lock() {
+            Ok(()) => Ok(StateFileLockProbe::Available(Self { file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(StateFileLockProbe::Active),
+            Err(std::fs::TryLockError::Error(error)) => Err(format!(
+                "probe {description} lock {}: {error}",
+                lock_path.display()
+            )),
+        }
+    }
 }
 
 pub(crate) fn read_regular_state_file(
@@ -126,9 +227,11 @@ pub(crate) fn read_regular_state_file(
             path.display()
         ));
     }
+    reject_state_hardlink_alias(&file, &metadata, path, description)?;
 
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(max_bytes.saturating_add(1))
+    let mut reader = (&file).take(max_bytes.saturating_add(1));
+    reader
         .read_to_end(&mut bytes)
         .map_err(|error| format!("read {description} {}: {error}", path.display()))?;
     if bytes.len() as u64 > max_bytes {
@@ -137,10 +240,20 @@ pub(crate) fn read_regular_state_file(
             path.display()
         ));
     }
+    let after = file
+        .metadata()
+        .map_err(|error| format!("reinspect opened {description} {}: {error}", path.display()))?;
+    reject_state_hardlink_alias(&file, &after, path, description)?;
+    if after.len() != metadata.len() {
+        return Err(format!(
+            "{description} changed length while it was read: {}",
+            path.display()
+        ));
+    }
     Ok(Some(bytes))
 }
 
-fn sibling_lock_path(state_path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn sibling_lock_path(state_path: &Path) -> Result<PathBuf, String> {
     let name = state_path.file_name().ok_or_else(|| {
         format!(
             "state path has no final component for locking: {}",
@@ -206,6 +319,19 @@ mod tests {
         std::fs::write(&target, b"state").unwrap();
         symlink(&target, &state).unwrap();
         assert!(read_regular_state_file(&state, "test state", 1024).is_err());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn state_reads_reject_hard_link_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("job.json");
+        let alias = directory.path().join("job-alias.json");
+        std::fs::write(&state, b"state").unwrap();
+        std::fs::hard_link(&state, &alias).unwrap();
+
+        let error = read_regular_state_file(&state, "test state", 1024).unwrap_err();
+        assert!(error.contains("hard-link"), "{error}");
     }
 
     #[cfg(unix)]

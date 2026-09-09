@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/batch-failure-report-v1",
+  "title": "Forge batch failure report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generator",
+    "job_id",
+    "semantic_fingerprint",
+    "fingerprint_revision",
+    "failure_policy",
+    "total",
+    "succeeded",
+    "skipped",
+    "failed",
+    "failures",
+    "truncated",
+    "dropped_count"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/batch-failure-report-v1"
+    },
+    "generator": {
+      "type": "string",
+      "maxLength": 256,
+      "pattern": "^forge-normalizer/[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "job_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "semantic_fingerprint": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "fingerprint_revision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "failure_policy": {
+      "enum": ["fail_fast", "keep_going"]
+    },
+    "total": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100000
+    },
+    "succeeded": {"type": "integer", "minimum": 0, "maximum": 100000},
+    "skipped": {"type": "integer", "minimum": 0, "maximum": 100000},
+    "failed": {"type": "integer", "minimum": 0, "maximum": 100000},
+    "failures": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["index", "input", "output", "error"],
+        "properties": {
+          "index": {"type": "integer", "minimum": 0, "maximum": 99999},
+          "input": {"type": "string", "minLength": 1, "maxLength": 4096},
+          "output": {"type": "string", "minLength": 1, "maxLength": 4096},
+          "error": {"type": "string", "minLength": 1, "maxLength": 16384}
+        }
+      }
+    },
+    "truncated": {"type": "boolean"},
+    "dropped_count": {"type": "integer", "minimum": 0, "maximum": 100000}
+  }
+}

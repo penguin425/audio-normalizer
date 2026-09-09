@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/generation-job-v1",
+  "title": "Forge generation publication job v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generator",
+    "generation_id",
+    "revision",
+    "phase",
+    "semantic_fingerprint",
+    "member_count",
+    "members"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/generation-job-v1"
+    },
+    "generator": {
+      "type": "string",
+      "maxLength": 256,
+      "pattern": "^forge-normalizer/[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "generation_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "phase": {
+      "enum": ["ready", "publishing", "committed", "rolled_back"]
+    },
+    "semantic_fingerprint": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^(?!.*[\\u0000-\\u001F\\u007F-\\u009F]).+$"
+    },
+    "member_count": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100000
+    },
+    "members": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100000,
+      "items": {"$ref": "#/$defs/member"}
+    }
+  },
+  "$defs": {
+    "fileEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "identity", "byte_len", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "identity": {"type": "string", "minLength": 1, "maxLength": 256},
+        "byte_len": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "destinationPreimage": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {"kind": {"const": "missing"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "identity", "byte_len", "sha256"],
+          "properties": {
+            "kind": {"const": "present"},
+            "identity": {"type": "string", "minLength": 1, "maxLength": 256},
+            "byte_len": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        }
+      ]
+    },
+    "member": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "destination",
+        "destination_preimage",
+        "stage",
+        "backup_path",
+        "publication"
+      ],
+      "properties": {
+        "destination": {"type": "string", "minLength": 1},
+        "destination_preimage": {"$ref": "#/$defs/destinationPreimage"},
+        "stage": {"$ref": "#/$defs/fileEvidence"},
+        "backup_path": {"type": "string", "minLength": 1},
+        "backup": {
+          "anyOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/fileEvidence"}
+          ]
+        },
+        "publication": {
+          "enum": ["prepared", "backed_up", "published", "restored", "abandoned"]
+        }
+      }
+    }
+  }
+}

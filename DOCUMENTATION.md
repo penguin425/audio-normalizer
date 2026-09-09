@@ -11,7 +11,7 @@ forge-container-qc --help
 
 ## Core workflows
 
-- [Resumable batch jobs](BATCH-JOBS.md)
+- [Resumable batch and album generations](BATCH-JOBS.md)
 - [Watch folders](WATCH-FOLDERS.md)
 - [Content-addressed analysis cache](ANALYSIS-CACHE.md)
 - [SQLite catalogue](CATALOGUE.md)
@@ -33,11 +33,21 @@ can restart one file transaction from its verified stage and publish with a
 compare-and-swap check. Its state and source-parent directories are a trusted
 boundary rather than a cryptographically authenticated adversarial store; the
 historical `--write-tags` path without a job state remains sequential.
-Generation-level all-or-nothing album/batch publication is deferred to
-v0.189.15. The machine-readable contracts are
+Multi-file `--job-state` now uses `batch-job-v3`, a semantic runtime context
+and job ID, and the sibling `<job-state>.generation.json` journal to stage and
+publish all audio outputs as one recoverable generation. See
+[BATCH-JOBS.md](BATCH-JOBS.md) for album, verification, bounded
+`--keep-going`, progress v2, and recovery commands. Dry runs remain
+side-effect-free apart from explicit cache warming. The machine-readable contracts are
 [`metadata-fidelity-report-v1`](schema/metadata-fidelity-report-v1.schema.json),
 [`metadata-inventory-v1`](schema/metadata-inventory-v1.schema.json), and
-[`metadata-job-v1`](schema/metadata-job-v1.schema.json).
+[`metadata-job-v1`](schema/metadata-job-v1.schema.json), together with
+[`batch-job-v3`](schema/batch-job-v3.schema.json),
+[`batch-progress-v2`](schema/batch-progress-v2.schema.json),
+[`batch-failure-report-v1`](schema/batch-failure-report-v1.schema.json),
+[`generation-job-v1`](schema/generation-job-v1.schema.json),
+[`generation-recovery-report-v1`](schema/generation-recovery-report-v1.schema.json),
+and [`normalization-semantic-context-v1`](schema/normalization-semantic-context-v1.schema.json).
 
 ## Quality control and codec adapters
 

@@ -63,6 +63,27 @@ impl FfmpegCodec {
     }
 }
 
+/// Stable runtime evidence for one FFmpeg-backed output.
+///
+/// The identity is copied from the process-wide preflight entry rather than
+/// resolving `ffmpeg` a second time.  In particular, the path, length, and
+/// digest below identify the exact image that the encoder launch will use.
+#[derive(Debug, Clone)]
+pub struct FfmpegRuntimeEvidence {
+    /// Canonical path captured by the preflight.
+    pub executable_path: std::path::PathBuf,
+    /// Byte length of the exact executable image captured by the preflight.
+    pub executable_byte_len: u64,
+    /// Lower-case SHA-256 of the exact executable image captured by preflight.
+    pub executable_sha256: String,
+    /// Exact FFmpeg encoder name required by the writer.
+    pub encoder: &'static str,
+    /// Exact FFmpeg muxer name required by the writer.
+    pub muxer: &'static str,
+    /// Whether the exact encoder and muxer capability checks succeeded.
+    pub capability_success: bool,
+}
+
 #[derive(Clone)]
 struct FfmpegPreflight {
     identity: ExecutableIdentity,
@@ -77,6 +98,26 @@ static VORBIS_PREFLIGHT: OnceLock<Result<FfmpegPreflight, String>> = OnceLock::n
 /// Results are cached per process after the first successful or failed probe.
 pub fn preflight_ffmpeg(codec: FfmpegCodec) -> Result<(), String> {
     cached_ffmpeg_preflight(codec)?.result
+}
+
+/// Return the cached identity and exact capability names for one FFmpeg
+/// writer.  This deliberately goes through the internal
+/// `cached_ffmpeg_preflight` cache, so a
+/// caller collecting semantic job evidence does not resolve or probe a
+/// second FFmpeg executable.
+pub fn ffmpeg_runtime_evidence(codec: FfmpegCodec) -> Result<FfmpegRuntimeEvidence, String> {
+    let preflight = cached_ffmpeg_preflight(codec)?;
+    if let Err(error) = &preflight.result {
+        return Err(error.clone());
+    }
+    Ok(FfmpegRuntimeEvidence {
+        executable_path: preflight.identity.path().to_owned(),
+        executable_byte_len: preflight.identity.byte_len(),
+        executable_sha256: preflight.identity.sha256_hex(),
+        encoder: codec.encoder(),
+        muxer: codec.muxer(),
+        capability_success: true,
+    })
 }
 
 fn cached_ffmpeg_preflight(codec: FfmpegCodec) -> Result<FfmpegPreflight, String> {

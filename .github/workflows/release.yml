@@ -62,7 +62,13 @@ on:
       - "schema/catalogue-report-v3.schema.json"
       - "schema/batch-job-v1.schema.json"
       - "schema/batch-job-v2.schema.json"
+      - "schema/batch-job-v3.schema.json"
       - "schema/batch-progress-v1.schema.json"
+      - "schema/batch-progress-v2.schema.json"
+      - "schema/batch-failure-report-v1.schema.json"
+      - "schema/generation-job-v1.schema.json"
+      - "schema/generation-recovery-report-v1.schema.json"
+      - "schema/normalization-semantic-context-v1.schema.json"
       - "schema/watch-folder-v1.schema.json"
       - "BATCH-JOBS.md"
       - "WATCH-FOLDERS.md"
@@ -1123,7 +1129,7 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Install pinned wasm-bindgen CLI
-        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+        run: cargo install wasm-bindgen-cli --version 0.2.127 --locked
 
       - name: Build and test the browser package
         env:
