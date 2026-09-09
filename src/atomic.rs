@@ -189,6 +189,129 @@ impl AtomicOutput {
         &self.destination
     }
 
+    /// Destination preimage captured when this output was staged.
+    ///
+    /// Generation-level publication performs the destination check before it
+    /// moves an existing destination into its private backup.  The generation
+    /// journal needs the same token so that the check is not reimplemented by
+    /// a caller with weaker identity semantics.
+    pub(crate) fn generation_expected_destination(&self) -> &DestinationPreimage {
+        &self.expected_destination
+    }
+
+    /// Verify the destination preimage immediately before a generation starts
+    /// moving any destination.  This deliberately does not publish anything.
+    pub(crate) fn generation_verify_destination(&self) -> Result<(), String> {
+        self.expected_destination
+            .verify_immediately_before_commit(&self.destination)
+            .map(drop)
+    }
+
+    /// Verify that the owned stage pathname still names the inode held by this
+    /// output.  A generation coordinator calls this before recording durable
+    /// stage evidence and again before publication.
+    pub(crate) fn generation_verify_stage(&self) -> Result<(), String> {
+        self.bound_stage_file().map(drop)
+    }
+
+    /// Publish a generation member after its coordinator has moved the
+    /// original destination to a private backup.  The no-clobber operation is
+    /// intentional: a creator racing the backup window must make the whole
+    /// generation fail and roll back rather than be overwritten.
+    pub(crate) fn generation_publish(mut self) -> Result<File, String> {
+        self.temporary
+            .as_file()
+            .sync_all()
+            .map_err(|error| format!("sync {}: {error}", self.temporary.path().display()))?;
+        let bound_path_handle = self.bound_stage_file()?;
+        reject_generation_hardlink(&bound_path_handle, &self.destination)?;
+        let source = self.temporary.path().to_owned();
+        let destination = self.destination;
+        // A ready generation journal, rather than this in-memory value, owns
+        // the stage.  Keep it available for rollback if the no-clobber rename
+        // fails after the original destination has already been backed up.
+        self.temporary.disable_cleanup(true);
+        move_path_without_replacing(&source, &destination)?;
+        Ok(bound_path_handle)
+    }
+
+    /// Re-open a retained stage using an arbitrary destination preimage.  The
+    /// older metadata-transaction bridge only accepted a present destination;
+    /// generation jobs also need to resume stages whose original destination
+    /// was missing.
+    pub(crate) fn from_existing_stage_with_destination_preimage(
+        destination: &Path,
+        stage: &Path,
+        expected_destination: DestinationPreimage,
+    ) -> Result<Self, String> {
+        let maximum_destination_bytes = expected_destination.maximum_capture_bytes();
+        let observed = DestinationState::capture(destination, maximum_destination_bytes)?;
+        if observed != expected_destination {
+            return Err(format!(
+                "generation destination preimage changed while reopening stage: {}",
+                destination.display()
+            ));
+        }
+
+        let file = open_regular_stage(stage, false)?;
+        let path = tempfile::TempPath::try_from_path(stage)
+            .map_err(|error| format!("retain generation stage {}: {error}", stage.display()))?;
+        let mut temporary = tempfile::NamedTempFile::from_parts(file, path);
+        temporary.disable_cleanup(true);
+        let output = Self {
+            destination: destination.to_owned(),
+            expected_destination,
+            temporary,
+        };
+        output.generation_verify_stage()?;
+        Ok(output)
+    }
+
+    /// Synchronize the parent directory after a generation backup/restore.
+    pub(crate) fn sync_generation_parent(path: &Path) -> Result<(), String> {
+        sync_parent_directory(path)
+    }
+
+    /// Move a regular private file to an absent sibling without replacing a
+    /// competing pathname.  The source identity is rebound immediately before
+    /// the move and must match the evidence captured by the coordinator.
+    pub(crate) fn generation_move_without_replacing(
+        source: &Path,
+        destination: &Path,
+        expected_identity: &StableFileIdentity,
+    ) -> Result<(), String> {
+        let source_file = open_regular_stage(source, false)?;
+        let observed_identity = identity_from_open_file(&source_file, source).map_err(|error| {
+            format!(
+                "identify generation move source {}: {error}",
+                source.display()
+            )
+        })?;
+        if &observed_identity != expected_identity {
+            return Err(format!(
+                "generation move source changed immediately before publication: {}",
+                source.display()
+            ));
+        }
+        reject_generation_hardlink(&source_file, source)?;
+        match std::fs::symlink_metadata(destination) {
+            Ok(_) => {
+                return Err(format!(
+                    "generation move destination already exists: {}",
+                    destination.display()
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "inspect generation move destination {}: {error}",
+                    destination.display()
+                ))
+            }
+        }
+        move_path_without_replacing(source, destination)
+    }
+
     /// Keep the stage pathname after this value is dropped.  Restartable
     /// callers invoke this only after the stage has been fully verified and
     /// are responsible for recording the path in a durable journal.
@@ -412,15 +535,233 @@ fn persist_temporary(
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn move_path_without_replacing(source: &Path, destination: &Path) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source_bytes = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        format!(
+            "generation move source contains an interior NUL: {}",
+            source.display()
+        )
+    })?;
+    let destination_bytes = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        format!(
+            "generation move destination contains an interior NUL: {}",
+            destination.display()
+        )
+    })?;
+    // Call the kernel ABI directly.  Referencing the libc `renameat2` symbol
+    // would raise the runtime glibc floor to 2.28 (and the Android API floor to
+    // the Bionic version that first exported it), even though the underlying
+    // syscall is available on older supported kernels.  ENOSYS still fails
+    // closed without replacing the destination.
+    let renamed = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source_bytes.as_ptr(),
+            libc::AT_FDCWD,
+            destination_bytes.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if renamed != 0 {
+        return Err(format!(
+            "rename generation path {} to {} without replacing: {}",
+            source.display(),
+            destination.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    sync_parent_directory(destination)
+}
+
+#[cfg(windows)]
+fn windows_wide_path(path: &Path) -> Result<Vec<u16>, String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut value = Vec::new();
+    for unit in path.as_os_str().encode_wide() {
+        if unit == 0 {
+            return Err(format!(
+                "Windows path contains an interior NUL: {}",
+                path.display()
+            ));
+        }
+        value.push(unit);
+    }
+    value.push(0);
+    Ok(value)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+))]
+fn move_path_without_replacing(source: &Path, destination: &Path) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source_bytes = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        format!(
+            "generation move source contains an interior NUL: {}",
+            source.display()
+        )
+    })?;
+    let destination_bytes = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        format!(
+            "generation move destination contains an interior NUL: {}",
+            destination.display()
+        )
+    })?;
+    let renamed = unsafe {
+        libc::renamex_np(
+            source_bytes.as_ptr(),
+            destination_bytes.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if renamed != 0 {
+        return Err(format!(
+            "rename generation path {} to {} without replacing: {}",
+            source.display(),
+            destination.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    sync_parent_directory(destination)
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))
+))]
+fn move_path_without_replacing(source: &Path, destination: &Path) -> Result<(), String> {
+    let _ = (source, destination);
+    Err("generation atomic no-clobber rename is unsupported on this Unix target".into())
+}
+
+fn reject_generation_hardlink(file: &File, path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    if file
+        .metadata()
+        .map_err(|error| format!("inspect generation link count {}: {error}", path.display()))?
+        .nlink()
+        > 1
+    {
+        return Err(format!(
+            "generation private file must not have hard-link aliases: {}",
+            path.display()
+        ));
+    }
+    #[cfg(windows)]
+    if crate::stable_input::windows_file_link_count(file)
+        .map_err(|error| format!("inspect generation link count {}: {error}", path.display()))?
+        > 1
+    {
+        return Err(format!(
+            "generation private file must not have hard-link aliases: {}",
+            path.display()
+        ));
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = (file, path);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn move_path_without_replacing(source: &Path, destination: &Path) -> Result<(), String> {
+    const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x0000_0100;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+        fn GetFileAttributesW(path: *const u16) -> u32;
+        fn SetFileAttributesW(path: *const u16, attributes: u32) -> i32;
+    }
+
+    let source_wide = windows_wide_path(source)?;
+    let destination_wide = windows_wide_path(destination)?;
+    // Only clear the temporary bit used by NamedTempFile; preserve any
+    // caller-owned read-only/hidden attributes on a backup or returned stage.
+    let attributes = unsafe { GetFileAttributesW(source_wide.as_ptr()) };
+    if attributes == u32::MAX {
+        return Err(format!(
+            "inspect generation move source {}: {}",
+            source.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let had_temporary_attribute = attributes & FILE_ATTRIBUTE_TEMPORARY != 0;
+    if had_temporary_attribute {
+        let normalized = unsafe {
+            SetFileAttributesW(source_wide.as_ptr(), attributes & !FILE_ATTRIBUTE_TEMPORARY)
+        };
+        if normalized == 0 {
+            return Err(format!(
+                "prepare generation move source {}: {}",
+                source.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    let moved = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        let error = std::io::Error::last_os_error();
+        if had_temporary_attribute {
+            let restored = unsafe { SetFileAttributesW(source_wide.as_ptr(), attributes) };
+            if restored == 0 {
+                let restore_error = std::io::Error::last_os_error();
+                return Err(format!(
+                    "move generation path {} to {} without replacing: {error}; restore source attributes: {restore_error}",
+                    source.display(),
+                    destination.display()
+                ));
+            }
+        }
+        return Err(format!(
+            "move generation path {} to {} without replacing: {error}",
+            source.display(),
+            destination.display()
+        ));
+    }
+    sync_parent_directory(destination)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn move_path_without_replacing(source: &Path, destination: &Path) -> Result<(), String> {
+    // Unknown targets have no portable no-clobber primitive.  Refuse the
+    // operation rather than silently turning the generation into an overwrite.
+    let _ = (source, destination);
+    Err("generation no-clobber move is unsupported on this target".into())
+}
+
 #[cfg(windows)]
 fn persist_temporary(
     temporary: NamedTempFile,
     destination: &Path,
     overwrite: bool,
 ) -> Result<File, String> {
-    use std::iter;
-    use std::os::windows::ffi::OsStrExt;
-
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
     const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x0000_0100;
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
@@ -429,29 +770,40 @@ fn persist_temporary(
     #[link(name = "kernel32")]
     extern "system" {
         fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+        fn GetFileAttributesW(path: *const u16) -> u32;
         fn SetFileAttributesW(path: *const u16, attributes: u32) -> i32;
     }
 
-    fn wide(path: &Path) -> Vec<u16> {
-        path.as_os_str()
-            .encode_wide()
-            .chain(iter::once(0))
-            .collect()
-    }
-
     let source = temporary.path().to_owned();
-    let source_wide = wide(&source);
-    let destination_wide = wide(destination);
-    // NamedTempFile marks named files as temporary on Windows. Clear that
-    // attribute before publication, then request write-through rename
-    // semantics so the directory update is not merely queued in memory.
-    let normalized = unsafe { SetFileAttributesW(source_wide.as_ptr(), FILE_ATTRIBUTE_NORMAL) };
-    if normalized == 0 {
+    let source_wide = windows_wide_path(&source)?;
+    let destination_wide = windows_wide_path(destination)?;
+    // NamedTempFile marks named files as temporary on Windows. Clear only that
+    // bit before publication; a trusted writer may also have applied hidden,
+    // read-only, archive, or other attributes that must survive the move.
+    let attributes = unsafe { GetFileAttributesW(source_wide.as_ptr()) };
+    if attributes == u32::MAX {
         return Err(format!(
-            "prepare Windows output {} for commit: {}",
+            "inspect Windows output stage for {}: {}",
             destination.display(),
             std::io::Error::last_os_error()
         ));
+    }
+    let had_temporary_attribute = attributes & FILE_ATTRIBUTE_TEMPORARY != 0;
+    if had_temporary_attribute {
+        let without_temporary = attributes & !FILE_ATTRIBUTE_TEMPORARY;
+        let normalized_attributes = if without_temporary == 0 {
+            FILE_ATTRIBUTE_NORMAL
+        } else {
+            without_temporary
+        };
+        let normalized = unsafe { SetFileAttributesW(source_wide.as_ptr(), normalized_attributes) };
+        if normalized == 0 {
+            return Err(format!(
+                "prepare Windows output {} for commit: {}",
+                destination.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
     }
     let flags = MOVEFILE_WRITE_THROUGH
         | if overwrite {
@@ -462,12 +814,21 @@ fn persist_temporary(
     let moved = unsafe { MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), flags) };
     if moved == 0 {
         let error = std::io::Error::last_os_error();
-        let _ = unsafe { SetFileAttributesW(source_wide.as_ptr(), FILE_ATTRIBUTE_TEMPORARY) };
         let action = if overwrite {
             "commit output"
         } else {
             "commit output without overwrite"
         };
+        if had_temporary_attribute {
+            let restored = unsafe { SetFileAttributesW(source_wide.as_ptr(), attributes) };
+            if restored == 0 {
+                return Err(format!(
+                    "{action} {}: {error}; restore stage attributes: {}",
+                    destination.display(),
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
         return Err(format!("{action} {}: {error}", destination.display()));
     }
 
@@ -495,6 +856,19 @@ impl DestinationState {
                 }
                 Some(text)
             }
+        }
+    }
+
+    /// Return the identity, byte length, and digest of a present preimage.
+    /// `None` represents an explicitly missing destination.
+    pub(crate) fn generation_present_parts(&self) -> Option<(&StableFileIdentity, u64, &[u8; 32])> {
+        match self {
+            Self::Missing => None,
+            Self::Present {
+                identity,
+                byte_len,
+                sha256,
+            } => Some((identity, *byte_len, sha256)),
         }
     }
 
@@ -736,7 +1110,9 @@ fn open_regular_stage(path: &Path, writable: bool) -> Result<File, String> {
     // Open a reparse point itself so the handle-based attribute check below
     // can reject it instead of silently following it.
     #[cfg(windows)]
-    options.custom_flags(0x0020_0000);
+    options
+        .share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004)
+        .custom_flags(0x0020_0000);
 
     let file = options
         .open(path)
@@ -764,6 +1140,13 @@ fn open_regular_stage(path: &Path, writable: bool) -> Result<File, String> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_wide_path_rejects_interior_nul() {
+        let error = windows_wide_path(Path::new("cache\0entry")).unwrap_err();
+        assert!(error.contains("interior NUL"), "{error}");
+    }
 
     #[test]
     fn dropping_uncommitted_output_preserves_destination() {
@@ -1047,5 +1430,31 @@ mod tests {
         assert!(error.contains("open staging path"), "{error}");
         assert_eq!(std::fs::read(&replacement).unwrap(), b"replacement");
         assert!(!destination.exists());
+    }
+
+    #[cfg(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))]
+    #[test]
+    fn failed_generation_publish_retains_its_journal_owned_stage() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("result.wav");
+        let mut output = AtomicOutput::new_with_overwrite(&destination, false).unwrap();
+        output.write_all(b"staged generation").unwrap();
+        let stage = output.path().to_owned();
+        output.retain_stage();
+        std::fs::write(&destination, b"racing destination").unwrap();
+
+        let error = output.generation_publish().unwrap_err();
+        assert!(error.contains("without replacing"), "{error}");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"racing destination");
+        assert_eq!(std::fs::read(&stage).unwrap(), b"staged generation");
     }
 }

@@ -19,10 +19,17 @@ use crate::wav::{ChannelRole, PcmKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::stable_input::identity_from_open_file;
 
 pub const ANALYSIS_CACHE_SCHEMA_V1: &str =
     "https://penguin425.github.io/audio-normalizer/schema/analysis-cache-v1";
@@ -94,12 +101,8 @@ impl AnalysisCache {
             return Err("analysis cache size limit must be greater than zero".into());
         }
         let root = root.into();
-        if root.exists() && !root.is_dir() {
-            return Err(format!(
-                "analysis cache path is not a directory: {}",
-                root.display()
-            ));
-        }
+        validate_existing_cache_directory_chain(&root, &root)
+            .map_err(|error| format!("inspect analysis cache path {}: {error}", root.display()))?;
         Ok(Self {
             root,
             policy,
@@ -423,18 +426,32 @@ impl AnalysisCache {
         request_hash: &str,
         request: &RequestRecord,
     ) -> Result<LoadResult, String> {
-        let metadata = match fs::metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        if let Err(error) = validate_existing_cache_directory_chain(
+            &self.root,
+            path.parent().unwrap_or_else(|| Path::new(".")),
+        ) {
+            return Ok(LoadResult::Invalid(format!(
+                "cache entry parent directory is unsafe: {error}"
+            )));
+        }
+        // Open the final component without following links.  A cache root is
+        // caller-selected (and may be writable by another process), so a
+        // pathname-only metadata/read pair could otherwise be redirected to
+        // an arbitrary file between the two operations.
+        let file = match open_regular_cache_entry(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(LoadResult::Missing);
             }
             Err(error) => {
-                return Err(format!(
-                    "inspect analysis cache {}: {error}",
-                    path.display()
-                ));
+                return Ok(LoadResult::Invalid(format!(
+                    "cache entry cannot be opened safely: {error}"
+                )));
             }
         };
+        let metadata = file.metadata().map_err(|error| {
+            format!("inspect opened analysis cache {}: {error}", path.display())
+        })?;
         if !metadata.is_file() {
             return Ok(LoadResult::Invalid(
                 "cache entry is not a regular file".into(),
@@ -445,15 +462,89 @@ impl AnalysisCache {
                 "cache entry exceeds the {MAX_ENTRY_BYTES}-byte limit"
             )));
         }
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(LoadResult::Missing);
+        let identity = identity_from_open_file(&file, path).map_err(|error| {
+            format!("identify opened analysis cache {}: {error}", path.display())
+        })?;
+        let mut reader = file
+            .try_clone()
+            .map_err(|error| format!("clone analysis cache {}: {error}", path.display()))?;
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 128 * 1024];
+        loop {
+            // Read at most one byte beyond the durable bound so an entry that
+            // grows after the initial metadata check is rejected without
+            // allocating unbounded memory.
+            let remaining = MAX_ENTRY_BYTES - bytes.len() as u64;
+            let read_limit = remaining.saturating_add(1).min(buffer.len() as u64) as usize;
+            let count = reader
+                .read(&mut buffer[..read_limit])
+                .map_err(|error| format!("read analysis cache {}: {error}", path.display()))?;
+            if count == 0 {
+                break;
+            }
+            if count as u64 > remaining {
+                return Ok(LoadResult::Invalid(format!(
+                    "cache entry exceeds the {MAX_ENTRY_BYTES}-byte limit"
+                )));
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        let after = file.metadata().map_err(|error| {
+            format!(
+                "reinspect opened analysis cache {}: {error}",
+                path.display()
+            )
+        })?;
+        if after.len() != metadata.len() || bytes.len() as u64 != metadata.len() {
+            return Ok(LoadResult::Invalid(
+                "cache entry length changed while it was read".into(),
+            ));
+        }
+        let after_identity = identity_from_open_file(&file, path).map_err(|error| {
+            format!(
+                "reidentify opened analysis cache {}: {error}",
+                path.display()
+            )
+        })?;
+        if after_identity != identity {
+            return Ok(LoadResult::Invalid(
+                "cache entry identity changed while it was read".into(),
+            ));
+        }
+        // Re-open the pathname after reading as well.  This catches a rename
+        // or final-component link swap that occurred while the original
+        // descriptor was being consumed.
+        let confirmation = match open_regular_cache_entry(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(LoadResult::Invalid(
+                    "cache entry disappeared while it was read".into(),
+                ));
             }
             Err(error) => {
-                return Err(format!("read analysis cache {}: {error}", path.display()));
+                return Ok(LoadResult::Invalid(format!(
+                    "cache entry changed to an unsafe pathname: {error}"
+                )));
             }
         };
+        let confirmation_metadata = confirmation.metadata().map_err(|error| {
+            format!(
+                "inspect confirmed analysis cache {}: {error}",
+                path.display()
+            )
+        })?;
+        let confirmation_identity =
+            identity_from_open_file(&confirmation, path).map_err(|error| {
+                format!(
+                    "identify confirmed analysis cache {}: {error}",
+                    path.display()
+                )
+            })?;
+        if confirmation_metadata.len() != metadata.len() || confirmation_identity != identity {
+            return Ok(LoadResult::Invalid(
+                "cache entry pathname changed while it was read".into(),
+            ));
+        }
         let document: CacheDocument = match serde_json::from_slice(&bytes) {
             Ok(document) => document,
             Err(error) => {
@@ -475,8 +566,20 @@ impl AnalysisCache {
         let parent = path
             .parent()
             .expect("content-addressed cache entries always have a parent");
+        validate_existing_cache_directory_chain(&self.root, parent).map_err(|error| {
+            format!(
+                "inspect analysis cache parent directory {}: {error}",
+                parent.display()
+            )
+        })?;
         fs::create_dir_all(parent)
             .map_err(|error| format!("create analysis cache {}: {error}", parent.display()))?;
+        validate_existing_cache_directory_chain(&self.root, parent).map_err(|error| {
+            format!(
+                "reinspect analysis cache parent directory {}: {error}",
+                parent.display()
+            )
+        })?;
         let mut output = AtomicOutput::new(path)?;
         output.write_all(bytes)?;
         output.commit()
@@ -525,33 +628,71 @@ impl AnalysisCache {
 
     fn recognized_entries(&self) -> Result<Vec<CacheFile>, String> {
         let base = self.root.join(LAYOUT_VERSION);
-        if !base.exists() {
-            return Ok(Vec::new());
+        validate_existing_cache_directory_chain(&self.root, &base).map_err(|error| {
+            format!(
+                "inspect analysis cache directory chain {}: {error}",
+                base.display()
+            )
+        })?;
+        let base_metadata = match fs::symlink_metadata(&base) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(format!(
+                    "inspect analysis cache {}: {error}",
+                    base.display()
+                ))
+            }
+        };
+        if !base_metadata.is_dir() {
+            return Err(format!(
+                "analysis cache layout path is not a directory: {}",
+                base.display()
+            ));
         }
         let mut entries = Vec::new();
         for prefix in read_dir_or_error(&base)? {
             let prefix = prefix
                 .map_err(|error| format!("scan analysis cache {}: {error}", base.display()))?;
-            if !prefix
-                .file_type()
-                .map_err(|error| format!("inspect {}: {error}", prefix.path().display()))?
-                .is_dir()
-                || !is_lower_hex(&prefix.file_name().to_string_lossy(), 2)
+            let prefix_path = prefix.path();
+            let prefix_metadata = fs::symlink_metadata(&prefix_path).map_err(|error| {
+                format!("inspect analysis cache {}: {error}", prefix_path.display())
+            })?;
+            reject_cache_alias(&prefix_path, &prefix_metadata)
+                .map_err(|error| format!("inspect {}: {error}", prefix_path.display()))?;
+            if !prefix_metadata.is_dir() || !is_lower_hex(&prefix.file_name().to_string_lossy(), 2)
             {
                 continue;
             }
+            validate_existing_cache_directory_chain(&self.root, &prefix_path).map_err(|error| {
+                format!(
+                    "inspect analysis cache directory chain {}: {error}",
+                    prefix_path.display()
+                )
+            })?;
             for input in read_dir_or_error(&prefix.path())? {
                 let input = input.map_err(|error| {
                     format!("scan analysis cache {}: {error}", prefix.path().display())
                 })?;
-                if !input
-                    .file_type()
-                    .map_err(|error| format!("inspect {}: {error}", input.path().display()))?
-                    .is_dir()
+                let input_path = input.path();
+                let input_metadata = fs::symlink_metadata(&input_path).map_err(|error| {
+                    format!("inspect analysis cache {}: {error}", input_path.display())
+                })?;
+                reject_cache_alias(&input_path, &input_metadata)
+                    .map_err(|error| format!("inspect {}: {error}", input_path.display()))?;
+                if !input_metadata.is_dir()
                     || !is_lower_hex(&input.file_name().to_string_lossy(), 64)
                 {
                     continue;
                 }
+                validate_existing_cache_directory_chain(&self.root, &input_path).map_err(
+                    |error| {
+                        format!(
+                            "inspect analysis cache directory chain {}: {error}",
+                            input_path.display()
+                        )
+                    },
+                )?;
                 for entry in read_dir_or_error(&input.path())? {
                     let entry = entry.map_err(|error| {
                         format!("scan analysis cache {}: {error}", input.path().display())
@@ -561,27 +702,155 @@ impl AnalysisCache {
                             "analysis cache exceeds the {MAX_SCAN_ENTRIES}-entry scan limit"
                         ));
                     }
-                    if !entry
-                        .file_type()
-                        .map_err(|error| format!("inspect {}: {error}", entry.path().display()))?
-                        .is_file()
+                    let entry_metadata = fs::symlink_metadata(entry.path())
+                        .map_err(|error| format!("inspect {}: {error}", entry.path().display()))?;
+                    reject_cache_alias(&entry.path(), &entry_metadata)
+                        .map_err(|error| format!("inspect {}: {error}", entry.path().display()))?;
+                    if !entry_metadata.file_type().is_file()
                         || !is_cache_filename(&entry.file_name().to_string_lossy())
                     {
                         continue;
                     }
-                    let metadata = entry
-                        .metadata()
-                        .map_err(|error| format!("inspect {}: {error}", entry.path().display()))?;
                     entries.push(CacheFile {
                         path: entry.path(),
-                        bytes: metadata.len(),
-                        modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+                        bytes: entry_metadata.len(),
+                        modified: entry_metadata.modified().unwrap_or(UNIX_EPOCH),
                     });
                 }
             }
         }
         Ok(entries)
     }
+}
+
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+fn reject_cache_alias(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cache path is a symbolic link: {}", path.display()),
+        ));
+    }
+    #[cfg(windows)]
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cache path is a reparse point: {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// Reject aliases in the cache root and every existing directory component
+/// below it.  The configured root is the trust boundary: ancestors above it
+/// (for example macOS's `/tmp` -> `/private/tmp` alias) are intentionally not
+/// inspected. Missing components are allowed for the create path, then
+/// checked again after `create_dir_all` has materialized them.
+fn validate_existing_cache_directory_chain(root: &Path, path: &Path) -> io::Result<()> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cache path is outside its configured root: {} (root {})",
+                path.display(),
+                root.display()
+            ),
+        )
+    })?;
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir
+        )
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cache path escapes its configured root: {} (root {})",
+                path.display(),
+                root.display()
+            ),
+        ));
+    }
+
+    let mut current = root.to_owned();
+    // Validate the anchor first, then append each relative component. Keeping
+    // this walk anchored avoids inspecting or rejecting symlinked ancestors
+    // outside the configured cache root.
+    match fs::symlink_metadata(root) {
+        Ok(metadata) => {
+            reject_cache_alias(root, &metadata)?;
+            if !metadata.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("cache root is not a directory: {}", root.display()),
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    for component in relative.components() {
+        if matches!(component, Component::CurDir) {
+            continue;
+        }
+        current.push(component.as_os_str());
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        reject_cache_alias(&current, &metadata)?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cache path component is not a directory: {}",
+                    current.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn open_regular_cache_entry(path: &Path) -> io::Result<File> {
+    // symlink_metadata is useful on platforms where the open flags below do
+    // not expose a portable no-follow primitive; on Unix/Windows the handle
+    // flags close the race between this check and open.
+    let link_metadata = fs::symlink_metadata(path)?;
+    if link_metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cache entry is a symbolic link",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(windows)]
+    options
+        .share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004)
+        .custom_flags(0x0020_0000);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    if metadata.file_attributes() & 0x0000_0400 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cache entry is a reparse point",
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cache entry is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 enum LoadResult {
@@ -1483,6 +1752,109 @@ mod tests {
             .warning
             .as_deref()
             .is_some_and(|warning| warning.contains("does not match its input descriptor")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_component_symlink_is_not_followed_during_cache_load() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("tone.wav");
+        let cache_root = directory.path().join("cache");
+        wav(&input, 0.1);
+        let cache = AnalysisCache::new(&cache_root, AnalysisCachePolicy::default()).unwrap();
+        cache.analyze_file(&input, None).unwrap();
+        let entry = cache.recognized_entries().unwrap().pop().unwrap().path;
+        let target = directory.path().join("outside-cache-entry.json");
+        fs::rename(&entry, &target).unwrap();
+        symlink(&target, &entry).unwrap();
+
+        let read_only = AnalysisCache::new(
+            &cache_root,
+            AnalysisCachePolicy {
+                read_only: true,
+                ..AnalysisCachePolicy::default()
+            },
+        )
+        .unwrap();
+        let result = read_only.analyze_file(&input, None).unwrap();
+        assert_eq!(result.disposition, CacheDisposition::ReadOnlyInvalid);
+        assert!(result
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("symbolic link")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_directory_symlink_is_not_followed_during_cache_load() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("tone.wav");
+        let cache_root = directory.path().join("cache");
+        wav(&input, 0.1);
+        let cache = AnalysisCache::new(&cache_root, AnalysisCachePolicy::default()).unwrap();
+        cache.analyze_file(&input, None).unwrap();
+        let entry = cache.recognized_entries().unwrap().pop().unwrap().path;
+        let input_directory = entry.parent().unwrap().to_owned();
+        let outside_directory = directory.path().join("outside-cache-directory");
+        fs::rename(&input_directory, &outside_directory).unwrap();
+        symlink(&outside_directory, &input_directory).unwrap();
+
+        let read_only = AnalysisCache::new(
+            &cache_root,
+            AnalysisCachePolicy {
+                read_only: true,
+                ..AnalysisCachePolicy::default()
+            },
+        )
+        .unwrap();
+        let result = read_only.analyze_file(&input, None).unwrap();
+        assert_eq!(result.disposition, CacheDisposition::ReadOnlyInvalid);
+        assert!(result
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("symbolic link")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_above_cache_root_is_allowed_but_internal_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let backing = directory.path().join("backing");
+        let parent_alias = directory.path().join("parent-alias");
+        let cache_root = parent_alias.join("cache");
+        fs::create_dir(&backing).unwrap();
+        symlink(&backing, &parent_alias).unwrap();
+
+        let cache = AnalysisCache::new(&cache_root, AnalysisCachePolicy::default()).unwrap();
+        let trusted_entry = cache_root.join("v5/aa").join("a".repeat(64) + ".json");
+        cache
+            .store(&trusted_entry, b"trusted through parent alias")
+            .unwrap();
+        assert_eq!(
+            fs::read(&trusted_entry).unwrap(),
+            b"trusted through parent alias"
+        );
+
+        let outside_layout = directory.path().join("outside-layout");
+        fs::create_dir(&outside_layout).unwrap();
+        fs::remove_dir_all(cache_root.join(LAYOUT_VERSION)).unwrap();
+        symlink(&outside_layout, cache_root.join(LAYOUT_VERSION)).unwrap();
+        let escaped_entry = cache_root
+            .join(LAYOUT_VERSION)
+            .join("bb")
+            .join("b".repeat(64) + ".json");
+        let error = cache.store(&escaped_entry, b"must not escape").unwrap_err();
+        assert!(error.contains("symbolic link"), "{error}");
+        assert!(!outside_layout
+            .join("bb")
+            .join("b".repeat(64) + ".json")
+            .exists());
     }
 
     #[test]

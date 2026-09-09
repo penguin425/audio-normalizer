@@ -42,3 +42,13 @@ family mismatches, missing owners, broken successor chains, and non-local
 `$ref` dependencies. The Rust test validates the registry against its schema,
 compiles every registered schema without network access, and validates any
 registered JSON samples.
+
+The v0.189.15 generation contracts are registered alongside the historical
+batch documents: `batch-job-v3` is the only CLI `--job-state` format,
+`batch-progress-v2` carries generation identity, and the bounded
+`batch-failure-report-v1`, `generation-job-v1`,
+`generation-recovery-report-v1`, and
+`normalization-semantic-context-v1` documents describe failure evidence,
+publication/recovery state, and semantic runtime identity. Native release
+packaging copies every registered top-level JSON document; release-readiness
+checks explicitly include these generation contracts in the crate closure.

@@ -24,7 +24,19 @@ const MAX_PACKET_FRAMES: usize = 5760;
 const RESAMPLE_CHUNK: usize = 1024;
 const MAX_RESAMPLE_FLUSH_PASSES: usize = 8;
 const CONTROLLED_OGG_READ_BYTES: usize = 32 * 1024;
+/// Revision of Forge's Ogg Opus writer/container pipeline represented by
+/// runtime evidence.  Bump this when framing, mapping, or loudness-tag
+/// semantics change in a way that can alter normalized output.
+pub const OPUS_WRITER_PIPELINE_REVISION: &str = "forge-ogg-opus-writer-v1";
 static NEXT_SERIAL: AtomicU32 = AtomicU32::new(0x464f_5247);
+
+/// Read the exact version string reported by the linked libopus runtime.
+pub fn opus_runtime_version() -> Result<String, String> {
+    // `opus::version()` already obtains the string from
+    // `opus_get_version_string`; keep this helper as the single evidence
+    // boundary so callers cannot accidentally report the Rust crate version.
+    Ok(::opus::version().to_owned())
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OpusInspection {

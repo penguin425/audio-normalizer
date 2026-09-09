@@ -53,7 +53,7 @@ A `dropped` entry is source-backed: it carries the source inventory locator and
 before hash, has no destination locator, and has no after hash. This makes a
 policy-driven removal distinct from a destination-only recomputed field.
 
-## Strict support boundary in v0.189.14
+## Strict support boundary
 
 The strict normalization claim is intentionally limited to the following
 evidence-backed clean paths:
@@ -64,14 +64,15 @@ evidence-backed clean paths:
 | clean WAVE -> Vorbis | supported | Exact output-adapter/writer preimages are bound in the field ledger. |
 | clean WAVE -> Opus | supported | Exact output-adapter/writer preimages are bound in the field ledger. |
 | clean WAVE -> M4A | supported | ISO-BMFF metadata descendants and their fully accounted ancestors are bound in the field ledger. |
+| clean WAVE -> M4A with requested Sound Check | supported since v0.189.15 | The final `iTunNORM` atom is read back and its exact ISO-BMFF region and fully accounted ancestors are bound to the Sound Check writer evidence. |
 | metadata-only clean FLAC | supported | The private stage is read back and the strict ledger is verified before the single-file commit. |
 
 These rows describe clean, evidence-backed paths; they do not imply generic
 full-container fidelity for every input. Strict metadata mutation involving
-MP3 or WAVE, Sound Check, or a rewrite of an existing composite tag is
-fail-closed until a field-specific adapter can prove every affected child and
-representation. A generic tag rewrite or a changed loudness field is not
-evidence of losslessness.
+MP3 or WAVE, Sound Check outside the evidence-backed ISO-BMFF path, or a rewrite
+of an existing composite tag is fail-closed until a field-specific adapter can
+prove every affected child and representation. A generic tag rewrite or a
+changed loudness field is not evidence of losslessness.
 
 ## Field ledger
 
@@ -140,8 +141,9 @@ readback verification against that stage, durably records a ready phase, and
 performs one compare-and-swap publication. A process restart can recreate a
 missing stage, resume a verified stage, or recognize a committed output. Its
 state contract is schema/metadata-job-v1.schema.json. Generation-level
-all-or-nothing album/batch publication is not part of this release; it is the
-planned v0.189.15 follow-up.
+all-or-nothing album/batch publication is provided by the delivered v0.189.15
+generation layer and its sibling recovery journal; this metadata-only
+transaction remains deliberately single-file.
 
 The high-level loudness writer accepts only the library-issued stage capability
 borrowed inside `MetadataTransaction::stage`; safe external code cannot
@@ -167,7 +169,8 @@ destination change in that final gap can leave committed audio without the
 report, and the command reports that condition explicitly. A metadata-only job
 keeps the report in its durable verification evidence so a rerun can publish
 it without repeating the mutation. General multi-path recovery is part of the
-v0.189.15 generation transaction rather than an implied guarantee here.
+v0.189.15 generation transaction, rather than an implied guarantee of this
+single-file metadata transaction.
 
 The report destination path is routing metadata, not operation semantics. It
 must remain outside a metadata transaction's semantic fingerprint and job

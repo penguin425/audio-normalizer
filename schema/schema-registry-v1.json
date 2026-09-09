@@ -459,6 +459,32 @@
       ]
     },
     {
+      "path": "schema/batch-failure-report-v1.schema.json",
+      "family": "batch-failure-report",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/batch-failure-report-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/batch-failure-report-v1"
+      },
+      "producers": [
+        "repo:src/batch.rs",
+        "repo:src/main.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
+      ]
+    },
+    {
       "path": "schema/batch-job-v1.schema.json",
       "family": "batch-job",
       "version": 1,
@@ -492,7 +518,7 @@
       "id_policy": "canonical",
       "document_kind": "json-schema",
       "artifact_class": "durable",
-      "lifecycle": "current",
+      "lifecycle": "supported-legacy",
       "change_policy": "migrate",
       "instance_discriminator": {
         "field": "schema",
@@ -507,6 +533,33 @@
       "validators": [
         "repo:tests/schema_registry.rs",
         "repo:tests/cli.rs"
+      ],
+      "successor_path": "schema/batch-job-v3.schema.json"
+    },
+    {
+      "path": "schema/batch-job-v3.schema.json",
+      "family": "batch-job",
+      "version": 3,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/batch-job-v3",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "durable",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/batch-job-v3"
+      },
+      "producers": [
+        "repo:src/batch.rs"
+      ],
+      "consumers": [
+        "repo:src/batch.rs",
+        "repo:src/main.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
       ]
     },
     {
@@ -517,7 +570,7 @@
       "id_policy": "canonical",
       "document_kind": "json-schema",
       "artifact_class": "durable",
-      "lifecycle": "current",
+      "lifecycle": "supported-legacy",
       "change_policy": "migrate",
       "instance_discriminator": {
         "field": "schema",
@@ -528,6 +581,34 @@
       ],
       "consumers": [
         "repo:src/batch.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
+      ],
+      "successor_path": "schema/batch-progress-v2.schema.json"
+    },
+    {
+      "path": "schema/batch-progress-v2.schema.json",
+      "family": "batch-progress",
+      "version": 2,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/batch-progress-v2",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "durable",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/batch-progress-v2"
+      },
+      "producers": [
+        "repo:src/batch.rs",
+        "repo:src/main.rs"
+      ],
+      "consumers": [
+        "repo:src/batch.rs",
+        "repo:src/main.rs"
       ],
       "validators": [
         "repo:tests/schema_registry.rs",
@@ -1062,6 +1143,57 @@
       ]
     },
     {
+      "path": "schema/generation-job-v1.schema.json",
+      "family": "generation-job",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/generation-job-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "durable",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/generation-job-v1"
+      },
+      "producers": [
+        "repo:src/generation.rs"
+      ],
+      "consumers": [
+        "repo:src/generation.rs",
+        "repo:src/main.rs"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
+      ]
+    },
+    {
+      "path": "schema/generation-recovery-report-v1.schema.json",
+      "family": "generation-recovery-report",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/generation-recovery-report-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "report",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/generation-recovery-report-v1"
+      },
+      "producers": [
+        "repo:src/main.rs"
+      ],
+      "consumers": [
+        "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
+      ]
+    },
+    {
       "path": "schema/hls-qc-v1.schema.json",
       "family": "hls-qc",
       "version": 1,
@@ -1533,6 +1665,32 @@
       ],
       "consumers": [
         "external:contract-client"
+      ],
+      "validators": [
+        "repo:tests/schema_registry.rs",
+        "repo:tests/cli.rs"
+      ]
+    },
+    {
+      "path": "schema/normalization-semantic-context-v1.schema.json",
+      "family": "normalization-semantic-context",
+      "version": 1,
+      "document_id": "https://penguin425.github.io/audio-normalizer/schema/normalization-semantic-context-v1",
+      "id_policy": "canonical",
+      "document_kind": "json-schema",
+      "artifact_class": "evidence",
+      "lifecycle": "current",
+      "change_policy": "immutable-version",
+      "instance_discriminator": {
+        "field": "schema",
+        "value": "https://penguin425.github.io/audio-normalizer/schema/normalization-semantic-context-v1"
+      },
+      "producers": [
+        "repo:src/runtime_fingerprint.rs"
+      ],
+      "consumers": [
+        "repo:src/batch.rs",
+        "repo:src/main.rs"
       ],
       "validators": [
         "repo:tests/schema_registry.rs",

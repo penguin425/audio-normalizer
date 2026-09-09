@@ -81,6 +81,8 @@ pub(crate) enum DestinationLoudnessWriter {
     ReplayGain,
     OpusR128,
     IsoBmffNative,
+    /// Apple Sound Check's `----:com.apple.iTunes:iTunNORM` freeform item.
+    IsoBmffSoundCheck,
 }
 
 /// Result of the synchronous metadata-only loudness adapter.
@@ -185,7 +187,8 @@ pub fn write_loudness_metadata_with_fidelity(
     // transaction source. Use it as the source inventory instead of opening
     // the live source pathname again while the mutation is in flight.
     let prepared = prepared_for_evaluation(policy, before.clone(), destination_kind)?;
-    let writers = loudness_writers_for_destination(destination_kind);
+    let writers =
+        loudness_writers_for_destination(destination_kind, requested_sound_check.is_some());
     let generated = prepared.destination_loudness_evidence(&before, &destination, &writers);
     let entries = prepared.ledger(&destination, None, &generated)?;
     let report =
@@ -1243,21 +1246,32 @@ fn destination_writer_owns_region(
             destination.container == ContainerKind::IsoBmff
                 && native_iso_loudness_region(destination, index, region)
         }
+        DestinationLoudnessWriter::IsoBmffSoundCheck => {
+            destination.container == ContainerKind::IsoBmff
+                && sound_check_iso_region(destination, index, region)
+        }
     }
 }
 
 fn loudness_writers_for_destination(
     destination: MetadataDestination,
+    sound_check_requested: bool,
 ) -> Vec<DestinationLoudnessWriter> {
     match destination {
         MetadataDestination::Flac | MetadataDestination::OggVorbis => {
             vec![DestinationLoudnessWriter::ReplayGain]
         }
         MetadataDestination::OggOpus => vec![DestinationLoudnessWriter::OpusR128],
-        MetadataDestination::IsoBmff => vec![
-            DestinationLoudnessWriter::ReplayGain,
-            DestinationLoudnessWriter::IsoBmffNative,
-        ],
+        MetadataDestination::IsoBmff => {
+            let mut writers = vec![
+                DestinationLoudnessWriter::ReplayGain,
+                DestinationLoudnessWriter::IsoBmffNative,
+            ];
+            if sound_check_requested {
+                writers.push(DestinationLoudnessWriter::IsoBmffSoundCheck);
+            }
+            writers
+        }
         // The current MP3 and WAVE metadata-only writers do not expose a
         // registry-native loudness region whose semantics can be bound here.
         MetadataDestination::Mp3 | MetadataDestination::Wave => Vec::new(),
@@ -1436,6 +1450,32 @@ fn replaygain_iso_region(
     index == item_index || children.contains(&index)
 }
 
+fn sound_check_iso_region(
+    destination: &MetadataInventory,
+    index: usize,
+    region: &MetadataRegion,
+) -> bool {
+    let MetadataKind::IsoBmffBox { id, .. } = &region.kind else {
+        return false;
+    };
+    let Some(item_path) = freeform_item_path(&region.path, id) else {
+        return false;
+    };
+    if !item_path
+        .windows(2)
+        .any(|window| window == ["meta", "ilst"])
+    {
+        return false;
+    }
+    let Some(item_index) = freeform_item_index(destination, index, item_path, id) else {
+        return false;
+    };
+    let Some(children) = sound_check_freeform_children(destination, item_index) else {
+        return false;
+    };
+    index == item_index || children.contains(&index)
+}
+
 fn freeform_item_path<'a>(path: &'a [String], id: &str) -> Option<&'a [String]> {
     match id {
         "----" if path.last().is_some_and(|component| component == "----") => Some(path),
@@ -1516,6 +1556,44 @@ fn replaygain_freeform_children(
     (child_count == 3).then_some([mean?, name?, data?])
 }
 
+fn sound_check_freeform_children(
+    destination: &MetadataInventory,
+    item_index: usize,
+) -> Option<[usize; 3]> {
+    let item = destination.regions.get(item_index)?;
+    let mut mean = None;
+    let mut name = None;
+    let mut data = None;
+    let mut child_count = 0_usize;
+    for (index, child) in destination.regions.iter().enumerate() {
+        if !is_direct_iso_child(item, child) {
+            continue;
+        }
+        child_count += 1;
+        let MetadataKind::IsoBmffBox { id, .. } = &child.kind else {
+            return None;
+        };
+        match id.as_str() {
+            "mean"
+                if mean.is_none()
+                    && bmff_text_value(child.raw.as_deref()) == Some(b"com.apple.iTunes") =>
+            {
+                mean = Some(index);
+            }
+            "name"
+                if name.is_none() && bmff_text_value(child.raw.as_deref()) == Some(b"iTunNORM") =>
+            {
+                name = Some(index);
+            }
+            "data" if data.is_none() && sound_check_data_leaf(child.raw.as_deref()) => {
+                data = Some(index);
+            }
+            _ => return None,
+        }
+    }
+    (child_count == 3).then_some([mean?, name?, data?])
+}
+
 fn valid_bmff_leaf(raw: Option<&[u8]>, id: &[u8; 4]) -> bool {
     let Some(raw) = raw else {
         return false;
@@ -1523,6 +1601,27 @@ fn valid_bmff_leaf(raw: Option<&[u8]>, id: &[u8; 4]) -> bool {
     raw.len() >= 8
         && &raw[4..8] == id
         && usize::try_from(u32::from_be_bytes(raw[..4].try_into().unwrap())) == Ok(raw.len())
+}
+
+fn sound_check_data_leaf(raw: Option<&[u8]>) -> bool {
+    let Some(payload) = bmff_data_payload(raw) else {
+        return false;
+    };
+    std::str::from_utf8(payload)
+        .ok()
+        .and_then(|value| crate::metadata::SoundCheck::parse(value).ok())
+        .is_some()
+}
+
+fn bmff_data_payload(raw: Option<&[u8]>) -> Option<&[u8]> {
+    let raw = raw?;
+    if raw.len() < 16
+        || &raw[4..8] != b"data"
+        || usize::try_from(u32::from_be_bytes(raw[..4].try_into().unwrap())) != Ok(raw.len())
+    {
+        return None;
+    }
+    Some(&raw[16..])
 }
 
 fn iso_region_contains(parent: &MetadataRegion, child: &MetadataRegion) -> bool {
@@ -2129,11 +2228,27 @@ mod tests {
         bmff_box(id, &body)
     }
 
+    fn bmff_data_box(value: &[u8]) -> Vec<u8> {
+        let mut body = vec![0_u8; 8];
+        body.extend_from_slice(value);
+        bmff_box(*b"data", &body)
+    }
+
     fn replaygain_freeform(name: &[u8]) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&bmff_full_box(*b"mean", b"com.apple.iTunes"));
         body.extend_from_slice(&bmff_full_box(*b"name", name));
         body.extend_from_slice(&bmff_full_box(*b"data", b"+1.00 dB"));
+        bmff_box(*b"----", &body)
+    }
+
+    fn sound_check_freeform() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&bmff_full_box(*b"mean", b"com.apple.iTunes"));
+        body.extend_from_slice(&bmff_full_box(*b"name", b"iTunNORM"));
+        body.extend_from_slice(&bmff_data_box(
+            b" 000003E8 000003E8 000009C4 000009C4 00000000 00000000 00008000 00008000 00000000 00000000",
+        ));
         bmff_box(*b"----", &body)
     }
 
@@ -2143,6 +2258,19 @@ mod tests {
             ilst_body.extend_from_slice(&replaygain_freeform(name));
         }
         let ilst = bmff_box(*b"ilst", &ilst_body);
+        let hdlr = bmff_box(*b"hdlr", b"adapter");
+        let mut meta_body = vec![0_u8; 4];
+        meta_body.extend_from_slice(&hdlr);
+        meta_body.extend_from_slice(&ilst);
+        let meta = bmff_box(*b"meta", &meta_body);
+        let udta = bmff_box(*b"udta", &meta);
+        let moov = bmff_box(*b"moov", &udta);
+        let ftyp = bmff_box(*b"ftyp", b"M4A \0\0\0\0M4A ");
+        [ftyp, moov].concat()
+    }
+
+    fn isobmff_with_sound_check() -> Vec<u8> {
+        let ilst = bmff_box(*b"ilst", &sound_check_freeform());
         let hdlr = bmff_box(*b"hdlr", b"adapter");
         let mut meta_body = vec![0_u8; 4];
         meta_body.extend_from_slice(&hdlr);
@@ -2255,6 +2383,82 @@ mod tests {
                 && entry.source_locator().is_none()
                 && entry.destination_locator().is_some()
         }));
+    }
+
+    #[test]
+    fn strict_isobmff_sound_check_writer_evidence_allows_i_tun_norm() {
+        assert!(
+            !loudness_writers_for_destination(MetadataDestination::IsoBmff, false)
+                .contains(&DestinationLoudnessWriter::IsoBmffSoundCheck)
+        );
+
+        let directory = tempdir().unwrap();
+        let source_path = directory.path().join("source.wav");
+        let before_path = directory.path().join("before.m4a");
+        let output_path = directory.path().join("output.m4a");
+        std::fs::write(&source_path, wave(48_000, &[])).unwrap();
+        std::fs::write(&before_path, isobmff_with_freeforms(&[])).unwrap();
+        std::fs::write(&output_path, isobmff_with_sound_check()).unwrap();
+
+        let prepared = PreparedMetadata::prepare(
+            &source_path,
+            MetadataDestination::IsoBmff,
+            48_000,
+            48_000,
+            0,
+            true,
+            false,
+            &MetadataPolicyConfig::strict(),
+        )
+        .unwrap();
+        let before = prepared.destination_inventory(&before_path).unwrap();
+        let after = prepared.destination_inventory(&output_path).unwrap();
+        let evidence = prepared.destination_loudness_evidence(
+            &before,
+            &after,
+            &loudness_writers_for_destination(MetadataDestination::IsoBmff, true),
+        );
+        assert!(evidence.iter().any(|entry| {
+            matches!(
+                &entry.kind,
+                MetadataKind::IsoBmffBox { id, .. } if id == "----"
+            ) && entry.origin == GeneratedDestinationOrigin::LoudnessWriter
+        }));
+
+        let report = prepared
+            .finish_with_bwf_loudness_and_evidence(&output_path, None, &evidence)
+            .unwrap();
+        assert!(report.publication_allowed(), "{report:#?}");
+        assert!(report
+            .entries()
+            .iter()
+            .all(|entry| { entry.loss_class() == MetadataLossClass::None }));
+
+        std::fs::write(&output_path, isobmff_with_freeforms(&[b"iTunNORM"])).unwrap();
+        let prepared = PreparedMetadata::prepare(
+            &source_path,
+            MetadataDestination::IsoBmff,
+            48_000,
+            48_000,
+            0,
+            true,
+            false,
+            &MetadataPolicyConfig::strict(),
+        )
+        .unwrap();
+        let after = prepared.destination_inventory(&output_path).unwrap();
+        let evidence = prepared.destination_loudness_evidence(
+            &before,
+            &after,
+            &[DestinationLoudnessWriter::IsoBmffSoundCheck],
+        );
+        assert!(!evidence
+            .iter()
+            .any(|entry| entry.origin == GeneratedDestinationOrigin::LoudnessWriter));
+        let report = prepared
+            .finish_with_bwf_loudness_and_evidence(&output_path, None, &evidence)
+            .unwrap();
+        assert!(!report.publication_allowed(), "{report:#?}");
     }
 
     #[test]

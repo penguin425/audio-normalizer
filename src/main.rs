@@ -1,12 +1,15 @@
 //! Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer.
 
-use clap::{Arg, ArgAction};
+use clap::{Arg, ArgAction, Command};
 use forge_normalizer::adm::{self, ReferenceRendererOptions};
 use forge_normalizer::analysis::{Analysis, AnalysisEngine};
 use forge_normalizer::analysis_cache::{
     AnalysisCache, AnalysisCachePolicy, CacheDisposition, Cached,
 };
-use forge_normalizer::batch::{BatchAssetSpec, BatchJob, BatchProgressEvent};
+use forge_normalizer::batch::{
+    BatchAssetSpec, BatchFailure, BatchFailurePolicy, BatchFailureReport, BatchJob,
+    BatchProgressEvent,
+};
 use forge_normalizer::bound_analysis::BoundAnalysis;
 use forge_normalizer::catalogue::{Catalogue, CatalogueAsset, CatalogueRecordV2};
 use forge_normalizer::cli;
@@ -19,6 +22,9 @@ use forge_normalizer::dsp::limiter::LimiterConfig;
 use forge_normalizer::dsp::resample::ResampleQuality;
 use forge_normalizer::ebu_qc_report;
 use forge_normalizer::ebu_qc_scenario1;
+use forge_normalizer::generation::{
+    GenerationPhase, GenerationRecovery, GenerationTransaction, PreparedGenerationOutput,
+};
 use forge_normalizer::metadata_fidelity::{
     MetadataFidelityReport, MetadataPolicy, MetadataPolicyConfig,
 };
@@ -40,6 +46,9 @@ use forge_normalizer::qc::{self, QcOptions};
 use forge_normalizer::report::{
     self, AnalysisReport, CodecMetadata, ComplianceProfile, TimelineReport,
 };
+use forge_normalizer::runtime_fingerprint::{
+    normalization_semantic_context, NORMALIZATION_FINGERPRINT_REVISION,
+};
 use forge_normalizer::stable_input::{StableInput, StableInputOptions};
 use forge_normalizer::watch::{WatchCandidate, WatchFolder, WatchProcessingOutput};
 use forge_normalizer::wav::{named_channel_layout, ChannelRole, PcmKind, WavContainer};
@@ -55,11 +64,15 @@ use std::time::Duration;
 use tempfile::{Builder, NamedTempFile, TempDir};
 
 const MAX_BATCH_WAVE_ASSETS: usize = 32;
+const MAX_BATCH_PROGRESS_PATH_BYTES: usize = 4096;
+const MAX_BATCH_FAILURE_ERROR_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Default)]
 struct BatchOptions {
     job_state: Option<PathBuf>,
     progress: Option<PathBuf>,
+    keep_going: bool,
+    failure_report: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -177,7 +190,6 @@ fn main() -> ExitCode {
                 )
                 .conflicts_with_all([
                     "analyze_only",
-                    "album",
                     "dry_run",
                     "gain_only",
                     "write_tags",
@@ -192,11 +204,35 @@ fn main() -> ExitCode {
                 .help("Write versioned normalization lifecycle events as NDJSON (`-` for stdout)")
                 .conflicts_with_all([
                     "analyze_only",
-                    "album",
                     "dry_run",
                     "gain_only",
                     "write_tags",
                 ]),
+        )
+        .arg(
+            Arg::new("keep_going")
+                .long("keep-going")
+                .action(ArgAction::SetTrue)
+                .requires("job_state")
+                .conflicts_with_all([
+                    "analyze_only",
+                    "album",
+                    "dry_run",
+                    "gain_only",
+                    "write_tags",
+                    "watch",
+                ])
+                .help(
+                    "Finish the bounded independent batch after asset failures; publish no generation until every asset succeeds",
+                ),
+        )
+        .arg(
+            Arg::new("failure_report")
+                .long("failure-report")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .requires("keep_going")
+                .help("Write a bounded, versioned JSON summary of --keep-going failures"),
         )
         .arg(
             Arg::new("analysis_cache")
@@ -372,7 +408,48 @@ fn main() -> ExitCode {
                     "Persist and resume one metadata-only transaction without mutating the live file before commit",
                 ),
         )
+        .subcommand_negates_reqs(true)
+        .subcommand(
+            Command::new("recovery")
+                .about("Inspect or safely reclaim one generation journal")
+                .subcommand_required(true)
+                .subcommand(
+                    Command::new("inspect")
+                        .about("Inspect a generation journal without creating or changing files")
+                        .arg(
+                            Arg::new("state")
+                                .value_name("STATE")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .required(true),
+                        ),
+                )
+                .subcommand(
+                    Command::new("reclaim")
+                        .about("Recover/abort and reclaim only journal-proven private files")
+                        .arg(
+                            Arg::new("state")
+                                .value_name("STATE")
+                                .value_parser(clap::value_parser!(PathBuf))
+                                .required(true),
+                        )
+                        .arg(
+                            Arg::new("yes")
+                                .long("yes")
+                                .action(ArgAction::SetTrue)
+                                .help("Confirm destructive reclamation; omission is a dry run"),
+                        ),
+                ),
+        )
         .get_matches();
+    if let Some(("recovery", command)) = matches.subcommand() {
+        return match run_recovery_command(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("forge: error: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
     let true_peak_backend = matches
         .get_one::<String>("true_peak_backend")
         .map(String::as_str)
@@ -394,6 +471,8 @@ fn main() -> ExitCode {
     let batch_options = BatchOptions {
         job_state: matches.get_one::<PathBuf>("job_state").cloned(),
         progress: matches.get_one::<PathBuf>("progress").cloned(),
+        keep_going: matches.get_flag("keep_going"),
+        failure_report: matches.get_one::<PathBuf>("failure_report").cloned(),
     };
     let cache_options = CacheOptions {
         directory: matches.get_one::<PathBuf>("analysis_cache").cloned(),
@@ -479,6 +558,80 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn run_recovery_command(matches: &clap::ArgMatches) -> Result<(), String> {
+    let (operation, arguments) = matches
+        .subcommand()
+        .ok_or_else(|| "recovery requires inspect or reclaim".to_string())?;
+    let state = arguments
+        .get_one::<PathBuf>("state")
+        .ok_or_else(|| "recovery state path is required".to_string())?;
+    let (status, action, confirmed, lock_state, private_file_count) = match operation {
+        "inspect" => (
+            GenerationTransaction::inspect(state)?,
+            "inspected",
+            false,
+            "not_probed",
+            0,
+        ),
+        "reclaim" if arguments.get_flag("yes") => {
+            let inspection = GenerationTransaction::inspect_reclaim(state)?;
+            if inspection.action()
+                == forge_normalizer::generation::GenerationReclaimAction::BlockedActive
+            {
+                return Err("generation is active in another process; reclaim is blocked".into());
+            }
+            let private_file_count = inspection.private_file_count();
+            let status = if inspection.action()
+                == forge_normalizer::generation::GenerationReclaimAction::Nothing
+            {
+                inspection.status().clone()
+            } else {
+                GenerationTransaction::reclaim(state)?
+            };
+            (
+                status,
+                "reclaimed",
+                true,
+                inspection.lock_state().as_str(),
+                private_file_count,
+            )
+        }
+        "reclaim" => {
+            let inspection = GenerationTransaction::inspect_reclaim(state)?;
+            (
+                inspection.status().clone(),
+                inspection.action().as_str(),
+                false,
+                inspection.lock_state().as_str(),
+                inspection.private_file_count(),
+            )
+        }
+        _ => return Err(format!("unknown recovery operation: {operation}")),
+    };
+    let record = serde_json::json!({
+        "schema": "https://penguin425.github.io/audio-normalizer/schema/generation-recovery-report-v1",
+        "generator": status.generator(),
+        "action": action,
+        "confirmed": confirmed,
+        "state": status.state_path().to_string_lossy(),
+        "generation_id": status.generation_id(),
+        "semantic_fingerprint": status.semantic_fingerprint(),
+        "phase": status.phase().as_str(),
+        "member_count": status.member_count(),
+        "publication_steps": status.publication_steps(),
+        "lock_state": lock_state,
+        "private_file_count": private_file_count,
+    });
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    serde_json::to_writer_pretty(&mut output, &record)
+        .map_err(|error| format!("write recovery report: {error}"))?;
+    output
+        .write_all(b"\n")
+        .and_then(|_| output.flush())
+        .map_err(|error| format!("flush recovery report: {error}"))
+}
+
 fn metadata_invocation_options(
     matches: &clap::ArgMatches,
 ) -> Result<MetadataInvocationOptions, String> {
@@ -539,8 +692,36 @@ fn validate_effective_mode_conflicts(
     metadata_options: &MetadataInvocationOptions,
     analysis_from_config: bool,
 ) -> Result<(), String> {
-    if !cli.analyze_only {
-        return Ok(());
+    let conflict = |left: &str, right: &str| -> Result<(), String> {
+        Err(format!(
+            "the argument '{left}' cannot be used with '{right}'"
+        ))
+    };
+    if batch_options.job_state.is_some() {
+        if cli.dry_run {
+            return conflict("--job-state", "--dry-run");
+        }
+        if cli.gain_only {
+            return conflict("--job-state", "--gain-only");
+        }
+        if cli.write_tags {
+            return conflict("--job-state", "--write-tags");
+        }
+        if cli.difference_report.is_some() {
+            return conflict("--job-state", "--difference-report");
+        }
+    }
+    if batch_options.progress.is_some() && (cli.dry_run || cli.gain_only || cli.write_tags) {
+        return Err("--progress cannot be used with dry-run, gain-only, or tags mode".into());
+    }
+    if batch_options.keep_going && cli.album {
+        return conflict("--keep-going", "--album");
+    }
+    if watch_options.enabled && cli.difference_report.is_some() {
+        return conflict("--watch", "--difference-report");
+    }
+    if cli.verify && (cli.dry_run || cli.gain_only || cli.write_tags) {
+        return Err("--verify cannot be used with dry-run, gain-only, or tags mode".into());
     }
 
     let reject = |option: &str| -> Result<(), String> {
@@ -549,11 +730,29 @@ fn validate_effective_mode_conflicts(
         ))
     };
 
+    if !cli.analyze_only {
+        return Ok(());
+    }
+
+    // Analysis may be supplied directly or enabled by config.  Config is
+    // applied after Clap has parsed the raw arguments, so check the effective
+    // mode here and fail before analysis prepares any report, output, or
+    // renderer paths.
+    if cli.dry_run {
+        return reject("--dry-run");
+    }
+
     if let Some(path) = &batch_options.job_state {
         return reject(&format!("--job-state {}", path.display()));
     }
     if let Some(path) = &batch_options.progress {
         return reject(&format!("--progress {}", path.display()));
+    }
+    if batch_options.keep_going {
+        return reject("--keep-going");
+    }
+    if let Some(path) = &batch_options.failure_report {
+        return reject(&format!("--failure-report {}", path.display()));
     }
     if watch_options.enabled {
         return reject("--watch");
@@ -585,9 +784,6 @@ fn validate_effective_mode_conflicts(
     if analysis_from_config {
         if cli.gain_only {
             return reject("--gain-only");
-        }
-        if cli.dry_run {
-            return reject("--dry-run");
         }
         if cli.album {
             return reject("--album");
@@ -1924,25 +2120,277 @@ fn run_paths_with_watch_output(
         {
             return Err("--job-state and --progress cannot be used with stdin".into());
         }
-        if cli.album {
+        if cli.album && batch_options.job_state.is_none() {
             validate_outputs(&cli.inputs, &outputs, cli.overwrite)?;
         }
     }
     let mut difference_assets = Vec::new();
 
+    let operation = batch_operation_descriptor(
+        &cli,
+        &plan,
+        &formats,
+        metadata_options,
+        analysis_engine,
+        audio_track,
+    );
+    let batch_assets = cli
+        .inputs
+        .iter()
+        .zip(&outputs)
+        .map(|(input, output)| BatchAssetSpec::new(input, output))
+        .collect::<Vec<_>>();
+    let failure_policy = if batch_options.keep_going {
+        BatchFailurePolicy::KeepGoing
+    } else {
+        BatchFailurePolicy::FailFast
+    };
+    let semantic_context = batch_options
+        .job_state
+        .as_ref()
+        .map(|_| normalization_semantic_context(analysis_engine, audio_track, &formats))
+        .transpose()?;
+    let mut batch_job = batch_options
+        .job_state
+        .as_ref()
+        .map(|path| {
+            BatchJob::open_v3(
+                path,
+                &batch_assets,
+                &operation,
+                semantic_context
+                    .as_ref()
+                    .expect("job state requested semantic context"),
+                NORMALIZATION_FINGERPRINT_REVISION,
+                failure_policy,
+                cli.overwrite,
+            )
+        })
+        .transpose()?;
+    let generation_journal = batch_options
+        .job_state
+        .as_deref()
+        .map(generation_state_path)
+        .transpose()?;
+    if let (Some(job), Some(journal)) = (&mut batch_job, generation_journal.as_deref()) {
+        let reconciliation = reconcile_batch_generation(job, journal, cli.overwrite)?;
+        if let BatchGenerationCheckpointOutcome::CommittedNeedsCheckpoint(error) = reconciliation {
+            let progress_result = emit_completed_resume_progress(
+                batch_options.progress.as_deref(),
+                job,
+                &cli.inputs,
+                &outputs,
+            );
+            return Err(committed_checkpoint_failure(error, progress_result));
+        }
+        if job.is_complete() {
+            // Progress describes the durable audio generation. Auxiliary
+            // catalogue/report repair below is a separate documented write
+            // boundary and must not hide the already-committed terminal event.
+            emit_completed_resume_progress(
+                batch_options.progress.as_deref(),
+                job,
+                &cli.inputs,
+                &outputs,
+            )?;
+            // A completed generation is an audio no-op, but auxiliary outputs
+            // are invocation-scoped.  Rebuild requested catalogue records and
+            // reports (and a requested zero-failure report) before returning so
+            // a resumed invocation can repair an artifact deleted after the
+            // original commit without touching any published audio.
+            if catalogue.is_some() || batch_options.failure_report.is_some() {
+                if catalogue.is_some() {
+                    let repaired = if let Some(cache) = analysis_cache.as_ref() {
+                        analyze_many_for_plan_cached(
+                            cache,
+                            &cli.inputs,
+                            channel_roles_override.as_deref(),
+                            &plan,
+                            audio_track,
+                        )?
+                    } else {
+                        analyze_many_for_plan_uncached(
+                            &cli.inputs,
+                            channel_roles_override.as_deref(),
+                            &plan,
+                            audio_track,
+                        )?
+                    };
+                    for (index, analysis) in repaired.iter().enumerate() {
+                        job.verify_input_binding(
+                            index,
+                            analysis.descriptor.stable_input().binding(),
+                        )?;
+                        record_catalogue_asset(
+                            catalogue.as_mut(),
+                            &mut catalogue_records,
+                            CatalogueAsset {
+                                source: &cli.inputs[index],
+                                expected_source_sha256: catalogue_source_hashes
+                                    .get(&cli.inputs[index])
+                                    .map_or("", String::as_str),
+                                output: Some(&outputs[index]),
+                                measurement: analysis.analysis.analysis(),
+                                operation: "normalization",
+                                profile: &catalogue_profile(&cli, &plan),
+                                provenance: catalogue_provenance(&cli, &plan, "normalization"),
+                            },
+                            Some(&analysis.descriptor),
+                            catalogue_descriptor_options(
+                                &cli,
+                                channel_roles_override.as_deref(),
+                                audio_track,
+                            ),
+                            &plan,
+                            catalogue_output_renderer(formats[index]),
+                        )?;
+                    }
+                    write_catalogue_report(
+                        catalogue.as_ref(),
+                        catalogue_options.report.as_deref(),
+                        std::mem::take(&mut catalogue_records),
+                        cli.overwrite,
+                    )?;
+                }
+                if let Some(path) = batch_options.failure_report.as_deref() {
+                    let job_id = job
+                        .job_id()
+                        .ok_or_else(|| {
+                            "completed batch state has no v3 job identity for failure report"
+                                .to_string()
+                        })?
+                        .to_owned();
+                    let semantic_fingerprint = job
+                        .semantic_fingerprint()
+                        .ok_or_else(|| {
+                            "completed batch state has no semantic fingerprint for failure report"
+                                .to_string()
+                        })?
+                        .to_owned();
+                    let fingerprint_revision = job.fingerprint_revision().ok_or_else(|| {
+                        "completed batch state has no fingerprint revision for failure report"
+                            .to_string()
+                    })?;
+                    let mut report = BatchFailureReport::new(
+                        &job_id,
+                        semantic_fingerprint,
+                        fingerprint_revision,
+                        failure_policy,
+                        job.asset_count(),
+                    );
+                    report.set_completed_counts(job.asset_count(), 0);
+                    write_batch_failure_report(path, &report)?;
+                }
+            }
+            eprintln!(
+                "batch generation already committed and verified: {} assets",
+                job.asset_count()
+            );
+            return Ok(());
+        }
+    }
+
     if cli.album {
-        let cached_analyses = analysis_cache
-            .as_ref()
-            .map(|cache| {
-                analyze_many_for_plan_cached(
-                    cache,
-                    &cli.inputs,
-                    channel_roles_override.as_deref(),
-                    &plan,
-                    audio_track,
-                )
+        // A v3 album generation is all-or-nothing.  Only destinations that
+        // still need work participate in the preflight check; completed
+        // members have already been validated by the generation journal.
+        let pending_album = cli
+            .inputs
+            .iter()
+            .zip(&outputs)
+            .enumerate()
+            .filter(|(index, _)| {
+                !batch_job
+                    .as_ref()
+                    .is_some_and(|job| job.is_completed(*index))
             })
+            .map(|(_, pair)| pair)
+            .collect::<Vec<_>>();
+        validate_outputs(
+            &pending_album
+                .iter()
+                .map(|(input, _)| (*input).clone())
+                .collect::<Vec<_>>(),
+            &pending_album
+                .iter()
+                .map(|(_, output)| (*output).clone())
+                .collect::<Vec<_>>(),
+            cli.overwrite,
+        )?;
+
+        let mut album_progress = batch_options
+            .progress
+            .as_deref()
+            .map(|path| open_batch_progress(path, batch_job.as_ref()))
             .transpose()?;
+        if let Some(writer) = &mut album_progress {
+            writer.emit("job_started", 0, cli.inputs.len(), None, None)?;
+            for (index, (input, output)) in cli.inputs.iter().zip(&outputs).enumerate() {
+                writer.emit(
+                    "asset_started",
+                    0,
+                    cli.inputs.len(),
+                    Some((index, input, output)),
+                    None,
+                )?;
+            }
+        }
+
+        let cached_analyses = if let Some(cache) = analysis_cache.as_ref() {
+            analyze_many_for_plan_cached(
+                cache,
+                &cli.inputs,
+                channel_roles_override.as_deref(),
+                &plan,
+                audio_track,
+            )
+        } else if batch_job.is_some() {
+            // A durable album job must render from the exact immutable inputs
+            // whose hashes formed its v3 identity. Capture and bind them even
+            // when no analysis cache was requested.
+            analyze_many_for_plan_uncached(
+                &cli.inputs,
+                channel_roles_override.as_deref(),
+                &plan,
+                audio_track,
+            )
+        } else {
+            Ok(Vec::new())
+        };
+        let cached_analyses = match cached_analyses {
+            Ok(analyses) if !analyses.is_empty() || batch_job.is_some() => Some(analyses),
+            Ok(_) => None,
+            Err(error) => {
+                return Err(finish_generation_failure(
+                    &mut album_progress,
+                    batch_options.failure_report.as_deref(),
+                    batch_job.as_ref(),
+                    failure_policy,
+                    &cli.inputs,
+                    &outputs,
+                    (!cli.inputs.is_empty()).then_some(0),
+                    error,
+                ));
+            }
+        };
+        if let (Some(job), Some(analyses)) = (batch_job.as_ref(), cached_analyses.as_ref()) {
+            for (index, analysis) in analyses.iter().enumerate() {
+                if let Err(error) =
+                    job.verify_input_binding(index, analysis.descriptor.stable_input().binding())
+                {
+                    return Err(finish_generation_failure(
+                        &mut album_progress,
+                        batch_options.failure_report.as_deref(),
+                        batch_job.as_ref(),
+                        failure_policy,
+                        &cli.inputs,
+                        &outputs,
+                        Some(index),
+                        error,
+                    ));
+                }
+            }
+        }
         if cli.dry_run {
             let analyses = if let Some(analyses) = cached_analyses {
                 analyses
@@ -1970,9 +2418,20 @@ fn run_paths_with_watch_output(
             }
             return Ok(());
         }
-        prepare_output_directories(&outputs)?;
+        if let Err(error) = prepare_output_directories(&outputs) {
+            return Err(finish_generation_failure(
+                &mut album_progress,
+                batch_options.failure_report.as_deref(),
+                batch_job.as_ref(),
+                failure_policy,
+                &cli.inputs,
+                &outputs,
+                None,
+                error,
+            ));
+        }
         if cli.verify {
-            let corrected = if let Some(cached) = cached_analyses.as_deref() {
+            let staged = if let Some(cached) = cached_analyses.as_deref() {
                 let stable_inputs = cached
                     .iter()
                     .map(|cached| cached.input.clone())
@@ -1981,7 +2440,7 @@ fn run_paths_with_watch_output(
                     .iter()
                     .map(|cached| cached.analysis.clone())
                     .collect::<Vec<_>>();
-                normalize::normalize_album_bound_corrected_with_policy(
+                normalize::normalize_album_bound_corrected_staged_with_policy(
                     &stable_inputs,
                     &outputs,
                     &plan,
@@ -1991,9 +2450,9 @@ fn run_paths_with_watch_output(
                     &bound_analyses,
                     output_conflict_policy,
                 )
-                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())
             } else {
-                normalize::normalize_album_corrected_with_roles_and_policy(
+                normalize::normalize_album_corrected_staged_with_roles_and_policy(
                     &cli.inputs,
                     &outputs,
                     &plan,
@@ -2002,8 +2461,70 @@ fn run_paths_with_watch_output(
                     cli.verify_retries as usize,
                     channel_roles_override.as_deref(),
                     output_conflict_policy,
-                )?
+                )
             };
+            let staged = match staged {
+                Ok(staged) => staged,
+                Err(error) => {
+                    return Err(finish_generation_failure(
+                        &mut album_progress,
+                        batch_options.failure_report.as_deref(),
+                        batch_job.as_ref(),
+                        failure_policy,
+                        &cli.inputs,
+                        &outputs,
+                        None,
+                        error,
+                    ));
+                }
+            };
+            let corrected = if let (Some(job), Some(journal)) =
+                (&mut batch_job, generation_journal.as_deref())
+            {
+                let (prepared, corrected) = match staged.into_generation_parts() {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        return Err(finish_generation_failure(
+                            &mut album_progress,
+                            batch_options.failure_report.as_deref(),
+                            Some(&*job),
+                            failure_policy,
+                            &cli.inputs,
+                            &outputs,
+                            None,
+                            error,
+                        ));
+                    }
+                };
+                let commit_result = commit_batch_generation(job, journal, prepared);
+                finish_batch_generation_commit(
+                    commit_result,
+                    &mut album_progress,
+                    batch_options.failure_report.as_deref(),
+                    Some(&*job),
+                    failure_policy,
+                    &cli.inputs,
+                    &outputs,
+                )?;
+                corrected
+            } else {
+                match staged.commit() {
+                    Ok(corrected) => corrected,
+                    Err(error) => {
+                        return Err(finish_generation_failure(
+                            &mut album_progress,
+                            batch_options.failure_report.as_deref(),
+                            batch_job.as_ref(),
+                            failure_policy,
+                            &cli.inputs,
+                            &outputs,
+                            None,
+                            error,
+                        ));
+                    }
+                }
+            };
+            emit_album_completed(&mut album_progress, &cli.inputs, &outputs)?;
             for (input, source) in cli.inputs.iter().zip(&corrected.sources) {
                 print_analysis(input, source, Some(corrected.gain));
             }
@@ -2020,10 +2541,9 @@ fn run_paths_with_watch_output(
                 .zip(&outputs)
             {
                 if !print_verification(input, verification, &plan) {
-                    return Err(format!(
-                        "post-encode verification failed: {}",
-                        output.display()
-                    ));
+                    let error = format!("post-encode verification failed: {}", output.display());
+                    emit_album_failed(&mut album_progress, &cli.inputs, &outputs, None, &error)?;
+                    return Err(error);
                 }
             }
             let album_deviation =
@@ -2044,7 +2564,9 @@ fn run_paths_with_watch_output(
                 );
             }
             if !album_ok {
-                return Err("post-encode album verification failed".into());
+                let error = "post-encode album verification failed".to_string();
+                emit_album_failed(&mut album_progress, &cli.inputs, &outputs, None, &error)?;
+                return Err(error);
             }
             for (index, ((input, output), source)) in cli
                 .inputs
@@ -2102,7 +2624,7 @@ fn run_paths_with_watch_output(
             )?;
             return Ok(());
         }
-        let results = if cli.difference_report.is_some() {
+        let staged = if cli.difference_report.is_some() {
             if let Some(cached) = cached_analyses.as_deref() {
                 let stable_inputs = cached
                     .iter()
@@ -2112,7 +2634,7 @@ fn run_paths_with_watch_output(
                     .iter()
                     .map(|cached| cached.analysis.clone())
                     .collect::<Vec<_>>();
-                normalize::normalize_album_bound_audited_with_policy(
+                normalize::normalize_album_bound_audited_staged_with_policy(
                     &stable_inputs,
                     &outputs,
                     &plan,
@@ -2120,20 +2642,17 @@ fn run_paths_with_watch_output(
                     &bound_analyses,
                     output_conflict_policy,
                 )
-                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())
             } else {
-                normalize::normalize_album_audited_with_roles_and_policy(
+                normalize::normalize_album_audited_staged_with_roles_and_policy(
                     &cli.inputs,
                     &outputs,
                     &plan,
                     &formats,
                     channel_roles_override.as_deref(),
                     output_conflict_policy,
-                )?
+                )
             }
-            .into_iter()
-            .map(|(analysis, gain, render)| (analysis, gain, Some(render)))
-            .collect::<Vec<_>>()
         } else {
             if let Some(cached) = cached_analyses.as_deref() {
                 let stable_inputs = cached
@@ -2144,7 +2663,7 @@ fn run_paths_with_watch_output(
                     .iter()
                     .map(|cached| cached.analysis.clone())
                     .collect::<Vec<_>>();
-                normalize::normalize_album_bound_with_policy(
+                normalize::normalize_album_bound_staged_with_policy(
                     &stable_inputs,
                     &outputs,
                     &plan,
@@ -2152,21 +2671,79 @@ fn run_paths_with_watch_output(
                     &bound_analyses,
                     output_conflict_policy,
                 )
-                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())
             } else {
-                normalize::normalize_album_with_roles_and_policy(
+                normalize::normalize_album_staged_with_roles_and_policy(
                     &cli.inputs,
                     &outputs,
                     &plan,
                     &formats,
                     channel_roles_override.as_deref(),
                     output_conflict_policy,
-                )?
+                )
             }
-            .into_iter()
-            .map(|(analysis, gain)| (analysis, gain, None))
-            .collect()
         };
+        let staged = match staged {
+            Ok(staged) => staged,
+            Err(error) => {
+                return Err(finish_generation_failure(
+                    &mut album_progress,
+                    batch_options.failure_report.as_deref(),
+                    batch_job.as_ref(),
+                    failure_policy,
+                    &cli.inputs,
+                    &outputs,
+                    None,
+                    error,
+                ));
+            }
+        };
+        let results =
+            if let (Some(job), Some(journal)) = (&mut batch_job, generation_journal.as_deref()) {
+                let (prepared, outcomes) = match staged.into_generation_parts() {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        return Err(finish_generation_failure(
+                            &mut album_progress,
+                            batch_options.failure_report.as_deref(),
+                            Some(&*job),
+                            failure_policy,
+                            &cli.inputs,
+                            &outputs,
+                            None,
+                            error,
+                        ));
+                    }
+                };
+                let commit_result = commit_batch_generation(job, journal, prepared);
+                finish_batch_generation_commit(
+                    commit_result,
+                    &mut album_progress,
+                    batch_options.failure_report.as_deref(),
+                    Some(&*job),
+                    failure_policy,
+                    &cli.inputs,
+                    &outputs,
+                )?;
+                outcomes
+            } else {
+                match staged.commit() {
+                    Ok(results) => results,
+                    Err(error) => {
+                        return Err(finish_generation_failure(
+                            &mut album_progress,
+                            batch_options.failure_report.as_deref(),
+                            batch_job.as_ref(),
+                            failure_policy,
+                            &cli.inputs,
+                            &outputs,
+                            None,
+                            error,
+                        ));
+                    }
+                }
+            };
+        emit_album_completed(&mut album_progress, &cli.inputs, &outputs)?;
         let analyses: Vec<_> = results.iter().map(|(a, _, _)| a.clone()).collect();
         let album_l = normalize::album_lufs(&analyses);
         let gain = results.first().map(|r| r.1).unwrap_or(1.0);
@@ -2231,18 +2808,6 @@ fn run_paths_with_watch_output(
         return Ok(());
     }
 
-    let operation = batch_operation_descriptor(&cli, &plan, &formats, metadata_options);
-    let batch_assets = cli
-        .inputs
-        .iter()
-        .zip(&outputs)
-        .map(|(input, output)| BatchAssetSpec::new(input, output))
-        .collect::<Vec<_>>();
-    let mut batch_job = batch_options
-        .job_state
-        .as_ref()
-        .map(|path| BatchJob::open(path, &batch_assets, &operation, cli.overwrite))
-        .transpose()?;
     let pending_inputs = cli
         .inputs
         .iter()
@@ -2272,7 +2837,7 @@ fn run_paths_with_watch_output(
         // A progress path denotes a per-invocation live stream. Preserve its
         // historical replace-on-open behavior independently of audio output
         // overwrite policy; aliases were rejected by the output plan above.
-        .map(|path| ProgressWriter::open(path, true))
+        .map(|path| open_batch_progress(path, batch_job.as_ref()))
         .transpose()?;
     let initial_completed = batch_job.as_ref().map_or(0, BatchJob::completed_count);
     if let Some(writer) = &mut progress {
@@ -2285,12 +2850,486 @@ fn run_paths_with_watch_output(
         )?;
     }
 
+    if cli.verify {
+        if let Some(job) = batch_job.as_mut() {
+            let job_id = job
+                .job_id()
+                .ok_or_else(|| "generation batch requires a v3 job identity".to_string())?
+                .to_owned();
+            let semantic_fingerprint = job
+                .semantic_fingerprint()
+                .ok_or_else(|| "generation batch requires a semantic fingerprint".to_string())?
+                .to_owned();
+            let fingerprint_revision = job
+                .fingerprint_revision()
+                .ok_or_else(|| "generation batch requires a fingerprint revision".to_string())?;
+            let mut failure_report = BatchFailureReport::new(
+                &job_id,
+                semantic_fingerprint,
+                fingerprint_revision,
+                failure_policy,
+                cli.inputs.len(),
+            );
+            let mut prepared_outputs = Vec::with_capacity(cli.inputs.len());
+            let mut completed_assets = Vec::with_capacity(cli.inputs.len());
+            for (index, ((input, output), format)) in
+                cli.inputs.iter().zip(&outputs).zip(&formats).enumerate()
+            {
+                if let Some(writer) = &mut progress {
+                    writer.emit(
+                        "asset_started",
+                        0,
+                        cli.inputs.len(),
+                        Some((index, input, output)),
+                        None,
+                    )?;
+                }
+                let result = (|| {
+                    prepare_output_directories(std::slice::from_ref(output))?;
+                    let analyzed = if let Some(cache) = analysis_cache.as_ref() {
+                        analyze_for_plan_cached(
+                            cache,
+                            input,
+                            channel_roles_override.as_deref(),
+                            &plan,
+                            audio_track,
+                        )?
+                    } else {
+                        analyze_for_plan_descriptor(
+                            input,
+                            channel_roles_override.as_deref(),
+                            &plan,
+                            audio_track,
+                        )?
+                    };
+                    job.verify_input_binding(index, analyzed.descriptor.stable_input().binding())?;
+                    let staged = if metadata_options.active_for_normalization() {
+                    normalize::normalize_one_descriptor_bound_corrected_staged_with_metadata_policy(
+                        &analyzed.descriptor,
+                        output,
+                        &plan,
+                        *format,
+                        cli.verify_tolerance,
+                        cli.verify_retries as usize,
+                        &analyzed.analysis,
+                        &metadata_options.policy,
+                        output_conflict_policy,
+                    )
+                } else {
+                    normalize::normalize_one_descriptor_bound_corrected_staged_with_policy(
+                        &analyzed.descriptor,
+                        output,
+                        &plan,
+                        *format,
+                        cli.verify_tolerance,
+                        cli.verify_retries as usize,
+                        &analyzed.analysis,
+                        output_conflict_policy,
+                    )
+                }
+                .map_err(|error| error.to_string())?;
+                    let (prepared, outcome) = staged.into_generation_parts()?;
+                    Ok::<_, String>((prepared, outcome, analyzed.descriptor))
+                })();
+                match result {
+                    Ok((prepared, outcome, descriptor)) => {
+                        prepared_outputs.push(prepared);
+                        completed_assets.push((index, outcome, descriptor));
+                    }
+                    Err(error) => {
+                        if let Some(writer) = &mut progress {
+                            writer.emit(
+                                "asset_failed",
+                                0,
+                                cli.inputs.len(),
+                                Some((index, input, output)),
+                                Some(&error),
+                            )?;
+                        }
+                        failure_report.add_failure(BatchFailure::new(
+                            index,
+                            bounded_utf8(&input.to_string_lossy(), MAX_BATCH_PROGRESS_PATH_BYTES),
+                            bounded_utf8(&output.to_string_lossy(), MAX_BATCH_PROGRESS_PATH_BYTES),
+                            error.clone(),
+                        ))?;
+                        if !batch_options.keep_going {
+                            failure_report.set_completed_counts(completed_assets.len(), 0);
+                            return Err(finish_batch_report_failure(
+                                &mut progress,
+                                batch_options.failure_report.as_deref(),
+                                &failure_report,
+                                cli.inputs.len(),
+                                format!(
+                                    "asset verification failed; no generation was published: {error}"
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+            failure_report.set_completed_counts(completed_assets.len(), 0);
+            if failure_report.failed != 0 {
+                let summary = format!(
+                    "{} batch asset(s) failed verification; no generation was published",
+                    failure_report.failed
+                );
+                return Err(finish_batch_report_failure(
+                    &mut progress,
+                    batch_options.failure_report.as_deref(),
+                    &failure_report,
+                    cli.inputs.len(),
+                    summary,
+                ));
+            }
+            let journal = match generation_journal.as_deref() {
+                Some(journal) => journal,
+                None => {
+                    let error = "generation batch has no journal path".to_string();
+                    return Err(finish_generation_failure(
+                        &mut progress,
+                        batch_options.failure_report.as_deref(),
+                        Some(&*job),
+                        failure_policy,
+                        &cli.inputs,
+                        &outputs,
+                        None,
+                        error,
+                    ));
+                }
+            };
+            let commit_result = commit_batch_generation(job, journal, prepared_outputs);
+            finish_batch_generation_commit(
+                commit_result,
+                &mut progress,
+                batch_options.failure_report.as_deref(),
+                Some(&*job),
+                failure_policy,
+                &cli.inputs,
+                &outputs,
+            )?;
+            emit_album_completed(&mut progress, &cli.inputs, &outputs)?;
+            if let Some(path) = batch_options.failure_report.as_deref() {
+                // A success report is only valid after the generation journal
+                // and v3 checkpoint have committed successfully.
+                write_batch_failure_report(path, &failure_report)?;
+            }
+            for (index, corrected, descriptor) in &completed_assets {
+                let input = &cli.inputs[*index];
+                let output = &outputs[*index];
+                print_analysis(input, &corrected.source, Some(corrected.gain));
+                if !print_verification(input, &corrected.verification, &plan) {
+                    return Err(format!(
+                        "post-encode verification failed after generation publication: {}",
+                        output.display()
+                    ));
+                }
+                if corrected.attempts > 1 {
+                    eprintln!(
+                        "{} correction: {} re-encode pass(es)",
+                        input.display(),
+                        corrected.attempts - 1
+                    );
+                }
+                record_catalogue_asset(
+                    catalogue.as_mut(),
+                    &mut catalogue_records,
+                    CatalogueAsset {
+                        source: input,
+                        expected_source_sha256: catalogue_source_hashes
+                            .get(input)
+                            .map_or("", String::as_str),
+                        output: Some(output),
+                        measurement: &corrected.source,
+                        operation: "normalization",
+                        profile: &catalogue_profile(&cli, &plan),
+                        provenance: catalogue_provenance(&cli, &plan, "normalization"),
+                    },
+                    Some(descriptor),
+                    catalogue_descriptor_options(
+                        &cli,
+                        channel_roles_override.as_deref(),
+                        audio_track,
+                    ),
+                    &plan,
+                    catalogue_output_renderer(formats[*index]),
+                )?;
+            }
+            write_catalogue_report(
+                catalogue.as_ref(),
+                catalogue_options.report.as_deref(),
+                catalogue_records,
+                cli.overwrite,
+            )?;
+            return Ok(());
+        }
+    }
+
     let parallel_batch = cli.inputs.len() > 1
         && !cli.gain_only
         && !cli.dry_run
         && !cli.verify
         && cli.difference_report.is_none();
     if parallel_batch {
+        if let Some(job) = batch_job.as_mut() {
+            let job_id = job
+                .job_id()
+                .ok_or_else(|| "generation batch requires a v3 job identity".to_string())?
+                .to_owned();
+            let semantic_fingerprint = job
+                .semantic_fingerprint()
+                .ok_or_else(|| "generation batch requires a semantic fingerprint".to_string())?
+                .to_owned();
+            let fingerprint_revision = job
+                .fingerprint_revision()
+                .ok_or_else(|| "generation batch requires a fingerprint revision".to_string())?;
+            let mut failure_report = BatchFailureReport::new(
+                &job_id,
+                semantic_fingerprint,
+                fingerprint_revision,
+                failure_policy,
+                cli.inputs.len(),
+            );
+            let wave_width = rayon::current_num_threads().clamp(1, MAX_BATCH_WAVE_ASSETS);
+            let mut staged_assets = (0..cli.inputs.len()).map(|_| None).collect::<Vec<_>>();
+            let mut index = 0_usize;
+            while index < cli.inputs.len() {
+                let wave_start = index;
+                let wave_end = (wave_start + wave_width).min(cli.inputs.len());
+                if let Some(writer) = &mut progress {
+                    for (offset, (input, output)) in cli.inputs[wave_start..wave_end]
+                        .iter()
+                        .zip(&outputs[wave_start..wave_end])
+                        .enumerate()
+                    {
+                        writer.emit(
+                            "asset_started",
+                            0,
+                            cli.inputs.len(),
+                            Some((wave_start + offset, input, output)),
+                            None,
+                        )?;
+                    }
+                }
+                let staged = (wave_start..wave_end)
+                    .into_par_iter()
+                    .map(|asset_index| {
+                        let output = &outputs[asset_index];
+                        if let Err(error) = prepare_output_directories(std::slice::from_ref(output))
+                        {
+                            return (Err(error), None);
+                        }
+                        let (analyzed, observation) = if let Some(cache) = analysis_cache.as_ref() {
+                            match analyze_for_plan_cached_unobserved(
+                                cache,
+                                &cli.inputs[asset_index],
+                                channel_roles_override.as_deref(),
+                                &plan,
+                                audio_track,
+                            ) {
+                                Ok((analysis, observation)) => (analysis, Some(observation)),
+                                Err(error) => return (Err(error), None),
+                            }
+                        } else {
+                            match analyze_for_plan_descriptor(
+                                &cli.inputs[asset_index],
+                                channel_roles_override.as_deref(),
+                                &plan,
+                                audio_track,
+                            ) {
+                                Ok(analysis) => (analysis, None),
+                                Err(error) => return (Err(error), None),
+                            }
+                        };
+                        let staged = if metadata_options.active_for_normalization() {
+                            normalize::normalize_one_descriptor_bound_staged_with_metadata_policy(
+                                &analyzed.descriptor,
+                                output,
+                                &plan,
+                                formats[asset_index],
+                                &analyzed.analysis,
+                                &metadata_options.policy,
+                                output_conflict_policy,
+                            )
+                        } else {
+                            normalize::normalize_one_descriptor_bound_staged_with_policy(
+                                &analyzed.descriptor,
+                                output,
+                                &plan,
+                                formats[asset_index],
+                                &analyzed.analysis,
+                                output_conflict_policy,
+                            )
+                        }
+                        .map(|staged| (staged, analyzed.descriptor))
+                        .map_err(|error| error.to_string());
+                        (staged, observation)
+                    })
+                    .collect::<Vec<_>>();
+
+                for (asset_index, (staged, observation)) in (wave_start..wave_end).zip(staged) {
+                    let input = &cli.inputs[asset_index];
+                    let output = &outputs[asset_index];
+                    if let Some(observation) = observation {
+                        observe_cache_parts(input, observation.disposition, observation.warning);
+                    }
+                    let staged = staged.and_then(|(staged, descriptor)| {
+                        job.verify_input_binding(asset_index, descriptor.stable_input().binding())?;
+                        Ok((staged, descriptor))
+                    });
+                    match staged {
+                        Ok(staged) => staged_assets[asset_index] = Some(staged),
+                        Err(error) => {
+                            if let Some(writer) = &mut progress {
+                                writer.emit(
+                                    "asset_failed",
+                                    0,
+                                    cli.inputs.len(),
+                                    Some((asset_index, input, output)),
+                                    Some(&error),
+                                )?;
+                            }
+                            failure_report.add_failure(BatchFailure::new(
+                                asset_index,
+                                bounded_utf8(
+                                    &input.to_string_lossy(),
+                                    MAX_BATCH_PROGRESS_PATH_BYTES,
+                                ),
+                                bounded_utf8(
+                                    &output.to_string_lossy(),
+                                    MAX_BATCH_PROGRESS_PATH_BYTES,
+                                ),
+                                error.clone(),
+                            ))?;
+                            if !batch_options.keep_going {
+                                let rendered =
+                                    staged_assets.iter().filter(|asset| asset.is_some()).count();
+                                failure_report.set_completed_counts(rendered, 0);
+                                return Err(finish_batch_report_failure(
+                                    &mut progress,
+                                    batch_options.failure_report.as_deref(),
+                                    &failure_report,
+                                    cli.inputs.len(),
+                                    format!(
+                                        "asset rendering failed; no generation was published: {error}"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+                index = wave_end;
+            }
+
+            let rendered = staged_assets.iter().filter(|asset| asset.is_some()).count();
+            failure_report.set_completed_counts(rendered, 0);
+            if failure_report.failed != 0 {
+                let summary = format!(
+                    "{} batch asset(s) failed; no generation was published",
+                    failure_report.failed
+                );
+                return Err(finish_batch_report_failure(
+                    &mut progress,
+                    batch_options.failure_report.as_deref(),
+                    &failure_report,
+                    cli.inputs.len(),
+                    summary,
+                ));
+            }
+
+            let mut prepared_outputs = Vec::with_capacity(staged_assets.len());
+            let mut completed_assets = Vec::with_capacity(staged_assets.len());
+            let preparation = (|| -> Result<(), String> {
+                for staged in staged_assets {
+                    let (staged, descriptor) = staged.ok_or_else(|| {
+                        "generation batch lost a successfully rendered asset".to_string()
+                    })?;
+                    let (prepared, outcome) = staged.into_generation_parts()?;
+                    prepared_outputs.push(prepared);
+                    completed_assets.push((outcome, descriptor));
+                }
+                Ok(())
+            })();
+            if let Err(error) = preparation {
+                return Err(finish_generation_failure(
+                    &mut progress,
+                    batch_options.failure_report.as_deref(),
+                    Some(&*job),
+                    failure_policy,
+                    &cli.inputs,
+                    &outputs,
+                    None,
+                    error,
+                ));
+            }
+            let journal = match generation_journal.as_deref() {
+                Some(journal) => journal,
+                None => {
+                    let error = "generation batch has no journal path".to_string();
+                    return Err(finish_generation_failure(
+                        &mut progress,
+                        batch_options.failure_report.as_deref(),
+                        Some(&*job),
+                        failure_policy,
+                        &cli.inputs,
+                        &outputs,
+                        None,
+                        error,
+                    ));
+                }
+            };
+            let commit_result = commit_batch_generation(job, journal, prepared_outputs);
+            finish_batch_generation_commit(
+                commit_result,
+                &mut progress,
+                batch_options.failure_report.as_deref(),
+                Some(&*job),
+                failure_policy,
+                &cli.inputs,
+                &outputs,
+            )?;
+            emit_album_completed(&mut progress, &cli.inputs, &outputs)?;
+            if let Some(path) = batch_options.failure_report.as_deref() {
+                // Do not publish a success report until the all-or-nothing
+                // generation journal has committed.
+                write_batch_failure_report(path, &failure_report)?;
+            }
+
+            for (asset_index, (outcome, descriptor)) in completed_assets.iter().enumerate() {
+                let input = &cli.inputs[asset_index];
+                let output = &outputs[asset_index];
+                print_analysis(input, &outcome.source, Some(outcome.gain));
+                record_catalogue_asset(
+                    catalogue.as_mut(),
+                    &mut catalogue_records,
+                    CatalogueAsset {
+                        source: input,
+                        expected_source_sha256: catalogue_source_hashes
+                            .get(input)
+                            .map_or("", String::as_str),
+                        output: Some(output),
+                        measurement: &outcome.source,
+                        operation: "normalization",
+                        profile: &catalogue_profile(&cli, &plan),
+                        provenance: catalogue_provenance(&cli, &plan, "normalization"),
+                    },
+                    Some(descriptor),
+                    catalogue_descriptor_options(
+                        &cli,
+                        channel_roles_override.as_deref(),
+                        audio_track,
+                    ),
+                    &plan,
+                    catalogue_output_renderer(formats[asset_index]),
+                )?;
+            }
+            write_catalogue_report(
+                catalogue.as_ref(),
+                catalogue_options.report.as_deref(),
+                catalogue_records,
+                cli.overwrite,
+            )?;
+            return Ok(());
+        }
         let wave_width = rayon::current_num_threads().clamp(1, MAX_BATCH_WAVE_ASSETS);
         let mut index = 0_usize;
         let mut completed_without_job = 0_usize;
@@ -2429,6 +3468,15 @@ fn run_paths_with_watch_output(
                                 Some((asset_index, input, output)),
                                 Some(&error),
                             )?;
+                            if batch_job.is_none() {
+                                writer.emit(
+                                    "job_failed",
+                                    0,
+                                    cli.inputs.len(),
+                                    None,
+                                    Some(&error),
+                                )?;
+                            }
                         }
                         return Err(error);
                     }
@@ -2900,6 +3948,9 @@ fn run_paths_with_watch_output(
                     Some((index, input, output)),
                     Some(&error),
                 )?;
+                if batch_job.is_none() {
+                    writer.emit("job_failed", 0, cli.inputs.len(), None, Some(&error))?;
+                }
             }
             return Err(error);
         }
@@ -2972,6 +4023,56 @@ fn write_difference_report(
         &NormalizationDifferenceReport::new(assets),
         overwrite,
     )
+}
+
+fn write_batch_failure_report(path: &Path, report: &BatchFailureReport) -> Result<(), String> {
+    let bytes = report.to_bytes()?;
+    write_file_atomically(path, true, |file| {
+        file.write_all(&bytes)
+            .map_err(|error| format!("write batch failure report: {error}"))
+    })
+}
+
+fn write_generation_failure_report(
+    path: Option<&Path>,
+    job: Option<&BatchJob>,
+    failure_policy: BatchFailurePolicy,
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    error: &str,
+) -> Result<(), String> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let job = job.ok_or_else(|| {
+        "batch failure report requires a v3 job identity for generation failure".to_string()
+    })?;
+    let job_id = job
+        .job_id()
+        .ok_or_else(|| "generation failure report requires a v3 job identity".to_string())?;
+    let semantic_fingerprint = job
+        .semantic_fingerprint()
+        .ok_or_else(|| "generation failure report requires a semantic fingerprint".to_string())?;
+    let fingerprint_revision = job
+        .fingerprint_revision()
+        .ok_or_else(|| "generation failure report requires a fingerprint revision".to_string())?;
+    let mut report = BatchFailureReport::new(
+        job_id,
+        semantic_fingerprint.to_owned(),
+        fingerprint_revision,
+        failure_policy,
+        inputs.len(),
+    );
+    for (index, (input, output)) in inputs.iter().zip(outputs).enumerate() {
+        report.add_failure(BatchFailure::new(
+            index,
+            bounded_utf8(&input.to_string_lossy(), MAX_BATCH_PROGRESS_PATH_BYTES),
+            bounded_utf8(&output.to_string_lossy(), MAX_BATCH_PROGRESS_PATH_BYTES),
+            bounded_utf8(error, MAX_BATCH_FAILURE_ERROR_BYTES),
+        ))?;
+    }
+    report.set_completed_counts(0, 0);
+    write_batch_failure_report(path, &report)
 }
 
 fn stage_metadata_fidelity_report(
@@ -3252,13 +4353,37 @@ impl PipelineFiles {
     }
 }
 
+fn bounded_utf8(value: &str, maximum: usize) -> String {
+    if value.len() <= maximum {
+        return value.to_owned();
+    }
+    let mut end = maximum;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
 struct ProgressWriter {
     output: Box<dyn Write>,
     sequence: u64,
+    job_id: Option<String>,
 }
 
 impl ProgressWriter {
     fn open(path: &Path, overwrite: bool) -> Result<Self, String> {
+        Self::open_internal(path, overwrite, None)
+    }
+
+    fn open_generation(
+        path: &Path,
+        overwrite: bool,
+        job_id: impl Into<String>,
+    ) -> Result<Self, String> {
+        Self::open_internal(path, overwrite, Some(job_id.into()))
+    }
+
+    fn open_internal(path: &Path, overwrite: bool, job_id: Option<String>) -> Result<Self, String> {
         let output: Box<dyn Write> = if path == Path::new("-") {
             Box::new(io::stdout())
         } else {
@@ -3274,6 +4399,7 @@ impl ProgressWriter {
         Ok(Self {
             output,
             sequence: 0,
+            job_id,
         })
     }
 
@@ -3285,15 +4411,52 @@ impl ProgressWriter {
         asset: Option<(usize, &Path, &Path)>,
         error: Option<&str>,
     ) -> Result<(), String> {
-        let mut record = BatchProgressEvent::new(self.sequence, event, completed, total);
-        if let Some((index, input, output)) = asset {
-            record.index = Some(index);
-            record.input = Some(input.to_string_lossy().into_owned());
-            record.output = Some(output.to_string_lossy().into_owned());
+        if let Some(job_id) = &self.job_id {
+            // The v2 contract bounds paths and failure details in bytes.  Do
+            // this at the writer boundary so an arbitrarily long filesystem
+            // path or codec error cannot make the terminal failure event
+            // invalid (and consequently hide the original operation error).
+            let phase = match event {
+                "job_started" | "asset_started" => "rendering",
+                "asset_completed" | "asset_skipped" | "job_completed" => "committed",
+                "asset_failed" | "job_failed" => "failed",
+                _ => "unknown",
+            };
+            let mut record = BatchProgressEvent::new_v2(
+                self.sequence,
+                event,
+                completed,
+                total,
+                job_id,
+                1,
+                phase,
+            );
+            if let Some((index, input, output)) = asset {
+                record.index = Some(index);
+                record.input = Some(bounded_utf8(
+                    &input.to_string_lossy(),
+                    MAX_BATCH_PROGRESS_PATH_BYTES,
+                ));
+                record.output = Some(bounded_utf8(
+                    &output.to_string_lossy(),
+                    MAX_BATCH_PROGRESS_PATH_BYTES,
+                ));
+            }
+            record.error = error.map(|value| bounded_utf8(value, MAX_BATCH_FAILURE_ERROR_BYTES));
+            record.validate()?;
+            serde_json::to_writer(&mut self.output, &record)
+                .map_err(|error| format!("write progress event: {error}"))?;
+        } else {
+            let mut record = BatchProgressEvent::new(self.sequence, event, completed, total);
+            if let Some((index, input, output)) = asset {
+                record.index = Some(index);
+                record.input = Some(input.to_string_lossy().into_owned());
+                record.output = Some(output.to_string_lossy().into_owned());
+            }
+            record.error = error.map(str::to_owned);
+            serde_json::to_writer(&mut self.output, &record)
+                .map_err(|error| format!("write progress event: {error}"))?;
         }
-        record.error = error.map(str::to_owned);
-        serde_json::to_writer(&mut self.output, &record)
-            .map_err(|error| format!("write progress event: {error}"))?;
         self.output
             .write_all(b"\n")
             .and_then(|_| self.output.flush())
@@ -3306,11 +4469,436 @@ impl ProgressWriter {
     }
 }
 
+fn open_batch_progress(path: &Path, job: Option<&BatchJob>) -> Result<ProgressWriter, String> {
+    if let Some(job_id) = job.and_then(BatchJob::job_id) {
+        ProgressWriter::open_generation(path, true, job_id)
+    } else {
+        ProgressWriter::open(path, true)
+    }
+}
+
+fn emit_album_completed(
+    writer: &mut Option<ProgressWriter>,
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+) -> Result<(), String> {
+    let Some(writer) = writer else {
+        return Ok(());
+    };
+    for (index, (input, output)) in inputs.iter().zip(outputs).enumerate() {
+        writer.emit(
+            "asset_completed",
+            index + 1,
+            inputs.len(),
+            Some((index, input, output)),
+            None,
+        )?;
+    }
+    writer.emit("job_completed", inputs.len(), inputs.len(), None, None)
+}
+
+fn emit_album_failed(
+    writer: &mut Option<ProgressWriter>,
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    failed_index: Option<usize>,
+    error: &str,
+) -> Result<(), String> {
+    let Some(writer) = writer else {
+        return Ok(());
+    };
+    if let Some(index) = failed_index {
+        if let (Some(input), Some(output)) = (inputs.get(index), outputs.get(index)) {
+            writer.emit(
+                "asset_failed",
+                0,
+                inputs.len(),
+                Some((index, input, output)),
+                Some(error),
+            )?;
+        }
+    }
+    writer.emit("job_failed", 0, inputs.len(), None, Some(error))
+}
+
+fn append_auxiliary_failure(primary: &mut String, label: &str, result: Result<(), String>) {
+    if let Err(error) = result {
+        use std::fmt::Write as _;
+        let _ = write!(primary, "; {label}: {error}");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_generation_failure(
+    writer: &mut Option<ProgressWriter>,
+    report_path: Option<&Path>,
+    job: Option<&BatchJob>,
+    failure_policy: BatchFailurePolicy,
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+    failed_index: Option<usize>,
+    error: String,
+) -> String {
+    let progress_result = emit_album_failed(writer, inputs, outputs, failed_index, &error);
+    let report_result =
+        write_generation_failure_report(report_path, job, failure_policy, inputs, outputs, &error);
+    let mut combined = error;
+    append_auxiliary_failure(
+        &mut combined,
+        "emit terminal generation progress",
+        progress_result,
+    );
+    append_auxiliary_failure(
+        &mut combined,
+        "write generation failure report",
+        report_result,
+    );
+    combined
+}
+
+fn finish_batch_report_failure(
+    writer: &mut Option<ProgressWriter>,
+    report_path: Option<&Path>,
+    report: &BatchFailureReport,
+    total: usize,
+    summary: String,
+) -> String {
+    let progress_result = if let Some(writer) = writer {
+        writer.emit("job_failed", 0, total, None, Some(&summary))
+    } else {
+        Ok(())
+    };
+    let report_result = report_path.map_or(Ok(()), |path| write_batch_failure_report(path, report));
+    let mut combined = summary;
+    append_auxiliary_failure(
+        &mut combined,
+        "emit terminal batch progress",
+        progress_result,
+    );
+    append_auxiliary_failure(&mut combined, "write batch failure report", report_result);
+    combined
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BatchGenerationCheckpointOutcome {
+    Persisted,
+    CommittedNeedsCheckpoint(String),
+}
+
+fn classify_committed_checkpoint_result(
+    was_complete: bool,
+    is_complete: bool,
+    result: Result<(), String>,
+) -> Result<BatchGenerationCheckpointOutcome, String> {
+    match result {
+        Ok(()) => Ok(BatchGenerationCheckpointOutcome::Persisted),
+        Err(error) if !was_complete && is_complete => Ok(
+            BatchGenerationCheckpointOutcome::CommittedNeedsCheckpoint(error),
+        ),
+        Err(error) => Err(error),
+    }
+}
+
+fn checkpoint_committed_generation(
+    job: &mut BatchJob,
+    status: &forge_normalizer::generation::GenerationStatus,
+) -> Result<BatchGenerationCheckpointOutcome, String> {
+    // `mark_generation_completed_with_evidence` performs every journal/job and
+    // live-output check before mutating the in-memory document. Therefore the
+    // false -> true transition on an error precisely identifies a state-save
+    // failure after the audio generation was already proved committed.
+    let was_complete = job.is_complete();
+    let result = job.mark_generation_completed_with_evidence(status);
+    classify_committed_checkpoint_result(was_complete, job.is_complete(), result)
+}
+
+fn committed_checkpoint_failure(
+    checkpoint_error: String,
+    progress_result: Result<(), String>,
+) -> String {
+    let mut combined = format!(
+        "audio generation committed, but its batch checkpoint requires retry: {checkpoint_error}"
+    );
+    append_auxiliary_failure(
+        &mut combined,
+        "emit committed generation progress",
+        progress_result,
+    );
+    combined
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_batch_generation_commit(
+    commit_result: Result<BatchGenerationCheckpointOutcome, String>,
+    writer: &mut Option<ProgressWriter>,
+    report_path: Option<&Path>,
+    job: Option<&BatchJob>,
+    failure_policy: BatchFailurePolicy,
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+) -> Result<(), String> {
+    match commit_result {
+        Ok(BatchGenerationCheckpointOutcome::Persisted) => Ok(()),
+        Ok(BatchGenerationCheckpointOutcome::CommittedNeedsCheckpoint(error)) => Err(
+            committed_checkpoint_failure(error, emit_album_completed(writer, inputs, outputs)),
+        ),
+        Err(error) => Err(finish_generation_failure(
+            writer,
+            report_path,
+            job,
+            failure_policy,
+            inputs,
+            outputs,
+            None,
+            error,
+        )),
+    }
+}
+
+fn reconcile_batch_generation(
+    job: &mut BatchJob,
+    journal: &Path,
+    reset_changed_outputs: bool,
+) -> Result<BatchGenerationCheckpointOutcome, String> {
+    match std::fs::symlink_metadata(journal) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if job.is_complete() {
+                if reset_changed_outputs {
+                    job.reset_completed_generation_for_rebuild()?;
+                    eprintln!(
+                        "completed batch generation journal is missing; rebuilding all outputs because --overwrite was supplied: {}",
+                        journal.display()
+                    );
+                    return Ok(BatchGenerationCheckpointOutcome::Persisted);
+                }
+                return Err(format!(
+                    "completed batch state is missing its generation journal: {}",
+                    journal.display()
+                ));
+            }
+            return Ok(BatchGenerationCheckpointOutcome::Persisted);
+        }
+        Err(error) => {
+            return Err(format!(
+                "inspect batch generation journal {}: {error}",
+                journal.display()
+            ));
+        }
+        Ok(_) => {}
+    }
+    let phase = GenerationTransaction::inspect_phase(journal)?;
+    if !job.is_complete() {
+        if phase == GenerationPhase::RolledBack {
+            return Ok(BatchGenerationCheckpointOutcome::Persisted);
+        }
+        if reset_changed_outputs
+            && phase == GenerationPhase::Committed
+            && GenerationTransaction::inspect(journal).is_err()
+        {
+            // An explicitly authorized --overwrite rebuild may have reset the
+            // whole v3 job after a terminal generation's outputs changed. The
+            // new fully staged generation will replace this terminal journal.
+            return Ok(BatchGenerationCheckpointOutcome::Persisted);
+        }
+    }
+    let job_id = job
+        .job_id()
+        .ok_or_else(|| "batch generation recovery requires a v3 job identity".to_string())?
+        .to_owned();
+    let recovery = match GenerationTransaction::resume_with_fingerprint(journal, &job_id) {
+        Ok(recovery) => recovery,
+        Err(resume_error) if phase == GenerationPhase::Committed => {
+            match GenerationTransaction::inspect(journal) {
+                Ok(status) => {
+                    if status.semantic_fingerprint() != job_id {
+                        return Err(format!(
+                            "{resume_error}; committed generation identity differs from batch job"
+                        ));
+                    }
+                    // A committed journal can remain valid even when cleanup
+                    // of its authenticated private backup reports an error.
+                    // Cleanup is recoverable maintenance; checkpoint the
+                    // already-committed audio instead of reporting job_failed.
+                    eprintln!(
+                        "committed generation requires private-backup cleanup: {resume_error}"
+                    );
+                    GenerationRecovery::Committed(status)
+                }
+                Err(inspect_error) if reset_changed_outputs && job.is_complete() => {
+                    // A same-byte replacement has the expected digest but not
+                    // the committed generation's file identity. `open_v3`
+                    // cannot observe that distinction from its hash-only
+                    // checkpoint, so honor the explicit rebuild authorization
+                    // only after the complete batch is reset atomically.
+                    job.reset_completed_generation_for_rebuild()?;
+                    eprintln!(
+                        "committed generation evidence changed; rebuilding all outputs because --overwrite was supplied: {resume_error}; inspection: {inspect_error}"
+                    );
+                    return Ok(BatchGenerationCheckpointOutcome::Persisted);
+                }
+                Err(inspect_error) => {
+                    return Err(format!(
+                        "{resume_error}; committed generation inspection failed: {inspect_error}"
+                    ));
+                }
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    let checkpoint = match recovery {
+        GenerationRecovery::Ready(transaction) => {
+            eprintln!(
+                "resuming ready batch generation: {} members",
+                transaction.member_count()
+            );
+            finalize_batch_generation_transaction(job, journal, &job_id, transaction)?
+        }
+        GenerationRecovery::Committed(status) => {
+            if status.semantic_fingerprint() != job_id {
+                return Err("committed generation identity differs from batch job".into());
+            }
+            checkpoint_committed_generation(job, &status)?
+        }
+        GenerationRecovery::RolledBack(status) => {
+            if job.is_complete() {
+                return Err(format!(
+                    "batch state is complete but generation {} is rolled back",
+                    status.generation_id()
+                ));
+            }
+            BatchGenerationCheckpointOutcome::Persisted
+        }
+    };
+    Ok(checkpoint)
+}
+
+fn commit_batch_generation(
+    job: &mut BatchJob,
+    journal: &Path,
+    outputs: Vec<PreparedGenerationOutput>,
+) -> Result<BatchGenerationCheckpointOutcome, String> {
+    let job_id = job
+        .job_id()
+        .ok_or_else(|| "batch generation requires a v3 job identity".to_string())?
+        .to_owned();
+    let transaction = match std::fs::symlink_metadata(journal) {
+        Ok(_) => GenerationTransaction::prepare_replacing_terminal(journal, &job_id, outputs)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            GenerationTransaction::prepare(journal, &job_id, outputs)?
+        }
+        Err(error) => {
+            return Err(format!(
+                "inspect generation journal {}: {error}",
+                journal.display()
+            ));
+        }
+    };
+    finalize_batch_generation_transaction(job, journal, &job_id, transaction)
+}
+
+fn finalize_batch_generation_transaction(
+    job: &mut BatchJob,
+    journal: &Path,
+    job_id: &str,
+    transaction: GenerationTransaction,
+) -> Result<BatchGenerationCheckpointOutcome, String> {
+    let status = reconcile_generation_commit_result(journal, job_id, transaction.commit())?;
+    checkpoint_committed_generation(job, &status)
+}
+
+fn reconcile_generation_commit_result(
+    journal: &Path,
+    job_id: &str,
+    commit_result: Result<forge_normalizer::generation::GenerationStatus, String>,
+) -> Result<forge_normalizer::generation::GenerationStatus, String> {
+    match commit_result {
+        Ok(status) => Ok(status),
+        Err(commit_error) => {
+            // Publication can have completed before the final committed-state
+            // write or private-backup cleanup reports an error. Reconcile the
+            // durable journal before classifying every asset as failed. This
+            // also rolls a genuinely partial publication back under the same
+            // journal lock and evidence checks.
+            match GenerationTransaction::recover_with_fingerprint(journal, job_id) {
+                Ok(status) if status.phase() == GenerationPhase::Committed => {
+                    eprintln!(
+                        "generation commit finalization recovered after an error: {commit_error}"
+                    );
+                    Ok(status)
+                }
+                Ok(status) => Err(format!(
+                    "{commit_error}; generation recovery reached {}",
+                    status.phase()
+                )),
+                Err(recovery_error) => match GenerationTransaction::inspect(journal) {
+                    Ok(status) if status.phase() == GenerationPhase::Committed => {
+                        // The committed journal and every live destination are
+                        // valid. Cleanup is recoverable maintenance, not a
+                        // failed audio generation; preserve the warning while
+                        // allowing the v3 checkpoint to reflect reality.
+                        eprintln!(
+                            "generation is committed but private cleanup still requires recovery: {commit_error}; recovery attempt: {recovery_error}"
+                        );
+                        Ok(status)
+                    }
+                    Ok(status) => Err(format!(
+                        "{commit_error}; generation recovery failed: {recovery_error}; journal remains {}",
+                        status.phase()
+                    )),
+                    Err(inspect_error) => Err(format!(
+                        "{commit_error}; generation recovery failed: {recovery_error}; journal inspection failed: {inspect_error}"
+                    )),
+                },
+            }
+        }
+    }
+}
+
+fn emit_completed_resume_progress(
+    path: Option<&Path>,
+    job: &BatchJob,
+    inputs: &[PathBuf],
+    outputs: &[PathBuf],
+) -> Result<(), String> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let job_id = job
+        .job_id()
+        .ok_or_else(|| "generation progress requires a v3 job identity".to_string())?;
+    let mut writer = ProgressWriter::open_generation(path, true, job_id)?;
+    writer.emit(
+        "job_started",
+        job.completed_count(),
+        job.asset_count(),
+        None,
+        None,
+    )?;
+    for (index, (input, output)) in inputs.iter().zip(outputs).enumerate() {
+        writer.emit(
+            "asset_skipped",
+            job.completed_count(),
+            job.asset_count(),
+            Some((index, input, output)),
+            None,
+        )?;
+    }
+    writer.emit(
+        "job_completed",
+        job.completed_count(),
+        job.asset_count(),
+        None,
+        None,
+    )
+}
+
 fn batch_operation_descriptor(
     cli: &cli::Cli,
     plan: &Plan,
     formats: &[OutputFormat],
     metadata_options: &MetadataInvocationOptions,
+    analysis_engine: AnalysisEngine,
+    audio_track: Option<u32>,
 ) -> serde_json::Value {
     let descriptor = serde_json::json!({
         "schema": "forge-normalization-operation-v1",
@@ -3339,9 +4927,15 @@ fn batch_operation_descriptor(
         "verify": cli.verify,
         "verify_tolerance": cli.verify_tolerance,
         "verify_retries": cli.verify_retries,
+        "album": cli.album,
+        "analysis_engine": analysis_engine.id(),
+        "audio_track": audio_track,
         "channel_layout": cli.channel_layout,
         "dual_mono": cli.dual_mono,
-        "formats": formats.iter().map(|format| fmt_ext(*format)).collect::<Vec<_>>(),
+        "formats": formats
+            .iter()
+            .map(|format| operation_format_id(*format))
+            .collect::<Vec<_>>(),
     });
     metadata_operation_descriptor(descriptor, metadata_options)
 }
@@ -3387,15 +4981,31 @@ fn validate_control_paths(
     let mut controls = Vec::new();
     if let Some(path) = &batch_options.job_state {
         controls.push(("--job-state", comparison_path(path)?));
+        controls.push((
+            "--job-state generation journal",
+            comparison_path(&generation_state_path(path)?)?,
+        ));
     }
     if let Some(path) = &batch_options.progress {
         if path != Path::new("-") {
             controls.push(("--progress", comparison_path(path)?));
         }
     }
+    if let Some(path) = &batch_options.failure_report {
+        if path == Path::new("-") {
+            return Err("--failure-report requires a file path".into());
+        }
+        controls.push(("--failure-report", comparison_path(path)?));
+    }
+    let audio_paths = cli
+        .inputs
+        .iter()
+        .chain(outputs)
+        .map(|path| comparison_path(path))
+        .collect::<Result<Vec<_>, _>>()?;
     for (label, control) in &controls {
-        for path in cli.inputs.iter().chain(outputs) {
-            if comparison_path(path)? != *control {
+        for path in &audio_paths {
+            if path != control {
                 continue;
             }
             return Err(format!(
@@ -3404,8 +5014,15 @@ fn validate_control_paths(
             ));
         }
     }
-    if controls.len() == 2 && controls[0].1 == controls[1].1 {
-        return Err("--job-state and --progress require different paths".into());
+    for left in 0..controls.len() {
+        for right in left + 1..controls.len() {
+            if controls[left].1 == controls[right].1 {
+                return Err(format!(
+                    "{} and {} require different paths",
+                    controls[left].0, controls[right].0
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -3455,9 +5072,15 @@ fn validate_catalogue_paths(
     if stdin_requested || cli.output.as_deref() == Some(Path::new("-")) {
         return Err("--catalogue does not support stdin or binary stdout".into());
     }
+    let audio_paths = cli
+        .inputs
+        .iter()
+        .chain(outputs)
+        .map(|path| comparison_path(path))
+        .collect::<Result<Vec<_>, _>>()?;
     let database = comparison_path(database)?;
-    for path in cli.inputs.iter().chain(outputs) {
-        if comparison_path(path)? == database {
+    for path in &audio_paths {
+        if path == &database {
             return Err(format!(
                 "--catalogue must not overwrite an audio input or output: {}",
                 database.display()
@@ -3478,8 +5101,8 @@ fn validate_catalogue_paths(
         if report == database {
             return Err("--catalogue and --catalogue-report require different paths".into());
         }
-        for path in cli.inputs.iter().chain(outputs) {
-            if comparison_path(path)? == report {
+        for path in &audio_paths {
+            if path == &report {
                 return Err(format!(
                     "--catalogue-report must not overwrite an audio input or output: {}",
                     report.display()
@@ -3599,12 +5222,70 @@ fn catalogue_provenance(cli: &cli::Cli, plan: &Plan, operation: &str) -> serde_j
 }
 
 fn comparison_path(path: &Path) -> Result<PathBuf, String> {
-    if path.exists() {
-        std::fs::canonicalize(path)
-            .map_err(|error| format!("canonicalize {}: {error}", path.display()))
-    } else {
-        std::path::absolute(path).map_err(|error| format!("resolve {}: {error}", path.display()))
+    let absolute = std::path::absolute(path)
+        .map_err(|error| format!("resolve {}: {error}", path.display()))?;
+    match std::fs::canonicalize(&absolute) {
+        Ok(resolved) => return Ok(comparison_path_platform_key(resolved)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!("canonicalize {}: {error}", path.display()));
+        }
     }
+    let components = absolute.components().collect::<Vec<_>>();
+    let mut resolved = PathBuf::new();
+    let mut missing_at = None;
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            std::path::Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            std::path::Component::RootDir => {
+                resolved.push(Path::new(std::path::MAIN_SEPARATOR_STR));
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir | std::path::Component::Normal(_) => {
+                let candidate = resolved.join(component.as_os_str());
+                match std::fs::canonicalize(&candidate) {
+                    Ok(canonical) => resolved = canonical,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        missing_at = Some(index);
+                        break;
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "canonicalize path prefix {}: {error}",
+                            candidate.display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(index) = missing_at {
+        for component in &components[index..] {
+            match component {
+                std::path::Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+                std::path::Component::RootDir => {
+                    resolved.push(Path::new(std::path::MAIN_SEPARATOR_STR));
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    let _ = resolved.pop();
+                }
+                std::path::Component::Normal(value) => resolved.push(value),
+            }
+        }
+    }
+    Ok(comparison_path_platform_key(resolved))
+}
+
+fn comparison_path_platform_key(resolved: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    let resolved = {
+        // Generation path keys use the same conservative ASCII folding for
+        // Windows path aliases. A lossy collision only rejects an ambiguous
+        // control path; it never authorizes an overwrite.
+        PathBuf::from(resolved.to_string_lossy().to_ascii_lowercase())
+    };
+    resolved
 }
 
 fn print_compliance(
@@ -3744,6 +5425,20 @@ struct CachedPlanAnalysis {
 struct CacheObservation {
     disposition: CacheDisposition,
     warning: Option<String>,
+}
+
+fn analyze_many_for_plan_uncached(
+    inputs: &[PathBuf],
+    channel_roles: Option<&[ChannelRole]>,
+    plan: &Plan,
+    audio_track: Option<u32>,
+) -> Result<Vec<CachedPlanAnalysis>, String> {
+    inputs
+        .par_iter()
+        .map(|input| analyze_for_plan_descriptor(input, channel_roles, plan, audio_track))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn analyze_many_for_plan_cached(
@@ -4433,6 +6128,17 @@ fn build_output_plan(
             state_lock_path(path)?,
             true,
         ));
+        let generation = generation_state_path(path)?;
+        outputs.push(PlannedOutput::new(
+            "batch generation journal",
+            &generation,
+            true,
+        ));
+        outputs.push(PlannedOutput::new(
+            "batch generation lock",
+            state_lock_path(&generation)?,
+            true,
+        ));
     }
     if let Some(path) = batch_options
         .progress
@@ -4440,6 +6146,9 @@ fn build_output_plan(
         .filter(|path| *path != Path::new("-"))
     {
         outputs.push(PlannedOutput::new("batch progress report", path, true));
+    }
+    if let Some(path) = &batch_options.failure_report {
+        outputs.push(PlannedOutput::new("batch failure report", path, true));
     }
     if let Some(path) = &catalogue_options.database {
         outputs.push(PlannedOutput::new("catalogue database", path, true));
@@ -4467,6 +6176,18 @@ fn state_lock_path(state: &Path) -> Result<PathBuf, String> {
     let mut lock_name = name.to_os_string();
     lock_name.push(".lock");
     Ok(state.with_file_name(lock_name))
+}
+
+fn generation_state_path(batch_state: &Path) -> Result<PathBuf, String> {
+    let name = batch_state.file_name().ok_or_else(|| {
+        format!(
+            "batch state path has no final component: {}",
+            batch_state.display()
+        )
+    })?;
+    let mut generation_name = name.to_os_string();
+    generation_name.push(".generation.json");
+    Ok(batch_state.with_file_name(generation_name))
 }
 
 fn prepare_output_directories(outputs: &[PathBuf]) -> Result<(), String> {
@@ -4564,6 +6285,23 @@ fn fmt_ext(f: OutputFormat) -> &'static str {
         OutputFormat::M4a => "m4a",
         OutputFormat::Alac => "m4a",
         OutputFormat::Vorbis => "ogg",
+    }
+}
+
+/// Stable semantic format identifiers used by operation fingerprints.
+///
+/// These are deliberately distinct from filename/container extensions: ALAC
+/// is carried in an M4A container and Vorbis in Ogg, but changing either
+/// codec must still change the normalization operation identity.
+const fn operation_format_id(format: OutputFormat) -> &'static str {
+    match format {
+        OutputFormat::Wav => "wav",
+        OutputFormat::Flac => "flac",
+        OutputFormat::Mp3 => "mp3",
+        OutputFormat::Opus => "opus",
+        OutputFormat::M4a => "m4a",
+        OutputFormat::Alac => "alac",
+        OutputFormat::Vorbis => "vorbis",
     }
 }
 
@@ -4699,4 +6437,42 @@ fn print_analysis(path: &Path, an: &normalize::Analysis, gain: Option<f32>) {
         },
         an.peak_to_loudness_ratio_lu(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        bounded_utf8, classify_committed_checkpoint_result, BatchGenerationCheckpointOutcome,
+    };
+
+    #[test]
+    fn bounded_utf8_truncates_at_a_character_boundary() {
+        let value = "あ".repeat(2_000);
+        let bounded = bounded_utf8(&value, 4_097);
+        assert!(bounded.len() <= 4_097);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert_eq!(bounded.chars().count(), 1_365);
+    }
+
+    #[test]
+    fn committed_checkpoint_errors_are_not_classified_as_generation_failures() {
+        assert_eq!(
+            classify_committed_checkpoint_result(false, true, Err("save failed".into())).unwrap(),
+            BatchGenerationCheckpointOutcome::CommittedNeedsCheckpoint("save failed".into())
+        );
+        assert_eq!(
+            classify_committed_checkpoint_result(false, true, Ok(())).unwrap(),
+            BatchGenerationCheckpointOutcome::Persisted
+        );
+        assert_eq!(
+            classify_committed_checkpoint_result(false, false, Err("validation failed".into()))
+                .unwrap_err(),
+            "validation failed"
+        );
+        assert_eq!(
+            classify_committed_checkpoint_result(true, true, Err("revalidation failed".into()))
+                .unwrap_err(),
+            "revalidation failed"
+        );
+    }
 }

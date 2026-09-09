@@ -6,7 +6,46 @@ tags and keeps public compatibility commitments in
 
 ## Unreleased
 
-- No user-visible changes yet.
+## 0.189.15 - 2026-09-09
+
+### Added
+
+- Add `batch-job-v3` semantic job identity, including analysis/decoder
+  revisions, selected audio-track policy, exact writer capability evidence,
+  optional metadata-fidelity operation fields, and deterministic job IDs.
+- Stage every pending album or independent-batch audio output before publishing
+  it through the sibling `<job-state>.generation.json` journal. Destination
+  preimages, private backups, stage hashes, rollback, and restart recovery are
+  validated with bounded generation evidence.
+- Add versioned `batch-progress-v2`, bounded `batch-failure-report-v1`, and
+  `normalization-semantic-context-v1` contracts. `--keep-going` is available
+  only for independent v3 batches and publishes no new audio generation when
+  any asset fails; `--verify` participates in the bound operation before
+  publication.
+- Add side-effect-free `forge recovery inspect STATE` and explicitly
+  confirmed `forge recovery reclaim STATE --yes`. Reclaim only accepts private
+  stage/backup paths proved by the journal and never removes unknown
+  `.forge-*` files.
+- Bind requested M4A Sound Check (`iTunNORM`) bytes to exact ISO-BMFF writer
+  evidence and read them back after the complete loudness writer set, allowing
+  that evidence-backed path under strict metadata fidelity while MP3/WAVE
+  Sound Check remains fail-closed.
+- Keep dry runs free of durable output, state, report, catalogue, and external
+  renderer writes. `--warm-cache` is the only explicit dry-run mutation.
+
+### Compatibility and boundaries
+
+- `--job-state` now accepts only `batch-job-v3`; registered v1/v2 documents are
+  not implicitly migrated because their per-asset checkpoints cannot prove
+  generation atomicity. The no-state progress stream retains v1 compatibility.
+- The generation guarantee covers the audio destination set. Catalogue
+  asset-record updates and auxiliary report writes remain a separate
+  post-audio-commit boundary; opening a configured catalogue may initialize its
+  database before audio work begins.
+- If the generation is committed but the final v3 batch checkpoint cannot be
+  saved, keep the audio committed, emit committed progress rather than a false
+  asset failure, return nonzero, and repair only the checkpoint on an identical
+  resume.
 
 ## 0.189.14 - 2026-09-07
 
@@ -36,8 +75,8 @@ tags and keeps public compatibility commitments in
 - Keep the existing CLI default behavior when no metadata policy is supplied;
   callers can opt into the new policies with `--metadata-policy`, while
   `legacy-generic` makes the compatibility choice explicit. The metadata-only
-  transaction is intentionally single-file; generation-level all-or-nothing
-  album/batch publication remains the v0.189.15 scope.
+  transaction was intentionally single-file in this release; generation-level
+  all-or-nothing album/batch publication shipped in v0.189.15.
 - Validate and synchronize an optional fidelity report before audio
   publication, then publish the two paths in order. The report contract
   documents the remaining cross-path crash window; metadata-only state retains

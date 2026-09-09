@@ -308,11 +308,13 @@ Forge already provides:
   workflows, including the exact intended pre-codec measurement, bounded gain
   envelope, limiter amount, clipping/ceiling counts, decoded-output endpoints,
   SHA-256 provenance, and codec loudness/peak/duration drift.
-- Resumable independent-track batch jobs with atomic per-output checkpoints,
-  input/settings/output SHA-256 binding, a crash-recoverable
+- The historical independent-track batch foundation used per-output
+  checkpoints, input/settings/output SHA-256 binding, a crash-recoverable
   `ready_to_publish` state, process locking, missing-output recovery,
-  changed-output rejection, v1-to-v2 migration, and schema-validated lifecycle
-  NDJSON.
+  changed-output rejection, and v1/v2 lifecycle documents. Those documents
+  remain available for compatibility inspection only; the current
+  `--job-state` path uses `batch-job-v3` generation publication and never
+  implicitly migrates v1/v2 state.
 - Opt-in content-addressed core analysis cache with streaming input SHA-256,
   request and algorithm revision binding, atomic schema-validated entries,
   corruption recovery, read-only operation, bounded FIFO eviction, and
@@ -525,7 +527,9 @@ adding another broad parser surface, Forge will:
   field-level preserved/mapped/recomputed/dropped reporting, exact rational
   sample-indexed BWF/DAW timing conversion after resampling, and resumable
   metadata-only single-file jobs;
-- defer generation-level all-or-nothing album/batch publication to v0.189.15;
+- use the v0.189.15 generation journal for all-or-nothing album/batch audio
+  publication, with semantic job identity, bounded failure reporting, and
+  side-effect-free dry runs outside explicit cache warming;
 - retain the v0.189.13 secure service boundary and bounded subprocess broker.
   A later strict broker profile will additionally combine OS filesystem and
   syscall isolation, disable networking and privilege gain, and fail closed
@@ -552,8 +556,38 @@ and raw-retention limits. Supported sample-indexed BWF/DAW timing fields use
 checked exact rational sample-clock conversion, including an explicit tie rule
 and crop origin; XML-bearing timing remains opaque. A restartable transaction
 binds one source file to a private verified stage and publishes it once with a
-compare-and-swap check. Album/batch generation atomicity is intentionally the
-v0.189.15 follow-up.
+compare-and-swap check. Multi-file generation publication is the subsequent
+v0.189.15 milestone described below.
+
+### Generation publication delivered in v0.189.15
+
+`--job-state` now creates a `batch-job-v3` document and a sibling
+`<job-state>.generation.json` journal. The job binds the ordered manifest,
+normalization operation, analysis/decoder/track context, writer capability
+identity, and failure policy to a deterministic job ID. Existing batch-job-v1
+and v2 documents are retained for compatibility inspection but are never
+implicitly migrated by the CLI.
+
+Opening a configured catalogue may initialize its database, schema, or WAL
+before audio work begins. Catalogue asset-record updates and auxiliary report
+writes remain outside the audio generation transaction and occur after audio
+publication.
+
+All pending album or independent-batch audio outputs are rendered and verified
+in private stages before the generation journal publishes them in order. The
+journal records destination preimages, stage hashes, backups, and the
+`ready`/`publishing`/`committed`/`rolled_back` lifecycle, allowing an
+interrupted publication to converge to the exact new generation or restore the
+old preimages. `--verify` is part of the bound operation and runs before
+publication. `--keep-going` is limited to independent batches and emits the
+bounded `batch-failure-report-v1` contract; any failure prevents a new audio
+generation from being published.
+
+`forge recovery inspect STATE` has no durable side effects. `recovery reclaim`
+is a report-only dry run unless `--yes` is supplied and never removes unknown
+`.forge-*` paths. Generation progress uses `batch-progress-v2` with job ID,
+generation, and phase fields. Dry runs remain side-effect-free except for
+explicit `--warm-cache` mutation.
 
 ### Newly identified integrity gates
 
@@ -576,10 +610,10 @@ batch, and configuration paths rather than by adding another format checklist:
 - probe the exact encoder and muxer capability before decoding, rather than
   treating a successful `ffmpeg -version` as proof that AAC, ALAC, or Vorbis
   output is available;
-- extend the crash-recoverable batch checkpoint with a semantic operation
-  fingerprint containing the analysis revision, codec, and encoder identity,
-  plus an opt-in bounded `--keep-going` failure report;
-- make dry-run behavior side-effect-free across file reports and external
+- keep the v0.189.15 semantic operation fingerprint, generation journal,
+  bounded `--keep-going` failure report, and recovery/reclaim evidence
+  contracts aligned across every future writer and decoder revision;
+- preserve side-effect-free dry-run behavior across file reports and external
   renderer outputs, retaining `--warm-cache` as the only explicit mutation;
 - treat a closed output pipe as a normal CLI termination; and
 - require release tags to resolve to protected `main`, recheck the remote tag
@@ -672,7 +706,7 @@ unchanged controls from paths whose normative work factor changed.
 The order below is an implementation plan, not a standards requirement. Each
 normative item must name the exact supported clauses and must not imply
 certification or coverage beyond its fixtures.
-v0.189.1 through v0.189.14 are the completed baseline; later entries are
+v0.189.1 through v0.189.15 are the completed baseline; later entries are
 planned.
 
 | Release | Scope | Classification |
@@ -691,7 +725,7 @@ planned.
 | v0.189.12 | Make REST/gRPC request limits effective during decode with streaming upload or bounded replay spooling, global memory/temp quotas, and cooperative cancellation throughout bounded decode and analysis | Product safety and resource control |
 | v0.189.13 | Require a secure non-loopback service boundary and centralize external codec/renderer execution behind bounded, cancellable process-tree supervision; keep full mTLS/OIDC and multi-OS sandbox policy as separately gated follow-up | Service and subprocess security |
 | v0.189.14 | Add explicit metadata-fidelity policies, registry-backed full-container metadata discovery, exact resampling-time conversion, and restartable metadata-only library transactions | Metadata integrity and workflow recovery |
-| v0.189.15 | Add generation-level all-or-nothing album/batch publication, semantic job fingerprints, bounded `--keep-going`, recovery inspection, safe reclamation of orphaned stages, and fully side-effect-free dry runs outside explicit cache warming | Recoverability and operations |
+| v0.189.15 | Add generation-level all-or-nothing album/batch audio publication through a sibling recovery journal, semantic runtime context and job IDs, bounded `--keep-going` failure reports, read-only recovery inspection, journal-proven private-stage reclamation, progress v2, and fully side-effect-free dry runs outside explicit cache warming | Recoverability and operations |
 | v0.189.16 | Prove Linux ABI and wheel-tag compatibility in the oldest supported runtime and ship relocatable CMake/pkg-config metadata before expanding release targets | Distribution compatibility |
 | v0.189.17 | Split assemble/attest/publish permissions, decide `latest` before the one-way immutable publication, validate an exact asset manifest, add Linux ARM64 after runtime proof, use OIDC trusted publishing for PyPI/npm while isolating a least-privilege crates.io token or credential provider until crates.io offers an equivalent official flow, and extend per-artifact SBOM/provenance; treat Windows ARM64, OCI, notarization, and Authenticode as demand- and credential-gated follow-up | Supply-chain and native trust |
 | v0.190 | Native file-based ADM BS.2168 Level 0/1/2 validation, including declarations, graph constraints, block timing, CHNA/essence reconciliation, and derived limits | Normative |

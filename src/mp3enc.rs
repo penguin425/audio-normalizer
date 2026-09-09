@@ -10,8 +10,9 @@
 //! The encoding is CBR by default (transparent and predictable for loudness
 //! work); quality and bitrate are configurable.
 
+use crate::atomic::AtomicOutput;
 use crate::wav::AudioBuffer;
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void, CStr};
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::raw::{c_float, c_int};
@@ -44,11 +45,37 @@ extern "C" {
     fn lame_get_lametag_frame(gfp: LameT, buffer: *mut u8, size: usize) -> usize;
     fn lame_get_brate(gfp: LameT) -> c_int;
     fn lame_get_out_samplerate(gfp: LameT) -> c_int;
+    /// Return LAME's exact runtime version string (for example `3.100`).
+    fn get_lame_version() -> *const c_char;
     fn lame_close(gfp: LameT) -> c_int;
 }
 
 const VBR_OFF: c_int = 0;
 const LAME_OKAY: c_int = 0;
+const ENCODE_CHUNK_FRAMES: usize = 8192;
+
+/// Revision of Forge's MP3 writer pipeline represented by runtime evidence.
+///
+/// Bump this when the writer's LAME configuration or byte/container handling
+/// changes in a way that can alter normalized output.
+pub const MP3_WRITER_PIPELINE_REVISION: &str = "forge-mp3-writer-v1";
+
+/// Read the exact version string exported by the linked LAME runtime.
+///
+/// This is intentionally obtained from LAME itself rather than from a build
+/// dependency version.  A binary may be linked against a different runtime
+/// image on another host, and that distinction belongs in a semantic job
+/// fingerprint.
+pub fn lame_runtime_version() -> Result<String, String> {
+    let version = unsafe { get_lame_version() };
+    if version.is_null() {
+        return Err("LAME returned a null runtime version string".into());
+    }
+    unsafe { CStr::from_ptr(version) }
+        .to_str()
+        .map(str::to_owned)
+        .map_err(|_| "LAME runtime version string is not valid UTF-8".into())
+}
 
 fn validate_mp3_configuration(sample_rate: u32, bitrate_kbps: i32) -> Result<(), String> {
     if !matches!(
@@ -65,16 +92,34 @@ fn validate_mp3_configuration(sample_rate: u32, bitrate_kbps: i32) -> Result<(),
     Ok(())
 }
 
-pub struct Mp3StreamWriter {
+fn validate_mp3_buffer(buf: &AudioBuffer, bitrate_kbps: i32) -> Result<usize, String> {
+    let channels = buf.channels as usize;
+    if channels == 0 || buf.frames == 0 {
+        return Err("no audio to encode".into());
+    }
+    if channels > 2 {
+        return Err("MP3 output supports only mono or stereo".into());
+    }
+    validate_mp3_configuration(buf.sample_rate, bitrate_kbps)?;
+    if buf.data.len() != channels {
+        return Err("channel count does not match audio planes".into());
+    }
+    for ch in &buf.data {
+        if ch.len() != buf.frames {
+            return Err("channel length mismatch".into());
+        }
+    }
+    Ok(channels)
+}
+
+struct Mp3Encoder {
     gfp: LameT,
     channels: usize,
-    output: File,
     encoded: Vec<u8>,
 }
 
-impl Mp3StreamWriter {
-    pub fn create(
-        path: &Path,
+impl Mp3Encoder {
+    fn create(
         sample_rate: u32,
         channels: u16,
         bitrate_kbps: i32,
@@ -122,38 +167,27 @@ impl Mp3StreamWriter {
                 "LAME selected {actual_bitrate} kbps instead of requested {bitrate_kbps} kbps"
             ));
         }
-        let output =
-            File::create(path).map_err(|error| format!("create {}: {error}", path.display()))?;
         Ok(Self {
             gfp,
             channels: channels as usize,
-            output,
             encoded: vec![0; 32_768],
         })
     }
 
-    pub fn write_chunk(&mut self, planar: &[Vec<f32>]) -> Result<(), String> {
-        if planar.len() != self.channels {
-            return Err("MP3 stream channel count changed".into());
-        }
-        let frames = planar.first().map_or(0, Vec::len);
-        if planar.iter().any(|channel| channel.len() != frames) {
+    fn encode_planar_chunk(&mut self, left: &[f32], right: &[f32]) -> Result<usize, String> {
+        if left.len() != right.len() {
             return Err("MP3 stream channel length mismatch".into());
         }
+        let frames = left.len();
         let required = (1.25 * (frames * self.channels) as f64 + 7200.0) as usize + 16;
         if self.encoded.len() < required {
             self.encoded.resize(required, 0);
         }
         let written = unsafe {
-            let right = if self.channels == 1 {
-                planar[0].as_ptr()
-            } else {
-                planar[1].as_ptr()
-            };
             lame_encode_buffer_ieee_float(
                 self.gfp,
-                planar[0].as_ptr(),
-                right,
+                left.as_ptr(),
+                right.as_ptr(),
                 frames as c_int,
                 self.encoded.as_mut_ptr(),
                 self.encoded.len() as c_int,
@@ -162,12 +196,10 @@ impl Mp3StreamWriter {
         if written < 0 {
             return Err(format!("lame_encode_buffer error code {written}"));
         }
-        self.output
-            .write_all(&self.encoded[..written as usize])
-            .map_err(|error| format!("write MP3: {error}"))
+        Ok(written as usize)
     }
 
-    pub fn finish(mut self) -> Result<(), String> {
+    fn flush(&mut self) -> Result<usize, String> {
         let written = unsafe {
             lame_encode_flush(
                 self.gfp,
@@ -178,155 +210,143 @@ impl Mp3StreamWriter {
         if written < 0 {
             return Err(format!("lame_encode_flush error code {written}"));
         }
-        self.output
-            .write_all(&self.encoded[..written as usize])
-            .map_err(|error| format!("write MP3: {error}"))?;
+        Ok(written as usize)
+    }
+
+    fn lametag_size(&mut self) -> Result<usize, String> {
         let tag_size = unsafe {
             lame_get_lametag_frame(self.gfp, self.encoded.as_mut_ptr(), self.encoded.len())
         };
         if tag_size > self.encoded.len() {
             return Err(format!("LAME tag requires {tag_size} bytes"));
         }
-        if tag_size > 0 {
-            self.output
-                .seek(SeekFrom::Start(0))
-                .and_then(|_| self.output.write_all(&self.encoded[..tag_size]))
-                .map_err(|error| format!("write MP3 LAME tag: {error}"))?;
-        }
-        self.output
-            .flush()
-            .map_err(|error| format!("flush MP3: {error}"))?;
-        unsafe {
-            lame_close(self.gfp);
-        }
-        self.gfp = std::ptr::null_mut();
-        Ok(())
+        Ok(tag_size)
     }
 }
 
-impl Drop for Mp3StreamWriter {
+impl Drop for Mp3Encoder {
     fn drop(&mut self) {
         if !self.gfp.is_null() {
             unsafe {
                 lame_close(self.gfp);
             }
+            self.gfp = std::ptr::null_mut();
         }
+    }
+}
+
+/// Incremental MP3 output backed by the shared internal encoder pipeline.
+pub struct Mp3StreamWriter {
+    encoder: Mp3Encoder,
+    output: File,
+}
+
+impl Mp3StreamWriter {
+    pub fn create(
+        path: &Path,
+        sample_rate: u32,
+        channels: u16,
+        bitrate_kbps: i32,
+        quality: i32,
+    ) -> Result<Self, String> {
+        let encoder = Mp3Encoder::create(sample_rate, channels, bitrate_kbps, quality)?;
+        let output = File::create(path).map_err(|error| {
+            // `encoder` owns the LAME handle and closes it if opening the
+            // destination fails.
+            format!("create {}: {error}", path.display())
+        })?;
+        Ok(Self { encoder, output })
+    }
+
+    pub fn write_chunk(&mut self, planar: &[Vec<f32>]) -> Result<(), String> {
+        let frames = planar.first().map_or(0, Vec::len);
+        self.write_chunk_range(planar, 0, frames)
+    }
+
+    fn write_chunk_range(
+        &mut self,
+        planar: &[Vec<f32>],
+        start: usize,
+        end: usize,
+    ) -> Result<(), String> {
+        if planar.len() != self.encoder.channels {
+            return Err("MP3 stream channel count changed".into());
+        }
+        let total_frames = planar.first().map_or(0, Vec::len);
+        if planar.iter().any(|channel| channel.len() != total_frames) {
+            return Err("MP3 stream channel length mismatch".into());
+        }
+        if start > end || end > total_frames {
+            return Err("MP3 stream chunk range is out of bounds".into());
+        }
+        let left = &planar[0][start..end];
+        let right = if self.encoder.channels == 1 {
+            left
+        } else {
+            &planar[1][start..end]
+        };
+        let written = self.encoder.encode_planar_chunk(left, right)?;
+        self.output
+            .write_all(&self.encoder.encoded[..written])
+            .map_err(|error| format!("write MP3: {error}"))
+    }
+
+    pub fn finish(mut self) -> Result<(), String> {
+        let written = self.encoder.flush()?;
+        self.output
+            .write_all(&self.encoder.encoded[..written])
+            .map_err(|error| format!("write MP3: {error}"))?;
+        let tag_size = self.encoder.lametag_size()?;
+        if tag_size > 0 {
+            self.output
+                .seek(SeekFrom::Start(0))
+                .and_then(|_| self.output.write_all(&self.encoder.encoded[..tag_size]))
+                .map_err(|error| format!("write MP3 LAME tag: {error}"))?;
+        }
+        self.output
+            .flush()
+            .map_err(|error| format!("flush MP3: {error}"))?;
+        Ok(())
     }
 }
 
 /// Encode a planar [`AudioBuffer`] to MP3 bytes (CBR).
 pub fn encode_mp3(buf: &AudioBuffer, bitrate_kbps: i32, quality: i32) -> Result<Vec<u8>, String> {
-    let channels = buf.channels as usize;
-    if channels == 0 || buf.frames == 0 {
-        return Err("no audio to encode".into());
-    }
-    if channels > 2 {
-        return Err("MP3 output supports only mono or stereo".into());
-    }
-    validate_mp3_configuration(buf.sample_rate, bitrate_kbps)?;
-    if buf.data.len() != channels {
-        return Err("channel count does not match audio planes".into());
-    }
-    for ch in &buf.data {
-        if ch.len() != buf.frames {
-            return Err("channel length mismatch".into());
-        }
-    }
-
-    let gfp = unsafe { lame_init() };
-    if gfp.is_null() {
-        return Err("lame_init() returned null".into());
-    }
-
-    // LAME recommends 1.25 * samples + 7200 bytes for the output buffer. We
-    // encode in chunks to keep peak memory modest; size the per-chunk buffer
-    // for the worst case.
-    const CHUNK_FRAMES: i32 = 8192;
-    let mp3buf_size = (1.25 * (CHUNK_FRAMES as f64 * channels as f64) + 7200.0) as usize + 16;
-    let mut mp3buf = vec![0u8; mp3buf_size];
+    let channels = validate_mp3_buffer(buf, bitrate_kbps)?;
+    let mut encoder = Mp3Encoder::create(buf.sample_rate, channels as u16, bitrate_kbps, quality)?;
     let mut out: Vec<u8> = Vec::with_capacity(buf.frames / 8);
 
-    unsafe {
-        let settings_ok = lame_set_in_samplerate(gfp, buf.sample_rate as c_int) == LAME_OKAY
-            && lame_set_num_channels(gfp, channels as c_int) == LAME_OKAY
-        // 0 = keep the input sample rate (no resampling).
-            && lame_set_out_samplerate(gfp, buf.sample_rate as c_int) == LAME_OKAY
-            && lame_set_brate(gfp, bitrate_kbps as c_int) == LAME_OKAY
-            && lame_set_VBR(gfp, VBR_OFF) == LAME_OKAY
-        // Clamp quality to LAME's 0..=9 range; 0 is best/slowest, 2 is a great default.
-            && lame_set_quality(gfp, quality.clamp(0, 9)) == LAME_OKAY
-        // Reserve a first-frame Info/LAME tag and backpatch it after flushing.
-            && lame_set_bWriteVbrTag(gfp, 1) == LAME_OKAY;
-
-        if !settings_ok || lame_init_params(gfp) != LAME_OKAY {
-            lame_close(gfp);
-            return Err("configure LAME encoder failed".into());
-        }
-        let actual_sample_rate = lame_get_out_samplerate(gfp);
-        if actual_sample_rate != buf.sample_rate as c_int {
-            lame_close(gfp);
-            return Err(format!(
-                "LAME selected {actual_sample_rate} Hz instead of requested {} Hz",
-                buf.sample_rate
-            ));
-        }
-        let actual_bitrate = lame_get_brate(gfp);
-        if actual_bitrate != bitrate_kbps {
-            lame_close(gfp);
-            return Err(format!(
-                "LAME selected {actual_bitrate} kbps instead of requested {bitrate_kbps} kbps"
-            ));
-        }
-
-        let mut pos: usize = 0;
-        let total = buf.frames as i32;
-        while (pos as i32) < total {
-            let n = CHUNK_FRAMES.min(total - pos as i32);
-            let left = buf.data[0].as_ptr().add(pos);
-            let right = if channels == 1 {
-                left
-            } else {
-                buf.data[1].as_ptr().add(pos)
-            };
-            let written = lame_encode_buffer_ieee_float(
-                gfp,
-                left,
-                right,
-                n,
-                mp3buf.as_mut_ptr(),
-                mp3buf.len() as c_int,
-            );
-            if written < 0 {
-                lame_close(gfp);
-                return Err(format!("lame_encode_buffer error code {written}"));
-            }
-            out.extend_from_slice(&mp3buf[..written as usize]);
-            pos += n as usize;
-        }
-
-        let written = lame_encode_flush(gfp, mp3buf.as_mut_ptr(), mp3buf.len() as c_int);
-        if written < 0 {
-            lame_close(gfp);
-            return Err(format!("lame_encode_flush error code {written}"));
-        }
-        out.extend_from_slice(&mp3buf[..written as usize]);
-
-        let tag_size = lame_get_lametag_frame(gfp, mp3buf.as_mut_ptr(), mp3buf.len());
-        if tag_size > mp3buf.len() || tag_size > out.len() {
-            lame_close(gfp);
-            return Err(format!("invalid LAME tag size {tag_size}"));
-        }
-        if tag_size > 0 {
-            out[..tag_size].copy_from_slice(&mp3buf[..tag_size]);
-        }
-
-        lame_close(gfp);
+    let mut pos = 0;
+    while pos < buf.frames {
+        let end = (pos + ENCODE_CHUNK_FRAMES).min(buf.frames);
+        let left = &buf.data[0][pos..end];
+        let right = if channels == 1 {
+            left
+        } else {
+            &buf.data[1][pos..end]
+        };
+        let written = encoder.encode_planar_chunk(left, right)?;
+        out.extend_from_slice(&encoder.encoded[..written]);
+        pos = end;
     }
 
+    let written = encoder.flush()?;
+    out.extend_from_slice(&encoder.encoded[..written]);
+    let tag_size = encoder.lametag_size()?;
+    if tag_size > out.len() {
+        return Err(format!("invalid LAME tag size {tag_size}"));
+    }
+    if tag_size > 0 {
+        out[..tag_size].copy_from_slice(&encoder.encoded[..tag_size]);
+    }
     Ok(out)
 }
 
 /// Encode `buf` to MP3 and write it to `path`.
+///
+/// The public one-shot route deliberately uses this stream writer with the
+/// same fixed chunking as [`encode_mp3`], so runtime evidence naming the
+/// stream writer covers both normalization entry points.
 pub fn write_mp3<P: AsRef<Path>>(
     path: P,
     buf: &AudioBuffer,
@@ -334,8 +354,23 @@ pub fn write_mp3<P: AsRef<Path>>(
     quality: i32,
 ) -> Result<(), String> {
     let p = path.as_ref();
-    let bytes = encode_mp3(buf, bitrate_kbps, quality)?;
-    std::fs::write(p, &bytes).map_err(|e| format!("write {}: {e}", p.display()))
+    let channels = validate_mp3_buffer(buf, bitrate_kbps)?;
+    let staged = AtomicOutput::new(p)?;
+    let mut writer = Mp3StreamWriter::create(
+        staged.path(),
+        buf.sample_rate,
+        channels as u16,
+        bitrate_kbps,
+        quality,
+    )?;
+    let mut pos = 0;
+    while pos < buf.frames {
+        let end = (pos + ENCODE_CHUNK_FRAMES).min(buf.frames);
+        writer.write_chunk_range(&buf.data, pos, end)?;
+        pos = end;
+    }
+    writer.finish()?;
+    staged.commit()
 }
 
 #[cfg(test)]
@@ -378,5 +413,25 @@ mod tests {
             .unwrap();
         assert!(error.contains("bitrate"), "{error}");
         assert_eq!(std::fs::read(&destination).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn one_shot_write_matches_the_shared_stream_pipeline() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("output.mp3");
+        let frames = ENCODE_CHUNK_FRAMES * 2 + 137;
+        let audio = AudioBuffer {
+            sample_rate: 44_100,
+            channels: 1,
+            frames,
+            data: vec![vec![0.0; frames]],
+            channel_roles: default_channel_roles(1),
+            source_kind: PcmKind::F32,
+        };
+
+        let expected = encode_mp3(&audio, 192, 2).unwrap();
+        write_mp3(&destination, &audio, 192, 2).unwrap();
+
+        assert_eq!(std::fs::read(destination).unwrap(), expected);
     }
 }

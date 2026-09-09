@@ -126,6 +126,12 @@ for file in \
   schema/metadata-job-v1.schema.json \
   schema/catalogue-report-v2.schema.json \
   schema/catalogue-report-v3.schema.json \
+  schema/batch-failure-report-v1.schema.json \
+  schema/batch-job-v3.schema.json \
+  schema/batch-progress-v2.schema.json \
+  schema/generation-job-v1.schema.json \
+  schema/generation-recovery-report-v1.schema.json \
+  schema/normalization-semantic-context-v1.schema.json \
   schema/ac4-adapter-report-v2.schema.json \
   schema/mpegh-adapter-report-v2.schema.json \
   schema/dts-adapter-report-v2.schema.json \

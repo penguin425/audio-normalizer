@@ -1,0 +1,478 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://penguin425.github.io/audio-normalizer/schema/batch-job-v3",
+  "title": "Forge resumable batch job v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generator",
+    "operation",
+    "specification_sha256",
+    "fingerprint_revision",
+    "semantic_fingerprint",
+    "semantic_context",
+    "job_id",
+    "failure_policy",
+    "asset_count",
+    "completed_count",
+    "assets"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://penguin425.github.io/audio-normalizer/schema/batch-job-v3"
+    },
+    "generator": {
+      "type": "string",
+      "maxLength": 256,
+      "pattern": "^forge-normalizer/[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "mode",
+        "target_lufs",
+        "target_peak_dbfs",
+        "target_rms_dbfs",
+        "ceiling_dbtp",
+        "max_gain_db",
+        "dither",
+        "output_bits",
+        "bitrate_kbps",
+        "encoder_quality",
+        "limiter",
+        "wav_container",
+        "bwf",
+        "output_sample_rate_hz",
+        "resample_quality",
+        "verify",
+        "verify_tolerance",
+        "verify_retries",
+        "album",
+        "analysis_engine",
+        "audio_track",
+        "channel_layout",
+        "dual_mono",
+        "formats"
+      ],
+      "properties": {
+        "schema": {"const": "forge-normalization-operation-v1"},
+        "mode": {"enum": ["lufs", "peak", "rms"]},
+        "target_lufs": {"type": "number"},
+        "target_peak_dbfs": {"type": "number"},
+        "target_rms_dbfs": {"type": "number"},
+        "ceiling_dbtp": {"type": "number"},
+        "max_gain_db": {"type": ["number", "null"]},
+        "dither": {"type": "boolean"},
+        "output_bits": {
+          "type": ["string", "null"],
+          "enum": ["8", "16", "24", "32", "32f", "64f", null]
+        },
+        "bitrate_kbps": {"type": "integer"},
+        "encoder_quality": {"type": "integer", "minimum": 0, "maximum": 9},
+        "limiter": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["lookahead_ms", "release_ms"],
+              "properties": {
+                "lookahead_ms": {"type": "number", "exclusiveMinimum": 0},
+                "release_ms": {"type": "number", "exclusiveMinimum": 0}
+              }
+            }
+          ]
+        },
+        "wav_container": {"enum": ["auto", "riff", "rf64", "bw64"]},
+        "bwf": {"type": "boolean"},
+        "output_sample_rate_hz": {
+          "type": ["integer", "null"],
+          "minimum": 8000,
+          "maximum": 384000
+        },
+        "resample_quality": {"enum": ["fast", "balanced", "best"]},
+        "verify": {"type": "boolean"},
+        "verify_tolerance": {"type": "number", "minimum": 0},
+        "verify_retries": {"type": "integer", "minimum": 0},
+        "album": {"type": "boolean"},
+        "analysis_engine": {"type": "string", "minLength": 1},
+        "audio_track": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "channel_layout": {"type": ["string", "null"], "minLength": 1},
+        "dual_mono": {"type": "boolean"},
+        "formats": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100000,
+          "items": {
+            "enum": ["wav", "flac", "mp3", "opus", "m4a", "alac", "vorbis"]
+          }
+        },
+        "metadata_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["policy", "strip_scope", "strip_locators"],
+          "properties": {
+            "policy": {
+              "enum": ["preserve", "strict", "strip", "legacy_generic"]
+            },
+            "strip_scope": {
+              "enum": ["none", "all", "selected"]
+            },
+            "strip_locators": {
+              "type": "array",
+              "maxItems": 1000000,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              }
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "policy": {"const": "strip"}
+                }
+              },
+              "then": {
+                "properties": {
+                  "strip_scope": {"enum": ["all", "selected"]}
+                }
+              },
+              "else": {
+                "properties": {
+                  "strip_scope": {"const": "none"},
+                  "strip_locators": {"maxItems": 0}
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "strip_scope": {"const": "selected"}
+                }
+              },
+              "then": {
+                "properties": {
+                  "strip_locators": {"minItems": 1}
+                }
+              },
+              "else": {
+                "properties": {
+                  "strip_locators": {"maxItems": 0}
+                }
+              }
+            }
+          ]
+        },
+        "metadata_registry_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "metadata_timing_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "metadata_fidelity_schema_version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "specification_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "fingerprint_revision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "semantic_fingerprint": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "semantic_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "revision",
+        "bound_analysis_version",
+        "measurement_algorithm_revision",
+        "input_content_binding_version",
+        "analysis_engine",
+        "analysis_engine_id",
+        "decoder",
+        "input_descriptor_semantic_revision",
+        "audio_track",
+        "audio_track_selection",
+        "normalization",
+        "output_formats",
+        "writers"
+      ],
+      "properties": {
+        "schema": {
+          "const": "https://penguin425.github.io/audio-normalizer/schema/normalization-semantic-context-v1"
+        },
+        "revision": {"const": 1},
+        "bound_analysis_version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "measurement_algorithm_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "input_content_binding_version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "analysis_engine": {"$ref": "#/$defs/semanticContextAnalysisEngine"},
+        "analysis_engine_id": {
+          "type": "string",
+          "enum": ["forge-fast-bs1770-r4", "forge-reference-bs1770-r1"]
+        },
+        "decoder": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["semantic_revision", "input_descriptor_version"],
+          "properties": {
+            "semantic_revision": {"type": "string", "minLength": 1, "maxLength": 128},
+            "input_descriptor_version": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            }
+          }
+        },
+        "input_descriptor_semantic_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "audio_track": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "audio_track_selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "index"],
+          "properties": {
+            "kind": {"enum": ["default", "index"]},
+            "index": {
+              "type": ["integer", "null"],
+              "minimum": 0,
+              "maximum": 4294967295
+            }
+          },
+          "allOf": [
+            {
+              "if": {"properties": {"kind": {"const": "default"}}},
+              "then": {"properties": {"index": {"const": null}}}
+            },
+            {
+              "if": {"properties": {"kind": {"const": "index"}}},
+              "then": {
+                "required": ["index"],
+                "properties": {"index": {"type": "integer", "minimum": 0}}
+              }
+            }
+          ]
+        },
+        "normalization": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["pipeline_revision"],
+          "properties": {
+            "pipeline_revision": {"type": "string", "minLength": 1, "maxLength": 128}
+          }
+        },
+        "output_formats": {
+          "type": "array",
+          "maxItems": 100000,
+          "items": {
+            "enum": ["wav", "flac", "mp3", "opus", "m4a", "alac", "vorbis"]
+          }
+        },
+        "writers": {
+          "type": "array",
+          "maxItems": 7,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/semanticContextWriter"}
+        }
+      }
+    },
+    "job_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "failure_policy": {
+      "enum": ["fail_fast", "keep_going"]
+    },
+    "asset_count": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100000
+    },
+    "completed_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100000
+    },
+    "assets": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["input", "output", "input_sha256", "status"],
+        "properties": {
+          "input": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?!.*[\\u0000-\\u001F\\u007F-\\u009F]).+$"
+          },
+          "output": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?!.*[\\u0000-\\u001F\\u007F-\\u009F]).+$"
+          },
+          "input_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "status": {"enum": ["pending", "completed"]},
+          "output_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"status": {"const": "pending"}}},
+            "then": {"not": {"required": ["output_sha256"]}},
+            "else": {"required": ["output_sha256"]}
+          }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "semanticContextAnalysisEngine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "enum": ["forge-fast-bs1770-r4", "forge-reference-bs1770-r1"]
+        }
+      }
+    },
+    "semanticContextWriter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "implementation_id",
+        "pipeline_revision",
+        "capability_success",
+        "runtime"
+      ],
+      "properties": {
+        "format": {
+          "enum": ["wav", "flac", "mp3", "opus", "m4a", "alac", "vorbis"]
+        },
+        "implementation_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "pipeline_revision": {"type": "string", "minLength": 1, "maxLength": 128},
+        "capability_success": {"const": true},
+        "runtime": {"$ref": "#/$defs/semanticContextRuntime"}
+      }
+    },
+    "semanticContextRuntime": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "capability_success"],
+          "properties": {
+            "kind": {"const": "native"},
+            "capability_success": {"const": true}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "lame_get_version", "lame_version", "capability_success"],
+          "properties": {
+            "kind": {"const": "lame"},
+            "lame_get_version": {"type": "string", "minLength": 1, "maxLength": 256},
+            "lame_version": {"type": "string", "minLength": 1, "maxLength": 256},
+            "capability_success": {"const": true}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "opus_version", "container", "capability_success"],
+          "properties": {
+            "kind": {"const": "libopus"},
+            "opus_version": {"type": "string", "minLength": 1, "maxLength": 256},
+            "container": {"const": "ogg"},
+            "capability_success": {"const": true}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "executable_byte_len",
+            "executable_sha256",
+            "byte_len",
+            "sha256",
+            "encoder",
+            "muxer",
+            "capability_success"
+          ],
+          "properties": {
+            "kind": {"const": "ffmpeg"},
+            "executable_byte_len": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 18446744073709551615
+            },
+            "executable_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "byte_len": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 18446744073709551615
+            },
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "encoder": {"type": "string", "minLength": 1, "maxLength": 128},
+            "muxer": {"type": "string", "minLength": 1, "maxLength": 128},
+            "capability_success": {"const": true}
+          }
+        }
+      ]
+    }
+  }
+}

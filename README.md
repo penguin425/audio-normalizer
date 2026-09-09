@@ -37,8 +37,8 @@ forge --analyze input.flac
 # Normalize an album with one shared gain
 forge --album album/*.flac -o normalized/
 
-# Process a directory and preserve its layout
-forge library/ --recursive -o normalized/
+# Process a directory and preserve its layout with a recoverable generation
+forge library/ --recursive -o normalized/ --job-state work/library-job.json
 
 # Use a named delivery target and verify the encoded result
 forge input.wav -o output.flac --preset spotify --verify
@@ -63,7 +63,10 @@ Run `forge --help` for the complete option list.
 - Configurable true-peak ceiling, optional look-ahead limiter, resampling, and
   integer PCM dither.
 - Bounded recursive discovery and lock-protected, crash-resumable batch/watch
-  processing with JSON, CSV, and NDJSON reports.
+  processing. Multi-file normalization with `--job-state` publishes an
+  all-or-nothing generation for the audio destination set only; catalogue
+  records and auxiliary reports are separate post-audio writes. JSON, CSV, and
+  NDJSON reports are available across the applicable workflows.
 - Atomic output publication with no-clobber or unchanged-destination checks.
 - Output re-verification, ReplayGain, native M4A/ALAC `tlou`/`alou`, BWF
   metadata, and delivery compliance profiles.
@@ -140,8 +143,18 @@ compare-and-swap publication. Its state and source-parent directories must be
 trusted against hostile writers; the journal is validated but not
 cryptographically authenticated. The historical `--write-tags` path without a
 job state writes requested tag families sequentially and does not provide that
-transaction guarantee. Generation-level all-or-nothing album/batch publication
-is deliberately deferred to v0.189.15.
+transaction guarantee.
+
+For multi-file normalization, `--job-state` uses a v3 semantic job identity and
+the sibling `<job-state>.generation.json` journal. All pending audio outputs are
+staged and verified before the generation is published; album shared-gain runs,
+`--verify`, bounded `--keep-going`, and `forge recovery inspect/reclaim` are
+documented in [BATCH-JOBS.md](BATCH-JOBS.md). Dry runs have no durable side
+effects except explicit `--warm-cache` analysis-cache warming. Stages,
+destinations, and private backups are sibling paths on one filesystem. The
+no-clobber publication uses `renameat2(RENAME_NOREPLACE)` on Linux/Android,
+`renamex_np(RENAME_EXCL)` on Apple platforms, and the corresponding
+write-through Windows primitive; unsupported Unix targets fail closed.
 
 See the [documentation map](DOCUMENTATION.md#command-line-tools) or run any
 command with `--help`.
