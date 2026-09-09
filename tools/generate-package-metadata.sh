@@ -44,7 +44,11 @@ class Forge < Formula
   def install
     bin.install Dir["forge", "forge-*"].select { |path| File.file?(path) && File.executable?(path) }
     include.install "include/forge_normalizer.h"
-    lib.install Dir["libforge_normalizer.*"]
+    # Install the canonical library and development metadata.  The archive's
+    # flat root library remains only as a compatibility path for existing
+    # consumers; installing it as well would create a duplicate Homebrew
+    # payload and leave CMake/pkg-config pointed at the wrong layout.
+    lib.install Dir["lib/*"]
   end
 
   test do

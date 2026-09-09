@@ -1,4 +1,5 @@
-# Complete CPython 3.10 wheel-build closure, resolved from PyPI on 2026-09-06.
+# Complete pure-Python wheel-build closure for the release's CPython 3.10+
+# environments, resolved from PyPI on 2026-09-10.
 # Every digest is the SHA256 published by the corresponding PyPI release JSON.
 # The release workflow downloads only binary wheels with --require-hashes, then
 # installs exclusively from the resulting local wheelhouse with --no-index.
@@ -7,6 +8,8 @@ auditwheel==6.7.0 \
     --hash=sha256:34e93e1b64ca54116fc110c3e975d3c884c4d47c87a590d42a89e4edf23e2af8
 build==1.5.0 \
     --hash=sha256:13f3eecb844759ab66efec90ca17639bbf14dc06cb2fdf37a9010322d9c50a6f
+colorama==0.4.6 \
+    --hash=sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6
 packaging==26.3 \
     --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
 pyelftools==0.33 \

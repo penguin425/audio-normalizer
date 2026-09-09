@@ -69,13 +69,19 @@ report names its schema version and the bounded checks it performs.
 
 ## APIs and host integration
 
-- [C API](C-API.md)
+- [C API and native package metadata](C-API.md)
 - [Python API](PYTHON-API.md)
 - [FFmpeg and GStreamer adapters](HOST-ADAPTERS.md)
 - [VST3 adapter](VST3-ADAPTER.md)
 - [Audio Unit adapter](AU-ADAPTER.md)
 - [Compatibility and deprecation policy](COMPATIBILITY.md)
 - [Rust API stability policy](API-STABILITY.md)
+
+Native C consumers should use the canonical package metadata documented in
+[`C-API.md`](C-API.md): CMake uses `Forge::Normalizer`, while pkg-config is
+available for Linux and macOS. The same page defines the dynamic-library-only
+archive layout, historical root-copy compatibility, and consumer-owned runtime
+loader configuration.
 
 ## Operations and engineering
 

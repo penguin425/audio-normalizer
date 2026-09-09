@@ -1,0 +1,16 @@
+# Relocatable Forge Normalizer CMake package version file.
+#
+# Forge's native package uses the C ABI v1 compatibility boundary: an
+# installed package is compatible with an equal or older requested version.
+
+set(PACKAGE_VERSION "@PACKAGE_VERSION@")
+
+if(DEFINED CMAKE_SIZEOF_VOID_P AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(PACKAGE_VERSION_UNSUITABLE TRUE)
+elseif(NOT PACKAGE_FIND_VERSION OR
+       PACKAGE_FIND_VERSION VERSION_LESS_EQUAL PACKAGE_VERSION)
+    set(PACKAGE_VERSION_COMPATIBLE TRUE)
+    if(PACKAGE_FIND_VERSION VERSION_EQUAL PACKAGE_VERSION)
+        set(PACKAGE_VERSION_EXACT TRUE)
+    endif()
+endif()

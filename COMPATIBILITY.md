@@ -17,9 +17,21 @@ The C ABI uses explicitly versioned symbols and structures as documented in
 [C-API.md](C-API.md). An incompatible ABI requires a new ABI version; existing
 versioned entry points remain available for their documented lifetime.
 
+Native archives also expose the relocatable CMake package
+`find_package(ForgeNormalizer CONFIG REQUIRED)` with the `Forge::Normalizer`
+target, and the `forge-normalizer` pkg-config module on Linux and macOS. These
+metadata names and the canonical `include/`/`lib/` layout are stable within the
+C ABI major version. Archives provide the dynamic library only; runtime loader
+paths are configured by the consumer, and a Windows `.lib` is an import library
+for the DLL.
+
 The Python package wraps the versioned native library. Documented Python names
 and call signatures are additive within a major package version. Platform wheel
-availability is a release property, not an API guarantee.
+availability is a release property, not an API guarantee. The official generic
+Linux archive and wheel target x86-64 with glibc 2.34 or newer; those artifacts
+use x86-64-v1 flags in the pinned manylinux 2.28 build and ABI-stress
+environment, which is not a glibc 2.28 wheel compatibility claim. The
+supplemental x86-64-v3 CLI is built separately with its explicit ISA target.
 
 ## JSON, TOML, XML, and protobuf contracts
 

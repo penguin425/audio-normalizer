@@ -1,0 +1,42 @@
+# Relocatable Forge Normalizer CMake package configuration.
+#
+# This file is rendered by tools/native_package_metadata.py.  Keep the
+# installation prefix relative to this config file: embedding the build or
+# source directory would make an extracted package non-relocatable.
+
+set(ForgeNormalizer_VERSION "@PACKAGE_VERSION@")
+set(_FORGE_NORMALIZER_LIBRARY_RELATIVE "@FORGE_NORMALIZER_LIBRARY_RELATIVE@")
+set(_FORGE_NORMALIZER_IMPORT_LIBRARY_RELATIVE "@FORGE_NORMALIZER_IMPORT_LIBRARY_RELATIVE@")
+
+# lib/cmake/ForgeNormalizer/ForgeNormalizerConfig.cmake -> package prefix.
+get_filename_component(
+    _FORGE_NORMALIZER_PREFIX
+    "${CMAKE_CURRENT_LIST_DIR}/../../.."
+    ABSOLUTE
+)
+set(ForgeNormalizer_INCLUDE_DIR "${_FORGE_NORMALIZER_PREFIX}/include")
+
+if(DEFINED CMAKE_SIZEOF_VOID_P AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(ForgeNormalizer_FOUND FALSE)
+    set(ForgeNormalizer_NOT_FOUND_MESSAGE
+        "ForgeNormalizer requires a 64-bit consumer")
+    return()
+endif()
+
+if(NOT TARGET Forge::Normalizer)
+    add_library(Forge::Normalizer SHARED IMPORTED)
+    set_target_properties(
+        Forge::Normalizer
+        PROPERTIES
+            IMPORTED_LOCATION
+                "${_FORGE_NORMALIZER_PREFIX}/${_FORGE_NORMALIZER_LIBRARY_RELATIVE}"
+@FORGE_NORMALIZER_IMPORT_PROPERTY@
+            INTERFACE_INCLUDE_DIRECTORIES "${ForgeNormalizer_INCLUDE_DIR}"
+    )
+endif()
+
+set(ForgeNormalizer_FOUND TRUE)
+
+unset(_FORGE_NORMALIZER_LIBRARY_RELATIVE)
+unset(_FORGE_NORMALIZER_IMPORT_LIBRARY_RELATIVE)
+unset(_FORGE_NORMALIZER_PREFIX)

@@ -53,6 +53,13 @@ jobs:
       - name: Validate crates.io package metadata and contents
         run: tools/check-release-readiness.sh
 
+      - name: Test native-package generation and Linux ABI gates
+        run: |
+          "$FORGE_WORKFLOW_CHECK_PYTHON" -m unittest \
+            tools/test_linux_native_abi.py \
+            tools/test_native_package_metadata.py \
+            tools/test_release_content.py
+
       - name: Run Clippy
         run: cargo clippy --all-targets --no-default-features -- -D warnings
 
@@ -270,12 +277,54 @@ jobs:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: tools/test-c-api.sh "${{ matrix.target }}"
 
+      - name: Relocate and consume the Unix native package
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          staging="${RUNNER_TEMP}/forge-native-staging"
+          mkdir -p "$staging/include" "$staging/lib"
+          cp include/forge_normalizer.h "$staging/include/"
+          cp "target/${{ matrix.target }}/debug/${{ matrix.library }}" \
+            "$staging/${{ matrix.library }}"
+          cp "target/${{ matrix.target }}/debug/${{ matrix.library }}" \
+            "$staging/lib/${{ matrix.library }}"
+          platform=linux
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            platform=macos
+          fi
+          python tools/native_package_metadata.py \
+            --root "$staging" --version "$version" --platform "$platform"
+          tools/test-native-package.sh "$staging" "$version"
+
       - name: Link and run a C consumer
         if: runner.os == 'Windows'
         shell: pwsh
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: tools/test-c-api.ps1 -Target "${{ matrix.target }}"
+
+      - name: Relocate and consume the Windows native package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed" }
+          $packages = @($metadata.packages | Where-Object { $_.name -eq "forge-normalizer" })
+          if ($packages.Count -ne 1) { throw "Expected one forge-normalizer package, found $($packages.Count)" }
+          $version = $packages[0].version
+          $staging = Join-Path $env:RUNNER_TEMP "forge-native-staging"
+          New-Item -ItemType Directory -Path "$staging/include","$staging/bin","$staging/lib" | Out-Null
+          Copy-Item include/forge_normalizer.h "$staging/include/"
+          Copy-Item "target/${{ matrix.target }}/debug/${{ matrix.library }}" "$staging/${{ matrix.library }}"
+          Copy-Item "target/${{ matrix.target }}/debug/${{ matrix.library }}" "$staging/bin/forge_normalizer.dll"
+          $importLibraries = @(Get-ChildItem "target/${{ matrix.target }}/debug" -File -Filter "forge_normalizer*.lib")
+          if ($importLibraries.Count -ne 1) { throw "Expected one Forge import library, found $($importLibraries.Count)" }
+          Copy-Item $importLibraries[0].FullName "$staging/forge_normalizer.lib"
+          Copy-Item $importLibraries[0].FullName "$staging/lib/forge_normalizer.lib"
+          python tools/native_package_metadata.py --root $staging --version $version --platform windows
+          tools/test-native-package.ps1 -Root $staging -ExpectedVersion $version
 
       - name: Test the Python source binding against the built library
         env:

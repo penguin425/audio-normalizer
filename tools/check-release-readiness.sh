@@ -113,9 +113,14 @@ for file in README.md LICENSE CHANGELOG.md COMPATIBILITY.md SECURITY.md CONTRIBU
 done
 for file in \
   ANALYSIS-CACHE.md \
+  C-API.md \
   CATALOGUE.md \
   EBU-QC-SCENARIO1.md \
   METADATA-FIDELITY.md \
+  packaging/ForgeNormalizerConfig.cmake.in \
+  packaging/ForgeNormalizerConfigVersion.cmake.in \
+  packaging/forge-normalizer.pc.in \
+  tools/native_package_metadata.py \
   schema/analysis-cache-v4.schema.json \
   schema/analysis-cache-v5.schema.json \
   schema/schema-registry-v1.schema.json \

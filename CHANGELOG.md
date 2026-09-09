@@ -6,6 +6,32 @@ tags and keeps public compatibility commitments in
 
 ## Unreleased
 
+## 0.189.16 - 2026-09-10
+
+### Added
+
+- Ship relocatable native development metadata in the C ABI archives. The
+  canonical layout provides `include/`, `lib/`, CMake config files under
+  `lib/cmake/ForgeNormalizer/`, and `lib/pkgconfig/forge-normalizer.pc` on
+  Unix; compatibility copies remain at their historical archive-root paths.
+  Consumers can use `find_package(ForgeNormalizer CONFIG REQUIRED)` with the
+  `Forge::Normalizer` target, or pkg-config on Linux and macOS.
+
+### Compatibility and release validation
+
+- The official generic Linux native archive and wheel floor is x86-64 with
+  glibc 2.34 or newer. Those generic artifacts use x86-64-v1 flags in the
+  pinned `manylinux_2_28` environment for build and ABI stress; this is not a
+  claim that the wheel installs or runs on glibc 2.28. The supplemental
+  x86-64-v3 CLI is built in the same pinned environment with an explicit v3
+  target.
+- The ordinary Linux archive is built, ELF-inspected, and runtime-smoked at
+  the official floor. The Linux wheel keeps its `manylinux_2_34_x86_64` tag
+  and is tested without a library override.
+- The C package exports the dynamic library only; no static library is
+  provided. Runtime loader-path setup remains the consumer's responsibility,
+  and the Windows `.lib` is an import library for the shipped DLL.
+
 ## 0.189.15 - 2026-09-09
 
 ### Added
