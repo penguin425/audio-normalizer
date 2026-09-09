@@ -80,13 +80,61 @@ metadata_files=()
 while IFS= read -r -d '' metadata_file; do
   metadata_files+=("$metadata_file")
 done < <(find "$cmake_config_dir" "$pkgconfig_dir" -type f -print0)
+
+metadata_embeds_path() {
+  python3 - "$1" "$2" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+
+needle = os.fsencode(sys.argv[1])
+data = Path(sys.argv[2]).read_bytes()
+component_bytes = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~+-"
+)
+
+# Require path-token boundaries.  A short mount such as /native must not match
+# a relative identifier such as tools/native_package_metadata.py.
+offset = 0
+while True:
+    match = data.find(needle, offset)
+    if match < 0:
+        # Reserve every other status for an unexpected inspection failure so
+        # the shell wrapper can distinguish a clean miss from an exception.
+        raise SystemExit(3)
+    end = match + len(needle)
+    before_is_boundary = match == 0 or (
+        data[match - 1] < 0x80
+        and data[match - 1] not in component_bytes
+        and data[match - 1] not in b"/\\"
+    )
+    after_is_boundary = end == len(data) or (
+        data[end] in b"/\\"
+        or (data[end] < 0x80 and data[end] not in component_bytes)
+    )
+    if before_is_boundary and after_is_boundary:
+        raise SystemExit(0)
+    offset = match + 1
+PY
+}
+
+reject_embedded_path() {
+  local candidate="$1"
+  local label="$2"
+  local metadata_file="$3"
+  local status=0
+  metadata_embeds_path "$candidate" "$metadata_file" || status=$?
+  case "$status" in
+    0) die "metadata retains $label $candidate: $metadata_file" ;;
+    3) ;;
+    *) die "could not inspect metadata for $label: $metadata_file" ;;
+  esac
+}
+
 for metadata_file in "${metadata_files[@]}"; do
-  if LC_ALL=C grep -aFq -- "$root_abs" "$metadata_file"; then
-    die "metadata retains original prefix $root_abs: $metadata_file"
-  fi
-  if LC_ALL=C grep -aFq -- "$repo_root" "$metadata_file"; then
-    die "metadata retains workspace path $repo_root: $metadata_file"
-  fi
+  reject_embedded_path "$root_abs" "original prefix" "$metadata_file"
+  reject_embedded_path "$repo_root" "workspace path" "$metadata_file"
   if LC_ALL=C grep -aEq -- '@[A-Za-z_][A-Za-z0-9_]*@' "$metadata_file"; then
     die "metadata contains an unexpanded template token: $metadata_file"
   fi
@@ -233,6 +281,34 @@ except ValueError as error:
     raise SystemExit(f"pkg-config emitted malformed flags: {error}") from error
 if not flags:
     raise SystemExit("pkg-config returned no compiler/linker flags")
+
+
+def normalize_directory_flags(arguments: list[str]) -> list[str]:
+    normalized: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        option = next(
+            (candidate for candidate in ("-I", "-L") if argument.startswith(candidate)),
+            None,
+        )
+        if option is None:
+            normalized.append(argument)
+            index += 1
+            continue
+        if argument == option:
+            index += 1
+            if index >= len(arguments):
+                raise SystemExit(f"pkg-config emitted a dangling {option}")
+            value = arguments[index]
+        else:
+            value = argument[len(option) :]
+        normalized.append(f"{option}{resolved_directory(value)}")
+        index += 1
+    return normalized
+
+
+flags = normalize_directory_flags(flags)
 
 
 def flag_values(short_option: str) -> list[str]:
