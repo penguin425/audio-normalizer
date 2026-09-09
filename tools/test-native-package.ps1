@@ -37,12 +37,16 @@ $scriptDirectory = $PSScriptRoot
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $scriptDirectory "..")).Path
 $fixtureDirectory = Join-Path $repoRoot "tests/fixtures/native_package"
 
-foreach ($commandName in @("cmake", "cl.exe")) {
-    if ($null -eq (Get-Command $commandName -CommandType Application -ErrorAction SilentlyContinue)) {
-        Stop-NativePackageTest "missing required command: $commandName"
-    }
+$cmakeApplication = Get-Command "cmake.exe" -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if ($null -eq $cmakeApplication) {
+    Stop-NativePackageTest "missing required command: cmake.exe"
 }
-$cmakeCommand = (Get-Command cmake -CommandType Application).Path
+if ($null -eq (Get-Command "cl.exe" -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1)) {
+    Stop-NativePackageTest "missing required command: cl.exe"
+}
+$cmakeCommand = $cmakeApplication.Path
 
 $temporary = Join-Path ([System.IO.Path]::GetTempPath()) (
     "forge-native-package-" + [guid]::NewGuid().ToString("N"))

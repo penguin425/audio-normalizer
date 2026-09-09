@@ -189,16 +189,31 @@ if version != expected_version:
 
 
 def resolved_directory(value: str) -> Path:
+    # freedesktop pkg-config prints --variable values as raw text, while
+    # pkgconf versions may shell-quote spaces (and, on some systems, bytes in
+    # non-ASCII path components).  Prefer the literal value and fall back to
+    # parsing exactly one shell-quoted token so both implementations exercise
+    # the same relocated prefix.
+    def existing_directory(candidate: str):
+        try:
+            path = Path(candidate).resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return path if path.is_dir() else None
+
+    literal = existing_directory(value)
+    if literal is not None:
+        return literal
     try:
         directory_tokens = shlex.split(value)
     except ValueError as error:
         raise SystemExit(f"pkg-config emitted malformed directory: {error}") from error
     if len(directory_tokens) != 1:
         raise SystemExit(f"pkg-config emitted an invalid directory: {value!r}")
-    path = Path(directory_tokens[0]).resolve(strict=True)
-    if not path.is_dir():
-        raise SystemExit(f"pkg-config path is not a directory: {value}")
-    return path
+    quoted = existing_directory(directory_tokens[0])
+    if quoted is None:
+        raise SystemExit(f"pkg-config path is not a directory: {value!r}")
+    return quoted
 
 
 include_dir = resolved_directory(
