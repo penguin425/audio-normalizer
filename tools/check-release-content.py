@@ -108,7 +108,17 @@ def compare_files(
 def committed_bytes(repo_root: Path, path: Path) -> bytes:
     relative = path.relative_to(repo_root).as_posix()
     result = subprocess.run(
-        ["git", "cat-file", "blob", f"HEAD:{relative}"],
+        [
+            "git",
+            # Container jobs mount the checkout with a host-owned UID. Trust
+            # only this resolved repository, and only for this read-only Git
+            # invocation, instead of mutating a runner-global configuration.
+            "-c",
+            f"safe.directory={repo_root}",
+            "cat-file",
+            "blob",
+            f"HEAD:{relative}",
+        ],
         cwd=repo_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

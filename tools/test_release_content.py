@@ -3,10 +3,12 @@ from __future__ import annotations
 import importlib.util
 import io
 import os
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from unittest import mock
 
 
 TOOLS = Path(__file__).resolve().parent
@@ -41,6 +43,24 @@ def make_native_prefix(base: Path, platform: str) -> Path:
 
 
 class NativeReleaseContentTests(unittest.TestCase):
+    def test_committed_bytes_uses_command_scoped_safe_directory(self) -> None:
+        expected = b"committed fixture\n"
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=expected, stderr=b""
+        )
+        with mock.patch.object(checker.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(
+                checker.committed_bytes(PROJECT_ROOT, PROJECT_ROOT / "README.md"),
+                expected,
+            )
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[:3],
+            ["git", "-c", f"safe.directory={PROJECT_ROOT}"],
+        )
+        self.assertEqual(command[3:], ["cat-file", "blob", "HEAD:README.md"])
+        self.assertEqual(run.call_args.kwargs["cwd"], PROJECT_ROOT)
+
     def test_all_platform_layouts_and_generated_metadata_pass(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
