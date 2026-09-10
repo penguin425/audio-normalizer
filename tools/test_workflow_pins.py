@@ -585,6 +585,9 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
 
     def test_release_privileges_are_split_across_the_one_way_dag(self) -> None:
         jobs = self.workflow["jobs"]
+        for job_name, job in jobs.items():
+            with self.subTest(job=job_name):
+                self.assertNotIn("${{ runner.", repr(job.get("env", {})))
         self.assertNotIn("permissions", jobs["assemble-release"])
         self.assertEqual(
             jobs["attest-release"]["permissions"],
