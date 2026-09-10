@@ -48,6 +48,9 @@ IMAGE_DIGEST = re.compile(r"^docker://.+@sha256:[0-9a-f]{64}$")
 CONTAINER_IMAGE_DIGEST = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}$"
 )
+MATRIX_IMAGE = re.compile(
+    r"^\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_]*)\s*}}$"
+)
 RAW_CONTAINER_ENGINE = re.compile(
     r"(?<![-\w])(?:docker(?:-compose)?|podman(?:-compose)?|nerdctl)(?:\.exe)?"
     r"(?![-\w])",
@@ -129,18 +132,74 @@ def _check_dependency(node: Node, scan: WorkflowScan) -> None:
         scan.reject(node, f"mutable external dependency: {dependency}")
 
 
-def _check_image(node: Node, scan: WorkflowScan, context: str) -> None:
+def _matrix_include_values(
+    job: MappingNode,
+    key: str,
+) -> list[ScalarNode] | None:
+    strategies = _direct_mapping_values(job, "strategy")
+    if len(strategies) != 1 or not isinstance(strategies[0], MappingNode):
+        return None
+    matrices = _direct_mapping_values(strategies[0], "matrix")
+    if len(matrices) != 1 or not isinstance(matrices[0], MappingNode):
+        return None
+    includes = _direct_mapping_values(matrices[0], "include")
+    if len(includes) != 1 or not isinstance(includes[0], SequenceNode):
+        return None
+    values: list[ScalarNode] = []
+    for item in includes[0].value:
+        if not isinstance(item, MappingNode):
+            return None
+        candidates = _direct_mapping_values(item, key)
+        if len(candidates) != 1 or not isinstance(candidates[0], ScalarNode):
+            return None
+        values.append(candidates[0])
+    return values or None
+
+
+def _check_image(
+    node: Node,
+    scan: WorkflowScan,
+    context: str,
+    *,
+    job: MappingNode | None = None,
+) -> None:
     if not isinstance(node, ScalarNode):
         scan.reject(node, f"{context} image must be a scalar reference")
+        return
+    matrix = MATRIX_IMAGE.fullmatch(node.value)
+    if matrix is not None:
+        values = (
+            _matrix_include_values(job, matrix.group(1))
+            if job is not None
+            else None
+        )
+        if values is None:
+            scan.reject(
+                node,
+                f"{context} matrix image must resolve in every include row: {node.value}",
+            )
+            return
+        for value in values:
+            scan.checked_images += 1
+            if not container_image_is_pinned(value.value):
+                scan.reject(
+                    value,
+                    f"mutable {context} matrix image: {value.value}",
+                )
         return
     scan.checked_images += 1
     if not container_image_is_pinned(node.value):
         scan.reject(node, f"mutable {context} image: {node.value}")
 
 
-def _check_container(node: Node, scan: WorkflowScan) -> None:
+def _check_container(
+    node: Node,
+    scan: WorkflowScan,
+    *,
+    job: MappingNode,
+) -> None:
     if isinstance(node, ScalarNode):
-        _check_image(node, scan, "job container")
+        _check_image(node, scan, "job container", job=job)
         return
     if not isinstance(node, MappingNode):
         scan.reject(node, "job container must be an image or mapping")
@@ -149,7 +208,7 @@ def _check_container(node: Node, scan: WorkflowScan) -> None:
     if len(images) != 1:
         scan.reject(node, "job container must contain exactly one direct image")
     for image in images:
-        _check_image(image, scan, "job container")
+        _check_image(image, scan, "job container", job=job)
 
 
 def _check_services(node: Node, scan: WorkflowScan) -> None:
@@ -229,7 +288,7 @@ def _walk(node: Node, scan: WorkflowScan, ancestors: frozenset[int]) -> None:
             if key == "uses":
                 _check_dependency(value_node, scan)
             elif key == "container":
-                _check_container(value_node, scan)
+                _check_container(value_node, scan, job=node)
             elif key == "services":
                 _check_services(value_node, scan)
             elif key == "run":

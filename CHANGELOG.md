@@ -6,6 +6,40 @@ tags and keeps public compatibility commitments in
 
 ## Unreleased
 
+## 0.189.17 - 2026-09-10
+
+### Added
+
+- Add generic Linux ARM64 native and Python artifacts. The AArch64 archive and
+  `manylinux_2_34_aarch64` wheel are built below the supported glibc 2.34
+  floor, scanned for the ARMv8-A baseline, runtime-tested on a native ARM64
+  runner, and exercised under a checksum-pinned `cortex-a53` emulator. The
+  archive is rebuilt byte for byte from its recorded PGO inputs; the wheel is
+  independently rebuilt, repaired, and compared byte for byte.
+- Add an exact public npm package for the browser WASM bindings and retain the
+  exact Cargo source package used by the crates.io publication boundary.
+
+### Supply chain and publication
+
+- Assemble releases from explicitly named producer artifacts and reject any
+  missing, extra, duplicate, linked, oversized, or digest-mismatched file.
+  `RELEASE-MANIFEST.json` binds every distributable, package-manager manifest,
+  and normalized per-artifact SPDX/CycloneDX sidecar to the exact checksum and
+  SLSA subject set. PGO training inputs remain private workflow evidence.
+- Split read-only assembly, OIDC attestation, and GitHub publication into
+  separate jobs. The publisher keeps release mutations on the contents-only
+  built-in token and uses a repository-scoped App token only for fail-closed
+  policy reads. It fills and verifies a reusable draft, decides `latest` under
+  a repository-wide mutex before the immutable transition, and refuses an
+  unprotected or moved tag.
+- Publish the manifest-checked wheel, npm, and Cargo package sets through
+  isolated PyPI, npm, and crates.io trusted-publisher jobs. Each job receives a
+  short-lived OIDC identity only, reconciles an exact existing registry version
+  for safe retries, and fails closed on a partial or different remote version.
+- Keep Windows ARM64, OCI publication, macOS notarization/stapling, and
+  Authenticode signing outside this release contract until demand, platform
+  validation, and credentials justify those targets.
+
 ## 0.189.16 - 2026-09-10
 
 ### Added

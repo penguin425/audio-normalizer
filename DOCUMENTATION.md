@@ -71,6 +71,7 @@ report names its schema version and the bounded checks it performs.
 
 - [C API and native package metadata](C-API.md)
 - [Python API](PYTHON-API.md)
+- [Browser WebAssembly and npm package](WASM-PACKAGE.md)
 - [FFmpeg and GStreamer adapters](HOST-ADAPTERS.md)
 - [VST3 adapter](VST3-ADAPTER.md)
 - [Audio Unit adapter](AU-ADAPTER.md)

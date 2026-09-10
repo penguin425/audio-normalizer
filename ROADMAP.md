@@ -169,7 +169,7 @@ Forge already provides:
 - Dependency-free Python 3.10+ bindings over C ABI v1, with immutable typed
   results, explicit decoded-sample bounds, deterministic native-library
   selection, concurrent-call coverage, and self-contained platform wheels for
-  Linux x86-64, macOS ARM64/x86-64, and Windows x86-64.
+  Linux x86-64/ARM64, macOS ARM64/x86-64, and Windows x86-64.
 - Dependency-free browser WebAssembly analysis over the shared Rust DSP core,
   with WAVE and interleaved Float32 entry points, TypeScript declarations,
   fixed resource limits, and no filesystem, network, normalization, or encoder
@@ -196,8 +196,9 @@ Forge already provides:
   acoustic-output requirements remain explicitly `not_run`.
 - Forge-specific decoded-audio rules for DC offset, inter-channel sample
   delay, stuck samples, and discontinuities, with bounded/coalesced evidence.
-- Immutable publication is enabled for future GitHub Releases; release assets
-  include SPDX/CycloneDX SBOMs and verified SLSA provenance, with
+- Immutable publication is enabled for GitHub Releases from v0.189.17 onward;
+  release assets include per-artifact SPDX/CycloneDX SBOMs and verified SLSA
+  provenance, with
   byte-reproducible Linux archives, dependency policy, Rust 1.89 MSRV checks,
   cargo-binstall metadata, and generated Homebrew/Scoop/WinGet manifests.
 - Delivery-manifest v1/v2-to-v3 migration with count/schema validation and
@@ -706,7 +707,7 @@ unchanged controls from paths whose normative work factor changed.
 The order below is an implementation plan, not a standards requirement. Each
 normative item must name the exact supported clauses and must not imply
 certification or coverage beyond its fixtures.
-v0.189.1 through v0.189.16 are the completed baseline; later entries are
+v0.189.1 through v0.189.17 are the completed baseline; later entries are
 planned.
 
 | Release | Scope | Classification |
@@ -727,7 +728,7 @@ planned.
 | v0.189.14 | Add explicit metadata-fidelity policies, registry-backed full-container metadata discovery, exact resampling-time conversion, and restartable metadata-only library transactions | Metadata integrity and workflow recovery |
 | v0.189.15 | Add generation-level all-or-nothing album/batch audio publication through a sibling recovery journal, semantic runtime context and job IDs, bounded `--keep-going` failure reports, read-only recovery inspection, journal-proven private-stage reclamation, progress v2, and fully side-effect-free dry runs outside explicit cache warming | Recoverability and operations |
 | v0.189.16 | Prove Linux ABI and wheel-tag compatibility in the oldest supported runtime and ship relocatable CMake/pkg-config metadata before expanding release targets | Distribution compatibility |
-| v0.189.17 | Split assemble/attest/publish permissions, decide `latest` before the one-way immutable publication, validate an exact asset manifest, add Linux ARM64 after runtime proof, use OIDC trusted publishing for PyPI/npm while isolating a least-privilege crates.io token or credential provider until crates.io offers an equivalent official flow, and extend per-artifact SBOM/provenance; treat Windows ARM64, OCI, notarization, and Authenticode as demand- and credential-gated follow-up | Supply-chain and native trust |
+| v0.189.17 | Split assemble/attest/publish permissions, decide `latest` before the one-way immutable publication, validate an exact asset manifest, add Linux ARM64 after runtime proof, use isolated OIDC trusted publishing for PyPI/npm/crates.io, and extend per-artifact SBOM/provenance; treat Windows ARM64, OCI, notarization, and Authenticode as demand- and credential-gated follow-up | Supply-chain and native trust |
 | v0.190 | Native file-based ADM BS.2168 Level 0/1/2 validation, including declarations, graph constraints, block timing, CHNA/essence reconciliation, and derived limits | Normative |
 | v0.190.1 | Add ITU-R BS.1864-1 international programme-exchange presets for programme- and explicitly ranged dialogue-based −24 LKFS measurement | Normative profile |
 | v0.190.2 | Introduce a common checked AES3 essence layer, then decode and validate uncompressed PCM Wave Audio essence in SMPTE ST 382:2023 MXF, including wrapping, descriptor, quantization, channel-ID, and BWF mapping evidence | Normative subset |

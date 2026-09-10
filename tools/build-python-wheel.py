@@ -21,6 +21,7 @@ SUPPORTED_PLATFORMS = {
     # Only auditwheel repair plus check-linux-wheel-abi.py may produce a
     # manylinux_2_34 release candidate.
     "linux_x86_64": "libforge_normalizer.so",
+    "linux_aarch64": "libforge_normalizer.so",
     "win_amd64": "forge_normalizer.dll",
 }
 

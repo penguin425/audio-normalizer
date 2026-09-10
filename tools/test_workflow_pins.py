@@ -111,6 +111,35 @@ class WorkflowPinTests(unittest.TestCase):
             )
         )
 
+    def test_matrix_container_image_requires_every_include_row_to_be_pinned(self) -> None:
+        digest = "a" * 64
+        pinned = f"registry.example/forge@sha256:{digest}"
+        fixture = f"""
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - architecture: x86_64
+            image: {pinned}
+          - architecture: aarch64
+            image: {pinned}
+    container:
+      image: ${{{{ matrix.image }}}}
+"""
+        _, images, violations = pins.scan_workflow_text(fixture)
+        self.assertEqual(images, 2)
+        self.assertEqual(violations, [])
+
+        mutable = fixture.replace(pinned, "registry.example/forge:latest", 1)
+        _, images, violations = pins.scan_workflow_text(mutable)
+        self.assertEqual(images, 2)
+        self.assertTrue(any("matrix image" in item for item in violations))
+
+        missing = fixture.replace(f"            image: {pinned}\n", "", 1)
+        _, _, violations = pins.scan_workflow_text(missing)
+        self.assertTrue(any("resolve in every include row" in item for item in violations))
+
     def test_flow_mappings_at_all_workflow_levels_are_inspected(self) -> None:
         fixture = """
 jobs: {test: {container: {image: ubuntu:24.04}, services: {database:
@@ -303,9 +332,15 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
                 "tools/check-linux-native-abi.py",
                 "tools/manylinux-cmake-toolchain.cmake",
                 "tools/native_package_metadata.py",
+                "tools/publish-github-release.py",
+                "tools/release_manifest.py",
                 "tools/test-native-package.sh",
                 "tools/test-native-package.ps1",
                 "tools/test_native_package_metadata.py",
+                "tools/test_publish_github_release.py",
+                "tools/test_registry_artifacts.py",
+                "tools/test_release_manifest.py",
+                "tools/verify-registry-artifacts.py",
                 "tools/workflow-check-requirements.lock",
             }
             <= paths
@@ -405,21 +440,34 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
 
     def test_cpu_model_is_passed_from_workflow_to_real_elf_controls(self) -> None:
         smoke = self.workflow["jobs"]["smoke-linux-wheel-floor"]
-        self.assertTrue(smoke["env"]["QEMU_CPU"])
+        rows = {
+            row["architecture"]: row
+            for row in smoke["strategy"]["matrix"]["include"]
+        }
+        self.assertEqual(set(rows), {"x86_64", "aarch64"})
         self.assertEqual(
-            smoke["env"]["QEMU_DEB_SHA256"],
+            rows["x86_64"]["qemu_deb_sha256"],
             "c3e3ba2bd87f8c5b9a5da5ef21b5a3b82d7c63b89dd448d9ddaa4eabc5b6e402",
         )
         self.assertEqual(
-            smoke["env"]["QEMU_DEB_URL"],
-            "https://snapshot.debian.org/archive/debian/20260526T203455Z/"
-            "pool/main/q/qemu/"
-            "qemu-user-static_7.2%2bdfsg-7%2bdeb12u18%2bb3_amd64.deb",
+            rows["aarch64"]["qemu_deb_sha256"],
+            "e420c417c12b42ca774795b62888d5388da0e08c1ef263dea1490e5ce4e32a0b",
         )
+        self.assertEqual(
+            rows["aarch64"]["manylinux_2_34"],
+            "quay.io/pypa/manylinux_2_34_aarch64@sha256:"
+            "effc0e17319a56b2c7eaff0cb5dd81a2d2c2850410841d3f017378f52ead6442",
+        )
+        self.assertEqual(rows["aarch64"]["qemu_cpu"], "cortex-a53")
+        for row in rows.values():
+            self.assertTrue(row["qemu_deb_url"].startswith(
+                "https://snapshot.debian.org/archive/debian/20260526T203455Z/"
+            ))
         commands = "\n".join(
             step.get("run", "") for step in smoke["steps"]
         )
         self.assertIn('--qemu-x86-64 "$qemu"', commands)
+        self.assertIn('--qemu-aarch64 "$qemu"', commands)
         self.assertIn('--qemu-cpu "$QEMU_CPU"', commands)
 
     def test_release_workflow_passes_the_structural_pin_scan(self) -> None:
@@ -428,8 +476,8 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         )
         self.assertEqual(violations, [])
 
-    def test_publish_still_needs_every_linux_wheel_gate(self) -> None:
-        needs = set(self.workflow["jobs"]["publish"]["needs"])
+    def test_assembly_still_needs_every_linux_wheel_gate(self) -> None:
+        needs = set(self.workflow["jobs"]["assemble-release"]["needs"])
         self.assertTrue(
             {
                 "build-linux-wheel",
@@ -439,23 +487,44 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             <= needs
         )
 
-    def test_publish_needs_every_portable_native_archive_gate(self) -> None:
-        needs = set(self.workflow["jobs"]["publish"]["needs"])
+    def test_assembly_needs_every_portable_native_archive_gate(self) -> None:
+        needs = set(self.workflow["jobs"]["assemble-release"]["needs"])
         self.assertTrue(
             {
                 "build-linux",
                 "smoke-linux-wheel-floor",
                 "reproducible-linux",
+                "reproducible-linux-aarch64",
             }
             <= needs
         )
 
     def test_generic_linux_archive_is_built_below_its_runtime_floor(self) -> None:
-        image = (
+        x86_image = (
             "quay.io/pypa/manylinux_2_28_x86_64@sha256:"
             "53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c"
         )
-        for job_name in ("build-linux", "build-linux-v3", "reproducible-linux"):
+        arm_image = (
+            "quay.io/pypa/manylinux_2_28_aarch64@sha256:"
+            "ad74e53b713f3b07d8c889c526dc0c6500da9827b45e38739570875fef52e28f"
+        )
+        generic = self.workflow["jobs"]["build-linux"]
+        self.assertEqual(generic["container"]["image"], "${{ matrix.image }}")
+        rows = {
+            row["architecture"]: row
+            for row in generic["strategy"]["matrix"]["include"]
+        }
+        self.assertEqual(rows["x86_64"]["image"], x86_image)
+        self.assertEqual(rows["aarch64"]["image"], arm_image)
+        self.assertEqual(rows["x86_64"]["target_cpu"], "x86-64")
+        self.assertEqual(rows["aarch64"]["target_cpu"], "generic")
+        self.assertIn("-march=x86-64", rows["x86_64"]["cflags"])
+        self.assertIn("-march=armv8-a", rows["aarch64"]["cflags"])
+        for job_name, image in (
+            ("build-linux-v3", x86_image),
+            ("reproducible-linux", x86_image),
+            ("reproducible-linux-aarch64", arm_image),
+        ):
             with self.subTest(job=job_name):
                 job = self.workflow["jobs"][job_name]
                 self.assertEqual(job["container"]["image"], image)
@@ -464,12 +533,10 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
                 )
                 self.assertIn('glibc 2.28', commands)
                 self.assertIn("RUSTUP_INIT_SHA256", commands)
-        generic = self.workflow["jobs"]["build-linux"]
-        self.assertIn("-C target-cpu=x86-64", generic["env"]["RUSTFLAGS"])
-        self.assertIn("-march=x86-64", generic["env"]["CFLAGS"])
         commands = "\n".join(
             step.get("run", "") for step in generic["steps"]
         )
+        self.assertIn("matrix.target_cpu", generic["env"]["RUSTFLAGS"])
         self.assertIn("tools/check-linux-native-abi.py", commands)
         self.assertIn("tools/test-native-package.sh", commands)
 
@@ -485,11 +552,12 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("tools/check-linux-native-abi.py", commands)
         self.assertIn("--archive", commands)
         self.assertIn("--expected-root", commands)
-        self.assertIn("/qemu-x86_64-static", commands)
+        self.assertIn("/qemu-static", commands)
+        self.assertIn("manylinux_2_34_${FORGE_ARCHITECTURE}", commands)
 
     def test_linux_wheel_builds_preserve_opus_analysis(self) -> None:
         builds = {
-            "build-linux-wheel": "Build the dedicated generic x86-64 cdylib",
+            "build-linux-wheel": "Build the dedicated generic Linux cdylib",
             "reproducible-linux-wheel": "Rebuild and repair independently",
         }
         toolchain = (
@@ -514,6 +582,189 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
                     step.get("env", {}).get("CMAKE_TOOLCHAIN_FILE"),
                     toolchain,
                 )
+
+    def test_release_privileges_are_split_across_the_one_way_dag(self) -> None:
+        jobs = self.workflow["jobs"]
+        for job_name, job in jobs.items():
+            with self.subTest(job=job_name):
+                self.assertNotIn("${{ runner.", repr(job.get("env", {})))
+        self.assertNotIn("permissions", jobs["assemble-release"])
+        self.assertEqual(
+            jobs["attest-release"]["permissions"],
+            {
+                "attestations": "write",
+                "contents": "read",
+                "id-token": "write",
+            },
+        )
+        self.assertEqual(
+            jobs["publish-github"]["permissions"],
+            {"contents": "write"},
+        )
+        self.assertEqual(
+            set(jobs["publish-github"]["needs"]),
+            {"validate", "attest-release"},
+        )
+        self.assertEqual(
+            set(jobs["attest-release"]["needs"]),
+            {"validate", "assemble-release"},
+        )
+        concurrency = jobs["publish-github"]["concurrency"]
+        self.assertEqual(concurrency["group"], "forge-release-publication")
+        self.assertEqual(concurrency["queue"], "max")
+        self.assertEqual(concurrency["cancel-in-progress"], "false")
+        publisher_steps = jobs["publish-github"]["steps"]
+        policy_steps = [
+            step
+            for step in publisher_steps
+            if step.get("id") == "release-policy-token"
+        ]
+        self.assertEqual(len(policy_steps), 1)
+        self.assertEqual(
+            policy_steps[0]["uses"],
+            "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
+        )
+        self.assertEqual(
+            policy_steps[0]["with"].get("permission-administration"), "write"
+        )
+        publish_steps = [
+            step
+            for step in publisher_steps
+            if "tools/publish-github-release.py" in step.get("run", "")
+        ]
+        self.assertEqual(len(publish_steps), 1)
+        self.assertEqual(
+            publish_steps[0].get("env", {}).get("GITHUB_POLICY_TOKEN"),
+            "${{ steps.release-policy-token.outputs.token }}",
+        )
+
+    def test_assembly_and_publication_use_an_exact_manifest_without_globs(self) -> None:
+        forbidden = (
+            "pattern: forge-*",
+            "merge-multiple: true",
+            "gh release create",
+            "gh release edit",
+            "dist/*",
+        )
+        for fragment in forbidden:
+            with self.subTest(fragment=fragment):
+                self.assertNotIn(fragment, self.text)
+        assembly = self.workflow["jobs"]["assemble-release"]
+        downloads = [
+            step["with"]["name"]
+            for step in assembly["steps"]
+            if step.get("uses", "").startswith("actions/download-artifact@")
+        ]
+        self.assertEqual(
+            set(downloads),
+            {
+                "forge-linux-x86_64",
+                "forge-linux-aarch64",
+                "forge-linux-x86_64-v3",
+                "forge-windows-x86_64",
+                "forge-macos-x86_64",
+                "forge-macos-aarch64",
+                "forge-python-linux-x86_64",
+                "forge-python-linux-aarch64",
+                "forge-wasm-packages",
+                "forge-rust-crate",
+            },
+        )
+        commands = "\n".join(
+            step.get("run", "") for step in assembly["steps"]
+        )
+        self.assertIn("tools/release_manifest.py generate-sboms", commands)
+        self.assertIn("tools/release_manifest.py finalize", commands)
+        self.assertIn("tools/release_manifest.py verify", commands)
+        self.assertIn("--state local", commands)
+        self.assertNotIn("pgo-profile", "\n".join(downloads))
+
+    def test_latest_is_decided_only_by_the_immutable_publisher(self) -> None:
+        publisher_job = self.workflow["jobs"]["publish-github"]
+        commands = "\n".join(
+            step.get("run", "") for step in publisher_job["steps"]
+        )
+        self.assertIn("tools/publish-github-release.py", commands)
+        self.assertNotIn("--latest", commands)
+        helper = (TOOLS / "publish-github-release.py").read_text(encoding="utf-8")
+        self.assertIn("decide_latest", helper)
+        self.assertIn('"draft": False', helper)
+        self.assertIn('"make_latest":', helper)
+
+    def test_registry_publishers_are_isolated_oidc_tag_push_jobs(self) -> None:
+        jobs = self.workflow["jobs"]
+        expected = {
+            "publish-pypi": "pypi",
+            "publish-npm": "npm",
+            "publish-crates": "crates-io",
+        }
+        for job_name, environment in expected.items():
+            with self.subTest(job=job_name):
+                job = jobs[job_name]
+                self.assertEqual(
+                    job["if"],
+                    "github.event_name == 'push' && github.ref_type == 'tag'",
+                )
+                self.assertEqual(job["environment"], environment)
+                self.assertEqual(
+                    job["permissions"],
+                    {"contents": "read", "id-token": "write"},
+                )
+                self.assertEqual(
+                    set(job["needs"]), {"validate", "publish-github"}
+                )
+                self.assertEqual(job["concurrency"].get("queue"), "max")
+                commands = "\n".join(
+                    step.get("run", "") for step in job["steps"]
+                )
+                self.assertIn("tools/release_manifest.py verify", commands)
+                self.assertIn("tools/verify-registry-artifacts.py", commands)
+                self.assertIn("--state pre", commands)
+                self.assertIn("--state post", commands)
+        self.assertIn(
+            "pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc",
+            self.text,
+        )
+        self.assertIn(
+            "rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18",
+            self.text,
+        )
+        crates_publish = [
+            step
+            for step in jobs["publish-crates"]["steps"]
+            if step.get("name") == "Publish the previously absent crate"
+        ]
+        self.assertEqual(len(crates_publish), 1)
+        self.assertIn("cargo publish --locked --no-verify", crates_publish[0]["run"])
+        self.assertIn("cmp", crates_publish[0]["run"])
+        self.assertIn("node-version: \"24.21.0\"", self.text)
+        self.assertIn("npm --version", self.text)
+        self.assertNotIn("NODE_AUTH_TOKEN", self.text)
+
+    def test_arm64_is_built_reproduced_and_exercised_on_native_runners(self) -> None:
+        release_jobs = self.workflow["jobs"]
+        for job_name in (
+            "build-linux",
+            "build-linux-wheel",
+            "reproducible-linux-wheel",
+            "smoke-linux-wheel-floor",
+        ):
+            rows = release_jobs[job_name]["strategy"]["matrix"]["include"]
+            arm = [row for row in rows if row["architecture"] == "aarch64"]
+            self.assertEqual(len(arm), 1, job_name)
+            self.assertEqual(arm[0]["runner"], "ubuntu-24.04-arm")
+        self.assertEqual(
+            release_jobs["reproducible-linux-aarch64"]["runs-on"],
+            "ubuntu-24.04-arm",
+        )
+        ci_rows = self.ci["jobs"]["c-api"]["strategy"]["matrix"]["include"]
+        self.assertTrue(
+            any(
+                row["os"] == "ubuntu-24.04-arm"
+                and row["target"] == "aarch64-unknown-linux-gnu"
+                for row in ci_rows
+            )
+        )
 
 
 if __name__ == "__main__":

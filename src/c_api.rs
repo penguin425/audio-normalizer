@@ -880,7 +880,7 @@ mod tests {
 
     #[test]
     fn error_writer_truncates_on_a_utf8_boundary_and_terminates() {
-        let mut bytes = [1_i8; 5];
+        let mut bytes: [c_char; 5] = [1; 5];
         // SAFETY: `bytes` is a writable five-byte buffer.
         unsafe { write_error("ééé", bytes.as_mut_ptr(), bytes.len()) };
         assert_eq!(bytes.map(|byte| byte as u8), [0xc3, 0xa9, 0xc3, 0xa9, 0]);
@@ -898,7 +898,7 @@ mod tests {
             attack_ms: 10.0,
             release_ms: 100.0,
         };
-        let mut error = [0_i8; 256];
+        let mut error: [c_char; 256] = [0; 256];
         // SAFETY: config and error are valid caller-owned storage.
         let handle =
             unsafe { forge_normalizer_live_create_v1(&config, error.as_mut_ptr(), error.len()) };
@@ -984,7 +984,7 @@ mod tests {
             attack_ms: 10.0,
             release_ms: 100.0,
         };
-        let mut error = [0_i8; 128];
+        let mut error: [c_char; 128] = [0; 128];
         // SAFETY: config and error are valid caller-owned storage.
         let handle =
             unsafe { forge_normalizer_live_create_v1(&config, error.as_mut_ptr(), error.len()) };

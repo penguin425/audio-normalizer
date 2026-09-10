@@ -1,6 +1,6 @@
 [package]
 name = "forge-normalizer"
-version = "0.189.16"
+version = "0.189.17"
 edition = "2021"
 rust-version = "1.89"
 description = "Forge: a SIMD-accelerated EBU R128 / ITU-R BS.1770-5 loudness normalizer (WAV/MP3/FLAC/Opus/AAC/Vorbis)"
@@ -23,6 +23,11 @@ disabled-strategies = ["quick-install"]
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
 pkg-url = "{ repo }/releases/download/v{ version }/forge-v{ version }-linux-x86_64.tar.gz"
 bin-dir = "forge-v{ version }-linux-x86_64/{ bin }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/forge-v{ version }-linux-aarch64.tar.gz"
+bin-dir = "forge-v{ version }-linux-aarch64/{ bin }"
 pkg-fmt = "tgz"
 
 [package.metadata.binstall.overrides.x86_64-apple-darwin]

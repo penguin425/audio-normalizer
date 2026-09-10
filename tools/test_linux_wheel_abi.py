@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("check-linux-wheel-abi.py")
@@ -27,24 +28,36 @@ BUILDER_SPEC.loader.exec_module(builder)
 MANYLINUX_CMAKE_TOOLCHAIN = SCRIPT.with_name("manylinux-cmake-toolchain.cmake")
 
 
-def elf_header(marker: bytes = b"") -> bytes:
+def elf_header(
+    marker: bytes = b"",
+    *,
+    architecture: str = "x86_64",
+    elf_type: int = abi.ET_DYN,
+) -> bytes:
     header = bytearray(64)
     header[:4] = b"\x7fELF"
     header[4] = 2
     header[5] = 1
     header[6] = 1
-    header[16:18] = (3).to_bytes(2, "little")
-    header[18:20] = (62).to_bytes(2, "little")
+    header[16:18] = elf_type.to_bytes(2, "little")
+    machine = abi.contract_for_architecture(architecture).elf_machine
+    header[18:20] = machine.to_bytes(2, "little")
     return bytes(header) + marker
 
 
 def make_wheel(
     directory: Path,
     *,
-    filename_platform: str = abi.EXPECTED_PLATFORM,
-    metadata_platform: str = abi.EXPECTED_PLATFORM,
+    architecture: str = "x86_64",
+    filename_platform: str | None = None,
+    metadata_platform: str | None = None,
     elves: tuple[str, ...] = ("forge_normalizer/lib/libforge_normalizer.so",),
 ) -> Path:
+    contract = abi.contract_for_architecture(architecture)
+    if filename_platform is None:
+        filename_platform = contract.platform
+    if metadata_platform is None:
+        metadata_platform = contract.platform
     wheel = directory / (
         f"forge_normalizer-0.189.11-py3-none-{filename_platform}.whl"
     )
@@ -56,7 +69,13 @@ def make_wheel(
     with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr("forge_normalizer-0.189.11.dist-info/WHEEL", metadata)
         for index, member in enumerate(elves):
-            archive.writestr(member, elf_header(str(index).encode("ascii")))
+            archive.writestr(
+                member,
+                elf_header(
+                    str(index).encode("ascii"),
+                    architecture=architecture,
+                ),
+            )
     return wheel
 
 
@@ -148,6 +167,17 @@ class DynamicAndIsaTests(unittest.TestCase):
         with self.assertRaisesRegex(abi.WheelAbiError, "exactly one"):
             abi.validate_program_headers("LOAD 0x0 0x0 0x0 0x0 0x0 R E 0x1000")
 
+    def test_interpreter_must_match_the_selected_architecture(self) -> None:
+        abi.validate_interpreter(
+            "[Requesting program interpreter: /lib/ld-linux-aarch64.so.1]",
+            architecture="aarch64",
+        )
+        with self.assertRaisesRegex(abi.WheelAbiError, "ld-linux-aarch64"):
+            abi.validate_interpreter(
+                "[Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]",
+                architecture="aarch64",
+            )
+
     def test_auditwheel_success_without_policy_text_is_rejected(self) -> None:
         with self.assertRaisesRegex(abi.WheelAbiError, "did not report"):
             abi.validate_auditwheel_output("The command completed successfully")
@@ -160,11 +190,100 @@ class DynamicAndIsaTests(unittest.TestCase):
                     f'"{policy}".'
                 )
 
+    def test_aarch64_contract_rejects_optional_features(self) -> None:
+        with self.assertRaisesRegex(abi.WheelAbiError, "BTI"):
+            abi.validate_notes(
+                "GNU properties: AArch64 feature: BTI",
+                architecture="aarch64",
+            )
+
+    def test_wheel_header_rejects_static_executable(self) -> None:
+        with self.assertRaisesRegex(abi.WheelAbiError, "ET_DYN"):
+            abi.validate_elf_header(
+                elf_header(elf_type=abi.ET_EXEC),
+                member="fixture.so",
+            )
+
+    def test_aarch64_auditwheel_policy_is_architecture_specific(self) -> None:
+        abi.validate_auditwheel_output(
+            'wheel is consistent with the following platform tag: '
+            '"manylinux_2_34_aarch64".',
+            architecture="aarch64",
+        )
+        with self.assertRaisesRegex(abi.WheelAbiError, "aarch64"):
+            abi.validate_auditwheel_output(
+                'wheel is consistent with the following platform tag: '
+                '"manylinux_2_34_x86_64".',
+                architecture="aarch64",
+            )
+
 
 class WholeWheelTests(unittest.TestCase):
     def test_builder_can_only_emit_an_unclaimed_linux_tag(self) -> None:
         self.assertIn("linux_x86_64", builder.SUPPORTED_PLATFORMS)
+        self.assertIn("linux_aarch64", builder.SUPPORTED_PLATFORMS)
         self.assertNotIn(abi.EXPECTED_PLATFORM, builder.SUPPORTED_PLATFORMS)
+
+    def test_aarch64_wheel_uses_aarch64_machine_and_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            wheel = make_wheel(Path(directory), architecture="aarch64")
+            inspected = abi.verify_wheel(
+                wheel,
+                architecture="aarch64",
+                inspector=accept_elf,
+                auditwheel_checker=accept_auditwheel,
+            )
+            self.assertEqual(
+                inspected,
+                ["forge_normalizer/lib/libforge_normalizer.so"],
+            )
+
+    def test_aarch64_default_elf_inspector_receives_architecture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheel = make_wheel(root, architecture="aarch64")
+            fake_readelf = root / "fake-readelf"
+            fake_readelf.write_text(
+                "#!/bin/sh\nprintf '%s\\n' 'GNU_STACK 0x0 0x0 0x0 0x0 0x0 RW 0x10'\n",
+                encoding="ascii",
+            )
+            fake_readelf.chmod(0o755)
+            self.assertEqual(
+                abi.verify_wheel(
+                    wheel,
+                    architecture="aarch64",
+                    readelf=str(fake_readelf),
+                    auditwheel_checker=accept_auditwheel,
+                ),
+                ["forge_normalizer/lib/libforge_normalizer.so"],
+            )
+
+    def test_aarch64_contract_rejects_x86_elf_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            wheel = make_wheel(
+                Path(directory),
+                architecture="aarch64",
+                elves=("forge_normalizer/lib/libforge_normalizer.so",),
+            )
+            # Replace the ARM fixture with a valid x86-64 ELF header while
+            # preserving the aarch64 filename and WHEEL tag.
+            with zipfile.ZipFile(wheel, "r") as source:
+                members = {
+                    name: source.read(name)
+                    for name in source.namelist()
+                }
+            members["forge_normalizer/lib/libforge_normalizer.so"] = elf_header()
+            wheel.unlink()
+            with zipfile.ZipFile(wheel, "w") as target:
+                for name, content in members.items():
+                    target.writestr(name, content)
+            with self.assertRaisesRegex(abi.WheelAbiError, "expected AArch64"):
+                abi.verify_wheel(
+                    wheel,
+                    architecture="aarch64",
+                    inspector=accept_elf,
+                    auditwheel_checker=accept_auditwheel,
+                )
 
     def test_every_elf_member_is_inspected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -224,6 +343,65 @@ class WholeWheelTests(unittest.TestCase):
 
 
 class BaselineCpuEmulationTests(unittest.TestCase):
+    def test_x86_workflow_cpu_reaches_the_x86_fixture(self) -> None:
+        class ReachedCompile(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            qemu = Path(directory) / "qemu-x86_64-static"
+            qemu.write_bytes(b"fixture")
+            qemu.chmod(0o755)
+            with mock.patch(
+                f"{__name__}._compile_static_elf",
+                side_effect=ReachedCompile,
+            ):
+                with self.assertRaises(ReachedCompile):
+                    run_cpu_emulation_controls(
+                        str(qemu),
+                        "qemu64,-lahf-lm,-pni,-ssse3,-sse4.1,-sse4.2,"
+                        "-popcnt,-cx16,-avx,-avx2",
+                    )
+
+    def test_aarch64_control_requires_plain_cortex_a53(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            qemu = Path(directory) / "qemu-aarch64-static"
+            qemu.write_bytes(b"fixture")
+            qemu.chmod(0o755)
+            with self.assertRaisesRegex(AssertionError, "plain cortex-a53"):
+                run_aarch64_cpu_controls(str(qemu), "max")
+
+    def test_aarch64_control_reaches_all_instruction_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            qemu = Path(directory) / "qemu-aarch64-static"
+            qemu.write_bytes(b"fixture")
+            qemu.chmod(0o755)
+
+            def compile_fixture(_source: str, output: Path, **_kwargs: object) -> None:
+                output.write_bytes(
+                    elf_header(architecture="aarch64", elf_type=abi.ET_EXEC)
+                )
+
+            with (
+                mock.patch(
+                    f"{__name__}._compile_static_elf",
+                    side_effect=compile_fixture,
+                ) as compile_mock,
+                mock.patch(
+                    f"{__name__}._run_qemu",
+                    side_effect=(0, 0, -4, 0),
+                ) as qemu_mock,
+                mock.patch.object(
+                    abi,
+                    "validate_elf_header",
+                    wraps=abi.validate_elf_header,
+                ) as header_mock,
+            ):
+                run_aarch64_cpu_controls(str(qemu), "cortex-a53")
+
+            self.assertEqual(compile_mock.call_count, 3)
+            self.assertEqual(header_mock.call_count, 3)
+            self.assertEqual(qemu_mock.call_count, 4)
+
     @unittest.skipUnless(
         os.environ.get("FORGE_QEMU_X86_64")
         and os.environ.get("FORGE_QEMU_CPU"),
@@ -266,7 +444,13 @@ CPU_FEATURES = {
 }
 
 
-def _compile_static_elf(source: str, output: Path) -> None:
+def _compile_static_elf(
+    source: str,
+    output: Path,
+    *,
+    compiler: str = "cc",
+    extra_args: tuple[str, ...] = (),
+) -> None:
     assembly = output.with_suffix(".S")
     assembly.write_text(
         ".global _start\n.text\n_start:\n"
@@ -276,7 +460,8 @@ def _compile_static_elf(source: str, output: Path) -> None:
     )
     subprocess.run(
         [
-            "cc",
+            compiler,
+            *extra_args,
             "-nostdlib",
             "-static",
             "-no-pie",
@@ -410,16 +595,117 @@ def run_cpu_emulation_controls(qemu: str, cpu: str) -> None:
                 )
 
 
+def run_aarch64_cpu_controls(
+    qemu: str,
+    cpu: str,
+    *,
+    compiler: str = "cc",
+) -> None:
+    """Prove that an AArch64 QEMU model enforces the Cortex-A53 floor.
+
+    The release baseline includes ARMv8-A and mandatory ASIMD/NEON.  QEMU's
+    Cortex-A53 model also exposes optional crypto instructions, so a later SVE
+    instruction is the sensitivity control: it must trap on Cortex-A53 and
+    execute on QEMU's ``max`` model.  Keeping the compiler explicit lets this
+    run on a native ARM runner (``cc``) or an x86 runner with a pinned aarch64
+    cross compiler.
+    """
+
+    qemu_path = Path(qemu)
+    if not qemu_path.is_file() or not os.access(qemu_path, os.X_OK):
+        raise AssertionError(f"QEMU executable is unavailable: {qemu}")
+    if cpu != "cortex-a53":
+        raise AssertionError(
+            "AArch64 baseline QEMU CPU must be plain cortex-a53: "
+            f"{cpu}"
+        )
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        baseline = root / "baseline-aarch64"
+        neon = root / "neon-aarch64"
+        sve = root / "sve-aarch64"
+        _compile_static_elf(
+            "mov x0, #0\nmov x8, #93\nsvc #0",
+            baseline,
+            compiler=compiler,
+            extra_args=("-march=armv8-a",),
+        )
+        _compile_static_elf(
+            "movi v0.16b, #0\n"
+            "add v0.16b, v0.16b, v0.16b\n"
+            "mov x0, #0\nmov x8, #93\nsvc #0",
+            neon,
+            compiler=compiler,
+            extra_args=("-march=armv8-a",),
+        )
+        _compile_static_elf(
+            ".arch armv8.2-a+sve\n"
+            "ptrue p0.b\n"
+            "mov x0, #0\nmov x8, #93\nsvc #0",
+            sve,
+            compiler=compiler,
+            extra_args=("-march=armv8.2-a+sve",),
+        )
+        for probe in (baseline, neon, sve):
+            abi.validate_elf_header(
+                probe.read_bytes()[:20],
+                member=probe.name,
+                architecture="aarch64",
+                expected_elf_type=abi.ET_EXEC,
+            )
+        baseline_status = _run_qemu(qemu, cpu, baseline)
+        if baseline_status != 0:
+            raise AssertionError(
+                f"AArch64 ARMv8 baseline ELF failed under QEMU: exit {baseline_status}"
+            )
+        neon_status = _run_qemu(qemu, cpu, neon)
+        if neon_status != 0:
+            raise AssertionError(
+                "AArch64 mandatory NEON instruction failed under QEMU: "
+                f"exit {neon_status}"
+            )
+        sve_status = _run_qemu(qemu, cpu, sve)
+        if sve_status not in (-4, 132):
+            raise AssertionError(
+                "AArch64 SVE instruction was not trapped by the Cortex-A53 "
+                f"QEMU CPU model: exit {sve_status}"
+            )
+        sve_positive_status = _run_qemu(qemu, "max", sve)
+        if sve_positive_status != 0:
+            raise AssertionError(
+                "AArch64 SVE positive control failed under QEMU max: "
+                f"exit {sve_positive_status}"
+            )
+
+
 def parse_qemu_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run real-ELF controls for the release QEMU CPU model"
     )
-    parser.add_argument("--qemu-x86-64", required=True)
-    parser.add_argument("--qemu-cpu", required=True)
+    parser.add_argument("--architecture", choices=abi.ARCHITECTURES, default="x86_64")
+    parser.add_argument("--qemu-x86-64")
+    parser.add_argument("--qemu-aarch64")
+    parser.add_argument("--qemu-cpu")
+    parser.add_argument("--cc", default="cc")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     qemu_args = parse_qemu_args()
-    run_cpu_emulation_controls(qemu_args.qemu_x86_64, qemu_args.qemu_cpu)
-    print("QEMU CPUID and instruction controls passed")
+    if qemu_args.architecture == "x86_64":
+        if not qemu_args.qemu_x86_64:
+            raise SystemExit("--qemu-x86-64 is required for --architecture x86_64")
+        if not qemu_args.qemu_cpu:
+            raise SystemExit("--qemu-cpu is required for --architecture x86_64")
+        run_cpu_emulation_controls(qemu_args.qemu_x86_64, qemu_args.qemu_cpu)
+    else:
+        if not qemu_args.qemu_aarch64:
+            raise SystemExit("--qemu-aarch64 is required for --architecture aarch64")
+        qemu_cpu = qemu_args.qemu_cpu or "cortex-a53"
+        run_aarch64_cpu_controls(
+            qemu_args.qemu_aarch64,
+            qemu_cpu,
+            compiler=qemu_args.cc,
+        )
+    print("QEMU CPU feature and instruction controls passed")

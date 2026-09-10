@@ -38,6 +38,7 @@ def _load_wheel_abi_module():
 _WHEEL_ABI = _load_wheel_abi_module()
 WheelAbiError = _WHEEL_ABI.WheelAbiError
 ElfInspector = Callable[[Path, str, str], None]
+contract_for_architecture = _WHEEL_ABI.contract_for_architecture
 
 # Keep these limits deliberately independent of the number of ELF files.  A
 # regular, non-ELF file still consumes archive extraction and stat budget and
@@ -311,6 +312,7 @@ def extract_bounded_archive(
 def verify_archive(
     root_path: Path,
     *,
+    architecture: str = "x86_64",
     readelf: str = "readelf",
     inspector: ElfInspector = inspect_elf,
     max_file_bytes: int | None = None,
@@ -321,6 +323,8 @@ def verify_archive(
     max_files: int | None = None,
 ) -> list[str]:
     """Verify an extracted release and return relative names of ELF files."""
+
+    contract_for_architecture(architecture)
 
     if max_file_count is not None and max_files is not None:
         raise ValueError("specify only one of max_file_count and max_files")
@@ -368,9 +372,21 @@ def verify_archive(
             raise WheelAbiError(f"cannot read archive file {relative}: {error}") from error
         if not header.startswith(b"\x7fELF"):
             continue
-        validate_elf_header(header, member=relative)
+        validate_elf_header(
+            header,
+            member=relative,
+            architecture=architecture,
+        )
         elf_names.add(relative)
-        inspector(path, relative, readelf)
+        if inspector is inspect_elf:
+            inspect_elf(
+                path,
+                relative,
+                readelf,
+                architecture=architecture,
+            )
+        else:
+            inspector(path, relative, readelf)
         inspected.append(relative)
 
     if EXPECTED_NATIVE_LIBRARY.as_posix() not in elf_names:
@@ -399,6 +415,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--extract-to", type=Path, help="existing empty extraction directory"
     )
     parser.add_argument("--expected-root", help="required top-level archive directory")
+    parser.add_argument(
+        "--architecture",
+        choices=_WHEEL_ABI.ARCHITECTURES,
+        default="x86_64",
+        help="Linux ELF contract to verify (default: x86_64)",
+    )
     parser.add_argument("--readelf", default="readelf")
     args = parser.parse_args(argv)
     if args.archive is None:
@@ -425,16 +447,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 expected_root=args.expected_root,
             )
         assert root is not None
-        files = verify_archive(root, readelf=args.readelf)
+        files = verify_archive(
+            root,
+            architecture=args.architecture,
+            readelf=args.readelf,
+        )
     except (OSError, UnicodeError, tarfile.TarError, WheelAbiError, ValueError) as error:
         print(
             f"Linux native archive ABI verification failed: {error}",
             file=sys.stderr,
         )
         return 1
+    contract = contract_for_architecture(args.architecture)
     print(
-        f"verified {Path(root).resolve()}: GLIBC <= 2.34, "
-        f"no declared x86-64-v2+ requirement, {len(files)} ELF file(s)"
+        f"verified {Path(root).resolve()}: {contract.architecture}, "
+        "GLIBC <= 2.34, "
+        f"no declared {contract.baseline_description} requirement, "
+        f"{len(files)} ELF file(s)"
     )
     return 0
 
