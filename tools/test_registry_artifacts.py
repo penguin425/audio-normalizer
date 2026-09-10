@@ -4,11 +4,13 @@ import importlib.util
 import io
 import json
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
 import unittest
+import warnings
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -68,10 +70,25 @@ def npm_member_bytes(relative: str) -> bytes:
     raise AssertionError(f"no npm test fixture is defined for {relative}")
 
 
-def make_wheel(root: Path, platform: str, version: str = VERSION) -> Path:
+def zip_member(name: str, mode: int, data: bytes = b"") -> tuple[zipfile.ZipInfo, bytes]:
+    member = zipfile.ZipInfo(name)
+    member.external_attr = mode << 16
+    if stat.S_ISDIR(mode):
+        member.external_attr |= 0x10
+    return member, data
+
+
+def make_wheel(
+    root: Path,
+    platform: str,
+    version: str = VERSION,
+    extra_members: tuple[tuple[zipfile.ZipInfo, bytes], ...] = (),
+) -> Path:
     path = root / f"forge_normalizer-{version}-py3-none-{platform}.whl"
     distribution = f"forge_normalizer-{version}.dist-info"
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for member, data in extra_members:
+            archive.writestr(member, data)
         archive.writestr("forge_normalizer/__init__.py", "__version__ = %r\n" % version)
         archive.writestr(
             f"{distribution}/METADATA",
@@ -131,6 +148,113 @@ def make_crate(root: Path, version: str = VERSION) -> Path:
 
 
 class RegistryArtifactTests(unittest.TestCase):
+    def test_wheel_accepts_canonical_empty_directory_members(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            directories = (
+                zip_member("forge_normalizer/", stat.S_IFDIR | 0o755),
+                zip_member(
+                    f"forge_normalizer-{VERSION}.dist-info/",
+                    stat.S_IFDIR | 0o755,
+                ),
+            )
+            wheel = make_wheel(
+                root,
+                WHEEL_PLATFORMS[0],
+                extra_members=directories,
+            )
+            artifact = checker.inspect_wheel(wheel, VERSION)
+            self.assertEqual(artifact.platform, WHEEL_PLATFORMS[0])
+
+    def test_wheel_rejects_unsafe_directory_members(self) -> None:
+        cases = {
+            "relative traversal": zip_member("../escape/", stat.S_IFDIR | 0o755),
+            "absolute path": zip_member("/absolute/", stat.S_IFDIR | 0o755),
+            "dot component": zip_member("./directory/", stat.S_IFDIR | 0o755),
+            "empty component": zip_member("nested//directory/", stat.S_IFDIR | 0o755),
+            "backslash": zip_member("bad\\directory/", stat.S_IFDIR | 0o755),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, (label, member) in enumerate(cases.items()):
+                with self.subTest(label=label):
+                    case_root = root / str(index)
+                    case_root.mkdir()
+                    wheel = make_wheel(
+                        case_root,
+                        WHEEL_PLATFORMS[0],
+                        extra_members=(member,),
+                    )
+                    with self.assertRaisesRegex(
+                        checker.VerificationError,
+                        "unsafe archive member name",
+                    ):
+                        checker.inspect_wheel(wheel, VERSION)
+
+    def test_wheel_rejects_noncanonical_or_special_members(self) -> None:
+        cases = {
+            "directory payload": (
+                (zip_member("payload/", stat.S_IFDIR | 0o755, b"not empty"),),
+                "directory member is not empty",
+            ),
+            "directory with file mode": (
+                (zip_member("regular/", stat.S_IFREG | 0o644),),
+                "directory member has a non-directory mode",
+            ),
+            "directory symlink": (
+                (zip_member("link/", stat.S_IFLNK | 0o777),),
+                "symbolic link",
+            ),
+            "special file": (
+                (zip_member("fifo", stat.S_IFIFO | 0o644),),
+                "non-regular member",
+            ),
+            "file-directory collision": (
+                (
+                    zip_member("collision", stat.S_IFREG | 0o644),
+                    zip_member("collision/", stat.S_IFDIR | 0o755),
+                ),
+                "conflicting member paths",
+            ),
+            "file as parent": (
+                (
+                    zip_member("parent", stat.S_IFREG | 0o644),
+                    zip_member("parent/child", stat.S_IFREG | 0o644),
+                ),
+                "descends from a regular file",
+            ),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, (label, (members, error)) in enumerate(cases.items()):
+                with self.subTest(label=label):
+                    case_root = root / str(index)
+                    case_root.mkdir()
+                    wheel = make_wheel(
+                        case_root,
+                        WHEEL_PLATFORMS[0],
+                        extra_members=members,
+                    )
+                    with self.assertRaisesRegex(checker.VerificationError, error):
+                        checker.inspect_wheel(wheel, VERSION)
+
+    def test_wheel_rejects_duplicate_directory_members(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            duplicate = (
+                zip_member("forge_normalizer/", stat.S_IFDIR | 0o755),
+                zip_member("forge_normalizer/", stat.S_IFDIR | 0o755),
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                wheel = make_wheel(
+                    root,
+                    WHEEL_PLATFORMS[0],
+                    extra_members=duplicate,
+                )
+            with self.assertRaisesRegex(checker.VerificationError, "duplicate member"):
+                checker.inspect_wheel(wheel, VERSION)
+
     def test_select_wheels_requires_exact_platforms_and_arm64(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

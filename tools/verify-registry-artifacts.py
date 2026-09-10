@@ -141,7 +141,13 @@ def _safe_member_name(name: str) -> None:
     if not name or "\x00" in name or "\\" in name:
         raise VerificationError(f"unsafe archive member name: {name!r}")
     path = PurePosixPath(name)
-    if path.is_absolute() or ".." in path.parts or "." in path.parts:
+    components = name.split("/")
+    if (
+        path.is_absolute()
+        or "." in components
+        or ".." in components
+        or "" in components[:-1]
+    ):
         raise VerificationError(f"unsafe archive member name: {name!r}")
 
 
@@ -186,16 +192,53 @@ def inspect_wheel(path: Path, version: str) -> Artifact:
     with archive:
         members = archive.infolist()
         names: list[str] = []
+        seen_names: set[str] = set()
+        logical_members: dict[str, bool] = {}
         for member in members:
             _safe_member_name(member.filename)
-            if member.filename.endswith("/"):
-                raise VerificationError(f"wheel contains a directory member: {member.filename}")
             mode = (member.external_attr >> 16) & 0o177777
             if stat.S_ISLNK(mode):
                 raise VerificationError(f"wheel contains a symbolic link: {member.filename}")
-            if member.filename in names:
+            if member.filename in seen_names:
                 raise VerificationError(f"wheel contains duplicate member: {member.filename}")
+            seen_names.add(member.filename)
+
+            member_type = stat.S_IFMT(mode)
+            is_directory = member.filename.endswith("/")
+            if is_directory:
+                dos_directory = member_type == 0 and bool(member.external_attr & 0x10)
+                if not (stat.S_ISDIR(mode) or dos_directory):
+                    raise VerificationError(
+                        "wheel directory member has a non-directory mode: "
+                        f"{member.filename}"
+                    )
+                if member.file_size != 0 or member.CRC != 0:
+                    raise VerificationError(
+                        f"wheel directory member is not empty: {member.filename}"
+                    )
+            elif member_type not in (0, stat.S_IFREG):
+                raise VerificationError(
+                    f"wheel contains a non-regular member: {member.filename}"
+                )
+
+            logical_name = member.filename.removesuffix("/")
+            if logical_name in logical_members:
+                raise VerificationError(
+                    f"wheel contains conflicting member paths: {logical_name}"
+                )
+            logical_members[logical_name] = is_directory
             names.append(member.filename)
+
+        for logical_name in logical_members:
+            for parent in PurePosixPath(logical_name).parents:
+                parent_name = str(parent)
+                if parent_name == ".":
+                    break
+                if logical_members.get(parent_name) is False:
+                    raise VerificationError(
+                        "wheel member descends from a regular file: "
+                        f"{logical_name}"
+                    )
 
         metadata_members = [name for name in names if name.endswith(".dist-info/METADATA")]
         wheel_members = [name for name in names if name.endswith(".dist-info/WHEEL")]
