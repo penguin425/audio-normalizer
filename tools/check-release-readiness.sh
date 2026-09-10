@@ -117,10 +117,14 @@ for file in \
   CATALOGUE.md \
   EBU-QC-SCENARIO1.md \
   METADATA-FIDELITY.md \
+  WASM-PACKAGE.md \
   packaging/ForgeNormalizerConfig.cmake.in \
   packaging/ForgeNormalizerConfigVersion.cmake.in \
   packaging/forge-normalizer.pc.in \
   tools/native_package_metadata.py \
+  tools/publish-github-release.py \
+  tools/release_manifest.py \
+  tools/verify-registry-artifacts.py \
   schema/analysis-cache-v4.schema.json \
   schema/analysis-cache-v5.schema.json \
   schema/schema-registry-v1.schema.json \

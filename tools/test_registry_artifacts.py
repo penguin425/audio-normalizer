@@ -1,0 +1,304 @@
+from __future__ import annotations
+
+import importlib.util
+import io
+import json
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+from unittest import mock
+
+
+TOOLS = Path(__file__).resolve().parent
+PROJECT_ROOT = TOOLS.parent
+SCRIPT = TOOLS / "verify-registry-artifacts.py"
+SPEC = importlib.util.spec_from_file_location("verify_registry_artifacts", SCRIPT)
+assert SPEC is not None and SPEC.loader is not None
+checker = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = checker
+SPEC.loader.exec_module(checker)
+
+
+VERSION = "0.189.17"
+WHEEL_PLATFORMS = (
+    "manylinux_2_34_aarch64",
+    "manylinux_2_34_x86_64",
+    "macosx_10_12_x86_64",
+    "macosx_11_0_arm64",
+    "win_amd64",
+)
+
+
+def make_wheel(root: Path, platform: str, version: str = VERSION) -> Path:
+    path = root / f"forge_normalizer-{version}-py3-none-{platform}.whl"
+    distribution = f"forge_normalizer-{version}.dist-info"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("forge_normalizer/__init__.py", "__version__ = %r\n" % version)
+        archive.writestr(
+            f"{distribution}/METADATA",
+            f"Metadata-Version: 2.4\nName: forge-normalizer\nVersion: {version}\n",
+        )
+        archive.writestr(
+            f"{distribution}/WHEEL",
+            "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: false\n"
+            f"Tag: py3-none-{platform}\n",
+        )
+    return path
+
+
+def make_npm_tarball(root: Path, version: str = VERSION) -> Path:
+    path = root / f"forge-normalizer-wasm-{version}.tgz"
+    package = json.loads(
+        (PROJECT_ROOT / "wasm/package/package.json").read_text(encoding="utf-8")
+    )
+    package["version"] = version
+    members = {
+        "package/package.json": json.dumps(package, indent=2).encode() + b"\n",
+        "package/LICENSE": (PROJECT_ROOT / "LICENSE").read_bytes(),
+    }
+    for relative in (
+        "README.md",
+        "forge_normalizer_wasm.js",
+        "forge_normalizer_wasm_bg.wasm",
+        "forge_normalizer_wasm_bg.wasm.d.ts",
+        "index.js",
+        "index.d.ts",
+    ):
+        members[f"package/{relative}"] = (PROJECT_ROOT / "wasm/package" / relative).read_bytes()
+    with tarfile.open(path, "w:gz") as archive:
+        for name in sorted(members):
+            data = members[name]
+            member = tarfile.TarInfo(name)
+            member.size = len(data)
+            member.mode = 0o644
+            member.mtime = 0
+            archive.addfile(member, io.BytesIO(data))
+    return path
+
+
+def make_crate(root: Path, version: str = VERSION) -> Path:
+    path = root / f"forge-normalizer-{version}.crate"
+    prefix = f"forge-normalizer-{version}"
+    with tarfile.open(path, "w:gz") as archive:
+        members = {
+            f"{prefix}/Cargo.toml": (
+                "[package]\n"
+                'name = "forge-normalizer"\n'
+                f'version = "{version}"\n'
+                'repository = "https://github.com/penguin425/audio-normalizer"\n'
+            ).encode("utf-8"),
+            f"{prefix}/README.md": b"fixture\n",
+        }
+        for name, data in members.items():
+            member = tarfile.TarInfo(name)
+            member.size = len(data)
+            member.mode = 0o644
+            member.mtime = 0
+            archive.addfile(member, io.BytesIO(data))
+    return path
+
+
+class RegistryArtifactTests(unittest.TestCase):
+    def test_select_wheels_requires_exact_platforms_and_arm64(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheels = [make_wheel(root, platform) for platform in WHEEL_PLATFORMS]
+            selected = checker.select_wheels(
+                root,
+                [],
+                VERSION,
+                expected_platforms=WHEEL_PLATFORMS,
+            )
+            self.assertEqual([item.path for item in selected], sorted(wheels))
+            only_x86 = root / "only-x86"
+            only_x86.mkdir()
+            x86 = make_wheel(only_x86, WHEEL_PLATFORMS[1])
+            with self.assertRaisesRegex(checker.VerificationError, "ARM64"):
+                checker.select_wheels(
+                    only_x86,
+                    [x86],
+                    VERSION,
+                    expected_platforms=(WHEEL_PLATFORMS[1],),
+                )
+
+    def test_npm_tarball_has_exact_members_and_public_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = make_npm_tarball(Path(directory))
+            artifact = checker.inspect_npm_tarball(path, VERSION)
+            self.assertEqual(artifact.name, "@forge-normalizer/wasm")
+            self.assertEqual(artifact.digests["sha1"], checker._digest_file(path)["sha1"])
+
+            extra_root = Path(directory) / "extra"
+            extra_root.mkdir()
+            extra = extra_root / path.name
+            with tarfile.open(path, "r:gz") as source, tarfile.open(extra, "w:gz") as target:
+                for member in source.getmembers():
+                    payload = source.extractfile(member)
+                    target.addfile(member, payload)
+                data = b"unexpected\n"
+                member = tarfile.TarInfo("package/extra.txt")
+                member.size = len(data)
+                target.addfile(member, io.BytesIO(data))
+            with self.assertRaisesRegex(checker.VerificationError, "member mismatch"):
+                checker.inspect_npm_tarball(extra, VERSION)
+
+    def test_registry_comparisons_accept_absent_and_exact_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheels = checker.select_wheels(root, [make_wheel(root, p) for p in WHEEL_PLATFORMS], VERSION)
+            npm = checker.inspect_npm_tarball(make_npm_tarball(root), VERSION)
+            crate = checker.inspect_crate(make_crate(root), VERSION)
+
+            self.assertEqual(checker.compare_pypi(None, VERSION, wheels)["state"], "absent")
+            self.assertEqual(checker.compare_npm(None, VERSION, npm)["state"], "absent")
+            self.assertEqual(checker.compare_crates(None, VERSION, crate)["state"], "absent")
+
+            pypi = {
+                "info": {"name": "forge-normalizer"},
+                "releases": {
+                    VERSION: [
+                        {
+                            "filename": item.path.name,
+                            "digests": {"sha256": item.digests["sha256"]},
+                            "size": item.path.stat().st_size,
+                        }
+                        for item in wheels
+                    ]
+                },
+            }
+            npm_document = {
+                "name": npm.name,
+                "versions": {
+                    VERSION: {
+                        "name": npm.name,
+                        "version": VERSION,
+                        "dist": {
+                            "shasum": npm.digests["sha1"],
+                            "integrity": npm.digests["integrity"],
+                        },
+                    }
+                },
+            }
+            crate_document = {
+                "version": {
+                    "crate": crate.name,
+                    "num": VERSION,
+                    "checksum": crate.digests["sha256"],
+                }
+            }
+            self.assertEqual(checker.compare_pypi(pypi, VERSION, wheels)["state"], "exact")
+            self.assertEqual(checker.compare_npm(npm_document, VERSION, npm)["state"], "exact")
+            self.assertEqual(checker.compare_crates(crate_document, VERSION, crate)["state"], "exact")
+
+            pypi["releases"][VERSION][0]["digests"]["sha256"] = "0" * 64
+            self.assertEqual(checker.compare_pypi(pypi, VERSION, wheels)["state"], "mismatch")
+
+    def test_local_mode_and_registry_selection_do_not_query_unselected_registries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for platform in WHEEL_PLATFORMS:
+                make_wheel(root, platform)
+            make_npm_tarball(root)
+            make_crate(root)
+            with mock.patch.object(checker, "fetch_json") as fetch:
+                report = checker.verify(
+                    version=VERSION,
+                    artifact_dir=root,
+                    wheel_paths=[],
+                    expected_wheel_platforms=None,
+                    require_arm64=True,
+                    npm_path=None,
+                    crate_path=None,
+                    state_mode="local",
+                    pypi_url=checker.DEFAULT_PYPI_URL,
+                    npm_url=checker.DEFAULT_NPM_URL,
+                    crates_url=checker.DEFAULT_CRATES_URL,
+                    timeout=1,
+                )
+                self.assertEqual(report["registries"], {})
+                fetch.assert_not_called()
+
+            with mock.patch.object(checker, "fetch_json", return_value=None) as fetch:
+                report = checker.verify(
+                    version=VERSION,
+                    artifact_dir=root,
+                    wheel_paths=[],
+                    expected_wheel_platforms=None,
+                    require_arm64=True,
+                    npm_path=None,
+                    crate_path=None,
+                    state_mode="pre",
+                    pypi_url=checker.DEFAULT_PYPI_URL,
+                    npm_url=checker.DEFAULT_NPM_URL,
+                    crates_url=checker.DEFAULT_CRATES_URL,
+                    timeout=1,
+                    registries=["npm"],
+                )
+                self.assertEqual(set(report["registries"]), {"npm"})
+                self.assertEqual(fetch.call_count, 1)
+
+    def test_fetch_json_uses_get_and_accepts_only_404_as_absent(self) -> None:
+        class Response:
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"ok": true}'
+
+        with mock.patch.object(checker.urllib.request, "urlopen", return_value=Response()) as urlopen:
+            self.assertEqual(checker.fetch_json("https://example.test/metadata"), {"ok": True})
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.method, "GET")
+        self.assertEqual(request.headers["Accept"], "application/json")
+
+    @unittest.skipUnless(shutil.which("npm"), "npm is required for the pack smoke test")
+    def test_npm_pack_is_byte_reproducible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "package"
+            package.mkdir()
+            for relative in (
+                "package.json",
+                "README.md",
+                "forge_normalizer_wasm.js",
+                "forge_normalizer_wasm_bg.wasm",
+                "forge_normalizer_wasm_bg.wasm.d.ts",
+                "index.js",
+                "index.d.ts",
+            ):
+                source = PROJECT_ROOT / "wasm/package" / relative
+                target = package / relative
+                target.write_bytes(source.read_bytes())
+            shutil.copy2(PROJECT_ROOT / "LICENSE", package / "LICENSE")
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            environment = {"SOURCE_DATE_EPOCH": "0"}
+            environment.update(__import__("os").environ)
+            for destination in (first, second):
+                subprocess.run(
+                    ["npm", "pack", "--ignore-scripts", "--json", "--pack-destination", str(destination)],
+                    cwd=package,
+                    env=environment,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            first_bytes = (first / f"forge-normalizer-wasm-{VERSION}.tgz").read_bytes()
+            second_bytes = (second / f"forge-normalizer-wasm-{VERSION}.tgz").read_bytes()
+            self.assertEqual(first_bytes, second_bytes)
+            checker.inspect_npm_tarball(first / f"forge-normalizer-wasm-{VERSION}.tgz", VERSION)
+
+
+if __name__ == "__main__":
+    unittest.main()

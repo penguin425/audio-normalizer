@@ -7,6 +7,15 @@ archive. The platform native archives retain the historical archive-root
 library copies for existing consumers and also provide one canonical
 development layout:
 
+The generic Linux archives are named
+`forge-v<VERSION>-linux-x86_64.tar.gz` and, for the v0.189.17 ARM64 target,
+`forge-v<VERSION>-linux-aarch64.tar.gz`. The ARM64 archive is an AArch64/
+ARMv8-A (mandatory NEON only) baseline build with a glibc 2.34-or-newer runtime
+floor and carries the
+same C ABI v1 layout below. This is distinct from the x86-64-v3 CLI-only
+archive; no C ABI or development metadata is promised in that supplemental
+archive.
+
 - `include/forge_normalizer.h`;
 - `lib/libforge_normalizer.so` on Linux or `lib/libforge_normalizer.dylib` on
   macOS;
@@ -30,6 +39,12 @@ integer status values, structure size, field order, field types, and field
 units will not change within ABI major 1. New functions may be added. A future
 incompatible interface must use new symbol and type names and increment
 `forge_normalizer_c_api_version()`.
+
+The ARM64 package exposes the same versioned symbols and structure layout as
+the other supported 64-bit native packages. Its archive and wheel runtime
+compatibility (AArch64 ARMv8-A with mandatory NEON and glibc 2.34 or newer) is
+a distribution property; it does not expand the set of CPU extensions promised
+by the C ABI.
 
 CLAP and LV2 plugin entry points are separate host ABIs and are not part of
 this contract.

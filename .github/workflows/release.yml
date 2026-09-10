@@ -225,6 +225,12 @@ on:
       - "tools/test_subprocess_boundary.py"
       - "tools/generate-package-metadata.sh"
       - "tools/check-release-readiness.sh"
+      - "tools/publish-github-release.py"
+      - "tools/release_manifest.py"
+      - "tools/test_publish_github_release.py"
+      - "tools/test_registry_artifacts.py"
+      - "tools/test_release_manifest.py"
+      - "tools/verify-registry-artifacts.py"
       # Rust source, dependency, and build-script changes intentionally run the
       # Linux wheel ABI, baseline-CPU, and reproducibility release gates.
   workflow_dispatch:
@@ -297,6 +303,11 @@ jobs:
             echo "::error::WASM package version ${wasm_version} does not match Cargo.toml version ${version}"
             exit 1
           fi
+          npm_version="$(jq -r '.version' wasm/package/package.json)"
+          if [[ "$npm_version" != "$version" ]]; then
+            echo "::error::npm package version ${npm_version} does not match Cargo.toml version ${version}"
+            exit 1
+          fi
           if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" != "v${version}" ]]; then
             echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}"
             exit 1
@@ -329,32 +340,58 @@ jobs:
             tools/test_linux_wheel_abi.py \
             tools/test_linux_native_abi.py \
             tools/test_native_package_metadata.py \
-            tools/test_release_content.py
+            tools/test_publish_github_release.py \
+            tools/test_registry_artifacts.py \
+            tools/test_release_content.py \
+            tools/test_release_manifest.py
           "$FORGE_WORKFLOW_CHECK_PYTHON" -m compileall -q \
             tools/build-python-wheel.py \
             tools/check-linux-native-abi.py \
             tools/check-linux-wheel-abi.py \
             tools/check-workflow-pins.py \
             tools/native_package_metadata.py \
+            tools/publish-github-release.py \
+            tools/release_manifest.py \
+            tools/verify-registry-artifacts.py \
             tools/run-pinned-container.py
 
   build-linux:
-    name: Build portable linux-x86_64 archive
+    name: Build portable linux-${{ matrix.architecture }} archive
     needs: validate
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            image: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+            cflags: -O2 -march=x86-64 -mtune=generic
+            target_cpu: x86-64
+            rustup_host: x86_64-unknown-linux-gnu
+            rustup_sha256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+          - architecture: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            image: quay.io/pypa/manylinux_2_28_aarch64@sha256:ad74e53b713f3b07d8c889c526dc0c6500da9827b45e38739570875fef52e28f
+            cflags: -O2 -march=armv8-a -mtune=generic
+            target_cpu: generic
+            rustup_host: aarch64-unknown-linux-gnu
+            rustup_sha256: e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
+    runs-on: ${{ matrix.runner }}
     container:
       # Build below the published glibc 2.34 runtime floor and retain the
-      # generic x86-64-v1 CPU baseline. Runtime acceptance is a separate job.
-      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+      # architecture's baseline CPU contract. Runtime acceptance is separate.
+      image: ${{ matrix.image }}
     env:
       CARGO_HOME: /tmp/forge-cargo
       CARGO_INCREMENTAL: "0"
-      CFLAGS: -O2 -march=x86-64 -mtune=generic
+      CFLAGS: ${{ matrix.cflags }}
       CMAKE_POLICY_VERSION_MINIMUM: "3.5"
       CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/tools/manylinux-cmake-toolchain.cmake
-      CXXFLAGS: -O2 -march=x86-64 -mtune=generic
+      CXXFLAGS: ${{ matrix.cflags }}
       LC_ALL: C.UTF-8
-      RUSTFLAGS: -C target-cpu=x86-64 --remap-path-prefix=${{ github.workspace }}=/workspace
+      RUSTFLAGS: -C target-cpu=${{ matrix.target_cpu }} --remap-path-prefix=${{ github.workspace }}=/workspace
       RUSTUP_HOME: /tmp/forge-rustup
       SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
       TZ: UTC
@@ -366,12 +403,12 @@ jobs:
         run: |
           set -euo pipefail
           test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
-          test "$(uname -m)" = "x86_64"
+          test "$(uname -m)" = "${{ matrix.architecture }}"
           command -v cc cmake pkg-config python3 readelf >/dev/null
 
       - name: Install checksum-pinned Rust 1.97.0 and LLVM PGO tools
         env:
-          RUSTUP_INIT_SHA256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+          RUSTUP_INIT_SHA256: ${{ matrix.rustup_sha256 }}
           RUSTUP_INIT_VERSION: 1.28.2
         shell: bash
         run: |
@@ -380,7 +417,7 @@ jobs:
           curl --fail --show-error --silent --location \
             --proto '=https' --tlsv1.2 --retry 3 \
             --output "$rustup_init" \
-            "https://static.rust-lang.org/rustup/archive/${RUSTUP_INIT_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
+            "https://static.rust-lang.org/rustup/archive/${RUSTUP_INIT_VERSION}/${{ matrix.rustup_host }}/rustup-init"
           echo "${RUSTUP_INIT_SHA256}  ${rustup_init}" | sha256sum --check --strict -
           chmod 0755 "$rustup_init"
           "$rustup_init" -y --no-modify-path --profile minimal --default-toolchain 1.97.0
@@ -391,34 +428,34 @@ jobs:
       - name: Build the portable release set
         shell: bash
         run: >-
-          cargo build --locked --release --target x86_64-unknown-linux-gnu
+          cargo build --locked --release --target ${{ matrix.target }}
           --features opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service,cuda-truepeak
 
       - name: Apply reproducible PGO to the portable normalizer CLI
         env:
           FORGE_PGO_FEATURES: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service,cuda-truepeak
-          FORGE_PGO_RUSTFLAGS: -C target-cpu=x86-64 --remap-path-prefix=${{ github.workspace }}=/workspace
+          FORGE_PGO_RUSTFLAGS: -C target-cpu=${{ matrix.target_cpu }} --remap-path-prefix=${{ github.workspace }}=/workspace
         shell: bash
         run: |
           set -euo pipefail
-          tools/build-pgo-forge.sh x86_64-unknown-linux-gnu
+          tools/build-pgo-forge.sh "${{ matrix.target }}"
           cp \
-            target/forge-pgo-x86_64-unknown-linux-gnu/optimized/x86_64-unknown-linux-gnu/release/forge \
-            target/x86_64-unknown-linux-gnu/release/forge
+            "target/forge-pgo-${{ matrix.target }}/optimized/${{ matrix.target }}/release/forge" \
+            "target/${{ matrix.target }}/release/forge"
           cp \
-            target/forge-pgo-x86_64-unknown-linux-gnu/canonical-profile.txt \
-            "forge-v${{ needs.validate.outputs.version }}-linux-x86_64.pgo-profile.txt"
+            "target/forge-pgo-${{ matrix.target }}/canonical-profile.txt" \
+            "forge-v${{ needs.validate.outputs.version }}-linux-${{ matrix.architecture }}.pgo-profile.txt"
           cp \
-            target/forge-pgo-x86_64-unknown-linux-gnu/training.json \
-            "forge-v${{ needs.validate.outputs.version }}-linux-x86_64.pgo-training.json"
+            "target/forge-pgo-${{ matrix.target }}/training.json" \
+            "forge-v${{ needs.validate.outputs.version }}-linux-${{ matrix.architecture }}.pgo-training.json"
 
       - name: Upload portable Linux PGO build inputs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
-          name: forge-pgo-profile-linux-x86_64
+          name: forge-pgo-profile-linux-${{ matrix.architecture }}
           path: |
-            forge-v${{ needs.validate.outputs.version }}-linux-x86_64.pgo-profile.txt
-            forge-v${{ needs.validate.outputs.version }}-linux-x86_64.pgo-training.json
+            forge-v${{ needs.validate.outputs.version }}-linux-${{ matrix.architecture }}.pgo-profile.txt
+            forge-v${{ needs.validate.outputs.version }}-linux-${{ matrix.architecture }}.pgo-training.json
           if-no-files-found: error
           retention-days: 7
 
@@ -428,22 +465,25 @@ jobs:
           set -euo pipefail
           tools/package-linux-release.sh \
             "${{ needs.validate.outputs.version }}" \
-            x86_64-unknown-linux-gnu \
+            "${{ matrix.target }}" \
             "${{ needs.validate.outputs.source-date-epoch }}" \
-            .
+            . \
+            "${{ matrix.architecture }}"
           mkdir extracted
-          tar --extract --gzip \
-            --file "forge-v${{ needs.validate.outputs.version }}-linux-x86_64.tar.gz" \
-            --directory extracted
-          prefix="extracted/forge-v${{ needs.validate.outputs.version }}-linux-x86_64"
-          python3 tools/check-linux-native-abi.py "$prefix"
+          root_name="forge-v${{ needs.validate.outputs.version }}-linux-${{ matrix.architecture }}"
+          prefix="extracted/${root_name}"
+          python3 tools/check-linux-native-abi.py \
+            --architecture "${{ matrix.architecture }}" \
+            --archive "${root_name}.tar.gz" \
+            --extract-to extracted \
+            --expected-root "$root_name"
           tools/test-native-package.sh "$prefix" "${{ needs.validate.outputs.version }}"
 
       - name: Upload packaged portable Linux archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
-          name: forge-linux-x86_64
-          path: forge-v${{ needs.validate.outputs.version }}-linux-x86_64.tar.gz
+          name: forge-linux-${{ matrix.architecture }}
+          path: forge-v${{ needs.validate.outputs.version }}-linux-${{ matrix.architecture }}.tar.gz
           if-no-files-found: error
           retention-days: 7
 
@@ -684,24 +724,44 @@ jobs:
           retention-days: 7
 
   build-linux-wheel:
-    name: Build and verify manylinux_2_34 wheel
+    name: Build and verify manylinux_2_34_${{ matrix.architecture }} wheel
     needs: validate
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            image: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+            cflags: -O2 -march=x86-64 -mtune=generic
+            target_cpu: x86-64
+            rustup_host: x86_64-unknown-linux-gnu
+            rustup_sha256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+          - architecture: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            image: quay.io/pypa/manylinux_2_28_aarch64@sha256:ad74e53b713f3b07d8c889c526dc0c6500da9827b45e38739570875fef52e28f
+            cflags: -O2 -march=armv8-a -mtune=generic
+            target_cpu: generic
+            rustup_host: aarch64-unknown-linux-gnu
+            rustup_sha256: e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
+    runs-on: ${{ matrix.runner }}
     container:
-      # AlmaLinux 8 retains the x86-64-v1 baseline. The published wheel tag
-      # remains manylinux_2_34 and is set only by auditwheel below.
-      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+      # AlmaLinux 8 retains each architecture's baseline. The published wheel
+      # tag remains manylinux_2_34 and is set only by auditwheel below.
+      image: ${{ matrix.image }}
     env:
       AUDITWHEEL: /tmp/forge-wheel-tools/bin/auditwheel
       CARGO_HOME: /tmp/forge-cargo
       CARGO_INCREMENTAL: "0"
       CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-      CFLAGS: -O2 -march=x86-64 -mtune=generic
-      CXXFLAGS: -O2 -march=x86-64 -mtune=generic
+      CFLAGS: ${{ matrix.cflags }}
+      CXXFLAGS: ${{ matrix.cflags }}
       LC_ALL: C.UTF-8
       PYTHON: /opt/python/cp310-cp310/bin/python
       PYTHONHASHSEED: "0"
-      RUSTFLAGS: -C target-cpu=x86-64 --remap-path-prefix=${{ github.workspace }}=/workspace
+      RUSTFLAGS: -C target-cpu=${{ matrix.target_cpu }} --remap-path-prefix=${{ github.workspace }}=/workspace
       RUSTUP_HOME: /tmp/forge-rustup
       SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
       TZ: UTC
@@ -714,12 +774,12 @@ jobs:
         run: |
           set -euo pipefail
           test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
-          test "$(uname -m)" = "x86_64"
+          test "$(uname -m)" = "${{ matrix.architecture }}"
           "$PYTHON" -c 'import sys; assert sys.version_info[:2] == (3, 10), sys.version'
 
       - name: Install checksum-pinned Rust 1.97.0
         env:
-          RUSTUP_INIT_SHA256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+          RUSTUP_INIT_SHA256: ${{ matrix.rustup_sha256 }}
           RUSTUP_INIT_VERSION: 1.28.2
         shell: bash
         run: |
@@ -728,7 +788,7 @@ jobs:
           curl --fail --show-error --silent --location \
             --proto '=https' --tlsv1.2 --retry 3 \
             --output "$rustup_init" \
-            "https://static.rust-lang.org/rustup/archive/${RUSTUP_INIT_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
+            "https://static.rust-lang.org/rustup/archive/${RUSTUP_INIT_VERSION}/${{ matrix.rustup_host }}/rustup-init"
           echo "${RUSTUP_INIT_SHA256}  ${rustup_init}" | sha256sum --check --strict -
           chmod 0755 "$rustup_init"
           "$rustup_init" -y --no-modify-path --profile minimal --default-toolchain 1.97.0
@@ -755,13 +815,13 @@ jobs:
             --only-binary=:all: \
             -r tools/python-wheel-build-requirements.lock
 
-      - name: Build the dedicated generic x86-64 cdylib
+      - name: Build the dedicated generic Linux cdylib
         shell: bash
         env:
           CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/tools/manylinux-cmake-toolchain.cmake
         run: >-
           cargo build --locked --release --lib
-          --target x86_64-unknown-linux-gnu --no-default-features
+          --target ${{ matrix.target }} --no-default-features
           --features opus-encoding
 
       - name: Build an unclaimed Linux wheel
@@ -770,9 +830,9 @@ jobs:
           set -euo pipefail
           mkdir raw-wheel repaired-wheel
           "$WHEEL_PYTHON" tools/build-python-wheel.py \
-            --library target/x86_64-unknown-linux-gnu/release/libforge_normalizer.so \
+            --library target/${{ matrix.target }}/release/libforge_normalizer.so \
             --library-name libforge_normalizer.so \
-            --platform linux_x86_64 \
+            --platform linux_${{ matrix.architecture }} \
             --outdir raw-wheel \
             --version "${{ needs.validate.outputs.version }}"
 
@@ -786,7 +846,7 @@ jobs:
             exit 1
           fi
           "$WHEEL_PYTHON" -m auditwheel repair \
-            --plat manylinux_2_34_x86_64 \
+            --plat manylinux_2_34_${{ matrix.architecture }} \
             --only-plat \
             --wheel-dir repaired-wheel \
             "${raw_wheels[0]}"
@@ -802,55 +862,77 @@ jobs:
           fi
           "$WHEEL_PYTHON" -m auditwheel show "${wheels[0]}" | tee auditwheel-show.txt
           "$WHEEL_PYTHON" tools/check-linux-wheel-abi.py \
+            --architecture "${{ matrix.architecture }}" \
             --auditwheel "$AUDITWHEEL" \
             "${wheels[0]}"
 
       - name: Upload only the repaired Linux wheel
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
-          name: forge-python-linux-x86_64
+          name: forge-python-linux-${{ matrix.architecture }}
           path: repaired-wheel/forge_normalizer-*.whl
           if-no-files-found: error
           retention-days: 7
 
   smoke-linux-wheel-floor:
-    name: Smoke-test portable Linux artifacts at the runtime and CPU floors
+    name: Smoke-test Linux ${{ matrix.architecture }} at runtime and CPU floors
     needs: [validate, build-linux, build-linux-wheel]
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64
+            runner: ubuntu-24.04
+            manylinux_2_28: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+            manylinux_2_34: quay.io/pypa/manylinux_2_34_x86_64@sha256:934419fa742ff922855f464203cc0ad5afe3317a8541712a00cf3dc7fb893fc8
+            qemu_cpu: qemu64,-lahf-lm,-pni,-ssse3,-sse4.1,-sse4.2,-popcnt,-cx16,-avx,-avx2
+            qemu_deb_sha256: c3e3ba2bd87f8c5b9a5da5ef21b5a3b82d7c63b89dd448d9ddaa4eabc5b6e402
+            qemu_deb_url: https://snapshot.debian.org/archive/debian/20260526T203455Z/pool/main/q/qemu/qemu-user-static_7.2%2bdfsg-7%2bdeb12u18%2bb3_amd64.deb
+            qemu_binary: qemu-x86_64-static
+          - architecture: aarch64
+            runner: ubuntu-24.04-arm
+            manylinux_2_28: quay.io/pypa/manylinux_2_28_aarch64@sha256:ad74e53b713f3b07d8c889c526dc0c6500da9827b45e38739570875fef52e28f
+            manylinux_2_34: quay.io/pypa/manylinux_2_34_aarch64@sha256:effc0e17319a56b2c7eaff0cb5dd81a2d2c2850410841d3f017378f52ead6442
+            qemu_cpu: cortex-a53
+            qemu_deb_sha256: e420c417c12b42ca774795b62888d5388da0e08c1ef263dea1490e5ce4e32a0b
+            qemu_deb_url: https://snapshot.debian.org/archive/debian/20260526T203455Z/pool/main/q/qemu/qemu-user-static_7.2%2bdfsg-7%2bdeb12u18%2bb3_arm64.deb
+            qemu_binary: qemu-aarch64-static
+    runs-on: ${{ matrix.runner }}
     env:
-      MANYLINUX_2_28_IMAGE: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
-      MANYLINUX_2_34_IMAGE: quay.io/pypa/manylinux_2_34_x86_64@sha256:934419fa742ff922855f464203cc0ad5afe3317a8541712a00cf3dc7fb893fc8
-      QEMU_CPU: qemu64,-lahf-lm,-pni,-ssse3,-sse4.1,-sse4.2,-popcnt,-cx16,-avx,-avx2
+      MANYLINUX_2_28_IMAGE: ${{ matrix.manylinux_2_28 }}
+      MANYLINUX_2_34_IMAGE: ${{ matrix.manylinux_2_34 }}
+      QEMU_CPU: ${{ matrix.qemu_cpu }}
       # QEMU 8.2 regressed x86-64 /proc/self/maps emulation (upstream #2170)
       # and crashes programs that inspect their own thread mappings. Use the
-      # maintained Debian Bookworm 7.2 build from before that regression.
-      QEMU_DEB_SHA256: c3e3ba2bd87f8c5b9a5da5ef21b5a3b82d7c63b89dd448d9ddaa4eabc5b6e402
-      QEMU_DEB_URL: https://snapshot.debian.org/archive/debian/20260526T203455Z/pool/main/q/qemu/qemu-user-static_7.2%2bdfsg-7%2bdeb12u18%2bb3_amd64.deb
+      # immutable Debian Bookworm 7.2 build for both release architectures.
+      QEMU_DEB_SHA256: ${{ matrix.qemu_deb_sha256 }}
+      QEMU_DEB_URL: ${{ matrix.qemu_deb_url }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
 
       - name: Download the verified wheel candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
         with:
-          name: forge-python-linux-x86_64
+          name: forge-python-linux-${{ matrix.architecture }}
           path: ${{ runner.temp }}/linux-wheel
 
       - name: Download the portable native archive candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
         with:
-          name: forge-linux-x86_64
+          name: forge-linux-${{ matrix.architecture }}
           path: ${{ runner.temp }}/linux-native
 
       - name: Extract safely and verify every native ELF
         shell: bash
         run: |
           set -euo pipefail
-          archive="${RUNNER_TEMP}/linux-native/forge-v${{ needs.validate.outputs.version }}-linux-x86_64.tar.gz"
+          archive="${RUNNER_TEMP}/linux-native/forge-v${{ needs.validate.outputs.version }}-linux-${{ matrix.architecture }}.tar.gz"
           extraction="${RUNNER_TEMP}/linux-native-extracted"
           mkdir "$extraction"
-          root_name="forge-v${{ needs.validate.outputs.version }}-linux-x86_64"
+          root_name="forge-v${{ needs.validate.outputs.version }}-linux-${{ matrix.architecture }}"
           native_root="${extraction}/${root_name}"
           python3 tools/check-linux-native-abi.py \
+            --architecture "${{ matrix.architecture }}" \
             --archive "$archive" \
             --extract-to "$extraction" \
             --expected-root "$root_name"
@@ -869,12 +951,20 @@ jobs:
           echo "${QEMU_DEB_SHA256}  ${qemu_deb}" | sha256sum --check --strict -
           mkdir "$qemu_root"
           dpkg-deb --extract "$qemu_deb" "$qemu_root"
-          qemu="${qemu_root}/usr/bin/qemu-x86_64-static"
+          qemu="${qemu_root}/usr/bin/${{ matrix.qemu_binary }}"
           test -x "$qemu"
-          echo "QEMU_X86_64=${qemu}" >> "$GITHUB_ENV"
-          python3 tools/test_linux_wheel_abi.py \
-            --qemu-x86-64 "$qemu" \
-            --qemu-cpu "$QEMU_CPU"
+          echo "QEMU_PATH=${qemu}" >> "$GITHUB_ENV"
+          if [[ "${{ matrix.architecture }}" == x86_64 ]]; then
+            python3 tools/test_linux_wheel_abi.py \
+              --architecture x86_64 \
+              --qemu-x86-64 "$qemu" \
+              --qemu-cpu "$QEMU_CPU"
+          else
+            python3 tools/test_linux_wheel_abi.py \
+              --architecture aarch64 \
+              --qemu-aarch64 "$qemu" \
+              --qemu-cpu "$QEMU_CPU"
+          fi
 
       - name: Install, load, and analyze WAV in network-isolated containers
         shell: bash
@@ -902,10 +992,12 @@ jobs:
             --mount "type=bind,src=${native_root},dst=/native,readonly" \
             --workdir /source \
             --env FORGE_VERSION="${{ needs.validate.outputs.version }}" \
+            --env FORGE_ARCHITECTURE="${{ matrix.architecture }}" \
             -- \
             /bin/bash -lc '
               set -euo pipefail
               test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.34"
+              test "$(uname -m)" = "$FORGE_ARCHITECTURE"
               py=/opt/python/cp310-cp310/bin/python
               "$py" -c "import sys; assert sys.version_info[:2] == (3, 10), sys.version"
               mkdir /tmp/home /tmp/site
@@ -928,24 +1020,26 @@ jobs:
             --mount "type=bind,src=${source_root},dst=/source,readonly" \
             --mount "type=bind,src=${wheel_root},dst=/wheel,readonly" \
             --mount "type=bind,src=${native_root},dst=/native,readonly" \
-            --mount "type=bind,src=${QEMU_X86_64},dst=/qemu-x86_64-static,readonly" \
+            --mount "type=bind,src=${QEMU_PATH},dst=/qemu-static,readonly" \
             --workdir /source \
             --env FORGE_VERSION="${{ needs.validate.outputs.version }}" \
+            --env FORGE_ARCHITECTURE="${{ matrix.architecture }}" \
             --env QEMU_CPU="$QEMU_CPU" \
             -- \
             /bin/bash -lc '
               set -euo pipefail
               test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
+              test "$(uname -m)" = "$FORGE_ARCHITECTURE"
               py=/opt/python/cp310-cp310/bin/python
               mkdir /tmp/home /tmp/site
               HOME=/tmp/home "$py" -m pip install \
                 --disable-pip-version-check --no-cache-dir --no-index --no-deps \
-                --only-binary=:all: --platform manylinux_2_34_x86_64 \
+                --only-binary=:all: --platform "manylinux_2_34_${FORGE_ARCHITECTURE}" \
                 --target /tmp/site /wheel/*.whl
               unset FORGE_NORMALIZER_LIBRARY
-              PYTHONPATH=/tmp/site /qemu-x86_64-static \
+              PYTHONPATH=/tmp/site /qemu-static \
                 -cpu "$QEMU_CPU" "$py" /source/python/tests/wheel_smoke.py
-              test "$(/qemu-x86_64-static -cpu "$QEMU_CPU" /native/forge --version)" \
+              test "$(/qemu-static -cpu "$QEMU_CPU" /native/forge --version)" \
                 = "forge ${FORGE_VERSION}"
               PKG_CONFIG_PATH=/native/lib/pkgconfig \
                 cc -std=c11 -Wall -Wextra -Werror \
@@ -953,27 +1047,47 @@ jobs:
                   $(PKG_CONFIG_PATH=/native/lib/pkgconfig \
                     pkg-config --cflags --libs forge-normalizer) \
                   -o /tmp/forge-native-consumer
-              LD_LIBRARY_PATH=/native/lib /qemu-x86_64-static \
+              LD_LIBRARY_PATH=/native/lib /qemu-static \
                 -cpu "$QEMU_CPU" /tmp/forge-native-consumer
             '
 
   reproducible-linux-wheel:
-    name: Reproduce the repaired Linux wheel
+    name: Reproduce the repaired Linux ${{ matrix.architecture }} wheel
     needs: [validate, build-linux-wheel]
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            image: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+            cflags: -O2 -march=x86-64 -mtune=generic
+            target_cpu: x86-64
+            rustup_host: x86_64-unknown-linux-gnu
+            rustup_sha256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+          - architecture: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            image: quay.io/pypa/manylinux_2_28_aarch64@sha256:ad74e53b713f3b07d8c889c526dc0c6500da9827b45e38739570875fef52e28f
+            cflags: -O2 -march=armv8-a -mtune=generic
+            target_cpu: generic
+            rustup_host: aarch64-unknown-linux-gnu
+            rustup_sha256: e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
+    runs-on: ${{ matrix.runner }}
     container:
-      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+      image: ${{ matrix.image }}
     env:
       AUDITWHEEL: /tmp/forge-wheel-tools/bin/auditwheel
       CARGO_HOME: /tmp/forge-cargo
       CARGO_INCREMENTAL: "0"
       CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-      CFLAGS: -O2 -march=x86-64 -mtune=generic
-      CXXFLAGS: -O2 -march=x86-64 -mtune=generic
+      CFLAGS: ${{ matrix.cflags }}
+      CXXFLAGS: ${{ matrix.cflags }}
       LC_ALL: C.UTF-8
       PYTHON: /opt/python/cp310-cp310/bin/python
       PYTHONHASHSEED: "0"
-      RUSTFLAGS: -C target-cpu=x86-64 --remap-path-prefix=${{ github.workspace }}=/workspace
+      RUSTFLAGS: -C target-cpu=${{ matrix.target_cpu }} --remap-path-prefix=${{ github.workspace }}=/workspace
       RUSTUP_HOME: /tmp/forge-rustup
       SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
       TZ: UTC
@@ -984,7 +1098,7 @@ jobs:
       - name: Download the independently built candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
         with:
-          name: forge-python-linux-x86_64
+          name: forge-python-linux-${{ matrix.architecture }}
           path: candidate-wheel
 
       - name: Verify the pinned reproduction floor and Python 3.10
@@ -992,12 +1106,12 @@ jobs:
         run: |
           set -euo pipefail
           test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
-          test "$(uname -m)" = "x86_64"
+          test "$(uname -m)" = "${{ matrix.architecture }}"
           "$PYTHON" -c 'import sys; assert sys.version_info[:2] == (3, 10), sys.version'
 
       - name: Install checksum-pinned Rust 1.97.0
         env:
-          RUSTUP_INIT_SHA256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+          RUSTUP_INIT_SHA256: ${{ matrix.rustup_sha256 }}
           RUSTUP_INIT_VERSION: 1.28.2
         shell: bash
         run: |
@@ -1006,7 +1120,7 @@ jobs:
           curl --fail --show-error --silent --location \
             --proto '=https' --tlsv1.2 --retry 3 \
             --output "$rustup_init" \
-            "https://static.rust-lang.org/rustup/archive/${RUSTUP_INIT_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
+            "https://static.rust-lang.org/rustup/archive/${RUSTUP_INIT_VERSION}/${{ matrix.rustup_host }}/rustup-init"
           echo "${RUSTUP_INIT_SHA256}  ${rustup_init}" | sha256sum --check --strict -
           chmod 0755 "$rustup_init"
           "$rustup_init" -y --no-modify-path --profile minimal --default-toolchain 1.97.0
@@ -1040,13 +1154,13 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --locked --release --lib \
-            --target x86_64-unknown-linux-gnu --no-default-features \
+            --target ${{ matrix.target }} --no-default-features \
             --features opus-encoding
           mkdir raw-wheel reproduced-wheel
           "$WHEEL_PYTHON" tools/build-python-wheel.py \
-            --library target/x86_64-unknown-linux-gnu/release/libforge_normalizer.so \
+            --library target/${{ matrix.target }}/release/libforge_normalizer.so \
             --library-name libforge_normalizer.so \
-            --platform linux_x86_64 \
+            --platform linux_${{ matrix.architecture }} \
             --outdir raw-wheel \
             --version "${{ needs.validate.outputs.version }}"
           mapfile -t raw_wheels < <(find raw-wheel -maxdepth 1 -type f -name '*.whl' -print | sort)
@@ -1055,7 +1169,7 @@ jobs:
             exit 1
           fi
           "$WHEEL_PYTHON" -m auditwheel repair \
-            --plat manylinux_2_34_x86_64 \
+            --plat manylinux_2_34_${{ matrix.architecture }} \
             --only-plat \
             --wheel-dir reproduced-wheel \
             "${raw_wheels[0]}"
@@ -1072,6 +1186,7 @@ jobs:
           fi
           for wheel in "${candidates[0]}" "${reproduced[0]}"; do
             "$WHEEL_PYTHON" tools/check-linux-wheel-abi.py \
+              --architecture "${{ matrix.architecture }}" \
               --auditwheel "$AUDITWHEEL" \
               "$wheel"
           done
@@ -1267,6 +1382,95 @@ jobs:
             "actual/forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.tar.gz" \
             "reproduced/forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.tar.gz"
 
+  reproducible-linux-aarch64:
+    name: Reproduce Linux ARM64 release
+    needs: [validate, build-linux]
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: quay.io/pypa/manylinux_2_28_aarch64@sha256:ad74e53b713f3b07d8c889c526dc0c6500da9827b45e38739570875fef52e28f
+    env:
+      CARGO_HOME: /tmp/forge-cargo
+      CARGO_INCREMENTAL: "0"
+      CFLAGS: -O2 -march=armv8-a -mtune=generic
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/tools/manylinux-cmake-toolchain.cmake
+      CXXFLAGS: -O2 -march=armv8-a -mtune=generic
+      LC_ALL: C.UTF-8
+      RUSTFLAGS: -C target-cpu=generic --remap-path-prefix=${{ github.workspace }}=/workspace
+      RUSTUP_HOME: /tmp/forge-rustup
+      SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install checksum-pinned Rust 1.97.0 and LLVM PGO tools
+        env:
+          RUSTUP_INIT_SHA256: e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
+          RUSTUP_INIT_VERSION: 1.28.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.28"
+          test "$(uname -m)" = aarch64
+          rustup_init="${RUNNER_TEMP}/rustup-init"
+          curl --fail --show-error --silent --location \
+            --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$rustup_init" \
+            "https://static.rust-lang.org/rustup/archive/${RUSTUP_INIT_VERSION}/aarch64-unknown-linux-gnu/rustup-init"
+          echo "${RUSTUP_INIT_SHA256}  ${rustup_init}" | sha256sum --check --strict -
+          chmod 0755 "$rustup_init"
+          "$rustup_init" -y --no-modify-path --profile minimal --default-toolchain 1.97.0
+          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+          "${CARGO_HOME}/bin/rustup" component add llvm-tools-preview
+          "${CARGO_HOME}/bin/rustc" --version | grep -Fx 'rustc 1.97.0 (2d8144b78 2026-07-07)'
+
+      - name: Download published ARM64 build candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-linux-aarch64
+          path: actual
+
+      - name: Download ARM64 PGO profile
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-pgo-profile-linux-aarch64
+          path: actual-profile
+
+      - name: Rebuild from the recorded ARM64 PGO input and compare
+        env:
+          FORGE_PGO_FEATURES: opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service,cuda-truepeak
+          FORGE_PGO_RUSTFLAGS: -C target-cpu=generic --remap-path-prefix=${{ github.workspace }}=/workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release \
+            --target aarch64-unknown-linux-gnu \
+            --features opus-encoding,ffmpeg-encoding,lv2-plugin,clap-plugin,onnx-provider,grpc-service,cuda-truepeak
+          FORGE_PGO_PROFILE_INPUT="$GITHUB_WORKSPACE/actual-profile/forge-v${{ needs.validate.outputs.version }}-linux-aarch64.pgo-profile.txt" \
+            tools/build-pgo-forge.sh aarch64-unknown-linux-gnu
+          cp \
+            target/forge-pgo-aarch64-unknown-linux-gnu/optimized/aarch64-unknown-linux-gnu/release/forge \
+            target/aarch64-unknown-linux-gnu/release/forge
+          mkdir reproduced reproduced-extracted
+          tools/package-linux-release.sh \
+            "${{ needs.validate.outputs.version }}" \
+            aarch64-unknown-linux-gnu \
+            "${{ needs.validate.outputs.source-date-epoch }}" \
+            reproduced \
+            aarch64
+          archive="reproduced/forge-v${{ needs.validate.outputs.version }}-linux-aarch64.tar.gz"
+          python3 tools/check-linux-native-abi.py \
+            --architecture aarch64 \
+            --archive "$archive" \
+            --extract-to reproduced-extracted \
+            --expected-root "forge-v${{ needs.validate.outputs.version }}-linux-aarch64"
+          cmp \
+            "actual/forge-v${{ needs.validate.outputs.version }}-linux-aarch64.tar.gz" \
+            "$archive"
+          sha256sum \
+            "actual/forge-v${{ needs.validate.outputs.version }}-linux-aarch64.tar.gz" \
+            "$archive"
+
   reproducible-macos-aarch64:
     name: Reproduce macOS ARM64 PGO CLI
     needs: [validate, build]
@@ -1316,12 +1520,56 @@ jobs:
             actual-profile/canonical-profile.txt \
             "$reproduced_profile"
 
+  package-crate:
+    name: Package the crates.io source archive
+    needs: validate
+    runs-on: ubuntu-24.04
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+
+      - name: Create and validate the exact Cargo registry package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo package --locked --no-verify
+          crate="target/package/forge-normalizer-${{ needs.validate.outputs.version }}.crate"
+          python3 tools/verify-registry-artifacts.py \
+            --verify-crate "$crate" \
+            --version "${{ needs.validate.outputs.version }}" >/dev/null
+          cp "$crate" .
+
+      - name: Upload the exact Cargo registry package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: forge-rust-crate
+          path: forge-normalizer-${{ needs.validate.outputs.version }}.crate
+          if-no-files-found: error
+          retention-days: 7
+
   wasm:
-    name: Build browser WASM package
+    name: Build browser and npm WASM packages
     needs: validate
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install the pinned Node and npm release toolchain
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.21.0"
+          package-manager-cache: false
+
+      - name: Verify the npm trusted-publishing CLI floor
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = v24.21.0
+          test "$(npm --version)" = 11.19.0
 
       - name: Install Rust 1.97.0 and the WebAssembly target
         uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
@@ -1342,39 +1590,180 @@ jobs:
           cmp \
             "first/forge-v${{ needs.validate.outputs.version }}-wasm-web.tar.gz" \
             "second/forge-v${{ needs.validate.outputs.version }}-wasm-web.tar.gz"
+          cmp \
+            "first/forge-normalizer-wasm-${{ needs.validate.outputs.version }}.tgz" \
+            "second/forge-normalizer-wasm-${{ needs.validate.outputs.version }}.tgz"
           mv "first/forge-v${{ needs.validate.outputs.version }}-wasm-web.tar.gz" .
+          mv "first/forge-normalizer-wasm-${{ needs.validate.outputs.version }}.tgz" .
 
-      - name: Upload browser package
+      - name: Upload browser and npm packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
-          name: forge-wasm-web
-          path: forge-v${{ needs.validate.outputs.version }}-wasm-web.tar.gz
+          name: forge-wasm-packages
+          path: |
+            forge-v${{ needs.validate.outputs.version }}-wasm-web.tar.gz
+            forge-normalizer-wasm-${{ needs.validate.outputs.version }}.tgz
           if-no-files-found: error
           retention-days: 7
 
-  publish:
-    name: Publish GitHub Release
-    needs: [validate, build, build-linux, build-linux-wheel, smoke-linux-wheel-floor, reproducible-linux-wheel, build-linux-v3, reproducible-linux, reproducible-macos-aarch64, wasm]
-    if: github.ref_type == 'tag'
+  assemble-release:
+    name: Assemble the exact release bundle
+    needs:
+      - validate
+      - build
+      - build-linux
+      - build-linux-wheel
+      - smoke-linux-wheel-floor
+      - reproducible-linux-wheel
+      - build-linux-v3
+      - reproducible-linux
+      - reproducible-linux-aarch64
+      - reproducible-macos-aarch64
+      - package-crate
+      - wasm
     runs-on: ubuntu-24.04
-    environment: release
-    permissions:
-      attestations: write
-      contents: write
-      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          persist-credentials: false
 
-      - name: Download release archives
+      - name: Download Linux x86-64 native archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
         with:
-          pattern: forge-*
-          path: dist
-          merge-multiple: true
+          name: forge-linux-x86_64
+          path: incoming/linux-x86_64
+
+      - name: Download Linux ARM64 native archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-linux-aarch64
+          path: incoming/linux-aarch64
+
+      - name: Download supplemental Linux x86-64-v3 archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-linux-x86_64-v3
+          path: incoming/linux-x86_64-v3
+
+      - name: Download Windows release pair
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-windows-x86_64
+          path: incoming/windows-x86_64
+
+      - name: Download macOS Intel release pair
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-macos-x86_64
+          path: incoming/macos-x86_64
+
+      - name: Download macOS ARM64 release pair
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-macos-aarch64
+          path: incoming/macos-aarch64
+
+      - name: Download Linux x86-64 wheel
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-python-linux-x86_64
+          path: incoming/python-linux-x86_64
+
+      - name: Download Linux ARM64 wheel
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-python-linux-aarch64
+          path: incoming/python-linux-aarch64
+
+      - name: Download browser and npm WASM packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-wasm-packages
+          path: incoming/wasm
+
+      - name: Download Cargo registry package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-rust-crate
+          path: incoming/crate
+
+      - name: Stage only the exact producer file sets
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import shutil
+          import stat
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          incoming = Path("incoming")
+          output = Path("dist")
+          output.mkdir()
+          groups = {
+              "linux-x86_64": [f"forge-v{version}-linux-x86_64.tar.gz"],
+              "linux-aarch64": [f"forge-v{version}-linux-aarch64.tar.gz"],
+              "linux-x86_64-v3": [f"forge-v{version}-linux-x86_64-v3.tar.gz"],
+              "windows-x86_64": [
+                  f"forge-v{version}-windows-x86_64.zip",
+                  f"forge_normalizer-{version}-py3-none-win_amd64.whl",
+              ],
+              "macos-x86_64": [
+                  f"forge-v{version}-macos-x86_64.tar.gz",
+                  f"forge_normalizer-{version}-py3-none-macosx_10_12_x86_64.whl",
+              ],
+              "macos-aarch64": [
+                  f"forge-v{version}-macos-aarch64.tar.gz",
+                  f"forge_normalizer-{version}-py3-none-macosx_11_0_arm64.whl",
+              ],
+              "python-linux-x86_64": [
+                  f"forge_normalizer-{version}-py3-none-manylinux_2_34_x86_64.whl",
+              ],
+              "python-linux-aarch64": [
+                  f"forge_normalizer-{version}-py3-none-manylinux_2_34_aarch64.whl",
+              ],
+              "wasm": [
+                  f"forge-v{version}-wasm-web.tar.gz",
+                  f"forge-normalizer-wasm-{version}.tgz",
+              ],
+              "crate": [f"forge-normalizer-{version}.crate"],
+          }
+          for group, expected in groups.items():
+              root = incoming / group
+              root_metadata = root.lstat()
+              if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+                  raise SystemExit(f"producer {group} root is not a real directory")
+              entries = sorted(root.iterdir(), key=lambda item: item.name)
+              actual = [entry.name for entry in entries]
+              if actual != sorted(expected):
+                  raise SystemExit(
+                      f"producer {group} file set mismatch: "
+                      f"expected={sorted(expected)!r}, actual={actual!r}"
+                  )
+              for entry in entries:
+                  metadata = entry.lstat()
+                  if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                      raise SystemExit(f"producer {group} contains a non-regular file: {entry.name}")
+                  destination = output / entry.name
+                  if destination.exists():
+                      raise SystemExit(f"duplicate release filename: {entry.name}")
+                  shutil.copyfile(entry, destination, follow_symlinks=False)
+          PY
 
       - name: Generate package-manager manifests
         shell: bash
         run: tools/generate-package-metadata.sh "${{ needs.validate.outputs.version }}" dist
+
+      - name: Validate local registry payload metadata
+        shell: bash
+        run: >-
+          python3 tools/verify-registry-artifacts.py
+          --artifact-dir dist
+          --version "${{ needs.validate.outputs.version }}"
+          --state local
 
       - name: Install checksum-pinned Syft
         env:
@@ -1395,79 +1784,390 @@ jobs:
           chmod 0755 "$install_dir/syft"
           echo "$install_dir" >> "$GITHUB_PATH"
 
-      - name: Generate SPDX and CycloneDX SBOMs
+      - name: Generate normalized SPDX and CycloneDX SBOMs per artifact
+        shell: bash
+        run: >-
+          python3 tools/release_manifest.py generate-sboms
+          --input-dir dist
+          --version "${{ needs.validate.outputs.version }}"
+          --source-date-epoch "${{ needs.validate.outputs.source-date-epoch }}"
+
+      - name: Finalize and verify the pre-attestation manifest
         shell: bash
         run: |
           set -euo pipefail
-          syft scan dir:. \
-            --output "spdx-json=dist/forge-v${{ needs.validate.outputs.version }}.spdx.json" \
-            --output "cyclonedx-json=dist/forge-v${{ needs.validate.outputs.version }}.cdx.json"
+          python3 tools/release_manifest.py finalize \
+            --input-dir dist \
+            --version "${{ needs.validate.outputs.version }}" \
+            --source-date-epoch "${{ needs.validate.outputs.source-date-epoch }}"
+          python3 tools/release_manifest.py verify \
+            --input-dir dist \
+            --version "${{ needs.validate.outputs.version }}"
 
-      - name: Validate evidence and create checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-          jq -e . "dist/forge-v${{ needs.validate.outputs.version }}.spdx.json" >/dev/null
-          jq -e . "dist/forge-v${{ needs.validate.outputs.version }}.cdx.json" >/dev/null
-          (
-            cd dist
-            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 |
-              sort -z |
-              xargs -0 sha256sum > SHA256SUMS
-            sha256sum -c SHA256SUMS
-          )
+      - name: Upload the read-only assembled bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: forge-release-assembled
+          path: dist
+          if-no-files-found: error
+          retention-days: 90
 
-      - name: Generate SLSA build provenance
+  attest-release:
+    name: Attest the exact release subject set
+    needs: [validate, assemble-release]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download the assembled bundle by exact producer name
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-release-assembled
+          path: dist
+
+      - name: Verify the pre-attestation bundle
+        run: >-
+          python3 tools/release_manifest.py verify
+          --input-dir dist
+          --version "${{ needs.validate.outputs.version }}"
+
+      - name: Generate one SLSA statement for the exact subject set
         id: provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-checksums: dist/SHA256SUMS
 
-      - name: Verify SLSA provenance before publication
+      - name: Bind and cryptographically verify the SLSA bundle
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          provenance="dist/forge-v${{ needs.validate.outputs.version }}.slsa.jsonl"
-          cp "${{ steps.provenance.outputs.bundle-path }}" "$provenance"
+          provenance="forge-v${{ needs.validate.outputs.version }}.slsa.jsonl"
+          cp "${{ steps.provenance.outputs.bundle-path }}" "dist/${provenance}"
+          python3 tools/release_manifest.py finalize \
+            --input-dir dist \
+            --version "${{ needs.validate.outputs.version }}" \
+            --source-date-epoch "${{ needs.validate.outputs.source-date-epoch }}" \
+            --slsa-bundle "$provenance"
+          python3 tools/release_manifest.py verify \
+            --input-dir dist \
+            --version "${{ needs.validate.outputs.version }}"
           while read -r _ artifact; do
             gh attestation verify "dist/${artifact#./}" \
               --repo "$GITHUB_REPOSITORY" \
-              --bundle "$provenance" \
+              --bundle "dist/${provenance}" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
           done < dist/SHA256SUMS
 
-      - name: Publish release
+      - name: Upload the fully attested release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: forge-release-final
+          path: dist
+          if-no-files-found: error
+          retention-days: 90
+
+  publish-github:
+    name: Publish the immutable GitHub Release
+    needs: [validate, attest-release]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    environment: release
+    concurrency:
+      group: forge-release-publication
+      queue: max
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      RELEASE_DIST: ${{ runner.temp }}/release-dist
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - id: release-policy-token
+        name: Acquire a short-lived fail-closed release-policy token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.FORGE_RELEASE_POLICY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FORGE_RELEASE_POLICY_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.repository }}
+          # GitHub discloses ruleset bypass actors only to a caller with
+          # ruleset write access. The helper uses this token for GET requests
+          # only; release mutations continue to use the built-in token.
+          permission-administration: write
+
+      - name: Download the fully attested bundle by exact producer name
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-release-final
+          path: ${{ runner.temp }}/release-dist
+
+      - name: Revalidate and publish through the one-way state machine
         env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_POLICY_TOKEN: ${{ steps.release-policy-token.outputs.token }}
         shell: bash
         run: |
           set -euo pipefail
-          remote_tag_commit="$(
-            git ls-remote --tags origin "refs/tags/${TAG}^{}" |
-              awk 'NR == 1 { print $1 }'
-          )"
-          if [[ -z "$remote_tag_commit" || "$remote_tag_commit" != "$GITHUB_SHA" ]]; then
-            echo "::error::Remote tag ${TAG} no longer resolves to workflow commit ${GITHUB_SHA}"
-            exit 1
-          fi
-
-          gh release create "$TAG" dist/* \
+          python3 tools/release_manifest.py verify \
+            --input-dir "$RELEASE_DIST" \
+            --version "${{ needs.validate.outputs.version }}"
+          python3 tools/publish-github-release.py \
             --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --generate-notes \
-            --latest=false \
-            --title "Forge $TAG"
+            --tag "$GITHUB_REF_NAME" \
+            --expected-commit "$GITHUB_SHA" \
+            --release-dir "$RELEASE_DIST" \
+            --manifest "$RELEASE_DIST/RELEASE-MANIFEST.json" \
+            --title "Forge $GITHUB_REF_NAME" \
+            --timeout 300
 
-          highest_tag="$(
-            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-              --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' |
-              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
-              sort -V |
-              tail -n 1
-          )"
-          if [[ "$TAG" == "$highest_tag" ]]; then
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --latest
+  publish-pypi:
+    name: Publish exact wheels to PyPI with OIDC
+    needs: [validate, publish-github]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    environment: pypi
+    concurrency:
+      group: forge-pypi-publication
+      queue: max
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_DIST: ${{ runner.temp }}/release-dist
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download the exact attested registry source bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-release-final
+          path: ${{ runner.temp }}/release-dist
+
+      - id: registry-preflight
+        name: Verify the manifest and reconcile PyPI before mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/release_manifest.py verify \
+            --input-dir "$RELEASE_DIST" \
+            --version "${{ needs.validate.outputs.version }}"
+          python3 tools/verify-registry-artifacts.py \
+            --artifact-dir "$RELEASE_DIST" \
+            --version "${{ needs.validate.outputs.version }}" \
+            --registry pypi \
+            --state pre > "$RUNNER_TEMP/registry-preflight.json"
+          state="$(jq -r '.registries.pypi.state' "$RUNNER_TEMP/registry-preflight.json")"
+          test "$state" = absent || test "$state" = exact
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          mkdir pypi-dist
+          jq -r '.assets[] | select(.kind == "python-wheel") | .name' \
+            "$RELEASE_DIST/RELEASE-MANIFEST.json" |
+            while IFS= read -r wheel; do
+              cp "$RELEASE_DIST/${wheel}" pypi-dist/
+            done
+          test "$(find pypi-dist -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 5
+
+      - name: Publish the previously absent wheel set
+        if: steps.registry-preflight.outputs.state == 'absent'
+        uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # v1.12.4
+        with:
+          packages-dir: pypi-dist
+          skip-existing: false
+          attestations: true
+          print-hash: true
+
+      - name: Require the exact PyPI post-state
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6; do
+            if python3 tools/verify-registry-artifacts.py \
+              --artifact-dir "$RELEASE_DIST" \
+              --version "${{ needs.validate.outputs.version }}" \
+              --registry pypi \
+              --state post > "$RUNNER_TEMP/registry-post.json"; then
+              exit 0
+            fi
+            if [[ "$attempt" != 6 ]]; then sleep 10; fi
+          done
+          exit 1
+
+  publish-npm:
+    name: Publish the exact WASM package to npm with OIDC
+    needs: [validate, publish-github]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    environment: npm
+    concurrency:
+      group: forge-npm-publication
+      queue: max
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_DIST: ${{ runner.temp }}/release-dist
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned npm trusted-publishing toolchain
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.21.0"
+          package-manager-cache: false
+          registry-url: https://registry.npmjs.org
+
+      - name: Download the exact attested registry source bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-release-final
+          path: ${{ runner.temp }}/release-dist
+
+      - id: registry-preflight
+        name: Verify the manifest and reconcile npm before mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = v24.21.0
+          test "$(npm --version)" = 11.19.0
+          python3 tools/release_manifest.py verify \
+            --input-dir "$RELEASE_DIST" \
+            --version "${{ needs.validate.outputs.version }}"
+          python3 tools/verify-registry-artifacts.py \
+            --artifact-dir "$RELEASE_DIST" \
+            --version "${{ needs.validate.outputs.version }}" \
+            --registry npm \
+            --state pre > "$RUNNER_TEMP/registry-preflight.json"
+          state="$(jq -r '.registries.npm.state' "$RUNNER_TEMP/registry-preflight.json")"
+          test "$state" = absent || test "$state" = exact
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the previously absent npm package
+        if: steps.registry-preflight.outputs.state == 'absent'
+        shell: bash
+        run: >-
+          npm publish
+          "$RELEASE_DIST/forge-normalizer-wasm-${{ needs.validate.outputs.version }}.tgz"
+          --access public
+          --provenance
+
+      - name: Require the exact npm post-state
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6; do
+            if python3 tools/verify-registry-artifacts.py \
+              --artifact-dir "$RELEASE_DIST" \
+              --version "${{ needs.validate.outputs.version }}" \
+              --registry npm \
+              --state post > "$RUNNER_TEMP/registry-post.json"; then
+              exit 0
+            fi
+            if [[ "$attempt" != 6 ]]; then sleep 10; fi
+          done
+          exit 1
+
+  publish-crates:
+    name: Publish the exact Rust crate with short-lived OIDC
+    needs: [validate, publish-github]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    environment: crates-io
+    concurrency:
+      group: forge-crates-publication
+      queue: max
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_DIST: ${{ runner.temp }}/release-dist
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+
+      - name: Download the exact attested registry source bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: forge-release-final
+          path: ${{ runner.temp }}/release-dist
+
+      - id: registry-preflight
+        name: Verify the manifest, package bytes, and crates.io pre-state
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/release_manifest.py verify \
+            --input-dir "$RELEASE_DIST" \
+            --version "${{ needs.validate.outputs.version }}"
+          python3 tools/verify-registry-artifacts.py \
+            --artifact-dir "$RELEASE_DIST" \
+            --version "${{ needs.validate.outputs.version }}" \
+            --registry crates \
+            --state pre > "$RUNNER_TEMP/registry-preflight.json"
+          state="$(jq -r '.registries.crates.state' "$RUNNER_TEMP/registry-preflight.json")"
+          test "$state" = absent || test "$state" = exact
+          if [[ "$state" == absent ]]; then
+            cargo package --locked --no-verify
+            cmp \
+              "target/package/forge-normalizer-${{ needs.validate.outputs.version }}.crate" \
+              "$RELEASE_DIST/forge-normalizer-${{ needs.validate.outputs.version }}.crate"
           fi
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+
+      - id: crates-auth
+        name: Acquire a crate-scoped short-lived token
+        if: steps.registry-preflight.outputs.state == 'absent'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish the previously absent crate
+        if: steps.registry-preflight.outputs.state == 'absent'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+          SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source-date-epoch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo publish --locked --no-verify
+          cmp \
+            "target/package/forge-normalizer-${{ needs.validate.outputs.version }}.crate" \
+            "$RELEASE_DIST/forge-normalizer-${{ needs.validate.outputs.version }}.crate"
+
+      - name: Require the exact crates.io post-state
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6; do
+            if python3 tools/verify-registry-artifacts.py \
+              --artifact-dir "$RELEASE_DIST" \
+              --version "${{ needs.validate.outputs.version }}" \
+              --registry crates \
+              --state post > "$RUNNER_TEMP/registry-post.json"; then
+              exit 0
+            fi
+            if [[ "$attempt" != 6 ]]; then sleep 10; fi
+          done
+          exit 1

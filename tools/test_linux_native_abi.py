@@ -12,31 +12,44 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).with_name("check-linux-native-abi.py")
+PACKAGE_SCRIPT = Path(__file__).with_name("package-linux-release.sh")
 SPEC = importlib.util.spec_from_file_location("check_linux_native_abi", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 abi = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(abi)
 
 
-def elf_header(marker: bytes = b"") -> bytes:
+def elf_header(marker: bytes = b"", *, architecture: str = "x86_64") -> bytes:
     header = bytearray(64)
     header[:4] = b"\x7fELF"
     header[4] = 2
     header[5] = 1
     header[6] = 1
     header[16:18] = (3).to_bytes(2, "little")
-    header[18:20] = (62).to_bytes(2, "little")
+    machine = abi.contract_for_architecture(architecture).elf_machine
+    header[18:20] = machine.to_bytes(2, "little")
     return bytes(header) + marker
 
 
-def make_archive(root: Path, *, extra: tuple[str, ...] = ()) -> None:
+def make_archive(
+    root: Path,
+    *,
+    architecture: str = "x86_64",
+    extra: tuple[str, ...] = (),
+) -> None:
     (root / "lib").mkdir(parents=True)
-    (root / "forge").write_bytes(elf_header(b"forge"))
-    (root / "lib" / "libforge_normalizer.so").write_bytes(elf_header(b"library"))
+    (root / "forge").write_bytes(
+        elf_header(b"forge", architecture=architecture)
+    )
+    (root / "lib" / "libforge_normalizer.so").write_bytes(
+        elf_header(b"library", architecture=architecture)
+    )
     for name in extra:
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(elf_header(name.encode("utf-8")))
+        path.write_bytes(
+            elf_header(name.encode("utf-8"), architecture=architecture)
+        )
 
 
 def accept_elf(_path: Path, _member: str, _readelf: str) -> None:
@@ -49,6 +62,26 @@ def write_tar(source: Path, archive: Path, root_name: str = "forge-package") -> 
 
 
 class NativeArchiveTests(unittest.TestCase):
+    def test_aarch64_archive_uses_aarch64_machine_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_archive(root, architecture="aarch64")
+            self.assertEqual(
+                abi.verify_archive(
+                    root,
+                    architecture="aarch64",
+                    inspector=accept_elf,
+                ),
+                ["forge", "lib/libforge_normalizer.so"],
+            )
+
+    def test_aarch64_archive_is_rejected_by_x86_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_archive(root, architecture="aarch64")
+            with self.assertRaisesRegex(abi.WheelAbiError, "expected x86-64"):
+                abi.verify_archive(root, inspector=accept_elf)
+
     def test_bounded_tar_extraction_yields_one_verified_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -237,6 +270,42 @@ class NativeArchiveTests(unittest.TestCase):
             )
             self.assertEqual(failure.returncode, 1)
             self.assertIn("verification failed", failure.stderr)
+
+
+class NativePackageArgumentTests(unittest.TestCase):
+    def test_package_script_rejects_unknown_architecture(self) -> None:
+        result = subprocess.run(
+            [
+                str(PACKAGE_SCRIPT),
+                "0.189.16",
+                "x86_64-unknown-linux-gnu",
+                "0",
+                ".",
+                "riscv64",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unsupported Linux architecture", result.stderr)
+
+    def test_package_script_rejects_target_architecture_mismatch(self) -> None:
+        result = subprocess.run(
+            [
+                str(PACKAGE_SCRIPT),
+                "0.189.16",
+                "x86_64-unknown-linux-gnu",
+                "0",
+                ".",
+                "aarch64",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("does not match Rust target", result.stderr)
 
 
 if __name__ == "__main__":

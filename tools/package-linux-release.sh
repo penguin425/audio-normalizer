@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 4 ]]; then
-  echo "usage: $0 VERSION TARGET SOURCE_DATE_EPOCH OUTPUT_DIR" >&2
+if [[ $# -lt 4 || $# -gt 5 ]]; then
+  echo "usage: $0 VERSION TARGET SOURCE_DATE_EPOCH OUTPUT_DIR [ARCHITECTURE]" >&2
   exit 2
 fi
 
@@ -10,6 +10,7 @@ version="$1"
 target="$2"
 source_date_epoch="$3"
 output_dir="$4"
+architecture="${5:-x86_64}"
 
 # Keep release names and filesystem arguments in a deliberately small ASCII
 # subset.  Apart from making the archive name unambiguous, this prevents an
@@ -24,6 +25,14 @@ if [[ ! "$target" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   echo "invalid Rust target triple: $target" >&2
   exit 2
 fi
+case "$architecture" in
+  x86_64|aarch64)
+    ;;
+  *)
+    echo "unsupported Linux architecture: $architecture" >&2
+    exit 2
+    ;;
+esac
 if [[ ! "$source_date_epoch" =~ ^[0-9]+$ ]]; then
   echo "invalid SOURCE_DATE_EPOCH: $source_date_epoch" >&2
   exit 2
@@ -60,7 +69,27 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd -- "${script_dir}/.." && pwd -P)"
 cd -- "$repo_root"
 
-asset="forge-v${version}-linux-x86_64"
+case "$target" in
+  x86_64-unknown-linux-gnu)
+    target_architecture=x86_64
+    ;;
+  aarch64-unknown-linux-gnu)
+    target_architecture=aarch64
+    ;;
+  *)
+    target_architecture=""
+    ;;
+esac
+if [[ -z "$target_architecture" ]]; then
+  echo "unsupported Linux Rust target: $target" >&2
+  exit 2
+fi
+if [[ -n "$target_architecture" && "$target_architecture" != "$architecture" ]]; then
+  echo "architecture ${architecture} does not match Rust target ${target}" >&2
+  exit 2
+fi
+
+asset="forge-v${version}-linux-${architecture}"
 staging="${output_root}/${asset}"
 
 if [[ -e "$staging" || -L "$staging" || -e "${staging}.tar.gz" || -L "${staging}.tar.gz" ]]; then

@@ -162,9 +162,10 @@ command with `--help`.
 ## APIs and integrations
 
 Forge provides a Rust library, a versioned [C API](C-API.md),
-[Python wheels](PYTHON-API.md), a browser WebAssembly package, and real-time
-host adapters. Source integrations for FFmpeg, GStreamer, VST3, and Audio Unit
-are documented in [HOST-ADAPTERS.md](HOST-ADAPTERS.md),
+[Python wheels](PYTHON-API.md), and a browser
+[WebAssembly package](WASM-PACKAGE.md). Source integrations for FFmpeg,
+GStreamer, VST3, and Audio Unit are documented in
+[HOST-ADAPTERS.md](HOST-ADAPTERS.md),
 [VST3-ADAPTER.md](VST3-ADAPTER.md), and [AU-ADAPTER.md](AU-ADAPTER.md).
 Native C ABI archives retain their historical root-level library copies and
 also provide the canonical `include/` and `lib/` layout. CMake consumers use
@@ -176,9 +177,10 @@ compatibility contract.
 
 ## Releases and verification
 
-Tagged releases contain platform archives, Python wheels, checksums, SPDX and
-CycloneDX SBOMs, and SLSA provenance. Linux and Apple Silicon release builds
-also pass independent reproducibility checks before publication.
+Tagged releases from v0.189.17 onward contain platform archives, Python wheels,
+checksums, per-artifact SPDX and CycloneDX SBOMs, and SLSA provenance. Linux
+and Apple Silicon release builds also pass independent reproducibility checks
+before publication.
 The official generic Linux native archive and wheel floor is x86-64 with glibc
 2.34 or newer. Those generic artifacts use x86-64-v1 flags in a pinned
 manylinux 2.28 build and ABI-stress environment; this is not a glibc 2.28
@@ -186,12 +188,88 @@ wheel-install claim. The supplemental x86-64-v3 CLI is built in the same
 pinned environment with an explicit v3 target. The ordinary Linux archive is
 built, ELF-inspected, and runtime-smoked at the official floor.
 
+The v0.189.17 Linux ARM64 release contract adds
+`forge-v<VERSION>-linux-aarch64.tar.gz` and
+`forge_normalizer-<VERSION>-py3-none-manylinux_2_34_aarch64.whl`. These are
+generic AArch64/ARMv8-A (mandatory NEON only) builds: they do not claim
+CPU-specific extensions such as SVE or a cryptographic extension, and they
+require glibc 2.34 or newer. The archive carries the same native C ABI layout
+and relocation checks as the
+other full native archives. `cargo-binstall` and the generated Homebrew
+formula select this archive on `aarch64-unknown-linux-gnu`; the x86-64-v3
+archive remains a CLI-only supplemental artifact.
+
+Every public release file is selected by an exact, versioned manifest. The
+manifest records the filename, byte length, SHA-256 digest, artifact class, and
+the corresponding verification evidence. Each distributable has its own
+SPDX/CycloneDX evidence and is included in the SLSA subject set; the aggregate
+checksum and provenance files are not a substitute for an artifact entry.
+Missing, extra, duplicate, symlinked, or digest-mismatched files fail before
+the immutable GitHub Release is made public. Build-input evidence such as PGO
+profiles is published only when it is explicitly listed, never because a
+download glob happened to match it.
+
 Use the checksums and attestation bundle shipped with each
 [GitHub Release](https://github.com/penguin425/audio-normalizer/releases).
+
+### Registry publication boundary
+
+The repository prepares, but does not by itself claim, registry publication.
+When the external publisher configuration is present, the v0.189.17 release
+workflow will publish the exact verified artifacts with trusted OIDC
+publishers: the Python wheel set to PyPI, the public browser package to npm,
+and the Rust crate to crates.io. Build jobs never receive registry credentials;
+the crates.io job uses the official `rust-lang/crates-io-auth-action`
+short-lived OIDC token exchange and exposes it only as
+`CARGO_REGISTRY_TOKEN` to the publish step.
+Each registry job consumes only the manifest-checked artifact bundle. The
+local manifest binds every byte length and SHA-256 digest; retry reconciliation
+then checks the registry's exact package identity and integrity fields (PyPI
+SHA-256 and size, npm integrity/SHA-1, or crates.io checksum). A missing
+publisher, a first-release/bootstrap requirement, or a registry digest
+mismatch blocks publication rather than being reported as a successful
+release. Until those checks pass, install from the GitHub Release and do not
+infer that a package exists on any registry.
+
+Before creating a v0.189.17 tag, repository administrators must provide the
+four protected GitHub environments `release`, `pypi`, `npm`, and `crates-io`.
+The `release` environment must expose
+`FORGE_RELEASE_POLICY_APP_CLIENT_ID` as a variable and
+`FORGE_RELEASE_POLICY_APP_PRIVATE_KEY` as a secret for a GitHub App installed
+only on this repository with repository Administration write permission.
+GitHub exposes ruleset bypass actors only at that permission level; the
+publisher uses the short-lived App token for GET requests only and fails closed
+if the field is absent or nonempty. Release creation and uploads still use the
+built-in contents-only token.
+
+The three registry trusted publishers must name repository
+`penguin425/audio-normalizer`, workflow `release.yml`, and their exact
+environment (`pypi`, `npm`, or `crates-io`). PyPI may use a pending publisher
+to create the project. npm and crates.io require the exact v0.189.16 package to
+be bootstrapped manually before their trusted publishers can be registered;
+the npm trusted-publisher entry must permit publishing, and the npm scope must
+already be controlled by the project owner. These are deployment prerequisites,
+not credentials accepted by build jobs.
+
+Cargo's stable publisher cannot upload a pre-existing `.crate` path: it always
+repackages before upload. The workflow therefore compares an independent
+`cargo package` result with the attested asset before acquiring credentials,
+runs the official `cargo publish`, compares Cargo's final local package again,
+and requires the immutable crates.io checksum to equal the asset. This is the
+strongest boundary available through the supported Cargo client, but the final
+registry comparison necessarily detects a hypothetical mismatch only after
+crates.io has accepted that non-replaceable version.
+
+Windows ARM64 binaries, OCI images or multi-architecture indexes, macOS
+notarization/stapling, and Authenticode signatures are deliberately outside
+the v0.189.17 contract. They remain demand-, platform-verification-, and
+credential-gated follow-up work; no current archive should be interpreted as
+having any of those properties.
 
 ## Documentation
 
 - [Documentation map and command index](DOCUMENTATION.md)
+- [Browser WebAssembly package](WASM-PACKAGE.md)
 - [JSON schemas and version registry](SCHEMA-REGISTRY.md)
 - [Compatibility and deprecation policy](COMPATIBILITY.md)
 - [Rust API stability policy](API-STABILITY.md)

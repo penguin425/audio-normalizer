@@ -15,6 +15,7 @@ hash_for() {
 }
 
 linux_hash="$(hash_for "forge-v${version}-linux-x86_64.tar.gz")"
+linux_aarch64_hash="$(hash_for "forge-v${version}-linux-aarch64.tar.gz")"
 macos_x86_hash="$(hash_for "forge-v${version}-macos-x86_64.tar.gz")"
 macos_arm_hash="$(hash_for "forge-v${version}-macos-aarch64.tar.gz")"
 windows_hash="$(hash_for "forge-v${version}-windows-x86_64.zip")"
@@ -37,8 +38,13 @@ class Forge < Formula
   end
 
   on_linux do
-    url "${base_url}/forge-v${version}-linux-x86_64.tar.gz"
-    sha256 "${linux_hash}"
+    if Hardware::CPU.arm?
+      url "${base_url}/forge-v${version}-linux-aarch64.tar.gz"
+      sha256 "${linux_aarch64_hash}"
+    else
+      url "${base_url}/forge-v${version}-linux-x86_64.tar.gz"
+      sha256 "${linux_hash}"
+    end
   end
 
   def install

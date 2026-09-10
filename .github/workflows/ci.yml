@@ -219,6 +219,11 @@ jobs:
             rustflags: ""
             python: "3.14"
             library: libforge_normalizer.so
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            rustflags: -Ctarget-cpu=generic
+            python: "3.10"
+            library: libforge_normalizer.so
           - os: macos-latest
             target: aarch64-apple-darwin
             rustflags: -Ctarget-feature=+neon,+aes,+sha2
@@ -253,7 +258,7 @@ jobs:
         run: cargo test --locked --target ${{ matrix.target }} --test c_api --test c_header
 
       - name: Check AArch64 stereo K-weighting equivalence
-        if: matrix.os == 'macos-latest'
+        if: startsWith(matrix.target, 'aarch64-')
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: >-
@@ -262,7 +267,7 @@ jobs:
           pair_kweight_is_bit_exact_including_exceptional_samples
 
       - name: Check AArch64 stereo PCM16 decode equivalence
-        if: matrix.os == 'macos-latest'
+        if: startsWith(matrix.target, 'aarch64-')
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: >-

@@ -10,14 +10,18 @@ v0.97.0. Each wheel bundles the matching Forge shared library:
 | Wheel platform tag | Host requirement | Bundled library |
 | --- | --- | --- |
 | `manylinux_2_34_x86_64` | 64-bit x86 Linux with glibc 2.34 or newer | `libforge_normalizer.so` |
+| `manylinux_2_34_aarch64` | 64-bit ARM Linux with glibc 2.34 or newer | `libforge_normalizer.so` |
 | `macosx_11_0_arm64` | Apple silicon macOS 11 or newer | `libforge_normalizer.dylib` |
 | `macosx_10_12_x86_64` | 64-bit Intel macOS 10.12 or newer | `libforge_normalizer.dylib` |
 | `win_amd64` | 64-bit x86 Windows | `forge_normalizer.dll` |
 
 The wheels support CPython and other Python 3 implementations that provide
 the standard `ctypes` module, beginning with Python 3.10. They have no Python
-runtime dependencies and are tagged `py3-none-<platform>`. Forge does not
-currently publish this package to PyPI.
+runtime dependencies and are tagged `py3-none-<platform>`. GitHub Release
+assets are the authoritative source while a registry publisher is being
+configured. The v0.189.17 workflow is prepared to publish the same exact wheel
+set to PyPI through a trusted OIDC publisher; this document does not claim that
+`forge-normalizer` is already present on PyPI.
 
 The official generic Linux native archive and wheel floor is x86-64 with glibc
 2.34 or newer. The Linux wheel is published as
@@ -30,6 +34,14 @@ inspected, and runtime-smoked at the official floor. The build first emits a
 release. The release gate scans every ELF member for GLIBC symbol versions,
 dynamic dependencies, C++ ABI references, declared ISA requirements, text
 relocations, and executable stacks.
+
+The ARM64 wheel is built and repaired as `manylinux_2_34_aarch64` from a
+generic ARMv8-A (mandatory NEON only) baseline in a pinned AArch64 manylinux
+build environment. Its
+runtime floor is glibc 2.34; the ARM build does not promise SVE, crypto, or
+other optional CPU extensions. The matching native archive is named
+`forge-v<VERSION>-linux-aarch64.tar.gz`. Both ARM artifacts are runtime-smoked
+on AArch64 before they can enter the release manifest.
 
 Forge contains CPUID-guarded AVX2 fast paths, so the release does not claim
 that its ELF has no AVX instructions. Instead, the repaired wheel is loaded
@@ -52,6 +64,24 @@ that wheelhouse with `--no-index`. QEMU comes from Ubuntu's versioned
 workflow. An independent job repeats the native build and repair and requires
 the candidate and reproduced wheels to be byte-identical before publication.
 
+## PyPI publication and evidence
+
+The release workflow separates wheel assembly, evidence generation, and
+publication. A manifest entry is required for every wheel and records its
+exact filename, size, SHA-256 digest, platform tag, and version. SPDX and
+CycloneDX sidecars are generated and verified for each entry; the SLSA bundle
+attests the same subject checksums. The publisher downloads only this
+allowlisted bundle and rejects missing, extra, duplicate, or digest-mismatched
+files. `SHA256SUMS` and the GitHub attestation should be checked before a wheel
+is installed.
+
+When the external PyPI trusted-publisher configuration is ready, the publish
+job uses OIDC (`id-token: write`) and no long-lived PyPI token. A retry is
+allowed only after the PyPI JSON API confirms that an existing filename has the
+same SHA-256; a different digest or a partial unexpected release stops the
+job. Until that precondition and reconciliation succeed, use the GitHub
+Release wheel directly and do not assume that PyPI publication occurred.
+
 ## Installation
 
 Download the wheel matching the host from the
@@ -63,11 +93,13 @@ python -m pip install ./forge_normalizer-0.97.0-py3-none-manylinux_2_34_x86_64.w
 ```
 
 Replace the version and platform tag with the selected release asset. The
-official `manylinux_2_34_x86_64` wheel is expected to run on glibc 2.34 or
-newer without `FORGE_NORMALIZER_LIBRARY` or another native-library override.
-The pinned glibc-2.28 environment is only the generic-build and ABI-stress
-floor described above. Verify the asset against `SHA256SUMS`; the same release
-also contains a GitHub SLSA provenance bundle covering every wheel.
+official `manylinux_2_34_x86_64` and `manylinux_2_34_aarch64` wheels are
+expected to run on glibc 2.34 or newer without
+`FORGE_NORMALIZER_LIBRARY` or another native-library override. The ARM wheel
+requires an ARMv8-A-compatible AArch64 CPU. The pinned glibc-2.28 environment
+is only the generic-build and ABI-stress floor described above. Verify the
+asset against `SHA256SUMS`; the same release also contains a GitHub SLSA
+provenance bundle covering every wheel.
 
 For development from a source checkout, put `python/src` on `PYTHONPATH` and
 select a compatible native library:
