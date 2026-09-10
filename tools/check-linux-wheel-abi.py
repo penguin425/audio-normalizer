@@ -18,6 +18,8 @@ from typing import Callable, NamedTuple, Sequence
 MAX_GLIBC = (2, 34)
 MAX_MEMBER_BYTES = 256 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+ET_EXEC = 2
+ET_DYN = 3
 
 WHEEL_NAME = re.compile(
     r"^forge_normalizer-(?P<version>[0-9]+\.[0-9]+\.[0-9]+)-"
@@ -257,9 +259,19 @@ def validate_interpreter(
 
 
 def validate_elf_header(
-    data: bytes, *, member: str, architecture: str = "x86_64"
+    data: bytes,
+    *,
+    member: str,
+    architecture: str = "x86_64",
+    expected_elf_type: int = ET_DYN,
 ) -> None:
     contract = contract_for_architecture(architecture)
+    expected_type_name = {
+        ET_EXEC: "ET_EXEC",
+        ET_DYN: "ET_DYN",
+    }.get(expected_elf_type)
+    if expected_type_name is None:
+        raise ValueError(f"unsupported expected ELF type: {expected_elf_type}")
     if len(data) < 20 or data[:4] != b"\x7fELF":
         raise WheelAbiError(f"{member} is not a complete ELF header")
     if data[4] != 2:
@@ -267,8 +279,8 @@ def validate_elf_header(
     if data[5] != 1:
         raise WheelAbiError(f"{member} is not little-endian")
     elf_type = int.from_bytes(data[16:18], "little")
-    if elf_type != 3:
-        raise WheelAbiError(f"{member} is not an ET_DYN object")
+    if elf_type != expected_elf_type:
+        raise WheelAbiError(f"{member} is not an {expected_type_name} object")
     machine = int.from_bytes(data[18:20], "little")
     if machine != contract.elf_machine:
         raise WheelAbiError(

@@ -58,7 +58,7 @@ fn version_and_size_queries_are_stable() {
 #[test]
 fn invalid_inputs_return_bounded_status_and_error_text() {
     let mut output = MaybeUninit::<ForgeAnalysisV1>::uninit();
-    let mut error = [1_i8; 128];
+    let mut error: [c_char; 128] = [1; 128];
     // SAFETY: output and error buffers are valid and non-overlapping.
     let status = unsafe {
         forge_normalizer_analyze_file_v1(
@@ -136,7 +136,7 @@ fn c_api_analyzes_a_bounded_file_into_the_fixed_v1_layout() {
     WavWriter::write(&path, &audio, PcmKind::S16, false).unwrap();
     let path = CString::new(path.to_str().unwrap()).unwrap();
     let mut result = MaybeUninit::<ForgeAnalysisV1>::uninit();
-    let mut error = [1_i8; 256];
+    let mut error: [c_char; 256] = [1; 256];
 
     // SAFETY: every pointer references live, sufficiently sized,
     // non-overlapping caller-owned storage.
@@ -193,7 +193,7 @@ fn c_api_rejects_non_finite_ieee_float_wave_samples() {
         write_f32_wave(&path, sample);
         let path = CString::new(path.to_str().unwrap()).unwrap();
         let mut result = MaybeUninit::<ForgeAnalysisV1>::uninit();
-        let mut error = [1_i8; 256];
+        let mut error: [c_char; 256] = [1; 256];
 
         // SAFETY: every pointer references live, sufficiently sized,
         // non-overlapping caller-owned storage.
@@ -232,7 +232,7 @@ fn c_api_rejects_maskless_multichannel_without_a_layout_override() {
     WavWriter::write(&path, &audio, PcmKind::F32, false).unwrap();
     let path = CString::new(path.to_str().unwrap()).unwrap();
     let mut result = MaybeUninit::<ForgeAnalysisV1>::uninit();
-    let mut error = [1_i8; 256];
+    let mut error: [c_char; 256] = [1; 256];
 
     // SAFETY: every pointer references live, sufficiently sized,
     // non-overlapping caller-owned storage.
@@ -269,7 +269,7 @@ fn c_api_exact_layout_override_returns_effective_descriptor() {
     let layout = CString::new(layout.to_json().unwrap()).unwrap();
     let mut result = MaybeUninit::<ForgeAnalysisV1>::uninit();
     let mut required = 0_usize;
-    let mut error = [1_i8; 256];
+    let mut error: [c_char; 256] = [1; 256];
 
     // A null output buffer performs bounded size negotiation while still
     // returning the fixed analysis result.
@@ -294,7 +294,7 @@ fn c_api_exact_layout_override_returns_effective_descriptor() {
     assert_eq!(unsafe { result.assume_init() }.channels, 6);
 
     let mut result = MaybeUninit::<ForgeAnalysisV1>::uninit();
-    let mut effective = vec![0_i8; required];
+    let mut effective: Vec<c_char> = vec![0; required];
     // SAFETY: every pointer references live, sufficiently sized,
     // non-overlapping caller-owned storage.
     let status = unsafe {

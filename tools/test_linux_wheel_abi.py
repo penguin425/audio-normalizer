@@ -28,13 +28,18 @@ BUILDER_SPEC.loader.exec_module(builder)
 MANYLINUX_CMAKE_TOOLCHAIN = SCRIPT.with_name("manylinux-cmake-toolchain.cmake")
 
 
-def elf_header(marker: bytes = b"", *, architecture: str = "x86_64") -> bytes:
+def elf_header(
+    marker: bytes = b"",
+    *,
+    architecture: str = "x86_64",
+    elf_type: int = abi.ET_DYN,
+) -> bytes:
     header = bytearray(64)
     header[:4] = b"\x7fELF"
     header[4] = 2
     header[5] = 1
     header[6] = 1
-    header[16:18] = (3).to_bytes(2, "little")
+    header[16:18] = elf_type.to_bytes(2, "little")
     machine = abi.contract_for_architecture(architecture).elf_machine
     header[18:20] = machine.to_bytes(2, "little")
     return bytes(header) + marker
@@ -190,6 +195,13 @@ class DynamicAndIsaTests(unittest.TestCase):
             abi.validate_notes(
                 "GNU properties: AArch64 feature: BTI",
                 architecture="aarch64",
+            )
+
+    def test_wheel_header_rejects_static_executable(self) -> None:
+        with self.assertRaisesRegex(abi.WheelAbiError, "ET_DYN"):
+            abi.validate_elf_header(
+                elf_header(elf_type=abi.ET_EXEC),
+                member="fixture.so",
             )
 
     def test_aarch64_auditwheel_policy_is_architecture_specific(self) -> None:
@@ -357,6 +369,38 @@ class BaselineCpuEmulationTests(unittest.TestCase):
             qemu.chmod(0o755)
             with self.assertRaisesRegex(AssertionError, "plain cortex-a53"):
                 run_aarch64_cpu_controls(str(qemu), "max")
+
+    def test_aarch64_control_reaches_all_instruction_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            qemu = Path(directory) / "qemu-aarch64-static"
+            qemu.write_bytes(b"fixture")
+            qemu.chmod(0o755)
+
+            def compile_fixture(_source: str, output: Path, **_kwargs: object) -> None:
+                output.write_bytes(
+                    elf_header(architecture="aarch64", elf_type=abi.ET_EXEC)
+                )
+
+            with (
+                mock.patch(
+                    f"{__name__}._compile_static_elf",
+                    side_effect=compile_fixture,
+                ) as compile_mock,
+                mock.patch(
+                    f"{__name__}._run_qemu",
+                    side_effect=(0, 0, -4, 0),
+                ) as qemu_mock,
+                mock.patch.object(
+                    abi,
+                    "validate_elf_header",
+                    wraps=abi.validate_elf_header,
+                ) as header_mock,
+            ):
+                run_aarch64_cpu_controls(str(qemu), "cortex-a53")
+
+            self.assertEqual(compile_mock.call_count, 3)
+            self.assertEqual(header_mock.call_count, 3)
+            self.assertEqual(qemu_mock.call_count, 4)
 
     @unittest.skipUnless(
         os.environ.get("FORGE_QEMU_X86_64")
@@ -557,13 +601,14 @@ def run_aarch64_cpu_controls(
     *,
     compiler: str = "cc",
 ) -> None:
-    """Prove that an AArch64 QEMU model exposes only the ARMv8 baseline.
+    """Prove that an AArch64 QEMU model enforces the Cortex-A53 floor.
 
-    The release baseline includes ARMv8-A and mandatory ASIMD/NEON, but not
-    optional crypto extensions.  The fixture is compiled with the crypto
-    extension explicitly and must trap under the supplied ``cortex-a53``
-    model.  Keeping the compiler explicit lets this run on a native ARM
-    runner (``cc``) or an x86 runner with a pinned aarch64 cross compiler.
+    The release baseline includes ARMv8-A and mandatory ASIMD/NEON.  QEMU's
+    Cortex-A53 model also exposes optional crypto instructions, so a later SVE
+    instruction is the sensitivity control: it must trap on Cortex-A53 and
+    execute on QEMU's ``max`` model.  Keeping the compiler explicit lets this
+    run on a native ARM runner (``cc``) or an x86 runner with a pinned aarch64
+    cross compiler.
     """
 
     qemu_path = Path(qemu)
@@ -579,7 +624,7 @@ def run_aarch64_cpu_controls(
         root = Path(directory)
         baseline = root / "baseline-aarch64"
         neon = root / "neon-aarch64"
-        crypto = root / "crypto-aarch64"
+        sve = root / "sve-aarch64"
         _compile_static_elf(
             "mov x0, #0\nmov x8, #93\nsvc #0",
             baseline,
@@ -595,24 +640,20 @@ def run_aarch64_cpu_controls(
             extra_args=("-march=armv8-a",),
         )
         _compile_static_elf(
-            ".arch armv8-a+crypto\n"
-            "movi v0.16b, #0\n"
-            "aese v0.16b, v0.16b\n"
+            ".arch armv8.2-a+sve\n"
+            "ptrue p0.b\n"
             "mov x0, #0\nmov x8, #93\nsvc #0",
-            crypto,
+            sve,
             compiler=compiler,
-            extra_args=("-march=armv8-a+crypto",),
+            extra_args=("-march=armv8.2-a+sve",),
         )
-        validate_elf_header(
-            baseline.read_bytes()[:20],
-            member=baseline.name,
-            architecture="aarch64",
-        )
-        validate_elf_header(
-            crypto.read_bytes()[:20],
-            member=crypto.name,
-            architecture="aarch64",
-        )
+        for probe in (baseline, neon, sve):
+            abi.validate_elf_header(
+                probe.read_bytes()[:20],
+                member=probe.name,
+                architecture="aarch64",
+                expected_elf_type=abi.ET_EXEC,
+            )
         baseline_status = _run_qemu(qemu, cpu, baseline)
         if baseline_status != 0:
             raise AssertionError(
@@ -624,11 +665,17 @@ def run_aarch64_cpu_controls(
                 "AArch64 mandatory NEON instruction failed under QEMU: "
                 f"exit {neon_status}"
             )
-        crypto_status = _run_qemu(qemu, cpu, crypto)
-        if crypto_status not in (-4, 132):
+        sve_status = _run_qemu(qemu, cpu, sve)
+        if sve_status not in (-4, 132):
             raise AssertionError(
-                "AArch64 crypto instruction was not trapped by the baseline "
-                f"QEMU CPU model: exit {crypto_status}"
+                "AArch64 SVE instruction was not trapped by the Cortex-A53 "
+                f"QEMU CPU model: exit {sve_status}"
+            )
+        sve_positive_status = _run_qemu(qemu, "max", sve)
+        if sve_positive_status != 0:
+            raise AssertionError(
+                "AArch64 SVE positive control failed under QEMU max: "
+                f"exit {sve_positive_status}"
             )
 
 
@@ -661,4 +708,4 @@ if __name__ == "__main__":
             qemu_cpu,
             compiler=qemu_args.cc,
         )
-    print("QEMU CPUID and instruction controls passed")
+    print("QEMU CPU feature and instruction controls passed")
