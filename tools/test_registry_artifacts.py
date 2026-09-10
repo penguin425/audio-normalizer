@@ -32,6 +32,40 @@ WHEEL_PLATFORMS = (
     "macosx_11_0_arm64",
     "win_amd64",
 )
+NPM_GENERATED_FIXTURES = {
+    # Release validation runs before the WASM build, so these package members
+    # must not depend on ignored bindings left behind in a developer checkout.
+    "forge_normalizer_wasm.js": b"export default async function init() {}\n",
+    "forge_normalizer_wasm_bg.wasm": b"\x00asm\x01\x00\x00\x00",
+    "forge_normalizer_wasm_bg.wasm.d.ts": (
+        b"export const memory: WebAssembly.Memory;\n"
+    ),
+}
+NPM_TRACKED_FIXTURES = frozenset(
+    {
+        "README.md",
+        "index.js",
+        "index.d.ts",
+        "package.json",
+    }
+)
+NPM_PAYLOAD_FIXTURES = (
+    "README.md",
+    "forge_normalizer_wasm.js",
+    "forge_normalizer_wasm_bg.wasm",
+    "forge_normalizer_wasm_bg.wasm.d.ts",
+    "index.js",
+    "index.d.ts",
+)
+
+
+def npm_member_bytes(relative: str) -> bytes:
+    generated = NPM_GENERATED_FIXTURES.get(relative)
+    if generated is not None:
+        return generated
+    if relative in NPM_TRACKED_FIXTURES:
+        return (PROJECT_ROOT / "wasm/package" / relative).read_bytes()
+    raise AssertionError(f"no npm test fixture is defined for {relative}")
 
 
 def make_wheel(root: Path, platform: str, version: str = VERSION) -> Path:
@@ -61,15 +95,8 @@ def make_npm_tarball(root: Path, version: str = VERSION) -> Path:
         "package/package.json": json.dumps(package, indent=2).encode() + b"\n",
         "package/LICENSE": (PROJECT_ROOT / "LICENSE").read_bytes(),
     }
-    for relative in (
-        "README.md",
-        "forge_normalizer_wasm.js",
-        "forge_normalizer_wasm_bg.wasm",
-        "forge_normalizer_wasm_bg.wasm.d.ts",
-        "index.js",
-        "index.d.ts",
-    ):
-        members[f"package/{relative}"] = (PROJECT_ROOT / "wasm/package" / relative).read_bytes()
+    for relative in NPM_PAYLOAD_FIXTURES:
+        members[f"package/{relative}"] = npm_member_bytes(relative)
     with tarfile.open(path, "w:gz") as archive:
         for name in sorted(members):
             data = members[name]
@@ -141,7 +168,7 @@ class RegistryArtifactTests(unittest.TestCase):
                     payload = source.extractfile(member)
                     target.addfile(member, payload)
                 data = b"unexpected\n"
-                member = tarfile.TarInfo("package/extra.txt")
+                member = tarfile.TarInfo("package/forge_normalizer_wasm.d.ts")
                 member.size = len(data)
                 target.addfile(member, io.BytesIO(data))
             with self.assertRaisesRegex(checker.VerificationError, "member mismatch"):
@@ -265,18 +292,9 @@ class RegistryArtifactTests(unittest.TestCase):
             root = Path(directory)
             package = root / "package"
             package.mkdir()
-            for relative in (
-                "package.json",
-                "README.md",
-                "forge_normalizer_wasm.js",
-                "forge_normalizer_wasm_bg.wasm",
-                "forge_normalizer_wasm_bg.wasm.d.ts",
-                "index.js",
-                "index.d.ts",
-            ):
-                source = PROJECT_ROOT / "wasm/package" / relative
+            for relative in ("package.json", *NPM_PAYLOAD_FIXTURES):
                 target = package / relative
-                target.write_bytes(source.read_bytes())
+                target.write_bytes(npm_member_bytes(relative))
             shutil.copy2(PROJECT_ROOT / "LICENSE", package / "LICENSE")
             first = root / "first"
             second = root / "second"
