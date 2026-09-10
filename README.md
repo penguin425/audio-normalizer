@@ -245,11 +245,37 @@ built-in contents-only token.
 The three registry trusted publishers must name repository
 `penguin425/audio-normalizer`, workflow `release.yml`, and their exact
 environment (`pypi`, `npm`, or `crates-io`). PyPI may use a pending publisher
-to create the project. npm and crates.io require the exact v0.189.16 package to
-be bootstrapped manually before their trusted publishers can be registered;
-the npm trusted-publisher entry must permit publishing, and the npm scope must
-already be controlled by the project owner. These are deployment prerequisites,
-not credentials accepted by build jobs.
+to create the project. crates.io requires the exact v0.189.16 crate to be
+bootstrapped manually before its trusted publisher can be registered.
+
+npm needs a different one-time bootstrap because the v0.189.16 package metadata
+contains `private: true` and cannot be published unchanged. Build
+`0.189.17-bootstrap.0` from the protected v0.189.17 source in an isolated tree,
+publish it manually to `https://registry.npmjs.org/` with public access and the
+non-default `bootstrap` dist-tag, and then register the trusted publisher with
+publish permission. The bootstrap prerelease is not a stable Forge release and
+the manual command below intentionally does not generate a trusted-OIDC
+attestation; v0.189.17 remains the first stable npm package published by the
+trusted workflow. Prepare the tarball by changing the package version in
+`wasm/Cargo.toml` and its `wasm/Cargo.lock` entry inside the isolated tree, then
+run `tools/build-wasm-package.sh` twice with the release-pinned Node 24.21.0,
+npm 11.19.0, Rust 1.97.0, and wasm-bindgen 0.2.127 toolchain and compare the
+outputs byte-for-byte.
+
+The npm scope must already be controlled by the project owner. Run the commands
+with npm 11.15.0 or newer from a 2FA-enabled account that has package write
+permission; `--yes` skips confirmation prompts but does not bypass interactive
+2FA. These are deployment prerequisites, not credentials accepted by build
+jobs.
+
+```console
+npm publish forge-normalizer-wasm-0.189.17-bootstrap.0.tgz \
+  --ignore-scripts --access public --tag bootstrap \
+  --registry=https://registry.npmjs.org/
+npm trust github @forge-normalizer/wasm \
+  --repo penguin425/audio-normalizer --file release.yml --env npm \
+  --allow-publish --yes --registry=https://registry.npmjs.org/
+```
 
 Cargo's stable publisher cannot upload a pre-existing `.crate` path: it always
 repackages before upload. The workflow therefore compares an independent
