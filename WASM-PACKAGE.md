@@ -60,6 +60,16 @@ extra package file is a release blocker. OIDC publisher configuration, npm
 scope ownership, and any first-package bootstrap are external prerequisites,
 so this document does not assert that npm publication has occurred.
 
+The v0.189.16 package metadata is `private`, so that tag cannot be used as an
+exact npm seed. The one-time first-package exception is the explicitly named
+`0.189.17-bootstrap.0` prerelease, built from the protected v0.189.17 source
+and published under the non-default `bootstrap` dist-tag. It is not a stable
+release; the manual bootstrap command omits `--provenance` and does not create
+a trusted-OIDC attestation. After it exists, configure the `release.yml` /
+`npm` trusted publisher with direct publishing allowed; the stable v0.189.17
+package must still be published through OIDC. npm 11.15.0 or newer, account
+2FA, and package write permission are required for that configuration.
+
 ## Evidence and unsupported release targets
 
 The exact release manifest records the WASM archive and npm tarball separately,
