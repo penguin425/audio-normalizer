@@ -257,7 +257,7 @@ jobs:
           fetch-depth: 0
 
       - name: Select Python 3.12 for workflow structure checks
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
@@ -450,7 +450,7 @@ jobs:
             "forge-v${{ needs.validate.outputs.version }}-linux-${{ matrix.architecture }}.pgo-training.json"
 
       - name: Upload portable Linux PGO build inputs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
         with:
           name: forge-pgo-profile-linux-${{ matrix.architecture }}
           path: |
@@ -480,7 +480,7 @@ jobs:
           tools/test-native-package.sh "$prefix" "${{ needs.validate.outputs.version }}"
 
       - name: Upload packaged portable Linux archive
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
         with:
           name: forge-linux-${{ matrix.architecture }}
           path: forge-v${{ needs.validate.outputs.version }}-linux-${{ matrix.architecture }}.tar.gz
@@ -536,7 +536,7 @@ jobs:
         run: rustup component add llvm-tools-preview
 
       - name: Install Python 3.14
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
 
@@ -568,7 +568,7 @@ jobs:
 
       - name: Upload Apple Silicon PGO profile evidence
         if: matrix.asset == 'macos-aarch64'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
         with:
           name: apple-pgo-profile-macos-aarch64
           path: |
@@ -714,7 +714,7 @@ jobs:
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
 
       - name: Upload packaged binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
         with:
           name: forge-${{ matrix.asset }}
           path: |
@@ -867,7 +867,7 @@ jobs:
             "${wheels[0]}"
 
       - name: Upload only the repaired Linux wheel
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
         with:
           name: forge-python-linux-${{ matrix.architecture }}
           path: repaired-wheel/forge_normalizer-*.whl
@@ -911,13 +911,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
 
       - name: Download the verified wheel candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-python-linux-${{ matrix.architecture }}
           path: ${{ runner.temp }}/linux-wheel
 
       - name: Download the portable native archive candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-linux-${{ matrix.architecture }}
           path: ${{ runner.temp }}/linux-native
@@ -1096,7 +1096,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
 
       - name: Download the independently built candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-python-linux-${{ matrix.architecture }}
           path: candidate-wheel
@@ -1253,7 +1253,7 @@ jobs:
             "forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.pgo-training.json"
 
       - name: Upload x86-64-v3 PGO build inputs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
         with:
           name: forge-pgo-profile-linux-x86_64-v3
           path: |
@@ -1272,7 +1272,7 @@ jobs:
           .
 
       - name: Upload the x86-64-v3 CLI
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
         with:
           name: forge-linux-x86_64-v3
           path: forge-v${{ needs.validate.outputs.version }}-linux-x86_64-v3.tar.gz
@@ -1321,25 +1321,25 @@ jobs:
           "${CARGO_HOME}/bin/rustc" --version | grep -Fx 'rustc 1.97.0 (2d8144b78 2026-07-07)'
 
       - name: Download published build candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-linux-x86_64
           path: actual
 
       - name: Download published x86-64-v3 candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-linux-x86_64-v3
           path: actual
 
       - name: Download generic Linux PGO profile
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-pgo-profile-linux-x86_64
           path: actual-profile
 
       - name: Download x86-64-v3 PGO profile
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-pgo-profile-linux-x86_64-v3
           path: actual-v3-profile
@@ -1425,13 +1425,13 @@ jobs:
           "${CARGO_HOME}/bin/rustc" --version | grep -Fx 'rustc 1.97.0 (2d8144b78 2026-07-07)'
 
       - name: Download published ARM64 build candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-linux-aarch64
           path: actual
 
       - name: Download ARM64 PGO profile
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-pgo-profile-linux-aarch64
           path: actual-profile
@@ -1485,13 +1485,13 @@ jobs:
           components: llvm-tools-preview
 
       - name: Download published Apple Silicon candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-macos-aarch64
           path: actual
 
       - name: Download published Apple Silicon PGO profile
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: apple-pgo-profile-macos-aarch64
           path: actual-profile
@@ -1544,7 +1544,7 @@ jobs:
           cp "$crate" .
 
       - name: Upload the exact Cargo registry package
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
         with:
           name: forge-rust-crate
           path: forge-normalizer-${{ needs.validate.outputs.version }}.crate
@@ -1559,7 +1559,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
 
       - name: Install the pinned Node and npm release toolchain
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24.21.0"
           package-manager-cache: false
@@ -1597,7 +1597,7 @@ jobs:
           mv "first/forge-normalizer-wasm-${{ needs.validate.outputs.version }}.tgz" .
 
       - name: Upload browser and npm packages
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
         with:
           name: forge-wasm-packages
           path: |
@@ -1628,61 +1628,61 @@ jobs:
           persist-credentials: false
 
       - name: Download Linux x86-64 native archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-linux-x86_64
           path: incoming/linux-x86_64
 
       - name: Download Linux ARM64 native archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-linux-aarch64
           path: incoming/linux-aarch64
 
       - name: Download supplemental Linux x86-64-v3 archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-linux-x86_64-v3
           path: incoming/linux-x86_64-v3
 
       - name: Download Windows release pair
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-windows-x86_64
           path: incoming/windows-x86_64
 
       - name: Download macOS Intel release pair
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-macos-x86_64
           path: incoming/macos-x86_64
 
       - name: Download macOS ARM64 release pair
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-macos-aarch64
           path: incoming/macos-aarch64
 
       - name: Download Linux x86-64 wheel
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-python-linux-x86_64
           path: incoming/python-linux-x86_64
 
       - name: Download Linux ARM64 wheel
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-python-linux-aarch64
           path: incoming/python-linux-aarch64
 
       - name: Download browser and npm WASM packages
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-wasm-packages
           path: incoming/wasm
 
       - name: Download Cargo registry package
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-rust-crate
           path: incoming/crate
@@ -1805,7 +1805,7 @@ jobs:
             --version "${{ needs.validate.outputs.version }}"
 
       - name: Upload the read-only assembled bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
         with:
           name: forge-release-assembled
           path: dist
@@ -1827,7 +1827,7 @@ jobs:
           persist-credentials: false
 
       - name: Download the assembled bundle by exact producer name
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-release-assembled
           path: dist
@@ -1868,7 +1868,7 @@ jobs:
           done < dist/SHA256SUMS
 
       - name: Upload the fully attested release bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
         with:
           name: forge-release-final
           path: dist
@@ -1898,7 +1898,7 @@ jobs:
 
       - id: release-policy-token
         name: Acquire a short-lived fail-closed release-policy token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ vars.FORGE_RELEASE_POLICY_APP_CLIENT_ID }}
           private-key: ${{ secrets.FORGE_RELEASE_POLICY_APP_PRIVATE_KEY }}
@@ -1910,7 +1910,7 @@ jobs:
           permission-administration: write
 
       - name: Download the fully attested bundle by exact producer name
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-release-final
           path: ${{ runner.temp }}/release-dist
@@ -1957,7 +1957,7 @@ jobs:
         run: printf 'RELEASE_DIST=%s/release-dist\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       - name: Download the exact attested registry source bundle
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-release-final
           path: ${{ runner.temp }}/release-dist
@@ -1988,7 +1988,7 @@ jobs:
 
       - name: Publish the previously absent wheel set
         if: steps.registry-preflight.outputs.state == 'absent'
-        uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # v1.12.4
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           packages-dir: pypi-dist
           skip-existing: false
@@ -2034,14 +2034,14 @@ jobs:
         run: printf 'RELEASE_DIST=%s/release-dist\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       - name: Install the pinned npm trusted-publishing toolchain
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24.21.0"
           package-manager-cache: false
           registry-url: https://registry.npmjs.org
 
       - name: Download the exact attested registry source bundle
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-release-final
           path: ${{ runner.temp }}/release-dist
@@ -2116,7 +2116,7 @@ jobs:
         uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
 
       - name: Download the exact attested registry source bundle
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           name: forge-release-final
           path: ${{ runner.temp }}/release-dist
@@ -2149,7 +2149,7 @@ jobs:
       - id: crates-auth
         name: Acquire a crate-scoped short-lived token
         if: steps.registry-preflight.outputs.state == 'absent'
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
 
       - name: Publish the previously absent crate
         if: steps.registry-preflight.outputs.state == 'absent'
