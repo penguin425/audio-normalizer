@@ -228,7 +228,7 @@ rubato = { version = "5.0.0", default-features = false, features = ["fft_resampl
 jsonschema = { version = "0.52.0", default-features = false }
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 ndarray = { version = "0.17", default-features = false, optional = true }
-ort = { version = "=2.0.0-rc.13", default-features = false, features = ["ndarray", "load-dynamic"], optional = true }
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["ndarray", "load-dynamic"], optional = true }
 prost = { version = "0.14.4", optional = true }
 http-body = { version = "1.0.1", optional = true }
 tokio = { version = "1.53.1", optional = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
@@ -243,7 +243,7 @@ libc = "0.2"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Diagnostics", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-cudarc = { version = "=0.19.9", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-11040"] }
+cudarc = { version = "=0.19.10", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-11040"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"
